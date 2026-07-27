@@ -688,7 +688,7 @@ pub fn value_as_bytes(heap: &Heap, v: Value) -> Result<Vec<u8>, IoErrorTag> {
                 } else {
                     // Out-of-range elements are a typechecker bug; clamp
                     // defensively rather than panicking in the host.
-                    (n as u8)
+                    n as u8
                 }
             })
             .collect()),

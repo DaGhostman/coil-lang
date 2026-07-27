@@ -70,6 +70,33 @@ fn type_mismatch_on_let_annotation_reports_expected_and_actual() {
 }
 
 #[test]
+fn type_mismatch_messages_avoid_raw_tvar_ids() {
+    // End-to-end: mismatch pretty-printing must not leak raw `tN` ids
+    // (free vars are renamed to `a`/`b`/… via `format_ty_for_diag`).
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+  let p = (1, 2);
+  let q: (string, int) = p;
+}
+"#,
+    );
+    let joined = msgs.join("\n");
+    assert!(
+        joined.contains("Type mismatch"),
+        "expected a type mismatch, got: {joined}"
+    );
+    assert!(
+        joined.contains("string") && joined.contains("int"),
+        "expected tuple element types in the message, got: {joined}"
+    );
+    assert!(
+        !joined.contains("`t"),
+        "diagnostics must not show raw tN type-var ids, got: {joined}"
+    );
+}
+
+#[test]
 fn arity_mismatch_mentions_function_name() {
     // `missing_fn` is unknown — the message should still mention the
     // name so the user can grep for it.
@@ -249,9 +276,48 @@ fn main() {
     assert!(
         msgs.iter().any(|m| {
             m.message().contains("cannot capture `y` without `use (y)`")
+                || m.message().contains("list `y` in the enclosing `use")
                 || m.message().contains("list `y` in the lambda's `use")
         }),
         "expected explicit-capture diagnostic for `y`, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn defer_cannot_capture_without_use() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    let y = 10;
+    defer { print "%i", y; }
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("cannot capture `y` without `use (y)`")
+        }),
+        "expected explicit-capture diagnostic for defer, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn defer_undefined_variable_is_rejected() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    defer { print "%i", totally_undefined_var; }
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message()
+                .contains("Cannot find value `totally_undefined_var`")
+        }),
+        "expected unknown-value diagnostic in defer, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
 }
@@ -2061,3 +2127,139 @@ fn main() {
     );
 }
 
+#[test]
+fn static_method_called_on_instance_errors() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub static fn origin() -> Point {
+        return new Point(0, 0);
+    }
+}
+fn main() {
+    let p = new Point(1, 2);
+    let q = p.origin();
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("static method")
+            && (m.contains("call it as") || m.contains("::"))),
+        "expected static-on-instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn instance_method_via_class_path_errors() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+fn main() {
+    let n = Point::sum();
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("instance method")
+            && (m.contains("call it on a value") || m.contains("obj."))),
+        "expected instance-via-Class:: diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn static_constructor_via_class_path_typechecks() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub static fn new(int x, int y) -> Point {
+        return new Point(x, y);
+    }
+}
+fn main() {
+    let p = Point::new(40, 2);
+}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "expected no diagnostics for Point::new, got: {:?}",
+        msgs
+    );
+}
+
+
+#[test]
+fn method_named_send_does_not_shadow_thread_send() {
+    // Regression: inherent `fn send` used to bind bare `send` for
+    // monomorphic recursion, shadowing `use thread::*;` and turning
+    // `send(self.channel, data)` into a self-type mismatch
+    // (expected Sender, found Wrapper) while checking function type.
+    let (_ty, msgs) = check(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn send(int data) {
+        send(self.channel, data)?;
+    }
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "bare send() inside fn send must resolve to thread::send; got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn self_channel_field_passes_sender_to_thread_send() {
+    let (_ty, msgs) = check(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn push(int data) {
+        send(self.channel, data)?;
+    }
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "self.channel must type as Sender for thread::send; got: {:?}",
+        msgs
+    );
+}

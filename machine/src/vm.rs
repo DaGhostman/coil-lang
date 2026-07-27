@@ -165,6 +165,8 @@ pub struct Machine<const S: usize> {
     thread_program: Option<std::sync::Arc<crate::thread::ThreadProgram>>,
     /// Optional shared stdout capture for worker threads.
     shared_print: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// Undetached spawns owned by this VM (joined at end of `run_with_pool`).
+    live_threads: crate::thread::LiveThreadRegistry,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -196,6 +198,7 @@ impl<const S: usize> Default for Machine<S> {
             program_debug: ProgramDebug::default(),
             thread_program: None,
             shared_print: None,
+            live_threads: crate::thread::new_live_thread_registry(),
         }
     }
 }
@@ -586,6 +589,16 @@ impl<const S: usize> Machine<S> {
         self.shared_print.clone()
     }
 
+    /// Replace the undetached-spawn registry (used by workers to share the
+    /// root VM's list so nested `spawn` still joins with the root).
+    pub fn set_live_threads(&mut self, registry: crate::thread::LiveThreadRegistry) {
+        self.live_threads = registry;
+    }
+
+    pub fn live_threads(&self) -> &crate::thread::LiveThreadRegistry {
+        &self.live_threads
+    }
+
     /// Allocate global static slots without running bytecode.
     pub fn init_static_slots(&mut self, static_slots: u32) {
         self.statics = vec![Value::default(); static_slots as usize];
@@ -602,6 +615,7 @@ impl<const S: usize> Machine<S> {
             program,
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
+            live_threads: std::sync::Arc::clone(&self.live_threads),
         })
     }
 
@@ -618,11 +632,6 @@ impl<const S: usize> Machine<S> {
             static_slot_count: self.statics.len() as u32,
             debug: self.program_debug.clone(),
         }));
-    }
-
-    /// Legacy hook for host callbacks; `with_lock` holds the `MutexGuard` directly instead.
-    pub fn active_machine_for_host() -> Option<*mut Machine<{ crate::thread::WORKER_STACK_SLOTS }>> {
-        None
     }
 
     /// Register a function signature on a previously-loaded
@@ -974,6 +983,11 @@ impl<const S: usize> Machine<S> {
                 break;
             }
         }
+        // Keep undetached workers alive past main's return. Without this,
+        // process exit kills threads still blocked in `recv` / still starting,
+        // which looks like "recv never blocks" and "nothing after recv runs".
+        // Only joins *this* Machine's registry (not a process-global list).
+        crate::thread::join_undetached_threads(&self.live_threads);
     }
 
     fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {
@@ -2159,11 +2173,14 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(array_obj.addr()));
                 }
                 Instruction::JumpIfMatch => {
-                    // Tag in operands[31:16]; jump target in value[31:0].
+                    // Tag in operands[31:16]; pool index in operands[15:0]
+                    // (`constants[idx]` holds the absolute jump target).
                     let operands = opcode.operand_u32();
                     let expected_tag = operands >> 16;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.peek().raw() as u64;
 
@@ -2176,6 +2193,12 @@ impl<const S: usize> Machine<S> {
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
                             if enum_ref.tag == expected_tag {
+                                let pool_idx = (operands & 0xFFFF) as usize;
+                                debug_assert!(
+                                    pool_idx < constants.len(),
+                                    "JumpIfMatch pool index {pool_idx} out of range (len {})",
+                                    constants.len()
+                                );
                                 let target_offset = opcode.jump_if_match_target(constants);
                                 let _ = self.stack.pop();
                                 for member in &enum_ref.payload {
@@ -2196,6 +2219,8 @@ impl<const S: usize> Machine<S> {
                     let _arity = opcode.operand_u32() as usize;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
@@ -2221,6 +2246,8 @@ impl<const S: usize> Machine<S> {
                     let field_index = (opcode.operand_u32() & 0xFFFF) as usize;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
@@ -2258,6 +2285,8 @@ impl<const S: usize> Machine<S> {
 
                     let slot = sp + slot_offset;
                     if slot >= self.stack.tell() {
+                        // Intentional empty body: defensive no-op when the UnpackAt
+                        // slot is out of range (typechecker should prevent this).
                     } else {
                         let scrutinee_addr = self.stack[slot].raw() as u64;
 
@@ -2329,6 +2358,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let has_send = opcode.operand_u32() & 1 != 0;
                         let handle = self.stack.pop();
@@ -2370,6 +2401,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::YieldCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let yield_val = self.stack.pop();
                         self.yield_coroutine(&mut ip, &mut sp, yield_val);
@@ -2377,6 +2410,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::YieldFromCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let handle = self.stack.pop();
                         let addr = handle.raw() as u64;

@@ -260,7 +260,15 @@ pub enum Expression<'expr> {
     Fragment(Vec<Output<'expr>>),
     Block(Vec<Output<'expr>>),
     Program(Vec<Output<'expr>>),
-    Defer(Output<'expr>),
+    /// `defer { … }` or `defer use (a, b) { … }` — runs on enclosing function exit.
+    ///
+    /// - `captures` — variable names from the optional `use (a, b)` list (same
+    ///   explicit-capture rules as [`Self::Lambda`]).
+    /// - `body` — the deferred block.
+    Defer {
+        captures: Vec<&'expr str>,
+        body: Output<'expr>,
+    },
 
     Assignment(Output<'expr>, Output<'expr>),
 
@@ -989,7 +997,13 @@ impl<'a> Display for Expression<'a> {
                     ),
                 }
             }
-            Self::Defer(b) => write!(f, "defer {}", b.1),
+            Self::Defer { captures, body } => {
+                write!(f, "defer")?;
+                if !captures.is_empty() {
+                    write!(f, " use ({})", captures.join(", "))?;
+                }
+                write!(f, " {}", body.1)
+            }
             Self::TestCase { name, body } => {
                 write!(f, "test({}) {{\n{}}}", name.1, body.1)
             }
@@ -1378,6 +1392,23 @@ impl<'a> Display for Expression<'a> {
                     Self::Block(_) => write!(f, " {{\n{}}}", body.1),
                     _ => write!(f, " => {}", body.1),
                 }
+            }
+            Self::Use { path, name, alias } => {
+                write!(f, "use ")?;
+                for (i, seg) in path.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "::")?;
+                    }
+                    write!(f, "{}", seg)?;
+                }
+                if !path.is_empty() {
+                    write!(f, "::")?;
+                }
+                write!(f, "{}", name)?;
+                if let Some(a) = alias {
+                    write!(f, " as {}", a)?;
+                }
+                write!(f, ";")
             }
             e => write!(f, "<unhandled: {:?}>", e),
         }

@@ -9,6 +9,54 @@ use std::sync::{
 };
 use std::thread;
 
+/// Per-root-VM registry of undetached spawns (shared with nested workers via
+/// [`ThreadSpawnContext`]). Process-global storage was wrong: parallel tests /
+/// multiple `Machine`s would steal each other's joins via `mem::take`.
+pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
+
+pub fn new_live_thread_registry() -> LiveThreadRegistry {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn register_live_thread(registry: &LiveThreadRegistry, state: Arc<JoinState>) {
+    // Match `join_undetached_threads`: recover from a poisoned mutex so the
+    // spawn is still tracked (otherwise shutdown would not wait for it).
+    let mut g = registry.lock().unwrap_or_else(|e| e.into_inner());
+    g.push(state);
+}
+
+/// Block until every undetached, not-yet-joined spawn in `registry` has finished.
+///
+/// Called automatically at the end of [`Machine::run_with_pool`] for that
+/// machine's own registry. Explicit `join(t)` still returns the worker's value;
+/// this path only keeps the process alive. `detach(t)` opts a thread out.
+///
+/// Loops until the registry drains: a worker may `spawn` nested threads onto
+/// the same registry while we wait, and those must be joined too.
+pub fn join_undetached_threads(registry: &LiveThreadRegistry) {
+    loop {
+        let threads = match registry.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        if threads.is_empty() {
+            break;
+        }
+        for state in threads {
+            if state.detached.load(Ordering::SeqCst) {
+                continue;
+            }
+            if state.joined.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            let _ = state.wait_result();
+            if let Some(h) = state.join_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
 use common::{
     Byte, BUILTIN_RESULT_VARIANTS, BUILTIN_THREAD_ERROR_VARIANTS, ProgramDebug, Value,
 };
@@ -46,7 +94,11 @@ pub enum ThreadErrorTag {
 }
 
 /// Host-side value graph for cross-thread copy (not a coil type).
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Channel / lock handles are included so they can nest inside tuples,
+/// arrays, and class instances passed to `spawn` or `send` (the typechecker
+/// already treats `Sender` / `Receiver` / `Mutex` / `RwLock` as sendable).
+#[derive(Clone)]
 pub enum PortableValue {
     Immediate(u64),
     String(String),
@@ -60,6 +112,60 @@ pub enum PortableValue {
         fields: Vec<(String, PortableValue)>,
     },
     Boxed(Box<PortableValue>),
+    Sender(Arc<ChannelInner>),
+    Receiver(Arc<ChannelInner>),
+    MutexHandle(Arc<MutexInner>),
+    RwLockHandle(Arc<RwLockInner>),
+}
+
+impl std::fmt::Debug for PortableValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Immediate(v) => write!(f, "Immediate({v})"),
+            Self::String(s) => write!(f, "String({s:?})"),
+            Self::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            Self::Tuple(t) => f.debug_tuple("Tuple").field(t).finish(),
+            Self::Enum { tag, payload } => f
+                .debug_struct("Enum")
+                .field("tag", tag)
+                .field("payload", payload)
+                .finish(),
+            Self::Instance { fields } => f.debug_struct("Instance").field("fields", fields).finish(),
+            Self::Boxed(inner) => f.debug_tuple("Boxed").field(inner).finish(),
+            Self::Sender(_) => write!(f, "Sender(..)"),
+            Self::Receiver(_) => write!(f, "Receiver(..)"),
+            Self::MutexHandle(_) => write!(f, "MutexHandle(..)"),
+            Self::RwLockHandle(_) => write!(f, "RwLockHandle(..)"),
+        }
+    }
+}
+
+impl PartialEq for PortableValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Immediate(a), Self::Immediate(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (
+                Self::Enum {
+                    tag: t1,
+                    payload: p1,
+                },
+                Self::Enum {
+                    tag: t2,
+                    payload: p2,
+                },
+            ) => t1 == t2 && p1 == p2,
+            (Self::Instance { fields: f1 }, Self::Instance { fields: f2 }) => f1 == f2,
+            (Self::Boxed(a), Self::Boxed(b)) => a == b,
+            (Self::Sender(a), Self::Sender(b)) => Arc::ptr_eq(a, b),
+            (Self::Receiver(a), Self::Receiver(b)) => Arc::ptr_eq(a, b),
+            (Self::MutexHandle(a), Self::MutexHandle(b)) => Arc::ptr_eq(a, b),
+            (Self::RwLockHandle(a), Self::RwLockHandle(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// Spawn-time argument (sendable value or host handle re-wrap).
@@ -167,8 +273,6 @@ impl RwLockInner {
 }
 
 thread_local! {
-    static ACTIVE_MACHINE: RefCell<*mut Machine<WORKER_STACK_SLOTS>> =
-        const { RefCell::new(std::ptr::null_mut()) };
     static HELD_MUTEX: RefCell<Option<(u64, MutexGuard<'static, PortableValue>)>> =
         RefCell::new(None);
 }
@@ -233,30 +337,6 @@ fn host_spawn_context() -> Result<ThreadSpawnContext, ThreadErrorTag> {
     })
 }
 
-#[allow(dead_code)]
-pub(crate) struct ActiveMachineGuard;
-
-impl ActiveMachineGuard {
-    fn enter(machine: *mut Machine<WORKER_STACK_SLOTS>) -> Self {
-        ACTIVE_MACHINE.with(|c| {
-            *c.borrow_mut() = machine;
-        });
-        Self
-    }
-}
-
-impl Drop for ActiveMachineGuard {
-    fn drop(&mut self) {
-        ACTIVE_MACHINE.with(|c| {
-            *c.borrow_mut() = std::ptr::null_mut();
-        });
-    }
-}
-
-pub(crate) fn set_active_machine(machine: *mut Machine<WORKER_STACK_SLOTS>) -> ActiveMachineGuard {
-    ActiveMachineGuard::enter(machine)
-}
-
 /// Allocate `ThreadError` variant on the heap.
 pub fn alloc_thread_error(heap: &mut Heap, tag: ThreadErrorTag) -> Value {
     let _ = BUILTIN_THREAD_ERROR_VARIANTS;
@@ -316,12 +396,29 @@ fn encode_value(
         return Ok(PortableValue::Immediate(v.raw() as u64));
     }
     let addr = v.raw() as u64;
-    if !visited.insert(addr) {
-        return Err(ThreadErrorTag::NotSendable);
-    }
     let Some(obj) = heap.find_object_by_addr(addr) else {
         return Ok(PortableValue::Immediate(v.raw() as u64));
     };
+    // Host handles share an `Arc` — no heap graph to traverse, and the same
+    // handle may appear twice in a tuple/record without being a cycle.
+    match &obj {
+        Object::Sender(gc) => {
+            return Ok(PortableValue::Sender(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::Receiver(gc) => {
+            return Ok(PortableValue::Receiver(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::Mutex(gc) => {
+            return Ok(PortableValue::MutexHandle(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::RwLock(gc) => {
+            return Ok(PortableValue::RwLockHandle(Arc::clone(&gc.as_ref().inner)));
+        }
+        _ => {}
+    }
+    if !visited.insert(addr) {
+        return Err(ThreadErrorTag::NotSendable);
+    }
     match obj {
         Object::String(gc) => Ok(PortableValue::String(gc.as_ref().data.clone())),
         Object::Array(gc) => {
@@ -375,11 +472,11 @@ fn encode_value(
         | Object::Coroutine(_)
         | Object::Fn(_)
         | Object::PolyFn(_)
-        | Object::Library(_)
-        | Object::Sender(_)
-        | Object::Receiver(_)
-        | Object::Mutex(_)
-        | Object::RwLock(_) => Err(ThreadErrorTag::NotSendable),
+        | Object::Library(_) => Err(ThreadErrorTag::NotSendable),
+        // Handled above; listed so the match stays exhaustive.
+        Object::Sender(_) | Object::Receiver(_) | Object::Mutex(_) | Object::RwLock(_) => {
+            unreachable!("host handles returned before deep encode")
+        }
     }
 }
 
@@ -446,6 +543,22 @@ fn decode_portable(heap: &mut Heap, p: PortableValue) -> Result<Value, ThreadErr
                 },
                 Object::Boxed,
             );
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::Sender(inner) => {
+            let (obj, _) = heap.alloc(ObjSender { inner }, Object::Sender);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::Receiver(inner) => {
+            let (obj, _) = heap.alloc(ObjReceiver { inner }, Object::Receiver);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::MutexHandle(inner) => {
+            let (obj, _) = heap.alloc(ObjThreadMutex { inner }, Object::Mutex);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::RwLockHandle(inner) => {
+            let (obj, _) = heap.alloc(ObjRwLock { inner }, Object::RwLock);
             Ok(Value::from(obj.addr()))
         }
     }
@@ -526,6 +639,7 @@ struct WorkerCtx {
     args: Vec<SpawnArg>,
     state: Arc<JoinState>,
     shared_print: Option<Arc<Mutex<Vec<u8>>>>,
+    live_threads: LiveThreadRegistry,
 }
 
 fn run_worker(ctx: WorkerCtx) {
@@ -536,12 +650,16 @@ fn run_worker(ctx: WorkerCtx) {
         args,
         state,
         shared_print,
+        live_threads,
     } = ctx;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
         vm.install_natives(&natives);
         vm.set_thread_program(Arc::clone(&program));
         vm.set_program_debug(program.debug.clone());
+        // Nested `spawn` from a worker registers on the root VM's list so the
+        // root's `run_with_pool` join still waits for them.
+        vm.set_live_threads(Arc::clone(&live_threads));
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
             vm.with_output(SharedPrintWriter(Arc::clone(buf)));
@@ -571,6 +689,7 @@ pub struct ThreadSpawnContext {
     pub program: Arc<ThreadProgram>,
     pub natives: Natives,
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
+    pub live_threads: LiveThreadRegistry,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -579,6 +698,7 @@ impl Clone for ThreadSpawnContext {
             program: Arc::clone(&self.program),
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
+            live_threads: Arc::clone(&self.live_threads),
         }
     }
 }
@@ -602,6 +722,7 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
             .collect::<Result<_, _>>()?
     };
     let ctx = host_spawn_context()?;
+    let live_threads = Arc::clone(&ctx.live_threads);
     let state = Arc::new(JoinState::new());
     let worker = WorkerCtx {
         program: ctx.program,
@@ -610,9 +731,11 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
         args: spawn_args,
         state: Arc::clone(&state),
         shared_print: ctx.shared_print,
+        live_threads: Arc::clone(&live_threads),
     };
     let handle = thread::spawn(move || run_worker(worker));
     *state.join_handle.lock().unwrap() = Some(handle);
+    register_live_thread(&live_threads, Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
     Ok(Value::from(obj.addr()))
 }
@@ -1019,6 +1142,72 @@ mod tests {
     use crate::memory::ObjFn;
     use std::time::Duration;
 
+    #[test]
+    fn live_thread_registries_are_per_machine() {
+        let m1 = Machine::<WORKER_STACK_SLOTS>::default();
+        let m2 = Machine::<WORKER_STACK_SLOTS>::default();
+        assert!(
+            !std::sync::Arc::ptr_eq(m1.live_threads(), m2.live_threads()),
+            "each Machine must own a distinct live-thread registry"
+        );
+        // Joining an empty registry must not touch another Machine's list.
+        let sentinel = Arc::new(JoinState::new());
+        register_live_thread(m2.live_threads(), Arc::clone(&sentinel));
+        join_undetached_threads(m1.live_threads());
+        assert_eq!(
+            m2.live_threads().lock().unwrap().len(),
+            1,
+            "joining m1 must not drain m2's undetached spawns"
+        );
+        // Avoid leaving a JoinState that never finishes: mark detached so a
+        // later join skips waiting.
+        sentinel.detached.store(true, Ordering::SeqCst);
+        join_undetached_threads(m2.live_threads());
+    }
+
+    #[test]
+    fn join_undetached_drains_threads_registered_during_join() {
+        // Mimic nested spawn: while waiting for the first worker, a second
+        // JoinState appears on the same registry and must still be joined.
+        let registry = new_live_thread_registry();
+        let first = Arc::new(JoinState::new());
+        let nested = Arc::new(JoinState::new());
+        register_live_thread(&registry, Arc::clone(&first));
+
+        let nested_for_first = Arc::clone(&nested);
+        let registry_for_first = Arc::clone(&registry);
+        let first_handle = {
+            let state = Arc::clone(&first);
+            thread::spawn(move || {
+                // Nested registration while the root join waits on `first`.
+                register_live_thread(&registry_for_first, nested_for_first);
+                thread::sleep(Duration::from_millis(20));
+                state.store_result(Ok(PortableValue::Immediate(1)));
+            })
+        };
+        *first.join_handle.lock().unwrap() = Some(first_handle);
+
+        let nested_handle = {
+            let state = Arc::clone(&nested);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                state.store_result(Ok(PortableValue::Immediate(2)));
+            })
+        };
+        // Attach handle after spawn so join can reap it even if registration
+        // races ahead of this assignment.
+        thread::sleep(Duration::from_millis(5));
+        *nested.join_handle.lock().unwrap() = Some(nested_handle);
+
+        join_undetached_threads(&registry);
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "nested registration during join must be drained"
+        );
+        assert!(first.joined.load(Ordering::SeqCst));
+        assert!(nested.joined.load(Ordering::SeqCst));
+    }
+
     fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {
         match heap.find_object_by_addr(v.raw() as u64) {
             Some(Object::Enum(gc)) => Some(gc.as_ref().tag),
@@ -1148,17 +1337,13 @@ mod tests {
     }
 
     #[test]
-    fn portable_rejects_channel_and_lock_handles() {
+    fn portable_round_trips_channel_and_lock_handles() {
         let mut heap = Heap::default();
         let (tx, rx) = channel_pair(&mut heap);
-        assert_eq!(
-            value_to_portable(&heap, tx),
-            Err(ThreadErrorTag::NotSendable)
-        );
-        assert_eq!(
-            value_to_portable(&heap, rx),
-            Err(ThreadErrorTag::NotSendable)
-        );
+        let tx_pv = value_to_portable(&heap, tx).unwrap();
+        assert!(matches!(tx_pv, PortableValue::Sender(_)));
+        let rx_pv = value_to_portable(&heap, rx).unwrap();
+        assert!(matches!(rx_pv, PortableValue::Receiver(_)));
 
         let mtx = host_mutex(&mut heap, &[Value::from(1_i64)]);
         let Object::Enum(gc) = heap.find_object_by_addr(mtx.raw() as u64).unwrap() else {
@@ -1168,10 +1353,8 @@ mod tests {
             panic!("expected Mutex");
         };
         let mtx_val = Value::from(obj.addr());
-        assert_eq!(
-            value_to_portable(&heap, mtx_val),
-            Err(ThreadErrorTag::NotSendable)
-        );
+        let mtx_pv = value_to_portable(&heap, mtx_val).unwrap();
+        assert!(matches!(mtx_pv, PortableValue::MutexHandle(_)));
 
         let rw = host_rwlock(&mut heap, &[Value::from(2_i64)]);
         let Object::Enum(gc) = heap.find_object_by_addr(rw.raw() as u64).unwrap() else {
@@ -1181,10 +1364,23 @@ mod tests {
             panic!("expected RwLock");
         };
         let rw_val = Value::from(obj.addr());
-        assert_eq!(
-            value_to_portable(&heap, rw_val),
-            Err(ThreadErrorTag::NotSendable)
+        let rw_pv = value_to_portable(&heap, rw_val).unwrap();
+        assert!(matches!(rw_pv, PortableValue::RwLockHandle(_)));
+
+        // Nested in a tuple (request/reply spawn arg shape).
+        let (tup, _) = heap.alloc(
+            ObjTuple {
+                elements: vec![tx, rx],
+            },
+            Object::Tuple,
         );
+        let tup_pv = value_to_portable(&heap, Value::from(tup.addr())).unwrap();
+        let PortableValue::Tuple(elems) = tup_pv else {
+            panic!("expected tuple");
+        };
+        assert_eq!(elems.len(), 2);
+        assert!(matches!(elems[0], PortableValue::Sender(_)));
+        assert!(matches!(elems[1], PortableValue::Receiver(_)));
     }
 
     #[test]

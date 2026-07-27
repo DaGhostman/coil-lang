@@ -77,6 +77,21 @@ fn run_example_src_with_entry(src: &str, entry: Option<&std::path::Path>) -> Str
     run_bytecode(bytecode, constants, &pipeline, entry)
 }
 
+/// Multi-file examples (`use` / `mod`) must go through
+/// `compile_src_from_file` so the pipeline discovers dependencies
+/// via `coil.toml` roots. In-memory `compile_src` cannot load them.
+fn run_example_multifile(path: &str) -> String {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let full = workspace_root.join(path);
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src_from_file(full.to_str().unwrap())
+        .unwrap_or_else(|_| panic!("multi-file example failed to compile: {}", full.display()));
+    run_bytecode(bytecode, constants, &pipeline, Some(full.as_path()))
+}
+
 /// Soft-skip an FFI-dependent test outside CI. In CI (`CI` env set), skip is a
 /// hard failure so missing `cc` / libffi never silently greens the suite.
 fn ffi_soft_skip(reason: &str) {
@@ -234,6 +249,13 @@ fn example_static_singleton_prints_121() {
     assert_eq!(output, "121");
 }
 
+/// `static fn new(...)` / `Class::fresh()` alongside positional `new Class(...)`.
+#[test]
+fn example_static_ctor_prints_42_1_1() {
+    let output = run_example("examples/static_ctor.hy");
+    assert_eq!(output, "42,1,1");
+}
+
 #[test]
 fn example_static_minimal_prints_11() {
     let output = run_example("examples/static_minimal.hy");
@@ -297,6 +319,165 @@ fn example_generic_class_prints_42() {
 fn example_aliases_prints_3_4_7() {
     let output = run_example("examples/aliases.hy");
     assert_eq!(output, "347");
+}
+
+#[test]
+fn example_nested_aggregates_prints_rows_and_total() {
+    let output = run_example("examples/nested_aggregates.hy");
+    assert_eq!(output, "alice:30bob:25total:55");
+}
+
+#[test]
+fn example_modules_brace_prints_12_42() {
+    let output = run_example_multifile("examples/modules_brace.hy");
+    assert_eq!(output, "1242");
+}
+
+#[test]
+fn example_match_block_self_prints_5() {
+    let output = run_example("examples/match_block_self.hy");
+    assert_eq!(output, "5");
+}
+
+#[test]
+fn example_defer_prints_enterleave_lifo_and_early_return() {
+    let output = run_example("examples/defer.hy");
+    assert_eq!(output, "enterleave,021,okd7,d99,55");
+}
+
+/// Regression: inherent `fn send` must not shadow `thread::send`, so
+/// `send(self.channel, msg)` typechecks and runs.
+#[test]
+fn method_named_send_can_call_thread_send_on_self_channel() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn send(string msg) {
+        send(self.channel, msg)?;
+    }
+}
+
+fn work() -> int { return 0; }
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(work)?;
+    let w = new ThreadWrapper(t, pair[0]);
+    w.send("hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+/// Regression: parenthesized `(self).field` must still emit GetField.
+/// Pre-fix, `receiver_type` ignored `Group`, so Access fell through to
+/// `LoadField(0)` and `send` received a bogus value (often looking like
+/// the class instance was passed instead of the field).
+#[test]
+fn grouped_self_field_passes_sender_to_send() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class Worker {
+    tx: Sender,
+}
+
+impl Worker {
+    fn push(string msg) {
+        send((self).tx, msg)?;
+    }
+}
+
+fn main() {
+    let pair = channel()?;
+    let w = new Worker(pair[0]);
+    w.push("hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+/// Regression: field access on `new Class(...)` must use GetField, and
+/// `new` must not leave a stash slot between a HostInvoke native-id and
+/// the field value (StorePop+final LOAD used to bury the id so `send`
+/// saw the instance address as the native id).
+#[test]
+fn inline_new_field_passes_sender_to_send() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class Worker {
+    tx: Sender,
+}
+
+fn main() {
+    let pair = channel()?;
+    send((new Worker(pair[0])).tx, "hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+/// Regression: method call on `(new Class(...))` must resolve the owner.
+#[test]
+fn inline_new_method_call_works() {
+    let output = run_example_src(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+
+impl Point {
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+
+fn main() {
+    print "%i", (new Point(1, 3)).sum();
+}
+"#,
+    );
+    assert_eq!(output, "4");
+}
+
+/// Regression: `defer` inside a function must run on early `return`, not
+/// only on fall-through.
+#[test]
+fn defer_runs_on_early_return() {
+    let output = run_example_src(
+        r#"
+fn f(int n) -> int {
+    defer { print "d"; }
+    if n == 0 {
+        return 1;
+    }
+    return 2;
+}
+
+fn main() {
+    print "%i,", f(0);
+    print "%i", f(9);
+}
+"#,
+    );
+    assert_eq!(output, "d1,d2");
 }
 
 #[test]
@@ -2817,6 +2998,63 @@ fn example_thread_join_prints_42() {
 fn example_thread_channel_prints_hello() {
     let output = run_example("examples/thread_channel.hy");
     assert_eq!(output, "hello");
+}
+
+#[test]
+fn example_thread_reply_prints_ping() {
+    let output = run_example("examples/thread_reply.hy");
+    assert_eq!(output, "ping");
+}
+
+#[test]
+fn thread_main_exits_without_join_still_runs_worker_recv() {
+    // Regression: process exit used to kill workers still in `recv`, so
+    // nothing after the worker's recv ran and the script looked like it
+    // "didn't block". Auto-join at end of `run_with_pool` keeps them alive.
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn worker(Receiver rx) {
+    let msg = recv(rx)?;
+    print "%s", msg;
+    return 0;
+}
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(worker, pair[1])?;
+    send(pair[0], "hi")?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+#[test]
+fn nested_spawn_joins_via_shared_root_registry() {
+    // Worker mid spawns leaf on the root Machine's live-thread registry.
+    // Main returns without join; root auto-join must still wait for leaf.
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn leaf() {
+    print "leaf";
+    return 0;
+}
+
+fn mid() {
+    let _ = spawn(leaf)?;
+    return 0;
+}
+
+fn main() {
+    let _ = spawn(mid)?;
+}
+"#,
+    );
+    assert_eq!(output, "leaf");
 }
 
 #[test]

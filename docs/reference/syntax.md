@@ -105,7 +105,7 @@ declaration ::= class_decl
               | use_stmt
               | mod_stmt
               | enum_decl
-              | defer_stmt          // at declaration level in parser chain
+              | defer_stmt          // also a statement inside function bodies
               | extern_block
               | statement
 ```
@@ -290,11 +290,15 @@ Examples: `type PointPair = (int, int);`, `type Pair<T> = (T, T);`
 ### Modules
 
 ```
-use_stmt ::= 'use' path ('as' IDENT)? ';'
-path     ::= IDENT ('::' IDENT)* ('::' '*')?
+use_stmt ::= 'use' use_path ';'
+use_path ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
+           | IDENT ('::' IDENT)* ('::' '*')?
+           | IDENT ('::' IDENT)* ('as' IDENT)?
+use_item ::= IDENT ('as' IDENT)?
 mod_stmt ::= 'mod' IDENT ';'
 ```
 
+Brace groups (`use math::{add, mul};`) desugar to multiple single-item `use`s.
 See [Modules reference](modules.md).
 
 ### Extern (FFI)
@@ -362,16 +366,23 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
+Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::*;` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
+
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
 parse path — see [Traits and impl](#traits-and-impl) above.
 
 ### Defer
 
 ```
-defer_stmt ::= 'defer' block
+defer_stmt ::= 'defer' ['use' '(' ident (',' ident)* ','? ')'] block
 ```
 
-Runs when the enclosing function exits (LIFO order for multiple defers).
+Runs when the enclosing function exits via `return` or fall-through (LIFO
+order for multiple defers). `panic` aborts without running registered defers.
+Functions that contain a `defer` are not eligible for self tail-call
+optimization (cleanup must run before leaving the frame). Outer locals must
+be listed in the optional `use (…)` capture list (same explicit-capture rule
+as lambdas); bare `defer { … }` cannot close over enclosing locals.
 
 ---
 
@@ -388,6 +399,7 @@ statement ::= while_stmt
             | block
             | let_stmt
             | const_stmt
+            | defer_stmt
             | expr_stmt
             | print_stmt
             | return_stmt
@@ -399,6 +411,7 @@ statement ::= while_stmt
 | `let` | `let IDENT (':' type_annotation)? ('=' expr)? ';'` |
 | `const` | `const IDENT (':' type_annotation)? '=' expr ';'` |
 | `static` | `static let IDENT …` / `static const IDENT …` (top-level only) |
+| `defer` | `defer [use (ident,*)] { statement* }` (runs on enclosing function exit, LIFO; outer locals require `use`) |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |
@@ -570,10 +583,15 @@ Primitive names are case-insensitive in the typechecker (`String` ≡ `string`).
 ## `match` arms
 
 ```
-arm ::= pattern '=>' expr
+arm ::= pattern '=>' (block_expr | expr)
+block_expr ::= '{' (expr ';'?)* '}'
 ```
 
 Arms are comma-separated inside `match { ... }`. The last arm may use `_` or `default` as wildcard.
+
+Brace bodies (`{ … }`) are **expression blocks**, not dict literals — so
+`self.method()` and other non-`name: value` forms work inside them.
+A dict arm still works when the body is a real record literal (`{ x: 1 }`).
 
 ---
 

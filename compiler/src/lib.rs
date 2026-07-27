@@ -556,7 +556,6 @@ struct Context {
     symbols: Interner<String>,
     assignments: HashMap<String, bool>,
     constants: HashMap<usize, bool>,
-    defers: Vec<usize>,
     classes: HashMap<String, Vec<(String, usize)>>,
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
@@ -574,12 +573,22 @@ struct Context {
 
 // --- Compiler ---
 
+/// Length of the CALL + JMP + HALT prologue every [`Compiler`] starts with.
+/// Multi-file linking treats `bytecode.len() <= PROLOGUE_BYTECODE_LEN` as a
+/// fresh compile (safe to clear the shared constant pool).
+pub const PROLOGUE_BYTECODE_LEN: usize = 3;
+
 pub struct Compiler {
     namespace: String,
     bytecode: Vec<Byte>,
 
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
+    /// Fixed arity + rest flag per function table key. Survives multi-file
+    /// `check_program` clears of `Checker::fn_param_names`, so `MakeFn` for
+    /// imported names (e.g. `spawn(run_jobs, …)` after `use pool::worker::run_jobs`)
+    /// still packs the real arity.
+    fn_arities: HashMap<String, (u32, bool)>,
     /// Top-level items per namespace (for `use foo::*` glob expansion).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
@@ -618,11 +627,30 @@ pub struct Compiler {
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
 
+    /// Count of expression values currently live on the operand stack
+    /// *above* interned locals (e.g. a `HostInvoke` native-id `CONST`
+    /// pushed before argument codegen). `alloc_temp_slot` must allocate
+    /// at or above `variables.len() + expr_depth` so `StorePop` does not
+    /// clobber those live values (locals and the operand stack share
+    /// memory).
+    expr_depth: u32,
+
     /// Active loop labels: `(continue_target, break_target)`.
     loop_stack: Vec<(BbLabel, BbLabel)>,
 
     /// Active loop patchers. Break/continue emit through the innermost builder.
     loop_bbs: Vec<BlockBuilder>,
+
+    /// Registered `defer` thunks in the function currently being compiled
+    /// (declaration order). Run LIFO on return / fall-through via
+    /// `emit_run_defers`. Kept on `Compiler` (not `Context`) so nested
+    /// block frames do not drop registered defers.
+    ///
+    /// Each thunk stores its bytecode entry offset and the `use (…)` capture
+    /// names. At run time those captures are LOADed from the enclosing frame
+    /// and passed as CALL arguments so the thunk's fresh frame sees them at
+    /// slots 0..N-1 (same layout as lambda capture slots).
+    fn_defers: Vec<(usize, Vec<String>)>,
 
     /// Class name → decorated constructor function name (from attr expansion).
     decorated_class_ctors: HashMap<String, String>,
@@ -697,9 +725,10 @@ impl Default for Compiler {
             Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
             Byte::new(Instruction::HALT),
         ]);
+        debug_assert_eq!(bytecode.len(), PROLOGUE_BYTECODE_LEN);
         // The first USER code (i.e., the first byte after
         // the prologue) is offset `bytecode.len()`, which
-        // is exactly 3 (CALL + JMP + HALT).
+        // is exactly PROLOGUE_BYTECODE_LEN (CALL + JMP + HALT).
         let program_start_offset = bytecode.len() as u32;
         let debug_locs = vec![DebugLoc::unknown(); bytecode.len()];
 
@@ -709,6 +738,7 @@ impl Default for Compiler {
             debug_locs,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
+            fn_arities: HashMap::with_capacity(32),
             module_items: std::collections::HashMap::default(),
             native: HashMap::default(),
             extern_runtime_libs: HashMap::with_capacity(4),
@@ -725,8 +755,10 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            expr_depth: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
+            fn_defers: Vec::new(),
             decorated_class_ctors: HashMap::new(),
             active_fn_name: None,
             compiling_method: false,
@@ -775,6 +807,39 @@ impl Compiler {
         }
         if self.debug_locs.len() > self.bytecode.len() {
             self.debug_locs.truncate(self.bytecode.len());
+        }
+    }
+
+    /// Run registered `defer` thunks in LIFO order.
+    ///
+    /// For each thunk: LOAD `use (…)` captures from the enclosing frame, then
+    /// `CALL` with that arity (push return IP + new frame whose slots 0..N-1
+    /// are the captures) and `JMP` to the thunk. The thunk ends in `RETURN`,
+    /// which resumes after the `JMP`. A following `POP` discards the thunk's
+    /// sentinel return value so a pending function return value stays on top.
+    fn emit_run_defers(&mut self, into: &mut Vec<Byte>) {
+        for (offset, captures) in self.fn_defers.iter().rev() {
+            for cap in captures {
+                if let Some(slot) = self.lookup_slot(cap) {
+                    into.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                } else {
+                    // Typecheck should have rejected unknown captures; emit a
+                    // zero so the CALL arity still matches.
+                    debug_assert!(
+                        false,
+                        "defer capture `{cap}` missing from enclosing frame at codegen"
+                    );
+                    into.push(Byte::new_with_value(
+                        Instruction::CONST,
+                        Value::default().raw() as _,
+                    ));
+                }
+            }
+            into.push(
+                Byte::new(Instruction::CALL).with_call_packed(captures.len() as u32, 0),
+            );
+            into.push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+            into.push(Byte::new(Instruction::POP));
         }
     }
 
@@ -1043,7 +1108,7 @@ impl Compiler {
         expr: &Output<'_>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        if !self.context.defers.is_empty() {
+        if !self.fn_defers.is_empty() {
             return false;
         }
         let Some(cur) = self.current_function_table_key.clone() else {
@@ -1214,7 +1279,6 @@ impl<'ctx> Context {
             current: self.current.clone(),
             impementations: self.impementations.clone(),
             methods: self.methods.clone(),
-            defers: Vec::default(),
             constants: self.constants.clone(),
             assignments: self.assignments.clone(),
             variables: self.variables.clone(),
@@ -3471,17 +3535,24 @@ impl Compiler {
         let arity = args.len();
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+        // Native id sits on the stack while args compile — protect it (and
+        // prior arg values) from Instantiate `StorePop` temps.
+        let depth_on_entry = self.expr_depth;
+        self.expr_depth = depth_on_entry + 1;
         for arg in args {
             // Nested IO HostInvoke writes to `self.bytecode`; also fold any
             // bytes returned in the local vec (non-IO subexpressions).
             let mut arg_bc = self.do_compile(arg);
             self.bytecode.append(&mut arg_bc);
+            self.expr_depth += 1;
         }
         self.bytecode
             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
         self.bytecode.push(
             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
         );
+        // Restore: caller owns counting the result value if it needs to.
+        self.expr_depth = depth_on_entry;
     }
 
     /// Emit bytecode thunks for compiler-provided primitive instances.
@@ -3710,6 +3781,7 @@ impl Compiler {
 
         let prev_result_mode = self.compiling_result_mode;
         self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+        let prev_fn_defers = std::mem::take(&mut self.fn_defers);
 
         let mut a = self.do_compile(args);
         self.bytecode.append(&mut a);
@@ -3729,15 +3801,13 @@ impl Compiler {
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
 
-        self.context.defers.iter().for_each(|offset| {
-            self.bytecode
-                .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-        });
-
         if !matches!(
             self.bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::RETURN)
         ) {
+            let mut epilogue = Vec::new();
+            self.emit_run_defers(&mut epilogue);
+            self.bytecode.append(&mut epilogue);
             self.bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
                 Value::default().raw() as _,
@@ -3748,6 +3818,7 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
 
+        self.fn_defers = prev_fn_defers;
         self.compiling_result_mode = prev_result_mode;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
@@ -3926,20 +3997,19 @@ impl Compiler {
             self.compiling_result_mode = self.checker.fn_is_result_mode(source_name);
             self.mono_codegen_var_types.push(overrides);
 
+            let prev_fn_defers = std::mem::take(&mut self.fn_defers);
             let mut a = self.do_compile(args);
             self.bytecode.append(&mut a);
             let mut c = self.do_compile(body);
             self.bytecode.append(&mut c);
 
-            self.context.defers.iter().for_each(|offset| {
-                self.bytecode
-                    .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-            });
-
             if !matches!(
                 self.bytecode.last().map(|b| b.bytecode()),
                 Some(Instruction::RETURN)
             ) {
+                let mut epilogue = Vec::new();
+                self.emit_run_defers(&mut epilogue);
+                self.bytecode.append(&mut epilogue);
                 self.bytecode.push(Byte::new_with_value(
                     Instruction::CONST,
                     Value::default().raw() as _,
@@ -3950,6 +4020,7 @@ impl Compiler {
                 self.bytecode.push(Byte::new(Instruction::RETURN));
             }
 
+            self.fn_defers = prev_fn_defers;
             self.mono_codegen_var_types.pop();
             self.compiling_result_mode = prev_result_mode;
             self.context.variables = prev_fn_vars;
@@ -4044,6 +4115,15 @@ impl Compiler {
 
     pub fn get_messages(&self) -> &Vec<Message> {
         &self.messages
+    }
+
+    /// Append a diagnostic produced outside the typechecker/codegen
+    /// path (e.g. pipeline discovery parse errors). Callers that also
+    /// emit via the reporting sink must bump their own
+    /// `messages_emitted` cursor so [`Pipeline::emit_new_messages`]
+    /// does not re-forward the same message.
+    pub fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
     }
 
     pub fn c_structs(&self) -> &[CStructDef] {
@@ -4178,6 +4258,16 @@ impl Compiler {
 
     fn alloc_temp_slot(&mut self) -> u32 {
         self.temp_counter += 1;
+        // Operand stack and locals share one buffer. A `CONST` left on
+        // the stack by `emit_host_native_invoke` (native id before args)
+        // occupies index `variables.len()` without being interned. If we
+        // `StorePop` into that index from `new Class(...)`, we overwrite
+        // the id and `HostInvoke` sees a heap address instead.
+        let min_slot = self.context.variables.len() as u32 + self.expr_depth;
+        while (self.context.variables.len() as u32) < min_slot {
+            let pad = format!("__pad{}", self.context.variables.len());
+            let _ = self.context.variables.intern(pad);
+        }
         let name = format!("__tmp{}", self.temp_counter);
         self.context.variables.intern(name) as u32
     }
@@ -5230,9 +5320,18 @@ impl Compiler {
         extract_enum_name(&ty)
     }
 
-    /// Receiver type for field access (identifier side-table or chained lookup).
+    /// Receiver type for field access / method calls.
+    ///
+    /// Handles identifiers, chained access, parentheses/`Group` wrappers, and
+    /// falls back to [`Self::codegen_expr_ty`] for forms like `new Class(...)`
+    /// so `(self).field` and `(new C(...)).method()` resolve as class
+    /// instances (not the LoadField/empty-owner miscompile path).
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
+            Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Statement(inner)
+            | Expression::ExprStatement(inner) => self.receiver_type(inner),
             Expression::Identifier(name) => {
                 self.codegen_var_type_for(name).map(|t| {
                     // Apply substitution so inferred record types resolve fully.
@@ -5257,7 +5356,10 @@ impl Compiler {
                 }
                 None
             }
-            _ => None,
+            // `new Class(...)`, calls, etc. — reuse the general expr-type helper
+            // (span cache / Instantiate Con) instead of treating the receiver
+            // as unknown and emitting LoadField(0).
+            _ => self.codegen_expr_ty(receiver),
         }
     }
 
@@ -5740,14 +5842,19 @@ impl Compiler {
         // HostInvoke stack: [id, args_tuple]; tuple = [arg0, …, meta].
         // Meta is a full u32 bitfield — must use `with_operand_u32` (not
         // `with_value_u32`, which only keeps the low 16 bits).
+        let depth_on_entry = self.expr_depth;
         bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(native_id as u32));
+        self.expr_depth = depth_on_entry + 1;
         for arg in value_args {
             bytecode.append(&mut self.do_compile(arg));
+            self.expr_depth += 1;
         }
         bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
+        self.expr_depth += 1;
         let arity = value_args.len() + 1; // + meta
         bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
         bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        self.expr_depth = depth_on_entry;
         true
     }
 
@@ -5928,12 +6035,30 @@ impl Compiler {
                         self.aliases.insert(item_name, fqn);
                     }
                 } else {
-                    let namespace = if p.is_empty() {
+                    // Prefer the FQN that actually exists in the function
+                    // table so both conventions work:
+                    //   foo/sadge.hy  → foo::sadge::sadge  (one-item-per-file)
+                    //   foo.hy        → foo::sadge         (item-in-module-file)
+                    let module_ns = p.join("::");
+                    let file_per_item = if module_ns.is_empty() {
+                        format!("{name}::{name}")
+                    } else {
+                        format!("{module_ns}::{name}::{name}")
+                    };
+                    let item_in_module = if module_ns.is_empty() {
                         name.clone()
                     } else {
-                        format!("{}::{}", p.join("::"), name)
+                        format!("{module_ns}::{name}")
                     };
-                    let qualified = format!("{}::{}", namespace, name);
+                    let qualified = if self.functions.contains_key(&file_per_item) {
+                        file_per_item
+                    } else if self.functions.contains_key(&item_in_module) {
+                        item_in_module
+                    } else {
+                        // Defensive: keep the historical one-item-per-file
+                        // shape when the dependency has not been linked yet.
+                        file_per_item
+                    };
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     self.aliases.insert(local, qualified);
                 }
@@ -6094,6 +6219,12 @@ impl Compiler {
                 };
                 let fn_offset = self.bytecode.len() as u32;
                 self.functions.insert(table_key.clone(), fn_offset as usize);
+                self.fn_arities
+                    .insert(table_key.clone(), (fixed_arity as u32, has_rest));
+                if table_key != qualified {
+                    self.fn_arities
+                        .insert(qualified.clone(), (fixed_arity as u32, has_rest));
+                }
                 if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
                     self.test_cases.push((desc, fn_offset));
                 }
@@ -6116,6 +6247,7 @@ impl Compiler {
                 self.current_function_table_key = Some(table_key.clone());
                 self.push_const_env();
                 self.context.variables = Interner::default();
+                self.expr_depth = 0;
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
                 }
@@ -6143,20 +6275,19 @@ impl Compiler {
 
                 let body_start = self.bytecode.len();
                 let prev_active = self.active_fn_name.take();
+                let prev_fn_defers = std::mem::take(&mut self.fn_defers);
                 self.active_fn_name = Some(name.to_string());
                 let mut c = self.do_compile(body);
                 self.active_fn_name = prev_active;
                 self.bytecode.append(&mut c);
 
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
-
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
                     Some(Instruction::RETURN)
                 ) {
+                    let mut epilogue = Vec::new();
+                    self.emit_run_defers(&mut epilogue);
+                    self.bytecode.append(&mut epilogue);
                     self.bytecode.push(Byte::new_with_value(
                         Instruction::CONST,
                         Value::default().raw() as _,
@@ -6167,6 +6298,7 @@ impl Compiler {
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
 
+                self.fn_defers = prev_fn_defers;
                 self.compiling_result_mode = prev_result_mode;
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
@@ -6403,38 +6535,6 @@ impl Compiler {
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::CALL).with_operand_u32(0));
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
-
-                // if let Expression::Identifier(name) = *expr.1.borrow() {
-                //     let ty = self.typechecker.get_variable_type(&name.into());
-                //     let symbol = self.context.variables.key(&name.into());
-                //     // if matches!(ty, Some(Type::OBJECT(_))) || matches!(ty, Some(Type::STRING)) {
-                //     //     bytecode.push(Byte::new_with_operands(
-                //     //         Instruction::ACQUIRE,
-                //     //         [symbol.expect("Unable to resolve unknown variable"), 0],
-                //     //     ));
-                //     // }
-                // }
-
-                // for variable in self.context.variables.iter() {
-                //     if let (Some(symbol), Some(ty)) = (
-                //         self.context.variables.key(variable),
-                //         self.typechecker.get_variable_type(variable),
-                //     ) && (matches!(ty, Type::OBJECT(_)) || matches!(ty, Type::STRING))
-                //     {
-                //         bytecode.push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
-                //     }
-                // }
-
-                // if matches!(expr.1.borrow(), Expression::Identifier(_)) {
-                //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
-                // }
-
                 if self.try_emit_tail_call_expr(expr, &mut bytecode) {
                     if self.compiling_result_mode {
                         Self::emit_ok_or_some_wrap(&mut bytecode, false);
@@ -6442,11 +6542,15 @@ impl Compiler {
                     return bytecode;
                 }
 
+                // Evaluate the return value first, then run defers (LIFO).
+                // Each defer thunk returns a sentinel that we POP so the
+                // pending return value stays on top for RETURN.
                 self.append_with_existential_pack(&mut bytecode, expr);
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
                 }
+                self.emit_run_defers(&mut bytecode);
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
                     bytecode.push(Byte::new(Instruction::RETURN));
                 }
@@ -6509,9 +6613,14 @@ impl Compiler {
                 for method_node in methods {
                     match method_node.1.borrow() {
                         Expression::Method(_, body) => {
-                            if let Expression::Function { name, .. } = body.1.borrow() {
+                            if let Expression::Function {
+                                name, is_static, ..
+                            } = body.1.borrow()
+                            {
                                 let fqn = format!("{}::{}", owner, name);
-                                self.compiling_method = true;
+                                // Instance methods reserve slot 0 for `self`;
+                                // static methods start params at slot 0.
+                                self.compiling_method = !*is_static;
                                 self.do_compile(body);
                                 self.compiling_method = false;
                                 self.context
@@ -6537,7 +6646,11 @@ impl Compiler {
                 self.namespace = saved_ns;
             }
             Expression::Method(_vis, body) => {
-                self.compiling_method = true;
+                let is_static = matches!(
+                    body.1.borrow(),
+                    Expression::Function { is_static: true, .. }
+                );
+                self.compiling_method = !is_static;
                 bytecode.append(&mut self.do_compile(body));
                 self.compiling_method = false;
             }
@@ -6573,6 +6686,15 @@ impl Compiler {
                 // Assignment to Access). Stash the instance, then for
                 // each ctor arg emit that sequence and discard the
                 // value SetField pushes back.
+                //
+                // `StorePop` keeps the instance at `tmp` with the cursor
+                // past that slot — so the stashed value is already TOS
+                // for the expression result. Do **not** emit a final
+                // `LOAD tmp`: that would push a second copy and leave
+                // the stash sitting between any live values below
+                // (e.g. a HostInvoke native-id CONST) and the result,
+                // so `MakeTuple`/`HostInvoke` would pick up the instance
+                // as the native id.
                 let tmp_inst = self.alloc_temp_slot();
                 bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_inst));
                 if let Some(arg_list) = args {
@@ -6584,7 +6706,6 @@ impl Compiler {
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                 }
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
                 }
             }
             Expression::Adjust { op, prefix, target } => {
@@ -6835,26 +6956,42 @@ impl Compiler {
                     self.emit_loop_jump(None, "continue", span.into_range());
                 }
             }
-            Expression::Defer(child) => {
-                let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
+            Expression::Defer { captures, body } => {
+                // Layout (emitted into `self.bytecode` so nested Blocks that
+                // write in-place stay contiguous with the thunk):
+                //   JMP after_thunk
+                //   <thunk body>          ← fn_defers points here
+                //     (slots 0..N-1 = use captures, pushed by emit_run_defers)
+                //   CONST 0; RETURN
+                // after_thunk:
+                let jmp_pos = self.bytecode.len();
+                self.bytecode
+                    .push(Byte::new(Instruction::JMP).with_operand_u32(0));
 
-                self.context.defers.push(self.bytecode.len() + body.len());
+                let thunk_start = self.bytecode.len();
+                let cap_names: Vec<String> =
+                    captures.iter().map(|c| (*c).to_string()).collect();
+                self.fn_defers.push((thunk_start, cap_names));
 
-                body.append(&mut self.do_compile(child));
-                body.push(Byte::new_with_value(
+                // Remap locals so capture names occupy slots 0..N-1 inside the
+                // thunk (matching the CALL args pushed by emit_run_defers).
+                let prev_vars = std::mem::take(&mut self.context.variables);
+                for cap in captures {
+                    self.context.variables.intern((*cap).to_string());
+                }
+                let mut body_bc = self.do_compile(body);
+                self.bytecode.append(&mut body_bc);
+                self.context.variables = prev_vars;
+
+                self.bytecode.push(Byte::new_with_value(
                     Instruction::CONST,
                     Value::from(0i64).raw() as _,
                 ));
-                body.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
 
-                let total_length = self.bytecode.len();
-                let current_length = body.len() + bytecode.len();
-                if let Some(v) = body.first_mut() {
-                    *v = Byte::new(Instruction::JMP)
-                        .with_operand_u32((total_length + current_length) as u32);
-                }
-
-                bytecode.append(&mut body);
+                let after = self.bytecode.len() as u32;
+                self.bytecode[jmp_pos] =
+                    Byte::new(Instruction::JMP).with_operand_u32(after);
             }
             Expression::Call { name, args } => {
                 // `assert` from `prelude::test` (auto-imported).
@@ -7035,7 +7172,12 @@ impl Compiler {
                         return bytecode;
                     }
 
-                    let recv_ty = self.receiver_type(recv);
+                    // Same fallback as ground-trait calls: inline receivers
+                    // like `(new Point(1, 2)).sum()` are not identifiers, so
+                    // `receiver_type` alone used to leave `owner` empty.
+                    let recv_ty = self
+                        .receiver_type(recv)
+                        .or_else(|| self.codegen_expr_ty(recv));
                     let owner = recv_ty
                         .as_ref()
                         .and_then(|ty| {
@@ -7222,14 +7364,17 @@ impl Compiler {
                             0
                         };
                         let variadic = self.checker.is_extern_variadic(&n);
+                        let depth_on_entry = self.expr_depth;
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
+                        self.expr_depth = depth_on_entry + 2;
                         if let Some(items) = args {
                             for arg in items {
                                 let mut arg_bc = self.do_compile(arg);
                                 self.bytecode.append(&mut arg_bc);
+                                self.expr_depth += 1;
                             }
                         }
                         self.bytecode
@@ -7257,6 +7402,7 @@ impl Compiler {
                         }
                         self.bytecode
                             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
+                        self.expr_depth = depth_on_entry;
                         self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
                         // Same stack order as `emit_io_host_invoke`: id first,
@@ -7266,12 +7412,15 @@ impl Compiler {
                         } else {
                             0
                         };
+                        let depth_on_entry = self.expr_depth;
                         self.bytecode
                             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                        self.expr_depth = depth_on_entry + 1;
                         if let Some(items) = args {
                             for arg in items {
                                 let mut arg_bc = self.do_compile(arg);
                                 self.bytecode.append(&mut arg_bc);
+                                self.expr_depth += 1;
                             }
                         }
                         self.bytecode
@@ -7279,6 +7428,7 @@ impl Compiler {
                         self.bytecode.push(
                             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                         );
+                        self.expr_depth = depth_on_entry;
                     } else if let Some(offset) = self.functions.get(&n).copied() {
                         let mono_offset = self.mono_call_offset(&n, args.as_ref());
                         let target_offset = mono_offset.unwrap_or(offset);
@@ -7310,6 +7460,12 @@ impl Compiler {
                                     names.len()
                                 };
                                 Some((fixed, rest))
+                            })
+                            .or_else(|| {
+                                self.fn_arities
+                                    .get(&lookup_name)
+                                    .or_else(|| self.fn_arities.get(&n))
+                                    .map(|(a, r)| (*a as usize, *r))
                             })
                             .unwrap_or((0, false));
                         let fill_mask = self.checker.partial_fill_at(span.start, span.end).or_else(
@@ -7768,6 +7924,17 @@ impl Compiler {
                             .get(&entry_key)
                             .or_else(|| self.functions.get(&resolved_n))
                         {
+                            // Prefer codegen-recorded arity: multi-file
+                            // `check_program` clears `fn_param_names`, so
+                            // imported names would otherwise MakeFn with
+                            // arity 0 and break `spawn(f, arg)`.
+                            let (fa, is_rest) = self
+                                .fn_arities
+                                .get(&entry_key)
+                                .or_else(|| self.fn_arities.get(&resolved_n))
+                                .copied()
+                                .map(|(a, r)| (a as usize, r))
+                                .unwrap_or((fa, is_rest));
                             bytecode.push(
                                 Byte::new(Instruction::CONST).with_const_inline(0),
                             );
@@ -7883,6 +8050,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -7890,6 +8059,8 @@ impl Compiler {
                     "Lt",
                     "lt",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -7916,6 +8087,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -7923,6 +8096,8 @@ impl Compiler {
                     "Gt",
                     "gt",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -7949,6 +8124,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -7956,6 +8133,8 @@ impl Compiler {
                     "Le",
                     "le",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -7982,6 +8161,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -7989,6 +8170,8 @@ impl Compiler {
                     "Ge",
                     "ge",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8015,6 +8198,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8022,6 +8207,8 @@ impl Compiler {
                     "Eq",
                     "eq",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
                 }
@@ -8041,6 +8228,8 @@ impl Compiler {
                     lhs,
                     None,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8050,6 +8239,8 @@ impl Compiler {
                     None,
                     crate::typechecking::AggregateOp::Neg,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
                 }
@@ -8058,6 +8249,8 @@ impl Compiler {
                 // `allow_mul_shl` is irrelevant for Add (strength_mul_to_shl
                 // only matches Mul); pass true for the shared helper API.
                 if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_matrix_op(
                     &mut bytecode,
                     self_id,
@@ -8066,6 +8259,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8075,6 +8270,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Add,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -8095,6 +8292,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8113,6 +8312,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8122,6 +8323,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Sub,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -8137,6 +8340,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8157,6 +8362,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8166,6 +8373,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Mul,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                 // Prefer trait/`Mul` dictionary dispatch over primitive
                 // `x * 2^n` → SHL when the checker recorded a bound operator
@@ -8180,6 +8389,8 @@ impl Compiler {
                     })
                     .cloned();
                 if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = bound_mul
                     && self.emit_bound_operator_call(
                         &mut bytecode,
@@ -8189,6 +8400,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8209,6 +8422,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Mod,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
                     let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(Instruction::DynMod));
@@ -8231,6 +8446,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Div,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -8246,6 +8463,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8271,6 +8490,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Pow,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8315,6 +8536,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8322,6 +8545,8 @@ impl Compiler {
                     "Eq",
                     "ne",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
                 }
@@ -8780,36 +9005,42 @@ impl Compiler {
                 // not panic: release builds use panic=abort).
                 let Some(tag) = self.checker.tag_for(enum_name, variant_name) else {
                     let fqn = format!("{}::{}", enum_name, variant_name);
-                    if let Some(offset) = self.functions.get(&fqn).copied() {
-                        match fields {
-                            EnumConstructPayload::Unit => {}
-                            EnumConstructPayload::Tuple(args) => {
-                                for arg in args {
-                                    bytecode.append(&mut self.do_compile(arg));
-                                }
-                            }
-                            EnumConstructPayload::Record(parts) => {
-                                for part in parts {
-                                    bytecode.append(&mut self.do_compile(&part.value));
-                                }
-                            }
-                        }
-                        let arity = match fields {
-                            EnumConstructPayload::Unit => 0,
-                            EnumConstructPayload::Tuple(args) => args.len(),
-                            EnumConstructPayload::Record(parts) => parts.len(),
-                        };
-                        bytecode.push(
-                            Byte::new(Instruction::CALL)
-                                .with_call_packed(arity as u32, offset as u32),
-                        );
-                        return bytecode;
-                    }
+                    // Match typechecker order for Unit form: static field
+                    // wins over a same-named 0-arg static method.
                     if matches!(fields, EnumConstructPayload::Unit)
                         && let Some(slot) = self.checker.static_slot_index(&fqn)
                     {
                         bytecode.push(
                             Byte::new(Instruction::LoadStatic).with_operand_u32(slot),
+                        );
+                        return bytecode;
+                    }
+                    // `Class::static_method(...)` — same surface as enum
+                    // Construct; lower to a direct CALL when registered.
+                    if let Some(offset) = self.functions.get(&fqn).copied() {
+                        let arg_slice: &[Output] = match fields {
+                            EnumConstructPayload::Unit => &[],
+                            EnumConstructPayload::Tuple(args) => args.as_slice(),
+                            EnumConstructPayload::Record(parts) => {
+                                for part in parts {
+                                    bytecode.append(&mut self.do_compile(&part.value));
+                                }
+                                // Record form is a type error for static
+                                // methods; still emit a CALL for recovery.
+                                bytecode.push(
+                                    Byte::new(Instruction::CALL).with_call_packed(
+                                        parts.len() as u32,
+                                        offset as u32,
+                                    ),
+                                );
+                                return bytecode;
+                            }
+                        };
+                        let arity =
+                            self.emit_call_args_with_rest(&fqn, arg_slice, &mut bytecode, false);
+                        bytecode.push(
+                            Byte::new(Instruction::CALL)
+                                .with_call_packed(arity, offset as u32),
                         );
                         return bytecode;
                     }
@@ -9708,6 +9939,7 @@ impl Compiler {
 
         self.emit_idx = 0;
         self.temp_counter = 0;
+        self.expr_depth = 0;
         self.const_env_stack.clear();
         self.const_env_stack.push(HashMap::new());
         self.static_const_values.clear();
@@ -9716,7 +9948,16 @@ impl Compiler {
         self.fn_bytecode_spans.clear();
         self.loop_stack.clear();
         self.loop_bbs.clear();
-        self.constants.clear();
+        // Constant pool is shared across multi-file `compile_module`
+        // calls. `JumpIfMatch` (and pool-backed `CONST`) store indices
+        // into this vec; clearing between modules orphans earlier
+        // instructions so the worker VM panics in
+        // `Byte::jump_if_match_target` (e.g. index 2, len 1) when a
+        // dependency uses `?` / match. Only reset on a fresh compile
+        // (still just the CALL/JMP/HALT prologue).
+        if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
+            self.constants.clear();
+        }
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
         self.test_cases.clear();

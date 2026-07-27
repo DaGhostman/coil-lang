@@ -109,6 +109,18 @@ fn unwrap(Option o) -> int {
 }
 ```
 
+Arm bodies may also be brace blocks when you need more than one expression
+(for example calling a method on `self` before yielding a value):
+
+```coil
+Mode::Other(n) => {
+    self.get();
+    n
+}
+```
+
+Those braces are a **block**, not a dict — `{ x: 1 }` remains a record literal.
+
 If one arm returns `int` and another returns `string`, the compiler reports a type mismatch on the arm bodies.
 
 Because `match` is an expression, it can appear anywhere a value is expected — in `return`, as a function argument, or on the right-hand side of a `let` binding.

@@ -46,14 +46,14 @@ struct CliArgs {
 fn print_help() {
     eprintln!(
         "Usage:\n\
-         \x20 coil [--log-json | --log-lsp] <file.hy>\n\
-         \x20 coil [--log-json | --log-lsp] compile <file.hy> [-o|--output <path>]\n\
+         \x20 coil [--log-json | --log-lsp] [<file.hy>]\n\
+         \x20 coil [--log-json | --log-lsp] compile [<file.hy>] [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] run <file.hyc>\n\
          \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \n\
          Commands:\n\
-         \x20 (default)  Compile <file.hy> to out.hyc (cached) and run it\n\
+         \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) to out.hyc and run it\n\
          \x20 compile    Compile an entry file (must define main) to a .hyc archive\n\
          \x20 run        Execute a previously compiled .hyc archive\n\
          \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
@@ -71,6 +71,7 @@ fn print_help() {
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
          \n\
+         When no file is given, `coil` / `coil compile` use `[entry].file` from coil.toml.\n\
          (default diagnostics) Pretty reports on stderr"
     );
 }
@@ -132,7 +133,21 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     }
 
     let command = match positionals.as_slice() {
-        [] => return Err("missing input file or command"),
+        [] => {
+            if output.is_some() {
+                return Err("-o/--output is only valid with `compile` or `package`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            // Resolved later from coil.toml `[entry].file`.
+            Command::BuildAndRun {
+                filename: String::new(),
+            }
+        }
         [cmd] if cmd == "test" => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile` or `package`");
@@ -166,7 +181,19 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 fail_fast,
             }
         }
-        [cmd] if cmd == "compile" => return Err("compile requires an entry file"),
+        [cmd] if cmd == "compile" => {
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            // Filename filled from `[entry].file` when empty.
+            Command::Compile {
+                filename: String::new(),
+                output: output.unwrap_or_else(|| DEFAULT_OUT.to_string()),
+            }
+        }
         [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
         [cmd, filename] if cmd == "package" => {
@@ -261,6 +288,32 @@ pub(crate) fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: i
     exit(1);
 }
 
+fn resolve_entry_filename(pipeline: &mut Pipeline, filename: &str) -> String {
+    if !filename.is_empty() {
+        return filename.to_string();
+    }
+    match pipeline.manifest_entry_path() {
+        Some(path) => {
+            let display = path.display().to_string();
+            if !path.exists() {
+                fail_and_exit(
+                    pipeline,
+                    ErrorCode::MissingInputFile,
+                    format!(
+                        "manifest `[entry].file` does not exist: `{display}` (set a valid path in coil.toml or pass a .hy file)"
+                    ),
+                );
+            }
+            display
+        }
+        None => fail_and_exit(
+            pipeline,
+            ErrorCode::MissingInputFile,
+            "missing input file or command (pass a .hy file, or set `[entry].file` in coil.toml)",
+        ),
+    }
+}
+
 fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
     // Multi-file entry: discovers `use` / `mod` via coil.toml.
     let (bytecode, constants) = match pipeline.compile_src_from_file(filename) {
@@ -304,6 +357,119 @@ fn archive_mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// Like [`archive_mtime`], but also tries project-root-relative paths.
+///
+/// Archives record `source_files` relative to the directory containing
+/// `coil.toml`. When the CLI cwd is that root, `path` works as-is; when the
+/// recorded path is relative and the cwd is nested (or absolute forms fail),
+/// walk parents until `coil.toml` and retry `root.join(path)`.
+fn archive_source_mtime(path: &str) -> Option<SystemTime> {
+    if let Some(m) = archive_mtime(path) {
+        return Some(m);
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return None;
+    }
+    let Ok(mut dir) = std::env::current_dir() else {
+        return None;
+    };
+    loop {
+        let candidate = dir.join(p);
+        if let Some(s) = candidate.to_str()
+            && let Some(m) = archive_mtime(s)
+        {
+            return Some(m);
+        }
+        if dir.join("coil.toml").is_file() {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// True when `path` refers to the same file as `other` (best-effort).
+fn same_source_path(path: &str, other: &str) -> bool {
+    if path == other {
+        return true;
+    }
+    let a = Path::new(path);
+    let b = Path::new(other);
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    let norm = |s: &str| {
+        s.replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let a_s = norm(path);
+    let b_s = norm(other);
+    if a_s == b_s {
+        return true;
+    }
+    // Proper path-suffix only (requires a `/` in the shorter side) so bare
+    // `main.hy` is not equated with `vendor/pkg/main.hy`.
+    fn proper_path_suffix(full: &str, suffix: &str) -> bool {
+        if suffix.is_empty() || !suffix.contains('/') {
+            return false;
+        }
+        full.len() > suffix.len()
+            && full.ends_with(suffix)
+            && full.as_bytes()[full.len() - suffix.len() - 1] == b'/'
+    }
+    proper_path_suffix(&a_s, &b_s) || proper_path_suffix(&b_s, &a_s)
+}
+
+/// Whether the cached `out.hyc` must be rebuilt for `entry`.
+///
+/// Invalidates when:
+/// - the entry file is newer than the archive
+/// - **any** source recorded in the archive is newer (multi-file modules)
+/// - the entry is not among the archive's `source_files` (different program
+///   was compiled into the shared `out.hyc` path — e.g. ran `A.hy` then `B.hy`)
+/// - a recorded source file is missing
+fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
+    let Some(arch_mtime) = archive_mtime(archive) else {
+        return true;
+    };
+
+    if debug.source_files.is_empty() {
+        return match archive_source_mtime(entry) {
+            Some(src) => src > arch_mtime,
+            None => true,
+        };
+    }
+
+    let entry_known = debug
+        .source_files
+        .iter()
+        .any(|s| same_source_path(s, entry));
+    if !entry_known {
+        return true;
+    }
+
+    for src in &debug.source_files {
+        match archive_source_mtime(src) {
+            Some(m) if m > arch_mtime => return true,
+            None => return true,
+            _ => {}
+        }
+    }
+
+    match archive_source_mtime(entry) {
+        Some(src) => src > arch_mtime,
+        // Entry was listed in `source_files` but cannot be resolved now —
+        // treat as stale (same as a missing dependency path above).
+        None => true,
+    }
+}
+
+/// Legacy helper kept for unit tests: entry-only mtime compare.
+#[cfg(test)]
 fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
     match (archive_mtime(archive), archive_mtime(filename)) {
         (Some(arch), Some(src)) => src > arch,
@@ -357,7 +523,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
             );
             true
         }
-        Ok(_) => source_newer_than_archive(filename, DEFAULT_OUT),
+        Ok((_, _, _, debug)) => archive_is_stale(filename, DEFAULT_OUT, debug),
     };
 
     if recompile {
@@ -738,8 +904,12 @@ fn main() {
                 pipeline.set_include_tests(true);
             }
             match command {
-                Command::BuildAndRun { filename } => cmd_build_and_run(&mut pipeline, &filename),
+                Command::BuildAndRun { filename } => {
+                    let filename = resolve_entry_filename(&mut pipeline, &filename);
+                    cmd_build_and_run(&mut pipeline, &filename)
+                }
                 Command::Compile { filename, output } => {
+                    let filename = resolve_entry_filename(&mut pipeline, &filename);
                     cmd_compile(&mut pipeline, &filename, &output)
                 }
                 Command::Run { archive } => cmd_run(&mut pipeline, &archive),
@@ -930,10 +1100,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_missing_compile_file() {
-        assert!(parse_args(&args(&["compile"])).is_err());
+    fn parse_empty_args_defers_to_manifest_entry() {
+        let cli = parse_args(&args(&[])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::BuildAndRun {
+                filename: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_compile_without_file_defers_to_manifest_entry() {
+        let cli = parse_args(&args(&["compile"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Compile {
+                filename: String::new(),
+                output: DEFAULT_OUT.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_run_archive() {
         assert!(parse_args(&args(&["run"])).is_err());
-        assert!(parse_args(&args(&[])).is_err());
     }
 
     #[test]
@@ -1067,6 +1258,114 @@ mod tests {
     }
 
     #[test]
+    fn archive_is_stale_when_entry_not_in_source_files() {
+        let dir = unique_tmp("stale_entry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.hy");
+        let b = dir.join("b.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&a, b"fn main() {}").unwrap();
+        std::fs::write(&b, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![a.to_string_lossy().into_owned()],
+            debug_locs: vec![],
+        };
+        // Running b.hy against an archive built from a.hy must rebuild.
+        assert!(archive_is_stale(
+            b.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        // Same entry, sources not newer => fresh.
+        assert!(!archive_is_stale(
+            a.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_when_dependency_source_newer() {
+        let dir = unique_tmp("stale_dep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let dep = dir.join("worker.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&dep, b"fn w() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Touch only the dependency — entry mtime stays older than the archive.
+        std::fs::write(&dep, b"fn w() { /* edited */ }").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![
+                entry.to_string_lossy().into_owned(),
+                dep.to_string_lossy().into_owned(),
+            ],
+            debug_locs: vec![],
+        };
+        assert!(archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_empty_source_files_uses_entry_mtime() {
+        let dir = unique_tmp("stale_empty_sources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![],
+            debug_locs: vec![],
+        };
+        // Entry not newer than archive → fresh via the empty-list branch.
+        assert!(!archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&entry, b"fn main() { /* edited */ }").unwrap();
+        assert!(archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_when_recorded_source_missing() {
+        let dir = unique_tmp("stale_missing_dep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let missing = dir.join("gone.hy");
+        let debug = ProgramDebug {
+            source_files: vec![
+                entry.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            debug_locs: vec![],
+        };
+        assert!(
+            archive_is_stale(entry.to_str().unwrap(), arch.to_str().unwrap(), &debug),
+            "missing recorded dependency must invalidate the archive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn collect_test_files_errors_and_discovers_nested() {
         let missing = unique_tmp("no_tests");
         assert!(collect_test_files(&missing).is_err());
@@ -1177,6 +1476,39 @@ mod tests {
     #[test]
     fn archive_mtime_returns_none_for_missing() {
         assert!(archive_mtime(unique_tmp("no_mtime").to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn same_source_path_rejects_unrelated_same_basename() {
+        assert!(!same_source_path("examples/foo.hy", "vendor/pkg/foo.hy"));
+        assert!(!same_source_path("main.hy", "vendor/pkg/main.hy"));
+        assert!(same_source_path("examples/foo.hy", "./examples/foo.hy"));
+        assert!(same_source_path(
+            "src/lib/io.hy",
+            "project/src/lib/io.hy"
+        ));
+    }
+
+    #[test]
+    fn archive_source_mtime_resolves_via_coil_toml_root() {
+        let root = unique_tmp("mtime_root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("coil.toml"), b"[module]\nroots = [\"./src\"]\n").unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("worker.hy");
+        std::fs::write(&file, b"fn f() {}").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&nested).unwrap();
+        let m = archive_source_mtime("src/worker.hy");
+        std::env::set_current_dir(&prev).unwrap();
+        assert!(
+            m.is_some(),
+            "should resolve src/worker.hy via parent coil.toml root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Fresh VM per case: soft-fail / panic in earlier cases must not skip later ones.
