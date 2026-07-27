@@ -4117,6 +4117,15 @@ impl Compiler {
         &self.messages
     }
 
+    /// Append a diagnostic produced outside the typechecker/codegen
+    /// path (e.g. pipeline discovery parse errors). Callers that also
+    /// emit via the reporting sink must bump their own
+    /// `messages_emitted` cursor so [`Pipeline::emit_new_messages`]
+    /// does not re-forward the same message.
+    pub fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
     pub fn c_structs(&self) -> &[CStructDef] {
         self.checker.c_structs()
     }

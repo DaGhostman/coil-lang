@@ -577,7 +577,14 @@ impl Pipeline {
     }
 
     /// Register `source` under `path` and emit a single producer [`Message`].
+    ///
+    /// Also records the message on the compiler so [`Self::messages`]
+    /// includes discovery-time parse / module-not-found errors (not only
+    /// typecheck diagnostics). Advances `messages_emitted` so a later
+    /// [`Self::emit_new_messages`] does not re-forward the same text.
     fn emit_message(&mut self, path: &Path, source: &str, message: &Message) {
+        self.compiler.push_message(message.clone());
+        self.messages_emitted = self.compiler.get_messages().len();
         let file_id = self.sink.register_source(path, source);
         self.sink.emit(Diagnostic::from_message(message, file_id));
         if self.sink.had_errors() {
