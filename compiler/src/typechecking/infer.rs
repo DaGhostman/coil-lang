@@ -18780,6 +18780,110 @@ fn main() { let g = add(a: 1); }
             c.partial_fills_by_span.values().collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn is_thread_sendable_ty_accepts_immediates_strings_and_host_handles() {
+        use crate::typechecking::ty::{mutex_ty, receiver_ty, rwlock_ty, sender_ty};
+        assert!(Checker::is_thread_sendable_ty(&int()));
+        assert!(Checker::is_thread_sendable_ty(&string()));
+        assert!(Checker::is_thread_sendable_ty(&boolean()));
+        assert!(Checker::is_thread_sendable_ty(&unit_ty()));
+        assert!(Checker::is_thread_sendable_ty(&sender_ty()));
+        assert!(Checker::is_thread_sendable_ty(&receiver_ty()));
+        assert!(Checker::is_thread_sendable_ty(&mutex_ty()));
+        assert!(Checker::is_thread_sendable_ty(&rwlock_ty()));
+        assert!(Checker::is_thread_sendable_ty(&array(int())));
+        assert!(Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+    }
+
+    #[test]
+    fn is_thread_sendable_ty_rejects_stream_coroutine_and_functions() {
+        use crate::typechecking::ty::stream_ty;
+        assert!(!Checker::is_thread_sendable_ty(&stream_ty()));
+        assert!(!Checker::is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
+        assert!(!Checker::is_thread_sendable_ty(&Ty::Fun(
+            Box::new(unit_ty()),
+            Box::new(int())
+        )));
+        assert!(!Checker::is_thread_sendable_ty(&Ty::App(
+            Box::new(Ty::Con("coroutine".into())),
+            vec![int(), unit_ty()]
+        )));
+        assert!(!Checker::is_thread_sendable_ty(&array(stream_ty())));
+        assert!(!Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
+    }
+
+    #[test]
+    fn spawn_rejects_non_sendable_function_argument() {
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn work(fn () -> int f) -> int { return f(); }
+fn main() {
+    let t = spawn(work, fn () => 1);
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("not sendable across threads")),
+            "expected non-sendable spawn arg diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_zero_and_too_many_arguments() {
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn main() {
+    let _ = spawn();
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("spawn expects a function")),
+            "expected zero-arg spawn diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn work(int a, int b) -> int { return a + b; }
+fn main() {
+    let _ = spawn(work, 1, 2);
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("too many arguments")),
+            "expected arity spawn diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spawn_accepts_sendable_int_argument() {
+        let (mut c, _) = check(
+            r#"
+use thread::*;
+fn work(int n) -> int { return n + 1; }
+fn main() {
+    let t = spawn(work, 41);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected messages: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
 }
 
 

@@ -2826,6 +2826,95 @@ fn example_thread_mutex_prints_2() {
 }
 
 #[test]
+fn thread_channel_close_try_recv_is_disconnected() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let pair = channel()?;
+    let tx = pair[0];
+    let rx = pair[1];
+    close(tx)?;
+    match try_recv(rx) {
+        Result::Ok(_) => print "ok",
+        Result::Err(e) => match e {
+            ThreadError::Disconnected => print "disc",
+            _ => print "other",
+        },
+    };
+}
+"#,
+    );
+    assert_eq!(output, "disc");
+}
+
+#[test]
+fn thread_try_recv_empty_open_channel_would_block() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let pair = channel()?;
+    let rx = pair[1];
+    match try_recv(rx) {
+        Result::Ok(_) => print "ok",
+        Result::Err(e) => match e {
+            ThreadError::WouldBlock => print "wb",
+            _ => print "other",
+        },
+    };
+}
+"#,
+    );
+    assert_eq!(output, "wb");
+}
+
+#[test]
+fn thread_rwlock_with_write_then_read() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let rw = rwlock(10)?;
+    with_write(rw, fn (int n) => (n + 1, 0))?;
+    let v = with_read(rw, fn (int n) => n)?;
+    print "%i", v;
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+#[test]
+fn thread_detach_then_join_fails() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn work() -> int {
+    return 1;
+}
+
+fn main() {
+    let t = spawn(work)?;
+    detach(t)?;
+    match join(t) {
+        Result::Ok(_) => print "joined",
+        Result::Err(e) => match e {
+            ThreadError::JoinFailed => print "jf",
+            _ => print "other",
+        },
+    };
+}
+"#,
+    );
+    assert_eq!(output, "jf");
+}
+
+#[test]
 fn example_vec_tuple_prints_zip_broadcast_negate() {
     let output = run_example("examples/vec_tuple.hy");
     assert_eq!(output, "22,23,24,-1-2");

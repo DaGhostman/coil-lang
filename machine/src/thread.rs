@@ -1021,6 +1021,44 @@ mod tests {
     use crate::memory::ObjFn;
     use std::time::Duration;
 
+    fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::Enum(gc)) => Some(gc.as_ref().tag),
+            _ => None,
+        }
+    }
+
+    fn result_err_tag(heap: &Heap, result: Value) -> ThreadErrorTag {
+        let Object::Enum(gc) = heap.find_object_by_addr(result.raw() as u64).unwrap() else {
+            panic!("expected Result enum");
+        };
+        assert_eq!(gc.as_ref().tag, 1, "expected Result::Err");
+        let Member::Object(Object::Enum(err)) = &gc.as_ref().payload[0] else {
+            panic!("expected ThreadError payload");
+        };
+        match err.as_ref().tag {
+            0 => ThreadErrorTag::WouldBlock,
+            1 => ThreadErrorTag::Disconnected,
+            2 => ThreadErrorTag::JoinFailed,
+            3 => ThreadErrorTag::NotSendable,
+            4 => ThreadErrorTag::Poisoned,
+            _ => ThreadErrorTag::Other,
+        }
+    }
+
+    fn channel_pair(heap: &mut Heap) -> (Value, Value) {
+        let ok = host_channel(heap, &[]);
+        let Object::Enum(gc) = heap.find_object_by_addr(ok.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        assert_eq!(gc.as_ref().tag, 0);
+        let Member::Object(Object::Tuple(tup)) = &gc.as_ref().payload[0] else {
+            panic!("expected (Sender, Receiver) tuple");
+        };
+        let elems = &tup.as_ref().elements;
+        (elems[0], elems[1])
+    }
+
     #[test]
     fn portable_roundtrip_immediate_and_string() {
         let mut heap = Heap::default();
@@ -1060,6 +1098,39 @@ mod tests {
     }
 
     #[test]
+    fn portable_roundtrip_tuple_and_enum() {
+        let mut heap = Heap::default();
+        let (tup, _) = heap.alloc(
+            ObjTuple {
+                elements: vec![Value::from(7_i64), Value::from(8_i64)],
+            },
+            Object::Tuple,
+        );
+        let pv = value_to_portable(&heap, Value::from(tup.addr())).unwrap();
+        assert!(matches!(pv, PortableValue::Tuple(ref e) if e.len() == 2));
+        let back = portable_to_value(&mut heap, pv).unwrap();
+        let Object::Tuple(gc) = heap.find_object_by_addr(back.raw() as u64).unwrap() else {
+            panic!("expected tuple");
+        };
+        assert_eq!(gc.as_ref().elements[0].as_int(), 7);
+        assert_eq!(gc.as_ref().elements[1].as_int(), 8);
+
+        let (en, _) = heap.alloc(
+            ObjEnum {
+                tag: 3,
+                payload: vec![Member::Value(Value::from(11_i64))],
+            },
+            Object::Enum,
+        );
+        let pv = value_to_portable(&heap, Value::from(en.addr())).unwrap();
+        let PortableValue::Enum { tag, payload } = pv else {
+            panic!("expected enum portable");
+        };
+        assert_eq!(tag, 3);
+        assert_eq!(payload, vec![PortableValue::Immediate(11)]);
+    }
+
+    #[test]
     fn portable_rejects_fn_object() {
         let mut heap = Heap::default();
         let pfn = ObjFn {
@@ -1076,6 +1147,97 @@ mod tests {
             value_to_portable(&heap, v),
             Err(ThreadErrorTag::NotSendable)
         );
+    }
+
+    #[test]
+    fn portable_rejects_channel_and_lock_handles() {
+        let mut heap = Heap::default();
+        let (tx, rx) = channel_pair(&mut heap);
+        assert_eq!(
+            value_to_portable(&heap, tx),
+            Err(ThreadErrorTag::NotSendable)
+        );
+        assert_eq!(
+            value_to_portable(&heap, rx),
+            Err(ThreadErrorTag::NotSendable)
+        );
+
+        let mtx = host_mutex(&mut heap, &[Value::from(1_i64)]);
+        let Object::Enum(gc) = heap.find_object_by_addr(mtx.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        let Member::Object(obj @ Object::Mutex(_)) = &gc.as_ref().payload[0] else {
+            panic!("expected Mutex");
+        };
+        let mtx_val = Value::from(obj.addr());
+        assert_eq!(
+            value_to_portable(&heap, mtx_val),
+            Err(ThreadErrorTag::NotSendable)
+        );
+
+        let rw = host_rwlock(&mut heap, &[Value::from(2_i64)]);
+        let Object::Enum(gc) = heap.find_object_by_addr(rw.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        let Member::Object(obj @ Object::RwLock(_)) = &gc.as_ref().payload[0] else {
+            panic!("expected RwLock");
+        };
+        let rw_val = Value::from(obj.addr());
+        assert_eq!(
+            value_to_portable(&heap, rw_val),
+            Err(ThreadErrorTag::NotSendable)
+        );
+    }
+
+    #[test]
+    fn value_to_spawn_arg_rewraps_sender_and_mutex() {
+        let mut heap = Heap::default();
+        let (tx, _rx) = channel_pair(&mut heap);
+        assert!(matches!(
+            value_to_spawn_arg(&heap, tx).unwrap(),
+            SpawnArg::Sender(_)
+        ));
+
+        let mtx = host_mutex(&mut heap, &[Value::from(5_i64)]);
+        let Object::Enum(gc) = heap.find_object_by_addr(mtx.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        let Member::Object(obj @ Object::Mutex(_)) = &gc.as_ref().payload[0] else {
+            panic!("expected Mutex");
+        };
+        let mtx_val = Value::from(obj.addr());
+        assert!(matches!(
+            value_to_spawn_arg(&heap, mtx_val).unwrap(),
+            SpawnArg::Mutex(_)
+        ));
+    }
+
+    #[test]
+    fn channel_close_then_send_and_try_recv_are_disconnected() {
+        let mut heap = Heap::default();
+        let (tx, rx) = channel_pair(&mut heap);
+        let close_ok = host_close(&mut heap, &[tx]);
+        assert_eq!(enum_tag(&heap, close_ok), Some(0));
+
+        let send_err = host_send(&mut heap, &[tx, Value::from(1_i64)]);
+        assert_eq!(
+            result_err_tag(&heap, send_err),
+            ThreadErrorTag::Disconnected
+        );
+
+        let recv_err = host_try_recv(&mut heap, &[rx]);
+        assert_eq!(
+            result_err_tag(&heap, recv_err),
+            ThreadErrorTag::Disconnected
+        );
+    }
+
+    #[test]
+    fn try_recv_empty_open_channel_would_block() {
+        let mut heap = Heap::default();
+        let (_tx, rx) = channel_pair(&mut heap);
+        let err = host_try_recv(&mut heap, &[rx]);
+        assert_eq!(result_err_tag(&heap, err), ThreadErrorTag::WouldBlock);
     }
 
     #[test]
