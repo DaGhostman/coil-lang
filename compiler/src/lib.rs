@@ -573,6 +573,11 @@ struct Context {
 
 // --- Compiler ---
 
+/// Length of the CALL + JMP + HALT prologue every [`Compiler`] starts with.
+/// Multi-file linking treats `bytecode.len() <= PROLOGUE_BYTECODE_LEN` as a
+/// fresh compile (safe to clear the shared constant pool).
+pub const PROLOGUE_BYTECODE_LEN: usize = 3;
+
 pub struct Compiler {
     namespace: String,
     bytecode: Vec<Byte>,
@@ -720,9 +725,10 @@ impl Default for Compiler {
             Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
             Byte::new(Instruction::HALT),
         ]);
+        debug_assert_eq!(bytecode.len(), PROLOGUE_BYTECODE_LEN);
         // The first USER code (i.e., the first byte after
         // the prologue) is offset `bytecode.len()`, which
-        // is exactly 3 (CALL + JMP + HALT).
+        // is exactly PROLOGUE_BYTECODE_LEN (CALL + JMP + HALT).
         let program_start_offset = bytecode.len() as u32;
         let debug_locs = vec![DebugLoc::unknown(); bytecode.len()];
 
@@ -819,6 +825,10 @@ impl Compiler {
                 } else {
                     // Typecheck should have rejected unknown captures; emit a
                     // zero so the CALL arity still matches.
+                    debug_assert!(
+                        false,
+                        "defer capture `{cap}` missing from enclosing frame at codegen"
+                    );
                     into.push(Byte::new_with_value(
                         Instruction::CONST,
                         Value::default().raw() as _,
@@ -9935,8 +9945,8 @@ impl Compiler {
         // instructions so the worker VM panics in
         // `Byte::jump_if_match_target` (e.g. index 2, len 1) when a
         // dependency uses `?` / match. Only reset on a fresh compile
-        // (still just the 3-byte CALL/JMP/HALT prologue).
-        if self.bytecode.len() <= 3 {
+        // (still just the CALL/JMP/HALT prologue).
+        if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
             self.constants.clear();
         }
         self.mono_offsets.clear();

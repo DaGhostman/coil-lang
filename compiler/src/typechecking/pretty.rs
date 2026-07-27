@@ -156,7 +156,10 @@ fn format_ty_renamed(
             let vars = bounds
                 .iter()
                 .map(|v| {
-                    let mut s = rename.get(v).cloned().unwrap_or_else(|| format!("t{}", v.raw()));
+                    let mut s = rename
+                        .get(v)
+                        .cloned()
+                        .unwrap_or_else(|| fresh_diag_name(next));
                     let classes = constraints
                         .iter()
                         .filter(|c| c.is_unary_on(*v))

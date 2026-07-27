@@ -987,7 +987,7 @@ impl<const S: usize> Machine<S> {
         // process exit kills threads still blocked in `recv` / still starting,
         // which looks like "recv never blocks" and "nothing after recv runs".
         // Only joins *this* Machine's registry (not a process-global list).
-        crate::thread::join_unddetached_threads(&self.live_threads);
+        crate::thread::join_undetached_threads(&self.live_threads);
     }
 
     fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {

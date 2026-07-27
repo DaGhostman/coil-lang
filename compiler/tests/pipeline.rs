@@ -345,8 +345,6 @@ fn example_defer_prints_enterleave_lifo_and_early_return() {
     assert_eq!(output, "enterleave,021,okd7,d99,55");
 }
 
-/// Regression: parenthesized `(self).field` must still emit GetField.
-/// Pre-fix, `receiver_type` ignored `Group`, so Access fell through to
 /// Regression: inherent `fn send` must not shadow `thread::send`, so
 /// `send(self.channel, msg)` typechecks and runs.
 #[test]
@@ -380,6 +378,8 @@ fn main() {
     assert_eq!(output, "hi");
 }
 
+/// Regression: parenthesized `(self).field` must still emit GetField.
+/// Pre-fix, `receiver_type` ignored `Group`, so Access fell through to
 /// `LoadField(0)` and `send` received a bogus value (often looking like
 /// the class instance was passed instead of the field).
 #[test]

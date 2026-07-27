@@ -29,7 +29,7 @@ fn register_live_thread(registry: &LiveThreadRegistry, state: Arc<JoinState>) {
 /// Called automatically at the end of [`Machine::run_with_pool`] for that
 /// machine's own registry. Explicit `join(t)` still returns the worker's value;
 /// this path only keeps the process alive. `detach(t)` opts a thread out.
-pub fn join_unddetached_threads(registry: &LiveThreadRegistry) {
+pub fn join_undetached_threads(registry: &LiveThreadRegistry) {
     let threads = match registry.lock() {
         Ok(mut g) => std::mem::take(&mut *g),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
@@ -1144,7 +1144,7 @@ mod tests {
         // Joining an empty registry must not touch another Machine's list.
         let sentinel = Arc::new(JoinState::new());
         register_live_thread(m2.live_threads(), Arc::clone(&sentinel));
-        join_unddetached_threads(m1.live_threads());
+        join_undetached_threads(m1.live_threads());
         assert_eq!(
             m2.live_threads().lock().unwrap().len(),
             1,
@@ -1153,7 +1153,7 @@ mod tests {
         // Avoid leaving a JoinState that never finishes: mark detached so a
         // later join skips waiting.
         sentinel.detached.store(true, Ordering::SeqCst);
-        join_unddetached_threads(m2.live_threads());
+        join_undetached_threads(m2.live_threads());
     }
 
     fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {

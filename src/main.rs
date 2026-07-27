@@ -357,6 +357,40 @@ fn archive_mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// Like [`archive_mtime`], but also tries project-root-relative paths.
+///
+/// Archives record `source_files` relative to the directory containing
+/// `coil.toml`. When the CLI cwd is that root, `path` works as-is; when the
+/// recorded path is relative and the cwd is nested (or absolute forms fail),
+/// walk parents until `coil.toml` and retry `root.join(path)`.
+fn archive_source_mtime(path: &str) -> Option<SystemTime> {
+    if let Some(m) = archive_mtime(path) {
+        return Some(m);
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return None;
+    }
+    let Ok(mut dir) = std::env::current_dir() else {
+        return None;
+    };
+    loop {
+        let candidate = dir.join(p);
+        if let Some(s) = candidate.to_str()
+            && let Some(m) = archive_mtime(s)
+        {
+            return Some(m);
+        }
+        if dir.join("coil.toml").is_file() {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
 /// True when `path` refers to the same file as `other` (best-effort).
 fn same_source_path(path: &str, other: &str) -> bool {
     if path == other {
@@ -364,17 +398,30 @@ fn same_source_path(path: &str, other: &str) -> bool {
     }
     let a = Path::new(path);
     let b = Path::new(other);
-    if a.file_name() != b.file_name() {
-        return false;
-    }
-    // Compare canonical paths when both exist; fall back to suffix match for
-    // archive-relative paths (`examples/foo.hy`) vs CLI args (`./examples/foo.hy`).
     if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
         return ca == cb;
     }
-    let a_s = a.to_string_lossy().replace('\\', "/");
-    let b_s = b.to_string_lossy().replace('\\', "/");
-    a_s.ends_with(b_s.trim_start_matches("./")) || b_s.ends_with(a_s.trim_start_matches("./"))
+    let norm = |s: &str| {
+        s.replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let a_s = norm(path);
+    let b_s = norm(other);
+    if a_s == b_s {
+        return true;
+    }
+    // Proper path-suffix only (requires a `/` in the shorter side) so bare
+    // `main.hy` is not equated with `vendor/pkg/main.hy`.
+    fn proper_path_suffix(full: &str, suffix: &str) -> bool {
+        if suffix.is_empty() || !suffix.contains('/') {
+            return false;
+        }
+        full.len() > suffix.len()
+            && full.ends_with(suffix)
+            && full.as_bytes()[full.len() - suffix.len() - 1] == b'/'
+    }
+    proper_path_suffix(&a_s, &b_s) || proper_path_suffix(&b_s, &a_s)
 }
 
 /// Whether the cached `out.hyc` must be rebuilt for `entry`.
@@ -391,7 +438,7 @@ fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
     };
 
     if debug.source_files.is_empty() {
-        return match archive_mtime(entry) {
+        return match archive_source_mtime(entry) {
             Some(src) => src > arch_mtime,
             None => true,
         };
@@ -406,18 +453,14 @@ fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
     }
 
     for src in &debug.source_files {
-        match archive_mtime(src) {
+        match archive_source_mtime(src) {
             Some(m) if m > arch_mtime => return true,
-            None => {
-                // Relative paths in the archive are project-root relative;
-                // also try as-is next to cwd (CLI often runs from repo root).
-                return true;
-            }
+            None => return true,
             _ => {}
         }
     }
 
-    match archive_mtime(entry) {
+    match archive_source_mtime(entry) {
         Some(src) => src > arch_mtime,
         None => false,
     }
@@ -1380,6 +1423,39 @@ mod tests {
     #[test]
     fn archive_mtime_returns_none_for_missing() {
         assert!(archive_mtime(unique_tmp("no_mtime").to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn same_source_path_rejects_unrelated_same_basename() {
+        assert!(!same_source_path("examples/foo.hy", "vendor/pkg/foo.hy"));
+        assert!(!same_source_path("main.hy", "vendor/pkg/main.hy"));
+        assert!(same_source_path("examples/foo.hy", "./examples/foo.hy"));
+        assert!(same_source_path(
+            "src/lib/io.hy",
+            "project/src/lib/io.hy"
+        ));
+    }
+
+    #[test]
+    fn archive_source_mtime_resolves_via_coil_toml_root() {
+        let root = unique_tmp("mtime_root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("coil.toml"), b"[module]\nroots = [\"./src\"]\n").unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("worker.hy");
+        std::fs::write(&file, b"fn f() {}").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&nested).unwrap();
+        let m = archive_source_mtime("src/worker.hy");
+        std::env::set_current_dir(&prev).unwrap();
+        assert!(
+            m.is_some(),
+            "should resolve src/worker.hy via parent coil.toml root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Fresh VM per case: soft-fail / panic in earlier cases must not skip later ones.

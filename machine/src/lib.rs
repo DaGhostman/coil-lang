@@ -16,7 +16,7 @@ pub use packed_la::{
     packed_matrix_neg, packed_matrix_zip,
 };
 pub use thread::{
-    join_unddetached_threads, new_live_thread_registry, LiveThreadRegistry, ThreadErrorTag,
+    join_undetached_threads, new_live_thread_registry, LiveThreadRegistry, ThreadErrorTag,
     ThreadProgram,
 };
 pub use vm::*;

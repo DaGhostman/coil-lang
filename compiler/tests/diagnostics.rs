@@ -70,6 +70,33 @@ fn type_mismatch_on_let_annotation_reports_expected_and_actual() {
 }
 
 #[test]
+fn type_mismatch_messages_avoid_raw_tvar_ids() {
+    // End-to-end: mismatch pretty-printing must not leak raw `tN` ids
+    // (free vars are renamed to `a`/`b`/… via `format_ty_for_diag`).
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+  let p = (1, 2);
+  let q: (string, int) = p;
+}
+"#,
+    );
+    let joined = msgs.join("\n");
+    assert!(
+        joined.contains("Type mismatch"),
+        "expected a type mismatch, got: {joined}"
+    );
+    assert!(
+        joined.contains("string") && joined.contains("int"),
+        "expected tuple element types in the message, got: {joined}"
+    );
+    assert!(
+        !joined.contains("`t"),
+        "diagnostics must not show raw tN type-var ids, got: {joined}"
+    );
+}
+
+#[test]
 fn arity_mismatch_mentions_function_name() {
     // `missing_fn` is unknown — the message should still mention the
     // name so the user can grep for it.
