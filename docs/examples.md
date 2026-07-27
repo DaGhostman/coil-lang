@@ -111,6 +111,49 @@ fn main() {
 
 ---
 
+### `examples/defer.hy`
+
+**Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered.
+
+```coil
+fn with_cleanup() {
+    defer { print "leave"; }
+    print "enter";
+}
+
+fn lifo() {
+    defer { print "1"; }
+    defer { print "2"; }
+    print "0";
+}
+
+fn early_return(int n) -> int {
+    defer { print "d"; }
+    if n == 0 {
+        return 99;
+    }
+    print "ok";
+    return n;
+}
+
+fn main() {
+    with_cleanup();
+    print ",";
+    lifo();
+    print ",";
+    print "%i", early_return(7);
+    print ",";
+    print "%i", early_return(0);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/defer.hy` |
+| **Output** | `enterleave,021,okd7,d99` |
+
+---
+
 ### `examples/named_args.hy`
 
 **Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
@@ -1661,6 +1704,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `string_fmt.hy` | Basics | `hello world42-x` |
 | `show_tuple.hy` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.hy` | Basics | `51020` |
+| `defer.hy` | Basics | `enterleave,021,okd7,d99` |
 | `named_args.hy` | Basics | `Ada36Grace40` |
 | `variadic.hy` | Basics | `60Hi!?` |
 | `const.hy` | Basics | `42hi` |

@@ -1280,6 +1280,9 @@ impl<'pratt> Pratt<'pratt> {
                 self.raise_().then_ignore(op!(';')),
                 self.panic_().then_ignore(op!(';')),
                 self.yield_().then_ignore(op!(';')),
+                // `defer { … }` before `expr_statement` so `defer` is not
+                // parsed as a bare identifier call / expression.
+                self.defer(stmt.clone()),
                 self.expr_statement(),
                 self.comment(),
             ))
@@ -3049,6 +3052,35 @@ mod tests {
         stmt!("print \"Hello, World!\";");
         stmt!("defer { print \"%i\", 42; }");
         stmt!("while x < 10 { x = x + 1; }");
+    }
+
+    #[test]
+    fn defer_parses_inside_function_body() {
+        // Regression: `defer` must be a statement, not only a top-level
+        // declaration — otherwise `defer {` inside `fn` fails looking for `:`.
+        let ast = decl_ast!(
+            "fn f() { defer { print \"x\"; } print \"y\"; }"
+        );
+        match ast {
+            Expression::Function { body: Some(body), .. } => {
+                let Expression::Block(items) = body.1.as_ref() else {
+                    panic!("expected function body block, got {:?}", body.1);
+                };
+                assert!(
+                    items.iter().any(|item| {
+                        matches!(item.1.as_ref(), Expression::Defer(_))
+                            || matches!(
+                                item.1.as_ref(),
+                                Expression::Statement(inner)
+                                    if matches!(inner.1.as_ref(), Expression::Defer(_))
+                            )
+                    }),
+                    "expected a Defer node in the function body, got {:?}",
+                    items
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
     }
 
     #[test]

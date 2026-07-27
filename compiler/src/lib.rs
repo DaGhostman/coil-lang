@@ -556,7 +556,6 @@ struct Context {
     symbols: Interner<String>,
     assignments: HashMap<String, bool>,
     constants: HashMap<usize, bool>,
-    defers: Vec<usize>,
     classes: HashMap<String, Vec<(String, usize)>>,
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
@@ -623,6 +622,12 @@ pub struct Compiler {
 
     /// Active loop patchers. Break/continue emit through the innermost builder.
     loop_bbs: Vec<BlockBuilder>,
+
+    /// Bytecode offsets of `defer` thunks in the function currently being
+    /// compiled (declaration order). Run LIFO on return / fall-through via
+    /// `emit_run_defers`. Kept on `Compiler` (not `Context`) so nested
+    /// block frames do not drop registered defers.
+    fn_defers: Vec<usize>,
 
     /// Class name → decorated constructor function name (from attr expansion).
     decorated_class_ctors: HashMap<String, String>,
@@ -727,6 +732,7 @@ impl Default for Compiler {
             temp_counter: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
+            fn_defers: Vec::new(),
             decorated_class_ctors: HashMap::new(),
             active_fn_name: None,
             compiling_method: false,
@@ -775,6 +781,20 @@ impl Compiler {
         }
         if self.debug_locs.len() > self.bytecode.len() {
             self.debug_locs.truncate(self.bytecode.len());
+        }
+    }
+
+    /// Run registered `defer` thunks in LIFO order.
+    ///
+    /// Each thunk is entered via `CALL` with target 0 (push return IP, fall
+    /// through) then `JMP` to the thunk. The thunk ends in `RETURN`, which
+    /// resumes after the `JMP`. A following `POP` discards the thunk's
+    /// sentinel return value so a pending function return value stays on top.
+    fn emit_run_defers(&mut self, into: &mut Vec<Byte>) {
+        for offset in self.fn_defers.iter().rev() {
+            into.push(Byte::new(Instruction::CALL).with_call_packed(0, 0));
+            into.push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+            into.push(Byte::new(Instruction::POP));
         }
     }
 
@@ -1043,7 +1063,7 @@ impl Compiler {
         expr: &Output<'_>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        if !self.context.defers.is_empty() {
+        if !self.fn_defers.is_empty() {
             return false;
         }
         let Some(cur) = self.current_function_table_key.clone() else {
@@ -1214,7 +1234,6 @@ impl<'ctx> Context {
             current: self.current.clone(),
             impementations: self.impementations.clone(),
             methods: self.methods.clone(),
-            defers: Vec::default(),
             constants: self.constants.clone(),
             assignments: self.assignments.clone(),
             variables: self.variables.clone(),
@@ -3710,6 +3729,7 @@ impl Compiler {
 
         let prev_result_mode = self.compiling_result_mode;
         self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+        let prev_fn_defers = std::mem::take(&mut self.fn_defers);
 
         let mut a = self.do_compile(args);
         self.bytecode.append(&mut a);
@@ -3729,15 +3749,13 @@ impl Compiler {
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
 
-        self.context.defers.iter().for_each(|offset| {
-            self.bytecode
-                .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-        });
-
         if !matches!(
             self.bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::RETURN)
         ) {
+            let mut epilogue = Vec::new();
+            self.emit_run_defers(&mut epilogue);
+            self.bytecode.append(&mut epilogue);
             self.bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
                 Value::default().raw() as _,
@@ -3748,6 +3766,7 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
 
+        self.fn_defers = prev_fn_defers;
         self.compiling_result_mode = prev_result_mode;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
@@ -3926,20 +3945,19 @@ impl Compiler {
             self.compiling_result_mode = self.checker.fn_is_result_mode(source_name);
             self.mono_codegen_var_types.push(overrides);
 
+            let prev_fn_defers = std::mem::take(&mut self.fn_defers);
             let mut a = self.do_compile(args);
             self.bytecode.append(&mut a);
             let mut c = self.do_compile(body);
             self.bytecode.append(&mut c);
 
-            self.context.defers.iter().for_each(|offset| {
-                self.bytecode
-                    .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-            });
-
             if !matches!(
                 self.bytecode.last().map(|b| b.bytecode()),
                 Some(Instruction::RETURN)
             ) {
+                let mut epilogue = Vec::new();
+                self.emit_run_defers(&mut epilogue);
+                self.bytecode.append(&mut epilogue);
                 self.bytecode.push(Byte::new_with_value(
                     Instruction::CONST,
                     Value::default().raw() as _,
@@ -3950,6 +3968,7 @@ impl Compiler {
                 self.bytecode.push(Byte::new(Instruction::RETURN));
             }
 
+            self.fn_defers = prev_fn_defers;
             self.mono_codegen_var_types.pop();
             self.compiling_result_mode = prev_result_mode;
             self.context.variables = prev_fn_vars;
@@ -6161,20 +6180,19 @@ impl Compiler {
 
                 let body_start = self.bytecode.len();
                 let prev_active = self.active_fn_name.take();
+                let prev_fn_defers = std::mem::take(&mut self.fn_defers);
                 self.active_fn_name = Some(name.to_string());
                 let mut c = self.do_compile(body);
                 self.active_fn_name = prev_active;
                 self.bytecode.append(&mut c);
 
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
-
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
                     Some(Instruction::RETURN)
                 ) {
+                    let mut epilogue = Vec::new();
+                    self.emit_run_defers(&mut epilogue);
+                    self.bytecode.append(&mut epilogue);
                     self.bytecode.push(Byte::new_with_value(
                         Instruction::CONST,
                         Value::default().raw() as _,
@@ -6185,6 +6203,7 @@ impl Compiler {
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
 
+                self.fn_defers = prev_fn_defers;
                 self.compiling_result_mode = prev_result_mode;
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
@@ -6421,38 +6440,6 @@ impl Compiler {
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::CALL).with_operand_u32(0));
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
-
-                // if let Expression::Identifier(name) = *expr.1.borrow() {
-                //     let ty = self.typechecker.get_variable_type(&name.into());
-                //     let symbol = self.context.variables.key(&name.into());
-                //     // if matches!(ty, Some(Type::OBJECT(_))) || matches!(ty, Some(Type::STRING)) {
-                //     //     bytecode.push(Byte::new_with_operands(
-                //     //         Instruction::ACQUIRE,
-                //     //         [symbol.expect("Unable to resolve unknown variable"), 0],
-                //     //     ));
-                //     // }
-                // }
-
-                // for variable in self.context.variables.iter() {
-                //     if let (Some(symbol), Some(ty)) = (
-                //         self.context.variables.key(variable),
-                //         self.typechecker.get_variable_type(variable),
-                //     ) && (matches!(ty, Type::OBJECT(_)) || matches!(ty, Type::STRING))
-                //     {
-                //         bytecode.push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
-                //     }
-                // }
-
-                // if matches!(expr.1.borrow(), Expression::Identifier(_)) {
-                //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
-                // }
-
                 if self.try_emit_tail_call_expr(expr, &mut bytecode) {
                     if self.compiling_result_mode {
                         Self::emit_ok_or_some_wrap(&mut bytecode, false);
@@ -6460,11 +6447,15 @@ impl Compiler {
                     return bytecode;
                 }
 
+                // Evaluate the return value first, then run defers (LIFO).
+                // Each defer thunk returns a sentinel that we POP so the
+                // pending return value stays on top for RETURN.
                 self.append_with_existential_pack(&mut bytecode, expr);
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
                 }
+                self.emit_run_defers(&mut bytecode);
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
                     bytecode.push(Byte::new(Instruction::RETURN));
                 }
@@ -6854,25 +6845,30 @@ impl Compiler {
                 }
             }
             Expression::Defer(child) => {
-                let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
+                // Layout (emitted into `self.bytecode` so nested Blocks that
+                // write in-place stay contiguous with the thunk):
+                //   JMP after_thunk
+                //   <thunk body>          ← fn_defers points here
+                //   CONST 0; RETURN
+                // after_thunk:
+                let jmp_pos = self.bytecode.len();
+                self.bytecode
+                    .push(Byte::new(Instruction::JMP).with_operand_u32(0));
 
-                self.context.defers.push(self.bytecode.len() + body.len());
+                let thunk_start = self.bytecode.len();
+                self.fn_defers.push(thunk_start);
 
-                body.append(&mut self.do_compile(child));
-                body.push(Byte::new_with_value(
+                let mut body_bc = self.do_compile(child);
+                self.bytecode.append(&mut body_bc);
+                self.bytecode.push(Byte::new_with_value(
                     Instruction::CONST,
                     Value::from(0i64).raw() as _,
                 ));
-                body.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
 
-                let total_length = self.bytecode.len();
-                let current_length = body.len() + bytecode.len();
-                if let Some(v) = body.first_mut() {
-                    *v = Byte::new(Instruction::JMP)
-                        .with_operand_u32((total_length + current_length) as u32);
-                }
-
-                bytecode.append(&mut body);
+                let after = self.bytecode.len() as u32;
+                self.bytecode[jmp_pos] =
+                    Byte::new(Instruction::JMP).with_operand_u32(after);
             }
             Expression::Call { name, args } => {
                 // `assert` from `prelude::test` (auto-imported).

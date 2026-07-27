@@ -105,7 +105,7 @@ declaration ::= class_decl
               | use_stmt
               | mod_stmt
               | enum_decl
-              | defer_stmt          // at declaration level in parser chain
+              | defer_stmt          // also a statement inside function bodies
               | extern_block
               | statement
 ```
@@ -392,6 +392,7 @@ statement ::= while_stmt
             | block
             | let_stmt
             | const_stmt
+            | defer_stmt
             | expr_stmt
             | print_stmt
             | return_stmt
@@ -403,6 +404,7 @@ statement ::= while_stmt
 | `let` | `let IDENT (':' type_annotation)? ('=' expr)? ';'` |
 | `const` | `const IDENT (':' type_annotation)? '=' expr ';'` |
 | `static` | `static let IDENT …` / `static const IDENT …` (top-level only) |
+| `defer` | `defer { statement* }` (runs on enclosing function exit, LIFO) |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |

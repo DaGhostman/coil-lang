@@ -333,6 +333,35 @@ fn example_match_block_self_prints_5() {
 }
 
 #[test]
+fn example_defer_prints_enterleave_lifo_and_early_return() {
+    let output = run_example("examples/defer.hy");
+    assert_eq!(output, "enterleave,021,okd7,d99");
+}
+
+/// Regression: `defer` inside a function must run on early `return`, not
+/// only on fall-through.
+#[test]
+fn defer_runs_on_early_return() {
+    let output = run_example_src(
+        r#"
+fn f(int n) -> int {
+    defer { print "d"; }
+    if n == 0 {
+        return 1;
+    }
+    return 2;
+}
+
+fn main() {
+    print "%i,", f(0);
+    print "%i", f(9);
+}
+"#,
+    );
+    assert_eq!(output, "d1,d2");
+}
+
+#[test]
 fn example_generic_alias_prints_7() {
     let output = run_example("examples/generic_alias.hy");
     assert_eq!(output, "7");
