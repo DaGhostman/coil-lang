@@ -496,6 +496,24 @@ roots = ["./src"]
 fn parse_fail_dependency_emits_single_diagnostic() {
     // discover_all emits parse errors and must not re-enqueue the bad file
     // for compile_file (which would duplicate the same diagnostic).
+    use reporting::ReportConfig;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     let manifest = r#"
 [module]
 roots = ["./src"]
@@ -505,40 +523,39 @@ roots = ["./src"]
         ("src/bad.hy", "@@@ not valid coil\n"),
     ];
     let (root, entry) = build_project("parse_fail_dep", manifest, files, "src/main.hy");
-    let msgs = compile_project_errors(&root, &entry);
-    let bad_msgs: Vec<_> = msgs
-        .iter()
-        .filter(|m| {
-            m.contains("bad.hy")
-                || m.contains("unexpected")
-                || m.contains("expected")
-                || m.contains("parse")
-                || m.contains("@")
-        })
-        .collect();
-    assert!(
-        !msgs.is_empty(),
-        "expected at least one diagnostic for unparseable dependency"
-    );
-    // Prefer a tight count when we can attribute messages to the bad file;
-    // otherwise ensure we did not flood with duplicates of the same text.
-    if !bad_msgs.is_empty() {
-        let unique: std::collections::BTreeSet<_> = bad_msgs.iter().map(|m| m.as_str()).collect();
-        assert_eq!(
-            bad_msgs.len(),
-            unique.len(),
-            "duplicate parse diagnostics for bad.hy: {:?}",
-            bad_msgs
-        );
-    } else {
-        let unique: std::collections::BTreeSet<_> = msgs.iter().map(|m| m.as_str()).collect();
-        assert_eq!(
-            msgs.len(),
-            unique.len(),
-            "duplicate diagnostics (likely discover+compile double emit): {:?}",
-            msgs
-        );
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
+    let _guard = CwdGuard(original_cwd);
+
+    let capture = Capture::default();
+    let mut pipeline =
+        Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
+    let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
+    assert!(result.is_err(), "expected compile to fail on bad dependency");
+    let _ = pipeline.finish_reporting();
+    let out = String::from_utf8_lossy(&capture.inner.lock().unwrap()).into_owned();
+    assert!(
+        out.contains("Parse error") || out.contains("E0001"),
+        "expected parse diagnostic in sink output, got: {out:?}"
+    );
+    let parse_hits = out.matches("Parse error").count() + out.matches("E0001").count();
+    // Pretty sink prints both the code and "Parse error" once per diagnostic.
+    assert!(
+        parse_hits <= 2,
+        "parse diagnostic appears duplicated (discover+compile): hit_count={parse_hits}, out={out:?}"
+    );
+    assert!(
+        out.contains("bad.hy"),
+        "diagnostic should name the unparseable dependency: {out:?}"
+    );
 }
 
 #[test]
@@ -567,7 +584,7 @@ file = "./src/main.hy"
     }
     let _guard = CwdGuard(original_cwd);
 
-    let pipeline = Pipeline::new();
+    let mut pipeline = Pipeline::new();
     let entry = pipeline
         .manifest_entry_path()
         .expect("manifest should declare [entry].file");
@@ -576,8 +593,10 @@ file = "./src/main.hy"
         "expected project-root-joined entry, got {}",
         entry.display()
     );
-    assert!(entry.is_absolute() || entry.exists());
-    let output = run_project(&root, &entry);
+    let (bytecode, constants) = pipeline
+        .compile_src_from_file(entry.to_str().unwrap())
+        .expect("manifest entry should compile");
+    let output = run_bytecode(bytecode, constants, &pipeline);
     assert_eq!(output, "42");
 }
 
