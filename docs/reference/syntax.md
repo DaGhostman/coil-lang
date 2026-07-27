@@ -366,6 +366,8 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
+Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::*;` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
+
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
 parse path — see [Traits and impl](#traits-and-impl) above.
 
