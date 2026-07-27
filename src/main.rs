@@ -357,6 +357,73 @@ fn archive_mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// True when `path` refers to the same file as `other` (best-effort).
+fn same_source_path(path: &str, other: &str) -> bool {
+    if path == other {
+        return true;
+    }
+    let a = Path::new(path);
+    let b = Path::new(other);
+    if a.file_name() != b.file_name() {
+        return false;
+    }
+    // Compare canonical paths when both exist; fall back to suffix match for
+    // archive-relative paths (`examples/foo.hy`) vs CLI args (`./examples/foo.hy`).
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    let a_s = a.to_string_lossy().replace('\\', "/");
+    let b_s = b.to_string_lossy().replace('\\', "/");
+    a_s.ends_with(b_s.trim_start_matches("./")) || b_s.ends_with(a_s.trim_start_matches("./"))
+}
+
+/// Whether the cached `out.hyc` must be rebuilt for `entry`.
+///
+/// Invalidates when:
+/// - the entry file is newer than the archive
+/// - **any** source recorded in the archive is newer (multi-file modules)
+/// - the entry is not among the archive's `source_files` (different program
+///   was compiled into the shared `out.hyc` path — e.g. ran `A.hy` then `B.hy`)
+/// - a recorded source file is missing
+fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
+    let Some(arch_mtime) = archive_mtime(archive) else {
+        return true;
+    };
+
+    if debug.source_files.is_empty() {
+        return match archive_mtime(entry) {
+            Some(src) => src > arch_mtime,
+            None => true,
+        };
+    }
+
+    let entry_known = debug
+        .source_files
+        .iter()
+        .any(|s| same_source_path(s, entry));
+    if !entry_known {
+        return true;
+    }
+
+    for src in &debug.source_files {
+        match archive_mtime(src) {
+            Some(m) if m > arch_mtime => return true,
+            None => {
+                // Relative paths in the archive are project-root relative;
+                // also try as-is next to cwd (CLI often runs from repo root).
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    match archive_mtime(entry) {
+        Some(src) => src > arch_mtime,
+        None => false,
+    }
+}
+
+/// Legacy helper kept for unit tests: entry-only mtime compare.
 fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
     match (archive_mtime(archive), archive_mtime(filename)) {
         (Some(arch), Some(src)) => src > arch,
@@ -410,7 +477,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
             );
             true
         }
-        Ok(_) => source_newer_than_archive(filename, DEFAULT_OUT),
+        Ok((_, _, _, debug)) => archive_is_stale(filename, DEFAULT_OUT, debug),
     };
 
     if recompile {
@@ -1140,6 +1207,63 @@ mod tests {
         assert!(!source_newer_than_archive(
             dir.join("nope.hy").to_str().unwrap(),
             arch.to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_when_entry_not_in_source_files() {
+        let dir = unique_tmp("stale_entry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.hy");
+        let b = dir.join("b.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&a, b"fn main() {}").unwrap();
+        std::fs::write(&b, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![a.to_string_lossy().into_owned()],
+            debug_locs: vec![],
+        };
+        // Running b.hy against an archive built from a.hy must rebuild.
+        assert!(archive_is_stale(
+            b.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        // Same entry, sources not newer => fresh.
+        assert!(!archive_is_stale(
+            a.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_when_dependency_source_newer() {
+        let dir = unique_tmp("stale_dep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let dep = dir.join("worker.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&dep, b"fn w() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Touch only the dependency — entry mtime stays older than the archive.
+        std::fs::write(&dep, b"fn w() { /* edited */ }").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![
+                entry.to_string_lossy().into_owned(),
+                dep.to_string_lossy().into_owned(),
+            ],
+            debug_locs: vec![],
+        };
+        assert!(archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }

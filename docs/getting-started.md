@@ -150,7 +150,9 @@ rm -f out.hyc
 cargo run -- examples/fib.hy
 ```
 
-The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source. The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
+The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, **older than any source file recorded in the archive** (entry *and* imported modules), or was built for a **different entry** than the one you are running (the shared `out.hyc` path is not per-file). The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
+
+If worker/`use` modules change and prints or behavior look “stuck” or intermittent across runs, stale `out.hyc` is a common false lead — `join` always waits for the worker to finish.
 
 ## A simpler hello-world
 
