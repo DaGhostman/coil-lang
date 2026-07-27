@@ -237,6 +237,14 @@ pub enum Instruction {
 
     /// TailCall: same packing as CALL — reuse frame (self tail recursion).
     TailCall,
+
+    // Primitive casts — append-only (`expr as int` / `Into` thunks).
+    CastIntToFloat,
+    CastFloatToInt,
+    CastIntToByte,
+    CastByteToInt,
+    CastIntToBool,
+    CastBoolToInt,
 }
 
 impl From<u8> for Instruction {
