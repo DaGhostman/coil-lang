@@ -9101,15 +9101,18 @@ test("two") { assert(true)?; }
             "float mul must not emit SHL; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
+        let has_mulf = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MULF)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::MULF as u8)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::MULF as u8)
+                || (*b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::MULF as u8)
+        });
         assert!(
-            bc.iter().any(|b| matches!(
-                b.bytecode(),
-                Instruction::MULF
-                    | Instruction::BinSlotImm
-                    | Instruction::BinSlotSlot
-                    | Instruction::BinReturn
-            )),
-            "expected a float mul opcode path; opcodes: {:?}",
+            has_mulf,
+            "expected MULF (bare or fused) for float mul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
