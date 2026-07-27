@@ -51,7 +51,7 @@ Example:
 roots = ["./src", "./vendor", "./builtins"]
 ```
 
-Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the compiler looks for `<root>/foo/bar.hy` under each root **in order**. The first existing file wins.
+Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the compiler looks under each root **in order** for `<root>/foo/bar.hy` (one-item-per-file), then falls back to `<root>/foo.hy` (module file). The first existing path wins; see [Discovery algorithm](#discovery-algorithm).
 
 If the `[module]` section is omitted entirely, roots default to `["src"]`.
 
@@ -70,12 +70,20 @@ Example:
 file = "./src/main.hy"
 ```
 
-When set, the compiler uses this file as the program entry point (jumps to `main` in that file).
+When set, `coil` and `coil compile` with **no file argument** use this path as the program entry (relative to the project root that owns `coil.toml`).
 
-When omitted, the entry file is whatever you pass on the command line:
+When omitted, you must pass the entry file on the command line:
 
 ```bash
-cargo run -- examples/modules.hy
+coil examples/modules.hy
+# or
+coil compile examples/modules.hy
+```
+
+```bash
+# with [entry] file = "./src/main.hy" in coil.toml:
+coil
+coil compile
 ```
 
 ---
@@ -104,14 +112,15 @@ roots = ["./src", "./vendor", "./builtins"]
 
 ## Discovery algorithm
 
-Given a `use a::b::c;` statement and roots `["./src", "./vendor", "./builtins"]`:
+Given a `use a::b::c;` statement and roots `["./src", "./vendor", "./builtins"]`.
+Resolution matches the [modules reference](modules.md#path-resolution-algorithm): **one-item-per-file first**, then a **module-file** fallback. When both `<root>/foo/item.hy` and `<root>/foo.hy` exist, the item file wins (see shadowing note in modules.md). **Migration:** if a project accidentally kept both layouts, `use foo::item` silently binds the item file after this change — delete or rename the unused path.
 
 ### Step 1 — Split the import path
 
 - Directory path segments: `["a", "b"]`
 - Item name (last segment): `"c"`
 
-### Step 2 — Search each root in order
+### Step 2 — Search each root in order (Convention A)
 
 For root `./src`:
 
@@ -131,6 +140,18 @@ Then `./builtins`:
 ./builtins/a/b/c.hy
 ```
 
+### Step 2b — Module-file fallback (Convention B)
+
+If no one-item-per-file candidate exists in any root, try each root again for the parent module file (directory path only):
+
+```
+./src/a/b.hy     → exists? use this file (item `c` lives inside)
+./vendor/a/b.hy
+./builtins/a/b.hy
+```
+
+Example: `use math::add;` with only `./src/math.hy` present resolves to that file (namespace `math`, FQN `math::add`).
+
 ### Step 3 — First match wins
 
 Stop at the first path that exists on disk. That file is loaded and compiled.
@@ -141,6 +162,7 @@ Strip the matching root prefix, remove `.hy`, replace `/` with `::`:
 
 ```
 ./src/a/b/c.hy  →  namespace "a::b::c"
+./src/a/b.hy    →  namespace "a::b"     (module-file fallback)
 ```
 
 ### Glob imports

@@ -92,6 +92,8 @@ pub struct Manifest {
     pub entry: Option<PathBuf>,
     /// Extra directories searched when resolving FFI library paths.
     pub ffi_search_paths: Vec<PathBuf>,
+    /// When false, `env::exec` fails at runtime with `ExecDisabled`.
+    pub allow_exec: bool,
 }
 
 impl Default for Manifest {
@@ -103,6 +105,7 @@ impl Default for Manifest {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         }
     }
 }
@@ -153,6 +156,7 @@ impl Manifest {
         let mut roots: Option<Vec<PathBuf>> = None;
         let mut entry: Option<PathBuf> = None;
         let mut ffi_search_paths: Option<Vec<PathBuf>> = None;
+        let mut allow_exec: Option<bool> = None;
         let mut current_section: Option<&'static str> = None;
 
         for (idx, raw_line) in source.lines().enumerate() {
@@ -172,6 +176,7 @@ impl Manifest {
                     "module" => Some("module"),
                     "entry" => Some("entry"),
                     "ffi" => Some("ffi"),
+                    "env" => Some("env"),
                     other => {
                         return Err(ManifestError::Parse {
                             line: line_num,
@@ -215,6 +220,13 @@ impl Manifest {
                     })?;
                     ffi_search_paths = Some(parsed.into_iter().map(PathBuf::from).collect());
                 }
+                ("env", "allow_exec") => {
+                    let parsed = parse_bool(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected `true` or `false`, got `{}`", value),
+                    })?;
+                    allow_exec = Some(parsed);
+                }
                 (section, key) => {
                     return Err(ManifestError::Parse {
                         line: line_num,
@@ -228,6 +240,7 @@ impl Manifest {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
             ffi_search_paths: ffi_search_paths.unwrap_or_default(),
+            allow_exec: allow_exec.unwrap_or(true),
         })
     }
 
@@ -240,33 +253,51 @@ impl Manifest {
     /// item name (e.g. `["a", "b"]` for `use a::b::c;`).
     /// `name` is the final segment (e.g. `"c"`).
     ///
-    /// The file containing the module is the LAST
-    /// segment of the dotted path (as a file stem). For
-    /// `use foo::sadge;`, the file is `foo.hy` (NOT
-    /// `foo/sadge.hy`). For `use lib::io::read;`, the
-    /// file is `io.hy` inside `lib/` (so the full path
-    /// is `<root>/lib/io.hy`).
+    /// Resolution tries, in order:
+    /// 1. **One-item-per-file:** `<root>/<path>/<name>.hy`
+    ///    (e.g. `use foo::sadge;` → `foo/sadge.hy`)
+    /// 2. **Item-in-module-file:** `<root>/<path>.hy`
+    ///    (e.g. `use foo::sadge;` → `foo.hy` when the item
+    ///    `sadge` lives inside that module file)
     ///
-    /// The fully qualified name of the imported item is
-    /// `<file's path>::<name>` — the file's directory
-    /// path is the namespace, and the function name is
-    /// the LAST segment. So `sadge` in `foo.hy` has
-    /// FQN `foo::sadge`, and `read` in `lib/io.hy` has
-    /// FQN `lib::io::read`.
+    /// If both exist, Convention A wins silently (documented in
+    /// `docs/reference/modules.md` under Path resolution /
+    /// Shadowing). Brace/glob imports against a module file are
+    /// unaffected when only Convention B is present.
+    ///
+    /// The fully qualified name of the imported item depends
+    /// on which file was loaded — see codegen's alias map.
     pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
+        // Convention A — one item per file (preferred when both A and B exist):
+        //   `use foo::sadge;` → `<root>/foo/sadge.hy`
+        //   `use lib::io::read;` → `<root>/lib/io/read.hy`
         for root in &self.roots {
             let mut candidate = project_root.join(root);
             for segment in path {
                 candidate.push(segment);
             }
-            // The file is `name.hy` inside the directory
-            // `<root>/<path joined>`. So for `use
-            // foo::sadge;`, file = `<root>/foo/sadge.hy`.
-            // For `use lib::io::read;`, file =
-            // `<root>/lib/io/read.hy`.
             candidate.push(format!("{}.hy", name));
             if candidate.exists() {
                 return Some(candidate);
+            }
+        }
+        // Convention B — item inside a module file (same file as
+        // `use path::*;`). Without this fallback, modules that live
+        // under a search root as `foo.hy` are only reachable via glob,
+        // never via `use foo::item;` / `use foo::{item, …};`.
+        //   `use foo::sadge;` → `<root>/foo.hy` (when foo/sadge.hy is absent)
+        //   `use lib::io::read;` → `<root>/lib/io.hy`
+        if let Some(module_stem) = path.last() {
+            let dir_segments = &path[..path.len() - 1];
+            for root in &self.roots {
+                let mut candidate = project_root.join(root);
+                for segment in dir_segments {
+                    candidate.push(segment);
+                }
+                candidate.push(format!("{}.hy", module_stem));
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -347,6 +378,14 @@ fn parse_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     let inner = trimmed.strip_prefix('"')?.strip_suffix('"')?;
     Some(inner.to_string())
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse a TOML-like array of double-quoted strings:
@@ -513,6 +552,7 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("vendor")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
@@ -521,6 +561,50 @@ mod tests {
         );
         let resolved = resolved.unwrap();
         assert!(resolved.ends_with("vendor/lib_x/foo.hy"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_use_falls_back_to_module_file() {
+        // Layout: <tmp>/src/foo.hy (no foo/sadge.hy).
+        // `use foo::sadge;` should resolve to foo.hy.
+        let tmp = std::env::temp_dir().join("coil_manifest_test_module_file");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("foo.hy"), "fn sadge() {}\n").unwrap();
+
+        let m = Manifest::default();
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
+        assert!(
+            resolved.is_some(),
+            "expected to fall back to <tmp>/src/foo.hy"
+        );
+        assert!(resolved.unwrap().ends_with("src/foo.hy"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_use_prefers_one_item_file_over_module_file() {
+        // Both Convention A (`foo/sadge.hy`) and B (`foo.hy`) exist —
+        // A must win so FQN/body resolution stays deterministic.
+        let tmp = std::env::temp_dir().join("coil_manifest_test_prefers_a");
+        let src = tmp.join("src");
+        let sub = src.join("foo");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(src.join("foo.hy"), "fn sadge() { /* module file */ }\n").unwrap();
+        std::fs::write(sub.join("sadge.hy"), "fn sadge() { /* one-item */ }\n").unwrap();
+
+        let m = Manifest::default();
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
+        assert!(resolved.is_some());
+        let path = resolved.unwrap();
+        assert!(
+            path.ends_with("src/foo/sadge.hy"),
+            "expected Convention A path, got {}",
+            path.display()
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -564,6 +648,7 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("builtins")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, Some("core::ffi::dload".to_string()));
@@ -583,6 +668,7 @@ mod tests {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, None);
@@ -598,6 +684,21 @@ mod tests {
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
         assert_eq!(m.entry, None);
+        assert!(m.allow_exec);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_reads_env_allow_exec_false() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_env");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[env]\nallow_exec = false\n[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+        let m = Manifest::load(&tmp).unwrap();
+        assert!(!m.allow_exec);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -13,9 +13,10 @@ roots = ["./src", "./vendor", "./builtins"]
 # The default roots (when no `coil.toml` exists) are just `["src"]`.
 
 [entry]
-# Optional: the entry-point file. The compiler jumps straight to
-# `main` in this file. If omitted, the entry is the file passed on
-# the command line (e.g. `coil examples/foo.hy`).
+# Optional: the entry-point file. When set, `coil` / `coil compile`
+# with no file argument use this path (relative to the project root).
+# If omitted, you must pass the entry on the command line
+# (e.g. `coil examples/foo.hy`).
 # file = "./src/main.hy"
 
 # --------------------------------------------------------------------------
@@ -25,39 +26,49 @@ roots = ["./src", "./vendor", "./builtins"]
 # Given `use foo::bar::baz;` and the roots above, the compiler
 # searches, in order:
 #
-#   1. ./src/foo/bar/baz.hy
-#   2. ./vendor/foo/bar/baz.hy
-#   3. ./builtins/foo/bar/baz.hy
+#   1. ./src/foo/bar/baz.hy          (one-item-per-file)
+#   2. ./src/foo/bar.hy              (item inside module file)
+#   3. ./vendor/... then ./builtins/...
 #
 # The first file that exists wins. The file's namespace is the path
 # RELATIVE to the matching root, with the extension stripped and
 # `/` replaced with `::`. So `./src/foo/bar/baz.hy` lives in
 # namespace `foo::bar::baz`, and its top-level `fn helper()` is
-# bytecode-named `foo::bar::baz::helper`.
+# bytecode-named `foo::bar::baz::helper`. A top-level `fn baz` in
+# `./src/foo/bar.hy` is named `foo::bar::baz`.
 #
 # --------------------------------------------------------------------------
 # Glob imports
 # --------------------------------------------------------------------------
 #
-# `use foo::bar::*;` triggers the loader to compile `foo/bar.hy`,
-# but does NOT pull its items into the current scope. After a
-# glob, you must use the fully qualified name:
+# `use foo::bar::*;` loads `foo/bar.hy` and brings every top-level
+# item from that file into scope by its bare name:
 #
 #     use foo::bar::*;
 #     fn main() {
-#         foo::bar::some_helper();
+#         some_helper();   // from foo/bar.hy
 #     }
 #
-# Future versions will support auto-importing glob items; for now,
-# use `use foo::bar::{name1 as x, name2 as y};` to bring specific
-# items into scope.
+# Glob imports are file-scoped — they do not reach into `foo/bar/`.
+#
+# --------------------------------------------------------------------------
+# Brace-group imports
+# --------------------------------------------------------------------------
+#
+# Import several items from the same module in one statement:
+#
+#     use math::{add, mul as product};
+#
+# This desugars to `use math::add;` + `use math::mul as product;`.
+# When `math.hy` exports both functions (and `math/add.hy` does not
+# exist), both resolve to the same module file.
 #
 # --------------------------------------------------------------------------
 # Aliasing
 # --------------------------------------------------------------------------
 #
 # `use foo::bar as baz;` brings `bar` into scope as `baz`. Calls
-# to `baz()` resolve to the qualified name `foo::bar`.
+# to `baz()` resolve to the qualified name for that item.
 #
 # `use builtins::core::ffi::dload as loadlib;` lets the user rename
 # a builtin to avoid conflicts (e.g., when a user function is also
@@ -74,4 +85,7 @@ roots = ["./src", "./vendor", "./builtins"]
 #   preludes = ["./stdlib"]  # auto-imported in every file
 #   strict   = true          # reject undefined names at typecheck
 #
-# These are recognized by the parser but currently ignored.
+#   [env]
+#   allow_exec = false       # disable env::exec at runtime (compile still warns)
+#
+# These keys are not accepted yet (unknown keys are a parse error).

@@ -128,9 +128,9 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Not(e)
         | Expression::LogicalNot(e)
         | Expression::Positive(e)
-        | Expression::Adjust { target: e, .. }
-        | Expression::Defer(e)
-        | Expression::Member(e) => pre_walk(e, table),
+            | Expression::Adjust { target: e, .. }
+            | Expression::Member(e) => pre_walk(e, table),
+        Expression::Defer { body, .. } => pre_walk(body, table),
 
         Expression::CompoundAssign(name, _, value) => {
             pre_walk(name, table);

@@ -997,6 +997,10 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(target, arg), e| (e.span(), Box::new(Expression::Resume(target, arg))))
     }
 
+    /// `defer { … }` or `defer use (a, b) { … }`.
+    ///
+    /// Optional `use (id, …)` after `defer` lists explicit captures from the
+    /// enclosing function (same keyword and list shape as lambda captures).
     fn defer<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -1006,9 +1010,27 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        let captures = keyword!("use")
+            .ignore_then(
+                text::ident()
+                    .padded()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default());
+
         keyword!("defer")
-            .ignore_then(self.block(stmt))
-            .map_with(output!(Defer))
+            .ignore_then(captures)
+            .then(self.block(stmt))
+            .map_with(|(captures, body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Defer { captures, body }),
+                )
+            })
     }
 
     fn while_<
@@ -1295,6 +1317,9 @@ impl<'pratt> Pratt<'pratt> {
                 self.raise_().then_ignore(op!(';')),
                 self.panic_().then_ignore(op!(';')),
                 self.yield_().then_ignore(op!(';')),
+                // `defer { … }` before `expr_statement` so `defer` is not
+                // parsed as a bare identifier call / expression.
+                self.defer(stmt.clone()),
                 self.expr_statement(),
                 self.comment(),
             ))
@@ -1394,93 +1419,127 @@ impl<'pratt> Pratt<'pratt> {
             .labelled("type alias")
     }
 
-    /// `use path::item;`, `use path::item as alias;`, or `use path::*;`.
+    /// `use path::item;`, `use path::item as alias;`, `use path::*;`,
+    /// or `use path::{a, b as c};` (brace-group import).
     fn use_(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // A path segment is one ident. The path is
-        // `ident (:: ident)* (:: *)?`. Each `::` is
-        // followed by either another ident or a `*`
-        // (glob marker).
         let segment = text::ident().padded();
 
-        // Each `::`-prefixed piece is either an ident or
-        // a `*`. We represent both as `Option<String>`:
-        // `Some(name)` for an ident, `None` for the glob
-        // marker. The first ident is consumed outside the
-        // loop (so we have at least one segment before
-        // any `::` is seen).
-        let path_tail = op!("::")
-            .ignore_then(
-                choice((
-                    text::ident().padded().map(|s: &str| Some(s.to_string())),
-                    just('*').padded().to(None),
-                ))
-                .map_with(|opt, e| (e.span(), opt)),
-            )
-            .repeated()
-            .collect::<Vec<_>>();
-
-        // Path = first ident + zero or more `::` pieces.
-        keyword!("use")
-            .ignore_then(segment.then(path_tail))
-            .map(
-                |(first, rest): (&'pratt str, Vec<(SimpleSpan, Option<String>)>)| {
-                    let mut out: Vec<Option<String>> = Vec::with_capacity(1 + rest.len());
-                    out.push(Some(first.to_string()));
-                    for (_span, opt) in rest {
-                        out.push(opt);
-                    }
-                    out
-                },
-            )
-            // After the path: either `as alias` (alias form)
-            // or nothing (concrete form). The glob marker
-            // (`*`) was consumed inside the path_tail above.
-            // The trailing `;` is consumed by the outer
-            // `.then_ignore(op!(";"))` below — we must NOT
-            // consume it here.
+        // One item inside `{ … }`: `name` or `name as alias`.
+        let brace_item = text::ident()
+            .padded()
             .then(
                 keyword!("as")
                     .ignore_then(text::ident().padded())
                     .map(|s: &str| s.to_string())
                     .or_not(),
             )
-            .then_ignore(op!(";"))
-            .map_with(|(segments, alias), e| {
-                // Walk the segments. The last segment is
-                // either:
-                //   - Some(name) — concrete import.
-                //   - None — glob (`use foo::bar::*;`).
-                // All earlier segments form the path.
-                let mut segs = segments;
-                let last = segs
-                    .pop()
-                    .expect("at least one segment from the leading ident");
-                let path: Vec<String> = segs
-                    .into_iter()
-                    .map(|opt| opt.expect("only the LAST segment may be a glob"))
-                    .collect();
+            .map(|(name, alias): (&str, Option<String>)| (name.to_string(), alias));
 
-                if let Some(name) = last {
-                    // Concrete import. Alias is whatever
-                    // the `as` clause produced.
-                    (e.span(), Box::new(Expression::Use { path, name, alias }))
-                } else {
-                    // Glob import. `alias` is always None
-                    // (a glob can't be aliased — the
-                    // alias would have nothing to bind
-                    // to, since glob imports are resolved
-                    // by the pipeline at compile time).
-                    (
-                        e.span(),
-                        Box::new(Expression::Use {
-                            path,
-                            name: "*".to_string(),
-                            alias: None,
-                        }),
-                    )
+        // Empty `{ }` is a parse error (silent no-op would hide typos).
+        let brace_group = just('{')
+            .padded()
+            .ignore_then(
+                brace_item
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just('}').padded());
+
+        // After the first ident: zero or more `::ident`, then either
+        // `::{…}`, `::*`, or end-of-path (+ optional `as`).
+        let path_middle = op!("::")
+            .ignore_then(text::ident().padded().map(|s: &str| s.to_string()))
+            .repeated()
+            .collect::<Vec<String>>();
+
+        #[derive(Clone)]
+        enum EndKind {
+            Brace(Vec<(String, Option<String>)>),
+            Glob,
+            Concrete(Option<String>),
+        }
+
+        let path_end = choice((
+            // `::{a, b as c}`
+            op!("::")
+                .ignore_then(brace_group)
+                .map(EndKind::Brace),
+            // `::*`
+            op!("::")
+                .ignore_then(just('*').padded())
+                .to(EndKind::Glob),
+            // bare end — optional `as alias`
+            keyword!("as")
+                .ignore_then(text::ident().padded())
+                .map(|s: &str| s.to_string())
+                .or_not()
+                .map(EndKind::Concrete),
+        ));
+
+        keyword!("use")
+            .ignore_then(segment.then(path_middle).then(path_end))
+            .then_ignore(op!(";"))
+            .map_with(
+                |((first, middle), end): ((&str, Vec<String>), EndKind), e| {
+                let span = e.span();
+                match end {
+                    EndKind::Brace(items) => {
+                        // `use foo::bar::{a, b as c};` → path = [foo, bar]
+                        let mut path = Vec::with_capacity(1 + middle.len());
+                        path.push(first.to_string());
+                        path.extend(middle);
+                        if items.len() == 1 {
+                            let (name, alias) = items.into_iter().next().unwrap();
+                            return (span, Box::new(Expression::Use { path, name, alias }));
+                        }
+                        let children: Vec<Output<'pratt>> = items
+                            .into_iter()
+                            .map(|(name, alias)| {
+                                (
+                                    span,
+                                    Box::new(Expression::Use {
+                                        path: path.clone(),
+                                        name,
+                                        alias,
+                                    }),
+                                )
+                            })
+                            .collect();
+                        (span, Box::new(Expression::Fragment(children)))
+                    }
+                    EndKind::Glob => {
+                        let mut path = Vec::with_capacity(1 + middle.len());
+                        path.push(first.to_string());
+                        path.extend(middle);
+                        (
+                            span,
+                            Box::new(Expression::Use {
+                                path,
+                                name: "*".to_string(),
+                                alias: None,
+                            }),
+                        )
+                    }
+                    EndKind::Concrete(alias) => {
+                        // `use foo;` / `use foo::bar;` / `use foo::bar as x;`
+                        let mut segs = Vec::with_capacity(1 + middle.len());
+                        segs.push(first.to_string());
+                        segs.extend(middle);
+                        let name = segs.pop().expect("at least the leading ident");
+                        (
+                            span,
+                            Box::new(Expression::Use {
+                                path: segs,
+                                name,
+                                alias,
+                            }),
+                        )
+                    }
                 }
             })
             .labelled("use statement")
@@ -2684,6 +2743,13 @@ impl<'pratt> Pratt<'pratt> {
 
     /// `pattern => expr` — one arm inside a `match` block.
     ///
+    /// Arm bodies may be a brace block `{ e; … }` (expression
+    /// sequence, same shape as lambda brace bodies) or any other
+    /// `expr`. The brace form is tried **before** the general
+    /// `expr` so that `{ self.foo(); x }` is a block rather than a
+    /// dict literal (dicts require `name: value` fields and would
+    /// otherwise report `found '.' expected ':'` on `self.method()`).
+    ///
     /// Returns a [`MatchArm`] directly (not an `Output`) because
     /// patterns are not expressions and don't carry a span.
     fn arm<
@@ -2696,9 +2762,21 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>>
     + Clone
     + 'pratt {
+        // Brace body built from the recursive `expr` — do NOT call
+        // `self.statement()` here (match lives inside `expr()`; that
+        // would re-enter `statement()` → `expr()` during parser
+        // construction and overflow the stack).
+        let brace_body = expr
+            .clone()
+            .then_ignore(op!(';').or_not())
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map_with(|children, e| (e.span(), Box::new(Expression::Block(children))));
+
         self.pattern()
             .then_ignore(op!("=>"))
-            .then(expr)
+            .then(choice((brace_body, expr)))
             .map_with(|(pattern, body), _| MatchArm { pattern, body })
     }
 
@@ -3010,6 +3088,74 @@ mod tests {
         stmt!("print \"Hello, World!\";");
         stmt!("defer { print \"%i\", 42; }");
         stmt!("while x < 10 { x = x + 1; }");
+    }
+
+    #[test]
+    fn defer_parses_inside_function_body() {
+        // Regression: `defer` must be a statement, not only a top-level
+        // declaration — otherwise `defer {` inside `fn` fails looking for `:`.
+        let ast = decl_ast!(
+            "fn f() { defer { print \"x\"; } print \"y\"; }"
+        );
+        match ast {
+            Expression::Function { body: Some(body), .. } => {
+                let Expression::Block(items) = body.1.as_ref() else {
+                    panic!("expected function body block, got {:?}", body.1);
+                };
+                assert!(
+                    items.iter().any(|item| {
+                        matches!(item.1.as_ref(), Expression::Defer { .. })
+                            || matches!(
+                                item.1.as_ref(),
+                                Expression::Statement(inner)
+                                    if matches!(inner.1.as_ref(), Expression::Defer { .. })
+                            )
+                    }),
+                    "expected a Defer node in the function body, got {:?}",
+                    items
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defer_use_parses_captures() {
+        let ast = decl_ast!(
+            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
+        );
+        match ast {
+            Expression::Function { body: Some(body), .. } => {
+                let Expression::Block(items) = body.1.as_ref() else {
+                    panic!("expected function body block, got {:?}", body.1);
+                };
+                let defer = items.iter().find_map(|item| match item.1.as_ref() {
+                    Expression::Defer { captures, .. } => Some(captures.as_slice()),
+                    Expression::Statement(inner) => match inner.1.as_ref() {
+                        Expression::Defer { captures, .. } => Some(captures.as_slice()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                assert_eq!(defer, Some(["x"].as_slice()));
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defer_use_display_round_trips() {
+        // Block Display omits braces; just check the capture list renders.
+        let ast = decl_ast!(
+            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
+        );
+        let rendered = format!("{}", ast);
+        assert!(
+            rendered.contains("defer use (x)"),
+            "expected Display to include capture list, got {rendered}"
+        );
+        // Bare defer still parses.
+        let _ = stmt!("defer { print \"x\"; }");
     }
 
     #[test]
@@ -3407,6 +3553,80 @@ mod tests {
                     Expression::Identifier(n) => assert_eq!(*n, "v"),
                     other => panic!("expected Identifier(v), got {:?}", other),
                 }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_parses_as_block_not_dict() {
+        let ast = expr_ast!("match x { Option::None => { 0 }, Option::Some(v) => { v } }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                assert!(
+                    matches!(arms[0].body.1.as_ref(), Expression::Block(_)),
+                    "brace arm body should be Block, got {}",
+                    arms[0].body.1
+                );
+                assert!(
+                    matches!(arms[1].body.1.as_ref(), Expression::Block(_)),
+                    "brace arm body should be Block, got {}",
+                    arms[1].body.1
+                );
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_allows_field_access_like_self_method() {
+        // Regression: `{ self.get() }` used to parse as a dict and fail with
+        // `found '.' expected ':'` because dict fields require `name: value`.
+        let ast = expr_ast!("match m { Mode::Zero => { self.get() }, Mode::Other(n) => n }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 1);
+                    let s = children[0].1.to_string();
+                    assert!(
+                        s.contains("self") && s.contains("get"),
+                        "expected self.get() in block, got {s}"
+                    );
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_dict_literal_still_parses() {
+        let ast = expr_ast!("match m { Mode::Zero => { x: 0 }, Mode::Other(n) => { x: n } }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert!(
+                    matches!(arms[0].body.1.as_ref(), Expression::Dict(_)),
+                    "dict arm body should stay Dict, got {}",
+                    arms[0].body.1
+                );
+                assert!(
+                    matches!(arms[1].body.1.as_ref(), Expression::Dict(_)),
+                    "dict arm body should stay Dict, got {}",
+                    arms[1].body.1
+                );
             }
             other => panic!("expected Match, got {:?}", other),
         }
@@ -4342,6 +4562,87 @@ mod tests {
                     assert!(alias.is_none());
                 }
                 other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group() {
+        let src = "use foo::{sadge, greet as g};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Use { path, name, alias } => {
+                            assert_eq!(path, &["foo".to_string()]);
+                            assert_eq!(name, "sadge");
+                            assert!(alias.is_none());
+                        }
+                        other => panic!("expected first Use, got {:?}", other),
+                    }
+                    match children[1].1.as_ref() {
+                        Expression::Use { path, name, alias } => {
+                            assert_eq!(path, &["foo".to_string()]);
+                            assert_eq!(name, "greet");
+                            assert_eq!(alias.as_deref(), Some("g"));
+                        }
+                        other => panic!("expected second Use, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment of Uses, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group_rejects_empty() {
+        let src = "use foo::{};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        assert!(
+            result.is_err(),
+            "empty brace-group import must fail to parse, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_use_brace_group_single_item() {
+        let src = "use foo::{sadge};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string()]);
+                    assert_eq!(name, "sadge");
+                    assert!(alias.is_none());
+                }
+                other => panic!("expected single Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group_nested_path() {
+        let src = "use lib::io::{read, write as w};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Use { path, name, .. } => {
+                            assert_eq!(path, &["lib".to_string(), "io".to_string()]);
+                            assert_eq!(name, "read");
+                        }
+                        other => panic!("expected Use, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment, got {:?}", other),
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }

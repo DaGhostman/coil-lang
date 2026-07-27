@@ -270,10 +270,13 @@ fn aead_chacha_encrypt(
         return Err(CryptoErrorTag::InvalidLength);
     }
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let nonce = ChaChaNonce::from_slice(&nonce);
+    let nonce: ChaChaNonce = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoErrorTag::InvalidLength)?;
     cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &pt,
                 aad: &aad,
@@ -297,10 +300,13 @@ fn aead_chacha_decrypt(
         return Err(CryptoErrorTag::InvalidLength);
     }
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let nonce = ChaChaNonce::from_slice(&nonce);
+    let nonce: ChaChaNonce = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoErrorTag::InvalidLength)?;
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &ct,
                 aad: &aad,
@@ -338,10 +344,14 @@ fn aead_aes_encrypt(
         return Err(CryptoErrorTag::InvalidLength);
     }
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let nonce = AesNonce::from_slice(&nonce);
+    let nonce_bytes: [u8; 12] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoErrorTag::InvalidLength)?;
+    let nonce = AesNonce::from(nonce_bytes);
     cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &pt,
                 aad: &aad,
@@ -365,10 +375,14 @@ fn aead_aes_decrypt(
         return Err(CryptoErrorTag::InvalidLength);
     }
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let nonce = AesNonce::from_slice(&nonce);
+    let nonce_bytes: [u8; 12] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoErrorTag::InvalidLength)?;
+    let nonce = AesNonce::from(nonce_bytes);
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &ct,
                 aad: &aad,

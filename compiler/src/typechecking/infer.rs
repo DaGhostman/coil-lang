@@ -162,6 +162,11 @@ pub struct Checker {
     methods:
         std::collections::HashMap<String, std::collections::HashMap<String, (Visibility, Scheme)>>,
 
+    /// Inherent `static fn` methods: owner → set of method names.
+    /// Used to type `Class::method(...)` Construct sites and to reject
+    /// `obj.static_method()` instance calls.
+    static_methods: std::collections::HashMap<String, std::collections::HashSet<String>>,
+
     /// Pre-walk IDs consumed in lockstep by [`infer`](Self::infer).
     ids: IdTable,
 
@@ -539,6 +544,7 @@ impl Checker {
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
             methods: std::collections::HashMap::new(),
+            static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
@@ -1279,7 +1285,7 @@ impl Checker {
                     "spawn argument",
                 );
                 let arg_resolved = apply_ty_prune(&self.subst, &arg_tys[1]);
-                if !Self::is_thread_sendable_ty(&arg_resolved) {
+                if !self.is_thread_sendable_ty(&arg_resolved) {
                     self.error_with_help(
                         ErrorCode::GenericTypeError,
                         format!(
@@ -1307,7 +1313,7 @@ impl Checker {
     }
 
     /// Whether `ty` may be deep-copied across OS thread boundaries (best-effort).
-    pub fn is_thread_sendable_ty(ty: &Ty) -> bool {
+    pub fn is_thread_sendable_ty(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Var(_) => true, // re-checked on concrete spawn arg after unify
             Ty::Con(name) => {
@@ -1318,7 +1324,7 @@ impl Checker {
                 ) {
                     return false;
                 }
-                matches!(
+                if matches!(
                     n.as_str(),
                     "int"
                         | "float"
@@ -1338,26 +1344,37 @@ impl Checker {
                     || name == crate::typechecking::ty::RECEIVER
                     || name == crate::typechecking::ty::MUTEX
                     || name == crate::typechecking::ty::RWLOCK
+                {
+                    return true;
+                }
+                // User class: sendable when every field type is sendable
+                // (so `spawn(f, mailbox)` works for a class of channel ends).
+                if let Some(fields) = self.classes.get(name) {
+                    return fields
+                        .iter()
+                        .all(|(_, _, field_ty)| self.is_thread_sendable_ty(field_ty));
+                }
+                false
             }
             Ty::App(head, args) => {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") {
                     return false;
                 }
-                args.iter().all(Self::is_thread_sendable_ty)
+                args.iter().all(|t| self.is_thread_sendable_ty(t))
             }
             Ty::Fun(_, _) => false,
-            Ty::Array { element, .. } => Self::is_thread_sendable_ty(element),
-            Ty::List(inner) => Self::is_thread_sendable_ty(inner),
-            Ty::Readonly(inner) => Self::is_thread_sendable_ty(inner),
-            Ty::Tuple(elems) => elems.iter().all(Self::is_thread_sendable_ty),
+            Ty::Array { element, .. } => self.is_thread_sendable_ty(element),
+            Ty::List(inner) => self.is_thread_sendable_ty(inner),
+            Ty::Readonly(inner) => self.is_thread_sendable_ty(inner),
+            Ty::Tuple(elems) => elems.iter().all(|t| self.is_thread_sendable_ty(t)),
             Ty::Record { fields } => fields
                 .iter()
-                .all(|(_, t)| Self::is_thread_sendable_ty(t)),
+                .all(|(_, t)| self.is_thread_sendable_ty(t)),
             Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
                 payload
                     .field_types()
                     .iter()
-                    .all(|t| Self::is_thread_sendable_ty(t))
+                    .all(|t| self.is_thread_sendable_ty(t))
             }),
             Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } => false,
         }
@@ -2211,7 +2228,7 @@ impl Checker {
                                 format!("cannot capture `{}` without `use ({})`", name, name),
                                 range,
                                 Some(format!(
-                                    "list `{}` in the lambda's `use (…)` capture list",
+                                    "list `{}` in the enclosing `use (…)` capture list",
                                     name
                                 )),
                             );
@@ -2796,6 +2813,20 @@ impl Checker {
                     if let Some(owner) = class_owner.as_ref()
                         && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
                     {
+                        if self.is_static_method(owner, method) {
+                            let fqn = format!("{}::{}", owner, method);
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "`{}` is a static method; call it as `{}(...)`",
+                                    method, fqn
+                                ),
+                                range,
+                                Some(
+                                    "static methods have no `self` receiver".to_string(),
+                                ),
+                            );
+                        }
                         let fqn = format!("{}::{}", owner, method);
                         let user_argc = method_args.len();
                         let (scheme, selected) = if self.is_overloaded(&fqn) {
@@ -3818,8 +3849,40 @@ impl Checker {
             Expression::Invoke(args) => self.infer_ffi_invoke(args, range),
 
             // ---- Defer / coroutines / list ----
-            Expression::Defer(e) => {
-                let _ = self.infer(e);
+            Expression::Defer { captures, body } => {
+                // Same explicit-capture isolation as lambdas: outer locals
+                // are invisible unless listed in `use (…)`.
+                let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
+                for cap in captures {
+                    match self.env.lookup(cap).cloned() {
+                        Some(scheme) => {
+                            let ty = self.instantiate_ty(&scheme);
+                            cap_bindings.push((cap.to_string(), ty));
+                        }
+                        None => {
+                            return self.error(
+                                ErrorCode::UnknownValue,
+                                format!("Cannot find value `{}` in this scope", cap),
+                                range,
+                            );
+                        }
+                    }
+                }
+                let mut uncaptured = self.env.all_names();
+                for (n, _) in &cap_bindings {
+                    uncaptured.remove(n);
+                }
+
+                let saved_frames = self.env.take_and_isolate();
+                let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+                for (n, ty) in &cap_bindings {
+                    self.env
+                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.record_codegen_var_type(n.clone(), ty.clone());
+                }
+                let _ = self.infer(body);
+                self.lambda_uncaptured_outer = prev_uncaptured;
+                self.env.restore_frames(saved_frames);
                 unit_ty()
             }
             Expression::Yield(e) => {
@@ -3928,6 +3991,8 @@ impl Checker {
                     &range,
                     None,
                     *is_coro,
+                    None,
+                    false,
                 );
 
                 if test_desc.is_some() {
@@ -4302,7 +4367,7 @@ impl Checker {
                 enum_name,
                 variant_name,
                 fields,
-            } => self.infer_construct(enum_name, variant_name, fields, range),
+            } => self.infer_construct(enum_name, variant_name, fields, range, id),
 
             // ---- Generics ----
             Expression::TypeClass {
@@ -4811,6 +4876,8 @@ impl Checker {
                                     &m.0.into_range(),
                                     None,
                                     is_coro,
+                                    None,
+                                    false,
                                 );
                             } else {
                                 let _ = self.infer(m);
@@ -7600,12 +7667,15 @@ impl Checker {
         let local = match unify_with(&Subst::empty(), &candidate, &expected_body) {
             Ok(s) => s,
             Err(_) => {
-                let expected_pretty = apply_ty_prune(&self.subst, expected);
+                let expected_pretty =
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, expected);
+                let found_pretty =
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, &candidate);
                 self.messages.push(Message::error(
                     ErrorCode::TypeMismatch,
                     format!(
                         "Type mismatch: expected `{}`, found `{}`",
-                        expected_pretty, candidate
+                        expected_pretty, found_pretty
                     ),
                     arg_expr
                         .map(|arg| arg.0.into_range())
@@ -7734,21 +7804,32 @@ impl Checker {
                 self.subst = compose(&s, &self.subst);
                 apply_ty(&self.subst, t1)
             }
-            Err(UnifyError::Mismatch { left, right }) => self.error_with_help(
-                ErrorCode::TypeMismatch,
-                format!("Type mismatch: expected `{}`, found `{}`", left, right),
-                range.clone(),
-                Some(format!("while checking `{}`", ctx)),
-            ),
-            Err(UnifyError::Occurs { var, ty }) => self.error_with_help(
-                ErrorCode::InfiniteType,
-                format!("Cannot construct infinite type `{}`", ty),
-                range.clone(),
-                Some(format!(
-                    "the type variable `t{}` would occur in its own definition",
-                    var.raw()
-                )),
-            ),
+            Err(UnifyError::Mismatch { left, right }) => {
+                let left_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &left);
+                let right_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &right);
+                self.error_with_help(
+                    ErrorCode::TypeMismatch,
+                    format!("Type mismatch: expected `{}`, found `{}`", left_s, right_s),
+                    range.clone(),
+                    Some(format!("while checking `{}`", ctx)),
+                )
+            }
+            Err(UnifyError::Occurs { var, ty }) => {
+                let ty_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ty);
+                let var_s = crate::typechecking::pretty::format_ty_for_diag(
+                    &self.subst,
+                    &Ty::Var(var),
+                );
+                self.error_with_help(
+                    ErrorCode::InfiniteType,
+                    format!("Cannot construct infinite type `{}`", ty_s),
+                    range.clone(),
+                    Some(format!(
+                        "the type variable `{}` would occur in its own definition",
+                        var_s
+                    )),
+                )
+            }
         }
     }
 
@@ -9732,8 +9813,9 @@ impl Checker {
 
         let prev_impl_owner = self.impl_owner.replace(owner.to_string());
         self.push_scope();
-        self.env
-            .insert_top("self".to_string(), Scheme::mono(owner_ty.clone()));
+        // Do not bind `self` on the impl frame — instance methods get it
+        // from `infer_function(..., Some(owner_ty))`, and static methods
+        // must not see a receiver.
 
         for method in methods {
             if let Expression::Method(vis, body) = method.1.as_ref() {
@@ -9761,6 +9843,8 @@ impl Checker {
                         &method.0.into_range(),
                         self_ty,
                         *is_coro,
+                        Some(owner),
+                        *is_static,
                     );
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
@@ -9802,6 +9886,12 @@ impl Checker {
                         },
                         &method.0.into_range(),
                     );
+                    if *is_static {
+                        self.static_methods
+                            .entry(owner.to_string())
+                            .or_default()
+                            .insert(name.to_string());
+                    }
                     self.methods
                         .entry(owner.to_string())
                         .or_default()
@@ -9930,6 +10020,11 @@ impl Checker {
         range: &Range<usize>,
         self_ty: Option<&Ty>,
         is_coro: bool,
+        // When set, this is an inherent `impl` method. Bare `name` must
+        // not shadow imports (`use thread::*;` → `send`); recursion uses
+        // `self.name(...)` / `Owner::name(...)` instead.
+        method_owner: Option<&str>,
+        is_static_method: bool,
     ) -> Ty {
         let Some(body) = body else {
             return self.error_with_help(
@@ -10051,10 +10146,10 @@ impl Checker {
             fun_ty = Ty::Fun(Box::new(self_ty.clone()), Box::new(fun_ty));
         }
 
-        // Monomorphic recursion: bind name to a fresh α in the
-        // *outer* frame so the function is visible to subsequent
-        // code. The body sees it too because the new frame we push
-        // for the body is a child of the outer.
+        // Monomorphic recursion: bind a fresh α so the body can call this
+        // function. Inherent methods bind `Owner::name` only — never the
+        // bare name — so `use thread::*;`/`send` is not shadowed by
+        // `impl Foo { fn send(...) { send(...) } }`.
         let alpha = self.counter.fresh();
 
         // Result/Option mode from an annotated return type. Bare
@@ -10093,13 +10188,41 @@ impl Checker {
             self.async_depth += 1;
         }
 
-        self.env
-            .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
+        if let Some(owner) = method_owner {
+            let fqn = format!("{}::{}", owner, name);
+            self.env
+                .insert_top(fqn, Scheme::mono(Ty::Var(alpha)));
+            // Stub so `self.name(...)` / `Owner::name(...)` resolve while
+            // the body is inferred (real scheme is written by infer_impl).
+            self.methods
+                .entry(owner.to_string())
+                .or_default()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    (
+                        Visibility::Private,
+                        Scheme::mono(Ty::Var(alpha)),
+                    )
+                });
+            if is_static_method {
+                self.static_methods
+                    .entry(owner.to_string())
+                    .or_default()
+                    .insert(name.to_string());
+            }
+        } else {
+            self.env
+                .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
+        }
 
         self.push_scope();
         let mut baseline = std::collections::HashSet::new();
         if let Some(self_ty) = self_ty {
-            // Method receiver — side-table for codegen Access/Call.
+            // Method receiver — env binding for the body + side-table for
+            // codegen Access/Call. Static methods pass `None` and must not
+            // see `self` (it is no longer bound on the outer impl frame).
+            self.env
+                .insert_top("self".to_string(), Scheme::mono(self_ty.clone()));
             self.record_codegen_var_type("self".to_string(), self_ty.clone());
             baseline.insert("self".to_string());
         }
@@ -11247,11 +11370,13 @@ impl Checker {
             | Expression::LogicalNot(e)
             | Expression::Positive(e)
             | Expression::Adjust { target: e, .. }
-            | Expression::Defer(e)
             | Expression::Member(e)
             | Expression::LetDestructure { rhs: e, .. }
             | Expression::NamedArg(_, e) => {
                 self.pre_register_enums_walk(e, errors);
+            }
+            Expression::Defer { body, .. } => {
+                self.pre_register_enums_walk(body, errors);
             }
 
             Expression::TypeApp { args, .. } => {
@@ -11635,12 +11760,17 @@ impl Checker {
     }
 
     /// Constructor application with shape/arity checking.
+    ///
+    /// Also resolves `Class::static_method(...)` when `enum_name` is a
+    /// class (parsed as Construct because `Class::name(...)` shares the
+    /// enum-constructor surface syntax).
     fn infer_construct(
         &mut self,
         enum_name: &str,
         variant_name: &str,
         fields: &parser::ast::EnumConstructPayload<'_>,
         range: Range<usize>,
+        call_id: Option<NodeId>,
     ) -> Ty {
         use parser::ast::EnumConstructPayload;
         // Surface path `ffi::types::Int` maps to the internal `FFIType` registry.
@@ -11672,10 +11802,31 @@ impl Checker {
             Some(t) => t.clone(),
             None => {
                 let static_fqn = format!("{}::{}", enum_name, variant_name);
+                // Bare / `()` Unit form: prefer static field, then 0-arg
+                // static method (`Counter::fresh()`).
                 if matches!(fields, EnumConstructPayload::Unit) {
                     if let Some(ty) = self.static_slot_types.get(&static_fqn).cloned() {
                         return apply_ty_prune(&self.subst, &ty);
                     }
+                }
+                if let Some(ty) =
+                    self.try_infer_static_method_call(enum_name, variant_name, fields, range.clone(), call_id)
+                {
+                    return ty;
+                }
+                if self.has_method(enum_name, variant_name) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
+                            static_fqn, variant_name
+                        ),
+                        range,
+                        Some(format!(
+                            "or declare `static fn {}` to call it as `{}`",
+                            variant_name, static_fqn
+                        )),
+                    );
                 }
                 return self.error(
                     ErrorCode::UnknownEnum,
@@ -13830,6 +13981,73 @@ impl Checker {
             .is_some_and(|m| m.contains_key(method))
     }
 
+    /// True when `owner::method` was declared as `static fn`.
+    pub fn is_static_method(&self, owner: &str, method: &str) -> bool {
+        self.static_methods
+            .get(owner)
+            .is_some_and(|m| m.contains(method))
+    }
+
+    /// Type `Class::static_method(args)` (parsed as Construct).
+    fn try_infer_static_method_call(
+        &mut self,
+        owner: &str,
+        method: &str,
+        fields: &parser::ast::EnumConstructPayload<'_>,
+        range: Range<usize>,
+        call_id: Option<NodeId>,
+    ) -> Option<Ty> {
+        use parser::ast::EnumConstructPayload;
+        if !self.is_static_method(owner, method) {
+            return None;
+        }
+        let fqn = format!("{}::{}", owner, method);
+        let scheme = self
+            .methods
+            .get(owner)
+            .and_then(|m| m.get(method))
+            .map(|(_, s)| s.clone())?;
+        let fun_ty = self.instantiate_ty(&scheme);
+
+        // Named-arg / rest reorder when the call uses a tuple payload.
+        let arg_tys = match fields {
+            EnumConstructPayload::Unit => Vec::new(),
+            EnumConstructPayload::Tuple(args) => {
+                if self.fn_has_rest(&fqn) || self.fn_param_names.contains_key(&fqn) {
+                    let (tys, _) = self.infer_and_reorder_call_args(&fqn, args, &range);
+                    tys
+                } else {
+                    args.iter().map(|a| self.infer(a)).collect()
+                }
+            }
+            EnumConstructPayload::Record(parts) => {
+                // Static methods don't take record payloads as ctors —
+                // still infer children for ID alignment, then error.
+                for p in parts {
+                    let _ = self.infer(&p.value);
+                }
+                return Some(self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "static method `{}` is called with parentheses, not a record literal",
+                        fqn
+                    ),
+                    range,
+                    Some(format!("write `{}(...)` with positional or named arguments", fqn)),
+                ));
+            }
+        };
+
+        Some(self.apply_function(
+            Some(&fqn),
+            &fun_ty,
+            &arg_tys,
+            None,
+            call_id,
+            range,
+        ))
+    }
+
     /// True if `name` was declared as `async fn`.
     pub fn is_async_function(&self, name: &str) -> bool {
         self.async_functions.contains(name)
@@ -14549,6 +14767,80 @@ mod tests {
     #[test]
     fn defer_returns_unit() {
         assert_ok("defer { 42; }", unit_ty());
+    }
+
+    /// Defer bodies cannot close over outer locals unless listed in `use`.
+    #[test]
+    fn defer_uncaptured_outer_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    let y = 10;
+    defer { print "%i", y; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("cannot capture `y` without `use (y)`")),
+            "expected cannot-capture diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Truly undefined names in a defer are rejected (not silently accepted).
+    #[test]
+    fn defer_undefined_variable_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    defer { print "%i", totally_undefined_var; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message()
+                    .contains("Cannot find value `totally_undefined_var`")
+            }),
+            "expected unknown-value diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `defer use (y)` makes the outer local visible inside the block.
+    #[test]
+    fn defer_use_capture_typechecks() {
+        let (mut c, _) = check(
+            r#"
+fn main() {
+    let y = 10;
+    defer use (y) { print "%i", y; }
+}
+"#,
+        );
+        assert!(
+            c.take_messages().is_empty(),
+            "expected no diagnostics for defer use (y)"
+        );
+    }
+
+    /// Listing an unknown name in `use (…)` is itself an error.
+    #[test]
+    fn defer_use_unknown_capture_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    defer use (nope) { print "%i", nope; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Cannot find value `nope`")),
+            "expected unknown capture diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     // ---- List literals ----
@@ -18974,33 +19266,36 @@ fn main() { let g = add(a: 1); }
     #[test]
     fn is_thread_sendable_ty_accepts_immediates_strings_and_host_handles() {
         use crate::typechecking::ty::{mutex_ty, receiver_ty, rwlock_ty, sender_ty};
-        assert!(Checker::is_thread_sendable_ty(&int()));
-        assert!(Checker::is_thread_sendable_ty(&string()));
-        assert!(Checker::is_thread_sendable_ty(&boolean()));
-        assert!(Checker::is_thread_sendable_ty(&unit_ty()));
-        assert!(Checker::is_thread_sendable_ty(&sender_ty()));
-        assert!(Checker::is_thread_sendable_ty(&receiver_ty()));
-        assert!(Checker::is_thread_sendable_ty(&mutex_ty()));
-        assert!(Checker::is_thread_sendable_ty(&rwlock_ty()));
-        assert!(Checker::is_thread_sendable_ty(&array(int())));
-        assert!(Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+        let c = Checker::new();
+        assert!(c.is_thread_sendable_ty(&int()));
+        assert!(c.is_thread_sendable_ty(&string()));
+        assert!(c.is_thread_sendable_ty(&boolean()));
+        assert!(c.is_thread_sendable_ty(&unit_ty()));
+        assert!(c.is_thread_sendable_ty(&sender_ty()));
+        assert!(c.is_thread_sendable_ty(&receiver_ty()));
+        assert!(c.is_thread_sendable_ty(&mutex_ty()));
+        assert!(c.is_thread_sendable_ty(&rwlock_ty()));
+        assert!(c.is_thread_sendable_ty(&array(int())));
+        assert!(c.is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+        assert!(c.is_thread_sendable_ty(&tuple_ty(vec![receiver_ty(), sender_ty()])));
     }
 
     #[test]
     fn is_thread_sendable_ty_rejects_stream_coroutine_and_functions() {
         use crate::typechecking::ty::stream_ty;
-        assert!(!Checker::is_thread_sendable_ty(&stream_ty()));
-        assert!(!Checker::is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
-        assert!(!Checker::is_thread_sendable_ty(&Ty::Fun(
+        let c = Checker::new();
+        assert!(!c.is_thread_sendable_ty(&stream_ty()));
+        assert!(!c.is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
+        assert!(!c.is_thread_sendable_ty(&Ty::Fun(
             Box::new(unit_ty()),
             Box::new(int())
         )));
-        assert!(!Checker::is_thread_sendable_ty(&Ty::App(
+        assert!(!c.is_thread_sendable_ty(&Ty::App(
             Box::new(Ty::Con("coroutine".into())),
             vec![int(), unit_ty()]
         )));
-        assert!(!Checker::is_thread_sendable_ty(&array(stream_ty())));
-        assert!(!Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
+        assert!(!c.is_thread_sendable_ty(&array(stream_ty())));
+        assert!(!c.is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
     }
 
     #[test]

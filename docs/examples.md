@@ -111,6 +111,56 @@ fn main() {
 
 ---
 
+### `examples/defer.hy`
+
+**Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered, plus `defer use (n)` to capture an outer local.
+
+```coil
+fn with_cleanup() {
+    defer { print "leave"; }
+    print "enter";
+}
+
+fn lifo() {
+    defer { print "1"; }
+    defer { print "2"; }
+    print "0";
+}
+
+fn early_return(int n) -> int {
+    defer { print "d"; }
+    if n == 0 {
+        return 99;
+    }
+    print "ok";
+    return n;
+}
+
+fn capture_n(int n) -> int {
+    defer use (n) { print "%i", n; }
+    return n;
+}
+
+fn main() {
+    with_cleanup();
+    print ",";
+    lifo();
+    print ",";
+    print "%i", early_return(7);
+    print ",";
+    print "%i", early_return(0);
+    print ",";
+    print "%i", capture_n(5);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/defer.hy` |
+| **Output** | `enterleave,021,okd7,d99,55` |
+
+---
+
 ### `examples/named_args.hy`
 
 **Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
@@ -778,6 +828,27 @@ fn main() {
 
 ---
 
+### `examples/nested_aggregates.hy`
+
+**Demonstrates:** Nested aggregates — `type Row = (string, int); type Table = [Row];` with `for` and let-destructure.
+
+```coil
+type Row = (string, int);
+type Table = [Row];
+
+fn main() {
+    let people: Table = [("alice", 30), ("bob", 25)];
+    // …
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/nested_aggregates.hy` |
+| **Output** | `alice:30bob:25total:55` |
+
+---
+
 ### `examples/vec_tuple.hy`
 
 **Demonstrates:** Element-wise tuple zip, scalar broadcast, and unary negate.
@@ -1134,12 +1205,27 @@ fn main() {
 | **Companion** | `examples/src/foo/sadge.hy` — defines `fn sadge()` printing `420` as hex |
 | **Expected output** | `1a4` (newline) then `45` — i.e. `1a4\n45` |
 
-**Setup:** The module resolver looks for `src/foo/sadge.hy` relative to the project root (default manifest roots). The examples layout places files at `examples/src/foo/sadge.hy`, so for a working demo you need either:
+**Setup:** Workspace `coil.toml` includes `./examples/src` in `[module].roots`, so `cargo run -- examples/modules.hy` resolves the import.
 
-- A `coil.toml` at the repo root with `roots = ["./examples/src"]`, **and**
-- Multi-file compilation (`compile_src_from_file`) — the stock `cargo run` path currently compiles one file in memory and does **not** resolve `use` across files.
+---
 
-See [reference/modules.md](reference/modules.md) and [reference/project-config.md](reference/project-config.md) for full module workflow. Namespace integration tests live in `compiler/tests/namespace.rs`.
+### `examples/modules_brace.hy`
+
+**Demonstrates:** Brace-group imports from a module file (`math.hy`).
+
+```coil
+use math::{add, mul};
+
+fn main() {
+    print "%i", add(5, 7);
+    print "%i", mul(6, 7);
+}
+```
+
+| | |
+|---|---|
+| **Companion** | `examples/src/math.hy` |
+| **Expected output** | `1242` |
 
 ---
 
@@ -1335,6 +1421,56 @@ fn main() {
 | **Run** | `cargo run -- examples/classes.hy` |
 | **Output** | `7458` |
 
+### `examples/static_ctor.hy`
+
+**Demonstrates:** `static fn` constructors via `Class::new(...)` alongside unchanged positional `new Class(...)`. Bodies build instances with `new ClassName(...)`.
+
+```coil
+class Point {
+    x: int,
+    y: int,
+}
+
+impl Point {
+    pub static fn new(int x, int y) -> Point {
+        return new Point(x, y);
+    }
+
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+
+fn main() {
+    let p = Point::new(40, 2);
+    print "%i,", p.sum();
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/static_ctor.hy` |
+| **Output** | `42,1,1` |
+
+### `examples/match_block_self.hy`
+
+**Demonstrates:** Brace-block `match` arm bodies that call `self.method()` (expression blocks, not dicts).
+
+```coil
+return match m {
+    Mode::Zero => { self.get() },
+    Mode::Other(n) => {
+        self.get();
+        n
+    },
+};
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/match_block_self.hy` |
+| **Output** | `5` |
+
 ### `examples/generic_class.hy`
 
 **Demonstrates:** Generic class declaration (`class Cell<T>`), inherent
@@ -1472,6 +1608,17 @@ Native threads via `use thread::*;` — each worker runs on its own VM. See [Tut
 
 ---
 
+### `examples/thread_reply.hy`
+
+**Demonstrates:** request/reply with two channels; spawn a worker with a `(Receiver, Sender)` tuple.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/thread_reply.hy` |
+| **Output** | `ping` |
+
+---
+
 ### `examples/thread_mutex.hy`
 
 **Demonstrates:** Shared `mutex` and `with_lock` from two threads.
@@ -1606,6 +1753,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `string_fmt.hy` | Basics | `hello world42-x` |
 | `show_tuple.hy` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.hy` | Basics | `51020` |
+| `defer.hy` | Basics | `enterleave,021,okd7,d99,55` |
 | `named_args.hy` | Basics | `Ada36Grace40` |
 | `variadic.hy` | Basics | `60Hi!?` |
 | `const.hy` | Basics | `42hi` |
@@ -1635,6 +1783,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
 | `aliases.hy` | Types | `347` |
+| `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |
 | `vec_array.hy` | Aggregates | `46,45,18` |
 | `vec_generic.hy` | Aggregates | `24,55` |
@@ -1659,8 +1808,10 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `polyfn.hy` | Types | `424.0424242` |
 | `operators.hy` | Operators | `801125428falsetrue3` |
 | `modules.hy` | Modules | `1a4\n45` |
+| `modules_brace.hy` | Modules | `1242` |
 | `src/foo/sadge.hy` | Modules | (support file) |
 | `src/foo.hy` | Modules | (support file) |
+| `src/math.hy` | Modules | (support file) |
 | `strlen.hy` | FFI | `5` |
 | `ffi_printf.hy` | FFI | `hello 42` |
 | `ffi_sum.hy` | FFI | `42` |
@@ -1668,6 +1819,8 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `ffi_callback_ret.hy` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.hy`) |
 | `classes.hy` | Classes | `7458` |
+| `static_ctor.hy` | Classes | `42,1,1` |
+| `match_block_self.hy` | Classes / Match | `5` |
 | `generic_class.hy` | Classes | `42` |
 | `coro.hy` | Coroutines | (see source) |
 | `coro_gen.hy` | Coroutines | `012` |
@@ -1677,6 +1830,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `coro_done.hy` | Coroutines | `falsefalsetrue` |
 | `thread_join.hy` | OS threads | `42` |
 | `thread_channel.hy` | OS threads | `hello` |
+| `thread_reply.hy` | OS threads | `ping` |
 | `thread_mutex.hy` | OS threads | `2` |
 | `for_in_coro.hy` | Coroutines | `01210` |
 | `for_in_array.hy` | Collections | `123` |

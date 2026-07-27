@@ -558,6 +558,25 @@ impl Pipeline {
         self.compiler.get_messages()
     }
 
+    /// Project root (directory containing `coil.toml`, or cwd).
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    /// Loaded project manifest (`[entry]`, `[module].roots`, …).
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Resolve `[entry].file` from the manifest to an absolute path.
+    /// Returns `None` when the manifest has no entry point.
+    pub fn manifest_entry_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .entry
+            .as_ref()
+            .map(|rel| self.project_root.join(rel))
+    }
+
     /// Wire FFI library resolution paths and C struct layouts into the VM.
     pub fn wire_vm_ffi<const N: usize>(
         &self,
@@ -660,7 +679,10 @@ impl Pipeline {
             messages_emitted: 0,
         };
         match Manifest::load(&project_root) {
-            Ok(m) => pipeline.manifest = m,
+            Ok(m) => {
+                pipeline.manifest = m.clone();
+                machine::env::set_allow_exec(m.allow_exec);
+            }
             Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
         }
         pipeline.register_io_natives();
@@ -675,7 +697,14 @@ impl Pipeline {
     }
 
     /// Register `source` under `path` and emit a single producer [`Message`].
+    ///
+    /// Also records the message on the compiler so [`Self::messages`]
+    /// includes discovery-time parse / module-not-found errors (not only
+    /// typecheck diagnostics). Advances `messages_emitted` so a later
+    /// [`Self::emit_new_messages`] does not re-forward the same text.
     fn emit_message(&mut self, path: &Path, source: &str, message: &Message) {
+        self.compiler.push_message(message.clone());
+        self.messages_emitted = self.compiler.get_messages().len();
         let file_id = self.sink.register_source(path, source);
         self.sink.emit(Diagnostic::from_message(message, file_id));
         if self.sink.had_errors() {
@@ -1015,12 +1044,6 @@ impl Pipeline {
                 depth += 1;
             }
             already_scanned.push(file.clone());
-            // Re-enqueue at the back so the compile pass
-            // can find it. The compile pass drains the
-            // worklist in LIFO order via `pop_back`,
-            // so dependencies (which are at the back)
-            // are compiled first.
-            self.worklist.push_back(item);
             // Read the source (cached after the first
             // call). The `compile_file` pass reuses the
             // same cached source, so the file is only
@@ -1040,11 +1063,17 @@ impl Pipeline {
             let ast = match parser.parse(src.as_str()) {
                 Ok(ast) => ast,
                 Err(errors) => {
+                    // Emit once here. Do NOT re-enqueue: compile_file
+                    // would parse again and duplicate the same report.
                     self.emit_message(&file, src.as_str(), &errors);
                     self.failed = true;
                     continue;
                 }
             };
+            // Re-enqueue only after a successful parse so the compile
+            // pass drains the worklist in LIFO order via `pop_back`
+            // (dependencies at the back are compiled first).
+            self.worklist.push_back(item);
             self.enqueue_uses(&file, src.as_str(), &ast);
             // Only stop when every worklist entry has been
             // scanned. Length-stable checks alone are wrong:
@@ -1309,6 +1338,7 @@ impl Pipeline {
         if root != self.project_root {
             self.project_root = root.clone();
             self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
+            machine::env::set_allow_exec(self.manifest.allow_exec);
         }
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);

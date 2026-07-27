@@ -31,7 +31,7 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **29**) and written to `out.hyc` on first run. See [Debug line table](reference/debug-info.md).
 5. **Execute** — the VM loads the archive and runs `main`.
 
-Re-run the same binary without deleting `out.hyc` to reuse the cached compile. Delete `out.hyc` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.
+Re-run the same binary without deleting `out.hyc` to reuse the cached compile. Delete `out.hyc` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, older than any recorded source (including `use`d modules), or was built for a different entry file.
 
 ## Language at a glance
 

@@ -604,7 +604,6 @@ where
         | Expression::LogicalNot(e)
         | Expression::Positive(e)
         | Expression::Adjust { target: e, .. }
-        | Expression::Defer(e)
         | Expression::Member(e)
         | Expression::Dload(e)
         | Expression::Done(e)
@@ -612,6 +611,7 @@ where
         | Expression::Method(_, e)
         | Expression::OptionalAccess(e, _)
         | Expression::Access(e, _) => f(e),
+        Expression::Defer { body, .. } => f(body),
         Expression::Assignment(lhs, rhs) | Expression::CompoundAssign(lhs, _, rhs) => {
             f(lhs);
             f(rhs);

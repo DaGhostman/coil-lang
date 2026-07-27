@@ -83,10 +83,10 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 
 | Invocation | Meaning |
 |------------|---------|
-| `coil <file.hy>` | Compile to `out.hyc` (cached) and run |
-| `coil compile <file.hy> [-o path]` | Compile only; default output is `out.hyc` |
+| `coil [<file.hy>]` | Compile to `out.hyc` (cached) and run; omit the file to use `[entry].file` from `coil.toml` |
+| `coil compile [<file.hy>] [-o path]` | Compile only; default output is `out.hyc`; omit the file to use `[entry].file` |
 | `coil run <file.hyc>` | Execute a previously compiled archive |
-| `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`) |
+| `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`); always requires an explicit `.hy` path (does not read `[entry].file`) |
 | `coil test [path] [--fail-fast]` | Compile and run every `.hy` under `[path]` (default `./tests`) |
 
 Examples:
@@ -150,7 +150,9 @@ rm -f out.hyc
 cargo run -- examples/fib.hy
 ```
 
-The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source. The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
+The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, **older than any source file recorded in the archive** (entry *and* imported modules), or was built for a **different entry** than the one you are running (the shared `out.hyc` path is not per-file). The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
+
+If worker/`use` modules change and prints or behavior look “stuck” or intermittent across runs, stale `out.hyc` is a common false lead — `join` always waits for the worker to finish.
 
 ## A simpler hello-world
 

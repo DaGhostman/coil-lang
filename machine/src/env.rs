@@ -10,8 +10,13 @@ use common::{
 use crate::io::{alloc_result_err, alloc_result_ok};
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, Object};
 
-/// When false, [`host_exec`] returns `ExecDisabled` (pipeline may set from `coil.toml`).
+/// When false, [`host_exec`] returns `ExecDisabled`. Set from `coil.toml` `[env] allow_exec`.
 pub static ALLOW_EXEC: AtomicBool = AtomicBool::new(true);
+
+/// Runtime gate for `env::exec` (from project manifest).
+pub fn set_allow_exec(allow: bool) {
+    ALLOW_EXEC.store(allow, Ordering::Relaxed);
+}
 
 /// Tag indices for [`EnvError`](common::BUILTIN_ENV_ERROR_ENUM).
 #[repr(u32)]
@@ -27,16 +32,6 @@ pub enum EnvErrorTag {
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
     let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
     Value::from(obj.addr())
-}
-
-fn member_from_value(heap: &Heap, value: Value) -> Member {
-    if !value.raw().is_null()
-        && let Some(obj) = heap.find_object_by_addr(value.raw() as u64)
-    {
-        Member::Object(obj)
-    } else {
-        Member::Value(value)
-    }
 }
 
 /// Allocate a unit-payload `EnvError` variant.
@@ -290,6 +285,9 @@ pub use host_var as env_var;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {
         match heap.find_object_by_addr(v.raw() as u64) {
@@ -392,13 +390,15 @@ mod tests {
 
     #[test]
     fn host_exec_disabled_when_flag_off() {
+        let _guard = ENV_TEST_GUARD.lock().expect("env test mutex");
+        let prev = ALLOW_EXEC.load(Ordering::Relaxed);
         ALLOW_EXEC.store(false, Ordering::Relaxed);
         let mut heap = Heap::default();
         let prog = heap.intern("true".into());
         let args = make_string_array(&mut heap, &[]);
         let r = host_exec(&mut heap, &[Value::from(prog.as_ptr() as *mut u8 as u64), args]);
         assert_eq!(result_err_tag(&heap, r), EnvErrorTag::ExecDisabled);
-        ALLOW_EXEC.store(true, Ordering::Relaxed);
+        ALLOW_EXEC.store(prev, Ordering::Relaxed);
     }
 
     #[test]

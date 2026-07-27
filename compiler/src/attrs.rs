@@ -478,6 +478,13 @@ fn collect_free_idents<'a>(
             }
             collect_free_idents(body, &mut inner_bound, free);
         }
+        Expression::Defer { captures, body } => {
+            let mut inner_bound = bound.clone();
+            for cap in captures {
+                inner_bound.insert(leak((*cap).to_string()));
+            }
+            collect_free_idents(body, &mut inner_bound, free);
+        }
         Expression::Function { args, body, .. } => {
             let mut inner_bound = bound.clone();
             for (_, name, _) in fn_param_nodes(args) {
@@ -557,7 +564,6 @@ fn collect_free_idents<'a>(
         | Expression::Not(inner)
         | Expression::LogicalNot(inner)
         | Expression::Positive(inner)
-        | Expression::Defer(inner)
         | Expression::Dload(inner)
         | Expression::Done(inner)
         | Expression::Expr(inner)
@@ -986,12 +992,19 @@ fn rewrite_expr_inline<'a>(
         | Expression::Not(inner)
         | Expression::LogicalNot(inner)
         | Expression::Positive(inner)
-        | Expression::Defer(inner)
         | Expression::Dload(inner)
         | Expression::Done(inner)
         | Expression::Expr(inner)
         | Expression::Group(inner)
         | Expression::Member(inner) => at(span, clone_unary(expr.1.as_ref(), rw(inner))),
+
+        Expression::Defer { captures, body } => at(
+            span,
+            Expression::Defer {
+                captures: captures.clone(),
+                body: rw(body),
+            },
+        ),
 
         Expression::Resume(handle, send) => at(
             span,
@@ -1459,7 +1472,6 @@ fn clone_unary<'a>(kind: &Expression<'a>, inner: Output<'a>) -> Expression<'a> {
         Expression::Not(_) => Expression::Not(inner),
         Expression::LogicalNot(_) => Expression::LogicalNot(inner),
         Expression::Positive(_) => Expression::Positive(inner),
-        Expression::Defer(_) => Expression::Defer(inner),
         Expression::Dload(_) => Expression::Dload(inner),
         Expression::Done(_) => Expression::Done(inner),
         Expression::Expr(_) => Expression::Expr(inner),

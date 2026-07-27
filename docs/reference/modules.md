@@ -9,8 +9,10 @@ This document specifies the syntax and semantics of coil's module system: `use` 
 ### `use` statement
 
 ```
-use_stmt ::= 'use' path ('as' IDENT)? ';'
-path     ::= IDENT ('::' IDENT)* ('::' '*')?
+use_stmt   ::= 'use' use_path ';'
+use_path   ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
+             | IDENT ('::' IDENT)* ('::' '*')? ('as' IDENT)?
+use_item   ::= IDENT ('as' IDENT)?
 ```
 
 Forms:
@@ -20,15 +22,17 @@ Forms:
 | Concrete import | `use foo::sadge;` |
 | Aliased import | `use foo::sadge as f;` |
 | Glob import | `use foo::*;` |
+| Brace group | `use math::{add, mul as product};` |
 | Multi-segment | `use lib::io::read;` |
 
 Rules:
 
 - Every `use` statement ends with `;`.
 - Path segments are identifiers separated by `::`.
-- The last segment is either an identifier (concrete import) or `*` (glob).
-- Only concrete imports may use `as`. Glob imports cannot be aliased.
-- A glob marker (`*`) must be the **last** segment.
+- The last segment is either an identifier (concrete import), `*` (glob), or a `{ … }` brace group.
+- Concrete imports and brace-group items may use `as`. Glob imports cannot be aliased.
+- A glob marker (`*`) or brace group must be the **last** segment.
+- Brace groups desugar to one concrete import per item (same module path).
 
 ### `mod` statement
 
@@ -87,9 +91,19 @@ Given a concrete import `use a::b::c;`:
    - Path: `["a", "b"]`
    - Item name: `"c"`
 2. For each search root in `[module].roots` (from `coil.toml`, in declaration order):
-   - Build candidate: `<project_root>/<root>/a/b/c.hy`
+   - **One-item-per-file:** `<project_root>/<root>/a/b/c.hy`
    - If the file exists, **stop** — this is the resolved module file.
-3. If no root contains the file, emit a module-not-found diagnostic.
+3. If no one-item-per-file candidate exists, try the **module-file** fallback for each root:
+   - `<project_root>/<root>/a/b.hy` (items exported from the module file)
+   - This is what makes `use math::add;` work when `add` lives in `math.hy`.
+4. If no root contains either form, emit a module-not-found diagnostic.
+
+**Shadowing:** when both `<root>/a/b/c.hy` (one-item-per-file) and `<root>/a/b.hy` (module file) exist, the one-item-per-file path always wins. Avoid keeping the same item name in both layouts.
+
+Given a brace-group import `use math::{add, mul};`:
+
+1. Desugar to `use math::add;` + `use math::mul;` (same path, one item each).
+2. Resolve each item with the algorithm above (typically both hit the same `math.hy`).
 
 Given a glob import `use a::b::*;`:
 
@@ -109,8 +123,9 @@ Given a `mod foo;` declaration:
 
 | Statement | Resolved file (root = `src/`) |
 |-----------|-------------------------------|
-| `use foo::sadge;` | `src/foo/sadge.hy` |
-| `use lib::io::read;` | `src/lib/io/read.hy` |
+| `use foo::sadge;` | `src/foo/sadge.hy`, else `src/foo.hy` |
+| `use math::{add, mul};` | `src/math.hy` (module-file fallback) |
+| `use lib::io::read;` | `src/lib/io/read.hy`, else `src/lib/io.hy` |
 | `use foo::*;` | `src/foo.hy` |
 | `mod foo;` | `src/foo.hy` |
 
@@ -153,14 +168,19 @@ Top-level functions register under:
 
 If the namespace is empty, the FQN is just `<function_name>`.
 
-For a concrete import `use a::b::c;`:
+The FQN shape depends on **which file** path resolution loaded (see [Path resolution algorithm](#path-resolution-algorithm)):
 
-- Expected file: `<root>/a/b/c.hy`
+**Convention A — one-item-per-file** (`use a::b::c;` → `<root>/a/b/c.hy`):
+
 - File namespace: `a::b::c`
-- Expected function name inside the file: `c`
-- FQN: `a::b::c::c`
+- Function name inside the file: `c`
+- FQN: `a::b::c::c` (last path segment names both the file and the function)
 
-The last path segment names both the file and the function inside it.
+**Convention B — module-file fallback** (`use math::add;` → `<root>/math.hy`):
+
+- File namespace: `math`
+- Function name inside the file: `add`
+- FQN: `math::add` (namespace is the module file stem; item is the bare function name)
 
 ---
 
@@ -196,7 +216,7 @@ After `use foo::*;` in another file, both `sadge()` and `greet()` are callable d
 | Property | Behavior |
 |----------|----------|
 | Local name | `alias` |
-| FQN target | `<namespace>::<name>` where namespace = `<path>::<name>` |
+| FQN target | Depends on resolved file (Convention A vs B; see above) |
 | Function expected in file | `fn name()` |
 | Typechecker | Inserts `alias` into the environment with a fresh type variable |
 
@@ -205,9 +225,14 @@ Without `as`, the local name defaults to the last path segment (`name`).
 Examples:
 
 ```coil
+// Convention A — foo/sadge.hy
 use foo::sadge;           // local: sadge  → FQN foo::sadge::sadge
 use foo::sadge as f;      // local: f      → FQN foo::sadge::sadge
 use lib::io::read as rd;  // local: rd     → FQN lib::io::read::read
+
+// Convention B — math.hy (no math/add.hy)
+use math::add;            // local: add    → FQN math::add
+use math::add as plus;    // local: plus   → FQN math::add
 ```
 
 Aliases are **per-file**. They do not propagate to other modules.
@@ -232,6 +257,7 @@ The pipeline runs in two passes:
 - Each file compiles with its computed namespace.
 - `use` statements in the consumer file resolve local names to FQNs via the alias map.
 - Glob imports expand against the compiled function registry.
+- Multi-file programs share **one constant pool** for the whole link (`?` / match / other pool-backed immediates). The pool is cleared only on a fresh compile (prologue-only bytecode), not between modules.
 
 ---
 

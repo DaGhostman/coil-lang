@@ -106,6 +106,8 @@ fn run_bytecode(
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
+    // Worker threads print via this buffer (not the parent's Write).
+    machine.set_shared_print(shared.inner.clone());
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
     pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
@@ -444,6 +446,286 @@ roots = ["./src"]
     let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "5");
+}
+
+#[test]
+fn use_brace_group_imports_from_module_file() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::{add, mul};\nfn main() { print \"%i\", add(2, 3); print \"%i\", mul(4, 5); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n\
+             fn mul(int a, int b) -> int { return a * b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_brace_group", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "520");
+}
+
+#[test]
+fn use_brace_group_as_alias_imports_from_module_file() {
+    // Parser covers `as` AST shape; this locks the desugar → alias map → call path.
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::{add as plus};\nfn main() { print \"%i\", plus(2, 3); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_brace_as", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "5");
+}
+
+#[test]
+fn parse_fail_dependency_emits_single_diagnostic() {
+    // discover_all emits parse errors and must not re-enqueue the bad file
+    // for compile_file (which would duplicate the same diagnostic).
+    use reporting::ReportConfig;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        ("src/main.hy", "use bad::*;\nfn main() {}\n"),
+        ("src/bad.hy", "@@@ not valid coil\n"),
+    ];
+    let (root, entry) = build_project("parse_fail_dep", manifest, files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let capture = Capture::default();
+    let mut pipeline =
+        Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
+    let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
+    assert!(result.is_err(), "expected compile to fail on bad dependency");
+    let _ = pipeline.finish_reporting();
+    let out = String::from_utf8_lossy(&capture.inner.lock().unwrap()).into_owned();
+    assert!(
+        out.contains("Parse error") || out.contains("E0001"),
+        "expected parse diagnostic in sink output, got: {out:?}"
+    );
+    let parse_hits = out.matches("Parse error").count() + out.matches("E0001").count();
+    // Pretty sink prints both the code and "Parse error" once per diagnostic.
+    assert!(
+        parse_hits <= 2,
+        "parse diagnostic appears duplicated (discover+compile): hit_count={parse_hits}, out={out:?}"
+    );
+    assert!(
+        out.contains("bad.hy"),
+        "diagnostic should name the unparseable dependency: {out:?}"
+    );
+}
+
+#[test]
+fn manifest_entry_path_joins_project_root() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+
+[entry]
+file = "./src/main.hy"
+"#;
+    let files = &[(
+        "src/main.hy",
+        "fn main() { print \"%i\", 42; }\n",
+    )];
+    let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let entry = pipeline
+        .manifest_entry_path()
+        .expect("manifest should declare [entry].file");
+    assert!(
+        entry.ends_with("src/main.hy"),
+        "expected project-root-joined entry, got {}",
+        entry.display()
+    );
+    let (bytecode, constants) = pipeline
+        .compile_src_from_file(entry.to_str().unwrap())
+        .expect("manifest entry should compile");
+    let output = run_bytecode(bytecode, constants, &pipeline);
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn use_item_from_module_file_without_subdir() {
+    // Concrete `use math::add` must fall back to math.hy when math/add.hy
+    // does not exist (the "modules in roots don't get imported" gap).
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::add;\nfn main() { print \"%i\", add(10, 32); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_module_file_item", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "42");
+}
+
+/// Multi-file programs that use `?` (JumpIfMatch → constant pool) in a
+/// dependency must keep a single shared pool across `compile_module`
+/// calls. Clearing the pool between files left worker threads panicking
+/// at `jump_if_match_target` (pool index OOB) under `spawn`.
+#[test]
+fn multi_file_try_operator_pool_survives_module_link() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use thread::*;
+use pool::worker::run_jobs;
+
+class Worker {
+    thread: Thread,
+    tx: Sender,
+}
+
+impl Worker {
+    fn submit(string job) {
+        send(self.tx, job)?;
+    }
+
+    fn join() {
+        join(self.thread)?;
+    }
+}
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(run_jobs, pair[1])?;
+    let w = new Worker(t, pair[0]);
+    w.submit("a")?;
+    w.submit("b")?;
+    w.submit("stop")?;
+    w.join()?;
+}
+"#,
+        ),
+        (
+            "src/pool/worker.hy",
+            r#"
+use thread::*;
+
+fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
+    while true {
+        let job = recv(rx)?;
+        if job == "stop" {
+            break;
+        }
+        print "%s,", job;
+    }
+    return 0;
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("try_pool", manifest, &files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("MSG: {}", msg.message());
+            }
+            panic!("compile failed");
+        }
+    };
+
+    let mut oob = Vec::new();
+    for (i, b) in bytecode.iter().enumerate() {
+        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
+            let idx = (b.operand_u32() & 0xFFFF) as usize;
+            if idx >= constants.len() {
+                oob.push((i, idx));
+            }
+        }
+    }
+    assert!(
+        oob.is_empty(),
+        "JumpIfMatch pool index out of range after multi-file link: \
+         {oob:?} (constants.len() = {})",
+        constants.len()
+    );
+
+    let output = run_bytecode(bytecode, constants, &pipeline);
+    assert_eq!(output, "a,b,");
 }
 
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
