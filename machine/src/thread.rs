@@ -980,16 +980,14 @@ fn try_host_try_write(heap: &mut Heap, lock: Value, callback: Value) -> Result<V
         return Err(ThreadErrorTag::Other);
     };
     let inner = Arc::clone(&gc.as_ref().inner);
-    let guard = match inner.cell.try_write() {
+    let mut guard = match inner.cell.try_write() {
         Ok(g) => g,
         Err(std::sync::TryLockError::WouldBlock) => return Err(ThreadErrorTag::WouldBlock),
         Err(std::sync::TryLockError::Poisoned(_)) => return Err(ThreadErrorTag::Poisoned),
     };
     let t_val = portable_to_value(heap, guard.clone())?;
-    drop(guard);
     let ret = host_call_function(entry, &[t_val])?;
     let (new_t, out_r) = parse_lock_callback_result(heap, ret)?;
-    let mut guard = inner.cell.write().map_err(|_| ThreadErrorTag::Poisoned)?;
     *guard = value_to_portable(heap, new_t)?;
     Ok(out_r)
 }

@@ -54,6 +54,8 @@ fn main() {
 
 `try_send` / `try_recv` are non-blocking variants when you need them.
 
+Channels are **unbounded** today: `try_send` always enqueues (same as `send`) and only fails with `Disconnected` if the sender is closed. `try_recv` returns `WouldBlock` when the queue is empty and the channel is still open.
+
 ## Mutex and `with_lock`
 
 `mutex(initial)` allocates a mutex holding a value. Prefer **`with_lock(m, callback)`**: the callback receives the current value and returns `(new_value, result)`; the mutex is updated and `result` is returned to the caller.
@@ -81,6 +83,10 @@ Lower-level `lock` / `unlock` exist but are easy to misuse; `with_lock` is the s
 ## RwLock
 
 `rwlock(initial)` plus `with_read` / `with_write` (and `try_read` / `try_write`) mirror the mutex pattern for many readers or one writer.
+
+- **`with_lock` / `with_write`** hold the lock for the whole callback. For writes, the callback returns `(new_value, result)` and the lock stores `new_value` before releasing — concurrent threads cannot observe or overwrite that update in between.
+- **`with_read` / `try_read`** take a **snapshot**: the read guard is released before the callback runs, so another thread may change the protected value while your callback executes. Use `with_read` only when the callback does not need a consistent view of the live lock contents.
+- **`try_write`** (like `with_write`) keeps the write lock held through the callback and commits the returned new value before releasing.
 
 ## Errors
 
