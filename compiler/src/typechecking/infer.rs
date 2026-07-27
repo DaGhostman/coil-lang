@@ -18814,7 +18814,7 @@ fn main() { let g = add(a: 1); }
     }
 
     #[test]
-    fn spawn_rejects_non_sendable_function_argument() {
+    fn spawn_rejects_non_sendable_thread_argument() {
         let msgs = assert_messages(
             r#"
 use thread::*;
