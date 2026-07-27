@@ -34,46 +34,86 @@ pub fn auth_url(url: &str) -> String {
     url.to_string()
 }
 
-/// List `(tag_name, commit_sha)` for tags that look like semver
-/// on the remote (via `git ls-remote --tags`).
+/// Strip embedded credentials from a URL so error messages never
+/// leak `GH_TOKEN` / `GITHUB_TOKEN` into logs.
+pub fn redact_url(url: &str) -> String {
+    // https://user:pass@host/... → https://host/...
+    if let Some(scheme_end) = url.find("://") {
+        let scheme = &url[..scheme_end];
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{scheme}://{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// List `(tag_name, commit_sha)` for tags on the remote.
+///
+/// Uses `git ls-remote --tags` **without** `--refs` so annotated
+/// tags expose the peeled commit via `refs/tags/vX.Y.Z^{}`. We
+/// prefer the peeled SHA when present; otherwise the lightweight
+/// tag SHA.
 pub fn list_semver_tags(url: &str) -> Result<Vec<(String, String)>, GitError> {
-    let url = auth_url(url);
+    let display = redact_url(url);
+    let fetch_url = auth_url(url);
     let output = Command::new("git")
-        .args(["ls-remote", "--tags", "--refs", &url])
+        .args(["ls-remote", "--tags", &fetch_url])
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| GitError(format!("failed to run git ls-remote: {e}")))?;
     if !output.status.success() {
         return Err(GitError(format!(
-            "git ls-remote failed for `{url}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "git ls-remote failed for `{display}`: {}",
+            redact_url(&String::from_utf8_lossy(&output.stderr))
+                .trim()
+                .to_string()
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut out = Vec::new();
+    // tag name → (sha, is_peeled)
+    let mut by_tag: std::collections::BTreeMap<String, (String, bool)> =
+        std::collections::BTreeMap::new();
     for line in stdout.lines() {
-        // <sha>\trefs/tags/<name>
         let mut parts = line.split_whitespace();
         let Some(sha) = parts.next() else { continue };
         let Some(refname) = parts.next() else { continue };
-        let Some(tag) = refname.strip_prefix("refs/tags/") else {
+        let Some(tag_part) = refname.strip_prefix("refs/tags/") else {
             continue;
         };
-        out.push((tag.to_string(), sha.to_string()));
+        let (tag, peeled) = if let Some(tag) = tag_part.strip_suffix("^{}") {
+            (tag, true)
+        } else {
+            (tag_part, false)
+        };
+        match by_tag.get(tag) {
+            Some((_, true)) if !peeled => {} // keep peeled
+            _ => {
+                by_tag.insert(tag.to_string(), (sha.to_string(), peeled));
+            }
+        }
     }
-    Ok(out)
+    Ok(by_tag
+        .into_iter()
+        .map(|(tag, (sha, _))| (tag, sha))
+        .collect())
 }
 
 /// Resolve the default-branch tip commit for `url`.
 pub fn remote_head(url: &str) -> Result<String, GitError> {
-    let url = auth_url(url);
+    let display = redact_url(url);
+    let fetch_url = auth_url(url);
     let output = Command::new("git")
-        .args(["ls-remote", "--symref", &url, "HEAD"])
+        .args(["ls-remote", "--symref", &fetch_url, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| GitError(format!("failed to run git ls-remote HEAD: {e}")))?;
     if !output.status.success() {
         return Err(GitError(format!(
-            "git ls-remote HEAD failed for `{url}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "git ls-remote HEAD failed for `{display}`: {}",
+            redact_url(&String::from_utf8_lossy(&output.stderr))
+                .trim()
+                .to_string()
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -88,7 +128,7 @@ pub fn remote_head(url: &str) -> Result<String, GitError> {
         }
     }
     Err(GitError(format!(
-        "could not resolve HEAD for `{url}`"
+        "could not resolve HEAD for `{display}`"
     )))
 }
 
@@ -97,13 +137,17 @@ pub fn remote_head(url: &str) -> Result<String, GitError> {
 ///
 /// Uses a temporary clone then checks out the exact commit so
 /// the lockfile SHA is what ends up on disk.
+///
+/// `url` should be the **original** (unauthenticated) remote;
+/// credentials are applied internally and never appear in errors.
 pub fn checkout_commit(
     url: &str,
     commit: &str,
     dest: &Path,
     subpath: Option<&str>,
 ) -> Result<(), GitError> {
-    let url = auth_url(url);
+    let display = redact_url(url);
+    let fetch_url = auth_url(url);
     // Fresh vendor dir each time so we never mix commits.
     if dest.exists() {
         std::fs::remove_dir_all(dest).map_err(|e| {
@@ -126,20 +170,21 @@ pub fn checkout_commit(
     }
 
     let status = Command::new("git")
-        .args(["clone", "--quiet", "--no-checkout", &url])
+        .args(["clone", "--quiet", "--no-checkout", &fetch_url])
         .arg(&staging)
         .env("GIT_TERMINAL_PROMPT", "0")
         .status()
         .map_err(|e| GitError(format!("failed to run git clone: {e}")))?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(GitError(format!("git clone failed for `{url}`")));
+        return Err(GitError(format!("git clone failed for `{display}`")));
     }
 
     // Fetch the exact commit (works for tag tips and arbitrary SHAs).
     let fetch = Command::new("git")
         .args(["fetch", "--depth", "1", "origin", commit])
         .current_dir(&staging)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .status()
         .map_err(|e| GitError(format!("failed to run git fetch: {e}")))?;
     if !fetch.success() {
@@ -147,18 +192,26 @@ pub fn checkout_commit(
         let fetch2 = Command::new("git")
             .args(["fetch", "origin", commit])
             .current_dir(&staging)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .status()
             .map_err(|e| GitError(format!("failed to run git fetch: {e}")))?;
         if !fetch2.success() {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(GitError(format!(
-                "git fetch of commit `{commit}` failed for `{url}`"
+                "git fetch of commit `{commit}` failed for `{display}`"
             )));
         }
     }
 
     let checkout = Command::new("git")
-        .args(["-c", "advice.detachedHead=false", "checkout", "--quiet", "--force", commit])
+        .args([
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            "--force",
+            commit,
+        ])
         .current_dir(&staging)
         .status()
         .map_err(|e| GitError(format!("failed to run git checkout: {e}")))?;
@@ -186,17 +239,19 @@ pub fn checkout_commit(
         _ => staging.clone(),
     };
 
-    std::fs::rename(&source, dest).or_else(|_| {
-        // Cross-device rename fallback.
-        copy_dir_all(&source, dest)?;
-        let _ = std::fs::remove_dir_all(&source);
-        Ok(())
-    }).map_err(|e: std::io::Error| {
-        GitError(format!(
-            "failed to place package at `{}`: {e}",
-            dest.display()
-        ))
-    })?;
+    std::fs::rename(&source, dest)
+        .or_else(|_| {
+            // Cross-device rename fallback.
+            copy_dir_all(&source, dest)?;
+            let _ = std::fs::remove_dir_all(&source);
+            Ok(())
+        })
+        .map_err(|e: std::io::Error| {
+            GitError(format!(
+                "failed to place package at `{}`: {e}",
+                dest.display()
+            ))
+        })?;
 
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
@@ -213,7 +268,8 @@ pub fn commits_between(
     if old_commit == new_commit {
         return Ok(Vec::new());
     }
-    let url = auth_url(url);
+    let display = redact_url(url);
+    let fetch_url = auth_url(url);
     let tmp = std::env::temp_dir().join(format!(
         "coil-gitlog-{}-{}",
         &new_commit[..new_commit.len().min(8)],
@@ -223,13 +279,16 @@ pub fn commits_between(
         let _ = std::fs::remove_dir_all(&tmp);
     }
     let status = Command::new("git")
-        .args(["clone", "--no-checkout", &url])
+        .args(["clone", "--quiet", "--no-checkout", &fetch_url])
         .arg(&tmp)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .status()
         .map_err(|e| GitError(format!("failed to run git clone for log: {e}")))?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(GitError(format!("git clone failed for changelog on `{url}`")));
+        return Err(GitError(format!(
+            "git clone failed for changelog on `{display}`"
+        )));
     }
 
     // Fetch both commits so the range is available.
@@ -237,12 +296,14 @@ pub fn commits_between(
         let _ = Command::new("git")
             .args(["fetch", "--depth", "50", "origin", commit])
             .current_dir(&tmp)
+            .env("GIT_TERMINAL_PROMPT", "0")
             .status();
     }
     // Ensure we can walk the range; deepen if needed.
     let _ = Command::new("git")
         .args(["fetch", "origin", old_commit, new_commit])
         .current_dir(&tmp)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .status();
 
     let range = format!("{old_commit}..{new_commit}");
@@ -364,5 +425,17 @@ mod tests {
                 None => std::env::remove_var("GITHUB_TOKEN"),
             }
         }
+    }
+
+    #[test]
+    fn redact_url_strips_embedded_credentials() {
+        assert_eq!(
+            redact_url("https://x-access-token:SECRET@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
     }
 }

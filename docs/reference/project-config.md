@@ -101,8 +101,11 @@ CLI:
 | `coil add <name> <git-url> [--version <req>]` | Append the dependency, resolve a matching tag, vendor, lock |
 | `coil install` | Materialise every lock entry into the vendor directory |
 | `coil update [name…]` | Propose newer matching tags, print commits since the locked SHA (grouped by repo), confirm, then bump |
+| `coil update -y` / `--yes` | Same as `update`, apply without prompting |
 
 Vendored packages are resolved **after** project `roots`. A package’s own `coil.toml` `[module].roots` (default `["src", "."]`) selects files inside the checkout; namespaces are always prefixed with the package name.
+
+`coil install` installs the **full dependency tree**: after vendoring a package it reads that package’s `[dependencies.*]` and installs those too (cycles and conflicting `git`/`path` for the same name are errors). `coil.lock` is the source of truth for commits; if a newer matching tag exists, install prints a notice and leaves the lock unchanged (`coil update` bumps it).
 
 ### `[entry]`
 

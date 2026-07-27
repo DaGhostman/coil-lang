@@ -43,7 +43,7 @@ enum Command {
         version: String,
     },
     /// Bump locked commits (with changelog + confirmation).
-    Update { names: Vec<String> },
+    Update { names: Vec<String>, yes: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +85,7 @@ fn print_help() {
          \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
          \x20 --fail-fast          With `test`, stop after the first failed case\n\
          \x20 --version <req>      With `add`, semver requirement (default: `*`)\n\
+         \x20 -y, --yes            With `update`, apply without prompting\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
@@ -104,6 +105,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
     let mut version_req: Option<String> = None;
+    let mut yes = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -115,6 +117,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--include-tests" => include_tests = true,
             "--check-native" => check_native = true,
             "--strip-debug" => strip_debug = true,
+            "-y" | "--yes" => yes = true,
             "--runner" => {
                 i += 1;
                 let Some(path) = args.get(i) else {
@@ -156,7 +159,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --version, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --version, -y/--yes, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
@@ -180,6 +183,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || strip_debug
                 || runner.is_some()
                 || version_req.is_some()
+                || yes
             {
                 return Err("`install` does not accept those flags");
             }
@@ -196,7 +200,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             {
                 return Err("`update` does not accept those flags");
             }
-            Command::Update { names: Vec::new() }
+            Command::Update {
+                names: Vec::new(),
+                yes,
+            }
         }
         [cmd, rest @ ..] if cmd == "update" => {
             if output.is_some()
@@ -214,6 +221,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             Command::Update {
                 names: rest.to_vec(),
+                yes,
             }
         }
         [cmd] if cmd == "add" => return Err("add requires <name> <git-url>"),
@@ -225,6 +233,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || check_native
                 || strip_debug
                 || runner.is_some()
+                || yes
             {
                 return Err("`add` only accepts --version among those flags");
             }
@@ -251,6 +260,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
             }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
+            }
             Command::Test {
                 path: None,
                 fail_fast,
@@ -268,6 +280,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
+            }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
             }
             if reserved(path) {
                 return Err("test path must be a directory");
@@ -292,6 +307,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
+            }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
             }
             let out = output.unwrap_or_else(|| {
                 Path::new(filename)
@@ -321,6 +339,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
             }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
+            }
             Command::Compile {
                 filename: filename.clone(),
                 output: output.unwrap_or_else(|| DEFAULT_OUT.to_string()),
@@ -339,6 +360,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
             }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
+            }
             Command::Run {
                 archive: archive.clone(),
             }
@@ -355,6 +379,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if version_req.is_some() {
                 return Err("--version is only valid with `add`");
+            }
+            if yes {
+                return Err("-y/--yes is only valid with `update`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -864,7 +891,7 @@ fn main() {
                     git_url,
                     version,
                 } => deps::cmd_add(&root, &name, &git_url, &version),
-                Command::Update { names } => deps::cmd_update(&root, &names),
+                Command::Update { names, yes } => deps::cmd_update(&root, &names, yes),
                 _ => unreachable!(),
             };
             if let Err(e) = result {
@@ -972,12 +999,23 @@ mod tests {
     fn parse_update_with_optional_names() {
         assert_eq!(
             parse_args(&args(&["update"])).unwrap().command,
-            Command::Update { names: vec![] }
+            Command::Update {
+                names: vec![],
+                yes: false,
+            }
         );
         assert_eq!(
             parse_args(&args(&["update", "foo", "bar"])).unwrap().command,
             Command::Update {
-                names: vec!["foo".into(), "bar".into()]
+                names: vec!["foo".into(), "bar".into()],
+                yes: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["update", "--yes"])).unwrap().command,
+            Command::Update {
+                names: vec![],
+                yes: true,
             }
         );
     }

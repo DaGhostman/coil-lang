@@ -91,6 +91,7 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 | `coil install` | Fetch git dependencies into the vendor directory from `coil.lock` |
 | `coil add <name> <git-url> [--version <req>]` | Add a git dependency, vendor it, and update `coil.lock` |
 | `coil update [name…]` | Bump locked commits (prints changelog; asks to confirm) |
+| `coil update -y` | Same, non-interactive |
 
 Examples:
 
