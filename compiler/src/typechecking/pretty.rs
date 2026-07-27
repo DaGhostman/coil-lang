@@ -436,6 +436,18 @@ mod tests {
         assert_eq!(format!("{}", s), "forall t0 t1. t0 -> t1");
     }
 
+    /// True if `s` contains a raw type-variable id like `t0` / `t43`
+    /// (word-boundary `t` + digits). Must not use `contains('t')` —
+    /// class names such as `Convert` contain the letter `t`.
+    fn contains_raw_tvar_id(s: &str) -> bool {
+        s.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| {
+                tok.len() > 1
+                    && tok.starts_with('t')
+                    && tok.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+            })
+    }
+
     #[test]
     fn format_ty_for_diag_renames_free_vars() {
         use crate::typechecking::subst::Subst;
@@ -445,7 +457,10 @@ mod tests {
         );
         let s = format_ty_for_diag(&Subst::empty(), &ty);
         assert_eq!(s, "a -> b");
-        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
+        assert!(
+            !contains_raw_tvar_id(&s),
+            "diagnostics must not show raw tN ids: {s}"
+        );
     }
 
     #[test]
@@ -471,7 +486,10 @@ mod tests {
         };
         let s = format_ty_for_diag(&Subst::empty(), &ty);
         assert_eq!(s, "forall a: Num. a -> a");
-        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
+        assert!(
+            !contains_raw_tvar_id(&s),
+            "diagnostics must not show raw tN ids: {s}"
+        );
     }
 
     #[test]
@@ -491,7 +509,10 @@ mod tests {
         };
         let s = format_ty_for_diag(&Subst::empty(), &ty);
         assert_eq!(s, "forall a, b. a -> b where Convert<a, b>");
-        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
+        assert!(
+            !contains_raw_tvar_id(&s),
+            "diagnostics must not show raw tN ids: {s}"
+        );
     }
 
     // ---- Sum / Constructor Display ----

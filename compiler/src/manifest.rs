@@ -247,10 +247,15 @@ impl Manifest {
     ///    (e.g. `use foo::sadge;` → `foo.hy` when the item
     ///    `sadge` lives inside that module file)
     ///
+    /// If both exist, Convention A wins silently (documented in
+    /// `docs/reference/modules.md` under Path resolution /
+    /// Shadowing). Brace/glob imports against a module file are
+    /// unaffected when only Convention B is present.
+    ///
     /// The fully qualified name of the imported item depends
     /// on which file was loaded — see codegen's alias map.
     pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
-        // Convention A — one item per file:
+        // Convention A — one item per file (preferred when both A and B exist):
         //   `use foo::sadge;` → `<root>/foo/sadge.hy`
         //   `use lib::io::read;` → `<root>/lib/io/read.hy`
         for root in &self.roots {
