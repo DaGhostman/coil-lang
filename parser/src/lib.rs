@@ -1379,93 +1379,128 @@ impl<'pratt> Pratt<'pratt> {
             .labelled("type alias")
     }
 
-    /// `use path::item;`, `use path::item as alias;`, or `use path::*;`.
+    /// `use path::item;`, `use path::item as alias;`, `use path::*;`,
+    /// or `use path::{a, b as c};` (brace-group import).
     fn use_(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // A path segment is one ident. The path is
-        // `ident (:: ident)* (:: *)?`. Each `::` is
-        // followed by either another ident or a `*`
-        // (glob marker).
         let segment = text::ident().padded();
 
-        // Each `::`-prefixed piece is either an ident or
-        // a `*`. We represent both as `Option<String>`:
-        // `Some(name)` for an ident, `None` for the glob
-        // marker. The first ident is consumed outside the
-        // loop (so we have at least one segment before
-        // any `::` is seen).
-        let path_tail = op!("::")
-            .ignore_then(
-                choice((
-                    text::ident().padded().map(|s: &str| Some(s.to_string())),
-                    just('*').padded().to(None),
-                ))
-                .map_with(|opt, e| (e.span(), opt)),
-            )
-            .repeated()
-            .collect::<Vec<_>>();
-
-        // Path = first ident + zero or more `::` pieces.
-        keyword!("use")
-            .ignore_then(segment.then(path_tail))
-            .map(
-                |(first, rest): (&'pratt str, Vec<(SimpleSpan, Option<String>)>)| {
-                    let mut out: Vec<Option<String>> = Vec::with_capacity(1 + rest.len());
-                    out.push(Some(first.to_string()));
-                    for (_span, opt) in rest {
-                        out.push(opt);
-                    }
-                    out
-                },
-            )
-            // After the path: either `as alias` (alias form)
-            // or nothing (concrete form). The glob marker
-            // (`*`) was consumed inside the path_tail above.
-            // The trailing `;` is consumed by the outer
-            // `.then_ignore(op!(";"))` below — we must NOT
-            // consume it here.
+        // One item inside `{ … }`: `name` or `name as alias`.
+        let brace_item = text::ident()
+            .padded()
             .then(
                 keyword!("as")
                     .ignore_then(text::ident().padded())
                     .map(|s: &str| s.to_string())
                     .or_not(),
             )
-            .then_ignore(op!(";"))
-            .map_with(|(segments, alias), e| {
-                // Walk the segments. The last segment is
-                // either:
-                //   - Some(name) — concrete import.
-                //   - None — glob (`use foo::bar::*;`).
-                // All earlier segments form the path.
-                let mut segs = segments;
-                let last = segs
-                    .pop()
-                    .expect("at least one segment from the leading ident");
-                let path: Vec<String> = segs
-                    .into_iter()
-                    .map(|opt| opt.expect("only the LAST segment may be a glob"))
-                    .collect();
+            .map(|(name, alias): (&str, Option<String>)| (name.to_string(), alias));
 
-                if let Some(name) = last {
-                    // Concrete import. Alias is whatever
-                    // the `as` clause produced.
-                    (e.span(), Box::new(Expression::Use { path, name, alias }))
-                } else {
-                    // Glob import. `alias` is always None
-                    // (a glob can't be aliased — the
-                    // alias would have nothing to bind
-                    // to, since glob imports are resolved
-                    // by the pipeline at compile time).
-                    (
-                        e.span(),
-                        Box::new(Expression::Use {
-                            path,
-                            name: "*".to_string(),
-                            alias: None,
-                        }),
-                    )
+        let brace_group = just('{')
+            .padded()
+            .ignore_then(
+                brace_item
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just('}').padded());
+
+        // After the first ident: zero or more `::ident`, then either
+        // `::{…}`, `::*`, or end-of-path (+ optional `as`).
+        let path_middle = op!("::")
+            .ignore_then(text::ident().padded().map(|s: &str| s.to_string()))
+            .repeated()
+            .collect::<Vec<String>>();
+
+        #[derive(Clone)]
+        enum EndKind {
+            Brace(Vec<(String, Option<String>)>),
+            Glob,
+            Concrete(Option<String>),
+        }
+
+        let path_end = choice((
+            // `::{a, b as c}`
+            op!("::")
+                .ignore_then(brace_group)
+                .map(EndKind::Brace),
+            // `::*`
+            op!("::")
+                .ignore_then(just('*').padded())
+                .to(EndKind::Glob),
+            // bare end — optional `as alias`
+            keyword!("as")
+                .ignore_then(text::ident().padded())
+                .map(|s: &str| s.to_string())
+                .or_not()
+                .map(EndKind::Concrete),
+        ));
+
+        keyword!("use")
+            .ignore_then(segment.then(path_middle).then(path_end))
+            .then_ignore(op!(";"))
+            .map_with(
+                |((first, middle), end): ((&str, Vec<String>), EndKind), e| {
+                let span = e.span();
+                match end {
+                    EndKind::Brace(items) => {
+                        // `use foo::bar::{a, b as c};` → path = [foo, bar]
+                        let mut path = Vec::with_capacity(1 + middle.len());
+                        path.push(first.to_string());
+                        path.extend(middle);
+                        if items.is_empty() {
+                            return (span, Box::new(Expression::Fragment(Vec::new())));
+                        }
+                        if items.len() == 1 {
+                            let (name, alias) = items.into_iter().next().unwrap();
+                            return (span, Box::new(Expression::Use { path, name, alias }));
+                        }
+                        let children: Vec<Output<'pratt>> = items
+                            .into_iter()
+                            .map(|(name, alias)| {
+                                (
+                                    span,
+                                    Box::new(Expression::Use {
+                                        path: path.clone(),
+                                        name,
+                                        alias,
+                                    }),
+                                )
+                            })
+                            .collect();
+                        (span, Box::new(Expression::Fragment(children)))
+                    }
+                    EndKind::Glob => {
+                        let mut path = Vec::with_capacity(1 + middle.len());
+                        path.push(first.to_string());
+                        path.extend(middle);
+                        (
+                            span,
+                            Box::new(Expression::Use {
+                                path,
+                                name: "*".to_string(),
+                                alias: None,
+                            }),
+                        )
+                    }
+                    EndKind::Concrete(alias) => {
+                        // `use foo;` / `use foo::bar;` / `use foo::bar as x;`
+                        let mut segs = Vec::with_capacity(1 + middle.len());
+                        segs.push(first.to_string());
+                        segs.extend(middle);
+                        let name = segs.pop().expect("at least the leading ident");
+                        (
+                            span,
+                            Box::new(Expression::Use {
+                                path: segs,
+                                name,
+                                alias,
+                            }),
+                        )
+                    }
                 }
             })
             .labelled("use statement")
@@ -4313,6 +4348,76 @@ mod tests {
                     assert!(alias.is_none());
                 }
                 other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group() {
+        let src = "use foo::{sadge, greet as g};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Use { path, name, alias } => {
+                            assert_eq!(path, &["foo".to_string()]);
+                            assert_eq!(name, "sadge");
+                            assert!(alias.is_none());
+                        }
+                        other => panic!("expected first Use, got {:?}", other),
+                    }
+                    match children[1].1.as_ref() {
+                        Expression::Use { path, name, alias } => {
+                            assert_eq!(path, &["foo".to_string()]);
+                            assert_eq!(name, "greet");
+                            assert_eq!(alias.as_deref(), Some("g"));
+                        }
+                        other => panic!("expected second Use, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment of Uses, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group_single_item() {
+        let src = "use foo::{sadge};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string()]);
+                    assert_eq!(name, "sadge");
+                    assert!(alias.is_none());
+                }
+                other => panic!("expected single Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_use_brace_group_nested_path() {
+        let src = "use lib::io::{read, write as w};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Use { path, name, .. } => {
+                            assert_eq!(path, &["lib".to_string(), "io".to_string()]);
+                            assert_eq!(name, "read");
+                        }
+                        other => panic!("expected Use, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment, got {:?}", other),
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }

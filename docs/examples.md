@@ -778,6 +778,27 @@ fn main() {
 
 ---
 
+### `examples/nested_aggregates.hy`
+
+**Demonstrates:** Nested aggregates — `type Row = (string, int); type Table = [Row];` with `for` and let-destructure.
+
+```coil
+type Row = (string, int);
+type Table = [Row];
+
+fn main() {
+    let people: Table = [("alice", 30), ("bob", 25)];
+    // …
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/nested_aggregates.hy` |
+| **Output** | `alice:30bob:25total:55` |
+
+---
+
 ### `examples/vec_tuple.hy`
 
 **Demonstrates:** Element-wise tuple zip, scalar broadcast, and unary negate.
@@ -1134,12 +1155,27 @@ fn main() {
 | **Companion** | `examples/src/foo/sadge.hy` — defines `fn sadge()` printing `420` as hex |
 | **Expected output** | `1a4` (newline) then `45` — i.e. `1a4\n45` |
 
-**Setup:** The module resolver looks for `src/foo/sadge.hy` relative to the project root (default manifest roots). The examples layout places files at `examples/src/foo/sadge.hy`, so for a working demo you need either:
+**Setup:** Workspace `coil.toml` includes `./examples/src` in `[module].roots`, so `cargo run -- examples/modules.hy` resolves the import.
 
-- A `coil.toml` at the repo root with `roots = ["./examples/src"]`, **and**
-- Multi-file compilation (`compile_src_from_file`) — the stock `cargo run` path currently compiles one file in memory and does **not** resolve `use` across files.
+---
 
-See [reference/modules.md](reference/modules.md) and [reference/project-config.md](reference/project-config.md) for full module workflow. Namespace integration tests live in `compiler/tests/namespace.rs`.
+### `examples/modules_brace.hy`
+
+**Demonstrates:** Brace-group imports from a module file (`math.hy`).
+
+```coil
+use math::{add, mul};
+
+fn main() {
+    print "%i", add(5, 7);
+    print "%i", mul(6, 7);
+}
+```
+
+| | |
+|---|---|
+| **Companion** | `examples/src/math.hy` |
+| **Expected output** | `1242` |
 
 ---
 
@@ -1635,6 +1671,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
 | `aliases.hy` | Types | `347` |
+| `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |
 | `vec_array.hy` | Aggregates | `46,45,18` |
 | `vec_generic.hy` | Aggregates | `24,55` |
@@ -1659,8 +1696,10 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `polyfn.hy` | Types | `424.0424242` |
 | `operators.hy` | Operators | `801125428falsetrue3` |
 | `modules.hy` | Modules | `1a4\n45` |
+| `modules_brace.hy` | Modules | `1242` |
 | `src/foo/sadge.hy` | Modules | (support file) |
 | `src/foo.hy` | Modules | (support file) |
+| `src/math.hy` | Modules | (support file) |
 | `strlen.hy` | FFI | `5` |
 | `ffi_printf.hy` | FFI | `hello 42` |
 | `ffi_sum.hy` | FFI | `42` |

@@ -70,12 +70,20 @@ Example:
 file = "./src/main.hy"
 ```
 
-When set, the compiler uses this file as the program entry point (jumps to `main` in that file).
+When set, `coil` and `coil compile` with **no file argument** use this path as the program entry (relative to the project root that owns `coil.toml`).
 
-When omitted, the entry file is whatever you pass on the command line:
+When omitted, you must pass the entry file on the command line:
 
 ```bash
-cargo run -- examples/modules.hy
+coil examples/modules.hy
+# or
+coil compile examples/modules.hy
+```
+
+```bash
+# with [entry] file = "./src/main.hy" in coil.toml:
+coil
+coil compile
 ```
 
 ---

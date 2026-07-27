@@ -1,8 +1,191 @@
 //! Pretty-printing for [`Ty`] and [`Scheme`] (diagnostics and tests).
 
+use std::collections::HashMap;
 use std::fmt;
 
-use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty};
+use super::subst::{Subst, apply_ty_prune};
+use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty, TyVarId};
+
+/// Format a type for user-facing diagnostics.
+///
+/// Applies the full substitution, then renames any remaining free
+/// type variables to `a`, `b`, `c`, … so messages never show raw
+/// counters like `` `t43` ``.
+pub fn format_ty_for_diag(subst: &Subst, ty: &Ty) -> String {
+    let pruned = apply_ty_prune(subst, ty);
+    let mut rename = HashMap::new();
+    let mut next = 0u32;
+    format_ty_renamed(&pruned, &mut rename, &mut next)
+}
+
+fn fresh_diag_name(next: &mut u32) -> String {
+    // a..z, then a1, b1, …
+    let n = *next;
+    *next += 1;
+    if n < 26 {
+        ((b'a' + n as u8) as char).to_string()
+    } else {
+        let letter = ((b'a' + (n % 26) as u8) as char);
+        format!("{}{}", letter, n / 26)
+    }
+}
+
+fn format_ty_renamed(
+    ty: &Ty,
+    rename: &mut HashMap<TyVarId, String>,
+    next: &mut u32,
+) -> String {
+    match ty {
+        Ty::Var(v) => rename
+            .entry(*v)
+            .or_insert_with(|| fresh_diag_name(next))
+            .clone(),
+        Ty::Con(name) => name.clone(),
+        Ty::Fun(a, b) => {
+            let left = format_ty_renamed(a, rename, next);
+            let right = format_ty_renamed(b, rename, next);
+            if needs_paren(a) {
+                format!("({}) -> {}", left, right)
+            } else {
+                format!("{} -> {}", left, right)
+            }
+        }
+        Ty::App(c, args) => {
+            if args.is_empty() {
+                format_ty_renamed(c, rename, next)
+            } else if let Ty::Con(name) = c.as_ref() {
+                if name == "coroutine" && args.len() == 2 {
+                    let y = format_ty_renamed(&args[0], rename, next);
+                    let s = format_ty_renamed(&args[1], rename, next);
+                    if matches!(&args[1], Ty::Con(n) if n == "unit") {
+                        return format!("coroutine<{}>", y);
+                    }
+                    return format!("coroutine<{}, {}>", y, s);
+                }
+                let inner = args
+                    .iter()
+                    .map(|t| format_ty_renamed(t, rename, next))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}<{}>", name, inner)
+            } else {
+                let head = format_ty_renamed(c, rename, next);
+                let inner = args
+                    .iter()
+                    .map(|t| format_ty_renamed(t, rename, next))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}<{}>", head, inner)
+            }
+        }
+        Ty::List(inner) => format!("[{}]", format_ty_renamed(inner, rename, next)),
+        Ty::Sum { name, variants } => {
+            let mut out = format!("enum {} {{ ", name);
+            for (i, (vname, payload)) in variants.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(vname);
+                match payload {
+                    EnumVariantPayloadTy::Unit => {}
+                    EnumVariantPayloadTy::Tuple(tys) => {
+                        out.push('(');
+                        for (j, p) in tys.iter().enumerate() {
+                            if j > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(&format_ty_renamed(p, rename, next));
+                        }
+                        out.push(')');
+                    }
+                    EnumVariantPayloadTy::Record(fields) => {
+                        out.push_str(" { ");
+                        for (j, (fname, fty)) in fields.iter().enumerate() {
+                            if j > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(fname);
+                            out.push_str(": ");
+                            out.push_str(&format_ty_renamed(fty, rename, next));
+                        }
+                        out.push_str(" }");
+                    }
+                }
+            }
+            out.push_str(" }");
+            out
+        }
+        Ty::Constructor { owner, tag, .. } => {
+            format!("{}::v{}", format_ty_renamed(owner, rename, next), tag)
+        }
+        Ty::Tuple(tys) => {
+            let inner = tys
+                .iter()
+                .map(|t| format_ty_renamed(t, rename, next))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({})", inner)
+        }
+        Ty::Array { element, length } => {
+            let elem = format_ty_renamed(element, rename, next);
+            match length {
+                ArrayLength::Static(n) => format!("[{}; {}]", elem, n),
+                ArrayLength::Dynamic => format!("[{}]", elem),
+            }
+        }
+        Ty::Record { fields } => {
+            let inner = fields
+                .iter()
+                .map(|(name, ty)| format!("{}: {}", name, format_ty_renamed(ty, rename, next)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {} }}", inner)
+        }
+        Ty::Readonly(inner) => format!("readonly {}", format_ty_renamed(inner, rename, next)),
+        Ty::Existential { class } => class.clone(),
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            for v in bounds {
+                rename
+                    .entry(*v)
+                    .or_insert_with(|| fresh_diag_name(next));
+            }
+            let vars = bounds
+                .iter()
+                .map(|v| {
+                    let mut s = rename.get(v).cloned().unwrap_or_else(|| format!("t{}", v.raw()));
+                    let classes = constraints
+                        .iter()
+                        .filter(|c| c.is_unary_on(*v))
+                        .map(|c| c.class.as_str())
+                        .collect::<Vec<_>>();
+                    if !classes.is_empty() {
+                        s.push_str(": ");
+                        s.push_str(&classes.join(" + "));
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body_s = format_ty_renamed(body, rename, next);
+            let multi: Vec<String> = constraints
+                .iter()
+                .filter(|c| {
+                    c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v))
+                })
+                .map(|c| c.to_string())
+                .collect();
+            if multi.is_empty() {
+                format!("forall {}. {}", vars, body_s)
+            } else {
+                format!("forall {}. {} where {}", vars, body_s, multi.join(", "))
+            }
+        }
+    }
+}
 
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -236,6 +419,27 @@ mod tests {
             ty: Ty::Fun(Box::new(Ty::Var(TyVarId(0))), Box::new(Ty::Var(TyVarId(1)))),
         };
         assert_eq!(format!("{}", s), "forall t0 t1. t0 -> t1");
+    }
+
+    #[test]
+    fn format_ty_for_diag_renames_free_vars() {
+        use crate::typechecking::subst::Subst;
+        let ty = Ty::Fun(
+            Box::new(Ty::Var(TyVarId(43))),
+            Box::new(Ty::Var(TyVarId(99))),
+        );
+        let s = format_ty_for_diag(&Subst::empty(), &ty);
+        assert_eq!(s, "a -> b");
+        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
+    }
+
+    #[test]
+    fn format_ty_for_diag_applies_subst_before_rename() {
+        use crate::typechecking::subst::Subst;
+        let mut subst = Subst::empty();
+        subst.insert(TyVarId(43), int());
+        let s = format_ty_for_diag(&subst, &Ty::Var(TyVarId(43)));
+        assert_eq!(s, "int");
     }
 
     // ---- Sum / Constructor Display ----

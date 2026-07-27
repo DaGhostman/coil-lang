@@ -257,6 +257,29 @@ See `examples/aliases.hy` for a complete runnable example.
 
 ---
 
+## Nesting aggregates
+
+Aggregates compose. A common shape is an **array of typed tuples** — a table of heterogeneous rows:
+
+```coil
+type Row = (string, int);
+type Table = [Row];
+
+fn main() {
+    let people: Table = [("alice", 30), ("bob", 25)];
+    for row in people {
+        let (name, age) = row;
+        print "%s:%i", name, age;
+    }
+}
+```
+
+See `examples/nested_aggregates.hy` for a complete runnable program (aliases + `for` + let-destructure).
+
+You can nest the other way too: tuples of arrays, arrays of dicts, dicts whose fields are tuples, and so on. Prefer a named `type` alias when the nested shape appears more than once.
+
+---
+
 ## Runnable examples
 
 | File | Demonstrates |
@@ -264,6 +287,7 @@ See `examples/aliases.hy` for a complete runnable example.
 | `examples/array_grow.hy` | Growing arrays with `arr[] =` and `len` |
 | `examples/dict.hy` | Dict literals and field access |
 | `examples/aliases.hy` | Type aliases with tuples |
+| `examples/nested_aggregates.hy` | `[(string, int)]` tables with aliases |
 | `examples/record.hy` | Enum record variants (contrast with dicts) |
 
 Run any example from the project root:

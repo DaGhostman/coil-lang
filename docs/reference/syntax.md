@@ -290,11 +290,15 @@ Examples: `type PointPair = (int, int);`, `type Pair<T> = (T, T);`
 ### Modules
 
 ```
-use_stmt ::= 'use' path ('as' IDENT)? ';'
-path     ::= IDENT ('::' IDENT)* ('::' '*')?
+use_stmt ::= 'use' use_path ';'
+use_path ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
+           | IDENT ('::' IDENT)* ('::' '*')?
+           | IDENT ('::' IDENT)* ('as' IDENT)?
+use_item ::= IDENT ('as' IDENT)?
 mod_stmt ::= 'mod' IDENT ';'
 ```
 
+Brace groups (`use math::{add, mul};`) desugar to multiple single-item `use`s.
 See [Modules reference](modules.md).
 
 ### Extern (FFI)

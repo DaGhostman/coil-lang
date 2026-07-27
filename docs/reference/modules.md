@@ -9,8 +9,10 @@ This document specifies the syntax and semantics of coil's module system: `use` 
 ### `use` statement
 
 ```
-use_stmt ::= 'use' path ('as' IDENT)? ';'
-path     ::= IDENT ('::' IDENT)* ('::' '*')?
+use_stmt   ::= 'use' use_path ';'
+use_path   ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
+             | IDENT ('::' IDENT)* ('::' '*')? ('as' IDENT)?
+use_item   ::= IDENT ('as' IDENT)?
 ```
 
 Forms:
@@ -20,15 +22,17 @@ Forms:
 | Concrete import | `use foo::sadge;` |
 | Aliased import | `use foo::sadge as f;` |
 | Glob import | `use foo::*;` |
+| Brace group | `use math::{add, mul as product};` |
 | Multi-segment | `use lib::io::read;` |
 
 Rules:
 
 - Every `use` statement ends with `;`.
 - Path segments are identifiers separated by `::`.
-- The last segment is either an identifier (concrete import) or `*` (glob).
-- Only concrete imports may use `as`. Glob imports cannot be aliased.
-- A glob marker (`*`) must be the **last** segment.
+- The last segment is either an identifier (concrete import), `*` (glob), or a `{ … }` brace group.
+- Concrete imports and brace-group items may use `as`. Glob imports cannot be aliased.
+- A glob marker (`*`) or brace group must be the **last** segment.
+- Brace groups desugar to one concrete import per item (same module path).
 
 ### `mod` statement
 
@@ -82,9 +86,17 @@ Given a concrete import `use a::b::c;`:
    - Path: `["a", "b"]`
    - Item name: `"c"`
 2. For each search root in `[module].roots` (from `coil.toml`, in declaration order):
-   - Build candidate: `<project_root>/<root>/a/b/c.hy`
+   - **One-item-per-file:** `<project_root>/<root>/a/b/c.hy`
    - If the file exists, **stop** — this is the resolved module file.
-3. If no root contains the file, emit a module-not-found diagnostic.
+3. If no one-item-per-file candidate exists, try the **module-file** fallback for each root:
+   - `<project_root>/<root>/a/b.hy` (items exported from the module file)
+   - This is what makes `use math::add;` work when `add` lives in `math.hy`.
+4. If no root contains either form, emit a module-not-found diagnostic.
+
+Given a brace-group import `use math::{add, mul};`:
+
+1. Desugar to `use math::add;` + `use math::mul;` (same path, one item each).
+2. Resolve each item with the algorithm above (typically both hit the same `math.hy`).
 
 Given a glob import `use a::b::*;`:
 
@@ -104,8 +116,9 @@ Given a `mod foo;` declaration:
 
 | Statement | Resolved file (root = `src/`) |
 |-----------|-------------------------------|
-| `use foo::sadge;` | `src/foo/sadge.hy` |
-| `use lib::io::read;` | `src/lib/io/read.hy` |
+| `use foo::sadge;` | `src/foo/sadge.hy`, else `src/foo.hy` |
+| `use math::{add, mul};` | `src/math.hy` (module-file fallback) |
+| `use lib::io::read;` | `src/lib/io/read.hy`, else `src/lib/io.hy` |
 | `use foo::*;` | `src/foo.hy` |
 | `mod foo;` | `src/foo.hy` |
 

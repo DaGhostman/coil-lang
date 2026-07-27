@@ -46,14 +46,14 @@ struct CliArgs {
 fn print_help() {
     eprintln!(
         "Usage:\n\
-         \x20 coil [--log-json | --log-lsp] <file.hy>\n\
-         \x20 coil [--log-json | --log-lsp] compile <file.hy> [-o|--output <path>]\n\
+         \x20 coil [--log-json | --log-lsp] [<file.hy>]\n\
+         \x20 coil [--log-json | --log-lsp] compile [<file.hy>] [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] run <file.hyc>\n\
          \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \n\
          Commands:\n\
-         \x20 (default)  Compile <file.hy> to out.hyc (cached) and run it\n\
+         \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) to out.hyc and run it\n\
          \x20 compile    Compile an entry file (must define main) to a .hyc archive\n\
          \x20 run        Execute a previously compiled .hyc archive\n\
          \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
@@ -71,6 +71,7 @@ fn print_help() {
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
          \n\
+         When no file is given, `coil` / `coil compile` use `[entry].file` from coil.toml.\n\
          (default diagnostics) Pretty reports on stderr"
     );
 }
@@ -132,7 +133,21 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     }
 
     let command = match positionals.as_slice() {
-        [] => return Err("missing input file or command"),
+        [] => {
+            if output.is_some() {
+                return Err("-o/--output is only valid with `compile` or `package`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            // Resolved later from coil.toml `[entry].file`.
+            Command::BuildAndRun {
+                filename: String::new(),
+            }
+        }
         [cmd] if cmd == "test" => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile` or `package`");
@@ -166,7 +181,19 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 fail_fast,
             }
         }
-        [cmd] if cmd == "compile" => return Err("compile requires an entry file"),
+        [cmd] if cmd == "compile" => {
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            // Filename filled from `[entry].file` when empty.
+            Command::Compile {
+                filename: String::new(),
+                output: output.unwrap_or_else(|| DEFAULT_OUT.to_string()),
+            }
+        }
         [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
         [cmd, filename] if cmd == "package" => {
@@ -259,6 +286,32 @@ pub(crate) fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: i
     pipeline.emit_spanless_error(code, message);
     let _ = pipeline.finish_reporting();
     exit(1);
+}
+
+fn resolve_entry_filename(pipeline: &mut Pipeline, filename: &str) -> String {
+    if !filename.is_empty() {
+        return filename.to_string();
+    }
+    match pipeline.manifest_entry_path() {
+        Some(path) => {
+            let display = path.display().to_string();
+            if !path.exists() {
+                fail_and_exit(
+                    pipeline,
+                    ErrorCode::MissingInputFile,
+                    format!(
+                        "manifest `[entry].file` does not exist: `{display}` (set a valid path in coil.toml or pass a .hy file)"
+                    ),
+                );
+            }
+            display
+        }
+        None => fail_and_exit(
+            pipeline,
+            ErrorCode::MissingInputFile,
+            "missing input file or command (pass a .hy file, or set `[entry].file` in coil.toml)",
+        ),
+    }
 }
 
 fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
@@ -738,8 +791,12 @@ fn main() {
                 pipeline.set_include_tests(true);
             }
             match command {
-                Command::BuildAndRun { filename } => cmd_build_and_run(&mut pipeline, &filename),
+                Command::BuildAndRun { filename } => {
+                    let filename = resolve_entry_filename(&mut pipeline, &filename);
+                    cmd_build_and_run(&mut pipeline, &filename)
+                }
                 Command::Compile { filename, output } => {
+                    let filename = resolve_entry_filename(&mut pipeline, &filename);
                     cmd_compile(&mut pipeline, &filename, &output)
                 }
                 Command::Run { archive } => cmd_run(&mut pipeline, &archive),
@@ -930,10 +987,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_missing_compile_file() {
-        assert!(parse_args(&args(&["compile"])).is_err());
+    fn parse_empty_args_defers_to_manifest_entry() {
+        let cli = parse_args(&args(&[])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::BuildAndRun {
+                filename: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_compile_without_file_defers_to_manifest_entry() {
+        let cli = parse_args(&args(&["compile"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Compile {
+                filename: String::new(),
+                output: DEFAULT_OUT.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_run_archive() {
         assert!(parse_args(&args(&["run"])).is_err());
-        assert!(parse_args(&args(&[])).is_err());
     }
 
     #[test]

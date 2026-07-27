@@ -240,33 +240,46 @@ impl Manifest {
     /// item name (e.g. `["a", "b"]` for `use a::b::c;`).
     /// `name` is the final segment (e.g. `"c"`).
     ///
-    /// The file containing the module is the LAST
-    /// segment of the dotted path (as a file stem). For
-    /// `use foo::sadge;`, the file is `foo.hy` (NOT
-    /// `foo/sadge.hy`). For `use lib::io::read;`, the
-    /// file is `io.hy` inside `lib/` (so the full path
-    /// is `<root>/lib/io.hy`).
+    /// Resolution tries, in order:
+    /// 1. **One-item-per-file:** `<root>/<path>/<name>.hy`
+    ///    (e.g. `use foo::sadge;` → `foo/sadge.hy`)
+    /// 2. **Item-in-module-file:** `<root>/<path>.hy`
+    ///    (e.g. `use foo::sadge;` → `foo.hy` when the item
+    ///    `sadge` lives inside that module file)
     ///
-    /// The fully qualified name of the imported item is
-    /// `<file's path>::<name>` — the file's directory
-    /// path is the namespace, and the function name is
-    /// the LAST segment. So `sadge` in `foo.hy` has
-    /// FQN `foo::sadge`, and `read` in `lib/io.hy` has
-    /// FQN `lib::io::read`.
+    /// The fully qualified name of the imported item depends
+    /// on which file was loaded — see codegen's alias map.
     pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
+        // Convention A — one item per file:
+        //   `use foo::sadge;` → `<root>/foo/sadge.hy`
+        //   `use lib::io::read;` → `<root>/lib/io/read.hy`
         for root in &self.roots {
             let mut candidate = project_root.join(root);
             for segment in path {
                 candidate.push(segment);
             }
-            // The file is `name.hy` inside the directory
-            // `<root>/<path joined>`. So for `use
-            // foo::sadge;`, file = `<root>/foo/sadge.hy`.
-            // For `use lib::io::read;`, file =
-            // `<root>/lib/io/read.hy`.
             candidate.push(format!("{}.hy", name));
             if candidate.exists() {
                 return Some(candidate);
+            }
+        }
+        // Convention B — item inside a module file (same file as
+        // `use path::*;`). Without this fallback, modules that live
+        // under a search root as `foo.hy` are only reachable via glob,
+        // never via `use foo::item;` / `use foo::{item, …};`.
+        //   `use foo::sadge;` → `<root>/foo.hy` (when foo/sadge.hy is absent)
+        //   `use lib::io::read;` → `<root>/lib/io.hy`
+        if let Some(module_stem) = path.last() {
+            let dir_segments = &path[..path.len() - 1];
+            for root in &self.roots {
+                let mut candidate = project_root.join(root);
+                for segment in dir_segments {
+                    candidate.push(segment);
+                }
+                candidate.push(format!("{}.hy", module_stem));
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -521,6 +534,26 @@ mod tests {
         );
         let resolved = resolved.unwrap();
         assert!(resolved.ends_with("vendor/lib_x/foo.hy"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_use_falls_back_to_module_file() {
+        // Layout: <tmp>/src/foo.hy (no foo/sadge.hy).
+        // `use foo::sadge;` should resolve to foo.hy.
+        let tmp = std::env::temp_dir().join("coil_manifest_test_module_file");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("foo.hy"), "fn sadge() {}\n").unwrap();
+
+        let m = Manifest::default();
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
+        assert!(
+            resolved.is_some(),
+            "expected to fall back to <tmp>/src/foo.hy"
+        );
+        assert!(resolved.unwrap().ends_with("src/foo.hy"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

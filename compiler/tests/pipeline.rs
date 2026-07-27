@@ -300,6 +300,18 @@ fn example_aliases_prints_3_4_7() {
 }
 
 #[test]
+fn example_nested_aggregates_prints_rows_and_total() {
+    let output = run_example("examples/nested_aggregates.hy");
+    assert_eq!(output, "alice:30bob:25total:55");
+}
+
+#[test]
+fn example_modules_brace_prints_12_42() {
+    let output = run_example("examples/modules_brace.hy");
+    assert_eq!(output, "1242");
+}
+
+#[test]
 fn example_generic_alias_prints_7() {
     let output = run_example("examples/generic_alias.hy");
     assert_eq!(output, "7");

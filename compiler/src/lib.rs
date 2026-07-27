@@ -5928,12 +5928,30 @@ impl Compiler {
                         self.aliases.insert(item_name, fqn);
                     }
                 } else {
-                    let namespace = if p.is_empty() {
+                    // Prefer the FQN that actually exists in the function
+                    // table so both conventions work:
+                    //   foo/sadge.hy  → foo::sadge::sadge  (one-item-per-file)
+                    //   foo.hy        → foo::sadge         (item-in-module-file)
+                    let module_ns = p.join("::");
+                    let file_per_item = if module_ns.is_empty() {
+                        format!("{name}::{name}")
+                    } else {
+                        format!("{module_ns}::{name}::{name}")
+                    };
+                    let item_in_module = if module_ns.is_empty() {
                         name.clone()
                     } else {
-                        format!("{}::{}", p.join("::"), name)
+                        format!("{module_ns}::{name}")
                     };
-                    let qualified = format!("{}::{}", namespace, name);
+                    let qualified = if self.functions.contains_key(&file_per_item) {
+                        file_per_item
+                    } else if self.functions.contains_key(&item_in_module) {
+                        item_in_module
+                    } else {
+                        // Defensive: keep the historical one-item-per-file
+                        // shape when the dependency has not been linked yet.
+                        file_per_item
+                    };
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     self.aliases.insert(local, qualified);
                 }

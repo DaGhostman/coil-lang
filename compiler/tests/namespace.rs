@@ -446,6 +446,51 @@ roots = ["./src"]
     assert_eq!(output, "5");
 }
 
+#[test]
+fn use_brace_group_imports_from_module_file() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::{add, mul};\nfn main() { print \"%i\", add(2, 3); print \"%i\", mul(4, 5); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n\
+             fn mul(int a, int b) -> int { return a * b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_brace_group", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "520");
+}
+
+#[test]
+fn use_item_from_module_file_without_subdir() {
+    // Concrete `use math::add` must fall back to math.hy when math/add.hy
+    // does not exist (the "modules in roots don't get imported" gap).
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::add;\nfn main() { print \"%i\", add(10, 32); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_module_file_item", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "42");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);

@@ -7414,12 +7414,15 @@ impl Checker {
         let local = match unify_with(&Subst::empty(), &candidate, &expected_body) {
             Ok(s) => s,
             Err(_) => {
-                let expected_pretty = apply_ty_prune(&self.subst, expected);
+                let expected_pretty =
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, expected);
+                let found_pretty =
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, &candidate);
                 self.messages.push(Message::error(
                     ErrorCode::TypeMismatch,
                     format!(
                         "Type mismatch: expected `{}`, found `{}`",
-                        expected_pretty, candidate
+                        expected_pretty, found_pretty
                     ),
                     arg_expr
                         .map(|arg| arg.0.into_range())
@@ -7548,21 +7551,32 @@ impl Checker {
                 self.subst = compose(&s, &self.subst);
                 apply_ty(&self.subst, t1)
             }
-            Err(UnifyError::Mismatch { left, right }) => self.error_with_help(
-                ErrorCode::TypeMismatch,
-                format!("Type mismatch: expected `{}`, found `{}`", left, right),
-                range.clone(),
-                Some(format!("while checking `{}`", ctx)),
-            ),
-            Err(UnifyError::Occurs { var, ty }) => self.error_with_help(
-                ErrorCode::InfiniteType,
-                format!("Cannot construct infinite type `{}`", ty),
-                range.clone(),
-                Some(format!(
-                    "the type variable `t{}` would occur in its own definition",
-                    var.raw()
-                )),
-            ),
+            Err(UnifyError::Mismatch { left, right }) => {
+                let left_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &left);
+                let right_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &right);
+                self.error_with_help(
+                    ErrorCode::TypeMismatch,
+                    format!("Type mismatch: expected `{}`, found `{}`", left_s, right_s),
+                    range.clone(),
+                    Some(format!("while checking `{}`", ctx)),
+                )
+            }
+            Err(UnifyError::Occurs { var, ty }) => {
+                let ty_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ty);
+                let var_s = crate::typechecking::pretty::format_ty_for_diag(
+                    &self.subst,
+                    &Ty::Var(var),
+                );
+                self.error_with_help(
+                    ErrorCode::InfiniteType,
+                    format!("Cannot construct infinite type `{}`", ty_s),
+                    range.clone(),
+                    Some(format!(
+                        "the type variable `{}` would occur in its own definition",
+                        var_s
+                    )),
+                )
+            }
         }
     }
 

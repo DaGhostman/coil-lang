@@ -129,6 +129,21 @@ fn main() {
 
 Glob imports are **file-scoped**. They do not reach into subdirectories — `use foo::*` imports from `foo.hy` only, not from `foo/bar.hy`.
 
+### Brace-group import
+
+Import several named items from one module without repeating the path:
+
+```coil
+use math::{add, mul as product};
+
+fn main() {
+    print "%i", add(2, 3);
+    print "%i", product(4, 5);
+}
+```
+
+When the items live in `math.hy` (and there is no `math/add.hy`), the resolver falls back to the module file so both names bind correctly.
+
 ---
 
 ## Forward declarations with `mod`

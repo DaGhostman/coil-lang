@@ -1379,6 +1379,23 @@ impl<'a> Display for Expression<'a> {
                     _ => write!(f, " => {}", body.1),
                 }
             }
+            Self::Use { path, name, alias } => {
+                write!(f, "use ")?;
+                for (i, seg) in path.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "::")?;
+                    }
+                    write!(f, "{}", seg)?;
+                }
+                if !path.is_empty() {
+                    write!(f, "::")?;
+                }
+                write!(f, "{}", name)?;
+                if let Some(a) = alias {
+                    write!(f, " as {}", a)?;
+                }
+                write!(f, ";")
+            }
             e => write!(f, "<unhandled: {:?}>", e),
         }
     }
