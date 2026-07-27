@@ -278,3 +278,91 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `auth_url` reads process-wide env vars; serialize those tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn auth_url_rewrites_github_https_when_gh_token_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_gh = std::env::var("GH_TOKEN").ok();
+        let old_github = std::env::var("GITHUB_TOKEN").ok();
+        // SAFETY: single-threaded under ENV_LOCK for this process's tests.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::set_var("GH_TOKEN", "secret-token");
+        }
+        let rewritten = auth_url("https://github.com/org/repo.git");
+        assert_eq!(
+            rewritten,
+            "https://x-access-token:secret-token@github.com/org/repo.git"
+        );
+        unsafe {
+            match old_gh {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+            match old_github {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+        }
+    }
+
+    #[test]
+    fn auth_url_leaves_ssh_and_non_github_urls_unchanged() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_gh = std::env::var("GH_TOKEN").ok();
+        let old_github = std::env::var("GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("GH_TOKEN", "secret-token");
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+        assert_eq!(
+            auth_url("nina.v@example.com:org/repo.git"),
+            "nina.v@example.com:org/repo.git"
+        );
+        assert_eq!(
+            auth_url("https://gitlab.com/org/repo.git"),
+            "https://gitlab.com/org/repo.git"
+        );
+        unsafe {
+            match old_gh {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+            match old_github {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+        }
+    }
+
+    #[test]
+    fn auth_url_unchanged_without_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_gh = std::env::var("GH_TOKEN").ok();
+        let old_github = std::env::var("GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+        let url = "https://github.com/org/repo.git";
+        assert_eq!(auth_url(url), url);
+        unsafe {
+            match old_gh {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+            match old_github {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+        }
+    }
+}

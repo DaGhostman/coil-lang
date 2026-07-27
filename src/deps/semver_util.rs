@@ -46,4 +46,16 @@ mod tests {
         assert_eq!(best.0, "1.2.0");
         assert_eq!(best.2, "bbb");
     }
+
+    #[test]
+    fn strip_v_prefix_handles_lower_and_upper_v() {
+        assert_eq!(strip_v_prefix("v1.2.3"), "1.2.3");
+        assert_eq!(strip_v_prefix("V0.1.0"), "0.1.0");
+        assert_eq!(strip_v_prefix("1.0.0"), "1.0.0");
+    }
+
+    #[test]
+    fn highest_matching_returns_none_for_empty() {
+        assert!(highest_matching(&[]).is_none());
+    }
 }

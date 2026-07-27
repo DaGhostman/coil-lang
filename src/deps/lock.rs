@@ -234,4 +234,75 @@ mod tests {
         assert_eq!(loaded, lock);
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn parse_ignores_comments_and_blank_lines() {
+        let src = r#"
+# header
+version = 1
+
+[package.foo]
+# note
+git = "https://example.com/foo"
+version = "1.0.0"
+commit = "deadbeef"
+"#;
+        let lock = Lockfile::parse(src).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages["foo"].commit, "deadbeef");
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_lock_version() {
+        let err = Lockfile::parse("version = 99\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported coil.lock version 99"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty_package_name() {
+        let err = Lockfile::parse("version = 1\n[package.]\ngit = \"x\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("empty package name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_section_and_key() {
+        let section = Lockfile::parse("version = 1\n[deps.foo]\n").unwrap_err();
+        assert!(
+            section.to_string().contains("unknown section"),
+            "got: {section}"
+        );
+
+        let key = Lockfile::parse(
+            "version = 1\n[package.foo]\ngit = \"x\"\nversion = \"1\"\ncommit = \"c\"\nextra = \"no\"\n",
+        )
+        .unwrap_err();
+        assert!(key.to_string().contains("unknown key `extra`"), "got: {key}");
+    }
+
+    #[test]
+    fn parse_rejects_missing_required_fields() {
+        let err = Lockfile::parse(
+            "version = 1\n[package.foo]\ngit = \"https://example.com/foo\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing `commit`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_keys_before_package_section() {
+        let err = Lockfile::parse("git = \"https://example.com/foo\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("key before `[package.*]`"),
+            "got: {err}"
+        );
+    }
 }

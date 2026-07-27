@@ -470,4 +470,212 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn add_rejects_invalid_and_duplicate_package_names() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_name_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+
+        let repo = tmp.join("upstream");
+        let url = init_git_repo(&repo, &[("v1.0.0", "one")]);
+
+        let bad = cmd_add(&tmp, "bad/name", &url, "*").unwrap_err();
+        assert!(
+            bad.to_string().contains("invalid package name"),
+            "got: {bad}"
+        );
+
+        cmd_add(&tmp, "foo", &url, "*").unwrap();
+        let dup = cmd_add(&tmp, "foo", &url, "*").unwrap_err();
+        assert!(
+            dup.to_string().contains("already declared"),
+            "got: {dup}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn install_drops_stale_lock_entries_not_in_manifest() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_stale_lock_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+
+        let repo = tmp.join("upstream");
+        let url = init_git_repo(&repo, &[("v1.0.0", "one")]);
+        std::fs::write(
+            tmp.join("coil.toml"),
+            format!(
+                "[module]\nroots = [\"./src\"]\n\n[dependencies.foo]\ngit = \"{url}\"\nversion = \"^1.0\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Seed a lockfile with an extra package that is no longer declared.
+        let mut lock = Lockfile::default();
+        lock.packages.insert(
+            "gone".into(),
+            LockPackage {
+                git: url.clone(),
+                version: "1.0.0".into(),
+                commit: "0".repeat(40),
+                path: None,
+            },
+        );
+        lock.save(&tmp.join(LOCKFILE_NAME)).unwrap();
+
+        cmd_install(&tmp).unwrap();
+        let lock = Lockfile::load(&tmp.join(LOCKFILE_NAME)).unwrap();
+        assert!(lock.packages.contains_key("foo"));
+        assert!(
+            !lock.packages.contains_key("gone"),
+            "stale lock entry should be pruned: {:?}",
+            lock.packages.keys().collect::<Vec<_>>()
+        );
+        assert!(tmp.join("vendor/foo/src/greet.hy").is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_star_with_no_tags_locks_default_branch_head() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_head_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repo = tmp.join("upstream");
+        // No tags — version `*` should fall back to HEAD.
+        let url = init_git_repo(&repo, &[]);
+        let head = remote_head(&url).unwrap();
+
+        let resolved = resolve_dependency(
+            "untagged",
+            &DependencySpec {
+                git: url,
+                version: "*".into(),
+                path: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.version, "0.0.0");
+        assert_eq!(resolved.commit, head);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn materialise_honors_monorepo_subpath() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_monorepo_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repo = tmp.join("upstream");
+        std::fs::create_dir_all(repo.join("packages/lib/src")).unwrap();
+        std::fs::write(
+            repo.join("packages/lib/src/mod.hy"),
+            "fn hi() -> string { return \"mono\"; }\n",
+        )
+        .unwrap();
+        run(&repo, &["git", "init", "-b", "main"]);
+        run(&repo, &["git", "config", "user.email", "test@example.com"]);
+        run(&repo, &["git", "config", "user.name", "Test"]);
+        run(&repo, &["git", "add", "."]);
+        run(&repo, &["git", "commit", "-m", "initial"]);
+        run(&repo, &["git", "tag", "v0.1.0"]);
+        let url = repo.display().to_string();
+
+        let project = tmp.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("coil.toml"),
+            "[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+
+        let spec = DependencySpec {
+            git: url.clone(),
+            version: "^0.1".into(),
+            path: Some("packages/lib".into()),
+        };
+        let resolved = resolve_dependency("lib", &spec).unwrap();
+        let manifest = Manifest {
+            roots: vec![PathBuf::from("./src")],
+            entry: None,
+            ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: BTreeMap::from([("lib".into(), spec)]),
+        };
+        materialise_package(&project, &manifest, "lib", &resolved).unwrap();
+        assert!(
+            project.join("vendor/lib/src/mod.hy").is_file(),
+            "expected monorepo subpath contents under vendor/lib/"
+        );
+        assert!(
+            !project.join("vendor/lib/packages").exists(),
+            "vendor tree should be the subpath root, not the repo root"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn update_errors_without_lockfile_or_undeclared_name() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_update_err_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+
+        let missing_lock = cmd_update(&tmp, &[]).unwrap_err();
+        assert!(
+            missing_lock.to_string().contains("no coil.lock"),
+            "got: {missing_lock}"
+        );
+
+        // Create an empty lock so the undeclared-name path is reachable.
+        Lockfile::default()
+            .save(&tmp.join(LOCKFILE_NAME))
+            .unwrap();
+        let bad_name = cmd_update(&tmp, &["not_declared".into()]).unwrap_err();
+        assert!(
+            bad_name.to_string().contains("not a declared dependency"),
+            "got: {bad_name}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_project_root_walks_up_to_coil_toml() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_deps_root_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let nested = tmp.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(tmp.join("coil.toml"), "[module]\nroots = [\"./src\"]\n").unwrap();
+        assert_eq!(find_project_root(&nested), tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -878,4 +878,81 @@ mod tests {
         assert_eq!(ns.as_deref(), Some("foo::something"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn parse_rejects_duplicate_dependency_sections() {
+        let src = r#"
+            [dependencies.foo]
+            git = "https://example.com/foo"
+            [dependencies.foo]
+            git = "https://example.com/foo2"
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate dependency `foo`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_dependency_missing_git() {
+        let src = r#"
+            [dependencies.foo]
+            version = "^1.0"
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required `git`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_dependency_section_name() {
+        let src = r#"
+            [dependencies.bad/name]
+            git = "https://example.com/foo"
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid dependency section"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_use_prefers_project_root_over_vendored_package() {
+        let tmp = std::env::temp_dir().join("coil_manifest_pkg_shadow");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let local = tmp.join("src").join("foo");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("something.hy"), "// local\n").unwrap();
+        let vendored = tmp.join("vendor").join("foo").join("src");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(vendored.join("something.hy"), "// vendor\n").unwrap();
+
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "foo".to_string(),
+            DependencySpec {
+                git: "https://example.com/foo".into(),
+                version: "*".into(),
+                path: None,
+            },
+        );
+        let m = Manifest {
+            roots: vec![PathBuf::from("src")],
+            entry: None,
+            ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: deps,
+        };
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "something").unwrap();
+        assert!(
+            resolved.ends_with("src/foo/something.hy"),
+            "project module roots must win over vendor packages; got {}",
+            resolved.display()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
