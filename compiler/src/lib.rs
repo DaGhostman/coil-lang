@@ -9125,6 +9125,19 @@ test("two") { assert(true)?; }
         );
     }
 
+    /// Type aliases to `int` expand at check time, so `I * 8` still SHLs.
+    #[test]
+    fn aliased_int_mul_by_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src(
+            "type I = int; fn scale(I x) -> I { return x * 8; }",
+        );
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected SHL for aliased int*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Generic `T: Num` bodies with two type operands dispatch through the
     /// dictionary (`CallIndirect`), never primitive `SHL`. (A literal factor
     /// like `x * 8` unifies `T` to `int` in the checker today, so that shape

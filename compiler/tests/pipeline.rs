@@ -2781,16 +2781,18 @@ fn scale_const(int x) -> int {
 }
 fn scale_one(int x) -> int { return x * 1; }
 fn scale_six(int x) -> int { return x * 6; }
+fn scale_neg(int x) -> int { return x * 8; }
 fn main() {
     print "%i,", scale_rhs(5);
     print "%i,", scale_lhs(7);
     print "%i,", scale_const(3);
     print "%i,", scale_one(9);
-    print "%i", scale_six(7);
+    print "%i,", scale_six(7);
+    print "%i", scale_neg(0 - 3);
 }
 "#,
     );
-    assert_eq!(output, "40,28,48,9,42");
+    assert_eq!(output, "40,28,48,9,42,-24");
 }
 
 /// Early-return callees must not be tiny-inlined (inliner truncates at first
