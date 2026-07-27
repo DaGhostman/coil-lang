@@ -22,6 +22,16 @@ ordinary host natives (`packed_dot`, …). Codegen emits
 `ARCHIVE_VERSION` is **29** (invalidate archives that encoded the
 short-lived Packed\* opcodes).
 
+### Release LTO / `execute` outlining
+
+`Machine::execute` must stay `#[inline(never)]`. With fat LTO,
+`#[inline(always)]` pasted the giant dispatch `match` into
+`run_with_pool` / callers and reshaped branch layout enough to blow
+mispredict rates on some CPUs while keeping dynamic instruction counts
+identical. Outlining matches non-LTO `machine` codegen (parity with
+`main`). Do not “optimize” this back to always-inline without
+re-checking `poop` on `fib_bench.hy`.
+
 ---
 
 ## 1. Why Approach A

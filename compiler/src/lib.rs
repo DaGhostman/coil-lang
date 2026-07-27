@@ -13823,7 +13823,7 @@ fn main() {
         );
     }
 
-    /// Approach A: `dot` lowers to `PackedDot`.
+    /// Approach A: `dot` lowers to packed `HostInvoke` (`packed_dot`).
     #[test]
     fn dot_emits_packed_dot_opcode() {
         use common::Instruction;
@@ -13842,7 +13842,7 @@ fn main() {
         );
     }
 
-    /// Approach A: `Matrix` `*` lowers to `PackedMatMul`.
+    /// Approach A: `Matrix` `*` lowers to packed `HostInvoke` (`packed_matmul`).
     #[test]
     fn matrix_mul_emits_packed_matmul_opcode() {
         use common::Instruction;

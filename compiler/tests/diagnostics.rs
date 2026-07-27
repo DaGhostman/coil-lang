@@ -1914,7 +1914,7 @@ fn matmul_dims_over_packed_u8_limit_warns() {
     assert!(
         msgs.iter().any(|m| {
             *m.kind() == MessageKind::WARNING
-                && m.message().contains("exceed the packed opcode limit")
+                && m.message().contains("exceed the packed kernel meta limit")
                 && m.message().contains("256")
         }),
         "expected packed-dim warning for matmul, got: {:?}",
@@ -1946,7 +1946,7 @@ fn matrix_mul_dims_over_packed_u8_limit_warns() {
     assert!(
         msgs.iter().any(|m| {
             *m.kind() == MessageKind::WARNING
-                && m.message().contains("exceed the packed opcode limit")
+                && m.message().contains("exceed the packed kernel meta limit")
         }),
         "expected packed-dim warning for Matrix *, got: {:?}",
         msgs.iter().map(|m| (m.kind(), m.message())).collect::<Vec<_>>()

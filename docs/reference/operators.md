@@ -75,10 +75,14 @@ Homogeneous numeric tuples and arrays support the same operators
 | `[T]` | `[T]` / `[T; N]` | **hard error** (length not known at compile time) |
 | aggregate | scalar `T` (or reverse) | broadcast |
 
-`T` must be numeric (`int` / `float`, or a `Num`-bounded type parameter).
+`T` must be numeric (`int` / `float` / `byte`, or a `Num`-bounded type
+parameter).
 `*` and `**` are element-wise (not dot product / matrix power). Unary `-`
 negates each element. Compound assign (`+=`, `**=`, …) follows the same
 rules with the LHS shape fixed.
+
+Static-length zip/broadcast fully unrolls at compile time (including large
+`[T; N]`); bytecode size scales with `N`.
 
 For **dot product**, **cross product**, and bare-array **matrix multiply**,
 use the named helpers `dot`, `cross`, and `matmul`. For matmul via `*`

@@ -5599,12 +5599,12 @@ impl Checker {
         let mut msg = Message::warn(
             ErrorCode::GenericTypeError,
             format!(
-                "{what} `{dims}` exceed the packed opcode limit ({limit})",
+                "{what} `{dims}` exceed the packed kernel meta limit ({limit})",
             ),
             range.clone(),
         );
         msg.with_help(
-            "codegen will fall back to scalar unroll; prefer smaller static shapes for the packed kernel"
+            "codegen will fall back to scalar unroll; prefer smaller static shapes for the HostInvoke packed kernel"
                 .to_string(),
         );
         self.messages.push(msg);

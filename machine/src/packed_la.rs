@@ -4,6 +4,12 @@
 //! (Approach A originally appended four opcodes and regressed branch
 //! prediction on some CPUs). Dims / flags are packed into a meta `u32`
 //! argument — same bit layout as the former packed opcodes.
+//!
+//! **Defensive posture:** malformed handles / shape mismatches do **not**
+//! trap. Missing aggregates yield `0` (dot) or zero-filled cells
+//! (matmul/zip/neg) so the VM stays aligned with other silent-fallback
+//! arms. Correctness for well-typed programs relies on the typechecker
+//! and codegen never emitting these kernels with bad static shapes.
 
 use common::Value;
 

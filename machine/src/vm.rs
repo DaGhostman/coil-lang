@@ -1713,6 +1713,11 @@ impl<const S: usize> Machine<S> {
                         Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
                         _ => Vec::new(),
                     };
+                    // Packed LA (and other host natives) allocate via
+                    // `heap.alloc` inside the closure; count those so GC
+                    // pressure still fires when HostInvoke is the only
+                    // allocator on a hot path.
+                    let live_before = self.heap.live_object_count();
                     match self.natives.get_by_id(fn_id) {
                         Some(native) => match native.invoke(&mut self.heap, &args) {
                             Ok(Some(v)) => self.stack.push(v),
@@ -1726,6 +1731,21 @@ impl<const S: usize> Machine<S> {
                         None => eprintln!("HostInvoke: unknown native id {fn_id}"),
                         #[cfg(not(debug_assertions))]
                         None => {}
+                    }
+                    let allocated = self
+                        .heap
+                        .live_object_count()
+                        .saturating_sub(live_before);
+                    if allocated > 0 {
+                        self.alloc_counter += allocated;
+                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                            Self::gc_collect(
+                                &mut self.heap,
+                                &self.stack,
+                                &self.resume_stack,
+                                &mut self.alloc_counter,
+                            );
+                        }
                     }
                 }
                 Instruction::HALT => {
