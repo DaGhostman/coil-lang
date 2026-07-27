@@ -347,6 +347,39 @@ fn example_defer_prints_enterleave_lifo_and_early_return() {
 
 /// Regression: parenthesized `(self).field` must still emit GetField.
 /// Pre-fix, `receiver_type` ignored `Group`, so Access fell through to
+/// Regression: inherent `fn send` must not shadow `thread::send`, so
+/// `send(self.channel, msg)` typechecks and runs.
+#[test]
+fn method_named_send_can_call_thread_send_on_self_channel() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn send(string msg) {
+        send(self.channel, msg)?;
+    }
+}
+
+fn work() -> int { return 0; }
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(work)?;
+    let w = new ThreadWrapper(t, pair[0]);
+    w.send("hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
 /// `LoadField(0)` and `send` received a bogus value (often looking like
 /// the class instance was passed instead of the field).
 #[test]

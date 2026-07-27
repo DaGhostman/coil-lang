@@ -2139,3 +2139,61 @@ fn main() {
     );
 }
 
+
+#[test]
+fn method_named_send_does_not_shadow_thread_send() {
+    // Regression: inherent `fn send` used to bind bare `send` for
+    // monomorphic recursion, shadowing `use thread::*;` and turning
+    // `send(self.channel, data)` into a self-type mismatch
+    // (expected Sender, found Wrapper) while checking function type.
+    let (_ty, msgs) = check(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn send(int data) {
+        send(self.channel, data)?;
+    }
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "bare send() inside fn send must resolve to thread::send; got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn self_channel_field_passes_sender_to_thread_send() {
+    let (_ty, msgs) = check(
+        r#"
+use thread::*;
+
+class ThreadWrapper {
+    thread: Thread,
+    channel: Sender,
+}
+
+impl ThreadWrapper {
+    fn push(int data) {
+        send(self.channel, data)?;
+    }
+}
+
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "self.channel must type as Sender for thread::send; got: {:?}",
+        msgs
+    );
+}

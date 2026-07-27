@@ -3836,6 +3836,8 @@ impl Checker {
                     &range,
                     None,
                     *is_coro,
+                    None,
+                    false,
                 );
 
                 if test_desc.is_some() {
@@ -4719,6 +4721,8 @@ impl Checker {
                                     &m.0.into_range(),
                                     None,
                                     is_coro,
+                                    None,
+                                    false,
                                 );
                             } else {
                                 let _ = self.infer(m);
@@ -9610,6 +9614,8 @@ impl Checker {
                         &method.0.into_range(),
                         self_ty,
                         *is_coro,
+                        Some(owner),
+                        *is_static,
                     );
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
@@ -9785,6 +9791,11 @@ impl Checker {
         range: &Range<usize>,
         self_ty: Option<&Ty>,
         is_coro: bool,
+        // When set, this is an inherent `impl` method. Bare `name` must
+        // not shadow imports (`use thread::*;` → `send`); recursion uses
+        // `self.name(...)` / `Owner::name(...)` instead.
+        method_owner: Option<&str>,
+        is_static_method: bool,
     ) -> Ty {
         let Some(body) = body else {
             return self.error_with_help(
@@ -9906,10 +9917,10 @@ impl Checker {
             fun_ty = Ty::Fun(Box::new(self_ty.clone()), Box::new(fun_ty));
         }
 
-        // Monomorphic recursion: bind name to a fresh α in the
-        // *outer* frame so the function is visible to subsequent
-        // code. The body sees it too because the new frame we push
-        // for the body is a child of the outer.
+        // Monomorphic recursion: bind a fresh α so the body can call this
+        // function. Inherent methods bind `Owner::name` only — never the
+        // bare name — so `use thread::*;`/`send` is not shadowed by
+        // `impl Foo { fn send(...) { send(...) } }`.
         let alpha = self.counter.fresh();
 
         // Result/Option mode from an annotated return type. Bare
@@ -9948,8 +9959,32 @@ impl Checker {
             self.async_depth += 1;
         }
 
-        self.env
-            .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
+        if let Some(owner) = method_owner {
+            let fqn = format!("{}::{}", owner, name);
+            self.env
+                .insert_top(fqn, Scheme::mono(Ty::Var(alpha)));
+            // Stub so `self.name(...)` / `Owner::name(...)` resolve while
+            // the body is inferred (real scheme is written by infer_impl).
+            self.methods
+                .entry(owner.to_string())
+                .or_default()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    (
+                        Visibility::Private,
+                        Scheme::mono(Ty::Var(alpha)),
+                    )
+                });
+            if is_static_method {
+                self.static_methods
+                    .entry(owner.to_string())
+                    .or_default()
+                    .insert(name.to_string());
+            }
+        } else {
+            self.env
+                .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
+        }
 
         self.push_scope();
         let mut baseline = std::collections::HashSet::new();
