@@ -714,4 +714,57 @@ mod tests {
         assert_eq!(instance_field_i64(&mut heap, pv, "hours").unwrap(), 2);
         assert_eq!(instance_field_i64(&mut heap, pv, "minutes").unwrap(), 5);
     }
+
+    fn result_err_tag(heap: &Heap, v: Value) -> u32 {
+        let Some(Object::Enum(gc)) = heap.find_object_by_addr(v.raw() as u64) else {
+            panic!("expected Result enum");
+        };
+        assert_eq!(gc.as_ref().tag, 1, "expected Err");
+        match &gc.as_ref().payload[0] {
+            Member::Object(Object::Enum(err)) => err.as_ref().tag,
+            _ => panic!("expected TimeError enum payload"),
+        }
+    }
+
+    #[test]
+    fn date_from_period_rejects_zero_month_and_instant_invalid() {
+        let mut heap = Heap::default();
+        let bad = alloc_period(
+            &mut heap,
+            PeriodParts {
+                years: 2024,
+                months: 0,
+                days: 1,
+                ..PeriodParts::default()
+            },
+        );
+        let r = date_from_period(&mut heap, bad);
+        assert_eq!(result_err_tag(&heap, r), TimeErrorTag::InvalidInput as u32);
+
+        let elapsed = elapsed_nanos(&mut heap, Value::from(0_i64));
+        assert_eq!(
+            result_err_tag(&heap, elapsed),
+            TimeErrorTag::InvalidInput as u32
+        );
+    }
+
+    #[test]
+    fn timestamp_add_one_month_from_known_epoch() {
+        let mut heap = Heap::default();
+        // 2024-01-01 00:00:00 UTC
+        let nanos = 1_704_067_200_i64 * NS_PER_SEC;
+        let ts = alloc_timestamp(&mut heap, nanos);
+        let month = alloc_period(
+            &mut heap,
+            PeriodParts {
+                months: 1,
+                ..PeriodParts::default()
+            },
+        );
+        let out_r = timestamp_add(&mut heap, ts, month);
+        let out = unwrap_result_ok(&heap, out_r);
+        let out_nanos = read_timestamp_nanos(&mut heap, out).unwrap();
+        // 2024-02-01 00:00:00 UTC
+        assert_eq!(out_nanos, 1_706_745_600_i64 * NS_PER_SEC);
+    }
 }
