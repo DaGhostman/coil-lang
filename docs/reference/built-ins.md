@@ -16,6 +16,11 @@ coil does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/
 | `ffi::{dload,declare,invoke,Error,ErrorKind}` | Virtual module | Runtime FFI + typed errors (requires `use ffi::*`) |
 | `ffi::types::{Int,…}` | Virtual module | FFI type-tag constructors (requires `use ffi::types::*`) |
 | `io::{open,read,write,…}` | Virtual module | Non-blocking streams + sync adapters (requires `use io::*`) |
+| `io::fs::{exists,realpath,…}` | Virtual module | Path/metadata (requires `use io::fs::*`) |
+| `time::{timestamp,format,…}` | Virtual module | UTC timestamps, periods, sleep (requires `use time::*`) |
+| `env::{args,var,exec,…}` | Virtual module | Process environment (requires `use env::*`) |
+| `crypto::{sha256,hmac_sha256,…}` | Virtual module | RustCrypto host primitives (`use crypto::*`) |
+| `ord` / `char` | Prelude builtins | Single-byte string ↔ `byte` |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
 | `prelude::ops::{Add,Eq,Into,…}` | Virtual module | Auto-imported operator / conversion traits |
@@ -558,6 +563,42 @@ panic format "bad index %i", i;
 Unlike `raise`, `panic` is not recoverable with `?` / `match`. Prefer `assert` + `?` when callers should handle failure.
 
 See `examples/panic.hy`.
+
+---
+
+## Primitive casts (`expr as T`)
+
+Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
+
+---
+
+## `time` module
+
+`use time::*;` — UTC wall clock (`timestamp`, `epoch`), `Period` arithmetic, `format` / `parse` (strftime-style), monotonic `instant_now` / `elapsed_*`, and `sleep_ms`. Errors use `TimeError` inside `prelude::Result`. File bytes are not handled here; use `io` streams.
+
+---
+
+## `io::fs` module
+
+`use io::fs::*;` — `exists`, `metadata`, `list_dir`, `realpath` (canonical path when it exists), mkdir/remove/rename/copy, symlinks. Returns `prelude::Result` with `IoError`. No whole-file `read`/`write` helpers; open a `Stream` via `io::open` and use `read_to_end` / `write_all`.
+
+---
+
+## `env` module
+
+`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The compiler emits a **warning** when `exec` is used; optional `coil.toml` `[env] allow_exec = false` disables it at runtime.
+
+---
+
+## `crypto` module
+
+`use crypto::*;` — one-shot and streaming hashes (`sha256`, `init` / `update` / `finalize`), HMAC, `random_bytes`, ChaCha20-Poly1305 and AES-256-GCM, Ed25519 / X25519, Argon2id, constant-time `ct_eq`. Pure Rust (RustCrypto); no OpenSSL.
+
+---
+
+## `ord` and `char`
+
+Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> string`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
 
 ---
 
