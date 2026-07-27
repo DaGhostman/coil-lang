@@ -620,8 +620,8 @@ impl<const S: usize> Machine<S> {
         }));
     }
 
-    /// Thread-local active machine for host `with_lock` (legacy; prefer [`HostStateGuard`]).
-    pub fn active_machine_for_host() -> Option<*mut Machine<512>> {
+    /// Legacy hook for host callbacks; `with_lock` holds the `MutexGuard` directly instead.
+    pub fn active_machine_for_host() -> Option<*mut Machine<{ crate::thread::WORKER_STACK_SLOTS }>> {
         None
     }
 

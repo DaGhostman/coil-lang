@@ -21,6 +21,9 @@ use crate::memory::{
 };
 use crate::vm::Machine;
 
+/// Operand-stack slots for worker VMs (same default as `execute_archive` in `src/main.rs`).
+pub const WORKER_STACK_SLOTS: usize = 256;
+
 /// Immutable program image shared across OS threads.
 #[derive(Clone)]
 pub struct ThreadProgram {
@@ -164,7 +167,7 @@ impl RwLockInner {
 }
 
 thread_local! {
-    static ACTIVE_MACHINE: RefCell<*mut Machine<512>> =
+    static ACTIVE_MACHINE: RefCell<*mut Machine<WORKER_STACK_SLOTS>> =
         const { RefCell::new(std::ptr::null_mut()) };
     static HELD_MUTEX: RefCell<Option<(u64, MutexGuard<'static, PortableValue>)>> =
         RefCell::new(None);
@@ -234,7 +237,7 @@ fn host_spawn_context() -> Result<ThreadSpawnContext, ThreadErrorTag> {
 pub(crate) struct ActiveMachineGuard;
 
 impl ActiveMachineGuard {
-    fn enter(machine: *mut Machine<512>) -> Self {
+    fn enter(machine: *mut Machine<WORKER_STACK_SLOTS>) -> Self {
         ACTIVE_MACHINE.with(|c| {
             *c.borrow_mut() = machine;
         });
@@ -250,7 +253,7 @@ impl Drop for ActiveMachineGuard {
     }
 }
 
-pub(crate) fn set_active_machine(machine: *mut Machine<512>) -> ActiveMachineGuard {
+pub(crate) fn set_active_machine(machine: *mut Machine<WORKER_STACK_SLOTS>) -> ActiveMachineGuard {
     ActiveMachineGuard::enter(machine)
 }
 
@@ -535,7 +538,7 @@ fn run_worker(ctx: WorkerCtx) {
         shared_print,
     } = ctx;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut vm = Machine::<512>::default();
+        let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
         vm.install_natives(&natives);
         vm.set_thread_program(Arc::clone(&program));
         vm.set_program_debug(program.debug.clone());
@@ -721,8 +724,13 @@ fn try_host_recv(heap: &mut Heap, rx: Value) -> Result<Value, ThreadErrorTag> {
 }
 
 pub fn host_try_send(heap: &mut Heap, args: &[Value]) -> Value {
-    let r = try_host_send(heap, args[0], args[1]);
+    let r = try_host_try_send(heap, args[0], args[1]);
     as_result_unit(heap, r)
+}
+
+/// Non-blocking send. The channel is unbounded today, so this matches `try_host_send`.
+fn try_host_try_send(heap: &mut Heap, tx: Value, value: Value) -> Result<(), ThreadErrorTag> {
+    try_host_send(heap, tx, value)
 }
 
 pub fn host_try_recv(heap: &mut Heap, args: &[Value]) -> Value {
@@ -821,6 +829,8 @@ fn try_host_lock(heap: &mut Heap, mtx: Value) -> Result<(), ThreadErrorTag> {
         .lock()
         .map_err(|_| ThreadErrorTag::Poisoned)?;
     let extended = unsafe {
+        // Store guard in thread-local until `unlock`; lifetime extended to `'static`
+        // because the guard cannot outlive this OS thread.
         std::mem::transmute::<MutexGuard<'_, PortableValue>, MutexGuard<'static, PortableValue>>(
             guard,
         )

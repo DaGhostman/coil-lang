@@ -1216,7 +1216,7 @@ impl Checker {
     /// Whether `ty` may be deep-copied across OS thread boundaries (best-effort).
     pub fn is_thread_sendable_ty(ty: &Ty) -> bool {
         match ty {
-            Ty::Var(_) => true,
+            Ty::Var(_) => true, // re-checked on concrete spawn arg after unify
             Ty::Con(name) => {
                 let n = name.to_ascii_lowercase();
                 if matches!(
