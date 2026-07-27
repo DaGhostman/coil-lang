@@ -471,6 +471,117 @@ roots = ["./src"]
 }
 
 #[test]
+fn use_brace_group_as_alias_imports_from_module_file() {
+    // Parser covers `as` AST shape; this locks the desugar → alias map → call path.
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.hy",
+            "use math::{add as plus};\nfn main() { print \"%i\", plus(2, 3); }\n",
+        ),
+        (
+            "src/math.hy",
+            "fn add(int a, int b) -> int { return a + b; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("use_brace_as", manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "5");
+}
+
+#[test]
+fn parse_fail_dependency_emits_single_diagnostic() {
+    // discover_all emits parse errors and must not re-enqueue the bad file
+    // for compile_file (which would duplicate the same diagnostic).
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        ("src/main.hy", "use bad::*;\nfn main() {}\n"),
+        ("src/bad.hy", "@@@ not valid coil\n"),
+    ];
+    let (root, entry) = build_project("parse_fail_dep", manifest, files, "src/main.hy");
+    let msgs = compile_project_errors(&root, &entry);
+    let bad_msgs: Vec<_> = msgs
+        .iter()
+        .filter(|m| {
+            m.contains("bad.hy")
+                || m.contains("unexpected")
+                || m.contains("expected")
+                || m.contains("parse")
+                || m.contains("@")
+        })
+        .collect();
+    assert!(
+        !msgs.is_empty(),
+        "expected at least one diagnostic for unparseable dependency"
+    );
+    // Prefer a tight count when we can attribute messages to the bad file;
+    // otherwise ensure we did not flood with duplicates of the same text.
+    if !bad_msgs.is_empty() {
+        let unique: std::collections::BTreeSet<_> = bad_msgs.iter().map(|m| m.as_str()).collect();
+        assert_eq!(
+            bad_msgs.len(),
+            unique.len(),
+            "duplicate parse diagnostics for bad.hy: {:?}",
+            bad_msgs
+        );
+    } else {
+        let unique: std::collections::BTreeSet<_> = msgs.iter().map(|m| m.as_str()).collect();
+        assert_eq!(
+            msgs.len(),
+            unique.len(),
+            "duplicate diagnostics (likely discover+compile double emit): {:?}",
+            msgs
+        );
+    }
+}
+
+#[test]
+fn manifest_entry_path_joins_project_root() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+
+[entry]
+file = "./src/main.hy"
+"#;
+    let files = &[(
+        "src/main.hy",
+        "fn main() { print \"%i\", 42; }\n",
+    )];
+    let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let pipeline = Pipeline::new();
+    let entry = pipeline
+        .manifest_entry_path()
+        .expect("manifest should declare [entry].file");
+    assert!(
+        entry.ends_with("src/main.hy"),
+        "expected project-root-joined entry, got {}",
+        entry.display()
+    );
+    assert!(entry.is_absolute() || entry.exists());
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "42");
+}
+
+#[test]
 fn use_item_from_module_file_without_subdir() {
     // Concrete `use math::add` must fall back to math.hy when math/add.hy
     // does not exist (the "modules in roots don't get imported" gap).

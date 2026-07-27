@@ -559,6 +559,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_use_prefers_one_item_file_over_module_file() {
+        // Both Convention A (`foo/sadge.hy`) and B (`foo.hy`) exist —
+        // A must win so FQN/body resolution stays deterministic.
+        let tmp = std::env::temp_dir().join("coil_manifest_test_prefers_a");
+        let src = tmp.join("src");
+        let sub = src.join("foo");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(src.join("foo.hy"), "fn sadge() { /* module file */ }\n").unwrap();
+        std::fs::write(sub.join("sadge.hy"), "fn sadge() { /* one-item */ }\n").unwrap();
+
+        let m = Manifest::default();
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
+        assert!(resolved.is_some());
+        let path = resolved.unwrap();
+        assert!(
+            path.ends_with("src/foo/sadge.hy"),
+            "expected Convention A path, got {}",
+            path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn resolve_use_returns_none_when_missing() {
         let tmp = std::env::temp_dir().join("coil_manifest_test_3");
         std::fs::create_dir_all(&tmp).unwrap();

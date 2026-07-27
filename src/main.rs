@@ -1313,6 +1313,57 @@ mod tests {
     }
 
     #[test]
+    fn archive_is_stale_empty_source_files_uses_entry_mtime() {
+        let dir = unique_tmp("stale_empty_sources");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let debug = ProgramDebug {
+            source_files: vec![],
+            debug_locs: vec![],
+        };
+        // Entry not newer than archive → fresh via the empty-list branch.
+        assert!(!archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&entry, b"fn main() { /* edited */ }").unwrap();
+        assert!(archive_is_stale(
+            entry.to_str().unwrap(),
+            arch.to_str().unwrap(),
+            &debug
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_is_stale_when_recorded_source_missing() {
+        let dir = unique_tmp("stale_missing_dep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("main.hy");
+        let arch = dir.join("out.hyc");
+        std::fs::write(&entry, b"fn main() {}").unwrap();
+        std::fs::write(&arch, b"x").unwrap();
+        let missing = dir.join("gone.hy");
+        let debug = ProgramDebug {
+            source_files: vec![
+                entry.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+            debug_locs: vec![],
+        };
+        assert!(
+            archive_is_stale(entry.to_str().unwrap(), arch.to_str().unwrap(), &debug),
+            "missing recorded dependency must invalidate the archive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn collect_test_files_errors_and_discovers_nested() {
         let missing = unique_tmp("no_tests");
         assert!(collect_test_files(&missing).is_err());

@@ -179,7 +179,19 @@ fn format_ty_renamed(
                 .filter(|c| {
                     c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v))
                 })
-                .map(|c| c.to_string())
+                .map(|c| {
+                    if c.args.is_empty() {
+                        c.class.clone()
+                    } else {
+                        let args = c
+                            .args
+                            .iter()
+                            .map(|t| format_ty_renamed(t, rename, next))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{}<{}>", c.class, args)
+                    }
+                })
                 .collect();
             if multi.is_empty() {
                 format!("forall {}. {}", vars, body_s)
@@ -443,6 +455,43 @@ mod tests {
         subst.insert(TyVarId(43), int());
         let s = format_ty_for_diag(&subst, &Ty::Var(TyVarId(43)));
         assert_eq!(s, "int");
+    }
+
+    #[test]
+    fn format_ty_for_diag_forall_renames_binders_and_unary_bounds() {
+        use crate::typechecking::subst::Subst;
+        use crate::typechecking::ty::Constraint;
+        let ty = Ty::Forall {
+            bounds: vec![TyVarId(7)],
+            constraints: vec![Constraint::unary("Num", TyVarId(7))],
+            body: Box::new(Ty::Fun(
+                Box::new(Ty::Var(TyVarId(7))),
+                Box::new(Ty::Var(TyVarId(7))),
+            )),
+        };
+        let s = format_ty_for_diag(&Subst::empty(), &ty);
+        assert_eq!(s, "forall a: Num. a -> a");
+        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
+    }
+
+    #[test]
+    fn format_ty_for_diag_forall_renames_multi_param_where() {
+        use crate::typechecking::subst::Subst;
+        use crate::typechecking::ty::Constraint;
+        let ty = Ty::Forall {
+            bounds: vec![TyVarId(3), TyVarId(9)],
+            constraints: vec![Constraint {
+                class: "Convert".into(),
+                args: vec![Ty::Var(TyVarId(3)), Ty::Var(TyVarId(9))],
+            }],
+            body: Box::new(Ty::Fun(
+                Box::new(Ty::Var(TyVarId(3))),
+                Box::new(Ty::Var(TyVarId(9))),
+            )),
+        };
+        let s = format_ty_for_diag(&Subst::empty(), &ty);
+        assert_eq!(s, "forall a, b. a -> b where Convert<a, b>");
+        assert!(!s.contains('t'), "diagnostics must not show raw tN ids: {s}");
     }
 
     // ---- Sum / Constructor Display ----

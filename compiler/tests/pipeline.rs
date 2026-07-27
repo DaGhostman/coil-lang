@@ -3032,6 +3032,32 @@ fn main() {
 }
 
 #[test]
+fn nested_spawn_joins_via_shared_root_registry() {
+    // Worker mid spawns leaf on the root Machine's live-thread registry.
+    // Main returns without join; root auto-join must still wait for leaf.
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn leaf() {
+    print "leaf";
+    return 0;
+}
+
+fn mid() {
+    let _ = spawn(leaf)?;
+    return 0;
+}
+
+fn main() {
+    let _ = spawn(mid)?;
+}
+"#,
+    );
+    assert_eq!(output, "leaf");
+}
+
+#[test]
 fn example_thread_mutex_prints_2() {
     let output = run_example("examples/thread_mutex.hy");
     assert_eq!(output, "2");
