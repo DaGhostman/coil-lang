@@ -412,7 +412,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.ident(),
             ));
 
-            choice((atom, self.group(expr.clone()))).pratt((
+            let pratt_expr = choice((atom, self.group(expr.clone()))).pratt((
                 // No postfix `!` here — it would conflict with `!=`
                 // (which should be parsed as a single infix operator).
                 // Prefix `!` is logical NOT; prefix `~` is bitwise NOT on integers.
@@ -649,7 +649,22 @@ impl<'pratt> Pratt<'pratt> {
                     self.params(expr.clone()),
                     |lhs, args, e| (e.span(), Box::new(Expression::Call { name: lhs, args })),
                 ),
-            ))
+            ));
+            pratt_expr
+                .then(
+                    op!("as")
+                        .ignore_then(self.type_annotation())
+                        .repeated()
+                        .collect::<Vec<_>>(),
+                )
+                .map(|(base, casts)| {
+                    casts.into_iter().fold(base, |lhs, ty| {
+                        (
+                            lhs.0,
+                            Box::new(Expression::Cast(lhs, ty)),
+                        )
+                    })
+                })
         })
         .map_with(output!(Expr))
     }
@@ -3649,6 +3664,20 @@ mod tests {
         assert!(
             matches!(inner, Expression::Float(_)),
             "expected Float(1.0), got {:?}",
+            inner
+        );
+    }
+
+    #[test]
+    fn primitive_cast_parses_as_expression() {
+        let ast = expr_ast!("65 as byte");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, Expression::Cast(_, _)),
+            "expected Cast, got {:?}",
             inner
         );
     }
