@@ -946,17 +946,18 @@ impl Compiler {
             && let Some((inner, shift)) = const_fold::strength_mul_to_shl(ast, self.const_env())
         {
             // Defense-in-depth: only emit int SHL when the non-const operand
-            // is known `int`. `float * k` is rejected at typecheck; skip SHL
-            // on recovery / unknown-type paths (fall through to MUL).
+            // is a known integer-like immediate (`int` or `byte`). VM `SHL`
+            // uses `as_int`; `float * k` is rejected at typecheck. Unknown
+            // types fall through to MUL / dictionary dispatch.
             use crate::typechecking::subst::apply_ty_prune;
-            use crate::typechecking::ty::INT;
-            let inner_is_int = self.codegen_expr_ty(inner).is_some_and(|ty| {
+            use crate::typechecking::ty::{BYTE, INT};
+            let inner_is_int_like = self.codegen_expr_ty(inner).is_some_and(|ty| {
                 matches!(
                     apply_ty_prune(self.checker.subst(), &ty),
-                    Ty::Con(ref n) if n == INT
+                    Ty::Con(ref n) if n == INT || n == BYTE
                 )
             });
-            if !inner_is_int {
+            if !inner_is_int_like {
                 return false;
             }
             let mut inner_bc = self.do_compile(inner);
@@ -6982,6 +6983,8 @@ impl Compiler {
                 // Prefer trait/`Mul` dictionary dispatch over primitive
                 // `x * 2^n` → SHL when the checker recorded a bound operator
                 // (non-primitive `T * 2^n` must not emit int SHL).
+                // `try_emit_folded_expr` also const-folds literal×literal and
+                // identity-reduces `* 1` before bound/primitive fallback.
                 let bound_mul = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -9106,6 +9109,18 @@ test("two") { assert(true)?; }
                     | Instruction::BinReturn
             )),
             "expected a float mul opcode path; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `byte` is int-like for VM `SHL` (`as_int`); `byte * 8` should still
+    /// strength-reduce (not be excluded by the int-only type gate).
+    #[test]
+    fn byte_mul_by_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src("fn scale(byte x) -> byte { return x * 8; }");
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected SHL (shift 3) for byte*8; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
