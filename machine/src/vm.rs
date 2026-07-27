@@ -303,11 +303,6 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Legacy helper — tag only, no aux.
-    fn ffi_type_tag_from_value(heap: &Heap, v: &Value) -> u32 {
-        Self::decode_ffi_type_tag(v, heap).0
-    }
-
     fn object_string_value(heap: &Heap, v: &Value) -> String {
         let addr = v.raw() as u64;
         let obj = Self::find_object_by_addr(heap, addr);
