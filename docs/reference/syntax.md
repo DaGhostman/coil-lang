@@ -574,10 +574,15 @@ Primitive names are case-insensitive in the typechecker (`String` ≡ `string`).
 ## `match` arms
 
 ```
-arm ::= pattern '=>' expr
+arm ::= pattern '=>' (block_expr | expr)
+block_expr ::= '{' (expr ';'?)* '}'
 ```
 
 Arms are comma-separated inside `match { ... }`. The last arm may use `_` or `default` as wildcard.
+
+Brace bodies (`{ … }`) are **expression blocks**, not dict literals — so
+`self.method()` and other non-`name: value` forms work inside them.
+A dict arm still works when the body is a real record literal (`{ x: 1 }`).
 
 ---
 

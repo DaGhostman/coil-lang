@@ -2704,6 +2704,13 @@ impl<'pratt> Pratt<'pratt> {
 
     /// `pattern => expr` — one arm inside a `match` block.
     ///
+    /// Arm bodies may be a brace block `{ e; … }` (expression
+    /// sequence, same shape as lambda brace bodies) or any other
+    /// `expr`. The brace form is tried **before** the general
+    /// `expr` so that `{ self.foo(); x }` is a block rather than a
+    /// dict literal (dicts require `name: value` fields and would
+    /// otherwise report `found '.' expected ':'` on `self.method()`).
+    ///
     /// Returns a [`MatchArm`] directly (not an `Output`) because
     /// patterns are not expressions and don't carry a span.
     fn arm<
@@ -2716,9 +2723,21 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>>
     + Clone
     + 'pratt {
+        // Brace body built from the recursive `expr` — do NOT call
+        // `self.statement()` here (match lives inside `expr()`; that
+        // would re-enter `statement()` → `expr()` during parser
+        // construction and overflow the stack).
+        let brace_body = expr
+            .clone()
+            .then_ignore(op!(';').or_not())
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map_with(|children, e| (e.span(), Box::new(Expression::Block(children))));
+
         self.pattern()
             .then_ignore(op!("=>"))
-            .then(expr)
+            .then(choice((brace_body, expr)))
             .map_with(|(pattern, body), _| MatchArm { pattern, body })
     }
 
@@ -3427,6 +3446,80 @@ mod tests {
                     Expression::Identifier(n) => assert_eq!(*n, "v"),
                     other => panic!("expected Identifier(v), got {:?}", other),
                 }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_parses_as_block_not_dict() {
+        let ast = expr_ast!("match x { Option::None => { 0 }, Option::Some(v) => { v } }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                assert!(
+                    matches!(arms[0].body.1.as_ref(), Expression::Block(_)),
+                    "brace arm body should be Block, got {}",
+                    arms[0].body.1
+                );
+                assert!(
+                    matches!(arms[1].body.1.as_ref(), Expression::Block(_)),
+                    "brace arm body should be Block, got {}",
+                    arms[1].body.1
+                );
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_allows_field_access_like_self_method() {
+        // Regression: `{ self.get() }` used to parse as a dict and fail with
+        // `found '.' expected ':'` because dict fields require `name: value`.
+        let ast = expr_ast!("match m { Mode::Zero => { self.get() }, Mode::Other(n) => n }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 1);
+                    let s = children[0].1.to_string();
+                    assert!(
+                        s.contains("self") && s.contains("get"),
+                        "expected self.get() in block, got {s}"
+                    );
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_dict_literal_still_parses() {
+        let ast = expr_ast!("match m { Mode::Zero => { x: 0 }, Mode::Other(n) => { x: n } }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert!(
+                    matches!(arms[0].body.1.as_ref(), Expression::Dict(_)),
+                    "dict arm body should stay Dict, got {}",
+                    arms[0].body.1
+                );
+                assert!(
+                    matches!(arms[1].body.1.as_ref(), Expression::Dict(_)),
+                    "dict arm body should stay Dict, got {}",
+                    arms[1].body.1
+                );
             }
             other => panic!("expected Match, got {:?}", other),
         }

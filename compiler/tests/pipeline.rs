@@ -327,6 +327,12 @@ fn example_modules_brace_prints_12_42() {
 }
 
 #[test]
+fn example_match_block_self_prints_5() {
+    let output = run_example("examples/match_block_self.hy");
+    assert_eq!(output, "5");
+}
+
+#[test]
 fn example_generic_alias_prints_7() {
     let output = run_example("examples/generic_alias.hy");
     assert_eq!(output, "7");
