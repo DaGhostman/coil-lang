@@ -638,6 +638,28 @@ mod tests {
             .collect()
     }
 
+    fn result_err_tag(heap: &Heap, result: Value) -> u32 {
+        let Object::Enum(gc) = heap.find_object_by_addr(result.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        assert_eq!(gc.as_ref().tag, 1, "expected Err");
+        let Member::Object(Object::Enum(err)) = &gc.as_ref().payload[0] else {
+            panic!("expected CryptoError enum payload");
+        };
+        err.as_ref().tag
+    }
+
+    fn result_ok_handle(heap: &Heap, result: Value) -> Value {
+        let Object::Enum(gc) = heap.find_object_by_addr(result.raw() as u64).unwrap() else {
+            panic!("expected Result");
+        };
+        assert_eq!(gc.as_ref().tag, 0, "expected Ok");
+        match &gc.as_ref().payload[0] {
+            Member::Value(v) => *v,
+            Member::Object(o) => Value::from(o.addr()),
+        }
+    }
+
     /// NIST SHA-256 KAT: empty string.
     #[test]
     fn sha256_empty_string_kat() {
@@ -651,5 +673,64 @@ mod tests {
             0x78, 0x52, 0xb8, 0x55,
         ];
         assert_eq!(digest.as_slice(), EXPECTED);
+    }
+
+    #[test]
+    fn chacha20_encrypt_decrypt_roundtrip_and_tamper_fails() {
+        let mut heap = Heap::default();
+        let key = alloc_bytes(&mut heap, &[0x11_u8; 32]);
+        let nonce = alloc_bytes(&mut heap, &[0x22_u8; 12]);
+        let pt = alloc_bytes(&mut heap, b"coil-aead");
+        let aad = alloc_bytes(&mut heap, b"");
+
+        let ct_r = host_chacha20_poly1305_encrypt(&mut heap, &[key, nonce, pt, aad]);
+        let ct = result_ok_bytes(&heap, ct_r);
+        assert!(ct.len() > b"coil-aead".len(), "ciphertext includes auth tag");
+
+        let ct_v = alloc_bytes(&mut heap, &ct);
+        let pt_r = host_chacha20_poly1305_decrypt(&mut heap, &[key, nonce, ct_v, aad]);
+        assert_eq!(result_ok_bytes(&heap, pt_r), b"coil-aead");
+
+        let mut tampered = ct;
+        *tampered.last_mut().unwrap() ^= 0x01;
+        let bad = alloc_bytes(&mut heap, &tampered);
+        let fail = host_chacha20_poly1305_decrypt(&mut heap, &[key, nonce, bad, aad]);
+        assert_eq!(
+            result_err_tag(&heap, fail),
+            CryptoErrorTag::AuthenticationFailed as u32
+        );
+    }
+
+    #[test]
+    fn hasher_finalize_twice_returns_already_finalized() {
+        let mut heap = Heap::default();
+        let init = host_hasher_init(&mut heap, &[Value::from(0_i64)]);
+        let handle = result_ok_handle(&heap, init);
+        let data = alloc_bytes(&mut heap, b"abc");
+        let upd = host_hasher_update(&mut heap, &[handle, data]);
+        assert_eq!(
+            heap.find_object_by_addr(upd.raw() as u64)
+                .and_then(|o| match o {
+                    Object::Enum(gc) => Some(gc.as_ref().tag),
+                    _ => None,
+                }),
+            Some(0),
+            "update should succeed"
+        );
+
+        let dig_r = host_hasher_finalize(&mut heap, &[handle]);
+        let digest = result_ok_bytes(&heap, dig_r);
+        const EXPECTED: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(digest.as_slice(), EXPECTED);
+
+        let again = host_hasher_finalize(&mut heap, &[handle]);
+        assert_eq!(
+            result_err_tag(&heap, again),
+            CryptoErrorTag::AlreadyFinalized as u32
+        );
     }
 }
