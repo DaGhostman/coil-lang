@@ -5081,4 +5081,33 @@ mod tests {
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
     }
+
+    #[test]
+    fn cast_int_to_byte_truncates_high_bits() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(257),
+            Byte::new(Instruction::CastIntToByte),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    #[test]
+    fn cast_int_to_bool_normalizes_nonzero() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(2),
+            Byte::new(Instruction::CastIntToBool),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+
+        vm.run(&[
+            const_int(0),
+            Byte::new(Instruction::CastIntToBool),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+    }
 }
