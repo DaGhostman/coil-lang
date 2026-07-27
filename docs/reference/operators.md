@@ -59,6 +59,10 @@ Forms **not** in the Pratt table but still tight-binding:
 
 Mixed `int` and `float` operands → **type error** at compile time.
 
+When the factor is a **compile-time power of two** (`2`, `4`, `8`, …), `int` /
+`byte` multiplication lowers to a left shift (`SHL` / `<<`) instead of `MUL`.
+Trait/`Mul` dictionary dispatch and float `*` are never rewritten this way.
+
 ### Aggregate (vector) arithmetic
 
 Homogeneous numeric tuples and arrays support the same operators
