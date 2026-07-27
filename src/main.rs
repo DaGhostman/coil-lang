@@ -424,6 +424,7 @@ fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
 }
 
 /// Legacy helper kept for unit tests: entry-only mtime compare.
+#[cfg(test)]
 fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
     match (archive_mtime(archive), archive_mtime(filename)) {
         (Some(arch), Some(src)) => src > arch,
