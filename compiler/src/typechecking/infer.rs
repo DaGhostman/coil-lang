@@ -1204,7 +1204,7 @@ impl Checker {
                     "spawn argument",
                 );
                 let arg_resolved = apply_ty_prune(&self.subst, &arg_tys[1]);
-                if !Self::is_thread_sendable_ty(&arg_resolved) {
+                if !self.is_thread_sendable_ty(&arg_resolved) {
                     self.error_with_help(
                         ErrorCode::GenericTypeError,
                         format!(
@@ -1232,7 +1232,7 @@ impl Checker {
     }
 
     /// Whether `ty` may be deep-copied across OS thread boundaries (best-effort).
-    pub fn is_thread_sendable_ty(ty: &Ty) -> bool {
+    pub fn is_thread_sendable_ty(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Var(_) => true, // re-checked on concrete spawn arg after unify
             Ty::Con(name) => {
@@ -1243,7 +1243,7 @@ impl Checker {
                 ) {
                     return false;
                 }
-                matches!(
+                if matches!(
                     n.as_str(),
                     "int"
                         | "float"
@@ -1263,26 +1263,37 @@ impl Checker {
                     || name == crate::typechecking::ty::RECEIVER
                     || name == crate::typechecking::ty::MUTEX
                     || name == crate::typechecking::ty::RWLOCK
+                {
+                    return true;
+                }
+                // User class: sendable when every field type is sendable
+                // (so `spawn(f, mailbox)` works for a class of channel ends).
+                if let Some(fields) = self.classes.get(name) {
+                    return fields
+                        .iter()
+                        .all(|(_, _, field_ty)| self.is_thread_sendable_ty(field_ty));
+                }
+                false
             }
             Ty::App(head, args) => {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") {
                     return false;
                 }
-                args.iter().all(Self::is_thread_sendable_ty)
+                args.iter().all(|t| self.is_thread_sendable_ty(t))
             }
             Ty::Fun(_, _) => false,
-            Ty::Array { element, .. } => Self::is_thread_sendable_ty(element),
-            Ty::List(inner) => Self::is_thread_sendable_ty(inner),
-            Ty::Readonly(inner) => Self::is_thread_sendable_ty(inner),
-            Ty::Tuple(elems) => elems.iter().all(Self::is_thread_sendable_ty),
+            Ty::Array { element, .. } => self.is_thread_sendable_ty(element),
+            Ty::List(inner) => self.is_thread_sendable_ty(inner),
+            Ty::Readonly(inner) => self.is_thread_sendable_ty(inner),
+            Ty::Tuple(elems) => elems.iter().all(|t| self.is_thread_sendable_ty(t)),
             Ty::Record { fields } => fields
                 .iter()
-                .all(|(_, t)| Self::is_thread_sendable_ty(t)),
+                .all(|(_, t)| self.is_thread_sendable_ty(t)),
             Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
                 payload
                     .field_types()
                     .iter()
-                    .all(|t| Self::is_thread_sendable_ty(t))
+                    .all(|t| self.is_thread_sendable_ty(t))
             }),
             Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } => false,
         }
@@ -18957,33 +18968,36 @@ fn main() { let g = add(a: 1); }
     #[test]
     fn is_thread_sendable_ty_accepts_immediates_strings_and_host_handles() {
         use crate::typechecking::ty::{mutex_ty, receiver_ty, rwlock_ty, sender_ty};
-        assert!(Checker::is_thread_sendable_ty(&int()));
-        assert!(Checker::is_thread_sendable_ty(&string()));
-        assert!(Checker::is_thread_sendable_ty(&boolean()));
-        assert!(Checker::is_thread_sendable_ty(&unit_ty()));
-        assert!(Checker::is_thread_sendable_ty(&sender_ty()));
-        assert!(Checker::is_thread_sendable_ty(&receiver_ty()));
-        assert!(Checker::is_thread_sendable_ty(&mutex_ty()));
-        assert!(Checker::is_thread_sendable_ty(&rwlock_ty()));
-        assert!(Checker::is_thread_sendable_ty(&array(int())));
-        assert!(Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+        let c = Checker::new();
+        assert!(c.is_thread_sendable_ty(&int()));
+        assert!(c.is_thread_sendable_ty(&string()));
+        assert!(c.is_thread_sendable_ty(&boolean()));
+        assert!(c.is_thread_sendable_ty(&unit_ty()));
+        assert!(c.is_thread_sendable_ty(&sender_ty()));
+        assert!(c.is_thread_sendable_ty(&receiver_ty()));
+        assert!(c.is_thread_sendable_ty(&mutex_ty()));
+        assert!(c.is_thread_sendable_ty(&rwlock_ty()));
+        assert!(c.is_thread_sendable_ty(&array(int())));
+        assert!(c.is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+        assert!(c.is_thread_sendable_ty(&tuple_ty(vec![receiver_ty(), sender_ty()])));
     }
 
     #[test]
     fn is_thread_sendable_ty_rejects_stream_coroutine_and_functions() {
         use crate::typechecking::ty::stream_ty;
-        assert!(!Checker::is_thread_sendable_ty(&stream_ty()));
-        assert!(!Checker::is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
-        assert!(!Checker::is_thread_sendable_ty(&Ty::Fun(
+        let c = Checker::new();
+        assert!(!c.is_thread_sendable_ty(&stream_ty()));
+        assert!(!c.is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
+        assert!(!c.is_thread_sendable_ty(&Ty::Fun(
             Box::new(unit_ty()),
             Box::new(int())
         )));
-        assert!(!Checker::is_thread_sendable_ty(&Ty::App(
+        assert!(!c.is_thread_sendable_ty(&Ty::App(
             Box::new(Ty::Con("coroutine".into())),
             vec![int(), unit_ty()]
         )));
-        assert!(!Checker::is_thread_sendable_ty(&array(stream_ty())));
-        assert!(!Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
+        assert!(!c.is_thread_sendable_ty(&array(stream_ty())));
+        assert!(!c.is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
     }
 
     #[test]

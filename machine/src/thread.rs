@@ -9,6 +9,41 @@ use std::sync::{
 };
 use std::thread;
 
+/// Spawned, non-forgotten join states. The root VM joins any still-live
+/// undetached entries when the main program finishes so workers blocked in
+/// `recv` are not killed by process exit (see `join_unddetached_threads`).
+static LIVE_THREADS: Mutex<Vec<Arc<JoinState>>> = Mutex::new(Vec::new());
+
+fn register_live_thread(state: Arc<JoinState>) {
+    if let Ok(mut g) = LIVE_THREADS.lock() {
+        g.push(state);
+    }
+}
+
+/// Block until every undetached, not-yet-joined spawn from this process has
+/// finished. Called automatically at the end of [`Machine::run_with_pool`].
+///
+/// Explicit `join(t)` still returns the worker's value; this path only keeps
+/// the process alive. `detach(t)` opts a thread out.
+pub fn join_unddetached_threads() {
+    let threads = match LIVE_THREADS.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    for state in threads {
+        if state.detached.load(Ordering::SeqCst) {
+            continue;
+        }
+        if state.joined.swap(true, Ordering::SeqCst) {
+            continue;
+        }
+        let _ = state.wait_result();
+        if let Some(h) = state.join_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.join();
+        }
+    }
+}
+
 use common::{
     Byte, BUILTIN_RESULT_VARIANTS, BUILTIN_THREAD_ERROR_VARIANTS, ProgramDebug, Value,
 };
@@ -46,7 +81,11 @@ pub enum ThreadErrorTag {
 }
 
 /// Host-side value graph for cross-thread copy (not a coil type).
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Channel / lock handles are included so they can nest inside tuples,
+/// arrays, and class instances passed to `spawn` or `send` (the typechecker
+/// already treats `Sender` / `Receiver` / `Mutex` / `RwLock` as sendable).
+#[derive(Clone)]
 pub enum PortableValue {
     Immediate(u64),
     String(String),
@@ -60,6 +99,38 @@ pub enum PortableValue {
         fields: Vec<(String, PortableValue)>,
     },
     Boxed(Box<PortableValue>),
+    Sender(Arc<ChannelInner>),
+    Receiver(Arc<ChannelInner>),
+    MutexHandle(Arc<MutexInner>),
+    RwLockHandle(Arc<RwLockInner>),
+}
+
+impl PartialEq for PortableValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Immediate(a), Self::Immediate(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Tuple(a), Self::Tuple(b)) => a == b,
+            (
+                Self::Enum {
+                    tag: t1,
+                    payload: p1,
+                },
+                Self::Enum {
+                    tag: t2,
+                    payload: p2,
+                },
+            ) => t1 == t2 && p1 == p2,
+            (Self::Instance { fields: f1 }, Self::Instance { fields: f2 }) => f1 == f2,
+            (Self::Boxed(a), Self::Boxed(b)) => a == b,
+            (Self::Sender(a), Self::Sender(b)) => Arc::ptr_eq(a, b),
+            (Self::Receiver(a), Self::Receiver(b)) => Arc::ptr_eq(a, b),
+            (Self::MutexHandle(a), Self::MutexHandle(b)) => Arc::ptr_eq(a, b),
+            (Self::RwLockHandle(a), Self::RwLockHandle(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// Spawn-time argument (sendable value or host handle re-wrap).
@@ -316,12 +387,29 @@ fn encode_value(
         return Ok(PortableValue::Immediate(v.raw() as u64));
     }
     let addr = v.raw() as u64;
-    if !visited.insert(addr) {
-        return Err(ThreadErrorTag::NotSendable);
-    }
     let Some(obj) = heap.find_object_by_addr(addr) else {
         return Ok(PortableValue::Immediate(v.raw() as u64));
     };
+    // Host handles share an `Arc` — no heap graph to traverse, and the same
+    // handle may appear twice in a tuple/record without being a cycle.
+    match &obj {
+        Object::Sender(gc) => {
+            return Ok(PortableValue::Sender(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::Receiver(gc) => {
+            return Ok(PortableValue::Receiver(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::Mutex(gc) => {
+            return Ok(PortableValue::MutexHandle(Arc::clone(&gc.as_ref().inner)));
+        }
+        Object::RwLock(gc) => {
+            return Ok(PortableValue::RwLockHandle(Arc::clone(&gc.as_ref().inner)));
+        }
+        _ => {}
+    }
+    if !visited.insert(addr) {
+        return Err(ThreadErrorTag::NotSendable);
+    }
     match obj {
         Object::String(gc) => Ok(PortableValue::String(gc.as_ref().data.clone())),
         Object::Array(gc) => {
@@ -375,11 +463,11 @@ fn encode_value(
         | Object::Coroutine(_)
         | Object::Fn(_)
         | Object::PolyFn(_)
-        | Object::Library(_)
-        | Object::Sender(_)
-        | Object::Receiver(_)
-        | Object::Mutex(_)
-        | Object::RwLock(_) => Err(ThreadErrorTag::NotSendable),
+        | Object::Library(_) => Err(ThreadErrorTag::NotSendable),
+        // Handled above; listed so the match stays exhaustive.
+        Object::Sender(_) | Object::Receiver(_) | Object::Mutex(_) | Object::RwLock(_) => {
+            unreachable!("host handles returned before deep encode")
+        }
     }
 }
 
@@ -446,6 +534,22 @@ fn decode_portable(heap: &mut Heap, p: PortableValue) -> Result<Value, ThreadErr
                 },
                 Object::Boxed,
             );
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::Sender(inner) => {
+            let (obj, _) = heap.alloc(ObjSender { inner }, Object::Sender);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::Receiver(inner) => {
+            let (obj, _) = heap.alloc(ObjReceiver { inner }, Object::Receiver);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::MutexHandle(inner) => {
+            let (obj, _) = heap.alloc(ObjThreadMutex { inner }, Object::Mutex);
+            Ok(Value::from(obj.addr()))
+        }
+        PortableValue::RwLockHandle(inner) => {
+            let (obj, _) = heap.alloc(ObjRwLock { inner }, Object::RwLock);
             Ok(Value::from(obj.addr()))
         }
     }
@@ -613,6 +717,7 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
     };
     let handle = thread::spawn(move || run_worker(worker));
     *state.join_handle.lock().unwrap() = Some(handle);
+    register_live_thread(Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
     Ok(Value::from(obj.addr()))
 }
@@ -1148,17 +1253,13 @@ mod tests {
     }
 
     #[test]
-    fn portable_rejects_channel_and_lock_handles() {
+    fn portable_round_trips_channel_and_lock_handles() {
         let mut heap = Heap::default();
         let (tx, rx) = channel_pair(&mut heap);
-        assert_eq!(
-            value_to_portable(&heap, tx),
-            Err(ThreadErrorTag::NotSendable)
-        );
-        assert_eq!(
-            value_to_portable(&heap, rx),
-            Err(ThreadErrorTag::NotSendable)
-        );
+        let tx_pv = value_to_portable(&heap, tx).unwrap();
+        assert!(matches!(tx_pv, PortableValue::Sender(_)));
+        let rx_pv = value_to_portable(&heap, rx).unwrap();
+        assert!(matches!(rx_pv, PortableValue::Receiver(_)));
 
         let mtx = host_mutex(&mut heap, &[Value::from(1_i64)]);
         let Object::Enum(gc) = heap.find_object_by_addr(mtx.raw() as u64).unwrap() else {
@@ -1168,10 +1269,8 @@ mod tests {
             panic!("expected Mutex");
         };
         let mtx_val = Value::from(obj.addr());
-        assert_eq!(
-            value_to_portable(&heap, mtx_val),
-            Err(ThreadErrorTag::NotSendable)
-        );
+        let mtx_pv = value_to_portable(&heap, mtx_val).unwrap();
+        assert!(matches!(mtx_pv, PortableValue::MutexHandle(_)));
 
         let rw = host_rwlock(&mut heap, &[Value::from(2_i64)]);
         let Object::Enum(gc) = heap.find_object_by_addr(rw.raw() as u64).unwrap() else {
@@ -1181,10 +1280,23 @@ mod tests {
             panic!("expected RwLock");
         };
         let rw_val = Value::from(obj.addr());
-        assert_eq!(
-            value_to_portable(&heap, rw_val),
-            Err(ThreadErrorTag::NotSendable)
+        let rw_pv = value_to_portable(&heap, rw_val).unwrap();
+        assert!(matches!(rw_pv, PortableValue::RwLockHandle(_)));
+
+        // Nested in a tuple (request/reply spawn arg shape).
+        let (tup, _) = heap.alloc(
+            ObjTuple {
+                elements: vec![tx, rx],
+            },
+            Object::Tuple,
         );
+        let tup_pv = value_to_portable(&heap, Value::from(tup.addr())).unwrap();
+        let PortableValue::Tuple(elems) = tup_pv else {
+            panic!("expected tuple");
+        };
+        assert_eq!(elems.len(), 2);
+        assert!(matches!(elems[0], PortableValue::Sender(_)));
+        assert!(matches!(elems[1], PortableValue::Receiver(_)));
     }
 
     #[test]

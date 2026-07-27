@@ -35,6 +35,8 @@ fn main() {
 
 `channel()` returns `(Sender, Receiver)` as a two-tuple. `send` / `recv` move values between threads; `close` drops the sender side.
 
+`recv` **blocks** until a value arrives or the channel is closed (`Disconnected`). Prefer `try_recv` when you need a non-blocking poll (`WouldBlock` if empty).
+
 ```coil
 use thread::*;
 
@@ -51,6 +53,34 @@ fn main() {
     join(t)?;
 }
 ```
+
+### Request / reply (send to a worker and get a result back)
+
+One channel is one-way. To send work *and* receive a reply, create **two** channels and pass both ends the worker needs as a tuple (or any sendable aggregate of handles):
+
+```coil
+use thread::*;
+
+fn worker((Receiver, Sender) ends) {
+    let job = recv(ends[0])?;
+    send(ends[1], job)?;
+}
+
+fn main() {
+    let jobs = channel()?;
+    let replies = channel()?;
+    let t = spawn(worker, (jobs[1], replies[0]))?;
+    send(jobs[0], "ping")?;
+    print "%s", recv(replies[1])?;
+    join(t)?;
+}
+```
+
+`spawn` accepts nested `Sender` / `Receiver` / `Mutex` / `RwLock` handles inside tuples, arrays, records, and class instances whose fields are all sendable.
+
+### Joining
+
+Always `join(t)` (or `detach(t)`) when you care about the worker's return value. If `main` returns without an explicit `join`, the runtime still waits for undetached workers so a blocked `recv` is not killed by process exit — but you should still `join` to observe errors and results.
 
 `try_send` / `try_recv` are non-blocking variants when you need them.
 
@@ -102,6 +132,7 @@ Threading is implemented with **host natives** (`HostInvoke`) — no extra VM op
 |------|--------|
 | `examples/thread_join.hy` | `42` |
 | `examples/thread_channel.hy` | `hello` |
+| `examples/thread_reply.hy` | `ping` |
 | `examples/thread_mutex.hy` | `2` |
 
 See also the [examples catalog](../examples.md#os-threads).

@@ -974,6 +974,10 @@ impl<const S: usize> Machine<S> {
                 break;
             }
         }
+        // Keep undetached workers alive past main's return. Without this,
+        // process exit kills threads still blocked in `recv` / still starting,
+        // which looks like "recv never blocks" and "nothing after recv runs".
+        crate::thread::join_unddetached_threads();
     }
 
     fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {

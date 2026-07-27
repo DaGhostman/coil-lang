@@ -1601,6 +1601,17 @@ Native threads via `use thread::*;` — each worker runs on its own VM. See [Tut
 
 ---
 
+### `examples/thread_reply.hy`
+
+**Demonstrates:** request/reply with two channels; spawn a worker with a `(Receiver, Sender)` tuple.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/thread_reply.hy` |
+| **Output** | `ping` |
+
+---
+
 ### `examples/thread_mutex.hy`
 
 **Demonstrates:** Shared `mutex` and `with_lock` from two threads.
@@ -1812,6 +1823,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `coro_done.hy` | Coroutines | `falsefalsetrue` |
 | `thread_join.hy` | OS threads | `42` |
 | `thread_channel.hy` | OS threads | `hello` |
+| `thread_reply.hy` | OS threads | `ping` |
 | `thread_mutex.hy` | OS threads | `2` |
 | `for_in_coro.hy` | Coroutines | `01210` |
 | `for_in_array.hy` | Collections | `123` |

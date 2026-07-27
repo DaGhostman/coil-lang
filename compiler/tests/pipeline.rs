@@ -3001,6 +3001,37 @@ fn example_thread_channel_prints_hello() {
 }
 
 #[test]
+fn example_thread_reply_prints_ping() {
+    let output = run_example("examples/thread_reply.hy");
+    assert_eq!(output, "ping");
+}
+
+#[test]
+fn thread_main_exits_without_join_still_runs_worker_recv() {
+    // Regression: process exit used to kill workers still in `recv`, so
+    // nothing after the worker's recv ran and the script looked like it
+    // "didn't block". Auto-join at end of `run_with_pool` keeps them alive.
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn worker(Receiver rx) {
+    let msg = recv(rx)?;
+    print "%s", msg;
+    return 0;
+}
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(worker, pair[1])?;
+    send(pair[0], "hi")?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+#[test]
 fn example_thread_mutex_prints_2() {
     let output = run_example("examples/thread_mutex.hy");
     assert_eq!(output, "2");
