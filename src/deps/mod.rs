@@ -562,6 +562,17 @@ fn short_sha(commit: &str) -> &str {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_workdir(label: &str) -> PathBuf {
+        let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "coil_deps_{label}_{}_{n}",
+            std::process::id()
+        ))
+    }
 
     fn init_git_repo(dir: &Path, tags: &[(&str, &str)]) -> String {
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -623,10 +634,7 @@ mod tests {
 
     #[test]
     fn install_add_update_roundtrip_with_local_git_repo() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_test_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -686,10 +694,7 @@ mod tests {
 
     #[test]
     fn install_pulls_transitive_dependencies() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_transitive_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("transitive");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -727,13 +732,8 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn lockfile_is_source_of_truth_on_reinstall() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_sot_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("sot");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -777,10 +777,7 @@ mod tests {
 
     #[test]
     fn add_rejects_invalid_and_duplicate_package_names() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_name_test_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("name_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(
@@ -810,10 +807,7 @@ mod tests {
 
     #[test]
     fn install_drops_stale_lock_entries_not_in_manifest() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_stale_lock_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("stale_lock");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src")).unwrap();
 
@@ -855,10 +849,7 @@ mod tests {
 
     #[test]
     fn resolve_star_with_no_tags_locks_default_branch_head() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_head_fallback_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("head_fallback");
         let _ = std::fs::remove_dir_all(&tmp);
         let repo = tmp.join("upstream");
         // No tags — version `*` should fall back to HEAD.
@@ -882,10 +873,7 @@ mod tests {
 
     #[test]
     fn materialise_honors_monorepo_subpath() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_monorepo_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("monorepo");
         let _ = std::fs::remove_dir_all(&tmp);
         let repo = tmp.join("upstream");
         std::fs::create_dir_all(repo.join("packages/lib/src")).unwrap();
@@ -938,10 +926,7 @@ mod tests {
 
     #[test]
     fn update_errors_without_lockfile_or_undeclared_name() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_update_err_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("update_err");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(
@@ -962,7 +947,9 @@ mod tests {
             .unwrap();
         let bad_name = cmd_update(&tmp, &["not_declared".into()], true).unwrap_err();
         assert!(
-            bad_name.to_string().contains("not a declared dependency"),
+            bad_name
+                .to_string()
+                .contains("not a declared or locked dependency"),
             "got: {bad_name}"
         );
 
@@ -971,10 +958,7 @@ mod tests {
 
     #[test]
     fn find_project_root_walks_up_to_coil_toml() {
-        let tmp = std::env::temp_dir().join(format!(
-            "coil_deps_root_{}",
-            std::process::id()
-        ));
+        let tmp = temp_workdir("root");
         let _ = std::fs::remove_dir_all(&tmp);
         let nested = tmp.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
