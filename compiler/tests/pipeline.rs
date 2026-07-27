@@ -77,6 +77,21 @@ fn run_example_src_with_entry(src: &str, entry: Option<&std::path::Path>) -> Str
     run_bytecode(bytecode, constants, &pipeline, entry)
 }
 
+/// Multi-file examples (`use` / `mod`) must go through
+/// `compile_src_from_file` so the pipeline discovers dependencies
+/// via `coil.toml` roots. In-memory `compile_src` cannot load them.
+fn run_example_multifile(path: &str) -> String {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let full = workspace_root.join(path);
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src_from_file(full.to_str().unwrap())
+        .unwrap_or_else(|_| panic!("multi-file example failed to compile: {}", full.display()));
+    run_bytecode(bytecode, constants, &pipeline, Some(full.as_path()))
+}
+
 /// Soft-skip an FFI-dependent test outside CI. In CI (`CI` env set), skip is a
 /// hard failure so missing `cc` / libffi never silently greens the suite.
 fn ffi_soft_skip(reason: &str) {
@@ -307,7 +322,7 @@ fn example_nested_aggregates_prints_rows_and_total() {
 
 #[test]
 fn example_modules_brace_prints_12_42() {
-    let output = run_example("examples/modules_brace.hy");
+    let output = run_example_multifile("examples/modules_brace.hy");
     assert_eq!(output, "1242");
 }
 

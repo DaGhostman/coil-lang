@@ -25,7 +25,7 @@ fn fresh_diag_name(next: &mut u32) -> String {
     if n < 26 {
         ((b'a' + n as u8) as char).to_string()
     } else {
-        let letter = ((b'a' + (n % 26) as u8) as char);
+        let letter = (b'a' + (n % 26) as u8) as char;
         format!("{}{}", letter, n / 26)
     }
 }
