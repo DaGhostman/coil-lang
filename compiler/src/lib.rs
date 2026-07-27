@@ -6562,9 +6562,14 @@ impl Compiler {
                 for method_node in methods {
                     match method_node.1.borrow() {
                         Expression::Method(_, body) => {
-                            if let Expression::Function { name, .. } = body.1.borrow() {
+                            if let Expression::Function {
+                                name, is_static, ..
+                            } = body.1.borrow()
+                            {
                                 let fqn = format!("{}::{}", owner, name);
-                                self.compiling_method = true;
+                                // Instance methods reserve slot 0 for `self`;
+                                // static methods start params at slot 0.
+                                self.compiling_method = !*is_static;
                                 self.do_compile(body);
                                 self.compiling_method = false;
                                 self.context
@@ -6590,7 +6595,11 @@ impl Compiler {
                 self.namespace = saved_ns;
             }
             Expression::Method(_vis, body) => {
-                self.compiling_method = true;
+                let is_static = matches!(
+                    body.1.borrow(),
+                    Expression::Function { is_static: true, .. }
+                );
+                self.compiling_method = !is_static;
                 bytecode.append(&mut self.do_compile(body));
                 self.compiling_method = false;
             }
@@ -8859,36 +8868,42 @@ impl Compiler {
                 // not panic: release builds use panic=abort).
                 let Some(tag) = self.checker.tag_for(enum_name, variant_name) else {
                     let fqn = format!("{}::{}", enum_name, variant_name);
-                    if let Some(offset) = self.functions.get(&fqn).copied() {
-                        match fields {
-                            EnumConstructPayload::Unit => {}
-                            EnumConstructPayload::Tuple(args) => {
-                                for arg in args {
-                                    bytecode.append(&mut self.do_compile(arg));
-                                }
-                            }
-                            EnumConstructPayload::Record(parts) => {
-                                for part in parts {
-                                    bytecode.append(&mut self.do_compile(&part.value));
-                                }
-                            }
-                        }
-                        let arity = match fields {
-                            EnumConstructPayload::Unit => 0,
-                            EnumConstructPayload::Tuple(args) => args.len(),
-                            EnumConstructPayload::Record(parts) => parts.len(),
-                        };
-                        bytecode.push(
-                            Byte::new(Instruction::CALL)
-                                .with_call_packed(arity as u32, offset as u32),
-                        );
-                        return bytecode;
-                    }
+                    // Match typechecker order for Unit form: static field
+                    // wins over a same-named 0-arg static method.
                     if matches!(fields, EnumConstructPayload::Unit)
                         && let Some(slot) = self.checker.static_slot_index(&fqn)
                     {
                         bytecode.push(
                             Byte::new(Instruction::LoadStatic).with_operand_u32(slot),
+                        );
+                        return bytecode;
+                    }
+                    // `Class::static_method(...)` — same surface as enum
+                    // Construct; lower to a direct CALL when registered.
+                    if let Some(offset) = self.functions.get(&fqn).copied() {
+                        let arg_slice: &[Output] = match fields {
+                            EnumConstructPayload::Unit => &[],
+                            EnumConstructPayload::Tuple(args) => args.as_slice(),
+                            EnumConstructPayload::Record(parts) => {
+                                for part in parts {
+                                    bytecode.append(&mut self.do_compile(&part.value));
+                                }
+                                // Record form is a type error for static
+                                // methods; still emit a CALL for recovery.
+                                bytecode.push(
+                                    Byte::new(Instruction::CALL).with_call_packed(
+                                        parts.len() as u32,
+                                        offset as u32,
+                                    ),
+                                );
+                                return bytecode;
+                            }
+                        };
+                        let arity =
+                            self.emit_call_args_with_rest(&fqn, arg_slice, &mut bytecode, false);
+                        bytecode.push(
+                            Byte::new(Instruction::CALL)
+                                .with_call_packed(arity, offset as u32),
                         );
                         return bytecode;
                     }

@@ -2061,3 +2061,81 @@ fn main() {
     );
 }
 
+#[test]
+fn static_method_called_on_instance_errors() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub static fn origin() -> Point {
+        return new Point(0, 0);
+    }
+}
+fn main() {
+    let p = new Point(1, 2);
+    let q = p.origin();
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("static method")
+            && (m.contains("call it as") || m.contains("::"))),
+        "expected static-on-instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn instance_method_via_class_path_errors() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+fn main() {
+    let n = Point::sum();
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("instance method")
+            && (m.contains("call it on a value") || m.contains("obj."))),
+        "expected instance-via-Class:: diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn static_constructor_via_class_path_typechecks() {
+    let (_ty, msgs) = check(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    pub static fn new(int x, int y) -> Point {
+        return new Point(x, y);
+    }
+}
+fn main() {
+    let p = Point::new(40, 2);
+}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "expected no diagnostics for Point::new, got: {:?}",
+        msgs
+    );
+}
+

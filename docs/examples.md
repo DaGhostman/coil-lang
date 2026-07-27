@@ -1414,6 +1414,37 @@ fn main() {
 | **Run** | `cargo run -- examples/classes.hy` |
 | **Output** | `7458` |
 
+### `examples/static_ctor.hy`
+
+**Demonstrates:** `static fn` constructors via `Class::new(...)` alongside unchanged positional `new Class(...)`. Bodies build instances with `new ClassName(...)`.
+
+```coil
+class Point {
+    x: int,
+    y: int,
+}
+
+impl Point {
+    pub static fn new(int x, int y) -> Point {
+        return new Point(x, y);
+    }
+
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+
+fn main() {
+    let p = Point::new(40, 2);
+    print "%i,", p.sum();
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/static_ctor.hy` |
+| **Output** | `42,1,1` |
+
 ### `examples/match_block_self.hy`
 
 **Demonstrates:** Brace-block `match` arm bodies that call `self.method()` (expression blocks, not dicts).
@@ -1770,6 +1801,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `ffi_callback_ret.hy` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.hy`) |
 | `classes.hy` | Classes | `7458` |
+| `static_ctor.hy` | Classes | `42,1,1` |
 | `match_block_self.hy` | Classes / Match | `5` |
 | `generic_class.hy` | Classes | `42` |
 | `coro.hy` | Coroutines | (see source) |

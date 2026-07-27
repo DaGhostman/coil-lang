@@ -249,6 +249,13 @@ fn example_static_singleton_prints_121() {
     assert_eq!(output, "121");
 }
 
+/// `static fn new(...)` / `Class::fresh()` alongside positional `new Class(...)`.
+#[test]
+fn example_static_ctor_prints_42_1_1() {
+    let output = run_example("examples/static_ctor.hy");
+    assert_eq!(output, "42,1,1");
+}
+
 #[test]
 fn example_static_minimal_prints_11() {
     let output = run_example("examples/static_minimal.hy");

@@ -162,6 +162,11 @@ pub struct Checker {
     methods:
         std::collections::HashMap<String, std::collections::HashMap<String, (Visibility, Scheme)>>,
 
+    /// Inherent `static fn` methods: owner → set of method names.
+    /// Used to type `Class::method(...)` Construct sites and to reject
+    /// `obj.static_method()` instance calls.
+    static_methods: std::collections::HashMap<String, std::collections::HashSet<String>>,
+
     /// Pre-walk IDs consumed in lockstep by [`infer`](Self::infer).
     ids: IdTable,
 
@@ -539,6 +544,7 @@ impl Checker {
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
             methods: std::collections::HashMap::new(),
+            static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
@@ -2714,6 +2720,20 @@ impl Checker {
                     if let Some(owner) = class_owner.as_ref()
                         && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
                     {
+                        if self.is_static_method(owner, method) {
+                            let fqn = format!("{}::{}", owner, method);
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "`{}` is a static method; call it as `{}(...)`",
+                                    method, fqn
+                                ),
+                                range,
+                                Some(
+                                    "static methods have no `self` receiver".to_string(),
+                                ),
+                            );
+                        }
                         let fqn = format!("{}::{}", owner, method);
                         let user_argc = method_args.len();
                         let (scheme, selected) = if self.is_overloaded(&fqn) {
@@ -4190,7 +4210,7 @@ impl Checker {
                 enum_name,
                 variant_name,
                 fields,
-            } => self.infer_construct(enum_name, variant_name, fields, range),
+            } => self.infer_construct(enum_name, variant_name, fields, range, id),
 
             // ---- Generics ----
             Expression::TypeClass {
@@ -9560,8 +9580,9 @@ impl Checker {
 
         let prev_impl_owner = self.impl_owner.replace(owner.to_string());
         self.push_scope();
-        self.env
-            .insert_top("self".to_string(), Scheme::mono(owner_ty.clone()));
+        // Do not bind `self` on the impl frame — instance methods get it
+        // from `infer_function(..., Some(owner_ty))`, and static methods
+        // must not see a receiver.
 
         for method in methods {
             if let Expression::Method(vis, body) = method.1.as_ref() {
@@ -9630,6 +9651,12 @@ impl Checker {
                         },
                         &method.0.into_range(),
                     );
+                    if *is_static {
+                        self.static_methods
+                            .entry(owner.to_string())
+                            .or_default()
+                            .insert(name.to_string());
+                    }
                     self.methods
                         .entry(owner.to_string())
                         .or_default()
@@ -9927,7 +9954,11 @@ impl Checker {
         self.push_scope();
         let mut baseline = std::collections::HashSet::new();
         if let Some(self_ty) = self_ty {
-            // Method receiver — side-table for codegen Access/Call.
+            // Method receiver — env binding for the body + side-table for
+            // codegen Access/Call. Static methods pass `None` and must not
+            // see `self` (it is no longer bound on the outer impl frame).
+            self.env
+                .insert_top("self".to_string(), Scheme::mono(self_ty.clone()));
             self.record_codegen_var_type("self".to_string(), self_ty.clone());
             baseline.insert("self".to_string());
         }
@@ -11459,12 +11490,17 @@ impl Checker {
     }
 
     /// Constructor application with shape/arity checking.
+    ///
+    /// Also resolves `Class::static_method(...)` when `enum_name` is a
+    /// class (parsed as Construct because `Class::name(...)` shares the
+    /// enum-constructor surface syntax).
     fn infer_construct(
         &mut self,
         enum_name: &str,
         variant_name: &str,
         fields: &parser::ast::EnumConstructPayload<'_>,
         range: Range<usize>,
+        call_id: Option<NodeId>,
     ) -> Ty {
         use parser::ast::EnumConstructPayload;
         // Surface path `ffi::types::Int` maps to the internal `FFIType` registry.
@@ -11496,10 +11532,31 @@ impl Checker {
             Some(t) => t.clone(),
             None => {
                 let static_fqn = format!("{}::{}", enum_name, variant_name);
+                // Bare / `()` Unit form: prefer static field, then 0-arg
+                // static method (`Counter::fresh()`).
                 if matches!(fields, EnumConstructPayload::Unit) {
                     if let Some(ty) = self.static_slot_types.get(&static_fqn).cloned() {
                         return apply_ty_prune(&self.subst, &ty);
                     }
+                }
+                if let Some(ty) =
+                    self.try_infer_static_method_call(enum_name, variant_name, fields, range.clone(), call_id)
+                {
+                    return ty;
+                }
+                if self.has_method(enum_name, variant_name) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
+                            static_fqn, variant_name
+                        ),
+                        range,
+                        Some(format!(
+                            "or declare `static fn {}` to call it as `{}`",
+                            variant_name, static_fqn
+                        )),
+                    );
                 }
                 return self.error(
                     ErrorCode::UnknownEnum,
@@ -13652,6 +13709,73 @@ impl Checker {
         self.methods
             .get(owner)
             .is_some_and(|m| m.contains_key(method))
+    }
+
+    /// True when `owner::method` was declared as `static fn`.
+    pub fn is_static_method(&self, owner: &str, method: &str) -> bool {
+        self.static_methods
+            .get(owner)
+            .is_some_and(|m| m.contains(method))
+    }
+
+    /// Type `Class::static_method(args)` (parsed as Construct).
+    fn try_infer_static_method_call(
+        &mut self,
+        owner: &str,
+        method: &str,
+        fields: &parser::ast::EnumConstructPayload<'_>,
+        range: Range<usize>,
+        call_id: Option<NodeId>,
+    ) -> Option<Ty> {
+        use parser::ast::EnumConstructPayload;
+        if !self.is_static_method(owner, method) {
+            return None;
+        }
+        let fqn = format!("{}::{}", owner, method);
+        let scheme = self
+            .methods
+            .get(owner)
+            .and_then(|m| m.get(method))
+            .map(|(_, s)| s.clone())?;
+        let fun_ty = self.instantiate_ty(&scheme);
+
+        // Named-arg / rest reorder when the call uses a tuple payload.
+        let arg_tys = match fields {
+            EnumConstructPayload::Unit => Vec::new(),
+            EnumConstructPayload::Tuple(args) => {
+                if self.fn_has_rest(&fqn) || self.fn_param_names.contains_key(&fqn) {
+                    let (tys, _) = self.infer_and_reorder_call_args(&fqn, args, &range);
+                    tys
+                } else {
+                    args.iter().map(|a| self.infer(a)).collect()
+                }
+            }
+            EnumConstructPayload::Record(parts) => {
+                // Static methods don't take record payloads as ctors —
+                // still infer children for ID alignment, then error.
+                for p in parts {
+                    let _ = self.infer(&p.value);
+                }
+                return Some(self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "static method `{}` is called with parentheses, not a record literal",
+                        fqn
+                    ),
+                    range,
+                    Some(format!("write `{}(...)` with positional or named arguments", fqn)),
+                ));
+            }
+        };
+
+        Some(self.apply_function(
+            Some(&fqn),
+            &fun_ty,
+            &arg_tys,
+            None,
+            call_id,
+            range,
+        ))
     }
 
     /// True if `name` was declared as `async fn`.
