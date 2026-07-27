@@ -379,7 +379,8 @@ fn encode_value(
         | Object::Sender(_)
         | Object::Receiver(_)
         | Object::Mutex(_)
-        | Object::RwLock(_) => Err(ThreadErrorTag::NotSendable),
+        | Object::RwLock(_)
+        | Object::CryptoHasher(_) => Err(ThreadErrorTag::NotSendable),
     }
 }
 

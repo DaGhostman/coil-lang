@@ -1164,7 +1164,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::TailCall as u8);
+            promise!(*bc as u8 <= Instruction::CastBoolToInt as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1441,6 +1441,30 @@ impl<const S: usize> Machine<S> {
                     // subsequent LOAD/BinSlotImm read the wrong slots.
                     sp = callee_sp;
                     ip = target;
+                }
+                Instruction::CastIntToFloat => {
+                    let v = self.stack.pop().as_int() as f64;
+                    self.stack.push(Value::from(v));
+                }
+                Instruction::CastFloatToInt => {
+                    let v = self.stack.pop().as_float() as i64;
+                    self.stack.push(Value::from(v));
+                }
+                Instruction::CastIntToByte => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from((v as u8) as i64));
+                }
+                Instruction::CastByteToInt => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from(v & 0xff));
+                }
+                Instruction::CastIntToBool => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from((v != 0) as i64));
+                }
+                Instruction::CastBoolToInt => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from(if v != 0 { 1 } else { 0 }));
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);

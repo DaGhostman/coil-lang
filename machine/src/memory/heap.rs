@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::crypto_hasher_state::ObjCryptoHasher;
+
 const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
 const GC_GROWTH_FACTOR: usize = 2;
 
@@ -248,6 +250,9 @@ impl Heap {
             Object::RwLock(l) => {
                 l.release();
             }
+            Object::CryptoHasher(h) => {
+                h.release();
+            }
         }
     }
 
@@ -275,7 +280,25 @@ impl Heap {
         self.addr_index.get(&addr).copied()
     }
 
-    /// Write back FFI scratch-buffer values into a live `ObjArray`.
+    pub fn with_crypto_hasher<R>(
+        &mut self,
+        addr: u64,
+        f: impl FnOnce(&mut ObjCryptoHasher) -> R,
+    ) -> Option<R> {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::CryptoHasher(gc) = reference {
+                    return Some(f(gc.payload_mut()));
+                }
+                return None;
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    /// Write back scratch-buffer values into a live `ObjArray`.
     pub fn update_array_elements(&mut self, addr: u64, values: &[i64]) {
         let mut current = self.head;
         while let Some(reference) = current {
@@ -389,6 +412,7 @@ pub type RefSender = Gc<ObjSender>;
 pub type RefReceiver = Gc<ObjReceiver>;
 pub type RefThreadMutex = Gc<ObjThreadMutex>;
 pub type RefRwLock = Gc<ObjRwLock>;
+pub type RefCryptoHasher = Gc<ObjCryptoHasher>;
 
 /// Kind of host-backed IO stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +445,7 @@ pub enum Object {
     Receiver(RefReceiver),
     Mutex(RefThreadMutex),
     RwLock(RefRwLock),
+    CryptoHasher(RefCryptoHasher),
 }
 
 impl Object {
@@ -443,6 +468,7 @@ impl Object {
             Self::Receiver(r) => r.mark(),
             Self::Mutex(m) => m.mark(),
             Self::RwLock(l) => l.mark(),
+            Self::CryptoHasher(h) => h.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -468,6 +494,7 @@ impl Object {
             Self::Receiver(r) => r.unmark(),
             Self::Mutex(m) => m.unmark(),
             Self::RwLock(l) => l.unmark(),
+            Self::CryptoHasher(h) => h.unmark(),
         }
     }
 
@@ -491,6 +518,7 @@ impl Object {
             Self::Receiver(r) => r.is_marked(),
             Self::Mutex(m) => m.is_marked(),
             Self::RwLock(l) => l.is_marked(),
+            Self::CryptoHasher(h) => h.is_marked(),
         }
     }
 
@@ -544,6 +572,7 @@ impl Object {
             Self::Receiver(_) => {}
             Self::Mutex(_) => {}
             Self::RwLock(_) => {}
+            Self::CryptoHasher(_) => {}
         }
     }
 
@@ -567,6 +596,7 @@ impl Object {
             Self::Receiver(r) => r.get_next(),
             Self::Mutex(m) => m.get_next(),
             Self::RwLock(l) => l.get_next(),
+            Self::CryptoHasher(h) => h.get_next(),
         }
     }
 
@@ -589,6 +619,7 @@ impl Object {
             Self::Receiver(r) => r.set_next(next),
             Self::Mutex(m) => m.set_next(next),
             Self::RwLock(l) => l.set_next(next),
+            Self::CryptoHasher(h) => h.set_next(next),
         }
     }
 
@@ -611,6 +642,7 @@ impl Object {
             Self::Receiver(r) => r.as_ptr() as u64,
             Self::Mutex(m) => m.as_ptr() as u64,
             Self::RwLock(l) => l.as_ptr() as u64,
+            Self::CryptoHasher(h) => h.as_ptr() as u64,
         }
     }
 }
@@ -634,6 +666,7 @@ impl GcSized for Object {
             Self::Receiver(r) => r.size(),
             Self::Mutex(m) => m.size(),
             Self::RwLock(l) => l.size(),
+            Self::CryptoHasher(h) => h.size(),
         }
     }
 }
@@ -657,6 +690,7 @@ impl fmt::Display for Object {
             Self::Receiver(_) => write!(f, "<receiver 0x{:08x}>", self.addr()),
             Self::Mutex(_) => write!(f, "<mutex 0x{:08x}>", self.addr()),
             Self::RwLock(_) => write!(f, "<rwlock 0x{:08x}>", self.addr()),
+            Self::CryptoHasher(_) => write!(f, "<crypto_hasher 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -680,7 +714,8 @@ impl Object {
             | Self::Sender(_)
             | Self::Receiver(_)
             | Self::Mutex(_)
-            | Self::RwLock(_) => std::ptr::null(),
+            | Self::RwLock(_)
+            | Self::CryptoHasher(_) => std::ptr::null(),
         }
     }
 }

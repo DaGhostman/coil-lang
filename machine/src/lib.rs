@@ -1,13 +1,20 @@
 //! Stack VM, managed heap, and FFI runtime for coil bytecode.
 
 mod ffi;
+pub mod crypto;
+mod crypto_hasher_state;
+pub mod env;
+pub mod fs;
 pub mod io;
+pub mod char_ord;
 pub mod thread;
+pub mod time;
 mod memory;
 mod opcode;
 pub mod packed_la;
 mod vm;
 
+pub use crypto::{CryptoErrorTag, CRYPTO_WIRING};
 pub use ffi::*;
 pub use memory::*;
 pub use opcode::*;
