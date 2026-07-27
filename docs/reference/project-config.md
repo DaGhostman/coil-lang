@@ -1,6 +1,6 @@
 # Project configuration (`coil.toml`)
 
-The **`coil.toml`** file at a project's root tells the compiler where to find module files and optionally which file is the entry point.
+The **`coil.toml`** file at a project's root tells the compiler where to find module files, which git dependencies to vendor, and optionally which file is the entry point.
 
 ---
 
@@ -11,6 +11,7 @@ Place `coil.toml` in the **project root** — the directory the compiler treats 
 ```
 my-project/
 ├── coil.toml
+├── coil.lock
 └── src/
     ├── main.hy
     └── foo/
@@ -25,7 +26,7 @@ If `coil.toml` is absent, the compiler uses built-in defaults (see [Default beha
 
 The parser accepts a minimal TOML-like subset:
 
-- Section headers: `[module]`, `[entry]`
+- Section headers: `[module]`, `[entry]`, `[ffi]`, `[package]`, `[dependencies.<name>]`
 - Key-value lines: `key = value`
 - String values: double-quoted (`"./src"`)
 - Array values: `["a", "b"]`
@@ -38,6 +39,17 @@ Unknown sections or keys are parse errors.
 
 ## Sections and keys
 
+### `[package]`
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `vendor_dir` | string | No (defaults to `"vendor"`) | Directory under the project root where `coil install` materialises git dependencies |
+
+```toml
+[package]
+vendor_dir = "vendor"
+```
+
 ### `[module]`
 
 | Key | Type | Required | Description |
@@ -48,7 +60,7 @@ Example:
 
 ```toml
 [module]
-roots = ["./src", "./vendor", "./builtins"]
+roots = ["./src", "./builtins"]
 ```
 
 Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the compiler looks for `<root>/foo/bar.hy` under each root **in order**. The first existing file wins.
@@ -56,6 +68,41 @@ Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the c
 If the `[module]` section is omitted entirely, roots default to `["src"]`.
 
 If `[module]` is present but `roots` is omitted, roots also default to `["src"]`.
+
+### `[dependencies.<name>]`
+
+Git dependencies (no central registry). The section name’s last segment is the **package name** and the `use` namespace prefix (`foo` → `foo::…`).
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `git` | string | Yes | Git remote URL (HTTPS or SSH) |
+| `version` | string | No (defaults to `"*"`) | Semver requirement (`^1.2`, `~2.0`, `1.0.0`, `*`) |
+| `path` | string | No | Subdirectory inside the repo (monorepos) |
+
+```toml
+[dependencies.foo]
+git = "https://github.com/org/foo"
+version = "^1.2.0"
+
+[dependencies.bar]
+git = "nina.v@example.com:org/private.git"
+version = "~2.0"
+path = "packages/bar"
+```
+
+Private GitHub HTTPS remotes: set `GH_TOKEN` or `GITHUB_TOKEN`. SSH remotes use your agent/credentials as usual.
+
+Locked versions live in **`coil.lock`** (commit SHA + concrete semver). Sources are checked out under `vendor/<name>/` (or `vendor_dir`). Commit `coil.lock`; keep `vendor/` out of version control (see `.gitignore`).
+
+CLI:
+
+| Command | Meaning |
+|---------|---------|
+| `coil add <name> <git-url> [--version <req>]` | Append the dependency, resolve a matching tag, vendor, lock |
+| `coil install` | Materialise every lock entry into the vendor directory |
+| `coil update [name…]` | Propose newer matching tags, print commits since the locked SHA (grouped by repo), confirm, then bump |
+
+Vendored packages are resolved **after** project `roots`. A package’s own `coil.toml` `[module].roots` (default `["src", "."]`) selects files inside the checkout; namespaces are always prefixed with the package name.
 
 ### `[entry]`
 
@@ -82,21 +129,20 @@ cargo run -- examples/modules.hy
 
 ## Complete example
 
-From `coil.toml.example`:
-
 ```toml
 # coil project manifest
 
-[module]
-# Search roots for `use` resolution. Each path is relative to
-# the directory containing this coil.toml file. The compiler
-# searches the roots in order; the first file that exists wins.
-roots = ["./src", "./vendor", "./builtins"]
+[package]
+vendor_dir = "vendor"
 
-# Default when no coil.toml exists: roots = ["src"]
+[module]
+roots = ["./src", "./builtins"]
+
+[dependencies.foo]
+git = "https://github.com/org/foo"
+version = "^1.0"
 
 [entry]
-# Optional entry point. If omitted, use the file from the CLI.
 # file = "./src/main.hy"
 ```
 
@@ -104,7 +150,7 @@ roots = ["./src", "./vendor", "./builtins"]
 
 ## Discovery algorithm
 
-Given a `use a::b::c;` statement and roots `["./src", "./vendor", "./builtins"]`:
+Given a `use a::b::c;` statement and roots `["./src", "./builtins"]`:
 
 ### Step 1 — Split the import path
 
@@ -119,17 +165,7 @@ For root `./src`:
 ./src/a/b/c.hy   → exists? use this file
 ```
 
-If not found, try `./vendor`:
-
-```
-./vendor/a/b/c.hy
-```
-
-Then `./builtins`:
-
-```
-./builtins/a/b/c.hy
-```
+If not found, try `./builtins`, then (if `a` is a declared dependency) `vendor/a/…` using that package’s module roots.
 
 ### Step 3 — First match wins
 
@@ -137,11 +173,7 @@ Stop at the first path that exists on disk. That file is loaded and compiled.
 
 ### Step 4 — Compute namespace
 
-Strip the matching root prefix, remove `.hy`, replace `/` with `::`:
-
-```
-./src/a/b/c.hy  →  namespace "a::b::c"
-```
+Strip the matching root prefix, remove `.hy`, replace `/` with `::`. For vendored packages, prefix with the package name (`foo::something`).
 
 ### Glob imports
 
@@ -177,7 +209,9 @@ When no `coil.toml` exists in the project root (or the file cannot be read):
 | Setting | Default |
 |---------|---------|
 | `[module].roots` | `["src"]` |
+| `[package].vendor_dir` | `"vendor"` |
 | `[entry].file` | None — use CLI argument |
+| dependencies | none |
 
 This means a minimal project with only `src/main.hy` and `src/foo/bar.hy` works without any manifest, as long as you run the compiler from the project root:
 
@@ -191,38 +225,41 @@ The namespace test suite confirms that `use foo::greet;` resolves to `src/foo/gr
 
 ## Multiple roots in practice
 
-Use multiple roots to vendored or built-in libraries:
+Use multiple roots for local libraries and builtins; use `[dependencies.*]` for git packages:
 
 ```toml
 [module]
-roots = ["./src", "./vendor", "./builtins"]
+roots = ["./src", "./builtins"]
+
+[dependencies.http]
+git = "https://github.com/example/coil-http"
+version = "^0.3"
 ```
 
-Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `vendor/foo/greet.hy` exist, the `src/` copy is used.
+Resolution order means **your source tree takes precedence** over vendored packages when a path exists in both places.
 
 Typical layout:
 
 ```
 project/
 ├── coil.toml
+├── coil.lock      # commit this
 ├── src/           # application code (first priority)
-├── vendor/        # third-party coil modules
-└── builtins/      # compiler-shipped helpers (e.g. FFI wrappers)
+├── vendor/        # git checkouts from `coil install` (usually gitignored)
+└── builtins/      # local shared helpers
 ```
 
 ---
 
 ## Reserved / future keys
 
-The parser currently accepts only the keys documented above. Future versions may add keys such as:
+Future versions may add keys such as:
 
 ```toml
 [module]
 preludes = ["./stdlib"]   # customize auto-imports (not yet implemented)
 strict   = true           # reject undefined names at typecheck (not yet implemented)
 ```
-
-These are recognized in planning documents but **ignored or rejected** by the current parser. Do not rely on them.
 
 Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `coil.toml` today. Every file always gets the implicit prelude; FFI still requires an explicit `use`.
 

@@ -75,3 +75,27 @@ roots = ["./src", "./vendor", "./builtins"]
 #   strict   = true          # reject undefined names at typecheck
 #
 # These are recognized by the parser but currently ignored.
+
+# --------------------------------------------------------------------------
+# Git dependencies (no central registry)
+# --------------------------------------------------------------------------
+#
+# Packages are git repositories. The package name is the `use` namespace
+# prefix: dependency `foo` is imported as `foo::something`.
+#
+# [package]
+# vendor_dir = "vendor"   # optional; default is "vendor"
+#
+# [dependencies.foo]
+# git = "https://github.com/org/foo"
+# version = "^1.2.0"
+# # path = "crates/foo"   # optional subdirectory in a monorepo
+#
+# Commands:
+#   coil add foo https://github.com/org/foo --version "^1.2"
+#   coil install
+#   coil update            # shows commits since lock; asks to confirm
+#
+# Private GitHub repos: use an SSH URL, or set GH_TOKEN / GITHUB_TOKEN for HTTPS.
+# Locked commits live in coil.lock; sources are materialised under vendor/.
+

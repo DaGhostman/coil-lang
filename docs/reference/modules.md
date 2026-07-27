@@ -109,7 +109,9 @@ Given a `mod foo;` declaration:
 | `use foo::*;` | `src/foo.hy` |
 | `mod foo;` | `src/foo.hy` |
 
-With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
+With multiple roots `["./src", "./builtins"]`, the compiler checks `./src/...` first, then `./builtins/...`. The first match wins.
+
+Declared git packages (`[dependencies.foo]` in `coil.toml`) are resolved **after** project roots. Import them by package name prefix (`use foo::something;`); see [Project configuration](project-config.md).
 
 ---
 

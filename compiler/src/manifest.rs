@@ -1,26 +1,37 @@
 //! Project manifest (`coil.toml`) parsing and module path resolution.
 //!
 //! A `coil.toml` at the project root declares search roots for `use`
-//! resolution and an optional entry point. The pipeline maps `a::b::c`
-//! paths to `<root>/a/b/c.hy` files on disk.
+//! resolution, optional git dependencies, and an optional entry point.
+//! The pipeline maps `a::b::c` paths to `<root>/a/b/c.hy` files on disk.
+//! Declared packages are also reachable as `name::…` under the vendor
+//! directory (see [`DependencySpec`]).
 //!
 //! ## Format
 //!
 //! ```toml
+//! [package]
+//! vendor_dir = "vendor"
+//!
 //! [module]
-//! roots = ["./src", "./vendor", "./builtins"]
+//! roots = ["./src", "./builtins"]
 //!
 //! [entry]
 //! # Optional. Default = the file passed to the compiler.
 //! file = "./src/main.hy"
+//!
+//! [dependencies.foo]
+//! git = "https://github.com/org/foo"
+//! version = "^1.0.0"
 //! ```
 //!
-//! The parser is intentionally minimal (no nested tables,
-//! no inline tables, no arrays of tables). The grammar is:
+//! The parser is intentionally minimal (no nested tables beyond
+//! dotted section names, no inline tables, no arrays of tables).
+//! The grammar is:
 //!
 //! ```text
 //! file   := section* ; zero or more sections
-//! section := '[' ident ']' '\n' (entry '\n')*
+//! section := '[' section_name ']' '\n' (entry '\n')*
+//! section_name := ident | 'dependencies.' ident
 //! entry  := key '=' value '\n'
 //! key    := ident (no quotes, no spaces)
 //! value  := string | array
@@ -40,9 +51,12 @@
 //! 1. `./src/a/b/c.hy`
 //! 2. `./vendor/a/b/c.hy`
 //!
-//! The first match wins. If no root contains the file, the
-//! pipeline emits a "module not found" diagnostic.
+//! The first match wins. If no project root contains the file,
+//! and the first path segment names a declared dependency, we
+//! resolve the remainder inside that package's vendor checkout
+//! (namespace prefix = the package name).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur while loading a `coil.toml` manifest.
@@ -80,6 +94,18 @@ impl std::fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+/// A git dependency declared under `[dependencies.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencySpec {
+    /// Git remote URL (HTTPS or SSH). Private repos use the
+    /// caller's git credentials / `GH_TOKEN` / `GITHUB_TOKEN`.
+    pub git: String,
+    /// Semver version requirement string (e.g. `"^1.2.0"`).
+    pub version: String,
+    /// Optional subdirectory inside the cloned repo (monorepos).
+    pub path: Option<String>,
+}
+
 /// Resolved project manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
@@ -92,17 +118,25 @@ pub struct Manifest {
     pub entry: Option<PathBuf>,
     /// Extra directories searched when resolving FFI library paths.
     pub ffi_search_paths: Vec<PathBuf>,
+    /// Directory under the project root where `coil install`
+    /// materializes git dependencies. Defaults to `"vendor"`.
+    pub vendor_dir: PathBuf,
+    /// Declared git dependencies keyed by package name. The
+    /// name is the `use` namespace prefix (`foo` → `foo::…`).
+    pub dependencies: BTreeMap<String, DependencySpec>,
 }
 
 impl Default for Manifest {
     /// Default manifest when no `coil.toml` is present:
     /// a single search root at `src/`, no explicit entry
-    /// point.
+    /// point, vendor dir `vendor`, no dependencies.
     fn default() -> Self {
         Self {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: BTreeMap::new(),
         }
     }
 }
@@ -153,7 +187,11 @@ impl Manifest {
         let mut roots: Option<Vec<PathBuf>> = None;
         let mut entry: Option<PathBuf> = None;
         let mut ffi_search_paths: Option<Vec<PathBuf>> = None;
-        let mut current_section: Option<&'static str> = None;
+        let mut vendor_dir: Option<PathBuf> = None;
+        let mut dependencies: BTreeMap<String, DependencySpec> = BTreeMap::new();
+        // Pending dependency fields while inside `[dependencies.name]`.
+        let mut pending_dep: Option<(String, PendingDep)> = None;
+        let mut current_section: Option<SectionKind> = None;
 
         for (idx, raw_line) in source.lines().enumerate() {
             let line_num = idx + 1;
@@ -166,19 +204,49 @@ impl Manifest {
                 continue;
             }
 
-            // Section header: `[name]`.
+            // Section header: `[name]` or `[dependencies.name]`.
             if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                current_section = match name.trim() {
-                    "module" => Some("module"),
-                    "entry" => Some("entry"),
-                    "ffi" => Some("ffi"),
+                // Flush any open dependency section.
+                if let Some((dep_name, pending)) = pending_dep.take() {
+                    dependencies.insert(dep_name, pending.into_spec(line_num)?);
+                }
+                let name = name.trim();
+                current_section = Some(match name {
+                    "module" => SectionKind::Module,
+                    "entry" => SectionKind::Entry,
+                    "ffi" => SectionKind::Ffi,
+                    "package" => SectionKind::Package,
+                    other if other.starts_with("dependencies.") => {
+                        let dep_name = other["dependencies.".len()..].trim();
+                        if dep_name.is_empty()
+                            || !dep_name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        {
+                            return Err(ManifestError::Parse {
+                                line: line_num,
+                                message: format!(
+                                    "invalid dependency section `[{}]` (expected `[dependencies.<name>]`)",
+                                    other
+                                ),
+                            });
+                        }
+                        if dependencies.contains_key(dep_name) {
+                            return Err(ManifestError::Parse {
+                                line: line_num,
+                                message: format!("duplicate dependency `{}`", dep_name),
+                            });
+                        }
+                        pending_dep = Some((dep_name.to_string(), PendingDep::default()));
+                        SectionKind::Dependency
+                    }
                     other => {
                         return Err(ManifestError::Parse {
                             line: line_num,
                             message: format!("unknown section `[{}]`", other),
                         });
                     }
-                };
+                });
                 continue;
             }
 
@@ -193,83 +261,111 @@ impl Manifest {
                 message: format!("expected `key = value`, got `{}`", line),
             })?;
 
-            match (section, key) {
-                ("module", "roots") => {
+            match section {
+                SectionKind::Module if key == "roots" => {
                     let parsed = parse_string_array(value).ok_or(ManifestError::Parse {
                         line: line_num,
                         message: format!("expected array of strings, got `{}`", value),
                     })?;
                     roots = Some(parsed.into_iter().map(PathBuf::from).collect());
                 }
-                ("entry", "file") => {
+                SectionKind::Entry if key == "file" => {
                     let parsed = parse_string(value).ok_or(ManifestError::Parse {
                         line: line_num,
                         message: format!("expected string, got `{}`", value),
                     })?;
                     entry = Some(PathBuf::from(parsed));
                 }
-                ("ffi", "search_paths") => {
+                SectionKind::Ffi if key == "search_paths" => {
                     let parsed = parse_string_array(value).ok_or(ManifestError::Parse {
                         line: line_num,
                         message: format!("expected array of strings, got `{}`", value),
                     })?;
                     ffi_search_paths = Some(parsed.into_iter().map(PathBuf::from).collect());
                 }
-                (section, key) => {
+                SectionKind::Package if key == "vendor_dir" => {
+                    let parsed = parse_string(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected string, got `{}`", value),
+                    })?;
+                    vendor_dir = Some(PathBuf::from(parsed));
+                }
+                SectionKind::Dependency => {
+                    let (_, pending) = pending_dep.as_mut().expect("dependency section open");
+                    let parsed = parse_string(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected string, got `{}`", value),
+                    })?;
+                    match key {
+                        "git" => pending.git = Some(parsed),
+                        "version" => pending.version = Some(parsed),
+                        "path" => pending.path = Some(parsed),
+                        other => {
+                            return Err(ManifestError::Parse {
+                                line: line_num,
+                                message: format!("unknown key `dependencies.*.{}`", other),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    let section_name = match other {
+                        SectionKind::Module => "module",
+                        SectionKind::Entry => "entry",
+                        SectionKind::Ffi => "ffi",
+                        SectionKind::Package => "package",
+                        SectionKind::Dependency => "dependencies",
+                    };
                     return Err(ManifestError::Parse {
                         line: line_num,
-                        message: format!("unknown key `{}.{}`", section, key),
+                        message: format!("unknown key `{}.{}`", section_name, key),
                     });
                 }
             }
+        }
+
+        if let Some((dep_name, pending)) = pending_dep.take() {
+            // End-of-file flush: use a synthetic line number.
+            let line = source.lines().count().max(1);
+            dependencies.insert(dep_name, pending.into_spec(line)?);
         }
 
         Ok(Self {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
             ffi_search_paths: ffi_search_paths.unwrap_or_default(),
+            vendor_dir: vendor_dir.unwrap_or_else(|| PathBuf::from("vendor")),
+            dependencies,
         })
+    }
+
+    /// Absolute path to the vendored checkout for `name`
+    /// (`<project>/<vendor_dir>/<name>`).
+    pub fn package_vendor_path(&self, project_root: &Path, name: &str) -> PathBuf {
+        project_root.join(&self.vendor_dir).join(name)
     }
 
     /// Resolve a `use` target (`a::b::c`) to an absolute file
     /// path. Searches each search root in order; the first
-    /// match wins. Returns `None` if no root contains the
-    /// module file.
+    /// match wins. If no project root matches and the first
+    /// path segment is a declared dependency name, resolves
+    /// inside that package's vendor directory.
     ///
     /// `path` is the segments of the module path BEFORE the
     /// item name (e.g. `["a", "b"]` for `use a::b::c;`).
     /// `name` is the final segment (e.g. `"c"`).
-    ///
-    /// The file containing the module is the LAST
-    /// segment of the dotted path (as a file stem). For
-    /// `use foo::sadge;`, the file is `foo.hy` (NOT
-    /// `foo/sadge.hy`). For `use lib::io::read;`, the
-    /// file is `io.hy` inside `lib/` (so the full path
-    /// is `<root>/lib/io.hy`).
-    ///
-    /// The fully qualified name of the imported item is
-    /// `<file's path>::<name>` — the file's directory
-    /// path is the namespace, and the function name is
-    /// the LAST segment. So `sadge` in `foo.hy` has
-    /// FQN `foo::sadge`, and `read` in `lib/io.hy` has
-    /// FQN `lib::io::read`.
     pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
         for root in &self.roots {
             let mut candidate = project_root.join(root);
             for segment in path {
                 candidate.push(segment);
             }
-            // The file is `name.hy` inside the directory
-            // `<root>/<path joined>`. So for `use
-            // foo::sadge;`, file = `<root>/foo/sadge.hy`.
-            // For `use lib::io::read;`, file =
-            // `<root>/lib/io/read.hy`.
             candidate.push(format!("{}.hy", name));
             if candidate.exists() {
                 return Some(candidate);
             }
         }
-        None
+        self.resolve_use_in_package(project_root, path, name)
     }
 
     /// Resolve a `mod foo;` forward declaration to an
@@ -286,19 +382,9 @@ impl Manifest {
     }
 
     /// Compute the namespace of a file given its absolute
-    /// path and the project root. The namespace is the path
-    /// of the file relative to the FIRST search root that
-    /// contains it, with the file extension stripped and
-    /// path separators replaced with `::`.
-    ///
-    /// For example, given roots `["./src", "./builtins"]` and
-    /// file `./builtins/core/ffi/dload.hy`, the namespace is
-    /// `core::ffi::dload`.
-    ///
-    /// Returns `None` if the file is not inside any search
-    /// root. Files outside any search root are still
-    /// compilable (we use their bare stem as the namespace),
-    /// but the caller is expected to handle that fallback.
+    /// path and the project root. Prefers project search
+    /// roots; if the file lives under a vendored package,
+    /// returns `package_name::relative`.
     pub fn namespace_of(&self, project_root: &Path, file: &Path) -> Option<String> {
         for root in &self.roots {
             let abs_root = project_root.join(root);
@@ -306,8 +392,110 @@ impl Manifest {
                 return Some(path_to_namespace(rel));
             }
         }
+        for (pkg_name, _spec) in &self.dependencies {
+            let pkg_dir = self.package_vendor_path(project_root, pkg_name);
+            let pkg_roots = package_module_roots(&pkg_dir);
+            for pkg_root in &pkg_roots {
+                let abs = pkg_dir.join(pkg_root);
+                if let Ok(rel) = file.strip_prefix(&abs) {
+                    let inner = path_to_namespace(rel);
+                    if inner.is_empty() {
+                        return Some(pkg_name.clone());
+                    }
+                    return Some(format!("{}::{}", pkg_name, inner));
+                }
+            }
+            // Fallback: relative to the package checkout root.
+            if let Ok(rel) = file.strip_prefix(&pkg_dir) {
+                let inner = path_to_namespace(rel);
+                if inner.is_empty() {
+                    return Some(pkg_name.clone());
+                }
+                return Some(format!("{}::{}", pkg_name, inner));
+            }
+        }
         None
     }
+
+    fn resolve_use_in_package(
+        &self,
+        project_root: &Path,
+        path: &[String],
+        name: &str,
+    ) -> Option<PathBuf> {
+        let (pkg_name, rest): (&str, &[String]) = if path.is_empty() {
+            // `use foo;` where foo is both the package and the module stem —
+            // only valid via resolve_mod; keep None here.
+            return None;
+        } else {
+            (path[0].as_str(), &path[1..])
+        };
+        if !self.dependencies.contains_key(pkg_name) {
+            return None;
+        }
+        let pkg_dir = self.package_vendor_path(project_root, pkg_name);
+        if !pkg_dir.is_dir() {
+            return None;
+        }
+        let pkg_roots = package_module_roots(&pkg_dir);
+        for pkg_root in &pkg_roots {
+            let mut candidate = pkg_dir.join(pkg_root);
+            for segment in rest {
+                candidate.push(segment);
+            }
+            candidate.push(format!("{}.hy", name));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionKind {
+    Module,
+    Entry,
+    Ffi,
+    Package,
+    Dependency,
+}
+
+#[derive(Debug, Default)]
+struct PendingDep {
+    git: Option<String>,
+    version: Option<String>,
+    path: Option<String>,
+}
+
+impl PendingDep {
+    fn into_spec(self, line: usize) -> Result<DependencySpec, ManifestError> {
+        let git = self.git.ok_or_else(|| ManifestError::Parse {
+            line,
+            message: "dependency missing required `git` key".to_string(),
+        })?;
+        let version = self.version.unwrap_or_else(|| "*".to_string());
+        Ok(DependencySpec {
+            git,
+            version,
+            path: self.path,
+        })
+    }
+}
+
+/// Module search roots inside a vendored package directory.
+/// Reads the package's own `coil.toml` `[module].roots` when
+/// present; otherwise defaults to `["src", "."]`.
+pub fn package_module_roots(pkg_dir: &Path) -> Vec<PathBuf> {
+    let manifest_path = pkg_dir.join("coil.toml");
+    if let Ok(contents) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(m) = Manifest::parse(&contents) {
+            if !m.roots.is_empty() {
+                return m.roots;
+            }
+        }
+    }
+    vec![PathBuf::from("src"), PathBuf::from(".")]
 }
 
 /// Strip an inline comment (everything after `#`, but not
@@ -513,6 +701,8 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("vendor")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: BTreeMap::new(),
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
@@ -564,6 +754,8 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("builtins")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: BTreeMap::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, Some("core::ffi::dload".to_string()));
@@ -583,6 +775,8 @@ mod tests {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: BTreeMap::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, None);
@@ -609,6 +803,79 @@ mod tests {
 
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("./vendor")]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_package_vendor_dir_and_dependencies() {
+        let src = r#"
+            [package]
+            vendor_dir = "third_party"
+
+            [module]
+            roots = ["./src"]
+
+            [dependencies.foo]
+            git = "https://github.com/org/foo"
+            version = "^1.2.0"
+
+            [dependencies.bar]
+            git = "nina.v@example.com:org/bar.git"
+            version = "~2.0"
+            path = "packages/bar"
+        "#;
+        let m = Manifest::parse(src).unwrap();
+        assert_eq!(m.vendor_dir, PathBuf::from("third_party"));
+        assert_eq!(m.dependencies.len(), 2);
+        let foo = m.dependencies.get("foo").unwrap();
+        assert_eq!(foo.git, "https://github.com/org/foo");
+        assert_eq!(foo.version, "^1.2.0");
+        assert_eq!(foo.path, None);
+        let bar = m.dependencies.get("bar").unwrap();
+        assert_eq!(bar.path.as_deref(), Some("packages/bar"));
+    }
+
+    #[test]
+    fn parse_dependency_defaults_version_to_star() {
+        let src = r#"
+            [dependencies.foo]
+            git = "https://github.com/org/foo"
+        "#;
+        let m = Manifest::parse(src).unwrap();
+        assert_eq!(m.dependencies["foo"].version, "*");
+        assert_eq!(m.vendor_dir, PathBuf::from("vendor"));
+    }
+
+    #[test]
+    fn resolve_use_finds_vendored_package_module() {
+        let tmp = std::env::temp_dir().join("coil_manifest_pkg_resolve");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("vendor").join("foo").join("src");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("something.hy"), "fn something() {}\n").unwrap();
+
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "foo".to_string(),
+            DependencySpec {
+                git: "https://example.com/foo".into(),
+                version: "^1".into(),
+                path: None,
+            },
+        );
+        let m = Manifest {
+            roots: vec![PathBuf::from("src")],
+            entry: None,
+            ffi_search_paths: Vec::new(),
+            vendor_dir: PathBuf::from("vendor"),
+            dependencies: deps,
+        };
+        let resolved = m.resolve_use(&tmp, &["foo".into()], "something");
+        assert!(resolved.is_some());
+        assert!(resolved.unwrap().ends_with("vendor/foo/src/something.hy"));
+
+        let ns = m.namespace_of(&tmp, &pkg.join("something.hy"));
+        assert_eq!(ns.as_deref(), Some("foo::something"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

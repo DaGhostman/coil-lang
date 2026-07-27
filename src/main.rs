@@ -13,6 +13,7 @@ const DEFAULT_OUT: &str = "out.hyc";
 const TESTS_DIR: &str = "tests";
 
 mod package_app;
+mod deps;
 
 use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 
@@ -33,6 +34,16 @@ enum Command {
         check_native: bool,
         strip_debug: bool,
     },
+    /// Materialise git dependencies from coil.lock into the vendor dir.
+    Install,
+    /// Declare + install a git dependency.
+    Add {
+        name: String,
+        git_url: String,
+        version: String,
+    },
+    /// Bump locked commits (with changelog + confirmation).
+    Update { names: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +62,9 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] run <file.hyc>\n\
          \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
+         \x20 coil install\n\
+         \x20 coil add <name> <git-url> [--version <req>]\n\
+         \x20 coil update [name…]\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.hy> to out.hyc (cached) and run it\n\
@@ -59,6 +73,9 @@ fn print_help() {
          \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
          \x20 test       Compile and run every .hy file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
+         \x20 install    Fetch git dependencies into the vendor directory (from coil.lock)\n\
+         \x20 add        Add a git dependency to coil.toml, resolve, vendor, and lock\n\
+         \x20 update     Bump locked dependency commits (shows changelog; asks to confirm)\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` or packaged binary for `package`\n\
@@ -67,6 +84,7 @@ fn print_help() {
          \x20 --strip-debug         With `package`, omit debug line table from embedded archive\n\
          \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
          \x20 --fail-fast          With `test`, stop after the first failed case\n\
+         \x20 --version <req>      With `add`, semver requirement (default: `*`)\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
@@ -85,6 +103,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut runner: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
+    let mut version_req: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -106,6 +125,19 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 }
                 runner = Some(PathBuf::from(path));
             }
+            "--version" => {
+                i += 1;
+                let Some(req) = args.get(i) else {
+                    return Err("missing requirement after --version");
+                };
+                if req.starts_with('-') {
+                    return Err("missing requirement after --version");
+                }
+                if version_req.is_some() {
+                    return Err("duplicate --version flag");
+                }
+                version_req = Some(req.clone());
+            }
             "-h" | "--help" => {
                 print_help();
                 exit(0);
@@ -124,15 +156,88 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --version, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
         i += 1;
     }
 
+    let reserved = |s: &str| {
+        matches!(
+            s,
+            "compile" | "run" | "test" | "package" | "install" | "add" | "update"
+        )
+    };
+
     let command = match positionals.as_slice() {
         [] => return Err("missing input file or command"),
+        [cmd] if cmd == "install" => {
+            if output.is_some()
+                || include_tests
+                || fail_fast
+                || check_native
+                || strip_debug
+                || runner.is_some()
+                || version_req.is_some()
+            {
+                return Err("`install` does not accept those flags");
+            }
+            Command::Install
+        }
+        [cmd] if cmd == "update" => {
+            if output.is_some()
+                || include_tests
+                || fail_fast
+                || check_native
+                || strip_debug
+                || runner.is_some()
+                || version_req.is_some()
+            {
+                return Err("`update` does not accept those flags");
+            }
+            Command::Update { names: Vec::new() }
+        }
+        [cmd, rest @ ..] if cmd == "update" => {
+            if output.is_some()
+                || include_tests
+                || fail_fast
+                || check_native
+                || strip_debug
+                || runner.is_some()
+                || version_req.is_some()
+            {
+                return Err("`update` does not accept those flags");
+            }
+            if rest.iter().any(|n| reserved(n)) {
+                return Err("update package names must not be command keywords");
+            }
+            Command::Update {
+                names: rest.to_vec(),
+            }
+        }
+        [cmd] if cmd == "add" => return Err("add requires <name> <git-url>"),
+        [cmd, _] if cmd == "add" => return Err("add requires <name> <git-url>"),
+        [cmd, name, git_url] if cmd == "add" => {
+            if output.is_some()
+                || include_tests
+                || fail_fast
+                || check_native
+                || strip_debug
+                || runner.is_some()
+            {
+                return Err("`add` only accepts --version among those flags");
+            }
+            if reserved(name) {
+                return Err("add requires <name> <git-url>");
+            }
+            Command::Add {
+                name: name.clone(),
+                git_url: git_url.clone(),
+                version: version_req.unwrap_or_else(|| "*".to_string()),
+            }
+        }
+        [cmd, ..] if cmd == "add" => return Err("too many arguments for `add`"),
         [cmd] if cmd == "test" => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile` or `package`");
@@ -142,6 +247,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
             }
             Command::Test {
                 path: None,
@@ -158,7 +266,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
-            if path == "compile" || path == "run" || path == "test" || path == "package" {
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
+            }
+            if reserved(path) {
                 return Err("test path must be a directory");
             }
             Command::Test {
@@ -170,7 +281,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
         [cmd, filename] if cmd == "package" => {
-            if filename == "package" || filename == "compile" || filename == "run" || filename == "test" {
+            if reserved(filename) {
                 return Err("package requires an entry file");
             }
             if fail_fast {
@@ -178,6 +289,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if include_tests {
                 return Err("--include-tests is not valid with `package`");
+            }
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
             }
             let out = output.unwrap_or_else(|| {
                 Path::new(filename)
@@ -195,7 +309,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
         }
         [cmd, filename] if cmd == "compile" => {
-            if filename == "compile" || filename == "run" || filename == "test" || filename == "package" {
+            if reserved(filename) {
                 return Err("compile requires an entry file");
             }
             if fail_fast {
@@ -203,6 +317,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
             }
             Command::Compile {
                 filename: filename.clone(),
@@ -219,6 +336,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
+            }
             Command::Run {
                 archive: archive.clone(),
             }
@@ -232,6 +352,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if version_req.is_some() {
+                return Err("--version is only valid with `add`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -731,6 +854,24 @@ fn main() {
 
     match cli.command {
         Command::Test { path, fail_fast } => cmd_test(config, path, fail_fast),
+        Command::Install | Command::Add { .. } | Command::Update { .. } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let root = deps::find_project_root(&cwd);
+            let result = match cli.command {
+                Command::Install => deps::cmd_install(&root),
+                Command::Add {
+                    name,
+                    git_url,
+                    version,
+                } => deps::cmd_add(&root, &name, &git_url, &version),
+                Command::Update { names } => deps::cmd_update(&root, &names),
+                _ => unreachable!(),
+            };
+            if let Err(e) = result {
+                eprintln!("error: {e}");
+                exit(1);
+            }
+        }
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
@@ -757,7 +898,10 @@ fn main() {
                     check_native,
                     strip_debug,
                 ),
-                Command::Test { .. } => unreachable!(),
+                Command::Test { .. }
+                | Command::Install
+                | Command::Add { .. }
+                | Command::Update { .. } => unreachable!(),
             }
         }
     }
@@ -783,6 +927,59 @@ mod tests {
             }
         );
         assert!(!cli.log_json);
+    }
+
+    #[test]
+    fn parse_install_command() {
+        let cli = parse_args(&args(&["install"])).unwrap();
+        assert_eq!(cli.command, Command::Install);
+    }
+
+    #[test]
+    fn parse_add_command_with_version() {
+        let cli = parse_args(&args(&[
+            "add",
+            "foo",
+            "https://github.com/org/foo",
+            "--version",
+            "^1.2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Add {
+                name: "foo".into(),
+                git_url: "https://github.com/org/foo".into(),
+                version: "^1.2".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_add_defaults_version_to_star() {
+        let cli = parse_args(&args(&["add", "foo", "https://github.com/org/foo"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Add {
+                name: "foo".into(),
+                git_url: "https://github.com/org/foo".into(),
+                version: "*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_update_with_optional_names() {
+        assert_eq!(
+            parse_args(&args(&["update"])).unwrap().command,
+            Command::Update { names: vec![] }
+        );
+        assert_eq!(
+            parse_args(&args(&["update", "foo", "bar"])).unwrap().command,
+            Command::Update {
+                names: vec!["foo".into(), "bar".into()]
+            }
+        );
     }
 
     #[test]

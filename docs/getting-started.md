@@ -88,6 +88,9 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 | `coil run <file.hyc>` | Execute a previously compiled archive |
 | `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`) |
 | `coil test [path] [--fail-fast]` | Compile and run every `.hy` under `[path]` (default `./tests`) |
+| `coil install` | Fetch git dependencies into the vendor directory from `coil.lock` |
+| `coil add <name> <git-url> [--version <req>]` | Add a git dependency, vendor it, and update `coil.lock` |
+| `coil update [name…]` | Bump locked commits (prints changelog; asks to confirm) |
 
 Examples:
 
@@ -109,7 +112,14 @@ cargo run --release -- package examples/strlen.hy -o ./strlen-app --check-native
 cargo run -- test
 cargo run -- test ./tests
 cargo run -- test --fail-fast   # stop after the first failed case
+
+# Git dependencies (no central registry)
+cargo run -- add foo https://github.com/org/foo --version "^1.0"
+cargo run -- install
+cargo run -- update             # shows commits since lock; confirms before applying
 ```
+
+Packages are imported by **name prefix**: dependency `foo` provides `foo::something`. See [Project configuration](reference/project-config.md).
 
 Layout under `./tests`:
 

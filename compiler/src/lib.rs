@@ -28,6 +28,7 @@ use parser::{
 };
 
 pub use pipeline::*;
+pub use manifest::{DependencySpec, Manifest, ManifestError, package_module_roots};
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
 pub use typechecking::{
     BuiltinExport, CStructDef, CallbackSigDef, Checker, FfiBuiltin, ForInInfo, ForInKind, Ty,
