@@ -105,6 +105,28 @@ pub enum PortableValue {
     RwLockHandle(Arc<RwLockInner>),
 }
 
+impl std::fmt::Debug for PortableValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Immediate(v) => write!(f, "Immediate({v})"),
+            Self::String(s) => write!(f, "String({s:?})"),
+            Self::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            Self::Tuple(t) => f.debug_tuple("Tuple").field(t).finish(),
+            Self::Enum { tag, payload } => f
+                .debug_struct("Enum")
+                .field("tag", tag)
+                .field("payload", payload)
+                .finish(),
+            Self::Instance { fields } => f.debug_struct("Instance").field("fields", fields).finish(),
+            Self::Boxed(inner) => f.debug_tuple("Boxed").field(inner).finish(),
+            Self::Sender(_) => write!(f, "Sender(..)"),
+            Self::Receiver(_) => write!(f, "Receiver(..)"),
+            Self::MutexHandle(_) => write!(f, "MutexHandle(..)"),
+            Self::RwLockHandle(_) => write!(f, "RwLockHandle(..)"),
+        }
+    }
+}
+
 impl PartialEq for PortableValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
