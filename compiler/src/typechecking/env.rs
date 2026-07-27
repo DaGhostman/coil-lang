@@ -1,4 +1,4 @@
-//! Scoped environments and let-polymorphism ([`generalize`], [`instantiate`]).
+//! Scoped environments and let-polymorphism ([`generalize`], [`instantiate_with_kinds`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -7,7 +7,7 @@ use super::ty::{Scheme, Ty, TyVarId, ftv_scheme, ftv_ty};
 /// A counter that mints fresh `TyVarId`s. Each call to [`TyVarCounter::fresh`]
 /// returns a distinct id.
 ///
-/// Used by [`instantiate`] and inference to mint fresh type variables.
+/// Used by [`instantiate_with_kinds`] and inference to mint fresh type variables.
 #[derive(Debug, Default, Clone)]
 pub struct TyVarCounter {
     next: u32,
@@ -191,22 +191,11 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
 /// `scheme.bounds`, so two instantiations of the same scheme produce
 /// different but consistently-ordered substitutions.
 ///
-/// Returns the instantiated type and freshened constraints (with new
-/// variable ids substituted).
+/// Returns the instantiated type (constraints discarded — use
+/// [`instantiate_with_kinds`] when they matter).
+#[cfg(test)]
 pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
     instantiate_with_kinds(scheme, counter).0
-}
-
-/// Like [`instantiate`], but also returns the freshened constraints.
-///
-/// Used by call-site constraint discharge in the typechecker
-/// (`infer.rs` `Expression::Call` path).
-pub fn instantiate_with_constraints(
-    scheme: &Scheme,
-    counter: &mut TyVarCounter,
-) -> (Ty, Vec<super::ty::Constraint>) {
-    let (ty, constraints, _) = instantiate_with_kinds(scheme, counter);
-    (ty, constraints)
 }
 
 /// Instantiate a scheme, returning the freshened type, constraints, and a

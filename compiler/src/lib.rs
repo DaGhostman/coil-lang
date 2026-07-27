@@ -825,10 +825,6 @@ impl Compiler {
         }
     }
 
-    fn emit_extend(&mut self, span: SimpleSpan, bytes: Vec<Byte>) {
-        self.emit_bytes(span, &bytes);
-    }
-
     /// Number of global static slots for the VM table.
     pub fn static_slot_count(&self) -> u32 {
         self.checker.static_slot_count()
@@ -890,12 +886,6 @@ impl Compiler {
         self.const_env_stack.pop();
     }
 
-    fn ensure_const_env(&mut self) {
-        if self.const_env_stack.is_empty() {
-            self.const_env_stack.push(HashMap::new());
-        }
-    }
-
     fn emit_const_value(&mut self, v: &ConstValue, bytecode: &mut Vec<Byte>) {
         match v {
             ConstValue::Int(n) => {
@@ -935,10 +925,15 @@ impl Compiler {
     }
 
     /// If `ast` folds to a scalar, emit it and return true.
+    ///
+    /// When `allow_mul_shl` is false, skip `x * 2^n` → `SHL` so trait/`Mul`
+    /// dictionary calls (`bound_operator_call`) still dispatch through
+    /// `emit_bound_operator_call` for non-primitive `T * 2^n`.
     fn try_emit_folded_expr(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'_>>),
         bytecode: &mut Vec<Byte>,
+        allow_mul_shl: bool,
     ) -> bool {
         if let Some(v) = const_fold::eval_expr(ast, self.const_env()) {
             self.emit_const_value(&v, bytecode);
@@ -946,6 +941,30 @@ impl Compiler {
         } else if let Some(inner) = const_fold::strength_reduced_inner(ast) {
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
+            true
+        } else if allow_mul_shl
+            && let Some((inner, shift)) = const_fold::strength_mul_to_shl(ast, self.const_env())
+        {
+            // Defense-in-depth: only emit int SHL when the non-const operand
+            // is a known integer-like immediate (`int` or `byte` — extend
+            // this match if more int-like primitives are added). VM `SHL`
+            // uses `as_int`; `float * k` is rejected at typecheck. Unknown
+            // types fall through to MUL / dictionary dispatch.
+            use crate::typechecking::subst::apply_ty_prune;
+            use crate::typechecking::ty::{BYTE, INT};
+            let inner_is_int_like = self.codegen_expr_ty(inner).is_some_and(|ty| {
+                matches!(
+                    apply_ty_prune(self.checker.subst(), &ty),
+                    Ty::Con(ref n) if n == INT || n == BYTE
+                )
+            });
+            if !inner_is_int_like {
+                return false;
+            }
+            let mut inner_bc = self.do_compile(inner);
+            bytecode.append(&mut inner_bc);
+            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(shift as i32));
+            bytecode.push(Byte::new(Instruction::SHL));
             true
         } else {
             false
@@ -1535,14 +1554,6 @@ impl Compiler {
         }
     }
 
-    /// Unwrap a [`Expression::NamedArg`] to its value expression.
-    fn call_arg_value<'a>(arg: &'a Output<'a>) -> &'a Output<'a> {
-        match arg.1.as_ref() {
-            Expression::NamedArg(_, value) => value,
-            _ => arg,
-        }
-    }
-
     /// Flatten `...expr` spread nodes for codegen using inferred types.
     fn flatten_call_args_for_emit<'a>(&self, args: &[Output<'a>]) -> Vec<Output<'a>> {
         use crate::typechecking::subst::apply_ty_prune;
@@ -1699,13 +1710,6 @@ impl Compiler {
             (fixed, rest, true)
         } else {
             (fixed, Vec::new(), false)
-        }
-    }
-
-    fn call_arg_value_owned<'a>(arg: &'a Output<'a>) -> Output<'a> {
-        match arg.1.as_ref() {
-            Expression::NamedArg(_, v) => v.clone(),
-            _ => arg.clone(),
         }
     }
 
@@ -6919,7 +6923,9 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                if self.try_emit_folded_expr(ast, &mut bytecode) {
+                // `allow_mul_shl` is irrelevant for Add (strength_mul_to_shl
+                // only matches Mul); pass true for the shared helper API.
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -6975,13 +6981,20 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if let Some(hint) = self_id
+                // Prefer trait/`Mul` dictionary dispatch over primitive
+                // `x * 2^n` → SHL when the checker recorded a bound operator
+                // (non-primitive `T * 2^n` must not emit int SHL).
+                // `try_emit_folded_expr` also const-folds literal×literal and
+                // identity-reduces `* 1` before bound/primitive fallback.
+                let bound_mul = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
                             .bound_operator_call_for_span(span.start, span.end)
                     })
-                    .cloned()
+                    .cloned();
+                if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
+                } else if let Some(hint) = bound_mul
                     && self.emit_bound_operator_call(
                         &mut bytecode,
                         lhs,
@@ -8691,6 +8704,34 @@ mod tests {
         (bc, compiler.constants)
     }
 
+    /// True when bytecode contains a strength-reduced `x << shift`
+    /// (`LOAD; CONST; SHL` or fused `BinSlotImm(SHL, shift)`).
+    fn bytecode_has_shl_by(bc: &[Byte], shift: i64) -> bool {
+        use common::Instruction;
+        let has_load_const_shl = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHL)
+                && (w[1].operand_u32() & Byte::POOL_FLAG) == 0
+                && w[1].operand_u32() as i32 == shift as i32
+        });
+        let has_fused_shl = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
+                && b.bin_slot_imm_parts().2 == shift
+        });
+        has_load_const_shl || has_fused_shl
+    }
+
+    fn bytecode_has_any_shl(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::SHL)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::SHL as u8)
+        })
+    }
+
     #[test]
     fn method_call_target_relocated_after_static_init_splice() {
         use common::Instruction;
@@ -8996,6 +9037,130 @@ test("two") { assert(true)?; }
         assert!(
             has_int_bin_slot && !has_float_bin_slot,
             "expected fused int BinSlotSlot(ADD) for integer arithmetic; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x * 8` strength-reduces to `x << 3` (via [`const_fold::strength_mul_int`]).
+    #[test]
+    fn mul_by_power_of_two_emits_shl_not_mul() {
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { return x * 8; }");
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected LOAD/CONST/SHL (shift 3) or fused BinSlotImm(SHL, 3) for x*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Commuted form `8 * x` must use the same SHL lowering (LHS factor).
+    #[test]
+    fn mul_by_lhs_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { return 8 * x; }");
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected SHL (shift 3) for 8*x; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `const K = 16; x * K` must consult `const_env` and emit `<< 4`.
+    #[test]
+    fn mul_by_const_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src(
+            "fn scale(int x) -> int { const K = 16; return x * K; }",
+        );
+        assert!(
+            bytecode_has_shl_by(&bc, 4),
+            "expected SHL (shift 4) for x*const(16); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x * 1` is identity-reduced, not `<< 0` (shift 0 is reserved for
+    /// [`const_fold::strength_reduced_inner`], not SHL lowering).
+    #[test]
+    fn mul_by_one_does_not_emit_shl() {
+        let (bc, _pool) = compile_src("fn id(int x) -> int { return x * 1; }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "x*1 should identity-reduce, not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float `*` must never strength-reduce to int `SHL` (defense-in-depth
+    /// type gate in `try_emit_folded_expr`). Typecheck rejects `float * int`;
+    /// when both sides are float the factor is never a power-of-two int, so
+    /// `strength_mul_to_shl` stays `None` and we emit `MULF`.
+    #[test]
+    fn float_mul_does_not_emit_shl() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn scale(float x) -> float { return x * 8.0; }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "float mul must not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let has_mulf = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MULF)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::MULF as u8)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::MULF as u8)
+                || (*b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::MULF as u8)
+        });
+        assert!(
+            has_mulf,
+            "expected MULF (bare or fused) for float mul; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `byte` is int-like for VM `SHL` (`as_int`); `byte * 8` should still
+    /// strength-reduce (not be excluded by the int-only type gate).
+    #[test]
+    fn byte_mul_by_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src("fn scale(byte x) -> byte { return x * 8; }");
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected SHL (shift 3) for byte*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Type aliases to `int` expand at check time, so `I * 8` still SHLs.
+    #[test]
+    fn aliased_int_mul_by_power_of_two_emits_shl() {
+        let (bc, _pool) = compile_src(
+            "type I = int; fn scale(I x) -> I { return x * 8; }",
+        );
+        assert!(
+            bytecode_has_shl_by(&bc, 3),
+            "expected SHL for aliased int*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Generic `T: Num` bodies with two type operands dispatch through the
+    /// dictionary (`CallIndirect`), never primitive `SHL`. (A literal factor
+    /// like `x * 8` unifies `T` to `int` in the checker today, so that shape
+    /// correctly takes the primitive SHL path; the `bound_mul` guard covers
+    /// the open-var case.)
+    #[test]
+    fn generic_num_mul_uses_dictionary_not_shl() {
+        use common::Instruction;
+        let (bc, _pool) =
+            compile_src("fn mul2<T: Num>(T a, T b) -> T { return a * b; } fn main() { }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "generic Num mul must not lower to SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect for generic Num mul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
