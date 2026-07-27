@@ -568,7 +568,7 @@ See `examples/panic.hy`.
 
 ## Primitive casts (`expr as T`)
 
-Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
+Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). `float as int` truncates toward zero (not `round`/`floor`). Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
 
 ---
 

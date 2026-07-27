@@ -25,7 +25,7 @@ If `coil.toml` is absent, the compiler uses built-in defaults (see [Default beha
 
 The parser accepts a minimal TOML-like subset:
 
-- Section headers: `[module]`, `[entry]`
+- Section headers: `[module]`, `[entry]`, `[env]`
 - Key-value lines: `key = value`
 - String values: double-quoted (`"./src"`)
 - Array values: `["a", "b"]`
@@ -84,6 +84,19 @@ coil compile examples/modules.hy
 # with [entry] file = "./src/main.hy" in coil.toml:
 coil
 coil compile
+```
+
+### `[env]`
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `allow_exec` | bool | No (defaults to `true`) | When `false`, `env::exec` fails at runtime with `ExecDisabled` (the compiler still warns at compile time) |
+
+Example:
+
+```toml
+[env]
+allow_exec = false
 ```
 
 ---

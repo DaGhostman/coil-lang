@@ -404,6 +404,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn host_exec_true_returns_zero() {
+        let _guard = ENV_TEST_GUARD.lock().expect("env test mutex");
+        let prev = ALLOW_EXEC.load(Ordering::Relaxed);
+        ALLOW_EXEC.store(true, Ordering::Relaxed);
         let mut heap = Heap::default();
         let prog = heap.intern("true".into());
         let args = make_string_array(&mut heap, &[]);
@@ -411,9 +414,15 @@ mod tests {
             &mut heap,
             &[Value::from(prog.as_ptr() as *mut u8 as u64), args],
         );
+        ALLOW_EXEC.store(prev, Ordering::Relaxed);
         if enum_tag(&heap, r) != Some(0) {
             // Sandboxed CI may block spawning subprocesses.
-            assert_eq!(result_err_tag(&heap, r), EnvErrorTag::ExecFailed);
+            let tag = result_err_tag(&heap, r);
+            assert!(
+                tag == EnvErrorTag::ExecFailed || tag == EnvErrorTag::ExecDisabled,
+                "unexpected exec error {:?}",
+                tag
+            );
             return;
         }
         let n = result_ok_payload(&heap, r).as_int();

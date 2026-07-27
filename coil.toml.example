@@ -85,7 +85,9 @@ roots = ["./src", "./vendor", "./builtins"]
 #   preludes = ["./stdlib"]  # auto-imported in every file
 #   strict   = true          # reject undefined names at typecheck
 #
+# Accepted today (see docs/reference/project-config.md):
+#
 #   [env]
 #   allow_exec = false       # disable env::exec at runtime (compile still warns)
 #
-# These keys are not accepted yet (unknown keys are a parse error).
+# Other keys under those sections are still parse errors until documented.
