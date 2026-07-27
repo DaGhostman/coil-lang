@@ -249,9 +249,48 @@ fn main() {
     assert!(
         msgs.iter().any(|m| {
             m.message().contains("cannot capture `y` without `use (y)`")
+                || m.message().contains("list `y` in the enclosing `use")
                 || m.message().contains("list `y` in the lambda's `use")
         }),
         "expected explicit-capture diagnostic for `y`, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn defer_cannot_capture_without_use() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    let y = 10;
+    defer { print "%i", y; }
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("cannot capture `y` without `use (y)`")
+        }),
+        "expected explicit-capture diagnostic for defer, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn defer_undefined_variable_is_rejected() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    defer { print "%i", totally_undefined_var; }
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message()
+                .contains("Cannot find value `totally_undefined_var`")
+        }),
+        "expected unknown-value diagnostic in defer, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
 }

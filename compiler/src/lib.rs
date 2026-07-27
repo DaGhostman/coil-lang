@@ -636,11 +636,16 @@ pub struct Compiler {
     /// Active loop patchers. Break/continue emit through the innermost builder.
     loop_bbs: Vec<BlockBuilder>,
 
-    /// Bytecode offsets of `defer` thunks in the function currently being
-    /// compiled (declaration order). Run LIFO on return / fall-through via
+    /// Registered `defer` thunks in the function currently being compiled
+    /// (declaration order). Run LIFO on return / fall-through via
     /// `emit_run_defers`. Kept on `Compiler` (not `Context`) so nested
     /// block frames do not drop registered defers.
-    fn_defers: Vec<usize>,
+    ///
+    /// Each thunk stores its bytecode entry offset and the `use (…)` capture
+    /// names. At run time those captures are LOADed from the enclosing frame
+    /// and passed as CALL arguments so the thunk's fresh frame sees them at
+    /// slots 0..N-1 (same layout as lambda capture slots).
+    fn_defers: Vec<(usize, Vec<String>)>,
 
     /// Class name → decorated constructor function name (from attr expansion).
     decorated_class_ctors: HashMap<String, String>,
@@ -801,13 +806,28 @@ impl Compiler {
 
     /// Run registered `defer` thunks in LIFO order.
     ///
-    /// Each thunk is entered via `CALL` with target 0 (push return IP, fall
-    /// through) then `JMP` to the thunk. The thunk ends in `RETURN`, which
-    /// resumes after the `JMP`. A following `POP` discards the thunk's
+    /// For each thunk: LOAD `use (…)` captures from the enclosing frame, then
+    /// `CALL` with that arity (push return IP + new frame whose slots 0..N-1
+    /// are the captures) and `JMP` to the thunk. The thunk ends in `RETURN`,
+    /// which resumes after the `JMP`. A following `POP` discards the thunk's
     /// sentinel return value so a pending function return value stays on top.
     fn emit_run_defers(&mut self, into: &mut Vec<Byte>) {
-        for offset in self.fn_defers.iter().rev() {
-            into.push(Byte::new(Instruction::CALL).with_call_packed(0, 0));
+        for (offset, captures) in self.fn_defers.iter().rev() {
+            for cap in captures {
+                if let Some(slot) = self.lookup_slot(cap) {
+                    into.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                } else {
+                    // Typecheck should have rejected unknown captures; emit a
+                    // zero so the CALL arity still matches.
+                    into.push(Byte::new_with_value(
+                        Instruction::CONST,
+                        Value::default().raw() as _,
+                    ));
+                }
+            }
+            into.push(
+                Byte::new(Instruction::CALL).with_call_packed(captures.len() as u32, 0),
+            );
             into.push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
             into.push(Byte::new(Instruction::POP));
         }
@@ -6917,11 +6937,12 @@ impl Compiler {
                     self.emit_loop_jump(None, "continue", span.into_range());
                 }
             }
-            Expression::Defer(child) => {
+            Expression::Defer { captures, body } => {
                 // Layout (emitted into `self.bytecode` so nested Blocks that
                 // write in-place stay contiguous with the thunk):
                 //   JMP after_thunk
                 //   <thunk body>          ← fn_defers points here
+                //     (slots 0..N-1 = use captures, pushed by emit_run_defers)
                 //   CONST 0; RETURN
                 // after_thunk:
                 let jmp_pos = self.bytecode.len();
@@ -6929,10 +6950,20 @@ impl Compiler {
                     .push(Byte::new(Instruction::JMP).with_operand_u32(0));
 
                 let thunk_start = self.bytecode.len();
-                self.fn_defers.push(thunk_start);
+                let cap_names: Vec<String> =
+                    captures.iter().map(|c| (*c).to_string()).collect();
+                self.fn_defers.push((thunk_start, cap_names));
 
-                let mut body_bc = self.do_compile(child);
+                // Remap locals so capture names occupy slots 0..N-1 inside the
+                // thunk (matching the CALL args pushed by emit_run_defers).
+                let prev_vars = std::mem::take(&mut self.context.variables);
+                for cap in captures {
+                    self.context.variables.intern((*cap).to_string());
+                }
+                let mut body_bc = self.do_compile(body);
                 self.bytecode.append(&mut body_bc);
+                self.context.variables = prev_vars;
+
                 self.bytecode.push(Byte::new_with_value(
                     Instruction::CONST,
                     Value::from(0i64).raw() as _,

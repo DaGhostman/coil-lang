@@ -37,7 +37,7 @@ All reserved words in the coil parser. Keywords cannot be used as identifiers.
 | `impl` | Declaration | Class methods or trait instances (`impl Trait for T`) | [Syntax — Classes](syntax.md#classes-and-impl) / [Types — Traits](types.md#generics-and-traits) |
 | `pub` | Modifier | Public field or method | [Syntax — Classes](syntax.md#classes-and-impl) |
 | `new` | Expression | Construct class instance | [Syntax — Expressions](syntax.md#atoms-primary-forms) |
-| `defer` | Declaration | Run block on function exit | [Syntax — Defer](syntax.md#defer) |
+| `defer` | Declaration | Run block on function exit (`defer use (x) { … }` captures outer locals) | [Syntax — Defer](syntax.md#defer) |
 | `true` | Literal | Boolean true | [Types — Primitives](types.md#primitive-types) |
 | `false` | Literal | Boolean false | [Types — Primitives](types.md#primitive-types) |
 | `dload` / `declare` / `invoke` | Ordinary names | FFI callables from virtual `ffi` (not keywords) | [Built-ins — FFI](built-ins.md#dload--declare--invoke-ffi) |

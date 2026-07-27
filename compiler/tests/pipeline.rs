@@ -342,7 +342,7 @@ fn example_match_block_self_prints_5() {
 #[test]
 fn example_defer_prints_enterleave_lifo_and_early_return() {
     let output = run_example("examples/defer.hy");
-    assert_eq!(output, "enterleave,021,okd7,d99");
+    assert_eq!(output, "enterleave,021,okd7,d99,55");
 }
 
 /// Regression: parenthesized `(self).field` must still emit GetField.

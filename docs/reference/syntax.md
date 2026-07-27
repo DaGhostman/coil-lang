@@ -374,10 +374,13 @@ parse path — see [Traits and impl](#traits-and-impl) above.
 ### Defer
 
 ```
-defer_stmt ::= 'defer' block
+defer_stmt ::= 'defer' ['use' '(' ident (',' ident)* ','? ')'] block
 ```
 
 Runs when the enclosing function exits (LIFO order for multiple defers).
+Outer locals must be listed in the optional `use (…)` capture list (same
+explicit-capture rule as lambdas); bare `defer { … }` cannot close over
+enclosing locals.
 
 ---
 
@@ -406,7 +409,7 @@ statement ::= while_stmt
 | `let` | `let IDENT (':' type_annotation)? ('=' expr)? ';'` |
 | `const` | `const IDENT (':' type_annotation)? '=' expr ';'` |
 | `static` | `static let IDENT …` / `static const IDENT …` (top-level only) |
-| `defer` | `defer { statement* }` (runs on enclosing function exit, LIFO) |
+| `defer` | `defer [use (ident,*)] { statement* }` (runs on enclosing function exit, LIFO; outer locals require `use`) |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |

@@ -113,7 +113,7 @@ fn main() {
 
 ### `examples/defer.hy`
 
-**Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered.
+**Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered, plus `defer use (n)` to capture an outer local.
 
 ```coil
 fn with_cleanup() {
@@ -136,6 +136,11 @@ fn early_return(int n) -> int {
     return n;
 }
 
+fn capture_n(int n) -> int {
+    defer use (n) { print "%i", n; }
+    return n;
+}
+
 fn main() {
     with_cleanup();
     print ",";
@@ -144,13 +149,15 @@ fn main() {
     print "%i", early_return(7);
     print ",";
     print "%i", early_return(0);
+    print ",";
+    print "%i", capture_n(5);
 }
 ```
 
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/defer.hy` |
-| **Output** | `enterleave,021,okd7,d99` |
+| **Output** | `enterleave,021,okd7,d99,55` |
 
 ---
 
@@ -1746,7 +1753,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `string_fmt.hy` | Basics | `hello world42-x` |
 | `show_tuple.hy` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.hy` | Basics | `51020` |
-| `defer.hy` | Basics | `enterleave,021,okd7,d99` |
+| `defer.hy` | Basics | `enterleave,021,okd7,d99,55` |
 | `named_args.hy` | Basics | `Ada36Grace40` |
 | `variadic.hy` | Basics | `60Hi!?` |
 | `const.hy` | Basics | `42hi` |

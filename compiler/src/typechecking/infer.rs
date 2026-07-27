@@ -2147,7 +2147,7 @@ impl Checker {
                                 format!("cannot capture `{}` without `use ({})`", name, name),
                                 range,
                                 Some(format!(
-                                    "list `{}` in the lambda's `use (…)` capture list",
+                                    "list `{}` in the enclosing `use (…)` capture list",
                                     name
                                 )),
                             );
@@ -3737,8 +3737,40 @@ impl Checker {
             Expression::Invoke(args) => self.infer_ffi_invoke(args, range),
 
             // ---- Defer / coroutines / list ----
-            Expression::Defer(e) => {
-                let _ = self.infer(e);
+            Expression::Defer { captures, body } => {
+                // Same explicit-capture isolation as lambdas: outer locals
+                // are invisible unless listed in `use (…)`.
+                let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
+                for cap in captures {
+                    match self.env.lookup(cap).cloned() {
+                        Some(scheme) => {
+                            let ty = self.instantiate_ty(&scheme);
+                            cap_bindings.push((cap.to_string(), ty));
+                        }
+                        None => {
+                            return self.error(
+                                ErrorCode::UnknownValue,
+                                format!("Cannot find value `{}` in this scope", cap),
+                                range,
+                            );
+                        }
+                    }
+                }
+                let mut uncaptured = self.env.all_names();
+                for (n, _) in &cap_bindings {
+                    uncaptured.remove(n);
+                }
+
+                let saved_frames = self.env.take_and_isolate();
+                let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+                for (n, ty) in &cap_bindings {
+                    self.env
+                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.record_codegen_var_type(n.clone(), ty.clone());
+                }
+                let _ = self.infer(body);
+                self.lambda_uncaptured_outer = prev_uncaptured;
+                self.env.restore_frames(saved_frames);
                 unit_ty()
             }
             Expression::Yield(e) => {
@@ -11152,11 +11184,13 @@ impl Checker {
             | Expression::LogicalNot(e)
             | Expression::Positive(e)
             | Expression::Adjust { target: e, .. }
-            | Expression::Defer(e)
             | Expression::Member(e)
             | Expression::LetDestructure { rhs: e, .. }
             | Expression::NamedArg(_, e) => {
                 self.pre_register_enums_walk(e, errors);
+            }
+            Expression::Defer { body, .. } => {
+                self.pre_register_enums_walk(body, errors);
             }
 
             Expression::TypeApp { args, .. } => {
@@ -14543,6 +14577,80 @@ mod tests {
     #[test]
     fn defer_returns_unit() {
         assert_ok("defer { 42; }", unit_ty());
+    }
+
+    /// Defer bodies cannot close over outer locals unless listed in `use`.
+    #[test]
+    fn defer_uncaptured_outer_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    let y = 10;
+    defer { print "%i", y; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("cannot capture `y` without `use (y)`")),
+            "expected cannot-capture diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Truly undefined names in a defer are rejected (not silently accepted).
+    #[test]
+    fn defer_undefined_variable_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    defer { print "%i", totally_undefined_var; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message()
+                    .contains("Cannot find value `totally_undefined_var`")
+            }),
+            "expected unknown-value diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `defer use (y)` makes the outer local visible inside the block.
+    #[test]
+    fn defer_use_capture_typechecks() {
+        let (mut c, _) = check(
+            r#"
+fn main() {
+    let y = 10;
+    defer use (y) { print "%i", y; }
+}
+"#,
+        );
+        assert!(
+            c.take_messages().is_empty(),
+            "expected no diagnostics for defer use (y)"
+        );
+    }
+
+    /// Listing an unknown name in `use (…)` is itself an error.
+    #[test]
+    fn defer_use_unknown_capture_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    defer use (nope) { print "%i", nope; }
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Cannot find value `nope`")),
+            "expected unknown capture diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     // ---- List literals ----

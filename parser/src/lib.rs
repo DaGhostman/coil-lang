@@ -982,6 +982,10 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(target, arg), e| (e.span(), Box::new(Expression::Resume(target, arg))))
     }
 
+    /// `defer { … }` or `defer use (a, b) { … }`.
+    ///
+    /// Optional `use (id, …)` after `defer` lists explicit captures from the
+    /// enclosing function (same keyword and list shape as lambda captures).
     fn defer<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -991,9 +995,27 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        let captures = keyword!("use")
+            .ignore_then(
+                text::ident()
+                    .padded()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default());
+
         keyword!("defer")
-            .ignore_then(self.block(stmt))
-            .map_with(output!(Defer))
+            .ignore_then(captures)
+            .then(self.block(stmt))
+            .map_with(|(captures, body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Defer { captures, body }),
+                )
+            })
     }
 
     fn while_<
@@ -3068,11 +3090,11 @@ mod tests {
                 };
                 assert!(
                     items.iter().any(|item| {
-                        matches!(item.1.as_ref(), Expression::Defer(_))
+                        matches!(item.1.as_ref(), Expression::Defer { .. })
                             || matches!(
                                 item.1.as_ref(),
                                 Expression::Statement(inner)
-                                    if matches!(inner.1.as_ref(), Expression::Defer(_))
+                                    if matches!(inner.1.as_ref(), Expression::Defer { .. })
                             )
                     }),
                     "expected a Defer node in the function body, got {:?}",
@@ -3081,6 +3103,45 @@ mod tests {
             }
             other => panic!("expected Function, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn defer_use_parses_captures() {
+        let ast = decl_ast!(
+            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
+        );
+        match ast {
+            Expression::Function { body: Some(body), .. } => {
+                let Expression::Block(items) = body.1.as_ref() else {
+                    panic!("expected function body block, got {:?}", body.1);
+                };
+                let defer = items.iter().find_map(|item| match item.1.as_ref() {
+                    Expression::Defer { captures, .. } => Some(captures.as_slice()),
+                    Expression::Statement(inner) => match inner.1.as_ref() {
+                        Expression::Defer { captures, .. } => Some(captures.as_slice()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                assert_eq!(defer, Some(["x"].as_slice()));
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn defer_use_display_round_trips() {
+        // Block Display omits braces; just check the capture list renders.
+        let ast = decl_ast!(
+            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
+        );
+        let rendered = format!("{}", ast);
+        assert!(
+            rendered.contains("defer use (x)"),
+            "expected Display to include capture list, got {rendered}"
+        );
+        // Bare defer still parses.
+        let _ = stmt!("defer { print \"x\"; }");
     }
 
     #[test]
