@@ -8031,6 +8031,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8038,6 +8040,8 @@ impl Compiler {
                     "Lt",
                     "lt",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8064,6 +8068,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8071,6 +8077,8 @@ impl Compiler {
                     "Gt",
                     "gt",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8097,6 +8105,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8104,6 +8114,8 @@ impl Compiler {
                     "Le",
                     "le",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8130,6 +8142,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8137,6 +8151,8 @@ impl Compiler {
                     "Ge",
                     "ge",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8163,6 +8179,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8170,6 +8188,8 @@ impl Compiler {
                     "Eq",
                     "eq",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
                 }
@@ -8189,6 +8209,8 @@ impl Compiler {
                     lhs,
                     None,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8198,6 +8220,8 @@ impl Compiler {
                     None,
                     crate::typechecking::AggregateOp::Neg,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
                 }
@@ -8206,6 +8230,8 @@ impl Compiler {
                 // `allow_mul_shl` is irrelevant for Add (strength_mul_to_shl
                 // only matches Mul); pass true for the shared helper API.
                 if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_matrix_op(
                     &mut bytecode,
                     self_id,
@@ -8214,6 +8240,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8223,6 +8251,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Add,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -8243,6 +8273,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8261,6 +8293,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8270,6 +8304,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Sub,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -8285,6 +8321,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8305,6 +8343,8 @@ impl Compiler {
                     lhs,
                     Some(rhs),
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -8314,6 +8354,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Mul,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                 // Prefer trait/`Mul` dictionary dispatch over primitive
                 // `x * 2^n` → SHL when the checker recorded a bound operator
@@ -8328,6 +8370,8 @@ impl Compiler {
                     })
                     .cloned();
                 if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = bound_mul
                     && self.emit_bound_operator_call(
                         &mut bytecode,
@@ -8337,6 +8381,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8357,6 +8403,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Mod,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
                     let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(Instruction::DynMod));
@@ -8379,6 +8427,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Div,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -8394,6 +8444,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -8419,6 +8471,8 @@ impl Compiler {
                     Some(rhs),
                     crate::typechecking::AggregateOp::Pow,
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -8463,6 +8517,8 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else if self.emit_concrete_operator_call(
                     &mut bytecode,
                     lhs,
@@ -8470,6 +8526,8 @@ impl Compiler {
                     "Eq",
                     "ne",
                 ) {
+                    // Intentional empty body: the emit/try_emit call in the
+                    // condition already wrote bytecode as a side effect.
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
                 }

@@ -2169,6 +2169,8 @@ impl<const S: usize> Machine<S> {
                     let expected_tag = operands >> 16;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.peek().raw() as u64;
 
@@ -2207,6 +2209,8 @@ impl<const S: usize> Machine<S> {
                     let _arity = opcode.operand_u32() as usize;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
@@ -2232,6 +2236,8 @@ impl<const S: usize> Machine<S> {
                     let field_index = (opcode.operand_u32() & 0xFFFF) as usize;
 
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
@@ -2269,6 +2275,8 @@ impl<const S: usize> Machine<S> {
 
                     let slot = sp + slot_offset;
                     if slot >= self.stack.tell() {
+                        // Intentional empty body: defensive no-op when the UnpackAt
+                        // slot is out of range (typechecker should prevent this).
                     } else {
                         let scrutinee_addr = self.stack[slot].raw() as u64;
 
@@ -2340,6 +2348,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let has_send = opcode.operand_u32() & 1 != 0;
                         let handle = self.stack.pop();
@@ -2381,6 +2391,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::YieldCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let yield_val = self.stack.pop();
                         self.yield_coroutine(&mut ip, &mut sp, yield_val);
@@ -2388,6 +2400,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::YieldFromCoro => {
                     if self.stack.tell() == 0 {
+                        // Intentional empty body: defensive no-op when the stack is
+                        // empty (typechecker should prevent this; do not panic).
                     } else {
                         let handle = self.stack.pop();
                         let addr = handle.raw() as u64;
