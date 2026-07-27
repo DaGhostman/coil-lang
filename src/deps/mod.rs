@@ -381,6 +381,10 @@ fn emit_newer_version_notices(
     lock: &Lockfile,
     reqs: &BTreeMap<String, Vec<String>>,
 ) -> Result<(), DepsError> {
+    // Skip remote version probes in CI / offline installs (no network churn).
+    if std::env::var_os("CI").is_some() || std::env::var_os("COIL_OFFLINE").is_some() {
+        return Ok(());
+    }
     for (name, locked) in &lock.packages {
         let Some(req_list) = reqs.get(name) else {
             continue;
@@ -532,12 +536,7 @@ fn append_dependency_to_toml(
 }
 
 fn escape_toml_string(s: &str) -> Result<String, DepsError> {
-    if s.chars().any(|c| matches!(c, '"' | '\\' | '\n' | '\r')) {
-        return Err(DepsError::User(format!(
-            "value contains characters that cannot be written to coil.toml: {s:?}"
-        )));
-    }
-    Ok(s.to_string())
+    lock::escape_toml_string(s).map_err(|e| DepsError::User(e.0.replace("coil.lock", "coil.toml")))
 }
 
 fn format_spec(spec: &DependencySpec) -> String {

@@ -438,4 +438,79 @@ mod tests {
             "https://github.com/org/repo.git"
         );
     }
+
+    #[test]
+    fn list_semver_tags_peels_annotated_tags_to_commit() {
+        let tmp = std::env::temp_dir().join(format!(
+            "coil_git_annot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("README"), "hi\n").unwrap();
+
+        let run = |args: &[&str]| {
+            let status = Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(&tmp)
+                .status()
+                .expect("spawn");
+            assert!(status.success(), "failed: {args:?}");
+        };
+        run(&["git", "init", "-b", "main"]);
+        run(&["git", "config", "user.email", "test@example.com"]);
+        run(&["git", "config", "user.name", "Test"]);
+        run(&["git", "add", "."]);
+        run(&["git", "commit", "-m", "initial"]);
+        // Annotated tag: ls-remote emits both the tag object and the peeled commit.
+        run(&[
+            "git",
+            "tag",
+            "-a",
+            "v1.2.3",
+            "-m",
+            "release 1.2.3",
+        ]);
+
+        let commit = {
+            let out = Command::new("git")
+                .args(["rev-parse", "v1.2.3^{}"])
+                .current_dir(&tmp)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let tag_obj = {
+            let out = Command::new("git")
+                .args(["rev-parse", "v1.2.3"])
+                .current_dir(&tmp)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_ne!(
+            commit, tag_obj,
+            "annotated tag object SHA must differ from peeled commit"
+        );
+
+        let url = tmp.display().to_string();
+        let tags = list_semver_tags(&url).unwrap();
+        let peeled = tags
+            .iter()
+            .find(|(t, _)| t == "v1.2.3")
+            .map(|(_, sha)| sha.as_str())
+            .expect("v1.2.3 missing from ls-remote parse");
+        assert_eq!(
+            peeled, commit,
+            "list_semver_tags must return the peeled commit, not the tag object"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

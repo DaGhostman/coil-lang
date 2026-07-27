@@ -105,7 +105,7 @@ CLI:
 
 Vendored packages are resolved **after** project `roots`. A package’s own `coil.toml` `[module].roots` (default `["src", "."]`) selects files inside the checkout; namespaces are always prefixed with the package name.
 
-`coil install` installs the **full dependency tree**: after vendoring a package it reads that package’s `[dependencies.*]` and installs those too (cycles and conflicting `git`/`path` for the same name are errors). `coil.lock` is the source of truth for commits; if a newer matching tag exists, install prints a notice and leaves the lock unchanged (`coil update` bumps it).
+`coil install` installs the **full dependency tree**: after vendoring a package it reads that package’s `[dependencies.*]` and installs those too. Conflicting `git`/`path` for the same package name is an error; compatible cycles (same source reached via different parents) are allowed. `coil.lock` is the source of truth for commits; if a newer matching tag exists, install prints a notice and leaves the lock unchanged (`coil update` bumps it). Notices are skipped when `CI` or `COIL_OFFLINE` is set in the environment.
 
 ### `[entry]`
 

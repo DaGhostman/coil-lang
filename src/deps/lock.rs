@@ -147,17 +147,34 @@ impl Lockfile {
         for (name, pkg) in &self.packages {
             out.push('\n');
             out.push_str(&format!("[package.{name}]\n"));
-            out.push_str(&format!("git = \"{}\"\n", pkg.git));
-            out.push_str(&format!("version = \"{}\"\n", pkg.version));
-            out.push_str(&format!("commit = \"{}\"\n", pkg.commit));
+            out.push_str(&format!("git = \"{}\"\n", escape_toml_string(&pkg.git)?));
+            out.push_str(&format!(
+                "version = \"{}\"\n",
+                escape_toml_string(&pkg.version)?
+            ));
+            out.push_str(&format!(
+                "commit = \"{}\"\n",
+                escape_toml_string(&pkg.commit)?
+            ));
             if let Some(p) = &pkg.path {
-                out.push_str(&format!("path = \"{p}\"\n"));
+                out.push_str(&format!("path = \"{}\"\n", escape_toml_string(p)?));
             }
         }
         std::fs::write(path, out)
             .map_err(|e| LockError(format!("failed to write `{}`: {e}", path.display())))?;
         Ok(())
     }
+}
+
+/// Reject characters that would break a basic TOML `"…"` string.
+/// Shared with `coil.toml` writers in `deps::mod`.
+pub(crate) fn escape_toml_string(s: &str) -> Result<String, LockError> {
+    if s.chars().any(|c| matches!(c, '"' | '\\' | '\n' | '\r')) {
+        return Err(LockError(format!(
+            "value contains characters that cannot be written to coil.lock: {s:?}"
+        )));
+    }
+    Ok(s.to_string())
 }
 
 #[derive(Default)]
@@ -298,11 +315,23 @@ commit = "deadbeef"
     }
 
     #[test]
-    fn parse_rejects_keys_before_package_section() {
-        let err = Lockfile::parse("git = \"https://example.com/foo\"\n").unwrap_err();
+    fn save_rejects_values_with_unsafe_toml_chars() {
+        let mut lock = Lockfile::default();
+        lock.packages.insert(
+            "foo".into(),
+            LockPackage {
+                git: "https://example.com/foo\"evil".into(),
+                version: "1.0.0".into(),
+                commit: "abc".into(),
+                path: None,
+            },
+        );
+        let tmp = std::env::temp_dir().join("coil_lock_unsafe.lock");
+        let err = lock.save(&tmp).unwrap_err();
         assert!(
-            err.to_string().contains("key before `[package.*]`"),
+            err.to_string().contains("cannot be written"),
             "got: {err}"
         );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
