@@ -29,21 +29,29 @@ fn register_live_thread(registry: &LiveThreadRegistry, state: Arc<JoinState>) {
 /// Called automatically at the end of [`Machine::run_with_pool`] for that
 /// machine's own registry. Explicit `join(t)` still returns the worker's value;
 /// this path only keeps the process alive. `detach(t)` opts a thread out.
+///
+/// Loops until the registry drains: a worker may `spawn` nested threads onto
+/// the same registry while we wait, and those must be joined too.
 pub fn join_undetached_threads(registry: &LiveThreadRegistry) {
-    let threads = match registry.lock() {
-        Ok(mut g) => std::mem::take(&mut *g),
-        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-    };
-    for state in threads {
-        if state.detached.load(Ordering::SeqCst) {
-            continue;
+    loop {
+        let threads = match registry.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        if threads.is_empty() {
+            break;
         }
-        if state.joined.swap(true, Ordering::SeqCst) {
-            continue;
-        }
-        let _ = state.wait_result();
-        if let Some(h) = state.join_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = h.join();
+        for state in threads {
+            if state.detached.load(Ordering::SeqCst) {
+                continue;
+            }
+            if state.joined.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            let _ = state.wait_result();
+            if let Some(h) = state.join_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -1154,6 +1162,49 @@ mod tests {
         // later join skips waiting.
         sentinel.detached.store(true, Ordering::SeqCst);
         join_undetached_threads(m2.live_threads());
+    }
+
+    #[test]
+    fn join_undetached_drains_threads_registered_during_join() {
+        // Mimic nested spawn: while waiting for the first worker, a second
+        // JoinState appears on the same registry and must still be joined.
+        let registry = new_live_thread_registry();
+        let first = Arc::new(JoinState::new());
+        let nested = Arc::new(JoinState::new());
+        register_live_thread(&registry, Arc::clone(&first));
+
+        let nested_for_first = Arc::clone(&nested);
+        let registry_for_first = Arc::clone(&registry);
+        let first_handle = {
+            let state = Arc::clone(&first);
+            thread::spawn(move || {
+                // Nested registration while the root join waits on `first`.
+                register_live_thread(&registry_for_first, nested_for_first);
+                thread::sleep(Duration::from_millis(20));
+                state.store_result(Ok(PortableValue::Immediate(1)));
+            })
+        };
+        *first.join_handle.lock().unwrap() = Some(first_handle);
+
+        let nested_handle = {
+            let state = Arc::clone(&nested);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                state.store_result(Ok(PortableValue::Immediate(2)));
+            })
+        };
+        // Attach handle after spawn so join can reap it even if registration
+        // races ahead of this assignment.
+        thread::sleep(Duration::from_millis(5));
+        *nested.join_handle.lock().unwrap() = Some(nested_handle);
+
+        join_undetached_threads(&registry);
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "nested registration during join must be drained"
+        );
+        assert!(first.joined.load(Ordering::SeqCst));
+        assert!(nested.joined.load(Ordering::SeqCst));
     }
 
     fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {
