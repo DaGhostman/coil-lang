@@ -338,6 +338,85 @@ fn example_defer_prints_enterleave_lifo_and_early_return() {
     assert_eq!(output, "enterleave,021,okd7,d99");
 }
 
+/// Regression: parenthesized `(self).field` must still emit GetField.
+/// Pre-fix, `receiver_type` ignored `Group`, so Access fell through to
+/// `LoadField(0)` and `send` received a bogus value (often looking like
+/// the class instance was passed instead of the field).
+#[test]
+fn grouped_self_field_passes_sender_to_send() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class Worker {
+    tx: Sender,
+}
+
+impl Worker {
+    fn push(string msg) {
+        send((self).tx, msg)?;
+    }
+}
+
+fn main() {
+    let pair = channel()?;
+    let w = new Worker(pair[0]);
+    w.push("hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+/// Regression: field access on `new Class(...)` must use GetField, and
+/// `new` must not leave a stash slot between a HostInvoke native-id and
+/// the field value (StorePop+final LOAD used to bury the id so `send`
+/// saw the instance address as the native id).
+#[test]
+fn inline_new_field_passes_sender_to_send() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+class Worker {
+    tx: Sender,
+}
+
+fn main() {
+    let pair = channel()?;
+    send((new Worker(pair[0])).tx, "hi")?;
+    print "%s", recv(pair[1])?;
+}
+"#,
+    );
+    assert_eq!(output, "hi");
+}
+
+/// Regression: method call on `(new Class(...))` must resolve the owner.
+#[test]
+fn inline_new_method_call_works() {
+    let output = run_example_src(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+
+impl Point {
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+
+fn main() {
+    print "%i", (new Point(1, 3)).sum();
+}
+"#,
+    );
+    assert_eq!(output, "4");
+}
+
 /// Regression: `defer` inside a function must run on early `return`, not
 /// only on fall-through.
 #[test]

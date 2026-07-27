@@ -617,6 +617,14 @@ pub struct Compiler {
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
 
+    /// Count of expression values currently live on the operand stack
+    /// *above* interned locals (e.g. a `HostInvoke` native-id `CONST`
+    /// pushed before argument codegen). `alloc_temp_slot` must allocate
+    /// at or above `variables.len() + expr_depth` so `StorePop` does not
+    /// clobber those live values (locals and the operand stack share
+    /// memory).
+    expr_depth: u32,
+
     /// Active loop labels: `(continue_target, break_target)`.
     loop_stack: Vec<(BbLabel, BbLabel)>,
 
@@ -730,6 +738,7 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            expr_depth: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
             fn_defers: Vec::new(),
@@ -3490,17 +3499,24 @@ impl Compiler {
         let arity = args.len();
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+        // Native id sits on the stack while args compile — protect it (and
+        // prior arg values) from Instantiate `StorePop` temps.
+        let depth_on_entry = self.expr_depth;
+        self.expr_depth = depth_on_entry + 1;
         for arg in args {
             // Nested IO HostInvoke writes to `self.bytecode`; also fold any
             // bytes returned in the local vec (non-IO subexpressions).
             let mut arg_bc = self.do_compile(arg);
             self.bytecode.append(&mut arg_bc);
+            self.expr_depth += 1;
         }
         self.bytecode
             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
         self.bytecode.push(
             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
         );
+        // Restore: caller owns counting the result value if it needs to.
+        self.expr_depth = depth_on_entry;
     }
 
     /// Emit bytecode thunks for compiler-provided primitive instances.
@@ -4197,6 +4213,16 @@ impl Compiler {
 
     fn alloc_temp_slot(&mut self) -> u32 {
         self.temp_counter += 1;
+        // Operand stack and locals share one buffer. A `CONST` left on
+        // the stack by `emit_host_native_invoke` (native id before args)
+        // occupies index `variables.len()` without being interned. If we
+        // `StorePop` into that index from `new Class(...)`, we overwrite
+        // the id and `HostInvoke` sees a heap address instead.
+        let min_slot = self.context.variables.len() as u32 + self.expr_depth;
+        while (self.context.variables.len() as u32) < min_slot {
+            let pad = format!("__pad{}", self.context.variables.len());
+            let _ = self.context.variables.intern(pad);
+        }
         let name = format!("__tmp{}", self.temp_counter);
         self.context.variables.intern(name) as u32
     }
@@ -5249,9 +5275,18 @@ impl Compiler {
         extract_enum_name(&ty)
     }
 
-    /// Receiver type for field access (identifier side-table or chained lookup).
+    /// Receiver type for field access / method calls.
+    ///
+    /// Handles identifiers, chained access, parentheses/`Group` wrappers, and
+    /// falls back to [`Self::codegen_expr_ty`] for forms like `new Class(...)`
+    /// so `(self).field` and `(new C(...)).method()` resolve as class
+    /// instances (not the LoadField/empty-owner miscompile path).
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
+            Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Statement(inner)
+            | Expression::ExprStatement(inner) => self.receiver_type(inner),
             Expression::Identifier(name) => {
                 self.codegen_var_type_for(name).map(|t| {
                     // Apply substitution so inferred record types resolve fully.
@@ -5276,7 +5311,10 @@ impl Compiler {
                 }
                 None
             }
-            _ => None,
+            // `new Class(...)`, calls, etc. — reuse the general expr-type helper
+            // (span cache / Instantiate Con) instead of treating the receiver
+            // as unknown and emitting LoadField(0).
+            _ => self.codegen_expr_ty(receiver),
         }
     }
 
@@ -5759,14 +5797,19 @@ impl Compiler {
         // HostInvoke stack: [id, args_tuple]; tuple = [arg0, …, meta].
         // Meta is a full u32 bitfield — must use `with_operand_u32` (not
         // `with_value_u32`, which only keeps the low 16 bits).
+        let depth_on_entry = self.expr_depth;
         bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(native_id as u32));
+        self.expr_depth = depth_on_entry + 1;
         for arg in value_args {
             bytecode.append(&mut self.do_compile(arg));
+            self.expr_depth += 1;
         }
         bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
+        self.expr_depth += 1;
         let arity = value_args.len() + 1; // + meta
         bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
         bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        self.expr_depth = depth_on_entry;
         true
     }
 
@@ -6153,6 +6196,7 @@ impl Compiler {
                 self.current_function_table_key = Some(table_key.clone());
                 self.push_const_env();
                 self.context.variables = Interner::default();
+                self.expr_depth = 0;
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
                 }
@@ -6582,6 +6626,15 @@ impl Compiler {
                 // Assignment to Access). Stash the instance, then for
                 // each ctor arg emit that sequence and discard the
                 // value SetField pushes back.
+                //
+                // `StorePop` keeps the instance at `tmp` with the cursor
+                // past that slot — so the stashed value is already TOS
+                // for the expression result. Do **not** emit a final
+                // `LOAD tmp`: that would push a second copy and leave
+                // the stash sitting between any live values below
+                // (e.g. a HostInvoke native-id CONST) and the result,
+                // so `MakeTuple`/`HostInvoke` would pick up the instance
+                // as the native id.
                 let tmp_inst = self.alloc_temp_slot();
                 bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_inst));
                 if let Some(arg_list) = args {
@@ -6593,7 +6646,6 @@ impl Compiler {
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                 }
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
                 }
             }
             Expression::Adjust { op, prefix, target } => {
@@ -7049,7 +7101,12 @@ impl Compiler {
                         return bytecode;
                     }
 
-                    let recv_ty = self.receiver_type(recv);
+                    // Same fallback as ground-trait calls: inline receivers
+                    // like `(new Point(1, 2)).sum()` are not identifiers, so
+                    // `receiver_type` alone used to leave `owner` empty.
+                    let recv_ty = self
+                        .receiver_type(recv)
+                        .or_else(|| self.codegen_expr_ty(recv));
                     let owner = recv_ty
                         .as_ref()
                         .and_then(|ty| {
@@ -7236,14 +7293,17 @@ impl Compiler {
                             0
                         };
                         let variadic = self.checker.is_extern_variadic(&n);
+                        let depth_on_entry = self.expr_depth;
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
+                        self.expr_depth = depth_on_entry + 2;
                         if let Some(items) = args {
                             for arg in items {
                                 let mut arg_bc = self.do_compile(arg);
                                 self.bytecode.append(&mut arg_bc);
+                                self.expr_depth += 1;
                             }
                         }
                         self.bytecode
@@ -7271,6 +7331,7 @@ impl Compiler {
                         }
                         self.bytecode
                             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
+                        self.expr_depth = depth_on_entry;
                         self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
                         // Same stack order as `emit_io_host_invoke`: id first,
@@ -7280,12 +7341,15 @@ impl Compiler {
                         } else {
                             0
                         };
+                        let depth_on_entry = self.expr_depth;
                         self.bytecode
                             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                        self.expr_depth = depth_on_entry + 1;
                         if let Some(items) = args {
                             for arg in items {
                                 let mut arg_bc = self.do_compile(arg);
                                 self.bytecode.append(&mut arg_bc);
+                                self.expr_depth += 1;
                             }
                         }
                         self.bytecode
@@ -7293,6 +7357,7 @@ impl Compiler {
                         self.bytecode.push(
                             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                         );
+                        self.expr_depth = depth_on_entry;
                     } else if let Some(offset) = self.functions.get(&n).copied() {
                         let mono_offset = self.mono_call_offset(&n, args.as_ref());
                         let target_offset = mono_offset.unwrap_or(offset);
@@ -9722,6 +9787,7 @@ impl Compiler {
 
         self.emit_idx = 0;
         self.temp_counter = 0;
+        self.expr_depth = 0;
         self.const_env_stack.clear();
         self.const_env_stack.push(HashMap::new());
         self.static_const_values.clear();
