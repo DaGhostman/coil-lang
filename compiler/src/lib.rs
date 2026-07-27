@@ -946,7 +946,8 @@ impl Compiler {
             && let Some((inner, shift)) = const_fold::strength_mul_to_shl(ast, self.const_env())
         {
             // Defense-in-depth: only emit int SHL when the non-const operand
-            // is a known integer-like immediate (`int` or `byte`). VM `SHL`
+            // is a known integer-like immediate (`int` or `byte` — extend
+            // this match if more int-like primitives are added). VM `SHL`
             // uses `as_int`; `float * k` is rejected at typecheck. Unknown
             // types fall through to MUL / dictionary dispatch.
             use crate::typechecking::subst::apply_ty_prune;
