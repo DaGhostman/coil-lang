@@ -564,6 +564,108 @@ impl Generics {
             },
         );
 
+        // ---- Default / Hash / Serialize / Deserialize / Send / String / Sensitive ----
+        // (#[derive] targets; see compiler/src/attrs.rs)
+        self.typeclasses.insert(
+            "Default".into(),
+            TypeClassDef {
+                name: "Default".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "default".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Hash".into(),
+            TypeClassDef {
+                name: "Hash".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "hash".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Serialize".into(),
+            TypeClassDef {
+                name: "Serialize".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "serialize".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Deserialize".into(),
+            TypeClassDef {
+                name: "Deserialize".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "deserialize".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Send".into(),
+            TypeClassDef {
+                name: "Send".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![],
+            },
+        );
+        self.typeclasses.insert(
+            "String".into(),
+            TypeClassDef {
+                name: "String".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "to_string".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Sensitive".into(),
+            TypeClassDef {
+                name: "Sensitive".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![],
+            },
+        );
+
         // ---- Into ----
         // Multi-param conversion trait (auto-imported via prelude::ops).
         // `impl Into<T> for Self` → instance args [Self, T]; method
@@ -786,6 +888,31 @@ impl Generics {
             assoc_tys: HashMap::new(),
         });
 
+        // ---- primitive Into (casts via `into()` / `as`) ----
+        let into_pairs: [(&str, Ty, &str, Ty); 6] = [
+            ("int", int(), "float", float()),
+            ("float", float(), "int", int()),
+            ("int", int(), "byte", super::ty::byte()),
+            ("byte", super::ty::byte(), "int", int()),
+            ("int", int(), "bool", boolean()),
+            ("bool", boolean(), "int", int()),
+        ];
+        for (from_s, from_ty, to_s, to_ty) in into_pairs {
+            let mut method_fqns = HashMap::new();
+            method_fqns.insert(
+                "into".to_string(),
+                format!("Into__{}__to_{}__into", from_s, to_s),
+            );
+            self.instances.push(InstanceDef {
+                class: "Into".into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
+                range: 0..0,
+                args: vec![from_ty.clone(), to_ty.clone()],
+                method_fqns,
+                assoc_tys: HashMap::new(),
+            });
+        }
+
         // ---- Stream: Read + Write (methods lower to host natives) ----
         self.instances.push(InstanceDef {
             class: "Read".into(),
@@ -985,6 +1112,34 @@ mod tests {
 
         assert_eq!(method_fqns.get("add").unwrap(), "Num__int__add");
         assert_eq!(method_fqns.get("zero").unwrap(), "Num__default__zero");
+    }
+
+    #[test]
+    fn derivable_prelude_traits_registered() {
+        let g = Generics::new();
+        for name in [
+            "Default",
+            "Hash",
+            "Serialize",
+            "Deserialize",
+            "Send",
+            "String",
+            "Sensitive",
+        ] {
+            assert!(
+                g.typeclass(name).is_some(),
+                "missing prelude typeclass `{name}`"
+            );
+        }
+        assert_eq!(
+            g.typeclass("Default").unwrap().methods[0].name,
+            "default"
+        );
+        assert_eq!(
+            g.typeclass("String").unwrap().methods[0].name,
+            "to_string"
+        );
+        assert!(g.typeclass("Send").unwrap().methods.is_empty());
     }
 
     #[test]

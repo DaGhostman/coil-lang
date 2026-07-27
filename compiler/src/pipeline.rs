@@ -379,6 +379,92 @@ impl Pipeline {
         }
     }
 
+    fn register_fs_natives(&mut self) {
+        use machine::fs::FS_HOST_FUNCTIONS;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, host) in FS_HOST_FUNCTIONS {
+            let arity = match name {
+                "fs_rename" | "fs_copy" | "fs_symlink" => 2,
+                _ => 1,
+            };
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("fs native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    fn register_time_natives(&mut self) {
+        use machine::time::TIME_HOST_FUNCTIONS;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, host) in TIME_HOST_FUNCTIONS {
+            let arity = match name {
+                "time_period" => 9,
+                "time_add" | "time_sub" | "time_period_add" | "time_period_sub" | "time_format"
+                | "time_parse" => 2,
+                "time_sleep_ms" | "time_elapsed_nanos" | "time_elapsed_millis"
+                | "time_date_from_period" | "time_date_from_epoch_period" => 1,
+                _ => 0,
+            };
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("time native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    fn register_env_natives(&mut self) {
+        use machine::env::ENV_HOST_FUNCTIONS;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, host) in ENV_HOST_FUNCTIONS {
+            let arity = match name {
+                "env_args" => 0,
+                "env_var" | "env_cwd" | "env_remove_var" | "env_exit" | "env_set_cwd" => 1,
+                "env_set_var" | "env_exec" => 2,
+                _ => 1,
+            };
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("env native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    fn register_crypto_natives(&mut self) {
+        use machine::CRYPTO_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in CRYPTO_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("crypto native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
     /// Install shared bytecode on `machine` for `thread::spawn` workers.
     pub fn wire_thread_program<const N: usize>(
         &self,
@@ -399,6 +485,32 @@ impl Pipeline {
     /// Bytecode entry offset for a registered function (for tests).
     pub fn function_offset(&self, name: &str) -> Option<usize> {
         self.compiler.function_offset(name)
+    }
+
+    /// Prelude `ord` / `char` host natives (auto-imported).
+    fn register_prelude_char_ord_natives(&mut self) {
+        use machine::char_ord::{prelude_char, prelude_ord};
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        let ord_sig =
+            FfiSignature::from_parts("ord".to_string(), vec![FfiType::Int], FfiType::Int)
+                .expect("ord signature");
+        let ord_id = self.host_natives.len();
+        self.compiler.register_native_id("ord", ord_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(ord_sig, |heap, args| {
+                Ok(Some(prelude_ord(heap, args)))
+            })));
+
+        let char_sig =
+            FfiSignature::from_parts("char".to_string(), vec![FfiType::Int], FfiType::Int)
+                .expect("char signature");
+        let char_id = self.host_natives.len();
+        self.compiler.register_native_id("char", char_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(char_sig, |heap, args| {
+                Ok(Some(prelude_char(heap, args)))
+            })));
     }
 
     /// Approach A packed LA kernels via existing `HostInvoke` (no new opcodes —
@@ -552,6 +664,11 @@ impl Pipeline {
             Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
         }
         pipeline.register_io_natives();
+        pipeline.register_fs_natives();
+        pipeline.register_time_natives();
+        pipeline.register_env_natives();
+        pipeline.register_crypto_natives();
+        pipeline.register_prelude_char_ord_natives();
         pipeline.register_thread_natives();
         pipeline.register_packed_la_natives();
         pipeline

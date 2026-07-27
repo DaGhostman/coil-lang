@@ -85,6 +85,113 @@ fn ffi_tag_for_expr_fallback(expr: &Output) -> Option<(u32, u32)> {
     }
 }
 
+/// Decode escape sequences in a coil string literal (`\n`, `\x41`, `\u{1F}`, …).
+pub(crate) fn unescape_coil_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('e') => out.push('\x1b'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                let hi = chars.next();
+                let lo = chars.next();
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    let hex = format!("{h}{l}");
+                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                        out.push(v as char);
+                        continue;
+                    }
+                }
+                out.push('\\');
+                out.push('x');
+                if let Some(h) = hi {
+                    out.push(h);
+                }
+                if let Some(l) = lo {
+                    out.push(l);
+                }
+            }
+            Some('u') => {
+                if chars.next() == Some('{') {
+                    let mut hex = String::new();
+                    let mut closed = false;
+                    while let Some(ch) = chars.next() {
+                        if ch == '}' {
+                            closed = true;
+                            break;
+                        }
+                        hex.push(ch);
+                    }
+                    if closed {
+                        if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(code) {
+                                out.push(ch);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('u');
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn primitive_name_from_type_ann(ty: &Output) -> Option<&'static str> {
+    match ty.1.as_ref() {
+        Expression::Type(name) => primitive_type_name(&Ty::Con((*name).into())),
+        _ => None,
+    }
+}
+
+fn primitive_type_name(ty: &Ty) -> Option<&'static str> {
+    use typechecking::ty::{BOOL, BYTE, FLOAT, INT};
+    match ty {
+        Ty::Con(name) => match name.as_str() {
+            INT => Some("int"),
+            FLOAT => Some("float"),
+            BYTE => Some("byte"),
+            BOOL => Some("bool"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn primitive_cast_opcode(from: &str, to: &str) -> Option<Instruction> {
+    match (from, to) {
+        ("int", "float") => Some(Instruction::CastIntToFloat),
+        ("float", "int") => Some(Instruction::CastFloatToInt),
+        ("int", "byte") => Some(Instruction::CastIntToByte),
+        ("byte", "int") => Some(Instruction::CastByteToInt),
+        ("int", "bool") => Some(Instruction::CastIntToBool),
+        ("bool", "int") => Some(Instruction::CastBoolToInt),
+        (a, b) if a == b => None,
+        _ => None,
+    }
+}
+
+fn into_primitive_fqn(from: &str, to: &str) -> String {
+    format!("Into__{}__to_{}__into", from, to)
+}
+
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
@@ -2548,11 +2655,7 @@ impl Compiler {
     /// Emit a string literal as `STRING` + `DATA` bytes into `self.bytecode`.
     /// Applies the same escape processing as `Expression::String` codegen.
     fn emit_string_literal(&mut self, s: &str) {
-        let escaped = s
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace("\\0", "\0");
+        let escaped = unescape_coil_string(s);
         let idx = self.bytecode.len();
         let mut count = 0u32;
         for ch in escaped.chars() {
@@ -3484,6 +3587,10 @@ impl Compiler {
         );
     }
 
+    fn emit_prelude_host_call(&mut self, args: &[Output], native_name: &str) {
+        self.emit_host_native_invoke(native_name, args);
+    }
+
     /// Emit bytecode thunks for compiler-provided primitive instances.
     ///
     /// Shared generic bodies receive boxed type-parameter values, so numeric
@@ -3622,6 +3729,34 @@ impl Compiler {
                 .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
             self.bytecode
                 .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+
+        let into_pairs = [
+            ("int", "float", Instruction::CastIntToFloat, ValueTag::Int, ValueTag::Float),
+            ("float", "int", Instruction::CastFloatToInt, ValueTag::Float, ValueTag::Int),
+            ("int", "byte", Instruction::CastIntToByte, ValueTag::Int, ValueTag::Int),
+            ("byte", "int", Instruction::CastByteToInt, ValueTag::Int, ValueTag::Int),
+            ("int", "bool", Instruction::CastIntToBool, ValueTag::Int, ValueTag::Bool),
+            ("bool", "int", Instruction::CastBoolToInt, ValueTag::Bool, ValueTag::Int),
+        ];
+        for (from, to, cast_op, from_tag, to_tag) in into_pairs {
+            let fqn = into_primitive_fqn(from, to);
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode.push(
+                Byte::new(Instruction::UnboxValue).with_operand_u32(from_tag as u32),
+            );
+            self.bytecode.push(Byte::new(cast_op));
+            if from_tag != to_tag {
+                self.bytecode.push(
+                    Byte::new(Instruction::BoxValue).with_operand_u32(to_tag as u32),
+                );
+            }
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
     }
@@ -6883,6 +7018,10 @@ impl Compiler {
                                 arg_slice,
                             );
                         }
+                        crate::typechecking::PreludeFn::Ord
+                        | crate::typechecking::PreludeFn::Char => {
+                            self.emit_prelude_host_call(arg_slice, kind.as_str());
+                        }
                     }
                     return bytecode;
                 }
@@ -6919,6 +7058,20 @@ impl Compiler {
                     && let Some(kind) = self.checker.thread_fn_in_scope(fname)
                 {
                     self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    return bytecode;
+                }
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(registry) = self.checker.host_fn_in_scope(fname)
+                {
+                    if registry == "env_exec" {
+                        self.messages.push(Message::warn(
+                            ErrorCode::GenericTypeError,
+                            "env::exec runs an external program with the given arguments; only use with trusted inputs"
+                                .to_string(),
+                            span.into_range(),
+                        ));
+                    }
+                    self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
                     return bytecode;
                 }
 
@@ -8340,13 +8493,7 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
             }
             Expression::String(str) => {
-                let escaped = str
-                    .replace("\\n", "\n")
-                    .replace("\\r", "\r")
-                    .replace("\\t", "\t")
-                    .replace("\\0", "\0");
-
-                // if let Ok(re) = Regex::new(r"\\u(?<code>\d{1,})").map_err(|e| dbg!(e)) {
+                let escaped = unescape_coil_string(str);
                 //     while let Some(captures) = re.captures(escaped.as_str()) {
                 //         let unicode = captures.name("code").unwrap().as_str();
                 //
@@ -9555,6 +9702,21 @@ impl Compiler {
                 bb.finalize()
                     .expect("BlockBuilder::finalize: Try success label bound");
                 // Payload left on stack for the caller (e.g. StorePop).
+            }
+            Expression::Cast(expr, ty_ann) => {
+                bytecode.append(&mut self.do_compile(expr));
+                let src_ty = self.codegen_expr_ty(expr);
+                let dst_name = primitive_name_from_type_ann(ty_ann);
+                if let (Some(from), Some(to)) = (
+                    src_ty.as_ref().and_then(primitive_type_name),
+                    dst_name,
+                ) {
+                    if from != to {
+                        if let Some(op) = primitive_cast_opcode(from, to) {
+                            bytecode.push(Byte::new(op));
+                        }
+                    }
+                }
             }
             Expression::Coalesce(lhs, rhs) => {
                 // `a ?? b` → Ok/Some payload, else evaluate b.
@@ -14020,6 +14182,33 @@ fn main() {
             packed_host_meta(&bc) & (1 << 16),
             0,
             "float packed_dot meta must set is_float bit"
+        );
+    }
+
+    #[test]
+    fn unescape_coil_string_supports_hex_and_unicode() {
+        assert_eq!(unescape_coil_string(r"\x41"), "A");
+        assert_eq!(unescape_coil_string(r"\u{42}"), "B");
+        assert_eq!(unescape_coil_string("\\\""), "\"");
+        assert_eq!(unescape_coil_string(r"\e"), "\x1b");
+    }
+
+    #[test]
+    fn cast_as_int_emits_cast_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x = 3.5 as int;
+    print "%i", x;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CastFloatToInt)),
+            "expected CastFloatToInt in {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 }

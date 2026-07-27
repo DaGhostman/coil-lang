@@ -17,7 +17,18 @@ use parser::{
 use reporting::{ErrorCode, Message};
 
 /// Builtin traits the compiler knows how to synthesize.
-const DERIVABLE: &[&str] = &["Show", "Eq", "Ord"];
+const DERIVABLE: &[&str] = &[
+    "Show",
+    "Eq",
+    "Ord",
+    "Default",
+    "Hash",
+    "Serialize",
+    "Deserialize",
+    "Send",
+    "String",
+    "Sensitive",
+];
 
 const KNOWN_ATTRS: &[&str] = &["derive", "ffi", "test"];
 
@@ -568,6 +579,10 @@ fn collect_free_idents<'a>(
                 collect_free_idents(index, bound, free);
             }
         }
+        Expression::Cast(expr, ty) => {
+            collect_free_idents(expr, bound, free);
+            collect_free_idents(ty, bound, free);
+        }
         Expression::Assignment(lhs, rhs)
         | Expression::Coalesce(lhs, rhs)
         | Expression::Add(lhs, rhs)
@@ -1024,6 +1039,7 @@ fn rewrite_expr_inline<'a>(
         | Expression::Le(l, r)
         | Expression::Gt(l, r)
         | Expression::Coalesce(l, r) => at(span, clone_binary(expr.1.as_ref(), rw(l), rw(r))),
+        Expression::Cast(expr, ty) => at(span, Expression::Cast(rw(expr), rw(ty))),
         Expression::Range {
             start,
             end,
@@ -1475,6 +1491,7 @@ fn clone_binary<'a>(kind: &Expression<'a>, left: Output<'a>, right: Output<'a>) 
         Expression::Le(_, _) => Expression::Le(left, right),
         Expression::Gt(_, _) => Expression::Gt(left, right),
         Expression::Coalesce(_, _) => Expression::Coalesce(left, right),
+        Expression::Cast(_, _) => Expression::Cast(left, right),
         other => panic!("clone_binary: unexpected {:?}", other),
     }
 }
@@ -1804,6 +1821,7 @@ fn expand_decls<'a>(
                 generic: bool,
                 derives: Vec<&'a str>,
                 variants: Vec<VariantMeta<'a>>,
+                variant_nodes: Vec<Output<'a>>,
             },
             Class {
                 name: &'a str,
@@ -1829,6 +1847,7 @@ fn expand_decls<'a>(
                         generic: !type_params.is_empty(),
                         derives,
                         variants: variant_metas(variants),
+                        variant_nodes: variants.clone(),
                     })
                 }
             }
@@ -1909,12 +1928,14 @@ fn expand_decls<'a>(
                 generic,
                 derives,
                 variants,
+                variant_nodes,
             }) => Some(expand_enum(
                 span,
                 name,
                 generic,
                 &derives,
                 &variants,
+                &variant_nodes,
                 &mut messages,
             )),
             Some(Job::Class {
@@ -1965,6 +1986,7 @@ fn expand_enum<'a>(
     generic: bool,
     derives: &[&'a str],
     variants: &[VariantMeta<'a>],
+    variant_nodes: &[Output<'a>],
     messages: &mut Vec<Message>,
 ) -> Vec<Output<'a>> {
     if generic {
@@ -1988,8 +2010,20 @@ fn expand_enum<'a>(
         match trait_name {
             "Show" => out.push(synth_show_enum(span, name, variants)),
             "Eq" => out.push(synth_eq_enum(span, name, variants)),
-            // Ord is a no-method supertrait over Lt/Le/Gt/Ge (PR #14).
             "Ord" => out.extend(synth_ord_enum(span, name, variants)),
+            "Default" => out.push(synth_default_enum(span, name, variants)),
+            "Hash" => out.push(synth_hash_enum(span, name, variants)),
+            "String" => out.push(synth_string_enum(span, name, variants)),
+            "Serialize" => {
+                if enum_payloads_int_only(variant_nodes) {
+                    out.push(synth_serialize_enum(span, name, variants));
+                } else {
+                    push_derive_not_implemented("Serialize", span, messages);
+                }
+            }
+            "Deserialize" | "Send" | "Sensitive" => {
+                push_derive_not_implemented(trait_name, span, messages);
+            }
             _ => unreachable!(),
         }
     }
@@ -2026,6 +2060,12 @@ fn expand_class<'a>(
             "Show" => out.push(synth_show_class(span, name, field_names)),
             "Eq" => out.push(synth_eq_class(span, name, field_names)),
             "Ord" => out.extend(synth_ord_class(span, name, field_names)),
+            "Default" => out.push(synth_default_class(span, name, field_names)),
+            "Hash" => out.push(synth_hash_class(span, name, field_names)),
+            "String" => out.push(synth_string_class(span, name, field_names)),
+            "Serialize" | "Deserialize" | "Send" | "Sensitive" => {
+                push_derive_not_implemented(trait_name, span, messages);
+            }
             _ => unreachable!(),
         }
     }
@@ -2831,4 +2871,376 @@ fn class_ord_body<'a>(
         acc = at(span, Expression::Or(prim, and_rest));
     }
     acc
+}
+
+// ── Default / Hash / String / Serialize (derive MVP) ─────────────────────────
+
+fn push_derive_not_implemented(trait_name: &str, span: SimpleSpan, messages: &mut Vec<Message>) {
+    messages.push(Message::error(
+        ErrorCode::GenericTypeError,
+        format!("derive {trait_name} not yet implemented"),
+        span.into_range(),
+    ));
+}
+
+fn int_zero<'a>(span: SimpleSpan) -> Output<'a> {
+    at(span, Expression::Integer(0))
+}
+
+fn type_expr_is_int(ty: &Output<'_>) -> bool {
+    matches!(
+        ty.1.as_ref(),
+        Expression::Type(name) if name.eq_ignore_ascii_case("int")
+    )
+}
+
+fn enum_payloads_int_only(variant_nodes: &[Output<'_>]) -> bool {
+    variant_nodes.iter().all(|node| {
+        let Expression::EnumVariant { payload, .. } = node.1.as_ref() else {
+            return true;
+        };
+        match payload {
+            EnumVariantPayload::Unit => true,
+            EnumVariantPayload::Tuple(items) => items.iter().all(type_expr_is_int),
+            EnumVariantPayload::Record(fields) => fields.iter().all(|f| type_expr_is_int(&f.value)),
+        }
+    })
+}
+
+fn hash_combine<'a>(span: SimpleSpan, acc: Output<'a>, field: Output<'a>) -> Output<'a> {
+    let scaled = at(
+        span,
+        Expression::Mul(acc, at(span, Expression::Integer(31))),
+    );
+    at(span, Expression::Add(scaled, field))
+}
+
+fn default_enum_variant<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    v: &VariantMeta<'a>,
+) -> Output<'a> {
+    match &v.shape {
+        VariantShape::Unit => at(
+            span,
+            Expression::Construct {
+                enum_name,
+                variant_name: v.name,
+                fields: EnumConstructPayload::Unit,
+            },
+        ),
+        VariantShape::Tuple(arity) => {
+            let items = (0..*arity).map(|_| int_zero(span)).collect();
+            at(
+                span,
+                Expression::Construct {
+                    enum_name,
+                    variant_name: v.name,
+                    fields: EnumConstructPayload::Tuple(items),
+                },
+            )
+        }
+        VariantShape::Record(fields) => {
+            let records = fields
+                .iter()
+                .map(|fname| RecordFieldValue {
+                    name: fname,
+                    value: int_zero(span),
+                })
+                .collect();
+            at(
+                span,
+                Expression::Construct {
+                    enum_name,
+                    variant_name: v.name,
+                    fields: EnumConstructPayload::Record(records),
+                },
+            )
+        }
+    }
+}
+
+fn synth_default_enum<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    variants: &[VariantMeta<'a>],
+) -> Output<'a> {
+    let value = variants
+        .first()
+        .map(|v| default_enum_variant(span, enum_name, v))
+        .unwrap_or_else(|| int_zero(span));
+    let body = block_return(span, value);
+    let m = method_fn(span, "default", vec![], enum_name, body);
+    typeclass_impl(span, "Default", enum_name, vec![m])
+}
+
+fn synth_default_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
+    let args: Vec<Output<'a>> = fields.iter().map(|_| int_zero(span)).collect();
+    let value = at(
+        span,
+        Expression::Instantiate(ident(span, name), Some(args)),
+    );
+    let m = method_fn(span, "default", vec![], name, block_return(span, value));
+    typeclass_impl(span, "Default", name, vec![m])
+}
+
+fn hash_variant_body<'a>(
+    span: SimpleSpan,
+    tag: usize,
+    shape: &VariantShape<'a>,
+    recv: &'a str,
+) -> Output<'a> {
+    let mut acc = at(span, Expression::Integer(tag as i64));
+    match shape {
+        VariantShape::Unit => {}
+        VariantShape::Tuple(arity) => {
+            for i in 0..*arity {
+                let fname = leak(i.to_string());
+                let field = at(span, Expression::Access(ident(span, recv), fname));
+                acc = hash_combine(span, acc, field);
+            }
+        }
+        VariantShape::Record(fields) => {
+            for &fname in fields {
+                let field = at(span, Expression::Access(ident(span, recv), fname));
+                acc = hash_combine(span, acc, field);
+            }
+        }
+    }
+    acc
+}
+
+fn synth_hash_enum<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    variants: &[VariantMeta<'a>],
+) -> Output<'a> {
+    let p = leak(format!("__hash_{enum_name}"));
+    let mut arms = Vec::new();
+    for (tag, v) in variants.iter().enumerate() {
+        let body = hash_variant_body(span, tag, &v.shape, p);
+        arms.push(MatchArm {
+            pattern: ord_wildcard_pattern(enum_name, v.name, &v.shape),
+            body,
+        });
+    }
+    arms.push(MatchArm {
+        pattern: Pattern::Wildcard,
+        body: int_zero(span),
+    });
+    let match_expr = at(
+        span,
+        Expression::Match {
+            scrutinee: ident(span, p),
+            arms,
+        },
+    );
+    let m = method_fn(
+        span,
+        "hash",
+        vec![arg(span, enum_name, p)],
+        "int",
+        block_return(span, match_expr),
+    );
+    typeclass_impl(span, "Hash", enum_name, vec![m])
+}
+
+fn synth_hash_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
+    let p = leak(format!("__hash_{name}"));
+    let mut acc = int_zero(span);
+    for f in fields {
+        let field = at(span, Expression::Access(ident(span, p), f));
+        acc = hash_combine(span, acc, field);
+    }
+    let m = method_fn(
+        span,
+        "hash",
+        vec![arg(span, name, p)],
+        "int",
+        block_return(span, acc),
+    );
+    typeclass_impl(span, "Hash", name, vec![m])
+}
+
+fn synth_string_enum<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    variants: &[VariantMeta<'a>],
+) -> Output<'a> {
+    let p = leak(format!("__str_{enum_name}"));
+    let mut arms = Vec::new();
+    for v in variants {
+        let (pattern, fmt, fmt_args) = show_variant_arm(span, enum_name, v.name, &v.shape, p);
+        let body = at(
+            span,
+            Expression::Format(str_lit(span, fmt), Some(fmt_args)),
+        );
+        arms.push(MatchArm { pattern, body });
+    }
+    let match_expr = at(
+        span,
+        Expression::Match {
+            scrutinee: ident(span, p),
+            arms,
+        },
+    );
+    let m = method_fn(
+        span,
+        "to_string",
+        vec![arg(span, enum_name, p)],
+        "string",
+        block_return(span, match_expr),
+    );
+    typeclass_impl(span, "String", enum_name, vec![m])
+}
+
+fn synth_string_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
+    let p = leak(format!("__str_{name}"));
+    let mut specs = Vec::new();
+    let mut fmt_args = Vec::new();
+    for f in fields {
+        specs.push(format!("{f}: %v"));
+        fmt_args.push(at(span, Expression::Access(ident(span, p), f)));
+    }
+    let fmt = leak(format!("{name} {{ {} }}", specs.join(", ")));
+    let format = at(
+        span,
+        Expression::Format(str_lit(span, fmt), Some(fmt_args)),
+    );
+    let m = method_fn(
+        span,
+        "to_string",
+        vec![arg(span, name, p)],
+        "string",
+        block_return(span, format),
+    );
+    typeclass_impl(span, "String", name, vec![m])
+}
+
+fn serialize_variant_body<'a>(
+    span: SimpleSpan,
+    tag: usize,
+    shape: &VariantShape<'a>,
+    recv: &'a str,
+) -> Output<'a> {
+    let mut elems = vec![at(span, Expression::Integer(tag as i64))];
+    match shape {
+        VariantShape::Unit => {}
+        VariantShape::Tuple(arity) => {
+            for i in 0..*arity {
+                let fname = leak(i.to_string());
+                elems.push(at(span, Expression::Access(ident(span, recv), fname)));
+            }
+        }
+        VariantShape::Record(fields) => {
+            for &fname in fields {
+                elems.push(at(span, Expression::Access(ident(span, recv), fname)));
+            }
+        }
+    }
+    at(span, Expression::Array(elems))
+}
+
+fn synth_serialize_enum<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    variants: &[VariantMeta<'a>],
+) -> Output<'a> {
+    let p = leak(format!("__ser_{enum_name}"));
+    let mut arms = Vec::new();
+    for (tag, v) in variants.iter().enumerate() {
+        let body = serialize_variant_body(span, tag, &v.shape, p);
+        arms.push(MatchArm {
+            pattern: ord_wildcard_pattern(enum_name, v.name, &v.shape),
+            body,
+        });
+    }
+    arms.push(MatchArm {
+        pattern: Pattern::Wildcard,
+        body: at(span, Expression::Array(vec![])),
+    });
+    let match_expr = at(
+        span,
+        Expression::Match {
+            scrutinee: ident(span, p),
+            arms,
+        },
+    );
+    let m = method_fn(
+        span,
+        "serialize",
+        vec![arg(span, enum_name, p)],
+        "[byte]",
+        block_return(span, match_expr),
+    );
+    typeclass_impl(span, "Serialize", enum_name, vec![m])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parser::Pratt;
+
+    fn expand_src(src: &str) -> (ExpandResult, Vec<Output<'_>>) {
+        let mut ast = Pratt::default().parse(src).expect("parse");
+        let expand = expand_program(&mut ast);
+        let Expression::Program(children) = ast.1.as_ref() else {
+            panic!("expected program");
+        };
+        (expand, children.clone())
+    }
+
+    fn impl_method_names(decls: &[Output<'_>], class: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for node in decls {
+            if let Expression::TypeClassImpl {
+                class: c,
+                methods,
+                ..
+            } = node.1.as_ref()
+            {
+                if *c != class {
+                    continue;
+                }
+                for m in methods {
+                    if let Expression::Method(_, f) = m.1.as_ref() {
+                        if let Expression::Function { name, .. } = f.1.as_ref() {
+                            names.push((*name).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn derive_default_enum_emits_default_method() {
+        let (_exp, decls) = expand_src("#[derive(Default)] enum E { A, B(int) } fn main() {}");
+        assert!(
+            impl_method_names(&decls, "Default").contains(&"default".to_string()),
+            "expected Default::default impl"
+        );
+    }
+
+    #[test]
+    fn derive_hash_class_emits_hash_method() {
+        let (_exp, decls) = expand_src("#[derive(Hash)] class P { x: int, y: int } fn main() {}");
+        assert!(
+            impl_method_names(&decls, "Hash").contains(&"hash".to_string()),
+            "expected Hash::hash impl"
+        );
+    }
+
+    #[test]
+    fn derive_deserialize_reports_not_implemented() {
+        let (exp, _) = expand_src("#[derive(Deserialize)] enum E { A } fn main() {}");
+        assert!(
+            exp.messages.iter().any(|m| {
+                m.message().contains("derive Deserialize not yet implemented")
+            }),
+            "expected Deserialize stub diagnostic, got: {:?}",
+            exp.messages.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
 }

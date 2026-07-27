@@ -649,6 +649,10 @@ impl Checker {
     /// Bind a virtual export under `local` (and drop any previous short
     /// binding for the export's canonical short name when `local` differs).
     pub fn bind_virtual_export(&mut self, local: String, export: BuiltinExport) {
+        let host_registry = match &export {
+            BuiltinExport::HostFn { registry, .. } => Some(*registry),
+            _ => None,
+        };
         // Lazily register `IoError` tags when the virtual `io` module is
         // brought into scope (enum or any host fn whose scheme mentions it).
         let needs_io_error = matches!(
@@ -656,7 +660,7 @@ impl Checker {
             BuiltinExport::Enum {
                 name: common::BUILTIN_IO_ERROR_ENUM
             } | BuiltinExport::IoFn { .. }
-        );
+        ) || host_registry.is_some_and(|r| r.starts_with("fs_"));
         if needs_io_error && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM) {
             self.register_builtin_io_error();
         }
@@ -669,6 +673,36 @@ impl Checker {
         );
         if needs_thread_error && !self.enums.contains_key(common::BUILTIN_THREAD_ERROR_ENUM) {
             self.register_builtin_thread_error();
+        }
+
+        let needs_time_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_TIME_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("time_"));
+        if needs_time_error && !self.enums.contains_key(common::BUILTIN_TIME_ERROR_ENUM) {
+            self.register_builtin_time_error();
+        }
+
+        let needs_env_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_ENV_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("env_"));
+        if needs_env_error && !self.enums.contains_key(common::BUILTIN_ENV_ERROR_ENUM) {
+            self.register_builtin_env_error();
+        }
+
+        let needs_crypto_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_CRYPTO_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("crypto_"));
+        if needs_crypto_error && !self.enums.contains_key(common::BUILTIN_CRYPTO_ERROR_ENUM) {
+            self.register_builtin_crypto_error();
         }
 
         // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
@@ -745,6 +779,14 @@ impl Checker {
     pub fn thread_fn_in_scope(&self, name: &str) -> Option<ThreadBuiltin> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::ThreadFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Registry key for a generic host native (`time_*`, `env_*`, `fs_*`, `crypto_*`).
+    pub fn host_fn_in_scope(&self, name: &str) -> Option<&'static str> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::HostFn { registry, .. } => Some(registry),
             _ => None,
         }
     }
@@ -882,6 +924,45 @@ impl Checker {
         self.enum_tags.insert(name.clone(), tag_map);
         self.enum_payloads.insert(name.clone(), payloads);
         self.enum_arities.insert(name, arities);
+    }
+
+    fn register_builtin_unit_enum(&mut self, enum_name: &str, variants: &[&str]) {
+        let name = enum_name.to_string();
+        let variant_names: Vec<String> = variants.iter().map(|s| s.to_string()).collect();
+        let payloads = variant_names
+            .iter()
+            .map(|_| EnumVariantPayloadTy::Unit)
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
+        }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
+    fn register_builtin_time_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_TIME_ERROR_ENUM,
+            common::BUILTIN_TIME_ERROR_VARIANTS,
+        );
+    }
+
+    fn register_builtin_env_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_ENV_ERROR_ENUM,
+            common::BUILTIN_ENV_ERROR_VARIANTS,
+        );
+    }
+
+    fn register_builtin_crypto_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_CRYPTO_ERROR_ENUM,
+            common::BUILTIN_CRYPTO_ERROR_VARIANTS,
+        );
     }
 
     /// Pre-register `ThreadError` unit variants for the virtual `thread` module.
@@ -2178,6 +2259,7 @@ impl Checker {
                                 BuiltinExport::FfiFn { .. }
                                     | BuiltinExport::IoFn { .. }
                                     | BuiltinExport::ThreadFn { .. }
+                                    | BuiltinExport::HostFn { .. }
                             )
                         })
                         .map(|(k, e)| (k.clone(), e.clone()))
@@ -2194,7 +2276,7 @@ impl Checker {
                                 let scheme = self.thread_fn_scheme(kind);
                                 self.env.insert_top(local, scheme);
                             }
-                            BuiltinExport::FfiFn { .. } => {
+                            BuiltinExport::HostFn { .. } | BuiltinExport::FfiFn { .. } => {
                                 self.env
                                     .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
                             }
@@ -2928,6 +3010,8 @@ impl Checker {
                         PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
                         PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
                         PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
+                        PreludeFn::Ord => self.infer_ord(arg_slice, range),
+                        PreludeFn::Char => self.infer_char(arg_slice, range),
                     };
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
@@ -3445,6 +3529,34 @@ impl Checker {
                         format!("`?` requires Option or Result, found `{}`", resolved),
                         range,
                     )
+                }
+            }
+
+            Expression::Cast(expr, ty_ann) => {
+                let src_ty = self.infer(expr);
+                let dst_ty = self.parse_type_name(ty_ann);
+                let src_ty = apply_ty_prune(&self.subst, &src_ty);
+                let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
+                let range = expr.0.into_range();
+                match (
+                    Self::primitive_cast_name(&src_ty),
+                    Self::primitive_cast_name(&dst_ty),
+                ) {
+                    (Some(from), Some(to)) if from == to => dst_ty,
+                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => dst_ty,
+                    (Some(from), Some(to)) => self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!("cannot cast `{from}` to `{to}`"),
+                        range,
+                        Some("allowed casts: int↔float, int↔byte, int↔bool".to_string()),
+                    ),
+                    _ => self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+                            .to_string(),
+                        ty_ann.0.into_range(),
+                        None,
+                    ),
                 }
             }
 
@@ -6272,6 +6384,80 @@ impl Checker {
             );
         }
         result_app_ty(unit_ty(), string())
+    }
+
+    fn primitive_cast_name(ty: &Ty) -> Option<&'static str> {
+        use super::ty::{BOOL, BYTE, FLOAT, INT};
+        match ty {
+            Ty::Con(name) => match name.as_str() {
+                INT => Some("int"),
+                FLOAT => Some("float"),
+                BYTE => Some("byte"),
+                BOOL => Some("bool"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn primitive_cast_allowed(from: &str, to: &str) -> bool {
+        matches!(
+            (from, to),
+            ("int", "float")
+                | ("float", "int")
+                | ("int", "byte")
+                | ("byte", "int")
+                | ("int", "bool")
+                | ("bool", "int")
+        )
+    }
+
+    /// `ord(string) -> Result<byte, string>`.
+    fn infer_ord(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        use super::ty::byte;
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("ord expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `ord(s)` with a single-character string".to_string()),
+            );
+        }
+        let s_ty = self.infer(&args[0]);
+        self.unify(
+            &s_ty,
+            &string(),
+            &args[0].0.into_range(),
+            "ord argument",
+        );
+        result_app_ty(byte(), string())
+    }
+
+    /// `char(byte) -> string`.
+    fn infer_char(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        use super::ty::byte;
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("char expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `char(b)` with a `byte` value".to_string()),
+            );
+        }
+        let b_ty = self.infer(&args[0]);
+        self.unify(
+            &b_ty,
+            &byte(),
+            &args[0].0.into_range(),
+            "char argument",
+        );
+        string()
     }
 
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
@@ -11111,6 +11297,10 @@ impl Checker {
             | Expression::Coalesce(l, r) => {
                 self.pre_register_enums_walk(l, errors);
                 self.pre_register_enums_walk(r, errors);
+            }
+            Expression::Cast(expr, ty) => {
+                self.pre_register_enums_walk(expr, errors);
+                self.pre_register_enums_walk(ty, errors);
             }
             Expression::Range { start, end, .. } => {
                 self.pre_register_enums_walk(start, errors);

@@ -3058,3 +3058,19 @@ fn main() {
     );
     assert_eq!(output, "46");
 }
+
+#[test]
+fn example_casts_primitive_as_operators() {
+    assert_eq!(run_example("examples/casts.hy"), "13true");
+}
+
+#[test]
+fn example_time_epoch_ok() {
+    assert_eq!(run_example("examples/time_demo.hy"), "1");
+}
+
+#[test]
+fn example_ansi_color_prints_red() {
+    let output = run_example("examples/ansi_color.hy");
+    assert!(output.contains("red"), "expected visible 'red', got {:?}", output);
+}

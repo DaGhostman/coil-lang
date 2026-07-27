@@ -635,7 +635,8 @@ where
         | Expression::Gt(l, r)
         | Expression::Leq(l, r)
         | Expression::Geq(l, r)
-        | Expression::Coalesce(l, r) => {
+        | Expression::Coalesce(l, r)
+        | Expression::Cast(l, r) => {
             f(l);
             f(r);
         }

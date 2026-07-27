@@ -36,6 +36,18 @@ pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
 /// Canonical module path for OS threads, channels, and locks.
 pub const THREAD_MODULE: &str = "thread";
 
+/// Path-oriented filesystem helpers (`exists`, `realpath`, …).
+pub const IO_FS_MODULE: &str = "io::fs";
+
+/// Wall clock, periods, and formatting (`timestamp`, `sleep_ms`, …).
+pub const TIME_MODULE: &str = "time";
+
+/// Process environment (`args`, `var`, `exec`, …).
+pub const ENV_MODULE: &str = "env";
+
+/// Cryptographic primitives (`sha256`, `random_bytes`, …).
+pub const CRYPTO_MODULE: &str = "crypto";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -72,6 +84,10 @@ pub enum PreludeFn {
     Cross,
     /// Construct a nominal `Matrix` from nested static rows.
     Matrix,
+    /// Construct a single UTF-8 code unit as `string`.
+    Char,
+    /// First code unit of a `string` as `Result<byte, string>`.
+    Ord,
 }
 
 impl PreludeFn {
@@ -82,6 +98,8 @@ impl PreludeFn {
             Self::MatMul => "matmul",
             Self::Cross => "cross",
             Self::Matrix => "matrix",
+            Self::Char => "char",
+            Self::Ord => "ord",
         }
     }
 
@@ -92,6 +110,8 @@ impl PreludeFn {
             "matmul" => Some(Self::MatMul),
             "cross" => Some(Self::Cross),
             "matrix" => Some(Self::Matrix),
+            "char" => Some(Self::Char),
+            "ord" => Some(Self::Ord),
             _ => None,
         }
     }
@@ -379,6 +399,11 @@ pub enum BuiltinExport {
     IoFn { kind: IoBuiltin },
     /// Thread host native (`spawn`, `send`, …).
     ThreadFn { kind: ThreadBuiltin },
+    /// Generic pipeline host native (`registry` key for [`HostInvoke`]).
+    HostFn {
+        surface: &'static str,
+        registry: &'static str,
+    },
 }
 
 impl BuiltinExport {
@@ -392,6 +417,14 @@ impl BuiltinExport {
             Self::OpaqueType { name } => name,
             Self::IoFn { kind } => kind.as_str(),
             Self::ThreadFn { kind } => kind.as_str(),
+            Self::HostFn { surface, .. } => surface,
+        }
+    }
+
+    pub fn host_registry(&self) -> Option<&'static str> {
+        match self {
+            Self::HostFn { registry, .. } => Some(registry),
+            _ => None,
         }
     }
 }
@@ -424,6 +457,12 @@ impl VirtualModules {
                 BuiltinExport::TypeClass { name: "Iterator" },
                 BuiltinExport::TypeClass {
                     name: "IntoIterator",
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Ord,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Char,
                 },
             ],
         );
@@ -541,6 +580,112 @@ impl VirtualModules {
             thread_exports.push(BuiltinExport::ThreadFn { kind: *kind });
         }
         modules.insert(THREAD_MODULE, thread_exports);
+
+        fn host_exports(pairs: &[(&'static str, &'static str)]) -> Vec<BuiltinExport> {
+            pairs
+                .iter()
+                .map(|(surface, registry)| BuiltinExport::HostFn {
+                    surface,
+                    registry,
+                })
+                .collect()
+        }
+
+        modules.insert(
+            IO_FS_MODULE,
+            host_exports(&[
+                ("exists", "fs_exists"),
+                ("is_file", "fs_is_file"),
+                ("is_dir", "fs_is_dir"),
+                ("is_symlink", "fs_is_symlink"),
+                ("metadata", "fs_metadata"),
+                ("create_dir", "fs_create_dir"),
+                ("create_dir_all", "fs_create_dir_all"),
+                ("remove_file", "fs_remove_file"),
+                ("remove_dir", "fs_remove_dir"),
+                ("remove_dir_all", "fs_remove_dir_all"),
+                ("rename", "fs_rename"),
+                ("copy", "fs_copy"),
+                ("read_link", "fs_read_link"),
+                ("symlink", "fs_symlink"),
+                ("list_dir", "fs_list_dir"),
+                ("realpath", "fs_realpath"),
+            ]),
+        );
+
+        let mut time_exports = vec![BuiltinExport::Enum {
+            name: common::BUILTIN_TIME_ERROR_ENUM,
+        }];
+        time_exports.extend(host_exports(&[
+            ("timestamp", "time_timestamp"),
+            ("sleep_ms", "time_sleep_ms"),
+            ("instant_now", "time_instant_now"),
+            ("elapsed_nanos", "time_elapsed_nanos"),
+            ("elapsed_millis", "time_elapsed_millis"),
+            ("period", "time_period"),
+            ("add", "time_add"),
+            ("sub", "time_sub"),
+            ("period_add", "time_period_add"),
+            ("period_sub", "time_period_sub"),
+            ("date", "time_date"),
+            ("date_from_period", "time_date_from_period"),
+            ("date_from_epoch_period", "time_date_from_epoch_period"),
+            ("epoch", "time_epoch"),
+            ("format", "time_format"),
+            ("parse", "time_parse"),
+        ]));
+        modules.insert(TIME_MODULE, time_exports);
+
+        let mut env_exports = vec![BuiltinExport::Enum {
+            name: common::BUILTIN_ENV_ERROR_ENUM,
+        }];
+        env_exports.extend(host_exports(&[
+            ("args", "env_args"),
+            ("var", "env_var"),
+            ("set_var", "env_set_var"),
+            ("remove_var", "env_remove_var"),
+            ("cwd", "env_cwd"),
+            ("set_cwd", "env_set_cwd"),
+            ("exit", "env_exit"),
+            ("exec", "env_exec"),
+        ]));
+        modules.insert(ENV_MODULE, env_exports);
+
+        let mut crypto_exports = vec![BuiltinExport::Enum {
+            name: common::BUILTIN_CRYPTO_ERROR_ENUM,
+        }];
+        crypto_exports.extend(host_exports(&[
+            ("sha256", "crypto_sha256"),
+            ("sha512", "crypto_sha512"),
+            ("blake3", "crypto_blake3"),
+            ("init", "crypto_hasher_init"),
+            ("update", "crypto_hasher_update"),
+            ("finalize", "crypto_hasher_finalize"),
+            ("hmac_sha256", "crypto_hmac_sha256"),
+            ("hmac_sha512", "crypto_hmac_sha512"),
+            ("hmac_verify_sha256", "crypto_hmac_verify_sha256"),
+            ("random_bytes", "crypto_random_bytes"),
+            ("random_u64", "crypto_random_u64"),
+            (
+                "chacha20_poly1305_encrypt",
+                "crypto_chacha20_poly1305_encrypt",
+            ),
+            (
+                "chacha20_poly1305_decrypt",
+                "crypto_chacha20_poly1305_decrypt",
+            ),
+            ("aes_256_gcm_encrypt", "crypto_aes_256_gcm_encrypt"),
+            ("aes_256_gcm_decrypt", "crypto_aes_256_gcm_decrypt"),
+            ("ed25519_generate", "crypto_ed25519_generate"),
+            ("ed25519_sign", "crypto_ed25519_sign"),
+            ("ed25519_verify", "crypto_ed25519_verify"),
+            ("x25519_generate", "crypto_x25519_generate"),
+            ("x25519_shared_secret", "crypto_x25519_shared_secret"),
+            ("argon2id_hash", "crypto_argon2id_hash"),
+            ("argon2id_verify", "crypto_argon2id_verify"),
+            ("ct_eq", "crypto_ct_eq"),
+        ]));
+        modules.insert(CRYPTO_MODULE, crypto_exports);
 
         Self { modules }
     }

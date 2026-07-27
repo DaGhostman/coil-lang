@@ -165,6 +165,10 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             pre_walk(l, table);
             pre_walk(r, table);
         }
+        Expression::Cast(expr, ty) => {
+            pre_walk(expr, table);
+            pre_walk(ty, table);
+        }
         Expression::Range { start, end, .. } => {
             pre_walk(start, table);
             pre_walk(end, table);
