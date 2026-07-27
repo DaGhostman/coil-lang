@@ -462,7 +462,9 @@ fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
 
     match archive_source_mtime(entry) {
         Some(src) => src > arch_mtime,
-        None => false,
+        // Entry was listed in `source_files` but cannot be resolved now —
+        // treat as stale (same as a missing dependency path above).
+        None => true,
     }
 }
 

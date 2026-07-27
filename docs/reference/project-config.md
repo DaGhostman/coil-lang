@@ -113,7 +113,7 @@ roots = ["./src", "./vendor", "./builtins"]
 ## Discovery algorithm
 
 Given a `use a::b::c;` statement and roots `["./src", "./vendor", "./builtins"]`.
-Resolution matches the [modules reference](modules.md#path-resolution-algorithm): **one-item-per-file first**, then a **module-file** fallback. When both `<root>/foo/item.hy` and `<root>/foo.hy` exist, the item file wins (see shadowing note in modules.md).
+Resolution matches the [modules reference](modules.md#path-resolution-algorithm): **one-item-per-file first**, then a **module-file** fallback. When both `<root>/foo/item.hy` and `<root>/foo.hy` exist, the item file wins (see shadowing note in modules.md). **Migration:** if a project accidentally kept both layouts, `use foo::item` silently binds the item file after this change — delete or rename the unused path.
 
 ### Step 1 — Split the import path
 

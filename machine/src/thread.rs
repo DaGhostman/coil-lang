@@ -19,9 +19,10 @@ pub fn new_live_thread_registry() -> LiveThreadRegistry {
 }
 
 fn register_live_thread(registry: &LiveThreadRegistry, state: Arc<JoinState>) {
-    if let Ok(mut g) = registry.lock() {
-        g.push(state);
-    }
+    // Match `join_undetached_threads`: recover from a poisoned mutex so the
+    // spawn is still tracked (otherwise shutdown would not wait for it).
+    let mut g = registry.lock().unwrap_or_else(|e| e.into_inner());
+    g.push(state);
 }
 
 /// Block until every undetached, not-yet-joined spawn in `registry` has finished.
