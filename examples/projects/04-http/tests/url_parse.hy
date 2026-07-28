@@ -30,3 +30,54 @@ test("reject bad url") {
         Result::Err(_) => true,
     }, "expected Err")?;
 }
+
+test("default path when omitted") {
+    let u = match parse_url("http://example.com") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    assert(u.path == "/", "default path")?;
+    assert(u.port == 80, "default http port")?;
+}
+
+test("https defaults to port 443") {
+    let u = match parse_url("https://example.com/secure") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    assert(u.port == 443, "default https port")?;
+    assert(u.scheme == "https", "scheme")?;
+    assert(u.path == "/secure", "path")?;
+}
+
+test("query-only path prefixes slash") {
+    let u = match parse_url("http://example.com?q=1") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    assert(u.path == "/?q=1", "query path")?;
+}
+
+test("reject unsupported scheme") {
+    let r = parse_url("ftp://example.com/file");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected unsupported scheme Err")?;
+}
+
+test("reject empty host") {
+    let r = parse_url("http://");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected empty host Err")?;
+}
+
+test("reject non-numeric port") {
+    let r = parse_url("http://example.com:abc/");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected bad port Err")?;
+}

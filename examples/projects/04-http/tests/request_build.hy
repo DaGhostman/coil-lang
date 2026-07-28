@@ -77,3 +77,89 @@ test("post body concat grows by body length") {
     let msg = concat_bytes(head, body);
     if len(msg) != len(head) + 2 { panic "concat len"; }
 }
+
+test("non-default http port in Host header") {
+    let u = match parse_url("http://example.com:8080/x") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    let hs = empty_headers();
+    let msg = match build_request_head("GET", u, hs, 0) {
+        Result::Ok(m) => m,
+        Result::Err(_) => panic "build",
+    };
+    let hostb = to_bytes("Host: example.com:8080");
+    let bare = to_bytes("Host: example.com\r\n");
+    if find_bytes(msg, hostb) == 999999 { panic "host with port"; }
+    if find_bytes(msg, bare) != 999999 { panic "bare host without port"; }
+}
+
+test("https default port omits port from Host") {
+    let u = match parse_url("https://example.com/s") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    let hs = empty_headers();
+    let msg = match build_request_head("GET", u, hs, 0) {
+        Result::Ok(m) => m,
+        Result::Err(_) => panic "build",
+    };
+    let hostb = to_bytes("Host: example.com\r\n");
+    let with443 = to_bytes("Host: example.com:443");
+    if find_bytes(msg, hostb) == 999999 { panic "host without default https port"; }
+    if find_bytes(msg, with443) != 999999 { panic "must omit :443"; }
+}
+
+test("reserved headers skipped in extras") {
+    let u = match parse_url("http://example.com/") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    let hs = empty_headers();
+    hs = header_add(hs, "Host", "evil.example");
+    hs = header_add(hs, "Content-Length", "999");
+    hs = header_add(hs, "Connection", "keep-alive");
+    hs = header_add(hs, "X-Ok", "1");
+    let extras = format_extra_headers_str(hs.names, hs.values);
+    let msg = match build_request_head_extras("GET", u, extras, 0) {
+        Result::Ok(m) => m,
+        Result::Err(_) => panic "build",
+    };
+    let okb = to_bytes("X-Ok: 1");
+    let evil = to_bytes("Host: evil.example");
+    let fake_cl = to_bytes("Content-Length: 999");
+    let keep = to_bytes("Connection: keep-alive");
+    let real_host = to_bytes("Host: example.com");
+    let real_cl = to_bytes("Content-Length: 0");
+    let closeb = to_bytes("Connection: close");
+    if find_bytes(msg, okb) == 999999 { panic "custom header"; }
+    if find_bytes(msg, evil) != 999999 { panic "must ignore caller Host"; }
+    if find_bytes(msg, fake_cl) != 999999 { panic "must ignore caller Content-Length"; }
+    if find_bytes(msg, keep) != 999999 { panic "must ignore caller Connection"; }
+    if find_bytes(msg, real_host) == 999999 { panic "client Host"; }
+    if find_bytes(msg, real_cl) == 999999 { panic "client Content-Length"; }
+    if find_bytes(msg, closeb) == 999999 { panic "client Connection"; }
+}
+
+test("only reserved headers yield no extras") {
+    let hs = empty_headers();
+    hs = header_add(hs, "host", "evil");
+    hs = header_add(hs, "content-length", "1");
+    hs = header_add(hs, "connection", "keep-alive");
+    let extras = format_extra_headers_str(hs.names, hs.values);
+    assert(extras == "__NONE__", "sentinel when all reserved")?;
+}
+
+test("odd content-length uses generic trailer") {
+    let u = match parse_url("http://example.com/") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    let hs = empty_headers();
+    let msg = match build_request_head("POST", u, hs, 17) {
+        Result::Ok(m) => m,
+        Result::Err(_) => panic "build",
+    };
+    let clb = to_bytes("Content-Length: 17");
+    if find_bytes(msg, clb) == 999999 { panic "content-length 17"; }
+}

@@ -3414,6 +3414,37 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
+/// HostInvoke + virtual `io::net::tls` wiring: invalid port → Err (no network).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_connect_insecure_invalid_port_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn invalid_port_is_err() -> int {
+    return match connect_insecure("127.0.0.1", 99999) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            IoError::InvalidInput => 1,
+            IoError::WouldBlock => 2,
+            IoError::NotFound => 3,
+            IoError::PermissionDenied => 4,
+            IoError::AlreadyClosed => 5,
+            IoError::Other => 6,
+        },
+    };
+}
+
+fn main() {
+    print "%i", invalid_port_is_err();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
 #[test]
 fn example_regex_demo_prints_expected() {
     assert_eq!(
