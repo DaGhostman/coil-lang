@@ -797,6 +797,124 @@ fn write_greeting() -> Result<(), IoError> {
     assert_eq!(written, b"hi\n");
 }
 
+/// Nested library layout (entry → facade → transport): deepest module owns
+/// Stream IO + `?`. Models stdlib/http calling a transport helper while the
+/// shared constant pool must survive every `compile_module` hop.
+#[test]
+fn multi_file_io_hostinvoke_try_in_nested_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use facade::roundtrip;
+
+fn main() {
+    print "%i", roundtrip()?;
+}
+"#,
+        ),
+        (
+            "src/facade.hy",
+            r#"
+use io::*;
+use transport::write_then_read;
+
+fn roundtrip() -> Result<int, IoError> {
+    return write_then_read("nested.bin");
+}
+"#,
+        ),
+        (
+            "src/transport.hy",
+            r#"
+use io::*;
+
+fn write_then_read(string path) -> Result<int, IoError> {
+    let a: byte = 65;
+    let b: byte = 66;
+    let payload: [byte] = [a, b];
+    let w = open(path, "w")?;
+    write_all(w, payload)?;
+    close(w)?;
+
+    let r = open(path, "r")?;
+    let out: [byte] = [0, 0];
+    read_exact(r, out)?;
+    close(r)?;
+    if out[0] == a {
+        if out[1] == b {
+            return 1;
+        }
+    }
+    return 0;
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("io_host_nested", &manifest, &files, "src/main.hy");
+
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
+    assert_eq!(output, "1");
+
+    let written = std::fs::read(root.join("nested.bin")).expect("transport wrote nested.bin");
+    assert_eq!(written, b"AB");
+}
+
+/// Non-entry modules may `use` a sibling module's free functions (the old
+/// echo NOTES caveat about `payload_eq` from `server.hy`). Locks the pattern
+/// this PR's docs now treat as supported.
+#[test]
+fn multi_file_sibling_use_free_fn_from_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use server::check;
+
+fn main() {
+    print "%i", check();
+}
+"#,
+        ),
+        (
+            "src/protocol.hy",
+            r#"
+fn payload_eq(int a, int b) -> int {
+    if a == b {
+        return 1;
+    }
+    return 0;
+}
+"#,
+        ),
+        (
+            "src/server.hy",
+            r#"
+use protocol::*;
+
+fn check() -> int {
+    return payload_eq(7, 7);
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("sibling_use_dep", &manifest, &files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "1");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);
