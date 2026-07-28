@@ -380,14 +380,10 @@ impl Pipeline {
     }
 
     fn register_fs_natives(&mut self) {
-        use machine::fs::FS_HOST_FUNCTIONS;
+        use machine::FS_WIRING;
         use machine::{FfiSignature, FfiType, HostClosureFn};
 
-        for &(name, host) in FS_HOST_FUNCTIONS {
-            let arity = match name {
-                "fs_rename" | "fs_copy" | "fs_symlink" => 2,
-                _ => 1,
-            };
+        for &(name, arity, host) in FS_WIRING {
             let args = vec![FfiType::Int; arity];
             let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
                 .expect("fs native signature");
@@ -400,19 +396,12 @@ impl Pipeline {
         }
     }
 
+    #[cfg(feature = "time")]
     fn register_time_natives(&mut self) {
-        use machine::time::TIME_HOST_FUNCTIONS;
+        use machine::TIME_WIRING;
         use machine::{FfiSignature, FfiType, HostClosureFn};
 
-        for &(name, host) in TIME_HOST_FUNCTIONS {
-            let arity = match name {
-                "time_period" => 9,
-                "time_add" | "time_sub" | "time_period_add" | "time_period_sub" | "time_format"
-                | "time_parse" => 2,
-                "time_sleep_ms" | "time_elapsed_nanos" | "time_elapsed_millis"
-                | "time_date_from_period" | "time_date_from_epoch_period" => 1,
-                _ => 0,
-            };
+        for &(name, arity, host) in TIME_WIRING {
             let args = vec![FfiType::Int; arity];
             let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
                 .expect("time native signature");
@@ -426,16 +415,10 @@ impl Pipeline {
     }
 
     fn register_env_natives(&mut self) {
-        use machine::env::ENV_HOST_FUNCTIONS;
+        use machine::ENV_WIRING;
         use machine::{FfiSignature, FfiType, HostClosureFn};
 
-        for &(name, host) in ENV_HOST_FUNCTIONS {
-            let arity = match name {
-                "env_args" => 0,
-                "env_var" | "env_cwd" | "env_remove_var" | "env_exit" | "env_set_cwd" => 1,
-                "env_set_var" | "env_exec" => 2,
-                _ => 1,
-            };
+        for &(name, arity, host) in ENV_WIRING {
             let args = vec![FfiType::Int; arity];
             let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
                 .expect("env native signature");
@@ -448,6 +431,7 @@ impl Pipeline {
         }
     }
 
+    #[cfg(feature = "crypto")]
     fn register_crypto_natives(&mut self) {
         use machine::CRYPTO_WIRING;
         use machine::{FfiSignature, FfiType, HostClosureFn};
@@ -715,8 +699,10 @@ impl Pipeline {
         }
         pipeline.register_io_natives();
         pipeline.register_fs_natives();
+        #[cfg(feature = "time")]
         pipeline.register_time_natives();
         pipeline.register_env_natives();
+        #[cfg(feature = "crypto")]
         pipeline.register_crypto_natives();
         pipeline.register_regex_natives();
         pipeline.register_prelude_char_ord_natives();
