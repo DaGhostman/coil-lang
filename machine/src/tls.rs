@@ -111,6 +111,8 @@ fn insecure_config() -> Arc<ClientConfig> {
     .clone()
 }
 
+/// Dangerous verifier for `connect_insecure`: skips **trust** / name checks only.
+/// TLS 1.2/1.3 record signatures are still verified via the default provider.
 #[derive(Debug)]
 struct NoCertVerify;
 
@@ -176,7 +178,9 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut ClientConnection) -> Re
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
+                // Socket is still blocking here; WouldBlock/Interrupted are unexpected.
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                    std::thread::yield_now();
                     continue;
                 }
                 Err(e) => return Err(map_io(e)),
@@ -217,7 +221,10 @@ pub fn tls_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoEr
     connect_with_config(heap, host, port, verified_config())
 }
 
-/// TLS connect without certificate verification (local / self-signed).
+/// TLS connect that **disables certificate verification** (local / self-signed only).
+///
+/// Still performs a real TLS handshake; only the trust store / name checks are
+/// skipped. Prefer [`tls_connect`] for anything beyond local development.
 pub fn tls_connect_insecure(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
     connect_with_config(heap, host, port, insecure_config())
 }
