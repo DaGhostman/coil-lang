@@ -87,6 +87,10 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
     if nn == 0 {
         return 0;
     }
+    // Guard empty hay explicitly (see coil compare quirks with zero).
+    if hn == 0 {
+        return 999999;
+    }
     if nn > hn {
         return 999999;
     }
@@ -410,6 +414,89 @@ fn cl_trailer(int body_len) -> string {
     }
 }
 
+fn header_name_eq_ci(string a, string b) -> int {
+    let ab = to_bytes(a);
+    let bb = to_bytes(b);
+    if len(ab) != len(bb) {
+        return 0;
+    }
+    let i = 0;
+    while i < len(ab) {
+        let x = ab[i] as int;
+        let y = bb[i] as int;
+        if x >= 65 {
+            if x <= 90 {
+                x = x + 32;
+            }
+        }
+        if y >= 65 {
+            if y <= 90 {
+                y = y + 32;
+            }
+        }
+        if x != y {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Host / Content-Length / Connection are always emitted by the client;
+// format_extra_headers_str skips those names (case-sensitive common spellings).
+
+fn format_extra_headers_str([string] names, [string] values) -> string {
+    // Precondition: caller ensures there is at least one non-reserved header.
+    let first = 999999;
+    let i = 0;
+    let n = len(names);
+    while i < n {
+        let name = names[i];
+        let skip = 0;
+        if name == "Host" { skip = 1; }
+        if name == "host" { skip = 1; }
+        if name == "Content-Length" { skip = 1; }
+        if name == "content-length" { skip = 1; }
+        if name == "Connection" { skip = 1; }
+        if name == "connection" { skip = 1; }
+        if skip == 0 {
+            if first == 999999 {
+                first = i;
+            }
+        }
+        i = i + 1;
+    }
+    if first == 999999 {
+        return "__NONE__";
+    }
+    let acc = names[first] + ": " + values[first] + "\r\n";
+    let j = first + 1;
+    while j < n {
+        let name = names[j];
+        let skip = 0;
+        if name == "Host" { skip = 1; }
+        if name == "host" { skip = 1; }
+        if name == "Content-Length" { skip = 1; }
+        if name == "content-length" { skip = 1; }
+        if name == "Connection" { skip = 1; }
+        if name == "connection" { skip = 1; }
+        if skip == 0 {
+            acc = acc + name + ": " + values[j] + "\r\n";
+        }
+        j = j + 1;
+    }
+    return acc;
+}
+
+fn format_extra_headers(Headers headers) -> [byte] {
+    let s = format_extra_headers_str(headers.names, headers.values);
+    if s == "__NONE__" {
+        let empty: [byte] = [];
+        return empty;
+    }
+    return to_bytes(s);
+}
+
 fn build_request_head(string method, Url u, Headers headers, int body_len) -> Result<[byte], HttpError> {
     // Inline Host construction (avoid nested Result `?` through host_header_value).
     let host = u.host;
@@ -431,6 +518,32 @@ fn build_request_head(string method, Url u, Headers headers, int body_len) -> Re
         }
     }
     let prefix = method + " " + path + " HTTP/1.1\r\nHost: " + host_hdr + "\r\nContent-Length: ";
+    let rest = cl_trailer(body_len);
+    return concat_bytes(to_bytes(prefix), to_bytes(rest));
+}
+
+fn build_request_head_extras(string method, Url u, string extras, int body_len) -> Result<[byte], HttpError> {
+    // Inserts non-empty `extras` ("Name: value\r\n" lines) after Host.
+    // Caller must not pass the "__NONE__" sentinel.
+    let host = u.host;
+    let port = u.port;
+    let scheme = u.scheme;
+    let path = u.path;
+    let host_hdr = host;
+    if scheme == "http" {
+        if port != 80 {
+            host_hdr = host + ":" + int_to_dec(port);
+        }
+    } else {
+        if scheme == "https" {
+            if port != 443 {
+                host_hdr = host + ":" + int_to_dec(port);
+            }
+        } else {
+            host_hdr = host + ":" + int_to_dec(port);
+        }
+    }
+    let prefix = method + " " + path + " HTTP/1.1\r\nHost: " + host_hdr + "\r\n" + extras + "Content-Length: ";
     let rest = cl_trailer(body_len);
     return concat_bytes(to_bytes(prefix), to_bytes(rest));
 }
@@ -574,34 +687,6 @@ fn parse_int_bytes([byte] b) -> Result<int, HttpError> {
         i = i + 1;
     }
     return v;
-}
-
-fn header_name_eq_ci(string a, string b) -> int {
-    let ab = to_bytes(a);
-    let bb = to_bytes(b);
-    if len(ab) != len(bb) {
-        return 0;
-    }
-    let i = 0;
-    while i < len(ab) {
-        let x = ab[i] as int;
-        let y = bb[i] as int;
-        if x >= 65 {
-            if x <= 90 {
-                x = x + 32;
-            }
-        }
-        if y >= 65 {
-            if y <= 90 {
-                y = y + 32;
-            }
-        }
-        if x != y {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
 }
 
 fn find_byte([byte] line, byte needle) -> int {

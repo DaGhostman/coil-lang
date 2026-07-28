@@ -40,7 +40,7 @@ Impl detail: request/response helpers live in `url.hy` so `client` depends on a
 
 - No redirects, cookies, pooling, timeouts, HTTP/2+
 - No chunked transfer encoding
-- `Connection: close` only
-- Custom request headers are accepted by the API but not yet serialized into the wire head
+- `Connection: close` only (caller Host / Content-Length / Connection are ignored
+  so the client always emits correct values; other custom headers go on the wire)
 - Prefer Result-mode helpers (`status_code` / `response_status`) over raw field
   access when crossing module/Result boundaries

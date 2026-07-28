@@ -26,9 +26,7 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
     return http_fail_stream()?;
 }
 
-fn request(string method, string url, Headers headers, [byte] body) -> Result<Response, HttpError> {
-    let u = parse_url(url)?;
-    let head = build_request_head(method, u, headers, len(body))?;
+fn request_send([byte] head, Url u, [byte] body) -> Result<Response, HttpError> {
     let msg = concat_bytes(head, body);
     let s = open_stream(u)?;
     match write_all(s, msg) {
@@ -47,6 +45,21 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
         Result::Err(_) => 0,
     };
     return parse_response(raw)?;
+}
+
+fn request(string method, string url, Headers headers, [byte] body) -> Result<Response, HttpError> {
+    let u = parse_url(url)?;
+    let bl = len(body);
+    let n = len(headers.names);
+    if n > 0 {
+        let extras = format_extra_headers_str(headers.names, headers.values);
+        if extras != "__NONE__" {
+            let head = build_request_head_extras(method, u, extras, bl)?;
+            return request_send(head, u, body)?;
+        }
+    }
+    let head = build_request_head(method, u, headers, bl)?;
+    return request_send(head, u, body)?;
 }
 
 fn get(string url) -> Result<Response, HttpError> {

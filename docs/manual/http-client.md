@@ -42,6 +42,9 @@ fn main() {
 `UnsupportedScheme`, `Io`).
 
 Requests are HTTP/1.1 with `Host`, `Content-Length`, and `Connection: close`.
+Extra headers passed to `request` are written on the wire; attempts to override
+`Host` / `Content-Length` / `Connection` (common spellings) are ignored so the
+client always emits those itself.
 
 ## Example
 
