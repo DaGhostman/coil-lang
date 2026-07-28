@@ -90,13 +90,13 @@ coil compile
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `allow_exec` | bool | No (defaults to `true`) | When `false`, `env::exec` fails at runtime with `ExecDisabled` (the compiler still warns at compile time) |
+| `allow_exec` | bool | No (defaults to `false`) | When `true`, `env::exec` may spawn subprocesses at runtime (the compiler still warns at compile time) |
 
 Example:
 
 ```toml
 [env]
-allow_exec = false
+allow_exec = true   # opt-in: enable env::exec for trusted scripts
 ```
 
 ---

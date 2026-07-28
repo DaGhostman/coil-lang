@@ -88,6 +88,6 @@ roots = ["./src", "./vendor", "./builtins"]
 # Accepted today (see docs/reference/project-config.md):
 #
 #   [env]
-#   allow_exec = false       # disable env::exec at runtime (compile still warns)
+#   allow_exec = true        # opt-in: enable env::exec at runtime (default is false)
 #
 # Other keys under those sections are still parse errors until documented.

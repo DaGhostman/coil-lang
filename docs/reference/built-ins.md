@@ -586,7 +586,7 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 
 ## `env` module
 
-`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The compiler emits a **warning** when `exec` is used; optional `coil.toml` `[env] allow_exec = false` disables it at runtime.
+`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The compiler emits a **warning** when `exec` or `exit` is used. By default `env::exec` is **disabled** at runtime; set `coil.toml` `[env] allow_exec = true` to enable it in trusted projects.
 
 ---
 
