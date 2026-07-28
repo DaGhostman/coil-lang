@@ -2139,6 +2139,28 @@ fn primitive_cast_rejects_float_to_byte() {
 }
 
 #[test]
+fn primitive_cast_rejects_literal_int_as_byte_oob() {
+    let (_ty, msgs) = check("fn main() { let x = 257 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("byte literal out of range")),
+        "expected literal int as byte OOB diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn primitive_cast_rejects_negative_literal_int_as_byte() {
+    let (_ty, msgs) = check("fn main() { let x = -1 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("byte literal out of range")),
+        "expected negative literal int as byte diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn env_exec_call_emits_trusted_inputs_warning() {
     let msgs = compile_messages(
         r#"

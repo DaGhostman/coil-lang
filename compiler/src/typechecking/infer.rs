@@ -1245,12 +1245,15 @@ impl Checker {
     }
 
     /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
-    pub fn host_fn_scheme(&mut self, registry: &str) -> Scheme {
-        use crate::typechecking::ty::{array, boolean, byte, record, regex_ty, tuple};
-        use common::{
-            BUILTIN_CRYPTO_ERROR_ENUM, BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM,
-            BUILTIN_REGEX_ERROR_ENUM, BUILTIN_TIME_ERROR_ENUM,
-        };
+    pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
+        use crate::typechecking::ty::{array, boolean, record, regex_ty, tuple};
+        #[cfg(feature = "crypto")]
+        use crate::typechecking::ty::byte;
+        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM, BUILTIN_REGEX_ERROR_ENUM};
+        #[cfg(feature = "crypto")]
+        use common::BUILTIN_CRYPTO_ERROR_ENUM;
+        #[cfg(feature = "time")]
+        use common::BUILTIN_TIME_ERROR_ENUM;
 
         let fun = |params: &[Ty], ret: Ty| {
             params.iter().rev().fold(ret, |acc, p| {
@@ -1258,8 +1261,10 @@ impl Checker {
             })
         };
         let io_err = Ty::Con(BUILTIN_IO_ERROR_ENUM.into());
+        #[cfg(feature = "time")]
         let time_err = Ty::Con(BUILTIN_TIME_ERROR_ENUM.into());
         let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
+        #[cfg(feature = "crypto")]
         let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
         let regex_err = Ty::Con(BUILTIN_REGEX_ERROR_ENUM.into());
         let regex = regex_ty();
@@ -1279,8 +1284,11 @@ impl Checker {
             io_err,
         );
 
+        #[cfg(feature = "time")]
         let res_int_time = result_app_ty(int(), time_err.clone());
+        #[cfg(feature = "time")]
         let res_string_time = result_app_ty(string(), time_err.clone());
+        #[cfg(feature = "time")]
         let res_unit_time = result_app_ty(unit_ty(), time_err);
 
         let res_string_env = result_app_ty(string(), env_err.clone());
@@ -1288,11 +1296,17 @@ impl Checker {
         let res_unit_env = result_app_ty(unit_ty(), env_err.clone());
         let res_int_env = result_app_ty(int(), env_err);
 
+        #[cfg(feature = "crypto")]
         let bytes = array(byte());
+        #[cfg(feature = "crypto")]
         let res_bytes_crypto = result_app_ty(bytes.clone(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
         let res_bool_crypto = result_app_ty(boolean(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
         let res_int_crypto = result_app_ty(int(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
         let res_unit_crypto = result_app_ty(unit_ty(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
         let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
 
         let span = tuple(vec![int(), int()]);
@@ -1318,18 +1332,26 @@ impl Checker {
             "fs_read_link" | "fs_realpath" => fun(&[string()], res_string_io.clone()),
             "fs_list_dir" => fun(&[string()], res_strs_io),
 
+            #[cfg(feature = "time")]
             "time_timestamp" | "time_instant_now" | "time_epoch" => fun(&[], res_int_time.clone()),
+            #[cfg(feature = "time")]
             "time_sleep_ms" => fun(&[int()], res_unit_time),
+            #[cfg(feature = "time")]
             "time_elapsed_nanos" | "time_elapsed_millis"
             | "time_date_from_period" | "time_date_from_epoch_period" => {
                 fun(&[int()], res_int_time.clone())
             }
+            #[cfg(feature = "time")]
             "time_add" | "time_sub" | "time_period_add" | "time_period_sub" => {
                 fun(&[int(), int()], res_int_time.clone())
             }
+            #[cfg(feature = "time")]
             "time_format" => fun(&[int(), string()], res_string_time.clone()),
+            #[cfg(feature = "time")]
             "time_parse" => fun(&[string(), string()], res_int_time.clone()),
+            #[cfg(feature = "time")]
             "time_date" => fun(&[], res_int_time.clone()),
+            #[cfg(feature = "time")]
             "time_period" => {
                 let params: Vec<Ty> = std::iter::repeat_with(int).take(9).collect();
                 fun(&params, res_int_time)
@@ -1343,23 +1365,32 @@ impl Checker {
             "env_exec" => fun(&[string(), array(string())], res_int_env),
             "env_exit" => fun(&[int()], unit_ty()),
 
+            #[cfg(feature = "crypto")]
             "crypto_sha256" | "crypto_sha512" | "crypto_blake3" => {
                 fun(&[bytes.clone()], res_bytes_crypto.clone())
             }
+            #[cfg(feature = "crypto")]
             "crypto_hasher_init" => fun(&[string()], res_int_crypto.clone()),
+            #[cfg(feature = "crypto")]
             "crypto_hasher_update" => fun(&[int(), bytes.clone()], res_unit_crypto.clone()),
+            #[cfg(feature = "crypto")]
             "crypto_hasher_finalize" => fun(&[int()], res_bytes_crypto.clone()),
+            #[cfg(feature = "crypto")]
             "crypto_hmac_sha256" | "crypto_hmac_sha512" => {
                 fun(&[bytes.clone(), bytes.clone()], res_bytes_crypto.clone())
             }
+            #[cfg(feature = "crypto")]
             "crypto_hmac_verify_sha256" => {
                 fun(
                     &[bytes.clone(), bytes.clone(), bytes.clone()],
                     res_bool_crypto.clone(),
                 )
             }
+            #[cfg(feature = "crypto")]
             "crypto_random_bytes" => fun(&[int()], res_bytes_crypto.clone()),
+            #[cfg(feature = "crypto")]
             "crypto_random_u64" => fun(&[], res_int_crypto),
+            #[cfg(feature = "crypto")]
             "crypto_chacha20_poly1305_encrypt" | "crypto_chacha20_poly1305_decrypt"
             | "crypto_aes_256_gcm_encrypt" | "crypto_aes_256_gcm_decrypt" => {
                 fun(
@@ -1367,24 +1398,29 @@ impl Checker {
                     res_bytes_crypto.clone(),
                 )
             }
+            #[cfg(feature = "crypto")]
             "crypto_ed25519_generate" | "crypto_x25519_generate" => {
                 fun(&[], result_app_ty(keypair.clone(), crypto_err.clone()))
             }
+            #[cfg(feature = "crypto")]
             "crypto_ed25519_sign" | "crypto_x25519_shared_secret" => {
                 fun(
                     &[bytes.clone(), bytes.clone()],
                     res_bytes_crypto.clone(),
                 )
             }
+            #[cfg(feature = "crypto")]
             "crypto_ed25519_verify" => {
                 fun(
                     &[bytes.clone(), bytes.clone(), bytes.clone()],
                     res_bool_crypto.clone(),
                 )
             }
+            #[cfg(feature = "crypto")]
             "crypto_argon2id_hash" | "crypto_argon2id_verify" => {
                 fun(&[bytes.clone(), bytes.clone()], res_unit_crypto)
             }
+            #[cfg(feature = "crypto")]
             "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
 
             "regex_compile" => fun(&[string(), string()], res_regex),
@@ -1398,7 +1434,18 @@ impl Checker {
                 fun(&[regex, string(), string()], res_string_regex)
             }
 
-            _ => Ty::Var(self.counter.fresh()),
+            _ => {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("unknown host native `{}`", registry),
+                    range,
+                );
+                msg.with_help(
+                    "every HostFn registry key must have a host_fn_scheme arm".to_string(),
+                );
+                self.messages.push(msg);
+                Ty::Var(self.counter.fresh())
+            }
         };
         Scheme::mono(ty)
     }
@@ -2520,7 +2567,7 @@ impl Checker {
                                 self.env.insert_top(local, scheme);
                             }
                             BuiltinExport::HostFn { registry, .. } => {
-                                let scheme = self.host_fn_scheme(registry);
+                                let scheme = self.host_fn_scheme(registry, range.clone());
                                 self.env.insert_top(local, scheme);
                             }
                             BuiltinExport::FfiFn { .. } => {
@@ -3806,7 +3853,22 @@ impl Checker {
                     Self::primitive_cast_name(&dst_ty),
                 ) {
                     (Some(from), Some(to)) if from == to => dst_ty,
-                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => dst_ty,
+                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => {
+                        if from == "int" && to == "byte" {
+                            if let Err(Some(n)) = Self::byte_literal_coercion(expr) {
+                                return self.error_with_help(
+                                    ErrorCode::TypeMismatch,
+                                    format!("byte literal out of range: `{n}` is not in 0..=255"),
+                                    range,
+                                    Some(
+                                        "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                        dst_ty
+                    }
                     (Some(from), Some(to)) => self.error_with_help(
                         ErrorCode::TypeMismatch,
                         format!("cannot cast `{from}` to `{to}`"),
@@ -6735,7 +6797,7 @@ impl Checker {
         result_app_ty(byte(), string())
     }
 
-    /// `char(byte) -> string`.
+    /// `char(byte) -> Result<string, string>`.
     fn infer_char(&mut self, args: &[Output], range: Range<usize>) -> Ty {
         use super::ty::byte;
         if args.len() != 1 {
@@ -6756,7 +6818,7 @@ impl Checker {
             &args[0].0.into_range(),
             "char argument",
         );
-        string()
+        result_app_ty(string(), string())
     }
 
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
@@ -7813,6 +7875,10 @@ impl Checker {
                     Err(Some(*n))
                 }
             }
+            Expression::Negate(inner) => match unwrap_expr_wrappers(inner).1.as_ref() {
+                Expression::Integer(n) => Err(Some(-n)),
+                _ => Err(None),
+            },
             _ => Err(None),
         }
     }
@@ -19729,6 +19795,51 @@ fn main() {
             msgs.is_empty(),
             "unexpected messages: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn host_fn_scheme_covers_all_wiring_registries() {
+        use machine::{ENV_WIRING, FS_WIRING, REGEX_WIRING};
+
+        let mut c = Checker::new();
+        let mut names: Vec<&str> = FS_WIRING
+            .iter()
+            .chain(ENV_WIRING.iter())
+            .chain(REGEX_WIRING.iter())
+            .map(|&(n, _, _)| n)
+            .collect();
+        #[cfg(feature = "time")]
+        {
+            names.extend(machine::TIME_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(feature = "crypto")]
+        {
+            names.extend(machine::CRYPTO_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(all(feature = "time", feature = "crypto"))]
+        assert_eq!(names.len(), 72);
+        for name in names {
+            let _ = c.host_fn_scheme(name, 0..0);
+        }
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "wired registries must not hit host_fn_scheme fallback: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn host_fn_scheme_unknown_registry_emits_diagnostic() {
+        let mut c = Checker::new();
+        let _ = c.host_fn_scheme("no_such_native", 0..0);
+        let msgs = c.take_messages();
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].message().contains("unknown host native `no_such_native`"),
+            "got: {}",
+            msgs[0].message()
         );
     }
 }
