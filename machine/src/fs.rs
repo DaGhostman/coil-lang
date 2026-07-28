@@ -209,8 +209,16 @@ pub fn fs_symlink(heap: &mut Heap, target: Value, link: Value) -> Value {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::symlink_file;
-            as_result_unit(heap, symlink_file(original, link_path).map_err(io_err))
+            let r = host_fs::metadata(original).map_err(io_err).and_then(|meta| {
+                if meta.is_dir() {
+                    use std::os::windows::fs::symlink_dir;
+                    symlink_dir(original, link_path).map_err(io_err)
+                } else {
+                    use std::os::windows::fs::symlink_file;
+                    symlink_file(original, link_path).map_err(io_err)
+                }
+            });
+            as_result_unit(heap, r)
         }
         #[cfg(not(any(unix, windows)))]
         {
