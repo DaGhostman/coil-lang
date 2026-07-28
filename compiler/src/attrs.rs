@@ -2913,6 +2913,17 @@ fn hash_combine<'a>(span: SimpleSpan, acc: Output<'a>, field: Output<'a>) -> Out
     at(span, Expression::Add(scaled, field))
 }
 
+/// `value.hash()` — recursive Hash dispatch for derive payloads.
+fn hash_of<'a>(span: SimpleSpan, value: Output<'a>) -> Output<'a> {
+    at(
+        span,
+        Expression::Call {
+            name: at(span, Expression::Access(value, "hash")),
+            args: None,
+        },
+    )
+}
+
 fn default_enum_variant<'a>(
     span: SimpleSpan,
     enum_name: &'a str,
@@ -2995,13 +3006,13 @@ fn hash_variant_body<'a>(
             for i in 0..*arity {
                 let fname = leak(i.to_string());
                 let field = at(span, Expression::Access(ident(span, recv), fname));
-                acc = hash_combine(span, acc, field);
+                acc = hash_combine(span, acc, hash_of(span, field));
             }
         }
         VariantShape::Record(fields) => {
             for &fname in fields {
                 let field = at(span, Expression::Access(ident(span, recv), fname));
-                acc = hash_combine(span, acc, field);
+                acc = hash_combine(span, acc, hash_of(span, field));
             }
         }
     }
@@ -3048,7 +3059,7 @@ fn synth_hash_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> 
     let mut acc = int_zero(span);
     for f in fields {
         let field = at(span, Expression::Access(ident(span, p), f));
-        acc = hash_combine(span, acc, field);
+        acc = hash_combine(span, acc, hash_of(span, field));
     }
     let m = method_fn(
         span,
@@ -3383,6 +3394,25 @@ mod tests {
         assert!(
             impl_method_names(&decls, "Hash").contains(&"hash".to_string()),
             "expected Hash::hash impl"
+        );
+    }
+
+    #[test]
+    fn derive_hash_emits_recursive_field_hash_calls() {
+        let (_exp, decls) = expand_src(
+            "#[derive(Hash)] enum E { A(int), B { s: string } } fn main() {}",
+        );
+        let hash_impl = decls.iter().find(|n| {
+            matches!(
+                n.1.as_ref(),
+                Expression::TypeClassImpl { class, .. } if *class == "Hash"
+            )
+        });
+        assert!(hash_impl.is_some(), "expected Hash impl");
+        let dump = format!("{:?}", hash_impl.unwrap().1);
+        assert!(
+            dump.contains("\"hash\"") && dump.contains("Call"),
+            "expected recursive field.hash() Call in derived Hash body, got: {dump}"
         );
     }
 
