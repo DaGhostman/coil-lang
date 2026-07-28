@@ -1747,7 +1747,7 @@ first-class range values, empty decreasing ranges.
 
 ## Showcase projects
 
-Larger multi-file apps live under [`examples/projects/`](../examples/projects/README.md).
+Larger multi-file apps live under [`examples/projects/`](../../examples/projects/README.md).
 Each project has its own `coil.toml`, co-located `tests/`, and `NOTES.md`.
 
 | Project | Focus | How to run |
@@ -1788,7 +1788,7 @@ CI / non-interactive (always under `timeout`; canned input in `transcript.txt`):
 ```
 
 Or `cd` into a project and run `coil test` (harness is CWD-`./tests` only).
-See [`examples/projects/README.md`](../examples/projects/README.md).
+See [`examples/projects/README.md`](../../examples/projects/README.md).
 
 ---
 

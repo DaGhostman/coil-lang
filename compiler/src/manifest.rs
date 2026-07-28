@@ -261,7 +261,7 @@ impl Manifest {
     ///    `sadge` lives inside that module file)
     ///
     /// If both exist, Convention A wins silently (documented in
-    /// `docs/reference/modules.md` under Path resolution /
+    /// `docs/references/modules.md` under Path resolution /
     /// Shadowing). Brace/glob imports against a module file are
     /// unaffected when only Convention B is present.
     ///

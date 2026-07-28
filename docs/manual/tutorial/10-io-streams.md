@@ -169,6 +169,6 @@ Prefer `?` in `Result`-mode helpers (see [Error handling](09-error-handling.md))
 
 ## Related
 
-- [Built-ins — `io` module](../reference/built-ins.md#io-virtual-module)
-- [Types — `byte`](../reference/types.md)
+- [Built-ins — `io` module](../../references/io.md)
+- [Types — `byte`](../../references/types.md)
 - [Examples catalog](../examples.md)

@@ -32,7 +32,7 @@ my-project/
 
 The **`coil.toml`** manifest declares where the compiler searches for module files and optionally sets the entry point. If no manifest exists, the compiler defaults to a single search root: `src/`.
 
-See [Project configuration reference](../reference/project-config.md) for the full format.
+See [Project configuration reference](../../references/project-config.md) for the full format.
 
 ---
 
@@ -242,12 +242,12 @@ You normally call imported items by their local alias (`sadge()`), but the FQN i
 | `use foo::*;` | `<root>/foo.hy` | all top-level items from that file |
 | `mod foo;` | `<root>/foo.hy` | none |
 
-For complete syntax rules, path resolution details, and edge cases, see the [Modules reference](../reference/modules.md).
+For complete syntax rules, path resolution details, and edge cases, see the [Modules reference](../../references/modules.md).
 
 ---
 
 ## See also
 
-- [Project configuration reference](../reference/project-config.md) — full `coil.toml` format
+- [Project configuration reference](../../references/project-config.md) — full `coil.toml` format
 - [Examples catalog](../examples.md) — `modules.hy` setup notes
 - [FFI](07-ffi.md) — next chapter for C interop

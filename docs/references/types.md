@@ -21,7 +21,7 @@ Integer literals coerce to `byte` when the expected type is `byte` (returns, ann
 
 Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print` (`%i` accepts `byte`).
 
-Opaque **`Stream`** (`Ty::Con("Stream")`) is the handle type for the virtual [`io`](built-ins.md#io-virtual-module) module — not constructible in userland.
+Opaque **`Stream`** (`Ty::Con("Stream")`) is the handle type for the virtual [`io`](io.md) module — not constructible in userland.
 
 ---
 
@@ -42,7 +42,7 @@ The compiler pre-registers polymorphic sum types under the virtual `prelude` mod
 | `Option` | `None` (0), `Some(T)` (1) | `Option` / `Option<T>` |
 | `Result` | `Ok(T)` (0), `Err(E)` (1) | `Result` / `Result<T, E>` |
 
-Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`). Error-handling operators (`raise`, `?`, `??`, `?.`) are documented in [Operators](operators.md) and [Tutorial 09](../tutorial/09-error-handling.md).
+Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`). Error-handling operators (`raise`, `?`, `??`, `?.`) are documented in [Operators](operators.md) and [Tutorial 09](../manual/tutorial/09-error-handling.md).
 
 **Result mode:** a function that uses `raise` or Result-`?` has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. One `E` per function.
 
@@ -831,7 +831,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 |------|------------|
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
-| FFI | Broad scalar/Ptr/struct/callback tags via `ffi::types` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
+| FFI | Broad scalar/Ptr/struct/callback tags via `ffi::types` / `extern struct` — see [FFI tutorial](../manual/tutorial/07-ffi.md) |
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
 | Trait runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
@@ -866,5 +866,5 @@ Diagnostic messages render types roughly as:
 |----------|----------|
 | [Syntax](syntax.md) | Where annotations appear in grammar |
 | [Operators](operators.md) | Arithmetic and comparison typing |
-| [Built-ins](built-ins.md) | FFI type tags |
-| [Tutorial: Types](../tutorial/02-types-and-variables.md) | Guided introduction |
+| [Built-ins](README.md) | FFI type tags |
+| [Tutorial: Types](../manual/tutorial/02-types-and-variables.md) | Guided introduction |

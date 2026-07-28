@@ -342,7 +342,7 @@ pipeline.register_host_native(sig, |heap, args| { /* ... */ Ok(Some(value)) });
 pipeline.wire_host_natives(&mut vm);
 ```
 
-This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins reference](../reference/built-ins.md#host-embedder-api).
+This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins reference](../../references/host-natives.md).
 
 ---
 
@@ -400,6 +400,6 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 ## Next steps
 
-- [Built-ins reference](../reference/built-ins.md) — full `print` / FFI builtin details
-- [Types reference](../reference/types.md) — what can and cannot cross the FFI boundary
+- [Built-ins reference](../../references/README.md) — full `print` / FFI builtin details
+- [Types reference](../../references/types.md) — what can and cannot cross the FFI boundary
 - [Getting Started](../getting-started.md) — build and cache (`out.hyc`) workflow

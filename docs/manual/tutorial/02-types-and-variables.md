@@ -130,7 +130,7 @@ fn main() {
 
 - Public or exported APIs where readers need the contract spelled out.
 - Empty or minimal initializers where inference has little to go on.
-- Tuple, array, and alias types where the shape matters (see [Aggregates](../tutorial/05-aggregates.md)).
+- Tuple, array, and alias types where the shape matters (see [Aggregates](05-aggregates.md)).
 - Disambiguating numeric literals when you need `float` but wrote an expression that looks integral.
 
 Inference is not magic: it reports all type errors it finds in one pass, with source locations, so you can fix multiple issues before recompiling.
@@ -247,7 +247,7 @@ static const VERSION = "1.0";
 
 Initializers run once in the program prologue (before `main`), in module dependency order. Other modules import the item name via `use` like ordinary functions.
 
-Class statics use `ClassName::field` / `ClassName::method(...)` — see [Types — Static slots](../reference/types.md#static-slots) and `examples/static_singleton.hy`.
+Class statics use `ClassName::field` / `ClassName::method(...)` — see [Types — Static slots](../../references/types.md#static-slots) and `examples/static_singleton.hy`.
 
 ### `readonly` values
 
@@ -258,7 +258,7 @@ let xs = readonly [1, 2, 3];
 let p = readonly new Point(1, 2);
 ```
 
-Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.hy` and [Types — Readonly](../reference/types.md#readonly-types).
+Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.hy` and [Types — Readonly](../../references/types.md#readonly-types).
 
 **Reading** a variable emits a load from that slot. The typechecker ensures you only assign types compatible with the binding's declared or inferred type.
 
@@ -323,7 +323,7 @@ Rules of thumb:
 - The right-hand side can be any type annotation form: primitives, tuples, arrays, fixed arrays, or class names.
 - Inner blocks may shadow outer aliases; duplicate aliases in the same scope are rejected.
 
-Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — Aggregates](../tutorial/05-aggregates.md). See `examples/aliases.hy` for a runnable example.
+Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — Aggregates](05-aggregates.md). See `examples/aliases.hy` for a runnable example.
 
 ---
 
@@ -373,8 +373,8 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 ## See also
 
 - [Chapter 1 — Basics](01-basics.md) — syntax, control flow, and `print`
-- [Chapter 5 — Aggregates](../tutorial/05-aggregates.md) — tuples, arrays, records, and aliases in depth
-- [Operator reference](../reference/operators.md) — operators and operand types
+- [Chapter 5 — Aggregates](05-aggregates.md) — tuples, arrays, records, and aliases in depth
+- [Operator reference](../../references/operators.md) — operators and operand types
 - `examples/let_test.hy` — binding and reassignment
 - `examples/aliases.hy` — type alias end-to-end
 - `examples/classes.hy` — class syntax snapshot

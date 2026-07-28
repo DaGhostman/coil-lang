@@ -384,7 +384,7 @@ When in doubt, parenthesise:
 (2 + 2) * (2 + 2)
 ```
 
-For the full precedence table and associativity rules, see [Operator reference](../reference/operators.md).
+For the full precedence table and associativity rules, see [Operator reference](../../references/operators.md).
 
 ---
 
@@ -518,7 +518,7 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 8. **Implicit return at end of function** — Relying on falling off the end without `return` may yield `0`. Be explicit for public APIs.
 
-9. **Parentheses in tuples vs grouping** — `(1 + 2)` is a grouped expression; `(1, 2)` is a two-element tuple (covered in [Aggregates](../tutorial/05-aggregates.md)). A single-element tuple requires a trailing comma: `(1,)`.
+9. **Parentheses in tuples vs grouping** — `(1 + 2)` is a grouped expression; `(1, 2)` is a two-element tuple (covered in [Aggregates](05-aggregates.md)). A single-element tuple requires a trailing comma: `(1,)`.
 
 ---
 
@@ -548,6 +548,6 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 ## See also
 
 - [Chapter 2 — Types and Variables](02-types-and-variables.md) — annotations, inference, and type errors
-- [Operator reference](../reference/operators.md) — full precedence and associativity
-- [Aggregates](../tutorial/05-aggregates.md) — tuples, arrays, records (coming in the tutorial track)
+- [Operator reference](../../references/operators.md) — full precedence and associativity
+- [Aggregates](05-aggregates.md) — tuples, arrays, records (coming in the tutorial track)
 - `examples/fib.hy`, `examples/let_test.hy`, `examples/fizbuz.hy` — source for the worked examples above

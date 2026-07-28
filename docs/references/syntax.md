@@ -322,7 +322,7 @@ extern "c" {
 }
 ```
 
-`extern "c"` is the portable libc alias. See [FFI tutorial](../tutorial/07-ffi.md).
+`extern "c"` is the portable libc alias. See [FFI tutorial](../manual/tutorial/07-ffi.md).
 
 Equivalent attribute form for a single function:
 
@@ -418,7 +418,7 @@ statement ::= while_stmt
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
 | `for` (C-style) | `for '(' init ';' cond ';' step ')' block` |
-| `for` (iterator) | `for IDENT in expr block` — via prelude `IntoIterator` / `Iterator` (arrays, homogeneous tuples/dicts, coroutines, or user `impl`s; see [Built-ins](built-ins.md#iterator--intoiterator)) |
+| `for` (iterator) | `for IDENT in expr block` — via prelude `IntoIterator` / `Iterator` (arrays, homogeneous tuples/dicts, coroutines, or user `impl`s; see [Built-ins](iterator.md)) |
 | `break` | `break ';'` (innermost loop) |
 | `continue` | `continue ';'` (jumps to `for` step / `while` condition / next for-in iteration) |
 | `if` | `if expr block ('else' (block \| if_stmt))?` |
@@ -438,7 +438,7 @@ Empty index `arr[]` is valid **only** as an assignment target and appends to a d
 arr[] = value;
 ```
 
-Using `arr[]` as an rvalue is a compile error. See [Built-ins — Array append](built-ins.md#array-append-arr--and-len).
+Using `arr[]` as an rvalue is a compile error. See [Built-ins — Array append](arrays.md).
 
 ### `readonly` expressions
 
@@ -471,7 +471,7 @@ atom ::= match_expr
 
 `dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::*` (not keyword atoms).
 
-Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `float as int` truncates toward zero (not `round`/`floor`); see [Built-ins](built-ins.md#primitive-casts-expr-as-t).
+Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `float as int` truncates toward zero (not `round`/`floor`); see [Built-ins](casts.md).
 
 | Form | Syntax | Notes |
 |------|--------|-------|
@@ -513,7 +513,7 @@ fn main() {
 }
 ```
 
-See [Tutorial: Coroutines](../tutorial/08-coroutines.md).
+See [Tutorial: Coroutines](../manual/tutorial/08-coroutines.md).
 
 ### Assignment
 
@@ -661,5 +661,5 @@ See [README](../README.md) language-at-a-glance table for the live feature matri
 | [Types](types.md) | Type forms and inference |
 | [Operators](operators.md) | Precedence and semantics |
 | [Keywords](keywords.md) | Reserved words |
-| [Built-ins](built-ins.md) | `print`, FFI builtins |
+| [Built-ins](README.md) | `print`, FFI builtins |
 | [Modules](modules.md) | `use` / `mod` resolution |

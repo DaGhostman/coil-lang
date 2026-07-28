@@ -211,7 +211,10 @@ coil/
 │   ├── src/memory/        # Stack, heap, GC
 │   └── src/ffi/           # libffi dynamic calls + host natives
 ├── examples/              # Runnable .hy programs (catalog in examples.md)
-├── docs/                  # User documentation (you are here)
+├── docs/
+│   ├── manual/            # Getting started, tutorials, examples catalog (you are here)
+│   ├── references/        # Language + per-API lookup
+│   └── internals/         # Pipeline, VM notes, grammar
 ├── src/main.rs            # `cargo run` entry point
 └── coil.toml.example      # Sample project manifest for modules
 ```
@@ -274,7 +277,7 @@ The language includes:
 - **`match`** with constructors, wildcards, and nested record patterns
 - **Tuples** `(a, b)`, **arrays** `[T]` / `[T; N]`, **dicts** `{ key: value }`
 - **Type aliases** `type Point = (int, int);`
-- **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [reference/modules.md](reference/modules.md))
+- **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [Modules](../references/modules.md))
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
 - **Classes** (partial — see `examples/classes.hy`)
 - **Coroutines** — `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` (see [tutorial/08-coroutines.md](tutorial/08-coroutines.md))
@@ -285,8 +288,8 @@ Not yet available: string concatenation with `+`, and a user-facing `format` key
 
 1. **Tutorial** — start with [01 — Basics](tutorial/01-basics.md) for a guided tour of syntax and types.
 2. **Examples** — browse the full catalog in [examples.md](examples.md); each entry includes the run command and expected output.
-3. **Reference** — keep [reference/syntax.md](reference/syntax.md) and [reference/types.md](reference/types.md) open while you code.
-4. **Modules** — copy `coil.toml.example` to `coil.toml` when you split code across files; see [reference/project-config.md](reference/project-config.md).
+3. **References** — keep [syntax](../references/syntax.md) and [types](../references/types.md) open while you code.
+4. **Modules** — copy `coil.toml.example` to `coil.toml` when you split code across files; see [project config](../references/project-config.md).
 
 ### Suggested learning path
 

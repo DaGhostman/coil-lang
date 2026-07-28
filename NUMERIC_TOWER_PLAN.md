@@ -287,7 +287,7 @@ have: Add<T>
 
 **Coherence:** these are compiler-owned lifts for builtin aggregate
 heads (already called out as non-local for user `impl`s in
-`docs/reference/types.md`). Document that users cannot write
+`docs/references/types.md`). Document that users cannot write
 `impl Add for (int, int)`.
 
 ### 4.3 Alternative rejected for v1
@@ -443,7 +443,7 @@ identifiers / locals, same as scalar `+=` today).
 
 ### Phase NT-6 — Polish
 
-- Docs: `docs/reference/operators.md`, `types.md`, tutorial 05,
+- Docs: `docs/references/operators.md`, `types.md`, manual/tutorial 05,
   feature matrix / examples catalog
 - `byte` in scalar `Num` (if not done elsewhere) so `[byte; N]` lifts
 - Optional: further peephole on unrolled `Index` convoys; VM fuse only
@@ -479,7 +479,7 @@ identifiers / locals, same as scalar `+=` today).
 | Diagnostics goldens | `compiler/tests/diagnostics.rs` |
 | Pipeline goldens | `compiler/tests/pipeline.rs` |
 | Examples | `examples/vec_tuple.hy`, `examples/vec_array.hy`, maybe `examples/vec_generic.hy` |
-| Docs | `docs/reference/operators.md`, `types.md`, `tutorial/05-aggregates.md`, `docs/examples.md` |
+| Docs | `docs/references/operators.md`, `types.md`, `tutorial/05-aggregates.md`, `docs/manual/examples.md` |
 | VM (only if fuse) | `common/src/opcode.rs`, `machine/src/vm.rs`, `ARCHIVE_VERSION` |
 
 No parser changes expected for v1.
