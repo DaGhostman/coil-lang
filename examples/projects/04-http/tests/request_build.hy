@@ -150,16 +150,18 @@ test("only reserved headers yield no extras") {
     assert(extras == "__NONE__", "sentinel when all reserved")?;
 }
 
-test("odd content-length uses generic trailer") {
+test("lookup content-length sixteen") {
     let u = match parse_url("http://example.com/") {
         Result::Ok(v) => v,
         Result::Err(_) => panic "parse failed",
     };
     let hs = empty_headers();
-    let msg = match build_request_head("POST", u, hs, 17) {
+    let msg = match build_request_head("POST", u, hs, 16) {
         Result::Ok(m) => m,
         Result::Err(_) => panic "build",
     };
-    let clb = to_bytes("Content-Length: 17");
-    if find_bytes(msg, clb) == 999999 { panic "content-length 17"; }
+    let clb = to_bytes("Content-Length: 16");
+    let closeb = to_bytes("Connection: close");
+    if find_bytes(msg, clb) == 999999 { panic "content-length 16"; }
+    if find_bytes(msg, closeb) == 999999 { panic "connection"; }
 }

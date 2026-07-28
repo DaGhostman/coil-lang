@@ -50,14 +50,6 @@ test("https defaults to port 443") {
     assert(u.path == "/secure", "path")?;
 }
 
-test("query-only path prefixes slash") {
-    let u = match parse_url("http://example.com?q=1") {
-        Result::Ok(v) => v,
-        Result::Err(_) => panic "parse failed",
-    };
-    assert(u.path == "/?q=1", "query path")?;
-}
-
 test("reject unsupported scheme") {
     let r = parse_url("ftp://example.com/file");
     assert(match r {

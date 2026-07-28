@@ -58,7 +58,9 @@ test("content-length truncates longer rest") {
         Result::Err(_) => panic "parse failed",
     };
     assert(len(r.body) == 1, "body len")?;
-    assert(r.body[0] as int == 88, "first byte X")?;
+    let x: [byte] = [];
+    x[] = 88;
+    if find_bytes(r.body, x) != 0 { panic "first byte X"; }
 }
 
 test("reject response without header terminator") {
