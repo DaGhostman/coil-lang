@@ -830,6 +830,30 @@ fn main() {
 
 ---
 
+### `examples/regex_demo.hy`
+
+**Demonstrates:** Virtual `regex` (PCRE2) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
+
+```coil
+use regex::*;
+
+fn main() {
+    let re = match compile("(\\w+)=(\\d+)", "i") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "compile",
+    };
+    // …
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/regex_demo.hy` |
+| **Output** | `true,2,a->1 b->2,a|b|c` |
+| **Needs** | system **libpcre2** (or `pcre2-sys` source build) |
+
+---
+
 ### `examples/aliases.hy`
 
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
@@ -1806,6 +1830,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `static_singleton.hy` | Statics | `121` |
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
+| `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
 | `aliases.hy` | Types | `347` |
 | `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |

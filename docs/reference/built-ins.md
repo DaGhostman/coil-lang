@@ -20,6 +20,7 @@ coil does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/
 | `time::{timestamp,format,…}` | Virtual module | UTC timestamps, periods, sleep (requires `use time::*`) |
 | `env::{args,var,exec,…}` | Virtual module | Process environment (requires `use env::*`) |
 | `crypto::{sha256,hmac_sha256,…}` | Virtual module | RustCrypto host primitives (`use crypto::*`) |
+| `regex::{compile,is_match,…}` | Virtual module | PCRE2 host regex (`use regex::*`; needs libpcre2) |
 | `ord` / `char` | Prelude builtins | Single-byte string ↔ `byte` |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
@@ -593,6 +594,27 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 ## `crypto` module
 
 `use crypto::*;` — one-shot and streaming hashes (`sha256`, `init` / `update` / `finalize`), HMAC, `random_bytes`, ChaCha20-Poly1305 and AES-256-GCM, Ed25519 / X25519, Argon2id, constant-time `ct_eq`. Pure Rust (RustCrypto); no OpenSSL. Argon2id uses fixed MVP params (19 MiB memory, 2 iterations, parallelism 1); salts shorter than 16 bytes are zero-padded to 16 — not OWASP-tunable.
+
+---
+
+## `regex` module
+
+`use regex::*;` — PCRE2 patterns via HostInvoke (system **libpcre2** / `pcre2-sys`). Opaque `Regex` handle from `compile(pattern, flags)`.
+
+| Surface | Types |
+|---------|--------|
+| `compile` | `(string, string) -> Result<Regex, RegexError>` |
+| `is_match` | `(Regex, string) -> Result<bool, RegexError>` |
+| `find` | `(Regex, string) -> Result<(int, int), RegexError>` — first match byte span; no match → `NoMatch` |
+| `find_all` | `(Regex, string) -> Result<[(int, int)], RegexError>` — all non-overlapping spans (empty if none) |
+| `captures` | `(Regex, string) -> Result<[string], RegexError>` — `[0]` full match; empty string for non-participating groups |
+| `captures_all` | `(Regex, string) -> Result<[[string]], RegexError>` |
+| `split` | `(Regex, string) -> Result<[string], RegexError>` |
+| `replace` / `replace_all` | `(Regex, string, string) -> Result<string, RegexError>` — `$n` / `${name}` / `$$` |
+
+**Flags** (second `compile` arg; case-sensitive; unknown letter → `Compile`): `i` caseless, `m` multiline, `s` dotall, `x` extended, `u` Unicode properties (`ucp`). UTF-8 matching is always on for coil strings. Other PCRE letters (`A`/`D`/`U`/`J`/…) are not exposed — use in-pattern verbs where PCRE2 allows.
+
+`RegexError` variants: `Compile`, `Runtime`, `NoMatch`, `Utf8`.
 
 ---
 

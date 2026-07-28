@@ -64,6 +64,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `time` | `timestamp`, `Period`, `format` / `parse`, monotonic `Instant` | No — `use time::*;` |
 | `env` | `args`, `var`, `cwd`, `exit`, `exec` (argv-only) | No — `use env::*;` |
 | `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::*;` |
+| `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::*;` |
 | `thread` | `spawn`, channels, mutexes | No — `use thread::*;` |
 
 ### Prelude rebind / redefine

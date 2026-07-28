@@ -3414,6 +3414,40 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
+#[test]
+fn example_regex_demo_prints_expected() {
+    assert_eq!(
+        run_example("examples/regex_demo.hy"),
+        "true,2,a->1 b->2,a|b|c"
+    );
+}
+
+#[test]
+fn regex_compile_error_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use regex::*;
+
+fn bad() -> int {
+    return match compile("(", "") {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            RegexError::Compile => 1,
+            RegexError::Runtime => 2,
+            RegexError::NoMatch => 3,
+            RegexError::Utf8 => 4,
+        },
+    };
+}
+
+fn main() {
+    print "%i", bad();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
 /// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.
 #[test]
 fn derive_string_to_string_prints_variant() {

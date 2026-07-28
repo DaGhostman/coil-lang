@@ -25,6 +25,18 @@ Examples that call C code (`examples/strlen.hy`, `examples/ffi_sum.hy`) require 
 
 You can build and run all non-FFI examples without libffi.
 
+### libpcre2 (optional, for `regex` examples)
+
+The virtual `regex` module links **libpcre2** via the `pcre2` / `pcre2-sys` crates (`examples/regex_demo.hy`).
+
+| Platform | Package |
+|----------|---------|
+| Arch Linux | `pcre2` |
+| Debian / Ubuntu | `libpcre2-dev` |
+| Fedora | `pcre2-devel` |
+
+If the system library is missing, `pcre2-sys` may build PCRE2 from source (needs a C toolchain).
+
 ## Build the project
 
 Clone the repository and build the workspace from the root:
