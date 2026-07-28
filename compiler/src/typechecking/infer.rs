@@ -1227,6 +1227,139 @@ impl Checker {
         }
     }
 
+    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` pipeline host natives.
+    pub fn host_fn_scheme(&mut self, registry: &str) -> Scheme {
+        use crate::typechecking::ty::{array, boolean, byte, record, tuple};
+        use common::{
+            BUILTIN_CRYPTO_ERROR_ENUM, BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM,
+            BUILTIN_TIME_ERROR_ENUM,
+        };
+
+        let fun = |params: &[Ty], ret: Ty| {
+            params.iter().rev().fold(ret, |acc, p| {
+                Ty::Fun(Box::new(p.clone()), Box::new(acc))
+            })
+        };
+        let io_err = Ty::Con(BUILTIN_IO_ERROR_ENUM.into());
+        let time_err = Ty::Con(BUILTIN_TIME_ERROR_ENUM.into());
+        let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
+        let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
+
+        let res_bool_io = result_app_ty(boolean(), io_err.clone());
+        let res_unit_io = result_app_ty(unit_ty(), io_err.clone());
+        let res_string_io = result_app_ty(string(), io_err.clone());
+        let res_strs_io = result_app_ty(array(string()), io_err.clone());
+        let res_meta_io = result_app_ty(
+            record(vec![
+                ("size".into(), int()),
+                ("is_file".into(), boolean()),
+                ("is_dir".into(), boolean()),
+                ("is_symlink".into(), boolean()),
+                ("modified_unix".into(), int()),
+            ]),
+            io_err,
+        );
+
+        let res_int_time = result_app_ty(int(), time_err.clone());
+        let res_string_time = result_app_ty(string(), time_err.clone());
+        let res_unit_time = result_app_ty(unit_ty(), time_err);
+
+        let res_string_env = result_app_ty(string(), env_err.clone());
+        let res_strs_env = result_app_ty(array(string()), env_err.clone());
+        let res_unit_env = result_app_ty(unit_ty(), env_err.clone());
+        let res_int_env = result_app_ty(int(), env_err);
+
+        let bytes = array(byte());
+        let res_bytes_crypto = result_app_ty(bytes.clone(), crypto_err.clone());
+        let res_bool_crypto = result_app_ty(boolean(), crypto_err.clone());
+        let res_int_crypto = result_app_ty(int(), crypto_err.clone());
+        let res_unit_crypto = result_app_ty(unit_ty(), crypto_err.clone());
+        let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
+
+        let ty = match registry {
+            "fs_exists" | "fs_is_file" | "fs_is_dir" | "fs_is_symlink" => {
+                fun(&[string()], res_bool_io)
+            }
+            "fs_metadata" => fun(&[string()], res_meta_io),
+            "fs_create_dir" | "fs_create_dir_all" | "fs_remove_file" | "fs_remove_dir"
+            | "fs_remove_dir_all" => fun(&[string()], res_unit_io.clone()),
+            "fs_rename" | "fs_copy" | "fs_symlink" => {
+                fun(&[string(), string()], res_unit_io.clone())
+            }
+            "fs_read_link" | "fs_realpath" => fun(&[string()], res_string_io.clone()),
+            "fs_list_dir" => fun(&[string()], res_strs_io),
+
+            "time_timestamp" | "time_instant_now" | "time_epoch" => fun(&[], res_int_time.clone()),
+            "time_sleep_ms" => fun(&[int()], res_unit_time),
+            "time_elapsed_nanos" | "time_elapsed_millis"
+            | "time_date_from_period" | "time_date_from_epoch_period" => {
+                fun(&[int()], res_int_time.clone())
+            }
+            "time_add" | "time_sub" | "time_period_add" | "time_period_sub" | "time_format"
+            | "time_parse" => fun(&[int(), int()], res_int_time.clone()),
+            "time_date" => fun(&[int()], res_string_time.clone()),
+            "time_period" => {
+                let params: Vec<Ty> = std::iter::repeat_with(int).take(9).collect();
+                fun(&params, res_int_time)
+            }
+
+            "env_args" => fun(&[], res_strs_env),
+            "env_var" => fun(&[string()], res_string_env.clone()),
+            "env_cwd" => fun(&[], res_string_env),
+            "env_remove_var" | "env_set_cwd" => fun(&[string()], res_unit_env.clone()),
+            "env_set_var" => fun(&[string(), string()], res_unit_env.clone()),
+            "env_exec" => fun(&[string(), array(string())], res_int_env),
+            "env_exit" => fun(&[int()], unit_ty()),
+
+            "crypto_sha256" | "crypto_sha512" | "crypto_blake3" => {
+                fun(&[bytes.clone()], res_bytes_crypto.clone())
+            }
+            "crypto_hasher_init" => fun(&[string()], res_int_crypto.clone()),
+            "crypto_hasher_update" => fun(&[int(), bytes.clone()], res_unit_crypto.clone()),
+            "crypto_hasher_finalize" => fun(&[int()], res_bytes_crypto.clone()),
+            "crypto_hmac_sha256" | "crypto_hmac_sha512" => {
+                fun(&[bytes.clone(), bytes.clone()], res_bytes_crypto.clone())
+            }
+            "crypto_hmac_verify_sha256" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bool_crypto.clone(),
+                )
+            }
+            "crypto_random_bytes" => fun(&[int()], res_bytes_crypto.clone()),
+            "crypto_random_u64" => fun(&[], res_int_crypto),
+            "crypto_chacha20_poly1305_encrypt" | "crypto_chacha20_poly1305_decrypt"
+            | "crypto_aes_256_gcm_encrypt" | "crypto_aes_256_gcm_decrypt" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bytes_crypto.clone(),
+                )
+            }
+            "crypto_ed25519_generate" | "crypto_x25519_generate" => {
+                fun(&[], result_app_ty(keypair.clone(), crypto_err.clone()))
+            }
+            "crypto_ed25519_sign" | "crypto_x25519_shared_secret" => {
+                fun(
+                    &[bytes.clone(), bytes.clone()],
+                    res_bytes_crypto.clone(),
+                )
+            }
+            "crypto_ed25519_verify" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bool_crypto.clone(),
+                )
+            }
+            "crypto_argon2id_hash" | "crypto_argon2id_verify" => {
+                fun(&[bytes.clone(), bytes.clone()], res_unit_crypto)
+            }
+            "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
+
+            _ => Ty::Var(self.counter.fresh()),
+        };
+        Scheme::mono(ty)
+    }
+
     /// Zero-argument functions are nullary at the call site (`f()`), but their
     /// value is still a `unit -> R` function suitable for `spawn(f)` / `MakeFn`.
     fn seal_nullary_fun_ty(fun_ty: Ty, arg_count: usize, has_self_receiver: bool) -> Ty {
@@ -2080,6 +2213,56 @@ impl Checker {
                 ),
             );
         }
+        // Serialize / Deserialize / Default / Hash / String
+        {
+            use crate::typechecking::ty::{array, byte};
+            let var = self.counter.fresh();
+            let bytes = array(byte());
+            self.typeclass_method_schemes.insert(
+                ("Serialize".to_string(), "serialize".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Serialize", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(bytes.clone())),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Deserialize".to_string(), "deserialize".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Deserialize", var)],
+                    Ty::Fun(Box::new(bytes), Box::new(Ty::Var(var))),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Default".to_string(), "default".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Default", var)],
+                    Ty::Fun(Box::new(unit_ty()), Box::new(Ty::Var(var))),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Hash".to_string(), "hash".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Hash", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(int())),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("String".to_string(), "to_string".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("String", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
+                ),
+            );
+        }
     }
 
     /// Inner inference — does the actual dispatch but no caching.
@@ -2293,9 +2476,15 @@ impl Checker {
                                 let scheme = self.thread_fn_scheme(kind);
                                 self.env.insert_top(local, scheme);
                             }
-                            BuiltinExport::HostFn { .. } | BuiltinExport::FfiFn { .. } => {
-                                self.env
-                                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                            BuiltinExport::HostFn { registry, .. } => {
+                                let scheme = self.host_fn_scheme(registry);
+                                self.env.insert_top(local, scheme);
+                            }
+                            BuiltinExport::FfiFn { .. } => {
+                                self.env.insert_top(
+                                    local,
+                                    Scheme::mono(Ty::Var(self.counter.fresh())),
+                                );
                             }
                             _ => {}
                         }
