@@ -33,6 +33,10 @@ pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
 /// UDP helpers under `io::net::udp` (`bind`, `send_to`, …).
 pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
 
+/// TLS helpers under `io::net::tls` (`connect`, `connect_insecure`).
+#[cfg(feature = "tls")]
+pub const IO_NET_TLS_MODULE: &str = "io::net::tls";
+
 /// Canonical module path for OS threads, channels, and locks.
 pub const THREAD_MODULE: &str = "thread";
 
@@ -160,6 +164,12 @@ pub enum IoBuiltin {
     UdpRecvFromWait,
     /// Local bound port of a UDP socket (useful after `bind(..., 0)`).
     UdpLocalPort,
+    /// TLS connect with system/webpki roots + SNI (`io::net::tls::connect`).
+    #[cfg(feature = "tls")]
+    TlsConnect,
+    /// TLS connect without certificate verification.
+    #[cfg(feature = "tls")]
+    TlsConnectInsecure,
 }
 
 impl IoBuiltin {
@@ -188,6 +198,10 @@ impl IoBuiltin {
             Self::UdpRecvFrom => "recv_from",
             Self::UdpRecvFromWait => "recv_from_wait",
             Self::UdpLocalPort => "local_port",
+            #[cfg(feature = "tls")]
+            Self::TlsConnect => "connect",
+            #[cfg(feature = "tls")]
+            Self::TlsConnectInsecure => "connect_insecure",
         }
     }
 
@@ -216,6 +230,10 @@ impl IoBuiltin {
             Self::UdpRecvFrom => "udp_recv_from",
             Self::UdpRecvFromWait => "udp_recv_from_wait",
             Self::UdpLocalPort => "udp_local_port",
+            #[cfg(feature = "tls")]
+            Self::TlsConnect => "tls_connect",
+            #[cfg(feature = "tls")]
+            Self::TlsConnectInsecure => "tls_connect_insecure",
         }
     }
 
@@ -259,6 +277,12 @@ impl IoBuiltin {
         ]
     }
 
+    /// Exports of `io::net::tls`.
+    #[cfg(feature = "tls")]
+    pub fn tls() -> &'static [IoBuiltin] {
+        &[Self::TlsConnect, Self::TlsConnectInsecure]
+    }
+
     /// Every IO host native (for pipeline registration).
     pub fn all() -> &'static [IoBuiltin] {
         &[
@@ -284,6 +308,10 @@ impl IoBuiltin {
             Self::UdpRecvFrom,
             Self::UdpRecvFromWait,
             Self::UdpLocalPort,
+            #[cfg(feature = "tls")]
+            Self::TlsConnect,
+            #[cfg(feature = "tls")]
+            Self::TlsConnectInsecure,
         ]
     }
 }
@@ -571,6 +599,15 @@ impl VirtualModules {
             .map(|kind| BuiltinExport::IoFn { kind: *kind })
             .collect();
         modules.insert(IO_NET_UDP_MODULE, udp_exports);
+
+        #[cfg(feature = "tls")]
+        {
+            let tls_exports: Vec<BuiltinExport> = IoBuiltin::tls()
+                .iter()
+                .map(|kind| BuiltinExport::IoFn { kind: *kind })
+                .collect();
+            modules.insert(IO_NET_TLS_MODULE, tls_exports);
+        }
 
         let mut thread_exports = vec![
             BuiltinExport::OpaqueType { name: "Thread" },
@@ -940,6 +977,24 @@ mod tests {
         assert_eq!(IoBuiltin::UdpBind.native_name(), "udp_bind");
         assert_eq!(IoBuiltin::TcpConnect.as_str(), "connect");
         assert_eq!(IoBuiltin::TcpConnect.native_name(), "tcp_connect");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn io_net_tls_exports_connect_and_insecure() {
+        let vm = VirtualModules::new();
+        let exports = vm
+            .resolve_glob(&["io".into(), "net".into(), "tls".into()])
+            .expect("io::net::tls");
+        assert!(exports.iter().any(|e| e.short_name() == "connect"));
+        assert!(exports.iter().any(|e| e.short_name() == "connect_insecure"));
+        assert_eq!(IoBuiltin::TlsConnect.native_name(), "tls_connect");
+        assert_eq!(
+            IoBuiltin::TlsConnectInsecure.native_name(),
+            "tls_connect_insecure"
+        );
+        assert_eq!(IoBuiltin::TlsConnect.as_str(), "connect");
+        assert_eq!(IoBuiltin::TlsConnectInsecure.as_str(), "connect_insecure");
     }
 
     #[test]

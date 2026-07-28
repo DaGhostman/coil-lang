@@ -1091,6 +1091,10 @@ impl Checker {
                 fun(&[string(), int()], res_stream)
             }
             IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
+            #[cfg(feature = "tls")]
+            IoBuiltin::TlsConnect | IoBuiltin::TlsConnectInsecure => {
+                fun(&[string(), int()], res_stream)
+            }
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
                 fun(&[string(), int()], res_stream)
             }
