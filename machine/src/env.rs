@@ -235,6 +235,8 @@ fn try_host_exec(heap: &mut Heap, args: &[Value]) -> Result<i64, EnvErrorTag> {
         return Err(EnvErrorTag::InvalidInput);
     }
     let argv = value_as_string_array(heap, args[1])?;
+    // Inherits VM cwd + env; runtime gate is `ALLOW_EXEC` / coil.toml
+    // `[env] allow_exec` (compile still warns on `exec` / `exit`).
     let status = Command::new(&program)
         .args(&argv)
         .status()

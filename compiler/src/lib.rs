@@ -3770,8 +3770,9 @@ impl Compiler {
         }
 
         // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
-        // after unbox; float reinterprets IEEE bits as int; unit is 0; string
-        // uses the intern FNV via HostInvoke `hash_string`.
+        // after unbox; float returns the float `Value` bits read via
+        // `Value::as_int()` (IEEE bit pattern in the current Value encoding);
+        // unit is 0; string uses the intern FNV via HostInvoke `hash_string`.
         for (ty, tag) in [
             ("int", ValueTag::Int),
             ("byte", ValueTag::Int),

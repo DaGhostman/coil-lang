@@ -569,7 +569,12 @@ See `examples/panic.hy`.
 
 ## Primitive casts (`expr as T`)
 
-Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). `float as int` truncates toward zero (not `round`/`floor`). Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
+Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). Semantics match Rust:
+
+- `float as int` truncates toward zero (not `round`/`floor`). `NaN` / `±inf` follow Rust `f64 as i64` (e.g. `NaN` → `0`).
+- `int as byte` keeps the low 8 bits (`257 as byte` → `1`; negatives wrap the same way, e.g. `-1 as byte` → `255`).
+
+Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
 
 ---
 
@@ -587,7 +592,7 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 
 ## `env` module
 
-`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The child inherits the VM process **cwd** and **environment**; there are no per-call overrides yet. The compiler emits a **warning** when `exec` or `exit` is used. By default `env::exec` is **disabled** at runtime; set `coil.toml` `[env] allow_exec = true` to enable it in trusted projects.
+`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The child inherits the VM process **cwd** and **environment**; there are no per-call overrides yet. The compiler emits a **warning** when `exec` or `exit` is used. **Only `exec` is runtime-gated:** by default it returns `EnvError::ExecDisabled` unless `coil.toml` `[env] allow_exec = true`. `exit` is compile-warned only (not blocked at runtime).
 
 ---
 
@@ -620,7 +625,7 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 
 ## `ord` and `char`
 
-Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> string`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
+Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> string`. Out-of-range `char` inputs (not in `0..=255`) return an empty string `""` rather than a `Result` error — prefer keeping the argument typed as `byte`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
 
 ---
 

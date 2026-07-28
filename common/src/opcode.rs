@@ -757,8 +757,9 @@ mod tests {
 
     #[test]
     fn instruction_from_u8_covers_last_appended_variant() {
-        // ARCHIVE stability: last variant must remain decodable.
-        let last = Instruction::MakeFn as u8;
+        // ARCHIVE stability: last variant must remain decodable (keep in sync
+        // with machine release `promise!` ceiling).
+        let last = Instruction::CastBoolToInt as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }

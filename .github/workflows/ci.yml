@@ -25,12 +25,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libffi-dev build-essential
+          sudo apt-get install -y libffi-dev libpcre2-dev build-essential
 
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi || true
+          brew install libffi pcre2 || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

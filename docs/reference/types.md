@@ -601,7 +601,7 @@ class Cell {
 | `Default` | `default` | First enum variant / zero field values for classes |
 | `Hash` | `hash` | Tag + recursive `field.hash()` mix (`* 31 + hash`); builtins for `int`/`byte`/`bool`/`float`/`string`/`unit`; nested `Hash` types recurse |
 | `String` | `to_string` | `format` with `%v` per field |
-| `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class) |
+| `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class). **MVP:** each payload field is cast through `byte` (`as_byte` / `as_int`); values outside `0..=255` and non-byte types silently corrupt — use only small integer / `byte` fields until a real encoding exists |
 | `Deserialize` | `deserialize` | Inverse of `Serialize` from `[byte]`; invalid tag → `panic` |
 | `Send` | _(marker)_ | Empty instance (thread spawn still uses structural sendability) |
 | `Sensitive` | _(marker)_ | Empty instance (redaction hooks deferred) |

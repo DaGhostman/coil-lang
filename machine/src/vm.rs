@@ -5130,6 +5130,23 @@ mod tests {
     }
 
     #[test]
+    fn cast_int_to_byte_wraps_negatives() {
+        let mut vm = Machine::<8>::default();
+        // Negatives need the constant pool (inline CONST cannot encode them).
+        let neg1 = Value::from(-1_i64).raw() as u64;
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CastIntToByte),
+                Byte::new(Instruction::HALT),
+            ],
+            &[neg1],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 255);
+    }
+
+    #[test]
     fn cast_int_to_bool_normalizes_nonzero() {
         let mut vm = Machine::<8>::default();
         vm.run(&[

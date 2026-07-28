@@ -499,6 +499,7 @@ pub fn host_argon2id_hash(heap: &mut Heap, args: &[Value]) -> Value {
             return Err(CryptoErrorTag::InvalidLength);
         }
         let salt_b64 = base64_salt(&salt)?;
+        // Fixed MVP params (not caller-tunable): 19 MiB, 2 iters, parallelism 1.
         let params = Params::new(19 * 1024, 2, 1, None).map_err(|_| CryptoErrorTag::InvalidInput)?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
         let hash = argon2
