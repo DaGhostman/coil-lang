@@ -48,6 +48,9 @@ pub const ENV_MODULE: &str = "env";
 /// Cryptographic primitives (`sha256`, `random_bytes`, …).
 pub const CRYPTO_MODULE: &str = "crypto";
 
+/// PCRE2 regex (`compile`, `is_match`, `find_all`, …).
+pub const REGEX_MODULE: &str = "regex";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -687,6 +690,25 @@ impl VirtualModules {
         ]));
         modules.insert(CRYPTO_MODULE, crypto_exports);
 
+        let mut regex_exports = vec![
+            BuiltinExport::OpaqueType { name: "Regex" },
+            BuiltinExport::Enum {
+                name: common::BUILTIN_REGEX_ERROR_ENUM,
+            },
+        ];
+        regex_exports.extend(host_exports(&[
+            ("compile", "regex_compile"),
+            ("is_match", "regex_is_match"),
+            ("find", "regex_find"),
+            ("find_all", "regex_find_all"),
+            ("captures", "regex_captures"),
+            ("captures_all", "regex_captures_all"),
+            ("split", "regex_split"),
+            ("replace", "regex_replace"),
+            ("replace_all", "regex_replace_all"),
+        ]));
+        modules.insert(REGEX_MODULE, regex_exports);
+
         Self { modules }
     }
 
@@ -961,6 +983,14 @@ mod tests {
             Some(BuiltinExport::HostFn {
                 surface: "sha256",
                 registry: "crypto_sha256"
+            })
+        ));
+        assert!(vm.resolves_use(&["regex".into()], "*"));
+        assert!(matches!(
+            vm.resolve_item(&["regex".into()], "compile"),
+            Some(BuiltinExport::HostFn {
+                surface: "compile",
+                registry: "regex_compile"
             })
         ));
     }

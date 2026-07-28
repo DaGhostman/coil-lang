@@ -465,6 +465,23 @@ impl Pipeline {
         }
     }
 
+    fn register_regex_natives(&mut self) {
+        use machine::REGEX_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in REGEX_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("regex native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
     /// Install shared bytecode on `machine` for `thread::spawn` workers.
     pub fn wire_thread_program<const N: usize>(
         &self,
@@ -701,6 +718,7 @@ impl Pipeline {
         pipeline.register_time_natives();
         pipeline.register_env_natives();
         pipeline.register_crypto_natives();
+        pipeline.register_regex_natives();
         pipeline.register_prelude_char_ord_natives();
         pipeline.register_thread_natives();
         pipeline.register_packed_la_natives();
