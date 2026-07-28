@@ -812,7 +812,9 @@ use io::*;
 use transport::write_then_read;
 
 fn roundtrip() -> Result<int, IoError> {
-    return write_then_read("nested.bin");
+    // Unwrap once — `return write_then_read(...)` would Ok-wrap the Result.
+    let n = write_then_read("nested.bin")?;
+    return n;
 }
 "#,
         ),
