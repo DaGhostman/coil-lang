@@ -4,7 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["crypto", "time"]
+crypto = [
+    "dep:sha2",
+    "dep:blake3",
+    "dep:hmac",
+    "dep:chacha20poly1305",
+    "dep:aes-gcm",
+    "dep:ed25519-dalek",
+    "dep:x25519-dalek",
+    "dep:argon2",
+    "dep:getrandom",
+    "dep:zeroize",
+    "dep:subtle",
+]
+time = ["dep:chrono"]
 vm_profile = []
 
 [dependencies]
@@ -13,18 +27,18 @@ rkyv = "0.8.12"
 libloading = "0.9"
 libffi = "5.1.1"
 libc = "0.2"
-sha2 = "0.11.0"
-blake3 = "1.8.5"
-hmac = "0.13.0"
-chacha20poly1305 = "0.11.0"
-aes-gcm = "0.11.0"
-ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
-x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-argon2 = "0.5.3"
-getrandom = "0.4.3"
-zeroize = "1.9.0"
-subtle = "2.6.1"
-chrono = "0.4.45"
+sha2 = { version = "0.11.0", optional = true }
+blake3 = { version = "1.8.5", optional = true }
+hmac = { version = "0.13.0", optional = true }
+chacha20poly1305 = { version = "0.11.0", optional = true }
+aes-gcm = { version = "0.11.0", optional = true }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"], optional = true }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"], optional = true }
+argon2 = { version = "0.5.3", optional = true }
+getrandom = { version = "0.4.3", optional = true }
+zeroize = { version = "1.9.0", optional = true }
+subtle = { version = "2.6.1", optional = true }
+chrono = { version = "0.4.45", optional = true }
 pcre2 = "0.2"
 
 [dev-dependencies]

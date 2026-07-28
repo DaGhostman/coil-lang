@@ -37,6 +37,17 @@ The virtual `regex` module links **libpcre2** via the `pcre2` / `pcre2-sys` crat
 
 If the system library is missing, `pcre2-sys` may build PCRE2 from source (needs a C toolchain).
 
+### Optional Cargo features (`crypto` / `time`)
+
+The default build enables the virtual `crypto` and `time` modules (and their crate dependencies). Embedders can strip them:
+
+```toml
+machine = { path = "...", default-features = false, features = ["time"] }
+# or: features = ["crypto"]
+```
+
+The `compiler` and root `coil` crates mirror the same feature names. With both disabled, `use crypto::*` / `use time::*` will not resolve.
+
 ## Build the project
 
 Clone the repository and build the workspace from the root:

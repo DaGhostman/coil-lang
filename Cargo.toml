@@ -23,7 +23,9 @@ name = "fib"
 harness = false
 
 [features]
-default = []
+default = ["crypto", "time"]
+crypto = ["machine/crypto", "compiler/crypto"]
+time = ["machine/time", "compiler/time"]
 
 [profile.release]
 opt-level=3

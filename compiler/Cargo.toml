@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["crypto", "time"]
+crypto = ["machine/crypto"]
+time = ["machine/time"]
 pratt = []
 
 [dependencies]
