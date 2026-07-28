@@ -728,6 +728,95 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
     assert_eq!(output, "a,b,");
 }
 
+/// Dependency modules that call IO HostInvoke + `?` must share the same
+/// constant pool as the entry (same class of bug as
+/// `multi_file_try_operator_pool_survives_module_link`, but with real Stream
+/// IO rather than thread channels).
+#[test]
+fn multi_file_io_hostinvoke_try_in_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use io::*;
+use helper::write_greeting;
+
+fn main() {
+    write_greeting()?;
+    print "ok";
+}
+"#,
+        ),
+        (
+            "src/helper.hy",
+            r#"
+use io::*;
+
+fn write_greeting() -> Result<(), IoError> {
+    let path = "greeting.bin";
+    let h: byte = 104;
+    let i: byte = 105;
+    let nl: byte = 10;
+    let payload: [byte] = [h, i, nl];
+    let w = open(path, "w")?;
+    write_all(w, payload)?;
+    close(w)?;
+    return ();
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("io_host_try", &manifest, &files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("MSG: {}", msg.message());
+            }
+            panic!("compile failed");
+        }
+    };
+
+    let mut oob = Vec::new();
+    for (i, b) in bytecode.iter().enumerate() {
+        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
+            let idx = (b.operand_u32() & 0xFFFF) as usize;
+            if idx >= constants.len() {
+                oob.push((i, idx));
+            }
+        }
+    }
+    assert!(
+        oob.is_empty(),
+        "JumpIfMatch pool index out of range after multi-file IO link: \
+         {oob:?} (constants.len() = {})",
+        constants.len()
+    );
+
+    let output = run_bytecode(bytecode, constants, &pipeline);
+    assert_eq!(output, "ok");
+
+    let written = std::fs::read(root.join("greeting.bin")).expect("dependency wrote greeting.bin");
+    assert_eq!(written, b"hi\n");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);
