@@ -5497,6 +5497,8 @@ impl Compiler {
     }
 
     /// Resolve enum name for field access via the codegen side-table.
+    /// Receiver enum name for field-access codegen (kept for tests / callers).
+    #[allow(dead_code)]
     fn enum_name_for_receiver(&mut self, receiver: &Output) -> Option<String> {
         // Cannot use infer cache inside function bodies (ID misalignment) or env (frame popped).
         let ty = self.receiver_type(receiver)?;
@@ -9916,13 +9918,31 @@ impl Compiler {
                 // defensive path) rather than GetField, which would
                 // corrupt ObjEnum stacks.
                 let enum_field_index = if !is_record && !is_class {
-                    self.enum_name_for_receiver(receiver).and_then(|name| {
-                        if self.checker.is_class(&name) {
+                    self.receiver_type(receiver).and_then(|ty| {
+                        use crate::typechecking::ty::Ty;
+                        if self.checker.ty_is_class(&ty) {
                             return None;
                         }
-                        self.checker
-                            .field_index_for(&name, field)
-                            .map(|(_variant, idx)| idx)
+                        match &ty {
+                            Ty::Constructor { tag, owner, .. } => {
+                                let name = extract_enum_name(owner)?;
+                                if self.checker.is_class(&name) {
+                                    return None;
+                                }
+                                self.checker
+                                    .field_index_for_tagged(&name, field, Some(*tag))
+                                    .map(|(_variant, idx)| idx)
+                            }
+                            _ => {
+                                let name = extract_enum_name(&ty)?;
+                                if self.checker.is_class(&name) {
+                                    return None;
+                                }
+                                self.checker
+                                    .field_index_for(&name, field)
+                                    .map(|(_variant, idx)| idx)
+                            }
+                        }
                     })
                 } else {
                     None

@@ -12477,6 +12477,61 @@ impl Checker {
             let pattern_range = arm.body.0.into_range();
             let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee, &pattern_range);
 
+            // Narrow an Identifier scrutinee to the matched variant so
+            // `p.0` / `p.field` inside the arm use tagged field lookup
+            // (tuple indices are shared across variants otherwise).
+            let mut refined_scrut: Option<(String, Option<Ty>)> = None;
+            if let Expression::Identifier(scrut_name) = scrutinee.1.as_ref()
+                && let Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    ..
+                } = &arm.pattern
+            {
+                if let Some(tag) = self
+                    .enum_tags
+                    .get(*enum_name)
+                    .and_then(|t| t.get(*variant_name).copied())
+                {
+                    let arity = self
+                        .enum_arities
+                        .get(*enum_name)
+                        .and_then(|a| a.get(tag as usize).copied())
+                        .unwrap_or(0);
+                    let owner = match &resolved_scrutinee {
+                        Ty::Sum { .. } => resolved_scrutinee.clone(),
+                        Ty::Constructor { owner, .. } => owner.as_ref().clone(),
+                        Ty::Con(name) => {
+                            let variant_names =
+                                self.enums.get(name.as_str()).cloned().unwrap_or_default();
+                            let payloads = self
+                                .enum_payloads
+                                .get(name.as_str())
+                                .cloned()
+                                .unwrap_or_default();
+                            let variants: Vec<(String, EnumVariantPayloadTy)> =
+                                variant_names.into_iter().zip(payloads).collect();
+                            Ty::Sum {
+                                name: name.clone(),
+                                variants,
+                            }
+                        }
+                        other => other.clone(),
+                    };
+                    let ctor = Ty::Constructor {
+                        owner: Box::new(owner),
+                        tag,
+                        arity,
+                    };
+                    let prev_cg = self.codegen_var_types.get(*scrut_name).cloned();
+                    self.env
+                        .insert_top((*scrut_name).to_string(), Scheme::mono(ctor.clone()));
+                    self.codegen_var_types
+                        .insert((*scrut_name).to_string(), ctor);
+                    refined_scrut = Some(((*scrut_name).to_string(), prev_cg));
+                }
+            }
+
             // Step 3: unify pattern type with scrutinee.
             self.unify(
                 &resolved_scrutinee,
@@ -12491,6 +12546,16 @@ impl Checker {
 
             // Step 5: infer body, unify with result.
             let body_ty = self.infer(&arm.body);
+            if let Some((name, prev_cg)) = refined_scrut {
+                match prev_cg {
+                    Some(ty) => {
+                        self.codegen_var_types.insert(name, ty);
+                    }
+                    None => {
+                        self.codegen_var_types.remove(&name);
+                    }
+                }
+            }
             if first {
                 result_ty = body_ty;
                 first = false;
@@ -13480,9 +13545,45 @@ impl Checker {
     }
 
     /// Field index in a record-shaped variant (codegen).
+    ///
+    /// When `specific_tag` is set (match-narrowed receiver), only that
+    /// variant is searched — required for shared tuple indices `"0"`, `"1"`, …
     pub fn field_index_for(&self, enum_name: &str, field: &str) -> Option<(String, u16)> {
+        self.field_index_for_tagged(enum_name, field, None)
+    }
+
+    /// Like [`Self::field_index_for`], optionally restricted to one variant tag.
+    pub fn field_index_for_tagged(
+        &self,
+        enum_name: &str,
+        field: &str,
+        specific_tag: Option<u32>,
+    ) -> Option<(String, u16)> {
         let payloads = self.enum_payloads.get(enum_name)?;
         let names = self.enums.get(enum_name)?;
+        if let Some(tag) = specific_tag {
+            let i = tag as usize;
+            let payload = payloads.get(i)?;
+            let variant_name = names.get(i)?.clone();
+            match payload {
+                EnumVariantPayloadTy::Record(fields) => {
+                    for (j, (fname, _)) in fields.iter().enumerate() {
+                        if fname == field {
+                            return Some((variant_name, j as u16));
+                        }
+                    }
+                }
+                EnumVariantPayloadTy::Tuple(parts) => {
+                    if let Ok(idx) = field.parse::<usize>() {
+                        if idx < parts.len() {
+                            return Some((variant_name, idx as u16));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         // Prefer declared record field names.
         for (i, payload) in payloads.iter().enumerate() {
             if let EnumVariantPayloadTy::Record(fields) = payload {
@@ -16420,6 +16521,31 @@ fn main() {
             msgs.iter()
                 .any(|m| m.message().contains("narrow with match first")),
             "expected 'narrow with match first' diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_tuple_field_after_match_narrows_shared_index() {
+        // Derive Show walks `recv.0` via AST Access. Multiple tuple
+        // variants share index `"0"`; match refinement must make this
+        // typecheck (and `%v` must resolve Show).
+        let src = r#"
+#[derive(Show, Eq)]
+enum Box { S(string), B(bool) }
+fn main() {
+    print "%v,", Box::S("x");
+    print "%z", Box::S("x") == Box::S("x");
+}
+"#;
+        let mut ast = Pratt::default().parse(src).expect("parse");
+        let _ = crate::attrs::expand_program(&mut ast);
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected derived Show/Eq with shared tuple indices to typecheck, got: {:?}",
             msgs
         );
     }
