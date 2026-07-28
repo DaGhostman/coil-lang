@@ -516,8 +516,6 @@ pub fn parse(heap: &mut Heap, text: Value, fmt: Value) -> Value {
     as_result_value(heap, r)
 }
 
-pub type TimeHostFn = fn(&mut Heap, &[Value]) -> Value;
-
 fn time_wrong_arity(heap: &mut Heap) -> Value {
     as_result_value(heap, Err(TimeErrorTag::InvalidInput))
 }
@@ -640,23 +638,24 @@ pub fn host_time_parse(heap: &mut Heap, args: &[Value]) -> Value {
     }
 }
 
-pub const TIME_HOST_FUNCTIONS: &[(&str, TimeHostFn)] = &[
-    ("time_timestamp", host_time_timestamp),
-    ("time_sleep_ms", host_time_sleep_ms),
-    ("time_instant_now", host_time_instant_now),
-    ("time_elapsed_nanos", host_time_elapsed_nanos),
-    ("time_elapsed_millis", host_time_elapsed_millis),
-    ("time_period", host_time_period),
-    ("time_add", host_time_add),
-    ("time_sub", host_time_sub),
-    ("time_period_add", host_time_period_add),
-    ("time_period_sub", host_time_period_sub),
-    ("time_date", host_time_date),
-    ("time_date_from_period", host_time_date_from_period),
-    ("time_date_from_epoch_period", host_time_date_from_epoch_period),
-    ("time_epoch", host_time_epoch),
-    ("time_format", host_time_format),
-    ("time_parse", host_time_parse),
+/// Pipeline wiring: `(registry_name, arity, host_fn)`.
+pub const TIME_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
+    ("time_timestamp", 0, host_time_timestamp),
+    ("time_sleep_ms", 1, host_time_sleep_ms),
+    ("time_instant_now", 0, host_time_instant_now),
+    ("time_elapsed_nanos", 1, host_time_elapsed_nanos),
+    ("time_elapsed_millis", 1, host_time_elapsed_millis),
+    ("time_period", 9, host_time_period),
+    ("time_add", 2, host_time_add),
+    ("time_sub", 2, host_time_sub),
+    ("time_period_add", 2, host_time_period_add),
+    ("time_period_sub", 2, host_time_period_sub),
+    ("time_date", 0, host_time_date),
+    ("time_date_from_period", 1, host_time_date_from_period),
+    ("time_date_from_epoch_period", 1, host_time_date_from_epoch_period),
+    ("time_epoch", 0, host_time_epoch),
+    ("time_format", 2, host_time_format),
+    ("time_parse", 2, host_time_parse),
 ];
 
 #[cfg(test)]
@@ -766,5 +765,16 @@ mod tests {
         let out_nanos = read_timestamp_nanos(&mut heap, out).unwrap();
         // 2024-02-01 00:00:00 UTC
         assert_eq!(out_nanos, 1_706_745_600_i64 * NS_PER_SEC);
+    }
+
+    #[test]
+    fn time_wiring_arities() {
+        assert_eq!(TIME_WIRING.len(), 16);
+        let by_name: std::collections::BTreeMap<&str, usize> =
+            TIME_WIRING.iter().map(|&(n, a, _)| (n, a)).collect();
+        assert_eq!(by_name["time_timestamp"], 0);
+        assert_eq!(by_name["time_period"], 9);
+        assert_eq!(by_name["time_add"], 2);
+        assert_eq!(by_name["time_sleep_ms"], 1);
     }
 }

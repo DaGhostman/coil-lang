@@ -248,30 +248,16 @@ fn try_host_exec(heap: &mut Heap, args: &[Value]) -> Result<i64, EnvErrorTag> {
     }
 }
 
-/// Stable host-native registry keys for pipeline wiring.
-pub const ENV_HOST_NATIVE_NAMES: &[&str] = &[
-    "env_args",
-    "env_var",
-    "env_set_var",
-    "env_remove_var",
-    "env_cwd",
-    "env_set_cwd",
-    "env_exit",
-    "env_exec",
-];
-
-pub type EnvHostFn = fn(&mut Heap, &[Value]) -> Value;
-
-/// `(registry_name, host_fn)` pairs for pipeline host-native registration.
-pub const ENV_HOST_FUNCTIONS: &[(&str, EnvHostFn)] = &[
-    ("env_args", host_args),
-    ("env_var", host_var),
-    ("env_set_var", host_set_var),
-    ("env_remove_var", host_remove_var),
-    ("env_cwd", host_cwd),
-    ("env_set_cwd", host_set_cwd),
-    ("env_exit", host_exit),
-    ("env_exec", host_exec),
+/// Pipeline wiring: `(registry_name, arity, host_fn)`.
+pub const ENV_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
+    ("env_args", 0, host_args),
+    ("env_var", 1, host_var),
+    ("env_set_var", 2, host_set_var),
+    ("env_remove_var", 1, host_remove_var),
+    ("env_cwd", 0, host_cwd),
+    ("env_set_cwd", 1, host_set_cwd),
+    ("env_exit", 1, host_exit),
+    ("env_exec", 2, host_exec),
 ];
 
 // Pipeline registry aliases (mirror `thread_spawn` pattern).
@@ -432,10 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn env_host_functions_matches_names() {
-        assert_eq!(ENV_HOST_FUNCTIONS.len(), ENV_HOST_NATIVE_NAMES.len());
-        for (i, (name, _)) in ENV_HOST_FUNCTIONS.iter().enumerate() {
-            assert_eq!(*name, ENV_HOST_NATIVE_NAMES[i]);
-        }
+    fn env_wiring_arities() {
+        assert_eq!(ENV_WIRING.len(), 8);
+        let by_name: std::collections::BTreeMap<&str, usize> =
+            ENV_WIRING.iter().map(|&(n, a, _)| (n, a)).collect();
+        assert_eq!(by_name["env_args"], 0);
+        assert_eq!(by_name["env_cwd"], 0);
+        assert_eq!(by_name["env_set_var"], 2);
+        assert_eq!(by_name["env_exec"], 2);
+        assert_eq!(by_name["env_var"], 1);
     }
 }

@@ -263,8 +263,6 @@ fn wrong_arity(heap: &mut Heap) -> Value {
     alloc_result_err(heap, err)
 }
 
-pub type FsHostFn = fn(&mut Heap, &[Value]) -> Value;
-
 macro_rules! fs_host_1 {
     ($host:ident, $inner:ident) => {
         pub fn $host(heap: &mut Heap, args: &[Value]) -> Value {
@@ -304,24 +302,24 @@ fs_host_2!(host_fs_rename, fs_rename);
 fs_host_2!(host_fs_copy, fs_copy);
 fs_host_2!(host_fs_symlink, fs_symlink);
 
-/// `(registry_name, host_fn)` for pipeline registration.
-pub const FS_HOST_FUNCTIONS: &[(&str, FsHostFn)] = &[
-    ("fs_exists", host_fs_exists),
-    ("fs_is_file", host_fs_is_file),
-    ("fs_is_dir", host_fs_is_dir),
-    ("fs_is_symlink", host_fs_is_symlink),
-    ("fs_metadata", host_fs_metadata),
-    ("fs_create_dir", host_fs_create_dir),
-    ("fs_create_dir_all", host_fs_create_dir_all),
-    ("fs_remove_file", host_fs_remove_file),
-    ("fs_remove_dir", host_fs_remove_dir),
-    ("fs_remove_dir_all", host_fs_remove_dir_all),
-    ("fs_rename", host_fs_rename),
-    ("fs_copy", host_fs_copy),
-    ("fs_read_link", host_fs_read_link),
-    ("fs_symlink", host_fs_symlink),
-    ("fs_list_dir", host_fs_list_dir),
-    ("fs_realpath", host_fs_realpath),
+/// Pipeline wiring: `(registry_name, arity, host_fn)`.
+pub const FS_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
+    ("fs_exists", 1, host_fs_exists),
+    ("fs_is_file", 1, host_fs_is_file),
+    ("fs_is_dir", 1, host_fs_is_dir),
+    ("fs_is_symlink", 1, host_fs_is_symlink),
+    ("fs_metadata", 1, host_fs_metadata),
+    ("fs_create_dir", 1, host_fs_create_dir),
+    ("fs_create_dir_all", 1, host_fs_create_dir_all),
+    ("fs_remove_file", 1, host_fs_remove_file),
+    ("fs_remove_dir", 1, host_fs_remove_dir),
+    ("fs_remove_dir_all", 1, host_fs_remove_dir_all),
+    ("fs_rename", 2, host_fs_rename),
+    ("fs_copy", 2, host_fs_copy),
+    ("fs_read_link", 1, host_fs_read_link),
+    ("fs_symlink", 2, host_fs_symlink),
+    ("fs_list_dir", 1, host_fs_list_dir),
+    ("fs_realpath", 1, host_fs_realpath),
 ];
 
 #[cfg(test)]
@@ -564,5 +562,16 @@ mod tests {
         let _ = fs::remove_file(&link);
         let _ = fs::remove_file(&target);
         let _ = fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn fs_wiring_arities() {
+        assert_eq!(FS_WIRING.len(), 16);
+        let by_name: std::collections::BTreeMap<&str, usize> =
+            FS_WIRING.iter().map(|&(n, a, _)| (n, a)).collect();
+        assert_eq!(by_name["fs_exists"], 1);
+        assert_eq!(by_name["fs_rename"], 2);
+        assert_eq!(by_name["fs_copy"], 2);
+        assert_eq!(by_name["fs_symlink"], 2);
     }
 }
