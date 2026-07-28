@@ -1178,7 +1178,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::TailCall as u8);
+            promise!(*bc as u8 <= Instruction::CastBoolToInt as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1455,6 +1455,31 @@ impl<const S: usize> Machine<S> {
                     // subsequent LOAD/BinSlotImm read the wrong slots.
                     sp = callee_sp;
                     ip = target;
+                }
+                Instruction::CastIntToFloat => {
+                    let v = self.stack.pop().as_int() as f64;
+                    self.stack.push(Value::from(v));
+                }
+                Instruction::CastFloatToInt => {
+                    // Truncate toward zero (`3.9 as int` → `3`); not floor/round.
+                    let v = self.stack.pop().as_float() as i64;
+                    self.stack.push(Value::from(v));
+                }
+                Instruction::CastIntToByte => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from((v as u8) as i64));
+                }
+                Instruction::CastByteToInt => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from(v & 0xff));
+                }
+                Instruction::CastIntToBool => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from((v != 0) as i64));
+                }
+                Instruction::CastBoolToInt => {
+                    let v = self.stack.pop().as_int();
+                    self.stack.push(Value::from(if v != 0 { 1 } else { 0 }));
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
@@ -5091,5 +5116,51 @@ mod tests {
         ];
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
+    }
+
+    #[test]
+    fn cast_int_to_byte_truncates_high_bits() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(257),
+            Byte::new(Instruction::CastIntToByte),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    #[test]
+    fn cast_int_to_byte_wraps_negatives() {
+        let mut vm = Machine::<8>::default();
+        // Negatives need the constant pool (inline CONST cannot encode them).
+        let neg1 = Value::from(-1_i64).raw() as u64;
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CastIntToByte),
+                Byte::new(Instruction::HALT),
+            ],
+            &[neg1],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 255);
+    }
+
+    #[test]
+    fn cast_int_to_bool_normalizes_nonzero() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(2),
+            Byte::new(Instruction::CastIntToBool),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+
+        vm.run(&[
+            const_int(0),
+            Byte::new(Instruction::CastIntToBool),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
     }
 }

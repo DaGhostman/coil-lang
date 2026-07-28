@@ -379,6 +379,94 @@ impl Pipeline {
         }
     }
 
+    fn register_fs_natives(&mut self) {
+        use machine::FS_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in FS_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("fs native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    #[cfg(feature = "time")]
+    fn register_time_natives(&mut self) {
+        use machine::TIME_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in TIME_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("time native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    fn register_env_natives(&mut self) {
+        use machine::ENV_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in ENV_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("env native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    #[cfg(feature = "crypto")]
+    fn register_crypto_natives(&mut self) {
+        use machine::CRYPTO_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in CRYPTO_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("crypto native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    fn register_regex_natives(&mut self) {
+        use machine::REGEX_WIRING;
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        for &(name, arity, host) in REGEX_WIRING {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("regex native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(host(heap, args)))
+                })));
+        }
+    }
+
     /// Install shared bytecode on `machine` for `thread::spawn` workers.
     pub fn wire_thread_program<const N: usize>(
         &self,
@@ -399,6 +487,43 @@ impl Pipeline {
     /// Bytecode entry offset for a registered function (for tests).
     pub fn function_offset(&self, name: &str) -> Option<usize> {
         self.compiler.function_offset(name)
+    }
+
+    /// Prelude `ord` / `char` / string-`Hash` host natives (auto-imported).
+    fn register_prelude_char_ord_natives(&mut self) {
+        use machine::char_ord::{prelude_char, prelude_hash_string, prelude_ord};
+        use machine::{FfiSignature, FfiType, HostClosureFn};
+
+        let ord_sig =
+            FfiSignature::from_parts("ord".to_string(), vec![FfiType::Int], FfiType::Int)
+                .expect("ord signature");
+        let ord_id = self.host_natives.len();
+        self.compiler.register_native_id("ord", ord_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(ord_sig, |heap, args| {
+                Ok(Some(prelude_ord(heap, args)))
+            })));
+
+        let char_sig =
+            FfiSignature::from_parts("char".to_string(), vec![FfiType::Int], FfiType::Int)
+                .expect("char signature");
+        let char_id = self.host_natives.len();
+        self.compiler.register_native_id("char", char_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(char_sig, |heap, args| {
+                Ok(Some(prelude_char(heap, args)))
+            })));
+
+        // Internal: `Hash__string__hash` thunk — not a userland free function.
+        let hash_sig =
+            FfiSignature::from_parts("hash_string".to_string(), vec![FfiType::String], FfiType::Int)
+                .expect("hash_string signature");
+        let hash_id = self.host_natives.len();
+        self.compiler.register_native_id("hash_string", hash_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(hash_sig, |heap, args| {
+                Ok(Some(prelude_hash_string(heap, args)))
+            })));
     }
 
     /// Approach A packed LA kernels via existing `HostInvoke` (no new opcodes —
@@ -567,10 +692,22 @@ impl Pipeline {
             messages_emitted: 0,
         };
         match Manifest::load(&project_root) {
-            Ok(m) => pipeline.manifest = m,
+            Ok(m) => {
+                pipeline.manifest = m.clone();
+                machine::env::set_allow_exec(m.allow_exec);
+            }
             Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
         }
         pipeline.register_io_natives();
+        pipeline.register_fs_natives();
+        #[cfg(feature = "time")]
+        pipeline.register_time_natives();
+        pipeline.register_env_natives();
+        #[cfg(feature = "crypto")]
+        pipeline.register_crypto_natives();
+        #[cfg(feature = "regex")]
+        pipeline.register_regex_natives();
+        pipeline.register_prelude_char_ord_natives();
         pipeline.register_thread_natives();
         pipeline.register_packed_la_natives();
         pipeline
@@ -1218,6 +1355,7 @@ impl Pipeline {
         if root != self.project_root {
             self.project_root = root.clone();
             self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
+            machine::env::set_allow_exec(self.manifest.allow_exec);
         }
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);

@@ -2,6 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "crypto")]
+use crate::crypto_hasher_state::ObjCryptoHasher;
+#[cfg(feature = "regex")]
+use crate::regex_state::ObjRegex;
+
 const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
 const GC_GROWTH_FACTOR: usize = 2;
 
@@ -248,6 +253,14 @@ impl Heap {
             Object::RwLock(l) => {
                 l.release();
             }
+            #[cfg(feature = "crypto")]
+            Object::CryptoHasher(h) => {
+                h.release();
+            }
+            #[cfg(feature = "regex")]
+            Object::Regex(r) => {
+                r.release();
+            }
         }
     }
 
@@ -275,7 +288,45 @@ impl Heap {
         self.addr_index.get(&addr).copied()
     }
 
-    /// Write back FFI scratch-buffer values into a live `ObjArray`.
+    #[cfg(feature = "crypto")]
+    pub fn with_crypto_hasher<R>(
+        &mut self,
+        addr: u64,
+        f: impl FnOnce(&mut ObjCryptoHasher) -> R,
+    ) -> Option<R> {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::CryptoHasher(gc) = reference {
+                    return Some(f(gc.payload_mut()));
+                }
+                return None;
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    #[cfg(feature = "regex")]
+    pub fn with_regex<R>(
+        &mut self,
+        addr: u64,
+        f: impl FnOnce(&mut ObjRegex) -> R,
+    ) -> Option<R> {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::Regex(gc) = reference {
+                    return Some(f(gc.payload_mut()));
+                }
+                return None;
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    /// Write back scratch-buffer values into a live `ObjArray`.
     pub fn update_array_elements(&mut self, addr: u64, values: &[i64]) {
         let mut current = self.head;
         while let Some(reference) = current {
@@ -389,6 +440,10 @@ pub type RefSender = Gc<ObjSender>;
 pub type RefReceiver = Gc<ObjReceiver>;
 pub type RefThreadMutex = Gc<ObjThreadMutex>;
 pub type RefRwLock = Gc<ObjRwLock>;
+#[cfg(feature = "crypto")]
+pub type RefCryptoHasher = Gc<ObjCryptoHasher>;
+#[cfg(feature = "regex")]
+pub type RefRegex = Gc<ObjRegex>;
 
 /// Kind of host-backed IO stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +476,10 @@ pub enum Object {
     Receiver(RefReceiver),
     Mutex(RefThreadMutex),
     RwLock(RefRwLock),
+    #[cfg(feature = "crypto")]
+    CryptoHasher(RefCryptoHasher),
+    #[cfg(feature = "regex")]
+    Regex(RefRegex),
 }
 
 impl Object {
@@ -443,6 +502,10 @@ impl Object {
             Self::Receiver(r) => r.mark(),
             Self::Mutex(m) => m.mark(),
             Self::RwLock(l) => l.mark(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.mark(),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -468,6 +531,10 @@ impl Object {
             Self::Receiver(r) => r.unmark(),
             Self::Mutex(m) => m.unmark(),
             Self::RwLock(l) => l.unmark(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.unmark(),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.unmark(),
         }
     }
 
@@ -491,6 +558,10 @@ impl Object {
             Self::Receiver(r) => r.is_marked(),
             Self::Mutex(m) => m.is_marked(),
             Self::RwLock(l) => l.is_marked(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.is_marked(),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.is_marked(),
         }
     }
 
@@ -544,6 +615,10 @@ impl Object {
             Self::Receiver(_) => {}
             Self::Mutex(_) => {}
             Self::RwLock(_) => {}
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(_) => {}
+            #[cfg(feature = "regex")]
+            Self::Regex(_) => {}
         }
     }
 
@@ -567,6 +642,10 @@ impl Object {
             Self::Receiver(r) => r.get_next(),
             Self::Mutex(m) => m.get_next(),
             Self::RwLock(l) => l.get_next(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.get_next(),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.get_next(),
         }
     }
 
@@ -589,6 +668,10 @@ impl Object {
             Self::Receiver(r) => r.set_next(next),
             Self::Mutex(m) => m.set_next(next),
             Self::RwLock(l) => l.set_next(next),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.set_next(next),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.set_next(next),
         }
     }
 
@@ -611,6 +694,10 @@ impl Object {
             Self::Receiver(r) => r.as_ptr() as u64,
             Self::Mutex(m) => m.as_ptr() as u64,
             Self::RwLock(l) => l.as_ptr() as u64,
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.as_ptr() as u64,
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.as_ptr() as u64,
         }
     }
 }
@@ -634,6 +721,10 @@ impl GcSized for Object {
             Self::Receiver(r) => r.size(),
             Self::Mutex(m) => m.size(),
             Self::RwLock(l) => l.size(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(h) => h.size(),
+            #[cfg(feature = "regex")]
+            Self::Regex(r) => r.size(),
         }
     }
 }
@@ -657,6 +748,10 @@ impl fmt::Display for Object {
             Self::Receiver(_) => write!(f, "<receiver 0x{:08x}>", self.addr()),
             Self::Mutex(_) => write!(f, "<mutex 0x{:08x}>", self.addr()),
             Self::RwLock(_) => write!(f, "<rwlock 0x{:08x}>", self.addr()),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(_) => write!(f, "<crypto_hasher 0x{:08x}>", self.addr()),
+            #[cfg(feature = "regex")]
+            Self::Regex(_) => write!(f, "<regex 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -681,6 +776,10 @@ impl Object {
             | Self::Receiver(_)
             | Self::Mutex(_)
             | Self::RwLock(_) => std::ptr::null(),
+            #[cfg(feature = "regex")]
+            Self::Regex(_) => std::ptr::null(),
+            #[cfg(feature = "crypto")]
+            Self::CryptoHasher(_) => std::ptr::null(),
         }
     }
 }

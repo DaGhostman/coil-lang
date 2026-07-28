@@ -92,6 +92,8 @@ pub struct Manifest {
     pub entry: Option<PathBuf>,
     /// Extra directories searched when resolving FFI library paths.
     pub ffi_search_paths: Vec<PathBuf>,
+    /// When false, `env::exec` fails at runtime with `ExecDisabled`.
+    pub allow_exec: bool,
 }
 
 impl Default for Manifest {
@@ -103,6 +105,7 @@ impl Default for Manifest {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: false,
         }
     }
 }
@@ -153,6 +156,7 @@ impl Manifest {
         let mut roots: Option<Vec<PathBuf>> = None;
         let mut entry: Option<PathBuf> = None;
         let mut ffi_search_paths: Option<Vec<PathBuf>> = None;
+        let mut allow_exec: Option<bool> = None;
         let mut current_section: Option<&'static str> = None;
 
         for (idx, raw_line) in source.lines().enumerate() {
@@ -172,6 +176,7 @@ impl Manifest {
                     "module" => Some("module"),
                     "entry" => Some("entry"),
                     "ffi" => Some("ffi"),
+                    "env" => Some("env"),
                     other => {
                         return Err(ManifestError::Parse {
                             line: line_num,
@@ -215,6 +220,13 @@ impl Manifest {
                     })?;
                     ffi_search_paths = Some(parsed.into_iter().map(PathBuf::from).collect());
                 }
+                ("env", "allow_exec") => {
+                    let parsed = parse_bool(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected `true` or `false`, got `{}`", value),
+                    })?;
+                    allow_exec = Some(parsed);
+                }
                 (section, key) => {
                     return Err(ManifestError::Parse {
                         line: line_num,
@@ -228,6 +240,7 @@ impl Manifest {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
             ffi_search_paths: ffi_search_paths.unwrap_or_default(),
+            allow_exec: allow_exec.unwrap_or(false),
         })
     }
 
@@ -365,6 +378,14 @@ fn parse_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     let inner = trimmed.strip_prefix('"')?.strip_suffix('"')?;
     Some(inner.to_string())
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parse a TOML-like array of double-quoted strings:
@@ -531,6 +552,7 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("vendor")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
@@ -626,6 +648,7 @@ mod tests {
             roots: vec![PathBuf::from("src"), PathBuf::from("builtins")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, Some("core::ffi::dload".to_string()));
@@ -645,6 +668,7 @@ mod tests {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
+            allow_exec: true,
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, None);
@@ -660,6 +684,35 @@ mod tests {
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
         assert_eq!(m.entry, None);
+        assert!(!m.allow_exec);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_reads_env_allow_exec_true() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_env_on");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[env]\nallow_exec = true\n[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+        let m = Manifest::load(&tmp).unwrap();
+        assert!(m.allow_exec);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_reads_env_allow_exec_false() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_env");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[env]\nallow_exec = false\n[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+        let m = Manifest::load(&tmp).unwrap();
+        assert!(!m.allow_exec);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -21,7 +21,7 @@ The table is updated when the peephole pass fuses instructions
 
 ## Archive version
 
-`ARCHIVE_VERSION` is **29**. Older `.hyc` files without `source_files` /
+`ARCHIVE_VERSION` is **30**. Older `.hyc` files without `source_files` /
 `debug_locs` are rejected at load time.
 
 ## Runtime `panic` output

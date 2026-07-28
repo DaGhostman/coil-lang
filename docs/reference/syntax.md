@@ -76,7 +76,7 @@ Multiple attributes stack (e.g. `#[derive(Show)] #[derive(Eq)]`). Unknown attrib
 | Identifiers | ASCII letters, digits, underscore; must not be a [keyword](keywords.md) |
 | Integers | Decimal (`42`, `-1`) |
 | Floats | Decimal with fraction (`1.0`, `3.14`) — parsed before postfix `.field` |
-| Strings | `"..."` — double-quoted, no escape sequences beyond `\"` not supported (no `\n` escapes in lexer) |
+| Strings | `"..."` — escapes: `\\` `\"` `\n` `\r` `\t` `\0` `\e` `\xHH` `\u{HEX}` |
 | Comments | `//` to end of line |
 | Whitespace | Insignificant except as token separator |
 
@@ -470,6 +470,8 @@ atom ::= match_expr
 ```
 
 `dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::*` (not keyword atoms).
+
+Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `float as int` truncates toward zero (not `round`/`floor`); see [Built-ins](built-ins.md#primitive-casts-expr-as-t).
 
 | Form | Syntax | Notes |
 |------|--------|-------|

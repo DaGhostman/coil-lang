@@ -16,6 +16,12 @@ coil does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/
 | `ffi::{dload,declare,invoke,Error,ErrorKind}` | Virtual module | Runtime FFI + typed errors (requires `use ffi::*`) |
 | `ffi::types::{Int,…}` | Virtual module | FFI type-tag constructors (requires `use ffi::types::*`) |
 | `io::{open,read,write,…}` | Virtual module | Non-blocking streams + sync adapters (requires `use io::*`) |
+| `io::fs::{exists,realpath,…}` | Virtual module | Path/metadata (requires `use io::fs::*`) |
+| `time::{timestamp,format,…}` | Virtual module | UTC timestamps, periods, sleep (requires `use time::*`) |
+| `env::{args,var,exec,…}` | Virtual module | Process environment (requires `use env::*`) |
+| `crypto::{sha256,hmac_sha256,…}` | Virtual module | RustCrypto host primitives (`use crypto::*`) |
+| `regex::{compile,is_match,…}` | Virtual module | PCRE2 host regex (`use regex::*`; needs libpcre2) |
+| `ord` / `char` | Prelude builtins | Single-byte string ↔ `byte` |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
 | `prelude::ops::{Add,Eq,Into,…}` | Virtual module | Auto-imported operator / conversion traits |
@@ -558,6 +564,69 @@ panic format "bad index %i", i;
 Unlike `raise`, `panic` is not recoverable with `?` / `match`. Prefer `assert` + `?` when callers should handle failure.
 
 See `examples/panic.hy`.
+
+---
+
+## Primitive casts (`expr as T`)
+
+Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation for non-literal values). Semantics match Rust for runtime casts:
+
+- `float as int` truncates toward zero (not `round`/`floor`). `NaN` / `±inf` follow Rust `f64 as i64` (e.g. `NaN` → `0`).
+- Non-literal `int as byte` keeps the low 8 bits (`let n = 257; n as byte` → `1`; negatives wrap the same way, e.g. `-1 as byte` when the operand is a variable).
+- A **literal** `int as byte` outside `0..=255` is a compile-time type error (same message as a byte literal out of range).
+
+Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
+
+---
+
+## `time` module
+
+`use time::*;` — UTC wall clock (`timestamp`, `epoch`), `Period` arithmetic, `format` / `parse` (strftime-style), monotonic `instant_now` / `elapsed_*`, and `sleep_ms`. Errors use `TimeError` inside `prelude::Result`. File bytes are not handled here; use `io` streams.
+
+---
+
+## `io::fs` module
+
+`use io::fs::*;` — `exists`, `metadata`, `list_dir`, `realpath` (canonical path when it exists), mkdir/remove/rename/copy, symlinks. Returns `prelude::Result` with `IoError`. No whole-file `read`/`write` helpers; open a `Stream` via `io::open` and use `read_to_end` / `write_all`.
+
+---
+
+## `env` module
+
+`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The child inherits the VM process **cwd** and **environment**; there are no per-call overrides yet. The compiler emits a **warning** when `exec` or `exit` is used. **Only `exec` is runtime-gated:** by default it returns `EnvError::ExecDisabled` unless `coil.toml` `[env] allow_exec = true`. `exit` is compile-warned only (not blocked at runtime).
+
+---
+
+## `crypto` module
+
+`use crypto::*;` — one-shot and streaming hashes (`sha256`, `init` / `update` / `finalize`), HMAC, `random_bytes`, ChaCha20-Poly1305 and AES-256-GCM, Ed25519 / X25519, Argon2id, constant-time `ct_eq`. Pure Rust (RustCrypto); no OpenSSL. Argon2id uses fixed MVP params (19 MiB memory, 2 iterations, parallelism 1); salts shorter than 16 bytes are zero-padded to 16 — not OWASP-tunable.
+
+---
+
+## `regex` module
+
+`use regex::*;` — PCRE2 patterns via HostInvoke (system **libpcre2** / `pcre2-sys`). Opaque `Regex` handle from `compile(pattern, flags)`.
+
+| Surface | Types |
+|---------|--------|
+| `compile` | `(string, string) -> Result<Regex, RegexError>` |
+| `is_match` | `(Regex, string) -> Result<bool, RegexError>` |
+| `find` | `(Regex, string) -> Result<(int, int), RegexError>` — first match byte span; no match → `NoMatch` |
+| `find_all` | `(Regex, string) -> Result<[(int, int)], RegexError>` — all non-overlapping spans (empty if none) |
+| `captures` | `(Regex, string) -> Result<[string], RegexError>` — `[0]` full match; empty string for non-participating groups |
+| `captures_all` | `(Regex, string) -> Result<[[string]], RegexError>` |
+| `split` | `(Regex, string) -> Result<[string], RegexError>` |
+| `replace` / `replace_all` | `(Regex, string, string) -> Result<string, RegexError>` — `$n` / `${name}` / `$$` |
+
+**Flags** (second `compile` arg; case-sensitive; unknown letter → `Compile`): `i` caseless, `m` multiline, `s` dotall, `x` extended, `u` Unicode properties (`ucp`). UTF-8 matching is always on for coil strings. Other PCRE letters (`A`/`D`/`U`/`J`/…) are not exposed — use in-pattern verbs where PCRE2 allows.
+
+`RegexError` variants: `Compile`, `Runtime`, `NoMatch`, `Utf8`.
+
+---
+
+## `ord` and `char`
+
+Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> Result<string, string>` (exactly one UTF-8 code unit). Out-of-range `char` inputs (not in `0..=255`) return `Err("byte out of range")`. Prefer keeping the argument typed as `byte`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
 
 ---
 

@@ -27,7 +27,28 @@ pub const BUILTIN_IO_ERROR_VARIANTS: &[&str] = &[
     "AlreadyClosed",
     "InvalidInput",
     "Other",
+    "NotADirectory",
+    "AlreadyExists",
 ];
+
+/// Built-in `CryptoError` enum name (virtual `crypto` module).
+pub const BUILTIN_CRYPTO_ERROR_ENUM: &str = "CryptoError";
+
+/// `CryptoError` variants in tag order.
+pub const BUILTIN_CRYPTO_ERROR_VARIANTS: &[&str] = &[
+    "InvalidInput",
+    "InvalidLength",
+    "AuthenticationFailed",
+    "UnsupportedAlgorithm",
+    "AlreadyFinalized",
+    "Other",
+];
+
+/// Built-in `RegexError` enum name (virtual `regex` module).
+pub const BUILTIN_REGEX_ERROR_ENUM: &str = "RegexError";
+
+/// `RegexError` variants in tag order.
+pub const BUILTIN_REGEX_ERROR_VARIANTS: &[&str] = &["Compile", "Runtime", "NoMatch", "Utf8"];
 
 /// Built-in `ThreadError` enum name (virtual `thread` module).
 pub const BUILTIN_THREAD_ERROR_ENUM: &str = "ThreadError";
@@ -39,6 +60,29 @@ pub const BUILTIN_THREAD_ERROR_VARIANTS: &[&str] = &[
     "JoinFailed",
     "NotSendable",
     "Poisoned",
+    "Other",
+];
+
+/// Built-in `EnvError` enum name (virtual `env` module).
+pub const BUILTIN_ENV_ERROR_ENUM: &str = "EnvError";
+
+/// Built-in `TimeError` enum name (virtual `time` module).
+pub const BUILTIN_TIME_ERROR_ENUM: &str = "TimeError";
+
+/// `TimeError` variants in tag order.
+pub const BUILTIN_TIME_ERROR_VARIANTS: &[&str] = &[
+    "InvalidInput",
+    "Overflow",
+    "ParseError",
+    "Other",
+];
+
+/// `EnvError` variants in tag order.
+pub const BUILTIN_ENV_ERROR_VARIANTS: &[&str] = &[
+    "InvalidInput",
+    "NotFound",
+    "ExecDisabled",
+    "ExecFailed",
     "Other",
 ];
 
@@ -67,12 +111,16 @@ pub const BUILTIN_FFI_ERROR_ENUM: &str = "Error";
 pub const BUILTIN_FFI_ERROR_VARIANT: &str = "Error";
 
 /// True when `name` is a reserved built-in enum (`Option`, `Result`, `IoError`,
-/// `Error` / `ErrorKind`, or `FFIType`).
+/// `CryptoError`, `RegexError`, `Error` / `ErrorKind`, or `FFIType`).
 pub fn is_builtin_enum(name: &str) -> bool {
     is_builtin_option_enum(name)
         || is_builtin_result_enum(name)
         || is_builtin_io_error_enum(name)
+        || is_builtin_crypto_error_enum(name)
+        || is_builtin_regex_error_enum(name)
         || is_builtin_thread_error_enum(name)
+        || is_builtin_env_error_enum(name)
+        || is_builtin_time_error_enum(name)
         || is_builtin_ffi_error_enum(name)
         || is_builtin_ffi_error_kind_enum(name)
         || is_builtin_ffi_enum(name)
@@ -82,8 +130,24 @@ pub fn is_builtin_io_error_enum(name: &str) -> bool {
     name == BUILTIN_IO_ERROR_ENUM
 }
 
+pub fn is_builtin_crypto_error_enum(name: &str) -> bool {
+    name == BUILTIN_CRYPTO_ERROR_ENUM
+}
+
+pub fn is_builtin_regex_error_enum(name: &str) -> bool {
+    name == BUILTIN_REGEX_ERROR_ENUM
+}
+
 pub fn is_builtin_thread_error_enum(name: &str) -> bool {
     name == BUILTIN_THREAD_ERROR_ENUM
+}
+
+pub fn is_builtin_env_error_enum(name: &str) -> bool {
+    name == BUILTIN_ENV_ERROR_ENUM
+}
+
+pub fn is_builtin_time_error_enum(name: &str) -> bool {
+    name == BUILTIN_TIME_ERROR_ENUM
 }
 
 pub fn is_builtin_ffi_error_enum(name: &str) -> bool {

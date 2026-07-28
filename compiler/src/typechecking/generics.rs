@@ -564,6 +564,108 @@ impl Generics {
             },
         );
 
+        // ---- Default / Hash / Serialize / Deserialize / Send / String / Sensitive ----
+        // (#[derive] targets; see compiler/src/attrs.rs)
+        self.typeclasses.insert(
+            "Default".into(),
+            TypeClassDef {
+                name: "Default".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "default".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Hash".into(),
+            TypeClassDef {
+                name: "Hash".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "hash".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Serialize".into(),
+            TypeClassDef {
+                name: "Serialize".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "serialize".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Deserialize".into(),
+            TypeClassDef {
+                name: "Deserialize".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "deserialize".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Send".into(),
+            TypeClassDef {
+                name: "Send".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![],
+            },
+        );
+        self.typeclasses.insert(
+            "String".into(),
+            TypeClassDef {
+                name: "String".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "to_string".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Sensitive".into(),
+            TypeClassDef {
+                name: "Sensitive".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![],
+            },
+        );
+
         // ---- Into ----
         // Multi-param conversion trait (auto-imported via prelude::ops).
         // `impl Into<T> for Self` → instance args [Self, T]; method
@@ -745,6 +847,25 @@ impl Generics {
             assoc_tys: HashMap::new(),
         });
 
+        // ---- Hash for primitives (derive mixes via `field.hash()`) ----
+        for (ty, ty_str) in [
+            (int(), "int"),
+            (float(), "float"),
+            (string(), "string"),
+            (boolean(), "bool"),
+            (unit(), "unit"),
+            (super::ty::byte(), "byte"),
+        ] {
+            self.instances.push(InstanceDef {
+                class: "Hash".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                range: 0..0,
+                args: vec![ty],
+                method_fqns: make_fqns("Hash", ty_str, &["hash"]),
+                assoc_tys: HashMap::new(),
+            });
+        }
+
         // ---- byte: Eq + Show + Ord (int opcodes; needed for `byte` ranges) ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
@@ -785,6 +906,31 @@ impl Generics {
             method_fqns: HashMap::new(),
             assoc_tys: HashMap::new(),
         });
+
+        // ---- primitive Into (casts via `into()` / `as`) ----
+        let into_pairs: [(&str, Ty, &str, Ty); 6] = [
+            ("int", int(), "float", float()),
+            ("float", float(), "int", int()),
+            ("int", int(), "byte", super::ty::byte()),
+            ("byte", super::ty::byte(), "int", int()),
+            ("int", int(), "bool", boolean()),
+            ("bool", boolean(), "int", int()),
+        ];
+        for (from_s, from_ty, to_s, to_ty) in into_pairs {
+            let mut method_fqns = HashMap::new();
+            method_fqns.insert(
+                "into".to_string(),
+                format!("Into__{}__to_{}__into", from_s, to_s),
+            );
+            self.instances.push(InstanceDef {
+                class: "Into".into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
+                range: 0..0,
+                args: vec![from_ty.clone(), to_ty.clone()],
+                method_fqns,
+                assoc_tys: HashMap::new(),
+            });
+        }
 
         // ---- Stream: Read + Write (methods lower to host natives) ----
         self.instances.push(InstanceDef {
@@ -856,7 +1002,9 @@ impl Generics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{TyVarId, float, int, option_app_ty};
+    use crate::typechecking::ty::{
+        TyVarId, boolean, byte, float, int, option_app_ty, string, unit,
+    };
 
     fn method(name: &str, has_default: bool) -> TypeClassMethodDef {
         TypeClassMethodDef {
@@ -985,6 +1133,45 @@ mod tests {
 
         assert_eq!(method_fqns.get("add").unwrap(), "Num__int__add");
         assert_eq!(method_fqns.get("zero").unwrap(), "Num__default__zero");
+    }
+
+    #[test]
+    fn derivable_prelude_traits_registered() {
+        let g = Generics::new();
+        for name in [
+            "Default",
+            "Hash",
+            "Serialize",
+            "Deserialize",
+            "Send",
+            "String",
+            "Sensitive",
+        ] {
+            assert!(
+                g.typeclass(name).is_some(),
+                "missing prelude typeclass `{name}`"
+            );
+        }
+        assert_eq!(
+            g.typeclass("Default").unwrap().methods[0].name,
+            "default"
+        );
+        assert_eq!(
+            g.typeclass("String").unwrap().methods[0].name,
+            "to_string"
+        );
+        assert!(g.typeclass("Send").unwrap().methods.is_empty());
+    }
+
+    #[test]
+    fn hash_builtin_instances_cover_primitives() {
+        let g = Generics::new();
+        for ty in [int(), float(), string(), boolean(), unit(), byte()] {
+            assert!(
+                g.find_instance("Hash", &[ty.clone()]).is_some(),
+                "missing Hash instance for {ty:?}"
+            );
+        }
     }
 
     #[test]

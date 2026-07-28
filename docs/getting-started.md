@@ -25,6 +25,29 @@ Examples that call C code (`examples/strlen.hy`, `examples/ffi_sum.hy`) require 
 
 You can build and run all non-FFI examples without libffi.
 
+### libpcre2 (optional, for `regex` examples)
+
+The virtual `regex` module links **libpcre2** via the `pcre2` / `pcre2-sys` crates (`examples/regex_demo.hy`).
+
+| Platform | Package |
+|----------|---------|
+| Arch Linux | `pcre2` |
+| Debian / Ubuntu | `libpcre2-dev` |
+| Fedora | `pcre2-devel` |
+
+If the system library is missing, `pcre2-sys` may build PCRE2 from source (needs a C toolchain).
+
+### Optional Cargo features (`crypto` / `time` / `regex`)
+
+The default build enables the virtual `crypto`, `time`, and `regex` modules (and their crate dependencies). Embedders can strip them:
+
+```toml
+machine = { path = "...", default-features = false, features = ["time"] }
+# or: features = ["crypto"] / ["regex"]
+```
+
+The `compiler` and root `coil` crates mirror the same feature names. With a feature disabled, the corresponding `use crypto::*` / `use time::*` / `use regex::*` will not resolve.
+
 ## Build the project
 
 Clone the repository and build the workspace from the root:
@@ -223,7 +246,7 @@ coil uses a **single-pass stack codegen** pipeline (with a post-codegen peephole
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
 3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`** (reuse frame, no extra `CALL`+`RETURN`); tiny callees may be inlined at `CALL` sites.
 4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar), folds constant `CONST` pairs (including pool-backed negatives), and relocates jump targets.
-5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **29**) must match at load time.
+5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **30**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention

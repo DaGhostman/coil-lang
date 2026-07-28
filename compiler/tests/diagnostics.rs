@@ -2128,6 +2128,87 @@ fn main() {
 }
 
 #[test]
+fn primitive_cast_rejects_float_to_byte() {
+    let (_ty, msgs) = check("fn main() { let x = 1.5 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot cast `float` to `byte`")),
+        "expected float→byte cast rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn primitive_cast_rejects_literal_int_as_byte_oob() {
+    let (_ty, msgs) = check("fn main() { let x = 257 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("byte literal out of range")),
+        "expected literal int as byte OOB diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn primitive_cast_rejects_negative_literal_int_as_byte() {
+    let (_ty, msgs) = check("fn main() { let x = -1 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("byte literal out of range")),
+        "expected negative literal int as byte diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn env_exec_call_emits_trusted_inputs_warning() {
+    let msgs = compile_messages(
+        r#"
+use env::*;
+fn main() {
+    let _ = exec("true", []);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("env::exec")
+            && m.contains("trusted inputs")),
+        "expected env::exec trusted-inputs warning, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn env_exit_call_emits_process_termination_warning() {
+    let msgs = compile_messages(
+        r#"
+use env::*;
+fn main() {
+    exit(0);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("env::exit")
+            && m.contains("terminates the process")),
+        "expected env::exit process-termination warning, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn primitive_cast_rejects_non_primitive_target() {
+    let (_ty, msgs) = check(r#"fn main() { let x = "hi" as int; }"#);
+    assert!(
+        msgs.iter().any(|m| m.contains(
+            "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+        )),
+        "expected non-primitive cast rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn static_method_called_on_instance_errors() {
     let (_ty, msgs) = check(
         r#"
@@ -2204,7 +2285,6 @@ fn main() {
         msgs
     );
 }
-
 
 #[test]
 fn method_named_send_does_not_shadow_thread_send() {

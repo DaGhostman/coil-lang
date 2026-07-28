@@ -1875,6 +1875,25 @@ fn example_derive_show_eq_prints_expected() {
     );
 }
 
+/// Regression: derived `Serialize::serialize` must typecheck (`[byte]` return,
+/// payload fields cast to `byte`).
+#[test]
+fn derive_serialize_enum_e2e_typechecks() {
+    let src = r#"
+#[derive(Serialize)]
+enum E {
+    A,
+    B(int),
+}
+
+fn main() {}
+"#;
+    let mut pipeline = Pipeline::new();
+    pipeline
+        .compile_src(src)
+        .expect("derive Serialize should compile without type errors");
+}
+
 /// Regression: concrete `<`/`>` codegen must look up `Lt`/`Gt` (not empty
 /// `Ord`), otherwise unit-enum compares fall back to raw heap-pointer `LE`
 /// and become ASLR-flaky (`Red < Blue` randomly false).
@@ -3295,4 +3314,185 @@ fn main() {
 "#,
     );
     assert_eq!(output, "46");
+}
+
+#[test]
+fn example_casts_primitive_as_operators() {
+    assert_eq!(run_example("examples/casts.hy"), "13true");
+}
+
+#[test]
+fn example_time_epoch_ok() {
+    assert_eq!(run_example("examples/time_demo.hy"), "1");
+}
+
+#[test]
+fn example_ansi_color_prints_red() {
+    let output = run_example("examples/ansi_color.hy");
+    assert!(output.contains("red"), "expected visible 'red', got {:?}", output);
+}
+
+/// HostInvoke + virtual `crypto` wiring: empty SHA-256 digest length is 32.
+#[test]
+fn crypto_sha256_empty_digest_len_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use crypto::*;
+
+fn digest_len() -> int {
+    let empty: [byte] = [];
+    return match sha256(empty) {
+        Result::Ok(d) => len(d),
+        Result::Err(_) => 0,
+    };
+}
+
+fn main() {
+    print "%i", digest_len();
+}
+"#,
+    );
+    assert_eq!(output, "32");
+}
+
+/// HostInvoke + virtual `io::fs` wiring: `exists(".")` returns Ok.
+#[test]
+fn fs_exists_dot_ok_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::fs::*;
+
+fn dot_ok() -> int {
+    return match exists(".") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+
+fn main() {
+    print "%i", dot_ok();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// HostInvoke + virtual `env` wiring: set/get/remove round-trip.
+#[test]
+fn env_var_round_trip_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use env::*;
+
+fn round_trip() -> string {
+    let set_ok = match set_var("COIL_PIPELINE_ENV_KEY", "coil_ok") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+    if set_ok == 0 {
+        return "0";
+    }
+    let got = match var("COIL_PIPELINE_ENV_KEY") {
+        Result::Ok(s) => s,
+        Result::Err(_) => "0",
+    };
+    let rem_ok = match remove_var("COIL_PIPELINE_ENV_KEY") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+    if rem_ok == 0 {
+        return "0";
+    }
+    return got;
+}
+
+fn main() {
+    print "%s", round_trip();
+}
+"#,
+    );
+    assert_eq!(output, "coil_ok");
+}
+
+#[test]
+fn example_regex_demo_prints_expected() {
+    assert_eq!(
+        run_example("examples/regex_demo.hy"),
+        "true,2,a->1 b->2,a|b|c"
+    );
+}
+
+#[test]
+fn regex_compile_error_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use regex::*;
+
+fn bad() -> int {
+    return match compile("(", "") {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            RegexError::Compile => 1,
+            RegexError::Runtime => 2,
+            RegexError::NoMatch => 3,
+            RegexError::Utf8 => 4,
+        },
+    };
+}
+
+fn main() {
+    print "%i", bad();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.
+#[test]
+fn derive_string_to_string_prints_variant() {
+    let output = run_example_src(
+        r#"
+#[derive(String)]
+enum Color {
+    Red,
+}
+
+fn main() {
+    print "%s", Color::Red.to_string();
+}
+"#,
+    );
+    assert_eq!(output, "Color::Red");
+}
+
+/// Recursive `#[derive(Hash)]` + primitive Hash instances.
+#[test]
+fn example_derive_hash_prints_true_true_true_true() {
+    let output = run_example("examples/derive_hash.hy");
+    assert_eq!(output, "true,true,true,true");
+}
+
+/// Primitive `Hash` covers non-int payloads used by derive.
+#[test]
+fn hash_primitives_and_nested_differ_when_payloads_differ() {
+    let output = run_example_src(
+        r#"
+#[derive(Hash)]
+enum Box {
+    S { s: string },
+    B { b: bool },
+    F { f: float },
+}
+
+fn main() {
+    print "%z,", "a".hash() != "b".hash();
+    print "%z,", true.hash() != false.hash();
+    print "%z,", (1.0).hash() != (2.0).hash();
+    print "%z,", Box::S { s: "x" }.hash() != Box::S { s: "y" }.hash();
+    print "%z", Box::B { b: true }.hash() != Box::B { b: false }.hash();
+}
+"#,
+    );
+    assert_eq!(output, "true,true,true,true,true");
 }

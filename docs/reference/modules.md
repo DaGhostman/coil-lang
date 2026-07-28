@@ -60,6 +60,12 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters | No — write `use io::*;` |
 | `io::net::tcp` | `connect` / `listen` / `accept` / `accept_wait` | No — write `use io::net::tcp::*;` |
 | `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — write `use io::net::udp::*;` |
+| `io::fs` | Path/metadata helpers (`exists`, `realpath`, `list_dir`, …) | No — `use io::fs::*;` |
+| `time` | `timestamp`, `Period`, `format` / `parse`, monotonic `Instant` | No — `use time::*;` |
+| `env` | `args`, `var`, `cwd`, `exit`, `exec` (argv-only) | No — `use env::*;` |
+| `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::*;` |
+| `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::*;` |
+| `thread` | `spawn`, channels, mutexes | No — `use thread::*;` |
 
 ### Prelude rebind / redefine
 

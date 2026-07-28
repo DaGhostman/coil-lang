@@ -598,16 +598,23 @@ class Cell {
 | `Show` | `show` | Enum: `match` + `format` / string lits; class: field walk via `.field` |
 | `Eq` | `eq`, `ne` | Tag + payload `==`; `ne` is `!(a == b)` |
 | `Ord` | `lt`, `le`, `gt`, `ge` | Lexicographic on declaration order |
+| `Default` | `default` | First enum variant / zero field values for classes |
+| `Hash` | `hash` | Tag + recursive `field.hash()` mix (`* 31 + hash`); builtins for `int`/`byte`/`bool`/`float`/`string`/`unit`; nested `Hash` types recurse |
+| `String` | `to_string` | `format` with `%v` per field |
+| `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class). **MVP:** each payload field is cast through `byte` (`as_byte` / `as_int`); values outside `0..=255` and non-byte types silently corrupt — use only small integer / `byte` fields until a real encoding exists |
+| `Deserialize` | `deserialize` | Inverse of `Serialize` from `[byte]`; invalid tag → `panic` |
+| `Send` | _(marker)_ | Empty instance (thread spawn still uses structural sendability) |
+| `Sensitive` | _(marker)_ | Empty instance (redaction hooks deferred) |
 
 Rules:
 
 - Placement: immediately before the `enum` / `class` keyword (after any doc comment).
-- Whitelist only: `Show`, `Eq`, `Ord`. Unknown / arithmetic traits (`Num`, …) error.
+- Whitelist only: `Show`, `Eq`, `Ord`, `Default`, `Hash`, `String`, `Serialize`, `Deserialize`, `Send`, `Sensitive`. Unknown / arithmetic traits (`Num`, …) error.
 - Generics (`#[derive(Show)] enum Box<T> { … }`) are rejected for now — write an explicit `impl`.
 - Combining `#[derive(Show)]` with a hand-written `impl Show for T` hits the usual overlap diagnostic.
 - Empty `#[derive()]` with no traits is a parse error.
 
-See `examples/derive_show_eq.hy`.
+See `examples/derive_show_eq.hy` and `examples/derive_hash.hy`.
 
 ### User-defined traits (sketch)
 

@@ -85,6 +85,113 @@ fn ffi_tag_for_expr_fallback(expr: &Output) -> Option<(u32, u32)> {
     }
 }
 
+/// Decode escape sequences in a coil string literal (`\n`, `\x41`, `\u{1F}`, …).
+pub(crate) fn unescape_coil_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('e') => out.push('\x1b'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                let hi = chars.next();
+                let lo = chars.next();
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    let hex = format!("{h}{l}");
+                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                        out.push(v as char);
+                        continue;
+                    }
+                }
+                out.push('\\');
+                out.push('x');
+                if let Some(h) = hi {
+                    out.push(h);
+                }
+                if let Some(l) = lo {
+                    out.push(l);
+                }
+            }
+            Some('u') => {
+                if chars.next() == Some('{') {
+                    let mut hex = String::new();
+                    let mut closed = false;
+                    while let Some(ch) = chars.next() {
+                        if ch == '}' {
+                            closed = true;
+                            break;
+                        }
+                        hex.push(ch);
+                    }
+                    if closed {
+                        if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(code) {
+                                out.push(ch);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('u');
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn primitive_name_from_type_ann(ty: &Output) -> Option<&'static str> {
+    match ty.1.as_ref() {
+        Expression::Type(name) => primitive_type_name(&Ty::Con((*name).into())),
+        _ => None,
+    }
+}
+
+fn primitive_type_name(ty: &Ty) -> Option<&'static str> {
+    use typechecking::ty::{BOOL, BYTE, FLOAT, INT};
+    match ty {
+        Ty::Con(name) => match name.as_str() {
+            INT => Some("int"),
+            FLOAT => Some("float"),
+            BYTE => Some("byte"),
+            BOOL => Some("bool"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn primitive_cast_opcode(from: &str, to: &str) -> Option<Instruction> {
+    match (from, to) {
+        ("int", "float") => Some(Instruction::CastIntToFloat),
+        ("float", "int") => Some(Instruction::CastFloatToInt),
+        ("int", "byte") => Some(Instruction::CastIntToByte),
+        ("byte", "int") => Some(Instruction::CastByteToInt),
+        ("int", "bool") => Some(Instruction::CastIntToBool),
+        ("bool", "int") => Some(Instruction::CastBoolToInt),
+        (a, b) if a == b => None,
+        _ => None,
+    }
+}
+
+fn into_primitive_fqn(from: &str, to: &str) -> String {
+    format!("Into__{}__to_{}__into", from, to)
+}
+
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
@@ -2612,11 +2719,7 @@ impl Compiler {
     /// Emit a string literal as `STRING` + `DATA` bytes into `self.bytecode`.
     /// Applies the same escape processing as `Expression::String` codegen.
     fn emit_string_literal(&mut self, s: &str) {
-        let escaped = s
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace("\\0", "\0");
+        let escaped = unescape_coil_string(s);
         let idx = self.bytecode.len();
         let mut count = 0u32;
         for ch in escaped.chars() {
@@ -3555,6 +3658,10 @@ impl Compiler {
         self.expr_depth = depth_on_entry;
     }
 
+    fn emit_prelude_host_call(&mut self, args: &[Output], native_name: &str) {
+        self.emit_host_native_invoke(native_name, args);
+    }
+
     /// Emit bytecode thunks for compiler-provided primitive instances.
     ///
     /// Shared generic bodies receive boxed type-parameter values, so numeric
@@ -3662,6 +3769,55 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
 
+        // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
+        // after unbox; float returns the float `Value` bits read via
+        // `Value::as_int()` (IEEE bit pattern in the current Value encoding);
+        // unit is 0; string uses the intern FNV via HostInvoke `hash_string`.
+        for (ty, tag) in [
+            ("int", ValueTag::Int),
+            ("byte", ValueTag::Int),
+            ("bool", ValueTag::Bool),
+            ("float", ValueTag::Float),
+        ] {
+            let fqn = Generics::builtin_instance_fqn("Hash", ty, "hash");
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode
+                .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+        {
+            let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
+            if !self.functions.contains_key(&fqn) {
+                self.functions.insert(fqn, self.bytecode.len());
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+        }
+        if let Some(native_id) = self.native_id("hash_string") {
+            let fqn = Generics::builtin_instance_fqn("Hash", "string", "hash");
+            if !self.functions.contains_key(&fqn) {
+                self.functions.insert(fqn, self.bytecode.len());
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                self.bytecode.push(
+                    Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::String as u32),
+                );
+                self.bytecode
+                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
+                self.bytecode
+                    .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+        }
+
         // Read/Write for Stream — lower to the same HostInvoke natives as
         // free functions `read` / `write`. Args may arrive boxed via the
         // dictionary ABI; unbox then call.
@@ -3693,6 +3849,34 @@ impl Compiler {
                 .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
             self.bytecode
                 .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+
+        let into_pairs = [
+            ("int", "float", Instruction::CastIntToFloat, ValueTag::Int, ValueTag::Float),
+            ("float", "int", Instruction::CastFloatToInt, ValueTag::Float, ValueTag::Int),
+            ("int", "byte", Instruction::CastIntToByte, ValueTag::Int, ValueTag::Int),
+            ("byte", "int", Instruction::CastByteToInt, ValueTag::Int, ValueTag::Int),
+            ("int", "bool", Instruction::CastIntToBool, ValueTag::Int, ValueTag::Bool),
+            ("bool", "int", Instruction::CastBoolToInt, ValueTag::Bool, ValueTag::Int),
+        ];
+        for (from, to, cast_op, from_tag, to_tag) in into_pairs {
+            let fqn = into_primitive_fqn(from, to);
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode.push(
+                Byte::new(Instruction::UnboxValue).with_operand_u32(from_tag as u32),
+            );
+            self.bytecode.push(Byte::new(cast_op));
+            if from_tag != to_tag {
+                self.bytecode.push(
+                    Byte::new(Instruction::BoxValue).with_operand_u32(to_tag as u32),
+                );
+            }
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
     }
@@ -5314,6 +5498,8 @@ impl Compiler {
     }
 
     /// Resolve enum name for field access via the codegen side-table.
+    /// Receiver enum name for field-access codegen (kept for tests / callers).
+    #[allow(dead_code)]
     fn enum_name_for_receiver(&mut self, receiver: &Output) -> Option<String> {
         // Cannot use infer cache inside function bodies (ID misalignment) or env (frame popped).
         let ty = self.receiver_type(receiver)?;
@@ -7020,6 +7206,10 @@ impl Compiler {
                                 arg_slice,
                             );
                         }
+                        crate::typechecking::PreludeFn::Ord
+                        | crate::typechecking::PreludeFn::Char => {
+                            self.emit_prelude_host_call(arg_slice, kind.as_str());
+                        }
                     }
                     return bytecode;
                 }
@@ -7056,6 +7246,27 @@ impl Compiler {
                     && let Some(kind) = self.checker.thread_fn_in_scope(fname)
                 {
                     self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    return bytecode;
+                }
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(registry) = self.checker.host_fn_in_scope(fname)
+                {
+                    if registry == "env_exec" {
+                        self.messages.push(Message::warn(
+                            ErrorCode::GenericTypeError,
+                            "env::exec runs an external program with the given arguments; only use with trusted inputs"
+                                .to_string(),
+                            span.into_range(),
+                        ));
+                    } else if registry == "env_exit" {
+                        self.messages.push(Message::warn(
+                            ErrorCode::GenericTypeError,
+                            "env::exit terminates the process with the given exit code"
+                                .to_string(),
+                            span.into_range(),
+                        ));
+                    }
+                    self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
                     return bytecode;
                 }
 
@@ -7146,11 +7357,15 @@ impl Compiler {
                         // Prefer `receiver_type` for identifiers/access; fall
                         // back to `codegen_expr_ty` so inline receivers like
                         // `new Celsius(0).into()` still get boxed.
+                        // Peel Constructor/Sum → Con so `ty_to_value_tag` matches
+                        // instance-head unbox tags (Con(enum) → Instance). Raw
+                        // Constructor types returned None and skipped boxing.
                         if let Some(recv_ty) = self
                             .receiver_type(recv)
                             .or_else(|| self.codegen_expr_ty(recv))
                         {
-                            Self::emit_box_if_needed(&mut bytecode, &recv_ty);
+                            let box_ty = Self::show_lookup_ty_for_instance(&recv_ty);
+                            Self::emit_box_if_needed(&mut bytecode, &box_ty);
                         }
                         let mut nargs = 1u32; // receiver
                         if let Some(items) = args {
@@ -8565,13 +8780,7 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
             }
             Expression::String(str) => {
-                let escaped = str
-                    .replace("\\n", "\n")
-                    .replace("\\r", "\r")
-                    .replace("\\t", "\t")
-                    .replace("\\0", "\0");
-
-                // if let Ok(re) = Regex::new(r"\\u(?<code>\d{1,})").map_err(|e| dbg!(e)) {
+                let escaped = unescape_coil_string(str);
                 //     while let Some(captures) = re.captures(escaped.as_str()) {
                 //         let unicode = captures.name("code").unwrap().as_str();
                 //
@@ -9710,13 +9919,31 @@ impl Compiler {
                 // defensive path) rather than GetField, which would
                 // corrupt ObjEnum stacks.
                 let enum_field_index = if !is_record && !is_class {
-                    self.enum_name_for_receiver(receiver).and_then(|name| {
-                        if self.checker.is_class(&name) {
+                    self.receiver_type(receiver).and_then(|ty| {
+                        use crate::typechecking::ty::Ty;
+                        if self.checker.ty_is_class(&ty) {
                             return None;
                         }
-                        self.checker
-                            .field_index_for(&name, field)
-                            .map(|(_variant, idx)| idx)
+                        match &ty {
+                            Ty::Constructor { tag, owner, .. } => {
+                                let name = extract_enum_name(owner)?;
+                                if self.checker.is_class(&name) {
+                                    return None;
+                                }
+                                self.checker
+                                    .field_index_for_tagged(&name, field, Some(*tag))
+                                    .map(|(_variant, idx)| idx)
+                            }
+                            _ => {
+                                let name = extract_enum_name(&ty)?;
+                                if self.checker.is_class(&name) {
+                                    return None;
+                                }
+                                self.checker
+                                    .field_index_for(&name, field)
+                                    .map(|(_variant, idx)| idx)
+                            }
+                        }
                     })
                 } else {
                     None
@@ -9786,6 +10013,21 @@ impl Compiler {
                 bb.finalize()
                     .expect("BlockBuilder::finalize: Try success label bound");
                 // Payload left on stack for the caller (e.g. StorePop).
+            }
+            Expression::Cast(expr, ty_ann) => {
+                bytecode.append(&mut self.do_compile(expr));
+                let src_ty = self.codegen_expr_ty(expr);
+                let dst_name = primitive_name_from_type_ann(ty_ann);
+                if let (Some(from), Some(to)) = (
+                    src_ty.as_ref().and_then(primitive_type_name),
+                    dst_name,
+                ) {
+                    if from != to {
+                        if let Some(op) = primitive_cast_opcode(from, to) {
+                            bytecode.push(Byte::new(op));
+                        }
+                    }
+                }
             }
             Expression::Coalesce(lhs, rhs) => {
                 // `a ?? b` → Ok/Some payload, else evaluate b.
@@ -14261,6 +14503,33 @@ fn main() {
             packed_host_meta(&bc) & (1 << 16),
             0,
             "float packed_dot meta must set is_float bit"
+        );
+    }
+
+    #[test]
+    fn unescape_coil_string_supports_hex_and_unicode() {
+        assert_eq!(unescape_coil_string(r"\x41"), "A");
+        assert_eq!(unescape_coil_string(r"\u{42}"), "B");
+        assert_eq!(unescape_coil_string("\\\""), "\"");
+        assert_eq!(unescape_coil_string(r"\e"), "\x1b");
+    }
+
+    #[test]
+    fn cast_as_int_emits_cast_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x = 3.5 as int;
+    print "%i", x;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CastFloatToInt)),
+            "expected CastFloatToInt in {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 }

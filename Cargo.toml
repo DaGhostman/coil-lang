@@ -9,9 +9,9 @@ edition = "2024"
 
 [dependencies]
 common = { path = "common" }
-machine = { path = "machine" }
+machine = { path = "machine", default-features = false }
 parser = { path = "parser" }
-compiler = { path = "compiler" }
+compiler = { path = "compiler", default-features = false }
 reporting = { path = "reporting" }
 rkyv = "0.8.12"
 
@@ -23,7 +23,10 @@ name = "fib"
 harness = false
 
 [features]
-default = []
+default = ["crypto", "time", "regex"]
+crypto = ["machine/crypto", "compiler/crypto"]
+time = ["machine/time", "compiler/time"]
+regex = ["machine/regex", "compiler/regex"]
 
 [profile.release]
 opt-level=3

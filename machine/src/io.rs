@@ -25,6 +25,8 @@ pub enum IoErrorTag {
     AlreadyClosed = 3,
     InvalidInput = 4,
     Other = 5,
+    NotADirectory = 6,
+    AlreadyExists = 7,
 }
 
 impl IoErrorTag {
@@ -34,6 +36,8 @@ impl IoErrorTag {
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::PermissionDenied => Self::PermissionDenied,
             ErrorKind::InvalidInput => Self::InvalidInput,
+            ErrorKind::NotADirectory => Self::NotADirectory,
+            ErrorKind::AlreadyExists => Self::AlreadyExists,
             _ => Self::Other,
         }
     }

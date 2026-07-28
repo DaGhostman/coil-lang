@@ -473,6 +473,10 @@ fn encode_value(
         | Object::Fn(_)
         | Object::PolyFn(_)
         | Object::Library(_) => Err(ThreadErrorTag::NotSendable),
+        #[cfg(feature = "regex")]
+        Object::Regex(_) => Err(ThreadErrorTag::NotSendable),
+        #[cfg(feature = "crypto")]
+        Object::CryptoHasher(_) => Err(ThreadErrorTag::NotSendable),
         // Handled above; listed so the match stays exhaustive.
         Object::Sender(_) | Object::Receiver(_) | Object::Mutex(_) | Object::RwLock(_) => {
             unreachable!("host handles returned before deep encode")

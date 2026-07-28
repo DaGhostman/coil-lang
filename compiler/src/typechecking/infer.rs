@@ -655,6 +655,10 @@ impl Checker {
     /// Bind a virtual export under `local` (and drop any previous short
     /// binding for the export's canonical short name when `local` differs).
     pub fn bind_virtual_export(&mut self, local: String, export: BuiltinExport) {
+        let host_registry = match &export {
+            BuiltinExport::HostFn { registry, .. } => Some(*registry),
+            _ => None,
+        };
         // Lazily register `IoError` tags when the virtual `io` module is
         // brought into scope (enum or any host fn whose scheme mentions it).
         let needs_io_error = matches!(
@@ -662,7 +666,7 @@ impl Checker {
             BuiltinExport::Enum {
                 name: common::BUILTIN_IO_ERROR_ENUM
             } | BuiltinExport::IoFn { .. }
-        );
+        ) || host_registry.is_some_and(|r| r.starts_with("fs_"));
         if needs_io_error && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM) {
             self.register_builtin_io_error();
         }
@@ -675,6 +679,46 @@ impl Checker {
         );
         if needs_thread_error && !self.enums.contains_key(common::BUILTIN_THREAD_ERROR_ENUM) {
             self.register_builtin_thread_error();
+        }
+
+        let needs_time_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_TIME_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("time_"));
+        if needs_time_error && !self.enums.contains_key(common::BUILTIN_TIME_ERROR_ENUM) {
+            self.register_builtin_time_error();
+        }
+
+        let needs_env_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_ENV_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("env_"));
+        if needs_env_error && !self.enums.contains_key(common::BUILTIN_ENV_ERROR_ENUM) {
+            self.register_builtin_env_error();
+        }
+
+        let needs_crypto_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_CRYPTO_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("crypto_"));
+        if needs_crypto_error && !self.enums.contains_key(common::BUILTIN_CRYPTO_ERROR_ENUM) {
+            self.register_builtin_crypto_error();
+        }
+
+        let needs_regex_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_REGEX_ERROR_ENUM
+            }
+        ) || host_registry.is_some_and(|r| r.starts_with("regex_"));
+        if needs_regex_error && !self.enums.contains_key(common::BUILTIN_REGEX_ERROR_ENUM) {
+            self.register_builtin_regex_error();
         }
 
         // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
@@ -751,6 +795,14 @@ impl Checker {
     pub fn thread_fn_in_scope(&self, name: &str) -> Option<ThreadBuiltin> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::ThreadFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Registry key for a generic host native (`time_*`, `env_*`, `fs_*`, `crypto_*`).
+    pub fn host_fn_in_scope(&self, name: &str) -> Option<&'static str> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::HostFn { registry, .. } => Some(registry),
             _ => None,
         }
     }
@@ -888,6 +940,52 @@ impl Checker {
         self.enum_tags.insert(name.clone(), tag_map);
         self.enum_payloads.insert(name.clone(), payloads);
         self.enum_arities.insert(name, arities);
+    }
+
+    fn register_builtin_unit_enum(&mut self, enum_name: &str, variants: &[&str]) {
+        let name = enum_name.to_string();
+        let variant_names: Vec<String> = variants.iter().map(|s| s.to_string()).collect();
+        let payloads = variant_names
+            .iter()
+            .map(|_| EnumVariantPayloadTy::Unit)
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
+        }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
+    fn register_builtin_time_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_TIME_ERROR_ENUM,
+            common::BUILTIN_TIME_ERROR_VARIANTS,
+        );
+    }
+
+    fn register_builtin_env_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_ENV_ERROR_ENUM,
+            common::BUILTIN_ENV_ERROR_VARIANTS,
+        );
+    }
+
+    fn register_builtin_crypto_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_CRYPTO_ERROR_ENUM,
+            common::BUILTIN_CRYPTO_ERROR_VARIANTS,
+        );
+    }
+
+    fn register_builtin_regex_error(&mut self) {
+        self.register_builtin_unit_enum(
+            common::BUILTIN_REGEX_ERROR_ENUM,
+            common::BUILTIN_REGEX_ERROR_VARIANTS,
+        );
     }
 
     /// Pre-register `ThreadError` unit variants for the virtual `thread` module.
@@ -1146,6 +1244,237 @@ impl Checker {
         }
     }
 
+    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
+    pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
+        use crate::typechecking::ty::{array, boolean, record};
+        #[cfg(feature = "crypto")]
+        use crate::typechecking::ty::byte;
+        #[cfg(any(feature = "crypto", feature = "regex"))]
+        use crate::typechecking::ty::tuple;
+        #[cfg(feature = "regex")]
+        use crate::typechecking::ty::regex_ty;
+        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
+        #[cfg(feature = "regex")]
+        use common::BUILTIN_REGEX_ERROR_ENUM;
+        #[cfg(feature = "crypto")]
+        use common::BUILTIN_CRYPTO_ERROR_ENUM;
+        #[cfg(feature = "time")]
+        use common::BUILTIN_TIME_ERROR_ENUM;
+
+        let fun = |params: &[Ty], ret: Ty| {
+            params.iter().rev().fold(ret, |acc, p| {
+                Ty::Fun(Box::new(p.clone()), Box::new(acc))
+            })
+        };
+        let io_err = Ty::Con(BUILTIN_IO_ERROR_ENUM.into());
+        #[cfg(feature = "time")]
+        let time_err = Ty::Con(BUILTIN_TIME_ERROR_ENUM.into());
+        let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
+        #[cfg(feature = "crypto")]
+        let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
+        #[cfg(feature = "regex")]
+        let regex_err = Ty::Con(BUILTIN_REGEX_ERROR_ENUM.into());
+        #[cfg(feature = "regex")]
+        let regex = regex_ty();
+
+        let res_bool_io = result_app_ty(boolean(), io_err.clone());
+        let res_unit_io = result_app_ty(unit_ty(), io_err.clone());
+        let res_string_io = result_app_ty(string(), io_err.clone());
+        let res_strs_io = result_app_ty(array(string()), io_err.clone());
+        let res_meta_io = result_app_ty(
+            record(vec![
+                ("size".into(), int()),
+                ("is_file".into(), boolean()),
+                ("is_dir".into(), boolean()),
+                ("is_symlink".into(), boolean()),
+                ("modified_unix".into(), int()),
+            ]),
+            io_err,
+        );
+
+        #[cfg(feature = "time")]
+        let res_int_time = result_app_ty(int(), time_err.clone());
+        #[cfg(feature = "time")]
+        let res_string_time = result_app_ty(string(), time_err.clone());
+        #[cfg(feature = "time")]
+        let res_unit_time = result_app_ty(unit_ty(), time_err);
+
+        let res_string_env = result_app_ty(string(), env_err.clone());
+        let res_strs_env = result_app_ty(array(string()), env_err.clone());
+        let res_unit_env = result_app_ty(unit_ty(), env_err.clone());
+        let res_int_env = result_app_ty(int(), env_err);
+
+        #[cfg(feature = "crypto")]
+        let bytes = array(byte());
+        #[cfg(feature = "crypto")]
+        let res_bytes_crypto = result_app_ty(bytes.clone(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
+        let res_bool_crypto = result_app_ty(boolean(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
+        let res_int_crypto = result_app_ty(int(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
+        let res_unit_crypto = result_app_ty(unit_ty(), crypto_err.clone());
+        #[cfg(feature = "crypto")]
+        let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
+
+        #[cfg(feature = "regex")]
+        let span = tuple(vec![int(), int()]);
+        #[cfg(feature = "regex")]
+        let res_regex = result_app_ty(regex.clone(), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_bool_regex = result_app_ty(boolean(), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_span_regex = result_app_ty(span.clone(), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_spans_regex = result_app_ty(array(span), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_caps_regex = result_app_ty(array(string()), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_caps_all_regex = result_app_ty(array(array(string())), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_strs_regex = result_app_ty(array(string()), regex_err.clone());
+        #[cfg(feature = "regex")]
+        let res_string_regex = result_app_ty(string(), regex_err.clone());
+
+        let ty = match registry {
+            "fs_exists" | "fs_is_file" | "fs_is_dir" | "fs_is_symlink" => {
+                fun(&[string()], res_bool_io)
+            }
+            "fs_metadata" => fun(&[string()], res_meta_io),
+            "fs_create_dir" | "fs_create_dir_all" | "fs_remove_file" | "fs_remove_dir"
+            | "fs_remove_dir_all" => fun(&[string()], res_unit_io.clone()),
+            "fs_rename" | "fs_copy" | "fs_symlink" => {
+                fun(&[string(), string()], res_unit_io.clone())
+            }
+            "fs_read_link" | "fs_realpath" => fun(&[string()], res_string_io.clone()),
+            "fs_list_dir" => fun(&[string()], res_strs_io),
+
+            #[cfg(feature = "time")]
+            "time_timestamp" | "time_instant_now" | "time_epoch" => fun(&[], res_int_time.clone()),
+            #[cfg(feature = "time")]
+            "time_sleep_ms" => fun(&[int()], res_unit_time),
+            #[cfg(feature = "time")]
+            "time_elapsed_nanos" | "time_elapsed_millis"
+            | "time_date_from_period" | "time_date_from_epoch_period" => {
+                fun(&[int()], res_int_time.clone())
+            }
+            #[cfg(feature = "time")]
+            "time_add" | "time_sub" | "time_period_add" | "time_period_sub" => {
+                fun(&[int(), int()], res_int_time.clone())
+            }
+            #[cfg(feature = "time")]
+            "time_format" => fun(&[int(), string()], res_string_time.clone()),
+            #[cfg(feature = "time")]
+            "time_parse" => fun(&[string(), string()], res_int_time.clone()),
+            #[cfg(feature = "time")]
+            "time_date" => fun(&[], res_int_time.clone()),
+            #[cfg(feature = "time")]
+            "time_period" => {
+                let params: Vec<Ty> = std::iter::repeat_with(int).take(9).collect();
+                fun(&params, res_int_time)
+            }
+
+            "env_args" => fun(&[], res_strs_env),
+            "env_var" => fun(&[string()], res_string_env.clone()),
+            "env_cwd" => fun(&[], res_string_env),
+            "env_remove_var" | "env_set_cwd" => fun(&[string()], res_unit_env.clone()),
+            "env_set_var" => fun(&[string(), string()], res_unit_env.clone()),
+            "env_exec" => fun(&[string(), array(string())], res_int_env),
+            "env_exit" => fun(&[int()], unit_ty()),
+
+            #[cfg(feature = "crypto")]
+            "crypto_sha256" | "crypto_sha512" | "crypto_blake3" => {
+                fun(&[bytes.clone()], res_bytes_crypto.clone())
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_hasher_init" => fun(&[string()], res_int_crypto.clone()),
+            #[cfg(feature = "crypto")]
+            "crypto_hasher_update" => fun(&[int(), bytes.clone()], res_unit_crypto.clone()),
+            #[cfg(feature = "crypto")]
+            "crypto_hasher_finalize" => fun(&[int()], res_bytes_crypto.clone()),
+            #[cfg(feature = "crypto")]
+            "crypto_hmac_sha256" | "crypto_hmac_sha512" => {
+                fun(&[bytes.clone(), bytes.clone()], res_bytes_crypto.clone())
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_hmac_verify_sha256" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bool_crypto.clone(),
+                )
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_random_bytes" => fun(&[int()], res_bytes_crypto.clone()),
+            #[cfg(feature = "crypto")]
+            "crypto_random_u64" => fun(&[], res_int_crypto),
+            #[cfg(feature = "crypto")]
+            "crypto_chacha20_poly1305_encrypt" | "crypto_chacha20_poly1305_decrypt"
+            | "crypto_aes_256_gcm_encrypt" | "crypto_aes_256_gcm_decrypt" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bytes_crypto.clone(),
+                )
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_ed25519_generate" | "crypto_x25519_generate" => {
+                fun(&[], result_app_ty(keypair.clone(), crypto_err.clone()))
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_ed25519_sign" | "crypto_x25519_shared_secret" => {
+                fun(
+                    &[bytes.clone(), bytes.clone()],
+                    res_bytes_crypto.clone(),
+                )
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_ed25519_verify" => {
+                fun(
+                    &[bytes.clone(), bytes.clone(), bytes.clone()],
+                    res_bool_crypto.clone(),
+                )
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_argon2id_hash" | "crypto_argon2id_verify" => {
+                fun(&[bytes.clone(), bytes.clone()], res_unit_crypto)
+            }
+            #[cfg(feature = "crypto")]
+            "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
+
+            #[cfg(feature = "regex")]
+            "regex_compile" => fun(&[string(), string()], res_regex),
+            #[cfg(feature = "regex")]
+            "regex_is_match" => fun(&[regex.clone(), string()], res_bool_regex),
+            #[cfg(feature = "regex")]
+            "regex_find" => fun(&[regex.clone(), string()], res_span_regex),
+            #[cfg(feature = "regex")]
+            "regex_find_all" => fun(&[regex.clone(), string()], res_spans_regex),
+            #[cfg(feature = "regex")]
+            "regex_captures" => fun(&[regex.clone(), string()], res_caps_regex),
+            #[cfg(feature = "regex")]
+            "regex_captures_all" => fun(&[regex.clone(), string()], res_caps_all_regex),
+            #[cfg(feature = "regex")]
+            "regex_split" => fun(&[regex.clone(), string()], res_strs_regex),
+            #[cfg(feature = "regex")]
+            "regex_replace" | "regex_replace_all" => {
+                fun(&[regex, string(), string()], res_string_regex)
+            }
+
+            _ => {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("unknown host native `{}`", registry),
+                    range,
+                );
+                msg.with_help(
+                    "every HostFn registry key must have a host_fn_scheme arm".to_string(),
+                );
+                self.messages.push(msg);
+                Ty::Var(self.counter.fresh())
+            }
+        };
+        Scheme::mono(ty)
+    }
+
     /// Zero-argument functions are nullary at the call site (`f()`), but their
     /// value is still a `unit -> R` function suitable for `spawn(f)` / `MakeFn`.
     fn seal_nullary_fun_ty(fun_ty: Ty, arg_count: usize, has_self_receiver: bool) -> Ty {
@@ -1239,7 +1568,7 @@ impl Checker {
                 let n = name.to_ascii_lowercase();
                 if matches!(
                     n.as_str(),
-                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn"
+                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn" | "regex"
                 ) {
                     return false;
                 }
@@ -1999,6 +2328,56 @@ impl Checker {
                 ),
             );
         }
+        // Serialize / Deserialize / Default / Hash / String
+        {
+            use crate::typechecking::ty::{array, byte};
+            let var = self.counter.fresh();
+            let bytes = array(byte());
+            self.typeclass_method_schemes.insert(
+                ("Serialize".to_string(), "serialize".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Serialize", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(bytes.clone())),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Deserialize".to_string(), "deserialize".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Deserialize", var)],
+                    Ty::Fun(Box::new(bytes), Box::new(Ty::Var(var))),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Default".to_string(), "default".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Default", var)],
+                    Ty::Fun(Box::new(unit_ty()), Box::new(Ty::Var(var))),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Hash".to_string(), "hash".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Hash", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(int())),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("String".to_string(), "to_string".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("String", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
+                ),
+            );
+        }
     }
 
     /// Inner inference — does the actual dispatch but no caching.
@@ -2195,6 +2574,7 @@ impl Checker {
                                 BuiltinExport::FfiFn { .. }
                                     | BuiltinExport::IoFn { .. }
                                     | BuiltinExport::ThreadFn { .. }
+                                    | BuiltinExport::HostFn { .. }
                             )
                         })
                         .map(|(k, e)| (k.clone(), e.clone()))
@@ -2211,9 +2591,15 @@ impl Checker {
                                 let scheme = self.thread_fn_scheme(kind);
                                 self.env.insert_top(local, scheme);
                             }
+                            BuiltinExport::HostFn { registry, .. } => {
+                                let scheme = self.host_fn_scheme(registry, range.clone());
+                                self.env.insert_top(local, scheme);
+                            }
                             BuiltinExport::FfiFn { .. } => {
-                                self.env
-                                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                                self.env.insert_top(
+                                    local,
+                                    Scheme::mono(Ty::Var(self.counter.fresh())),
+                                );
                             }
                             _ => {}
                         }
@@ -2959,6 +3345,8 @@ impl Checker {
                         PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
                         PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
                         PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
+                        PreludeFn::Ord => self.infer_ord(arg_slice, range),
+                        PreludeFn::Char => self.infer_char(arg_slice, range),
                     };
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
@@ -3476,6 +3864,49 @@ impl Checker {
                         format!("`?` requires Option or Result, found `{}`", resolved),
                         range,
                     )
+                }
+            }
+
+            Expression::Cast(expr, ty_ann) => {
+                let src_ty = self.infer(expr);
+                let dst_ty = self.parse_type_name(ty_ann);
+                let src_ty = apply_ty_prune(&self.subst, &src_ty);
+                let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
+                let range = expr.0.into_range();
+                match (
+                    Self::primitive_cast_name(&src_ty),
+                    Self::primitive_cast_name(&dst_ty),
+                ) {
+                    (Some(from), Some(to)) if from == to => dst_ty,
+                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => {
+                        if from == "int" && to == "byte" {
+                            if let Err(Some(n)) = Self::byte_literal_coercion(expr) {
+                                return self.error_with_help(
+                                    ErrorCode::TypeMismatch,
+                                    format!("byte literal out of range: `{n}` is not in 0..=255"),
+                                    range,
+                                    Some(
+                                        "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                        dst_ty
+                    }
+                    (Some(from), Some(to)) => self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!("cannot cast `{from}` to `{to}`"),
+                        range,
+                        Some("allowed casts: int↔float, int↔byte, int↔bool".to_string()),
+                    ),
+                    _ => self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+                            .to_string(),
+                        ty_ann.0.into_range(),
+                        None,
+                    ),
                 }
             }
 
@@ -6341,6 +6772,80 @@ impl Checker {
         result_app_ty(unit_ty(), string())
     }
 
+    fn primitive_cast_name(ty: &Ty) -> Option<&'static str> {
+        use super::ty::{BOOL, BYTE, FLOAT, INT};
+        match ty {
+            Ty::Con(name) => match name.as_str() {
+                INT => Some("int"),
+                FLOAT => Some("float"),
+                BYTE => Some("byte"),
+                BOOL => Some("bool"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn primitive_cast_allowed(from: &str, to: &str) -> bool {
+        matches!(
+            (from, to),
+            ("int", "float")
+                | ("float", "int")
+                | ("int", "byte")
+                | ("byte", "int")
+                | ("int", "bool")
+                | ("bool", "int")
+        )
+    }
+
+    /// `ord(string) -> Result<byte, string>`.
+    fn infer_ord(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        use super::ty::byte;
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("ord expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `ord(s)` with a single-character string".to_string()),
+            );
+        }
+        let s_ty = self.infer(&args[0]);
+        self.unify(
+            &s_ty,
+            &string(),
+            &args[0].0.into_range(),
+            "ord argument",
+        );
+        result_app_ty(byte(), string())
+    }
+
+    /// `char(byte) -> Result<string, string>`.
+    fn infer_char(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        use super::ty::byte;
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("char expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `char(b)` with a `byte` value".to_string()),
+            );
+        }
+        let b_ty = self.infer(&args[0]);
+        self.unify(
+            &b_ty,
+            &byte(),
+            &args[0].0.into_range(),
+            "char argument",
+        );
+        result_app_ty(string(), string())
+    }
+
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
     fn infer_dot(
         &mut self,
@@ -7395,6 +7900,10 @@ impl Checker {
                     Err(Some(*n))
                 }
             }
+            Expression::Negate(inner) => match unwrap_expr_wrappers(inner).1.as_ref() {
+                Expression::Integer(n) => Err(Some(-n)),
+                _ => Err(None),
+            },
             _ => Err(None),
         }
     }
@@ -8792,6 +9301,7 @@ impl Checker {
             "string" => string(),
             "void" => unit_ty(),
             "stream" => crate::typechecking::ty::stream_ty(),
+            "regex" => crate::typechecking::ty::regex_ty(),
             "thread" => crate::typechecking::ty::thread_ty(),
             "sender" => crate::typechecking::ty::sender_ty(),
             "receiver" => crate::typechecking::ty::receiver_ty(),
@@ -8800,6 +9310,7 @@ impl Checker {
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
+            "regexerror" => Ty::Con(common::BUILTIN_REGEX_ERROR_ENUM.into()),
             "threaderror" => Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into()),
             "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
@@ -11237,6 +11748,10 @@ impl Checker {
                 self.pre_register_enums_walk(l, errors);
                 self.pre_register_enums_walk(r, errors);
             }
+            Expression::Cast(expr, ty) => {
+                self.pre_register_enums_walk(expr, errors);
+                self.pre_register_enums_walk(ty, errors);
+            }
             Expression::Range { start, end, .. } => {
                 self.pre_register_enums_walk(start, errors);
                 self.pre_register_enums_walk(end, errors);
@@ -12095,6 +12610,61 @@ impl Checker {
             let pattern_range = arm.body.0.into_range();
             let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee, &pattern_range);
 
+            // Narrow an Identifier scrutinee to the matched variant so
+            // `p.0` / `p.field` inside the arm use tagged field lookup
+            // (tuple indices are shared across variants otherwise).
+            let mut refined_scrut: Option<(String, Option<Ty>)> = None;
+            if let Expression::Identifier(scrut_name) = scrutinee.1.as_ref()
+                && let Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    ..
+                } = &arm.pattern
+            {
+                if let Some(tag) = self
+                    .enum_tags
+                    .get(*enum_name)
+                    .and_then(|t| t.get(*variant_name).copied())
+                {
+                    let arity = self
+                        .enum_arities
+                        .get(*enum_name)
+                        .and_then(|a| a.get(tag as usize).copied())
+                        .unwrap_or(0);
+                    let owner = match &resolved_scrutinee {
+                        Ty::Sum { .. } => resolved_scrutinee.clone(),
+                        Ty::Constructor { owner, .. } => owner.as_ref().clone(),
+                        Ty::Con(name) => {
+                            let variant_names =
+                                self.enums.get(name.as_str()).cloned().unwrap_or_default();
+                            let payloads = self
+                                .enum_payloads
+                                .get(name.as_str())
+                                .cloned()
+                                .unwrap_or_default();
+                            let variants: Vec<(String, EnumVariantPayloadTy)> =
+                                variant_names.into_iter().zip(payloads).collect();
+                            Ty::Sum {
+                                name: name.clone(),
+                                variants,
+                            }
+                        }
+                        other => other.clone(),
+                    };
+                    let ctor = Ty::Constructor {
+                        owner: Box::new(owner),
+                        tag,
+                        arity,
+                    };
+                    let prev_cg = self.codegen_var_types.get(*scrut_name).cloned();
+                    self.env
+                        .insert_top((*scrut_name).to_string(), Scheme::mono(ctor.clone()));
+                    self.codegen_var_types
+                        .insert((*scrut_name).to_string(), ctor);
+                    refined_scrut = Some(((*scrut_name).to_string(), prev_cg));
+                }
+            }
+
             // Step 3: unify pattern type with scrutinee.
             self.unify(
                 &resolved_scrutinee,
@@ -12109,6 +12679,16 @@ impl Checker {
 
             // Step 5: infer body, unify with result.
             let body_ty = self.infer(&arm.body);
+            if let Some((name, prev_cg)) = refined_scrut {
+                match prev_cg {
+                    Some(ty) => {
+                        self.codegen_var_types.insert(name, ty);
+                    }
+                    None => {
+                        self.codegen_var_types.remove(&name);
+                    }
+                }
+            }
             if first {
                 result_ty = body_ty;
                 first = false;
@@ -13098,9 +13678,45 @@ impl Checker {
     }
 
     /// Field index in a record-shaped variant (codegen).
+    ///
+    /// When `specific_tag` is set (match-narrowed receiver), only that
+    /// variant is searched — required for shared tuple indices `"0"`, `"1"`, …
     pub fn field_index_for(&self, enum_name: &str, field: &str) -> Option<(String, u16)> {
+        self.field_index_for_tagged(enum_name, field, None)
+    }
+
+    /// Like [`Self::field_index_for`], optionally restricted to one variant tag.
+    pub fn field_index_for_tagged(
+        &self,
+        enum_name: &str,
+        field: &str,
+        specific_tag: Option<u32>,
+    ) -> Option<(String, u16)> {
         let payloads = self.enum_payloads.get(enum_name)?;
         let names = self.enums.get(enum_name)?;
+        if let Some(tag) = specific_tag {
+            let i = tag as usize;
+            let payload = payloads.get(i)?;
+            let variant_name = names.get(i)?.clone();
+            match payload {
+                EnumVariantPayloadTy::Record(fields) => {
+                    for (j, (fname, _)) in fields.iter().enumerate() {
+                        if fname == field {
+                            return Some((variant_name, j as u16));
+                        }
+                    }
+                }
+                EnumVariantPayloadTy::Tuple(parts) => {
+                    if let Ok(idx) = field.parse::<usize>() {
+                        if idx < parts.len() {
+                            return Some((variant_name, idx as u16));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         // Prefer declared record field names.
         for (i, payload) in payloads.iter().enumerate() {
             if let EnumVariantPayloadTy::Record(fields) = payload {
@@ -16038,6 +16654,31 @@ fn main() {
             msgs.iter()
                 .any(|m| m.message().contains("narrow with match first")),
             "expected 'narrow with match first' diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_tuple_field_after_match_narrows_shared_index() {
+        // Derive Show walks `recv.0` via AST Access. Multiple tuple
+        // variants share index `"0"`; match refinement must make this
+        // typecheck (and `%v` must resolve Show).
+        let src = r#"
+#[derive(Show, Eq)]
+enum Box { S(string), B(bool) }
+fn main() {
+    print "%v,", Box::S("x");
+    print "%z", Box::S("x") == Box::S("x");
+}
+"#;
+        let mut ast = Pratt::default().parse(src).expect("parse");
+        let _ = crate::attrs::expand_program(&mut ast);
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected derived Show/Eq with shared tuple indices to typecheck, got: {:?}",
             msgs
         );
     }
@@ -19179,6 +19820,54 @@ fn main() {
             msgs.is_empty(),
             "unexpected messages: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn host_fn_scheme_covers_all_wiring_registries() {
+        use machine::{ENV_WIRING, FS_WIRING};
+
+        let mut c = Checker::new();
+        let mut names: Vec<&str> = FS_WIRING
+            .iter()
+            .chain(ENV_WIRING.iter())
+            .map(|&(n, _, _)| n)
+            .collect();
+        #[cfg(feature = "time")]
+        {
+            names.extend(machine::TIME_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(feature = "crypto")]
+        {
+            names.extend(machine::CRYPTO_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(feature = "regex")]
+        {
+            names.extend(machine::REGEX_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(all(feature = "time", feature = "crypto", feature = "regex"))]
+        assert_eq!(names.len(), 72);
+        for name in names {
+            let _ = c.host_fn_scheme(name, 0..0);
+        }
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "wired registries must not hit host_fn_scheme fallback: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn host_fn_scheme_unknown_registry_emits_diagnostic() {
+        let mut c = Checker::new();
+        let _ = c.host_fn_scheme("no_such_native", 0..0);
+        let msgs = c.take_messages();
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].message().contains("unknown host native `no_such_native`"),
+            "got: {}",
+            msgs[0].message()
         );
     }
 }
