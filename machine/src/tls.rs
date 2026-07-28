@@ -512,4 +512,50 @@ mod tests {
         let err = tls_connect_insecure(&mut heap, "127.0.0.1", 99999).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
     }
+
+    #[test]
+    fn connect_insecure_negative_port() {
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "127.0.0.1", -1).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn connect_rejects_empty_server_name() {
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "", 443).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        let err = tls_connect(&mut heap, "", 443).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn connect_insecure_connection_refused() {
+        // Port 1 is almost never listening on loopback in CI/dev.
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "127.0.0.1", 1).unwrap_err();
+        assert_eq!(err, IoErrorTag::Other);
+    }
+
+    #[test]
+    fn empty_write_then_double_close() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let empty = make_byte_array(&mut heap, b"");
+        stream_write_all(&mut heap, s, empty).expect("empty write_all");
+        // Peer waits for app data; close_notify should still succeed.
+        stream_close(&mut heap, s).expect("close");
+        let err = stream_close(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        // Server may exit early when the client closes without sending data.
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn verified_connect_invalid_port() {
+        let mut heap = Heap::default();
+        let err = tls_connect(&mut heap, "localhost", -5).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
 }
