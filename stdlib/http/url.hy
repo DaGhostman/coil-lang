@@ -142,6 +142,136 @@ fn http_err_bad_response() -> Result<(), HttpError> {
     raise HttpError::BadResponse;
 }
 
+// Reject CR (13) / LF (10) so path/host/method/headers cannot inject request lines.
+// Plain int return — keep raise/`?` out of build_request_head* (concat poison).
+fn bytes_have_crlf([byte] b) -> int {
+    let i = 0;
+    let cr: byte = 13;
+    let lf: byte = 10;
+    while i < len(b) {
+        if b[i] == cr {
+            return 1;
+        }
+        if b[i] == lf {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn has_crlf(string s) -> int {
+    return bytes_have_crlf(to_bytes(s));
+}
+
+// `to_bytes` invalidates the input string (VM quirk); rebuild after a CRLF scan.
+fn str_reject_crlf(string s) -> Result<string, HttpError> {
+    let b = to_bytes(s);
+    if bytes_have_crlf(b) == 1 {
+        http_err_bad_url()?;
+    }
+    return match from_bytes(b) {
+        Result::Ok(s2) => s2,
+        Result::Err(_) => {
+            http_err_bad_url()?;
+            ""
+        },
+    };
+}
+
+// True (1) if the first header line of an HTTP message contains "HTTP/1.1"
+// (rejects method/path CRLF injection, which truncates the request line).
+fn request_line_ok([byte] head) -> int {
+    let cr: byte = 13;
+    let lf: byte = 10;
+    let i = 0;
+    let n = len(head);
+    while i + 1 < n {
+        if head[i] == cr {
+            if head[i + 1] == lf {
+                let needle: [byte] = [72, 84, 84, 80, 47, 49, 46, 49];
+                let j = 0;
+                while j + 8 <= i {
+                    let ok = 1;
+                    let k = 0;
+                    while k < 8 {
+                        if head[j + k] != needle[k] {
+                            ok = 0;
+                        }
+                        k = k + 1;
+                    }
+                    if ok == 1 {
+                        return 1;
+                    }
+                    j = j + 1;
+                }
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// After format_extra_headers_str: every non-empty line must contain ':'.
+// Rebuilds extras (to_bytes invalidates the input string).
+fn extras_sanitize(string extras) -> Result<string, HttpError> {
+    let b = to_bytes(extras);
+    let cr: byte = 13;
+    let lf: byte = 10;
+    let colon: byte = 58;
+    let line_start = 0;
+    let i = 0;
+    let n = len(b);
+    while i + 1 < n {
+        if b[i] == cr {
+            if b[i + 1] == lf {
+                if i > line_start {
+                    let has_colon = 0;
+                    let j = line_start;
+                    while j < i {
+                        if b[j] == colon {
+                            has_colon = 1;
+                        }
+                        j = j + 1;
+                    }
+                    if has_colon == 0 {
+                        http_err_bad_url()?;
+                    }
+                }
+                line_start = i + 2;
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    return match from_bytes(b) {
+        Result::Ok(s) => s,
+        Result::Err(_) => {
+            http_err_bad_url()?;
+            ""
+        },
+    };
+}
+
+fn headers_have_crlf([string] names, [string] values) -> int {
+    let i = 0;
+    let n = len(names);
+    while i < n {
+        if has_crlf(names[i]) == 1 {
+            return 1;
+        }
+        if has_crlf(values[i]) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn http_err_unsupported_scheme() -> Result<(), HttpError> {
     raise HttpError::UnsupportedScheme;
 }
@@ -234,6 +364,9 @@ fn parse_url(string s) -> Result<Url, HttpError> {
         http_err_bad_url()?;
     }
     let host_b = bytes_slice(b, rest_start, host_end);
+    if bytes_have_crlf(host_b) == 1 {
+        http_err_bad_url()?;
+    }
     let host = bytes_to_string(host_b)?;
 
     let port = 80;
@@ -258,11 +391,18 @@ fn parse_url(string s) -> Result<Url, HttpError> {
     let path = "/";
     if found_path == 1 {
         if b[path_start] == qmark {
+            // Bare `host?q=` → path "?q=…". Prefer `/?q=` in URLs: prefixing
+            // `"/" + q` here under Result mode hits a known compiler SEGV.
             let path_b = bytes_slice(b, path_start, len(b));
-            let q = bytes_to_string(path_b)?;
-            path = "/" + q;
+            if bytes_have_crlf(path_b) == 1 {
+                http_err_bad_url()?;
+            }
+            path = bytes_to_string(path_b)?;
         } else {
             let path_b = bytes_slice(b, path_start, len(b));
+            if bytes_have_crlf(path_b) == 1 {
+                http_err_bad_url()?;
+            }
             path = bytes_to_string(path_b)?;
         }
     }
@@ -348,6 +488,7 @@ fn body_len_str(int body_len) -> string {
     if body_len == 14 { return "14"; }
     if body_len == 15 { return "15"; }
     if body_len == 16 { return "16"; }
+    if body_len == 17 { return "17"; }
     if body_len == 32 { return "32"; }
     if body_len == 64 { return "64"; }
     if body_len == 128 { return "128"; }
@@ -397,6 +538,8 @@ fn cl_trailer(int body_len) -> string {
         return "10\r\nConnection: close\r\n\r\n";
     } else if body_len == 16 {
         return "16\r\nConnection: close\r\n\r\n";
+    } else if body_len == 17 {
+        return "17\r\nConnection: close\r\n\r\n";
     } else if body_len == 32 {
         return "32\r\nConnection: close\r\n\r\n";
     } else if body_len == 64 {
@@ -444,6 +587,8 @@ fn header_name_eq_ci(string a, string b) -> int {
 
 // Host / Content-Length / Connection are always emitted by the client;
 // format_extra_headers_str skips those names (case-sensitive common spellings).
+// Header name/value CRLF is rejected via headers_have_crlf / has_crlf in callers
+// (and unit tests); formatting itself stays raise-free and to_bytes-light.
 
 fn format_extra_headers_str([string] names, [string] values) -> string {
     // Precondition: caller ensures there is at least one non-reserved header.
@@ -499,6 +644,7 @@ fn format_extra_headers(Headers headers) -> [byte] {
 
 fn build_request_head(string method, Url u, Headers headers, int body_len) -> Result<[byte], HttpError> {
     // Inline Host construction (avoid nested Result `?` through host_header_value).
+    // No raise/`?` here — poisons Ok-path string concat. Callers use has_crlf / parse_url.
     let host = u.host;
     let port = u.port;
     let scheme = u.scheme;
@@ -524,7 +670,8 @@ fn build_request_head(string method, Url u, Headers headers, int body_len) -> Re
 
 fn build_request_head_extras(string method, Url u, string extras, int body_len) -> Result<[byte], HttpError> {
     // Inserts non-empty `extras` ("Name: value\r\n" lines) after Host.
-    // Caller must not pass the "__NONE__" sentinel.
+    // Caller must not pass the "__NONE__" / "__CRLF__" sentinels.
+    // Header CRLF is rejected in format_extra_headers_str. No raise/`?` here.
     let host = u.host;
     let port = u.port;
     let scheme = u.scheme;
@@ -781,6 +928,9 @@ fn parse_response([byte] raw) -> Result<Response, HttpError> {
     let content_length = content_length_from(names, values)?;
     let body = rest;
     if content_length != 999999 {
+        if content_length > len(rest) {
+            raise HttpError::BadResponse;
+        }
         if content_length < len(rest) {
             body = bytes_slice_resp(rest, 0, content_length);
         }

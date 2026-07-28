@@ -54,7 +54,11 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
     if n > 0 {
         let extras = format_extra_headers_str(headers.names, headers.values);
         if extras != "__NONE__" {
+            let extras = extras_sanitize(extras)?;
             let head = build_request_head_extras(method, u, extras, bl)?;
+            if request_line_ok(head) == 0 {
+                http_err_bad_url()?;
+            }
             return request_send(head, u, body)?;
         }
     }
