@@ -111,6 +111,8 @@ fn insecure_config() -> Arc<ClientConfig> {
     .clone()
 }
 
+/// Dangerous verifier for `connect_insecure`: skips **trust** / name checks only.
+/// TLS 1.2/1.3 record signatures are still verified via the default provider.
 #[derive(Debug)]
 struct NoCertVerify;
 
@@ -176,7 +178,9 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut ClientConnection) -> Re
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
+                // Socket is still blocking here; WouldBlock/Interrupted are unexpected.
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                    std::thread::yield_now();
                     continue;
                 }
                 Err(e) => return Err(map_io(e)),
@@ -217,7 +221,10 @@ pub fn tls_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoEr
     connect_with_config(heap, host, port, verified_config())
 }
 
-/// TLS connect without certificate verification (local / self-signed).
+/// TLS connect that **disables certificate verification** (local / self-signed only).
+///
+/// Still performs a real TLS handshake; only the trust store / name checks are
+/// skipped. Prefer [`tls_connect`] for anything beyond local development.
 pub fn tls_connect_insecure(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
     connect_with_config(heap, host, port, insecure_config())
 }
@@ -510,6 +517,52 @@ mod tests {
     fn connect_insecure_invalid_port() {
         let mut heap = Heap::default();
         let err = tls_connect_insecure(&mut heap, "127.0.0.1", 99999).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn connect_insecure_negative_port() {
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "127.0.0.1", -1).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn connect_rejects_empty_server_name() {
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "", 443).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        let err = tls_connect(&mut heap, "", 443).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn connect_insecure_connection_refused() {
+        // Port 1 is almost never listening on loopback in CI/dev.
+        let mut heap = Heap::default();
+        let err = tls_connect_insecure(&mut heap, "127.0.0.1", 1).unwrap_err();
+        assert_eq!(err, IoErrorTag::Other);
+    }
+
+    #[test]
+    fn empty_write_then_double_close() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let empty = make_byte_array(&mut heap, b"");
+        stream_write_all(&mut heap, s, empty).expect("empty write_all");
+        // Peer waits for app data; close_notify should still succeed.
+        stream_close(&mut heap, s).expect("close");
+        let err = stream_close(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        // Server may exit early when the client closes without sending data.
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn verified_connect_invalid_port() {
+        let mut heap = Heap::default();
+        let err = tls_connect(&mut heap, "localhost", -5).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
     }
 }

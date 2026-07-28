@@ -140,9 +140,10 @@ runs in the host; afterwards you use the normal `Stream` APIs
 | `connect(host, port)` | `→ Result<Stream, IoError>` | webpki roots + SNI from `host` |
 | `connect_insecure(host, port)` | same | No certificate verification (local/dev) |
 
-Handshake / TLS failures map to `IoError::Other` in v1. IP-literal hosts
-are accepted for the socket connect; SNI is omitted for IP `ServerName`s
-(use a DNS name when the peer requires SNI).
+Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
+tags yet). IP-literal hosts are accepted for the socket connect;
+`ServerName::try_from` may still treat them as IP server names (not the same
+as omitting SNI). Prefer a DNS `host` when the peer requires classic hostname SNI.
 
 See `examples/io_tls.hy`.
 

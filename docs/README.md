@@ -68,6 +68,9 @@ Docs are split into three trees:
 | [References](references/README.md) | Lookup | Syntax, types, keywords, per-API builtin pages |
 | [Internals](internals/README.md) | Contributors / embedders | Pipeline, debug info, opcodes, grammar |
 
+Design notes for the userland HTTP client + host TLS work live in
+[HTTP/TLS stdlib design](superpowers/specs/2026-07-28-http-tls-stdlib-design.md).
+
 ### Manual (tutorial)
 
 | Chapter | Topic |
