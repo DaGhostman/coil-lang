@@ -30,7 +30,8 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi pcre2 || true
+          brew install libffi pcre2
+          pkg-config --exists libpcre2-8
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
