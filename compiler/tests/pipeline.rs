@@ -3377,6 +3377,43 @@ fn main() {
     assert_eq!(output, "1");
 }
 
+/// HostInvoke + virtual `env` wiring: set/get/remove round-trip.
+#[test]
+fn env_var_round_trip_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use env::*;
+
+fn round_trip() -> string {
+    let set_ok = match set_var("COIL_PIPELINE_ENV_KEY", "coil_ok") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+    if set_ok == 0 {
+        return "0";
+    }
+    let got = match var("COIL_PIPELINE_ENV_KEY") {
+        Result::Ok(s) => s,
+        Result::Err(_) => "0",
+    };
+    let rem_ok = match remove_var("COIL_PIPELINE_ENV_KEY") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+    if rem_ok == 0 {
+        return "0";
+    }
+    return got;
+}
+
+fn main() {
+    print "%s", round_trip();
+}
+"#,
+    );
+    assert_eq!(output, "coil_ok");
+}
+
 /// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.
 #[test]
 fn derive_string_to_string_prints_variant() {
