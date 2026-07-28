@@ -122,6 +122,54 @@ fn run_bytecode(
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
 }
 
+/// Serialize cwd changes, `chdir` into `root`, run `f`, then restore cwd.
+fn with_project_cwd<R>(root: &PathBuf, f: impl FnOnce() -> R) -> R {
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+    f()
+}
+
+/// Compile `entry` and assert every `JumpIfMatch` pool index is in range.
+fn compile_entry_and_assert_jump_if_match_pool_valid(
+    entry: &PathBuf,
+) -> (Vec<common::Byte>, Vec<u64>, Pipeline) {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("MSG: {}", msg.message());
+            }
+            panic!("compile failed");
+        }
+    };
+
+    let mut oob = Vec::new();
+    for (i, b) in bytecode.iter().enumerate() {
+        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
+            let idx = (b.operand_u32() & 0xFFFF) as usize;
+            if idx >= constants.len() {
+                oob.push((i, idx));
+            }
+        }
+    }
+    assert!(
+        oob.is_empty(),
+        "JumpIfMatch pool index out of range after multi-file link: \
+         {oob:?} (constants.len() = {})",
+        constants.len()
+    );
+    (bytecode, constants, pipeline)
+}
+
 fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String> {
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
 
@@ -686,45 +734,11 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
     ];
     let (root, entry) = build_project("try_pool", manifest, &files, "src/main.hy");
 
-    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(&root).expect("chdir");
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(original_cwd);
-
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(pair) => pair,
-        Err(()) => {
-            for msg in pipeline.messages() {
-                eprintln!("MSG: {}", msg.message());
-            }
-            panic!("compile failed");
-        }
-    };
-
-    let mut oob = Vec::new();
-    for (i, b) in bytecode.iter().enumerate() {
-        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
-            let idx = (b.operand_u32() & 0xFFFF) as usize;
-            if idx >= constants.len() {
-                oob.push((i, idx));
-            }
-        }
-    }
-    assert!(
-        oob.is_empty(),
-        "JumpIfMatch pool index out of range after multi-file link: \
-         {oob:?} (constants.len() = {})",
-        constants.len()
-    );
-
-    let output = run_bytecode(bytecode, constants, &pipeline);
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
     assert_eq!(output, "a,b,");
 }
 
@@ -772,45 +786,11 @@ fn write_greeting() -> Result<(), IoError> {
     ];
     let (root, entry) = build_project("io_host_try", &manifest, &files, "src/main.hy");
 
-    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(&root).expect("chdir");
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(original_cwd);
-
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(pair) => pair,
-        Err(()) => {
-            for msg in pipeline.messages() {
-                eprintln!("MSG: {}", msg.message());
-            }
-            panic!("compile failed");
-        }
-    };
-
-    let mut oob = Vec::new();
-    for (i, b) in bytecode.iter().enumerate() {
-        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
-            let idx = (b.operand_u32() & 0xFFFF) as usize;
-            if idx >= constants.len() {
-                oob.push((i, idx));
-            }
-        }
-    }
-    assert!(
-        oob.is_empty(),
-        "JumpIfMatch pool index out of range after multi-file IO link: \
-         {oob:?} (constants.len() = {})",
-        constants.len()
-    );
-
-    let output = run_bytecode(bytecode, constants, &pipeline);
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
     assert_eq!(output, "ok");
 
     let written = std::fs::read(root.join("greeting.bin")).expect("dependency wrote greeting.bin");
