@@ -4,12 +4,9 @@ use io::*;
 use io::net::tls::*;
 
 test("tls connect_insecure to closed port is Err") {
-    let msg = match connect_insecure("127.0.0.1", 1) {
-        Result::Ok(s) => {
-            close(s)?;
-            "unexpected-ok"
-        },
-        Result::Err(_) => "tls-ok",
+    let ok = match connect_insecure("127.0.0.1", 1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
     };
-    assert(msg == "tls-ok")?;
+    assert(ok == 1)?;
 }
