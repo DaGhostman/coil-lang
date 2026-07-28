@@ -1998,7 +1998,7 @@ fn expand_enum<'a>(
     generic: bool,
     derives: &[&'a str],
     variants: &[VariantMeta<'a>],
-    variant_nodes: &[Output<'a>],
+    _variant_nodes: &[Output<'a>],
     messages: &mut Vec<Message>,
 ) -> Vec<Output<'a>> {
     if generic {
@@ -2026,16 +2026,9 @@ fn expand_enum<'a>(
             "Default" => out.push(synth_default_enum(span, name, variants)),
             "Hash" => out.push(synth_hash_enum(span, name, variants)),
             "String" => out.push(synth_string_enum(span, name, variants)),
-            "Serialize" => {
-                if enum_payloads_int_only(variant_nodes) {
-                    out.push(synth_serialize_enum(span, name, variants));
-                } else {
-                    push_derive_not_implemented("Serialize", span, messages);
-                }
-            }
-            "Deserialize" | "Send" | "Sensitive" => {
-                push_derive_not_implemented(trait_name, span, messages);
-            }
+            "Serialize" => out.push(synth_serialize_enum(span, name, variants)),
+            "Deserialize" => out.push(synth_deserialize_enum(span, name, variants)),
+            "Send" | "Sensitive" => out.push(synth_marker_impl(span, trait_name, name)),
             _ => unreachable!(),
         }
     }
@@ -2075,9 +2068,9 @@ fn expand_class<'a>(
             "Default" => out.push(synth_default_class(span, name, field_names)),
             "Hash" => out.push(synth_hash_class(span, name, field_names)),
             "String" => out.push(synth_string_class(span, name, field_names)),
-            "Serialize" | "Deserialize" | "Send" | "Sensitive" => {
-                push_derive_not_implemented(trait_name, span, messages);
-            }
+            "Serialize" => out.push(synth_serialize_class(span, name, field_names)),
+            "Deserialize" => out.push(synth_deserialize_class(span, name, field_names)),
+            "Send" | "Sensitive" => out.push(synth_marker_impl(span, trait_name, name)),
             _ => unreachable!(),
         }
     }
@@ -2887,36 +2880,8 @@ fn class_ord_body<'a>(
 
 // ── Default / Hash / String / Serialize (derive MVP) ─────────────────────────
 
-fn push_derive_not_implemented(trait_name: &str, span: SimpleSpan, messages: &mut Vec<Message>) {
-    messages.push(Message::error(
-        ErrorCode::GenericTypeError,
-        format!("derive {trait_name} not yet implemented"),
-        span.into_range(),
-    ));
-}
-
 fn int_zero<'a>(span: SimpleSpan) -> Output<'a> {
     at(span, Expression::Integer(0))
-}
-
-fn type_expr_is_int(ty: &Output<'_>) -> bool {
-    matches!(
-        ty.1.as_ref(),
-        Expression::Type(name) if name.eq_ignore_ascii_case("int")
-    )
-}
-
-fn enum_payloads_int_only(variant_nodes: &[Output<'_>]) -> bool {
-    variant_nodes.iter().all(|node| {
-        let Expression::EnumVariant { payload, .. } = node.1.as_ref() else {
-            return true;
-        };
-        match payload {
-            EnumVariantPayload::Unit => true,
-            EnumVariantPayload::Tuple(items) => items.iter().all(type_expr_is_int),
-            EnumVariantPayload::Record(fields) => fields.iter().all(|f| type_expr_is_int(&f.value)),
-        }
-    })
 }
 
 fn hash_combine<'a>(span: SimpleSpan, acc: Output<'a>, field: Output<'a>) -> Output<'a> {
@@ -3188,6 +3153,159 @@ fn synth_serialize_enum<'a>(
     typeclass_impl(span, "Serialize", enum_name, vec![m])
 }
 
+fn synth_marker_impl<'a>(span: SimpleSpan, trait_name: &'a str, self_ty: &'a str) -> Output<'a> {
+    typeclass_impl(span, trait_name, self_ty, vec![])
+}
+
+fn data_at<'a>(span: SimpleSpan, data: &Output<'a>, index: usize) -> Output<'a> {
+    at(
+        span,
+        Expression::Index(
+            data.clone(),
+            Some(at(span, Expression::Integer(index as i64))),
+        ),
+    )
+}
+
+fn deserialize_variant_value<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    v: &VariantMeta<'a>,
+    data: &Output<'a>,
+    base_index: usize,
+) -> Output<'a> {
+    match &v.shape {
+        VariantShape::Unit => at(
+            span,
+            Expression::Construct {
+                enum_name,
+                variant_name: v.name,
+                fields: EnumConstructPayload::Unit,
+            },
+        ),
+        VariantShape::Tuple(arity) => {
+            let items = (0..*arity)
+                .map(|i| data_at(span, data, base_index + i))
+                .collect();
+            at(
+                span,
+                Expression::Construct {
+                    enum_name,
+                    variant_name: v.name,
+                    fields: EnumConstructPayload::Tuple(items),
+                },
+            )
+        }
+        VariantShape::Record(fields) => {
+            let records = fields
+                .iter()
+                .enumerate()
+                .map(|(i, fname)| RecordFieldValue {
+                    name: fname,
+                    value: data_at(span, data, base_index + i),
+                })
+                .collect();
+            at(
+                span,
+                Expression::Construct {
+                    enum_name,
+                    variant_name: v.name,
+                    fields: EnumConstructPayload::Record(records),
+                },
+            )
+        }
+    }
+}
+
+fn if_tag_equals<'a>(
+    span: SimpleSpan,
+    data: &Output<'a>,
+    tag: usize,
+    body: Output<'a>,
+) -> Output<'a> {
+    let cond = at(
+        span,
+        Expression::Eq(
+            data_at(span, data, 0),
+            at(span, Expression::Integer(tag as i64)),
+        ),
+    );
+    at(span, Expression::Branch(Some(cond), body))
+}
+
+fn synth_deserialize_enum<'a>(
+    span: SimpleSpan,
+    enum_name: &'a str,
+    variants: &[VariantMeta<'a>],
+) -> Output<'a> {
+    let data = leak(format!("__de_{enum_name}"));
+    let panic_msg = leak(format!("deserialize: invalid tag for `{enum_name}`"));
+    let err_body = at(
+        span,
+        Expression::Panic(str_lit(span, panic_msg)),
+    );
+    let mut branches: Vec<Output<'a>> = variants
+        .iter()
+        .enumerate()
+        .map(|(tag, v)| {
+            if_tag_equals(
+                span,
+                &ident(span, data),
+                tag,
+                deserialize_variant_value(span, enum_name, v, &ident(span, data), 1),
+            )
+        })
+        .collect();
+    branches.push(at(span, Expression::Branch(None, err_body)));
+    let body = block_return(span, at(span, Expression::If(branches)));
+    let m = method_fn(
+        span,
+        "deserialize",
+        vec![arg(span, "[byte]", data)],
+        enum_name,
+        body,
+    );
+    typeclass_impl(span, "Deserialize", enum_name, vec![m])
+}
+
+fn synth_serialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
+    let p = leak(format!("__ser_{name}"));
+    let mut elems = Vec::new();
+    for f in fields {
+        elems.push(at(span, Expression::Access(ident(span, p), f)));
+    }
+    let arr = at(span, Expression::Array(elems));
+    let m = method_fn(
+        span,
+        "serialize",
+        vec![arg(span, name, p)],
+        "[byte]",
+        block_return(span, arr),
+    );
+    typeclass_impl(span, "Serialize", name, vec![m])
+}
+
+fn synth_deserialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
+    let data = leak(format!("__de_{name}"));
+    let args: Vec<Output<'a>> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, _)| data_at(span, &ident(span, data), i))
+        .collect();
+    let value = at(
+        span,
+        Expression::Instantiate(ident(span, name), Some(args)),
+    );
+    let m = method_fn(
+        span,
+        "deserialize",
+        vec![arg(span, "[byte]", data)],
+        name,
+        block_return(span, value),
+    );
+    typeclass_impl(span, "Deserialize", name, vec![m])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3245,14 +3363,35 @@ mod tests {
     }
 
     #[test]
-    fn derive_deserialize_reports_not_implemented() {
-        let (exp, _) = expand_src("#[derive(Deserialize)] enum E { A } fn main() {}");
+    fn derive_deserialize_emits_deserialize_method() {
+        let (_exp, decls) =
+            expand_src("#[derive(Deserialize)] enum E { A, B(int) } fn main() {}");
         assert!(
-            exp.messages.iter().any(|m| {
-                m.message().contains("derive Deserialize not yet implemented")
-            }),
-            "expected Deserialize stub diagnostic, got: {:?}",
-            exp.messages.iter().map(|m| m.message()).collect::<Vec<_>>()
+            impl_method_names(&decls, "Deserialize").contains(&"deserialize".to_string()),
+            "expected Deserialize::deserialize impl"
+        );
+    }
+
+    #[test]
+    fn derive_send_emits_marker_impl() {
+        let (_exp, decls) = expand_src("#[derive(Send)] enum E { A } fn main() {}");
+        assert!(
+            decls.iter().any(|n| matches!(
+                n.1.as_ref(),
+                Expression::TypeClassImpl { class, args, methods }
+                    if *class == "Send" && args.len() == 1 && methods.is_empty()
+            )),
+            "expected empty Send instance"
+        );
+    }
+
+    #[test]
+    fn derive_serialize_class_emits_serialize_method() {
+        let (_exp, decls) =
+            expand_src("#[derive(Serialize)] class P { x: int } fn main() {}");
+        assert!(
+            impl_method_names(&decls, "Serialize").contains(&"serialize".to_string()),
+            "expected Serialize::serialize on class"
         );
     }
 }
