@@ -11,7 +11,7 @@ use crate::io::{alloc_result_err, alloc_result_ok};
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, Object};
 
 /// When false, [`host_exec`] returns `ExecDisabled`. Set from `coil.toml` `[env] allow_exec`.
-pub static ALLOW_EXEC: AtomicBool = AtomicBool::new(true);
+pub static ALLOW_EXEC: AtomicBool = AtomicBool::new(false);
 
 /// Runtime gate for `env::exec` (from project manifest).
 pub fn set_allow_exec(allow: bool) {

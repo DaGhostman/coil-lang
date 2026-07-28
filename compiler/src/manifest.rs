@@ -105,7 +105,7 @@ impl Default for Manifest {
             roots: vec![PathBuf::from("src")],
             entry: None,
             ffi_search_paths: Vec::new(),
-            allow_exec: true,
+            allow_exec: false,
         }
     }
 }
@@ -240,7 +240,7 @@ impl Manifest {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
             ffi_search_paths: ffi_search_paths.unwrap_or_default(),
-            allow_exec: allow_exec.unwrap_or(true),
+            allow_exec: allow_exec.unwrap_or(false),
         })
     }
 
@@ -684,6 +684,20 @@ mod tests {
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
         assert_eq!(m.entry, None);
+        assert!(!m.allow_exec);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_reads_env_allow_exec_true() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_env_on");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            "[env]\nallow_exec = true\n[module]\nroots = [\"./src\"]\n",
+        )
+        .unwrap();
+        let m = Manifest::load(&tmp).unwrap();
         assert!(m.allow_exec);
         let _ = std::fs::remove_dir_all(&tmp);
     }
