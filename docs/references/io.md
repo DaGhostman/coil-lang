@@ -17,6 +17,7 @@ use io::*;
 | `from_bytes` / `to_bytes` | Text | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`) |
 | `io::net::tcp::{connect,listen,accept,accept_wait}` | TCP | Nested module — `use io::net::tcp::*;` |
 | `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
+| `io::net::tls::{connect,connect_insecure}` | TLS | Nested module (feature `tls`); handshake in host; same `Stream` APIs |
 
 Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 

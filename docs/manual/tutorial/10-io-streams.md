@@ -68,16 +68,18 @@ See `examples/io_text.hy`.
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
+| `io::net::tls::*` | TLS | `connect` / `connect_insecure` (feature `tls`) |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
 
-TCP and UDP live in nested virtual modules — import them explicitly
+TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 (like `ffi::types`):
 
 ```coil
 use io::*;
 use io::net::tcp::*;
 use io::net::udp::*;
+use io::net::tls::*;
 ```
 
 ---
@@ -124,6 +126,25 @@ See `examples/io_udp.hy`.
 | `listen(host, port)` | `→ Result<Stream, IoError>` | Listening socket |
 | `accept(s)` | `→ Result<Stream, IoError>` | Non-blocking; `WouldBlock` if empty |
 | `accept_wait(s)` | same | Blocks in the host via `poll` |
+
+---
+
+## TLS (`io::net::tls`)
+
+Client TLS via rustls (Cargo feature `tls`, default-on). The handshake
+runs in the host; afterwards you use the normal `Stream` APIs
+(`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
+
+| Function | Signature (simplified) | Behavior |
+|----------|------------------------|----------|
+| `connect(host, port)` | `→ Result<Stream, IoError>` | webpki roots + SNI from `host` |
+| `connect_insecure(host, port)` | same | No certificate verification (local/dev) |
+
+Handshake / TLS failures map to `IoError::Other` in v1. IP-literal hosts
+are accepted for the socket connect; SNI is omitted for IP `ServerName`s
+(use a DNS name when the peer requires SNI).
+
+See `examples/io_tls.hy`.
 
 ---
 
