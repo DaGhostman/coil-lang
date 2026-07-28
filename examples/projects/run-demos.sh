@@ -32,4 +32,9 @@ rm -f "$ROOT/out.hyc"
 timeout "${TIMEOUT_SECS}s" "$BIN" "$PROJECTS/03-echo/src/main.hy"
 echo
 
+echo "=== 04-http ==="
+rm -f "$ROOT/out.hyc"
+"$PROJECTS/04-http/demo.sh"
+echo
+
 echo "All showcase demos finished."

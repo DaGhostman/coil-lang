@@ -17,7 +17,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 failed=0
-for proj in 01-todo 02-adventure 03-echo; do
+for proj in 01-todo 02-adventure 03-echo 04-http; do
   echo "=== $proj tests ==="
   rm -f "$PROJECTS/$proj/out.hyc" "$ROOT/out.hyc"
   if (
