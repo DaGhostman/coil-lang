@@ -56,7 +56,7 @@ Parse → typecheck (HM) → stack codegen + peephole → versioned `.hyc` archi
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
-Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo) live under [`examples/projects/`](../examples/projects/README.md).
+Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo, HTTP client) live under [`examples/projects/`](../examples/projects/README.md). See also [HTTP/1.1 client](manual/http-client.md).
 
 ## Documentation
 

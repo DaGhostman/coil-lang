@@ -1755,13 +1755,16 @@ Each project has its own `coil.toml`, co-located `tests/`, and `NOTES.md`.
 | `01-todo` | Classes, arrays, modules | `./examples/projects/01-todo/demo.sh` |
 | `02-adventure` | Interactive stdin REPL + save/load | `./examples/projects/02-adventure/demo.sh` (or `--ci`) |
 | `03-echo` | TCP + coroutines + protocol module | `./examples/projects/03-echo/demo.sh` |
+| `04-http` | Userland HTTP/1.1 client (`stdlib/http`) | `./examples/projects/04-http/demo.sh` |
 
 Convenience from repo root:
 
 ```bash
-./examples/projects/run-demos.sh    # all three demos (adventure uses transcript.txt)
-./examples/projects/run-tests.sh    # co-located tests for all three
+./examples/projects/run-demos.sh    # all demos (adventure uses transcript.txt)
+./examples/projects/run-tests.sh    # co-located tests for all four
 ```
+
+See also [HTTP/1.1 client](http-client.md).
 
 ### Playing `02-adventure`
 

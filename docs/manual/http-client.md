@@ -1,0 +1,68 @@
+# HTTP/1.1 client (`stdlib/http`)
+
+Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
+It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
+(`io::net::tls::connect`) for `https://` — never insecure by default.
+
+## Setup
+
+Add the stdlib root to your project `coil.toml`:
+
+```toml
+[module]
+roots = ["./src", "./stdlib"]   # or point at the coil checkout's stdlib/
+```
+
+The workspace manifest already includes `./stdlib`. See
+[`coil.toml.example`](../../coil.toml.example) and
+[project config](../references/project-config.md).
+
+## API
+
+```coil
+use http::client::*;
+
+fn main() {
+    match get("http://127.0.0.1:41250/") {
+        Result::Ok(_) => { /* success */ },
+        Result::Err(_) => { panic "get failed"; },
+    };
+}
+```
+
+| Function | Role |
+|----------|------|
+| `get(url)` | `GET` with empty body |
+| `post(url, body)` | `POST` with `[byte]` body |
+| `request(method, url, headers, body)` | Full builder |
+| `status_code(r)` / `body_len(r)` | Result-mode accessors for `Response` |
+
+`Response` carries `status: int`, parallel `header_names` / `header_values`, and
+`body: [byte]`. Errors use `HttpError` (`BadUrl`, `BadResponse`,
+`UnsupportedScheme`, `Io`).
+
+Requests are HTTP/1.1 with `Host`, `Content-Length`, and `Connection: close`.
+
+## Example
+
+Self-contained cleartext demo (local server + client):
+
+```bash
+./examples/projects/04-http/demo.sh
+# ok
+```
+
+Unit tests (URL / request / response parse, no network):
+
+```bash
+cd examples/projects/04-http && coil test
+```
+
+## Limitations (v1)
+
+- No redirects, cookies, connection pooling, or timeouts
+- No chunked transfer encoding (uses `Content-Length` or read-to-close)
+- No HTTP/2 / HTTP/3
+- HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
+  certs are out of scope for the demo (use `connect_insecure` only via TLS
+  APIs directly, not through this client)
