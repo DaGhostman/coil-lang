@@ -487,9 +487,9 @@ impl Pipeline {
         self.compiler.function_offset(name)
     }
 
-    /// Prelude `ord` / `char` host natives (auto-imported).
+    /// Prelude `ord` / `char` / string-`Hash` host natives (auto-imported).
     fn register_prelude_char_ord_natives(&mut self) {
-        use machine::char_ord::{prelude_char, prelude_ord};
+        use machine::char_ord::{prelude_char, prelude_hash_string, prelude_ord};
         use machine::{FfiSignature, FfiType, HostClosureFn};
 
         let ord_sig =
@@ -510,6 +510,17 @@ impl Pipeline {
         self.host_natives
             .push(std::sync::Arc::new(HostClosureFn::new(char_sig, |heap, args| {
                 Ok(Some(prelude_char(heap, args)))
+            })));
+
+        // Internal: `Hash__string__hash` thunk — not a userland free function.
+        let hash_sig =
+            FfiSignature::from_parts("hash_string".to_string(), vec![FfiType::String], FfiType::Int)
+                .expect("hash_string signature");
+        let hash_id = self.host_natives.len();
+        self.compiler.register_native_id("hash_string", hash_id);
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(hash_sig, |heap, args| {
+                Ok(Some(prelude_hash_string(heap, args)))
             })));
     }
 

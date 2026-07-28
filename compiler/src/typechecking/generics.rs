@@ -847,6 +847,25 @@ impl Generics {
             assoc_tys: HashMap::new(),
         });
 
+        // ---- Hash for primitives (derive mixes via `field.hash()`) ----
+        for (ty, ty_str) in [
+            (int(), "int"),
+            (float(), "float"),
+            (string(), "string"),
+            (boolean(), "bool"),
+            (unit(), "unit"),
+            (super::ty::byte(), "byte"),
+        ] {
+            self.instances.push(InstanceDef {
+                class: "Hash".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                range: 0..0,
+                args: vec![ty],
+                method_fqns: make_fqns("Hash", ty_str, &["hash"]),
+                assoc_tys: HashMap::new(),
+            });
+        }
+
         // ---- byte: Eq + Show + Ord (int opcodes; needed for `byte` ranges) ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
@@ -983,7 +1002,9 @@ impl Generics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{TyVarId, float, int, option_app_ty};
+    use crate::typechecking::ty::{
+        TyVarId, boolean, byte, float, int, option_app_ty, string, unit,
+    };
 
     fn method(name: &str, has_default: bool) -> TypeClassMethodDef {
         TypeClassMethodDef {
@@ -1140,6 +1161,17 @@ mod tests {
             "to_string"
         );
         assert!(g.typeclass("Send").unwrap().methods.is_empty());
+    }
+
+    #[test]
+    fn hash_builtin_instances_cover_primitives() {
+        let g = Generics::new();
+        for ty in [int(), float(), string(), boolean(), unit(), byte()] {
+            assert!(
+                g.find_instance("Hash", &[ty.clone()]).is_some(),
+                "missing Hash instance for {ty:?}"
+            );
+        }
     }
 
     #[test]

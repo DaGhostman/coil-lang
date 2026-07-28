@@ -48,6 +48,17 @@ pub fn prelude_char(heap: &mut Heap, args: &[Value]) -> Value {
     string_val(heap, encoded)
 }
 
+/// Content hash for `Hash` on `string` — returns the interned `ObjString` FNV hash as `int`.
+pub fn prelude_hash_string(heap: &mut Heap, args: &[Value]) -> Value {
+    match value_as_string(heap, args[0]) {
+        Ok(s) => {
+            let h = crate::memory::ObjString::hash(&s);
+            Value::from(h as i64)
+        }
+        Err(_) => Value::from(0_i64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +119,18 @@ mod tests {
 
         let oob = prelude_char(&mut heap, &[Value::from(300_i64)]);
         assert_eq!(value_as_string(&heap, oob).unwrap(), "");
+    }
+
+    #[test]
+    fn hash_string_is_stable_and_content_sensitive() {
+        let mut heap = Heap::default();
+        let a = str_arg(&mut heap, "hi");
+        let b = str_arg(&mut heap, "hi");
+        let c = str_arg(&mut heap, "bye");
+        let ha = prelude_hash_string(&mut heap, &[a]).as_int();
+        let hb = prelude_hash_string(&mut heap, &[b]).as_int();
+        let hc = prelude_hash_string(&mut heap, &[c]).as_int();
+        assert_eq!(ha, hb);
+        assert_ne!(ha, hc);
     }
 }

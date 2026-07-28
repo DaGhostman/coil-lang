@@ -3769,6 +3769,54 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
 
+        // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
+        // after unbox; float reinterprets IEEE bits as int; unit is 0; string
+        // uses the intern FNV via HostInvoke `hash_string`.
+        for (ty, tag) in [
+            ("int", ValueTag::Int),
+            ("byte", ValueTag::Int),
+            ("bool", ValueTag::Bool),
+            ("float", ValueTag::Float),
+        ] {
+            let fqn = Generics::builtin_instance_fqn("Hash", ty, "hash");
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode
+                .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+        {
+            let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
+            if !self.functions.contains_key(&fqn) {
+                self.functions.insert(fqn, self.bytecode.len());
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+        }
+        if let Some(native_id) = self.native_id("hash_string") {
+            let fqn = Generics::builtin_instance_fqn("Hash", "string", "hash");
+            if !self.functions.contains_key(&fqn) {
+                self.functions.insert(fqn, self.bytecode.len());
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                self.bytecode.push(
+                    Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::String as u32),
+                );
+                self.bytecode
+                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
+                self.bytecode
+                    .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+        }
+
         // Read/Write for Stream — lower to the same HostInvoke natives as
         // free functions `read` / `write`. Args may arrive boxed via the
         // dictionary ABI; unbox then call.
