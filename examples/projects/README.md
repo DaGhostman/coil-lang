@@ -88,7 +88,8 @@ See each project's `NOTES.md` for detail. Highlights:
 4. Avoid `x < 0` for EOF/sentinels; use `==` / positive sentinels.
 5. Test harness is CWD-`./tests` only; pipe adventure transcripts under `timeout`.
 6. Multi-file IO HostInvoke + `?` in a dependency is supported (regression:
-   `multi_file_io_hostinvoke_try_in_dependency`); demos may still keep Stream
-   IO in the entry for layout clarity.
+   `multi_file_io_hostinvoke_try_in_dependency` in
+   `compiler/tests/namespace.rs`); demos may still keep Stream IO in the
+   entry for layout clarity.
 7. Prefer a single `use http::url::*` import graph for HTTP helpers — globbing
    several sibling `http::*` modules that each re-import `url` can hide symbols.

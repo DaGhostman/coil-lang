@@ -25,7 +25,7 @@ coil http::client
 
 | PR | Scope |
 |----|--------|
-| 1 | Fix/verify multi-module IO HostInvoke + `?`; regression golden; update NOTES |
+| 1 | Verify multi-module IO HostInvoke + `?` (pool retention already on main); regression golden; update NOTES |
 | 2 | Host `io::net::tls::{connect, connect_insecure}` via rustls |
 | 3 | Coil `stdlib/http` request builder (`get` / `post` / `request`) |
 

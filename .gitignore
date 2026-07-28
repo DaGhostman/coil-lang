@@ -7,3 +7,5 @@ out.hyc
 *.so
 *.o
 THREADS_PLAN.md
+.cursor/hooks/state/continual-learning.json
+
