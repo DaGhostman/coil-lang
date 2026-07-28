@@ -1461,7 +1461,7 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(v));
                 }
                 Instruction::CastFloatToInt => {
-                    // Truncate toward zero (matches primitive `as int` semantics).
+                    // Truncate toward zero (`3.9 as int` → `3`); not floor/round.
                     let v = self.stack.pop().as_float() as i64;
                     self.stack.push(Value::from(v));
                 }

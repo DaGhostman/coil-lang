@@ -599,7 +599,7 @@ class Cell {
 | `Eq` | `eq`, `ne` | Tag + payload `==`; `ne` is `!(a == b)` |
 | `Ord` | `lt`, `le`, `gt`, `ge` | Lexicographic on declaration order |
 | `Default` | `default` | First enum variant / zero field values for classes |
-| `Hash` | `hash` | Tag + field mix (`* 31 + field`) |
+| `Hash` | `hash` | Tag + int-field mix (`* 31 + field`); **int-payload MVP** — non-`int` fields are not hashed recursively |
 | `String` | `to_string` | `format` with `%v` per field |
 | `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class) |
 | `Deserialize` | `deserialize` | Inverse of `Serialize` from `[byte]`; invalid tag → `panic` |

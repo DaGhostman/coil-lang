@@ -586,13 +586,13 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 
 ## `env` module
 
-`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The compiler emits a **warning** when `exec` or `exit` is used. By default `env::exec` is **disabled** at runtime; set `coil.toml` `[env] allow_exec = true` to enable it in trusted projects.
+`use env::*;` — `args()`, `var` / `set_var` / `remove_var`, `cwd` / `set_cwd`, `exit(code)`. `exec(program, args)` spawns a program with an argv vector (no shell). The child inherits the VM process **cwd** and **environment**; there are no per-call overrides yet. The compiler emits a **warning** when `exec` or `exit` is used. By default `env::exec` is **disabled** at runtime; set `coil.toml` `[env] allow_exec = true` to enable it in trusted projects.
 
 ---
 
 ## `crypto` module
 
-`use crypto::*;` — one-shot and streaming hashes (`sha256`, `init` / `update` / `finalize`), HMAC, `random_bytes`, ChaCha20-Poly1305 and AES-256-GCM, Ed25519 / X25519, Argon2id, constant-time `ct_eq`. Pure Rust (RustCrypto); no OpenSSL.
+`use crypto::*;` — one-shot and streaming hashes (`sha256`, `init` / `update` / `finalize`), HMAC, `random_bytes`, ChaCha20-Poly1305 and AES-256-GCM, Ed25519 / X25519, Argon2id, constant-time `ct_eq`. Pure Rust (RustCrypto); no OpenSSL. Argon2id uses fixed MVP params (19 MiB memory, 2 iterations, parallelism 1); salts shorter than 16 bytes are zero-padded to 16 — not OWASP-tunable.
 
 ---
 

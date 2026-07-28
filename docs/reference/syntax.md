@@ -471,6 +471,8 @@ atom ::= match_expr
 
 `dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::*` (not keyword atoms).
 
+Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `float as int` truncates toward zero (not `round`/`floor`); see [Built-ins](built-ins.md#primitive-casts-expr-as-t).
+
 | Form | Syntax | Notes |
 |------|--------|-------|
 | Group | `(expr)` | Single expr — **not** a 1-tuple |
