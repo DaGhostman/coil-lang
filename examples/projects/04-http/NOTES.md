@@ -44,3 +44,25 @@ Impl detail: request/response helpers live in `url.hy` so `client` depends on a
   so the client always emits correct values; other custom headers go on the wire)
 - Prefer Result-mode helpers (`status_code` / `response_status`) over raw field
   access when crossing module/Result boundaries
+- `http::client` imports `io::net::tls` — requires Cargo feature `tls` (default-on)
+- IPv6 URL literals not supported (first `:` before `/` is treated as the port)
+- Connect / TLS errors collapse to `HttpError::Io`; TLS host errors map to
+  `IoError::Other` (no dedicated tags in v1 — deferred by design)
+- Blocking connect/handshake has no timeout (same as TCP)
+- CRLF (CR/LF) in URL host/path, method, or header names/values → `HttpError::BadUrl`
+- `Content-Length` greater than available body bytes → `HttpError::BadResponse`
+
+## Known compiler workaround
+
+`body_len_str` / `cl_trailer` use length lookup tables instead of always calling
+`int_to_dec` when concatenating into the request head under Result-mode deps —
+`int_to_dec` has been flaky (SEGV) on some lengths. Track as a known compiler
+issue; do not expand the workaround further unless needed.
+
+Also:
+- Do not `raise` / `?` inside `build_request_head*` (poisons Ok-path string concat).
+- `to_bytes(s)` invalidates `s` for later use — CRLF scans on URL host/path use
+  raw bytes before `bytes_to_string`; method injection is caught via
+  `request_line_ok` on the built head; header injection via `extras_sanitize`.
+- Query-only URLs (`http://host?q=`) do not get an automatic `/` prefix (same
+  Result-mode concat SEGV) — write `/?q=` explicitly.

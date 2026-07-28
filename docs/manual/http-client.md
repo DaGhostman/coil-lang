@@ -66,6 +66,21 @@ cd examples/projects/04-http && coil test
 - No redirects, cookies, connection pooling, or timeouts
 - No chunked transfer encoding (uses `Content-Length` or read-to-close)
 - No HTTP/2 / HTTP/3
+- `http::client` requires Cargo feature `tls` (imports `io::net::tls`; default-on)
+- IPv6 URL literals are not supported — the first `:` before `/` is the port
+- Connect failures and TLS errors collapse to `HttpError::Io`; TLS maps to
+  `IoError::Other` (v1 — dedicated tags deferred)
+- Blocking TCP connect / TLS handshake has no timeout (same as raw TCP)
+- CR/LF in URL host/path, method, or header names/values → `HttpError::BadUrl`
+- When `Content-Length` exceeds available body bytes → `HttpError::BadResponse`
 - HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
   certs are out of scope for the demo (use `connect_insecure` only via TLS
   APIs directly, not through this client)
+
+### Known compiler note
+
+Request Content-Length formatting uses `body_len_str` / `cl_trailer` lookup
+helpers because concatenating `int_to_dec` into the request head under
+Result-mode dependency helpers has been flaky (SEGV) on some lengths. This is
+a known compiler issue to track — not an HTTP design choice. Prefer `/?q=` over
+bare `host?q=` (slash-prefix under Result-mode parse also SEGVs).
