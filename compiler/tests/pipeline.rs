@@ -3312,3 +3312,66 @@ fn example_ansi_color_prints_red() {
     let output = run_example("examples/ansi_color.hy");
     assert!(output.contains("red"), "expected visible 'red', got {:?}", output);
 }
+
+/// HostInvoke + virtual `crypto` wiring: empty SHA-256 digest length is 32.
+#[test]
+fn crypto_sha256_empty_digest_len_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use crypto::*;
+
+fn digest_len() -> int {
+    let empty: [byte] = [];
+    return match sha256(empty) {
+        Result::Ok(d) => len(d),
+        Result::Err(_) => 0,
+    };
+}
+
+fn main() {
+    print "%i", digest_len();
+}
+"#,
+    );
+    assert_eq!(output, "32");
+}
+
+/// HostInvoke + virtual `io::fs` wiring: `exists(".")` returns Ok.
+#[test]
+fn fs_exists_dot_ok_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::fs::*;
+
+fn dot_ok() -> int {
+    return match exists(".") {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+
+fn main() {
+    print "%i", dot_ok();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.
+#[test]
+fn derive_string_to_string_prints_variant() {
+    let output = run_example_src(
+        r#"
+#[derive(String)]
+enum Color {
+    Red,
+}
+
+fn main() {
+    print "%s", Color::Red.to_string();
+}
+"#,
+    );
+    assert_eq!(output, "Color::Red");
+}

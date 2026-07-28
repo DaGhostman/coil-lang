@@ -3394,4 +3394,26 @@ mod tests {
             "expected Serialize::serialize on class"
         );
     }
+
+    #[test]
+    fn derive_string_enum_emits_to_string_method() {
+        let (_exp, decls) = expand_src("#[derive(String)] enum E { A, B(int) } fn main() {}");
+        assert!(
+            impl_method_names(&decls, "String").contains(&"to_string".to_string()),
+            "expected String::to_string impl"
+        );
+    }
+
+    #[test]
+    fn derive_sensitive_emits_marker_impl() {
+        let (_exp, decls) = expand_src("#[derive(Sensitive)] class P { x: int } fn main() {}");
+        assert!(
+            decls.iter().any(|n| matches!(
+                n.1.as_ref(),
+                Expression::TypeClassImpl { class, args, methods }
+                    if *class == "Sensitive" && args.len() == 1 && methods.is_empty()
+            )),
+            "expected empty Sensitive instance"
+        );
+    }
 }
