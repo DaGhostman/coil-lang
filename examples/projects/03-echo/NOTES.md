@@ -6,7 +6,8 @@ Single-process TCP echo: `io::net::tcp` listen/connect/accept_wait, length-prefi
 framing (`protocol.hy`), pure server/client helpers, and a coroutine that
 supplies payload bytes. Stream IO currently lives in `main.hy` for clarity;
 dependency modules may call IO HostInvoke + `?` (see regression
-`multi_file_io_hostinvoke_try_in_dependency`).
+`multi_file_io_hostinvoke_try_in_dependency`). Sibling free-fn `use` from a
+non-entry module is also supported (`multi_file_sibling_use_free_fn_from_dependency`).
 
 ## Run
 
