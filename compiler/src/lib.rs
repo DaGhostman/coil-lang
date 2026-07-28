@@ -7207,6 +7207,13 @@ impl Compiler {
                                 .to_string(),
                             span.into_range(),
                         ));
+                    } else if registry == "env_exit" {
+                        self.messages.push(Message::warn(
+                            ErrorCode::GenericTypeError,
+                            "env::exit terminates the process with the given exit code"
+                                .to_string(),
+                            span.into_range(),
+                        ));
                     }
                     self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
                     return bytecode;
