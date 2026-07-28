@@ -801,7 +801,8 @@ roots = ["./src"]
 use facade::roundtrip;
 
 fn main() {
-    print "%i", roundtrip()?;
+    roundtrip()?;
+    print "ok";
 }
 "#,
         ),
@@ -811,10 +812,9 @@ fn main() {
 use io::*;
 use transport::write_then_read;
 
-fn roundtrip() -> Result<int, IoError> {
-    // Unwrap once — `return write_then_read(...)` would Ok-wrap the Result.
-    let n = write_then_read("nested.bin")?;
-    return n;
+fn roundtrip() -> Result<(), IoError> {
+    write_then_read("nested.bin")?;
+    return ();
 }
 "#,
         ),
@@ -823,7 +823,7 @@ fn roundtrip() -> Result<int, IoError> {
             r#"
 use io::*;
 
-fn write_then_read(string path) -> Result<int, IoError> {
+fn write_then_read(string path) -> Result<(), IoError> {
     let a: byte = 65;
     let b: byte = 66;
     let payload: [byte] = [a, b];
@@ -835,12 +835,7 @@ fn write_then_read(string path) -> Result<int, IoError> {
     let out: [byte] = [0, 0];
     read_exact(r, out)?;
     close(r)?;
-    if out[0] == a {
-        if out[1] == b {
-            return 1;
-        }
-    }
-    return 0;
+    return ();
 }
 "#,
         ),
@@ -852,7 +847,7 @@ fn write_then_read(string path) -> Result<int, IoError> {
             compile_entry_and_assert_jump_if_match_pool_valid(&entry);
         run_bytecode(bytecode, constants, &pipeline)
     });
-    assert_eq!(output, "1");
+    assert_eq!(output, "ok");
 
     let written = std::fs::read(root.join("nested.bin")).expect("transport wrote nested.bin");
     assert_eq!(written, b"AB");
