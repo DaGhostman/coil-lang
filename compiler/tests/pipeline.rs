@@ -3414,6 +3414,59 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
+/// HostInvoke + virtual `io::net::tls`: refused connect surfaces as `Result::Err`.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_connect_insecure_refused_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::net::tls::*;
+
+fn refused() -> int {
+    return match connect_insecure("127.0.0.1", 1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+}
+
+fn main() {
+    print "%i", refused();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// HostInvoke wiring for verified `tls_connect` (invalid port → Err, no network).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_connect_invalid_port_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::net::tls::*;
+
+fn bad_port() -> int {
+    return match connect("localhost", 99999) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+}
+
+fn main() {
+    print "%i", bad_port();
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// Smoke example stays green without public-network TLS.
+#[cfg(feature = "tls")]
+#[test]
+fn example_io_tls_prints_tls_ok() {
+    assert_eq!(run_example("examples/io_tls.hy"), "tls-ok");
+}
+
 #[test]
 fn example_regex_demo_prints_expected() {
     assert_eq!(

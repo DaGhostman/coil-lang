@@ -995,6 +995,33 @@ mod tests {
         );
         assert_eq!(IoBuiltin::TlsConnect.as_str(), "connect");
         assert_eq!(IoBuiltin::TlsConnectInsecure.as_str(), "connect_insecure");
+
+        let connect = vm
+            .resolve_item(
+                &["io".into(), "net".into(), "tls".into()],
+                "connect",
+            )
+            .expect("io::net::tls::connect");
+        assert_eq!(
+            connect,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsConnect
+            }
+        );
+        let insecure = vm
+            .resolve_item(
+                &["io".into(), "net".into(), "tls".into()],
+                "connect_insecure",
+            )
+            .expect("io::net::tls::connect_insecure");
+        assert_eq!(
+            insecure,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsConnectInsecure
+            }
+        );
+        // Surface names must stay unprefixed (native ids carry the tls_ prefix).
+        assert!(!exports.iter().any(|e| e.short_name() == "tls_connect"));
     }
 
     #[test]
