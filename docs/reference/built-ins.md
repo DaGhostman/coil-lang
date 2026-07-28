@@ -569,10 +569,11 @@ See `examples/panic.hy`.
 
 ## Primitive casts (`expr as T`)
 
-Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation, not checked). Semantics match Rust:
+Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/truncation for non-literal values). Semantics match Rust for runtime casts:
 
 - `float as int` truncates toward zero (not `round`/`floor`). `NaN` / `±inf` follow Rust `f64 as i64` (e.g. `NaN` → `0`).
-- `int as byte` keeps the low 8 bits (`257 as byte` → `1`; negatives wrap the same way, e.g. `-1 as byte` → `255`).
+- Non-literal `int as byte` keeps the low 8 bits (`let n = 257; n as byte` → `1`; negatives wrap the same way, e.g. `-1 as byte` when the operand is a variable).
+- A **literal** `int as byte` outside `0..=255` is a compile-time type error (same message as a byte literal out of range).
 
 Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
 
@@ -625,7 +626,7 @@ Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available 
 
 ## `ord` and `char`
 
-Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> string`. Out-of-range `char` inputs (not in `0..=255`) return an empty string `""` rather than a `Result` error — prefer keeping the argument typed as `byte`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
+Auto-imported: `ord(string) -> Result<byte, string>` (exactly one character with codepoint ≤ 255) and `char(byte) -> Result<string, string>` (exactly one UTF-8 code unit). Out-of-range `char` inputs (not in `0..=255`) return `Err("byte out of range")`. Prefer keeping the argument typed as `byte`. String literals of one such character coerce to `byte` in annotations (e.g. `let c: byte = "A";`).
 
 ---
 

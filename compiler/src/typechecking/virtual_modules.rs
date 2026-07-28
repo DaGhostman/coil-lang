@@ -40,12 +40,14 @@ pub const THREAD_MODULE: &str = "thread";
 pub const IO_FS_MODULE: &str = "io::fs";
 
 /// Wall clock, periods, and formatting (`timestamp`, `sleep_ms`, …).
+#[cfg(feature = "time")]
 pub const TIME_MODULE: &str = "time";
 
 /// Process environment (`args`, `var`, `exec`, …).
 pub const ENV_MODULE: &str = "env";
 
 /// Cryptographic primitives (`sha256`, `random_bytes`, …).
+#[cfg(feature = "crypto")]
 pub const CRYPTO_MODULE: &str = "crypto";
 
 /// PCRE2 regex (`compile`, `is_match`, `find_all`, …).
@@ -87,7 +89,7 @@ pub enum PreludeFn {
     Cross,
     /// Construct a nominal `Matrix` from nested static rows.
     Matrix,
-    /// Construct a single UTF-8 code unit as `string`.
+    /// Construct a single UTF-8 code unit as `Result<string, string>`.
     Char,
     /// First code unit of a `string` as `Result<byte, string>`.
     Ord,
@@ -616,29 +618,6 @@ impl VirtualModules {
             ]),
         );
 
-        let mut time_exports = vec![BuiltinExport::Enum {
-            name: common::BUILTIN_TIME_ERROR_ENUM,
-        }];
-        time_exports.extend(host_exports(&[
-            ("timestamp", "time_timestamp"),
-            ("sleep_ms", "time_sleep_ms"),
-            ("instant_now", "time_instant_now"),
-            ("elapsed_nanos", "time_elapsed_nanos"),
-            ("elapsed_millis", "time_elapsed_millis"),
-            ("period", "time_period"),
-            ("add", "time_add"),
-            ("sub", "time_sub"),
-            ("period_add", "time_period_add"),
-            ("period_sub", "time_period_sub"),
-            ("date", "time_date"),
-            ("date_from_period", "time_date_from_period"),
-            ("date_from_epoch_period", "time_date_from_epoch_period"),
-            ("epoch", "time_epoch"),
-            ("format", "time_format"),
-            ("parse", "time_parse"),
-        ]));
-        modules.insert(TIME_MODULE, time_exports);
-
         let mut env_exports = vec![BuiltinExport::Enum {
             name: common::BUILTIN_ENV_ERROR_ENUM,
         }];
@@ -654,41 +633,70 @@ impl VirtualModules {
         ]));
         modules.insert(ENV_MODULE, env_exports);
 
-        let mut crypto_exports = vec![BuiltinExport::Enum {
-            name: common::BUILTIN_CRYPTO_ERROR_ENUM,
-        }];
-        crypto_exports.extend(host_exports(&[
-            ("sha256", "crypto_sha256"),
-            ("sha512", "crypto_sha512"),
-            ("blake3", "crypto_blake3"),
-            ("init", "crypto_hasher_init"),
-            ("update", "crypto_hasher_update"),
-            ("finalize", "crypto_hasher_finalize"),
-            ("hmac_sha256", "crypto_hmac_sha256"),
-            ("hmac_sha512", "crypto_hmac_sha512"),
-            ("hmac_verify_sha256", "crypto_hmac_verify_sha256"),
-            ("random_bytes", "crypto_random_bytes"),
-            ("random_u64", "crypto_random_u64"),
-            (
-                "chacha20_poly1305_encrypt",
-                "crypto_chacha20_poly1305_encrypt",
-            ),
-            (
-                "chacha20_poly1305_decrypt",
-                "crypto_chacha20_poly1305_decrypt",
-            ),
-            ("aes_256_gcm_encrypt", "crypto_aes_256_gcm_encrypt"),
-            ("aes_256_gcm_decrypt", "crypto_aes_256_gcm_decrypt"),
-            ("ed25519_generate", "crypto_ed25519_generate"),
-            ("ed25519_sign", "crypto_ed25519_sign"),
-            ("ed25519_verify", "crypto_ed25519_verify"),
-            ("x25519_generate", "crypto_x25519_generate"),
-            ("x25519_shared_secret", "crypto_x25519_shared_secret"),
-            ("argon2id_hash", "crypto_argon2id_hash"),
-            ("argon2id_verify", "crypto_argon2id_verify"),
-            ("ct_eq", "crypto_ct_eq"),
-        ]));
-        modules.insert(CRYPTO_MODULE, crypto_exports);
+        #[cfg(feature = "time")]
+        {
+            let mut time_exports = vec![BuiltinExport::Enum {
+                name: common::BUILTIN_TIME_ERROR_ENUM,
+            }];
+            time_exports.extend(host_exports(&[
+                ("timestamp", "time_timestamp"),
+                ("sleep_ms", "time_sleep_ms"),
+                ("instant_now", "time_instant_now"),
+                ("elapsed_nanos", "time_elapsed_nanos"),
+                ("elapsed_millis", "time_elapsed_millis"),
+                ("period", "time_period"),
+                ("add", "time_add"),
+                ("sub", "time_sub"),
+                ("period_add", "time_period_add"),
+                ("period_sub", "time_period_sub"),
+                ("date", "time_date"),
+                ("date_from_period", "time_date_from_period"),
+                ("date_from_epoch_period", "time_date_from_epoch_period"),
+                ("epoch", "time_epoch"),
+                ("format", "time_format"),
+                ("parse", "time_parse"),
+            ]));
+            modules.insert(TIME_MODULE, time_exports);
+        }
+
+        #[cfg(feature = "crypto")]
+        {
+            let mut crypto_exports = vec![BuiltinExport::Enum {
+                name: common::BUILTIN_CRYPTO_ERROR_ENUM,
+            }];
+            crypto_exports.extend(host_exports(&[
+                ("sha256", "crypto_sha256"),
+                ("sha512", "crypto_sha512"),
+                ("blake3", "crypto_blake3"),
+                ("init", "crypto_hasher_init"),
+                ("update", "crypto_hasher_update"),
+                ("finalize", "crypto_hasher_finalize"),
+                ("hmac_sha256", "crypto_hmac_sha256"),
+                ("hmac_sha512", "crypto_hmac_sha512"),
+                ("hmac_verify_sha256", "crypto_hmac_verify_sha256"),
+                ("random_bytes", "crypto_random_bytes"),
+                ("random_u64", "crypto_random_u64"),
+                (
+                    "chacha20_poly1305_encrypt",
+                    "crypto_chacha20_poly1305_encrypt",
+                ),
+                (
+                    "chacha20_poly1305_decrypt",
+                    "crypto_chacha20_poly1305_decrypt",
+                ),
+                ("aes_256_gcm_encrypt", "crypto_aes_256_gcm_encrypt"),
+                ("aes_256_gcm_decrypt", "crypto_aes_256_gcm_decrypt"),
+                ("ed25519_generate", "crypto_ed25519_generate"),
+                ("ed25519_sign", "crypto_ed25519_sign"),
+                ("ed25519_verify", "crypto_ed25519_verify"),
+                ("x25519_generate", "crypto_x25519_generate"),
+                ("x25519_shared_secret", "crypto_x25519_shared_secret"),
+                ("argon2id_hash", "crypto_argon2id_hash"),
+                ("argon2id_verify", "crypto_argon2id_verify"),
+                ("ct_eq", "crypto_ct_eq"),
+            ]));
+            modules.insert(CRYPTO_MODULE, crypto_exports);
+        }
 
         let mut regex_exports = vec![
             BuiltinExport::OpaqueType { name: "Regex" },
@@ -952,11 +960,14 @@ mod tests {
     #[test]
     fn resolves_time_fs_env_crypto_exports() {
         let vm = VirtualModules::new();
+        #[cfg(feature = "time")]
         assert!(vm.resolves_use(&["time".into()], "*"));
         assert!(vm.resolves_use(&["io".into(), "fs".into()], "*"));
         assert!(vm.resolves_use(&["env".into()], "*"));
+        #[cfg(feature = "crypto")]
         assert!(vm.resolves_use(&["crypto".into()], "*"));
 
+        #[cfg(feature = "time")]
         assert!(matches!(
             vm.resolve_item(&["time".into()], "epoch"),
             Some(BuiltinExport::HostFn {
@@ -978,6 +989,7 @@ mod tests {
                 registry: "env_var"
             })
         ));
+        #[cfg(feature = "crypto")]
         assert!(matches!(
             vm.resolve_item(&["crypto".into()], "sha256"),
             Some(BuiltinExport::HostFn {

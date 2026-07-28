@@ -36,16 +36,17 @@ pub fn prelude_ord(heap: &mut Heap, args: &[Value]) -> Value {
     alloc_result_ok(heap, Value::from(code as i64))
 }
 
-/// `char(byte) -> string` — one code unit in 0..=255.
+/// `char(byte) -> Result<string, string>` — one code unit in 0..=255.
 pub fn prelude_char(heap: &mut Heap, args: &[Value]) -> Value {
     let b = args[0].as_int();
     if !(0..=255).contains(&b) {
-        return string_val(heap, "");
+        return err_msg(heap, "byte out of range");
     }
     let ch = char::from_u32(b as u32).unwrap_or('\0');
     let mut buf = [0u8; 4];
     let encoded = ch.encode_utf8(&mut buf);
-    string_val(heap, encoded)
+    let s = string_val(heap, encoded);
+    alloc_result_ok(heap, s)
 }
 
 /// Content hash for `Hash` on `string` — returns the interned `ObjString` FNV hash as `int`.
@@ -91,6 +92,18 @@ mod tests {
         }
     }
 
+    fn result_ok_string(heap: &Heap, v: Value) -> String {
+        let Some(Object::Enum(gc)) = heap.find_object_by_addr(v.raw() as u64) else {
+            panic!("expected Result");
+        };
+        assert_eq!(gc.as_ref().tag, 0, "expected Ok");
+        match &gc.as_ref().payload[0] {
+            Member::Object(Object::String(s)) => s.as_ref().data.clone(),
+            Member::Value(val) => value_as_string(heap, *val).unwrap(),
+            _ => panic!("expected string payload"),
+        }
+    }
+
     #[test]
     fn ord_rejects_empty_and_multichar_char_roundtrips() {
         let mut heap = Heap::default();
@@ -108,7 +121,7 @@ mod tests {
         assert_eq!(result_ok_int(&heap, ok), 65);
 
         let ch = prelude_char(&mut heap, &[Value::from(65_i64)]);
-        assert_eq!(value_as_string(&heap, ch).unwrap(), "A");
+        assert_eq!(result_ok_string(&heap, ch), "A");
 
         let euro_s = str_arg(&mut heap, "€");
         let euro = prelude_ord(&mut heap, &[euro_s]);
@@ -118,7 +131,7 @@ mod tests {
         );
 
         let oob = prelude_char(&mut heap, &[Value::from(300_i64)]);
-        assert_eq!(value_as_string(&heap, oob).unwrap(), "");
+        assert_eq!(result_err_string(&heap, oob), "byte out of range");
     }
 
     #[test]
