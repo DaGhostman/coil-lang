@@ -3431,3 +3431,34 @@ fn main() {
     );
     assert_eq!(output, "Color::Red");
 }
+
+/// Recursive `#[derive(Hash)]` + primitive Hash instances.
+#[test]
+fn example_derive_hash_prints_true_true_true_true() {
+    let output = run_example("examples/derive_hash.hy");
+    assert_eq!(output, "true,true,true,true");
+}
+
+/// Primitive `Hash` covers non-int payloads used by derive.
+#[test]
+fn hash_primitives_and_nested_differ_when_payloads_differ() {
+    let output = run_example_src(
+        r#"
+#[derive(Hash)]
+enum Box {
+    S { s: string },
+    B { b: bool },
+    F { f: float },
+}
+
+fn main() {
+    print "%z,", "a".hash() != "b".hash();
+    print "%z,", true.hash() != false.hash();
+    print "%z,", (1.0).hash() != (2.0).hash();
+    print "%z,", Box::S { s: "x" }.hash() != Box::S { s: "y" }.hash();
+    print "%z", Box::B { b: true }.hash() != Box::B { b: false }.hash();
+}
+"#,
+    );
+    assert_eq!(output, "true,true,true,true,true");
+}

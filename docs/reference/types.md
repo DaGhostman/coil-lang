@@ -599,7 +599,7 @@ class Cell {
 | `Eq` | `eq`, `ne` | Tag + payload `==`; `ne` is `!(a == b)` |
 | `Ord` | `lt`, `le`, `gt`, `ge` | Lexicographic on declaration order |
 | `Default` | `default` | First enum variant / zero field values for classes |
-| `Hash` | `hash` | Tag + int-field mix (`* 31 + field`); **int-payload MVP** — non-`int` fields are not hashed recursively |
+| `Hash` | `hash` | Tag + recursive `field.hash()` mix (`* 31 + hash`); builtins for `int`/`byte`/`bool`/`float`/`string`/`unit`; nested `Hash` types recurse |
 | `String` | `to_string` | `format` with `%v` per field |
 | `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class) |
 | `Deserialize` | `deserialize` | Inverse of `Serialize` from `[byte]`; invalid tag → `panic` |
@@ -614,7 +614,7 @@ Rules:
 - Combining `#[derive(Show)]` with a hand-written `impl Show for T` hits the usual overlap diagnostic.
 - Empty `#[derive()]` with no traits is a parse error.
 
-See `examples/derive_show_eq.hy`.
+See `examples/derive_show_eq.hy` and `examples/derive_hash.hy`.
 
 ### User-defined traits (sketch)
 

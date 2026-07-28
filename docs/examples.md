@@ -569,6 +569,30 @@ class Cell {
 
 ---
 
+### `examples/derive_hash.hy`
+
+**Demonstrates:** `#[derive(Hash)]` with recursive `field.hash()` — primitives (`int`, `string`, …) and nested Hash types.
+
+```coil
+#[derive(Hash)]
+enum Inner {
+    A(int),
+}
+
+#[derive(Hash)]
+enum Outer {
+    Wrap(Inner),
+    Label { name: string, flag: bool },
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/derive_hash.hy` |
+| **Output** | `true,true,true,true` |
+
+---
+
 ### `examples/attr_ffi.hy`
 
 **Demonstrates:** `#[ffi(lib = "c")]` attribute sugar for a single libc binding (equivalent to an `extern` block entry).
