@@ -1295,9 +1295,12 @@ impl Checker {
             | "time_date_from_period" | "time_date_from_epoch_period" => {
                 fun(&[int()], res_int_time.clone())
             }
-            "time_add" | "time_sub" | "time_period_add" | "time_period_sub" | "time_format"
-            | "time_parse" => fun(&[int(), int()], res_int_time.clone()),
-            "time_date" => fun(&[int()], res_string_time.clone()),
+            "time_add" | "time_sub" | "time_period_add" | "time_period_sub" => {
+                fun(&[int(), int()], res_int_time.clone())
+            }
+            "time_format" => fun(&[int(), string()], res_string_time.clone()),
+            "time_parse" => fun(&[string(), string()], res_int_time.clone()),
+            "time_date" => fun(&[], res_int_time.clone()),
             "time_period" => {
                 let params: Vec<Ty> = std::iter::repeat_with(int).take(9).collect();
                 fun(&params, res_int_time)
