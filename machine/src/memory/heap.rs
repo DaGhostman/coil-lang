@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "crypto")]
 use crate::crypto_hasher_state::ObjCryptoHasher;
+#[cfg(feature = "regex")]
 use crate::regex_state::ObjRegex;
 
 const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
@@ -256,6 +257,7 @@ impl Heap {
             Object::CryptoHasher(h) => {
                 h.release();
             }
+            #[cfg(feature = "regex")]
             Object::Regex(r) => {
                 r.release();
             }
@@ -305,6 +307,7 @@ impl Heap {
         None
     }
 
+    #[cfg(feature = "regex")]
     pub fn with_regex<R>(
         &mut self,
         addr: u64,
@@ -439,6 +442,7 @@ pub type RefThreadMutex = Gc<ObjThreadMutex>;
 pub type RefRwLock = Gc<ObjRwLock>;
 #[cfg(feature = "crypto")]
 pub type RefCryptoHasher = Gc<ObjCryptoHasher>;
+#[cfg(feature = "regex")]
 pub type RefRegex = Gc<ObjRegex>;
 
 /// Kind of host-backed IO stream.
@@ -474,6 +478,7 @@ pub enum Object {
     RwLock(RefRwLock),
     #[cfg(feature = "crypto")]
     CryptoHasher(RefCryptoHasher),
+    #[cfg(feature = "regex")]
     Regex(RefRegex),
 }
 
@@ -499,6 +504,7 @@ impl Object {
             Self::RwLock(l) => l.mark(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.mark(),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.mark(),
         };
         if marked {
@@ -527,6 +533,7 @@ impl Object {
             Self::RwLock(l) => l.unmark(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.unmark(),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.unmark(),
         }
     }
@@ -553,6 +560,7 @@ impl Object {
             Self::RwLock(l) => l.is_marked(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.is_marked(),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.is_marked(),
         }
     }
@@ -609,6 +617,7 @@ impl Object {
             Self::RwLock(_) => {}
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(_) => {}
+            #[cfg(feature = "regex")]
             Self::Regex(_) => {}
         }
     }
@@ -635,6 +644,7 @@ impl Object {
             Self::RwLock(l) => l.get_next(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.get_next(),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.get_next(),
         }
     }
@@ -660,6 +670,7 @@ impl Object {
             Self::RwLock(l) => l.set_next(next),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.set_next(next),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.set_next(next),
         }
     }
@@ -685,6 +696,7 @@ impl Object {
             Self::RwLock(l) => l.as_ptr() as u64,
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.as_ptr() as u64,
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.as_ptr() as u64,
         }
     }
@@ -711,6 +723,7 @@ impl GcSized for Object {
             Self::RwLock(l) => l.size(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(h) => h.size(),
+            #[cfg(feature = "regex")]
             Self::Regex(r) => r.size(),
         }
     }
@@ -737,6 +750,7 @@ impl fmt::Display for Object {
             Self::RwLock(_) => write!(f, "<rwlock 0x{:08x}>", self.addr()),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(_) => write!(f, "<crypto_hasher 0x{:08x}>", self.addr()),
+            #[cfg(feature = "regex")]
             Self::Regex(_) => write!(f, "<regex 0x{:08x}>", self.addr()),
         }
     }
@@ -761,8 +775,9 @@ impl Object {
             | Self::Sender(_)
             | Self::Receiver(_)
             | Self::Mutex(_)
-            | Self::RwLock(_)
-            | Self::Regex(_) => std::ptr::null(),
+            | Self::RwLock(_) => std::ptr::null(),
+            #[cfg(feature = "regex")]
+            Self::Regex(_) => std::ptr::null(),
             #[cfg(feature = "crypto")]
             Self::CryptoHasher(_) => std::ptr::null(),
         }

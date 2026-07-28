@@ -1246,10 +1246,16 @@ impl Checker {
 
     /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
     pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
-        use crate::typechecking::ty::{array, boolean, record, regex_ty, tuple};
+        use crate::typechecking::ty::{array, boolean, record};
         #[cfg(feature = "crypto")]
         use crate::typechecking::ty::byte;
-        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM, BUILTIN_REGEX_ERROR_ENUM};
+        #[cfg(any(feature = "crypto", feature = "regex"))]
+        use crate::typechecking::ty::tuple;
+        #[cfg(feature = "regex")]
+        use crate::typechecking::ty::regex_ty;
+        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
+        #[cfg(feature = "regex")]
+        use common::BUILTIN_REGEX_ERROR_ENUM;
         #[cfg(feature = "crypto")]
         use common::BUILTIN_CRYPTO_ERROR_ENUM;
         #[cfg(feature = "time")]
@@ -1266,7 +1272,9 @@ impl Checker {
         let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
         #[cfg(feature = "crypto")]
         let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
+        #[cfg(feature = "regex")]
         let regex_err = Ty::Con(BUILTIN_REGEX_ERROR_ENUM.into());
+        #[cfg(feature = "regex")]
         let regex = regex_ty();
 
         let res_bool_io = result_app_ty(boolean(), io_err.clone());
@@ -1309,14 +1317,23 @@ impl Checker {
         #[cfg(feature = "crypto")]
         let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
 
+        #[cfg(feature = "regex")]
         let span = tuple(vec![int(), int()]);
+        #[cfg(feature = "regex")]
         let res_regex = result_app_ty(regex.clone(), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_bool_regex = result_app_ty(boolean(), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_span_regex = result_app_ty(span.clone(), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_spans_regex = result_app_ty(array(span), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_caps_regex = result_app_ty(array(string()), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_caps_all_regex = result_app_ty(array(array(string())), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_strs_regex = result_app_ty(array(string()), regex_err.clone());
+        #[cfg(feature = "regex")]
         let res_string_regex = result_app_ty(string(), regex_err.clone());
 
         let ty = match registry {
@@ -1423,13 +1440,21 @@ impl Checker {
             #[cfg(feature = "crypto")]
             "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
 
+            #[cfg(feature = "regex")]
             "regex_compile" => fun(&[string(), string()], res_regex),
+            #[cfg(feature = "regex")]
             "regex_is_match" => fun(&[regex.clone(), string()], res_bool_regex),
+            #[cfg(feature = "regex")]
             "regex_find" => fun(&[regex.clone(), string()], res_span_regex),
+            #[cfg(feature = "regex")]
             "regex_find_all" => fun(&[regex.clone(), string()], res_spans_regex),
+            #[cfg(feature = "regex")]
             "regex_captures" => fun(&[regex.clone(), string()], res_caps_regex),
+            #[cfg(feature = "regex")]
             "regex_captures_all" => fun(&[regex.clone(), string()], res_caps_all_regex),
+            #[cfg(feature = "regex")]
             "regex_split" => fun(&[regex.clone(), string()], res_strs_regex),
+            #[cfg(feature = "regex")]
             "regex_replace" | "regex_replace_all" => {
                 fun(&[regex, string(), string()], res_string_regex)
             }
@@ -19800,13 +19825,12 @@ fn main() {
 
     #[test]
     fn host_fn_scheme_covers_all_wiring_registries() {
-        use machine::{ENV_WIRING, FS_WIRING, REGEX_WIRING};
+        use machine::{ENV_WIRING, FS_WIRING};
 
         let mut c = Checker::new();
         let mut names: Vec<&str> = FS_WIRING
             .iter()
             .chain(ENV_WIRING.iter())
-            .chain(REGEX_WIRING.iter())
             .map(|&(n, _, _)| n)
             .collect();
         #[cfg(feature = "time")]
@@ -19817,7 +19841,11 @@ fn main() {
         {
             names.extend(machine::CRYPTO_WIRING.iter().map(|&(n, _, _)| n));
         }
-        #[cfg(all(feature = "time", feature = "crypto"))]
+        #[cfg(feature = "regex")]
+        {
+            names.extend(machine::REGEX_WIRING.iter().map(|&(n, _, _)| n));
+        }
+        #[cfg(all(feature = "time", feature = "crypto", feature = "regex"))]
         assert_eq!(names.len(), 72);
         for name in names {
             let _ = c.host_fn_scheme(name, 0..0);

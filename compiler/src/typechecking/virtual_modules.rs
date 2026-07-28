@@ -51,6 +51,7 @@ pub const ENV_MODULE: &str = "env";
 pub const CRYPTO_MODULE: &str = "crypto";
 
 /// PCRE2 regex (`compile`, `is_match`, `find_all`, …).
+#[cfg(feature = "regex")]
 pub const REGEX_MODULE: &str = "regex";
 
 /// Which userland FFI builtin a virtual export names.
@@ -698,24 +699,27 @@ impl VirtualModules {
             modules.insert(CRYPTO_MODULE, crypto_exports);
         }
 
-        let mut regex_exports = vec![
-            BuiltinExport::OpaqueType { name: "Regex" },
-            BuiltinExport::Enum {
-                name: common::BUILTIN_REGEX_ERROR_ENUM,
-            },
-        ];
-        regex_exports.extend(host_exports(&[
-            ("compile", "regex_compile"),
-            ("is_match", "regex_is_match"),
-            ("find", "regex_find"),
-            ("find_all", "regex_find_all"),
-            ("captures", "regex_captures"),
-            ("captures_all", "regex_captures_all"),
-            ("split", "regex_split"),
-            ("replace", "regex_replace"),
-            ("replace_all", "regex_replace_all"),
-        ]));
-        modules.insert(REGEX_MODULE, regex_exports);
+        #[cfg(feature = "regex")]
+        {
+            let mut regex_exports = vec![
+                BuiltinExport::OpaqueType { name: "Regex" },
+                BuiltinExport::Enum {
+                    name: common::BUILTIN_REGEX_ERROR_ENUM,
+                },
+            ];
+            regex_exports.extend(host_exports(&[
+                ("compile", "regex_compile"),
+                ("is_match", "regex_is_match"),
+                ("find", "regex_find"),
+                ("find_all", "regex_find_all"),
+                ("captures", "regex_captures"),
+                ("captures_all", "regex_captures_all"),
+                ("split", "regex_split"),
+                ("replace", "regex_replace"),
+                ("replace_all", "regex_replace_all"),
+            ]));
+            modules.insert(REGEX_MODULE, regex_exports);
+        }
 
         Self { modules }
     }
@@ -997,7 +1001,9 @@ mod tests {
                 registry: "crypto_sha256"
             })
         ));
+        #[cfg(feature = "regex")]
         assert!(vm.resolves_use(&["regex".into()], "*"));
+        #[cfg(feature = "regex")]
         assert!(matches!(
             vm.resolve_item(&["regex".into()], "compile"),
             Some(BuiltinExport::HostFn {

@@ -449,6 +449,7 @@ impl Pipeline {
         }
     }
 
+    #[cfg(feature = "regex")]
     fn register_regex_natives(&mut self) {
         use machine::REGEX_WIRING;
         use machine::{FfiSignature, FfiType, HostClosureFn};
@@ -704,6 +705,7 @@ impl Pipeline {
         pipeline.register_env_natives();
         #[cfg(feature = "crypto")]
         pipeline.register_crypto_natives();
+        #[cfg(feature = "regex")]
         pipeline.register_regex_natives();
         pipeline.register_prelude_char_ord_natives();
         pipeline.register_thread_natives();

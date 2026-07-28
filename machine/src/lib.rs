@@ -9,7 +9,9 @@ pub mod env;
 pub mod fs;
 pub mod io;
 pub mod char_ord;
+#[cfg(feature = "regex")]
 pub mod regex;
+#[cfg(feature = "regex")]
 mod regex_state;
 pub mod thread;
 #[cfg(feature = "time")]
@@ -23,6 +25,7 @@ mod vm;
 pub use crypto::{CryptoErrorTag, CRYPTO_WIRING};
 pub use env::ENV_WIRING;
 pub use fs::FS_WIRING;
+#[cfg(feature = "regex")]
 pub use regex::{RegexErrorTag, REGEX_WIRING};
 #[cfg(feature = "time")]
 pub use time::TIME_WIRING;
