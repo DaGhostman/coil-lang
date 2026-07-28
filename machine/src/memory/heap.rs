@@ -456,6 +456,9 @@ pub enum StreamKind {
     TcpListener,
     /// Datagram socket (`io::net::udp::bind` / `connect`).
     Udp,
+    /// TLS-wrapped TCP (`io::net::tls::connect` / `connect_insecure`).
+    #[cfg(feature = "tls")]
+    Tls,
 }
 
 #[derive(Clone, Copy)]
@@ -926,17 +929,24 @@ pub struct ObjFn {
     pub captures: Vec<Value>,
 }
 
-/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP).
+/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP / TLS).
 pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
     pub kind: StreamKind,
     pub closed: bool,
+    /// Optional rustls client session (only for [`StreamKind::Tls`]).
+    #[cfg(feature = "tls")]
+    pub tls: Option<Box<crate::tls::TlsSession>>,
 }
 
 impl Drop for ObjStream {
     fn drop(&mut self) {
         // OwnedFd closes on drop; clear explicitly for clarity.
         self.fd.take();
+        #[cfg(feature = "tls")]
+        {
+            self.tls.take();
+        }
         self.closed = true;
     }
 }

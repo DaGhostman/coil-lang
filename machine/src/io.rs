@@ -133,6 +133,28 @@ pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Resul
             fd: Some(fd),
             kind,
             closed: false,
+            #[cfg(feature = "tls")]
+            tls: None,
+        },
+        Object::Stream,
+    );
+    Ok(Value::from(obj.addr()))
+}
+
+/// Wrap an owned TCP fd plus a completed TLS session as a heap `Stream`.
+#[cfg(feature = "tls")]
+pub fn alloc_tls_stream(
+    heap: &mut Heap,
+    fd: OwnedFd,
+    session: crate::tls::TlsSession,
+) -> io::Result<Value> {
+    set_nonblocking(fd.as_raw_fd())?;
+    let (obj, _) = heap.alloc(
+        ObjStream {
+            fd: Some(fd),
+            kind: StreamKind::Tls,
+            closed: false,
+            tls: Some(Box::new(session)),
         },
         Object::Stream,
     );
@@ -205,6 +227,13 @@ pub fn stream_close(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
         if s.closed {
             return Err(IoErrorTag::AlreadyClosed);
         }
+        #[cfg(feature = "tls")]
+        if s.kind == StreamKind::Tls {
+            if let (Some(fd), Some(tls)) = (s.fd.as_ref(), s.tls.as_mut()) {
+                let _ = crate::tls::send_close_notify(fd.as_raw_fd(), tls);
+            }
+            s.tls.take();
+        }
         s.fd.take();
         s.closed = true;
         Ok(())
@@ -235,6 +264,11 @@ pub fn stream_read(
             return Err(IoErrorTag::AlreadyClosed);
         }
         let fd = s.fd.as_ref().unwrap().as_raw_fd();
+        #[cfg(feature = "tls")]
+        if s.kind == StreamKind::Tls {
+            let tls = s.tls.as_mut().ok_or(IoErrorTag::Other)?;
+            return crate::tls::tls_read(fd, tls, &mut tmp);
+        }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let result = match file.read(&mut tmp) {
             Ok(0) => Ok(None),
@@ -287,6 +321,11 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
             return Err(IoErrorTag::AlreadyClosed);
         }
         let fd = s.fd.as_ref().unwrap().as_raw_fd();
+        #[cfg(feature = "tls")]
+        if s.kind == StreamKind::Tls {
+            let tls = s.tls.as_mut().ok_or(IoErrorTag::Other)?;
+            return crate::tls::tls_write(fd, tls, &bytes);
+        }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let result = match file.write(&bytes) {
             Ok(n) => Ok(n),
@@ -426,12 +465,36 @@ pub fn stream_write_all(heap: &mut Heap, stream: Value, buf: Value) -> Result<()
 }
 
 fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
+    #[cfg(feature = "tls")]
+    {
+        let skip = with_stream_mut(heap, stream, |s| {
+            s.kind == StreamKind::Tls
+                && s.tls
+                    .as_ref()
+                    .is_some_and(|t| t.has_buffered_plaintext())
+        })?;
+        if skip {
+            return Ok(());
+        }
+    }
     let fd = stream_raw_fd(heap, stream)?;
     poll_fd(fd, true, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     Ok(())
 }
 
 fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
+    #[cfg(feature = "tls")]
+    {
+        // Prefer draining pending TLS ciphertext when the socket can accept writes.
+        let wants = with_stream_mut(heap, stream, |s| {
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+        })?;
+        if wants {
+            let fd = stream_raw_fd(heap, stream)?;
+            poll_fd(fd, false, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+            return Ok(());
+        }
+    }
     let fd = stream_raw_fd(heap, stream)?;
     poll_fd(fd, false, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     Ok(())
