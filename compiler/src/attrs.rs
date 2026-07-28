@@ -2167,6 +2167,19 @@ fn ty_name<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     at(span, Expression::Type(name))
 }
 
+/// Parse `int` / `string` or dynamic `[elem]` (not `Type("[byte]")`, which is invalid).
+fn ty_ret<'a>(span: SimpleSpan, ret: &'a str) -> Output<'a> {
+    if ret.len() >= 2
+        && ret.starts_with('[')
+        && ret.ends_with(']')
+        && !ret.contains(';')
+    {
+        let elem = &ret[1..ret.len() - 1];
+        return at(span, Expression::Array(vec![ty_name(span, elem)]));
+    }
+    ty_name(span, ret)
+}
+
 fn ident<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     at(span, Expression::Identifier(name))
 }
@@ -2205,7 +2218,7 @@ fn method_fn<'a>(
             is_static: false,
             type_params: vec![],
             args: at(span, Expression::Fragment(args)),
-            returns: Some(ty_name(span, ret)),
+            returns: Some(ty_ret(span, ret)),
             where_constraints: vec![],
             body: Some(body),
         },
@@ -2216,7 +2229,7 @@ fn method_fn<'a>(
 fn arg<'a>(span: SimpleSpan, ty: &'a str, name: &'a str) -> Output<'a> {
     at(
         span,
-        Expression::Argument(Some(ty_name(span, ty)), name, false),
+        Expression::Argument(Some(ty_ret(span, ty)), name, false),
     )
 }
 
@@ -2884,6 +2897,14 @@ fn int_zero<'a>(span: SimpleSpan) -> Output<'a> {
     at(span, Expression::Integer(0))
 }
 
+fn as_byte<'a>(span: SimpleSpan, expr: Output<'a>) -> Output<'a> {
+    at(span, Expression::Cast(expr, ty_name(span, "byte")))
+}
+
+fn as_int<'a>(span: SimpleSpan, expr: Output<'a>) -> Output<'a> {
+    at(span, Expression::Cast(expr, ty_name(span, "int")))
+}
+
 fn hash_combine<'a>(span: SimpleSpan, acc: Output<'a>, field: Output<'a>) -> Output<'a> {
     let scaled = at(
         span,
@@ -3100,18 +3121,20 @@ fn serialize_variant_body<'a>(
     shape: &VariantShape<'a>,
     recv: &'a str,
 ) -> Output<'a> {
-    let mut elems = vec![at(span, Expression::Integer(tag as i64))];
+    let mut elems = vec![as_byte(span, at(span, Expression::Integer(tag as i64)))];
     match shape {
         VariantShape::Unit => {}
         VariantShape::Tuple(arity) => {
             for i in 0..*arity {
                 let fname = leak(i.to_string());
-                elems.push(at(span, Expression::Access(ident(span, recv), fname)));
+                let field = at(span, Expression::Access(ident(span, recv), fname));
+                elems.push(as_byte(span, field));
             }
         }
         VariantShape::Record(fields) => {
             for &fname in fields {
-                elems.push(at(span, Expression::Access(ident(span, recv), fname)));
+                let field = at(span, Expression::Access(ident(span, recv), fname));
+                elems.push(as_byte(span, field));
             }
         }
     }
@@ -3185,7 +3208,7 @@ fn deserialize_variant_value<'a>(
         ),
         VariantShape::Tuple(arity) => {
             let items = (0..*arity)
-                .map(|i| data_at(span, data, base_index + i))
+                .map(|i| as_int(span, data_at(span, data, base_index + i)))
                 .collect();
             at(
                 span,
@@ -3202,7 +3225,7 @@ fn deserialize_variant_value<'a>(
                 .enumerate()
                 .map(|(i, fname)| RecordFieldValue {
                     name: fname,
-                    value: data_at(span, data, base_index + i),
+                    value: as_int(span, data_at(span, data, base_index + i)),
                 })
                 .collect();
             at(
@@ -3226,7 +3249,7 @@ fn if_tag_equals<'a>(
     let cond = at(
         span,
         Expression::Eq(
-            data_at(span, data, 0),
+            as_int(span, data_at(span, data, 0)),
             at(span, Expression::Integer(tag as i64)),
         ),
     );
@@ -3272,7 +3295,8 @@ fn synth_serialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]
     let p = leak(format!("__ser_{name}"));
     let mut elems = Vec::new();
     for f in fields {
-        elems.push(at(span, Expression::Access(ident(span, p), f)));
+        let field = at(span, Expression::Access(ident(span, p), f));
+        elems.push(as_byte(span, field));
     }
     let arr = at(span, Expression::Array(elems));
     let m = method_fn(
@@ -3290,7 +3314,7 @@ fn synth_deserialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a st
     let args: Vec<Output<'a>> = fields
         .iter()
         .enumerate()
-        .map(|(i, _)| data_at(span, &ident(span, data), i))
+        .map(|(i, _)| as_int(span, data_at(span, &ident(span, data), i)))
         .collect();
     let value = at(
         span,

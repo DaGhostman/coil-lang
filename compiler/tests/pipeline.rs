@@ -1875,6 +1875,25 @@ fn example_derive_show_eq_prints_expected() {
     );
 }
 
+/// Regression: derived `Serialize::serialize` must typecheck (`[byte]` return,
+/// payload fields cast to `byte`).
+#[test]
+fn derive_serialize_enum_e2e_typechecks() {
+    let src = r#"
+#[derive(Serialize)]
+enum E {
+    A,
+    B(int),
+}
+
+fn main() {}
+"#;
+    let mut pipeline = Pipeline::new();
+    pipeline
+        .compile_src(src)
+        .expect("derive Serialize should compile without type errors");
+}
+
 /// Regression: concrete `<`/`>` codegen must look up `Lt`/`Gt` (not empty
 /// `Ord`), otherwise unit-enum compares fall back to raw heap-pointer `LE`
 /// and become ASLR-flaky (`Red < Blue` randomly false).
