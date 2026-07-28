@@ -261,6 +261,9 @@ pub fn tls_read(fd: RawFd, tls: &mut TlsSession, buf: &mut [u8]) -> Result<Optio
     if buf.is_empty() {
         return Ok(Some(0));
     }
+    // Drain pending ciphertext first so a prior write that returned Ok(n) with
+    // a WouldBlock flush cannot leave the peer waiting while we poll for read.
+    flush_tls(fd, tls)?;
     // Prefer already-buffered plaintext.
     let n = tls.drain_plaintext_into(buf);
     if n > 0 {
@@ -412,8 +415,14 @@ mod tests {
                 }
             }
             let mut acc = Vec::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while acc.is_empty() && std::time::Instant::now() < deadline {
+            let hard_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut last_data = std::time::Instant::now();
+            // Accumulate until peer goes idle after first byte (or EOF / hard deadline).
+            // A single-shot read is not enough for multi-record client writes.
+            while std::time::Instant::now() < hard_deadline {
+                if !acc.is_empty() && last_data.elapsed() > Duration::from_millis(50) {
+                    break;
+                }
                 match conn.read_tls(&mut sock) {
                     Ok(0) => break,
                     Ok(_) => {
@@ -424,7 +433,10 @@ mod tests {
                         loop {
                             match conn.reader().read(&mut tmp) {
                                 Ok(0) => break,
-                                Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                                Ok(n) => {
+                                    acc.extend_from_slice(&tmp[..n]);
+                                    last_data = std::time::Instant::now();
+                                }
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(_) => break,
                             }
@@ -465,6 +477,22 @@ mod tests {
         stream_write_all(&mut heap, s, msg).expect("write_all");
         let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
         assert_eq!(array_bytes(&heap, echoed), b"hello-tls");
+        stream_close(&mut heap, s).expect("close");
+        handle.join().expect("server thread");
+    }
+
+    /// Large payload so rustls may buffer ciphertext across write/flush; ensures
+    /// read_to_end still drains pending writes instead of hanging on poll(read).
+    #[test]
+    fn connect_insecure_large_write_then_read_to_end() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let msg = make_byte_array(&mut heap, &payload);
+        stream_write_all(&mut heap, s, msg).expect("write_all");
+        let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
+        assert_eq!(array_bytes(&heap, echoed), payload);
         stream_close(&mut heap, s).expect("close");
         handle.join().expect("server thread");
     }

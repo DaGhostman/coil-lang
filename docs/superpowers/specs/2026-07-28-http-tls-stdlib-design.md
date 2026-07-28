@@ -34,7 +34,8 @@ Land serially. Parallelize investigation only.
 ## Locked decisions
 
 - TLS handshake stays in the host (rustls); coil never implements the handshake.
-- Certs v1: system trust store + `connect_insecure` for local/dev.
+- Certs v1: webpki-roots (Mozilla CA set) + `connect_insecure` for local/dev.
+  (OS/native trust store deferred; portable default for embedders/CI.)
 - Custom PEM CA / private roots: deferred.
 - HTTP v1: request builder; HTTP/1.1 only; `Connection: close`.
 - No redirects, cookies, pooling, timeouts API, ALPN, HTTP/2+.

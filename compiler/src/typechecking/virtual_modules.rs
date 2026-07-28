@@ -164,7 +164,7 @@ pub enum IoBuiltin {
     UdpRecvFromWait,
     /// Local bound port of a UDP socket (useful after `bind(..., 0)`).
     UdpLocalPort,
-    /// TLS connect with system/webpki roots + SNI (`io::net::tls::connect`).
+    /// TLS connect with webpki roots + SNI (`io::net::tls::connect`).
     #[cfg(feature = "tls")]
     TlsConnect,
     /// TLS connect without certificate verification.
