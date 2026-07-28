@@ -25,6 +25,7 @@ getrandom = "0.4.3"
 zeroize = "1.9.0"
 subtle = "2.6.1"
 chrono = "0.4.45"
+pcre2 = "0.2"
 
 [dev-dependencies]
 libc = "0.2"

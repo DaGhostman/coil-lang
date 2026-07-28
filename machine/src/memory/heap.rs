@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::crypto_hasher_state::ObjCryptoHasher;
+use crate::regex_state::ObjRegex;
 
 const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
 const GC_GROWTH_FACTOR: usize = 2;
@@ -253,6 +254,9 @@ impl Heap {
             Object::CryptoHasher(h) => {
                 h.release();
             }
+            Object::Regex(r) => {
+                r.release();
+            }
         }
     }
 
@@ -289,6 +293,24 @@ impl Heap {
         while let Some(reference) = current {
             if reference.addr() == addr {
                 if let Object::CryptoHasher(gc) = reference {
+                    return Some(f(gc.payload_mut()));
+                }
+                return None;
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    pub fn with_regex<R>(
+        &mut self,
+        addr: u64,
+        f: impl FnOnce(&mut ObjRegex) -> R,
+    ) -> Option<R> {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::Regex(gc) = reference {
                     return Some(f(gc.payload_mut()));
                 }
                 return None;
@@ -413,6 +435,7 @@ pub type RefReceiver = Gc<ObjReceiver>;
 pub type RefThreadMutex = Gc<ObjThreadMutex>;
 pub type RefRwLock = Gc<ObjRwLock>;
 pub type RefCryptoHasher = Gc<ObjCryptoHasher>;
+pub type RefRegex = Gc<ObjRegex>;
 
 /// Kind of host-backed IO stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +469,7 @@ pub enum Object {
     Mutex(RefThreadMutex),
     RwLock(RefRwLock),
     CryptoHasher(RefCryptoHasher),
+    Regex(RefRegex),
 }
 
 impl Object {
@@ -469,6 +493,7 @@ impl Object {
             Self::Mutex(m) => m.mark(),
             Self::RwLock(l) => l.mark(),
             Self::CryptoHasher(h) => h.mark(),
+            Self::Regex(r) => r.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -495,6 +520,7 @@ impl Object {
             Self::Mutex(m) => m.unmark(),
             Self::RwLock(l) => l.unmark(),
             Self::CryptoHasher(h) => h.unmark(),
+            Self::Regex(r) => r.unmark(),
         }
     }
 
@@ -519,6 +545,7 @@ impl Object {
             Self::Mutex(m) => m.is_marked(),
             Self::RwLock(l) => l.is_marked(),
             Self::CryptoHasher(h) => h.is_marked(),
+            Self::Regex(r) => r.is_marked(),
         }
     }
 
@@ -573,6 +600,7 @@ impl Object {
             Self::Mutex(_) => {}
             Self::RwLock(_) => {}
             Self::CryptoHasher(_) => {}
+            Self::Regex(_) => {}
         }
     }
 
@@ -597,6 +625,7 @@ impl Object {
             Self::Mutex(m) => m.get_next(),
             Self::RwLock(l) => l.get_next(),
             Self::CryptoHasher(h) => h.get_next(),
+            Self::Regex(r) => r.get_next(),
         }
     }
 
@@ -620,6 +649,7 @@ impl Object {
             Self::Mutex(m) => m.set_next(next),
             Self::RwLock(l) => l.set_next(next),
             Self::CryptoHasher(h) => h.set_next(next),
+            Self::Regex(r) => r.set_next(next),
         }
     }
 
@@ -643,6 +673,7 @@ impl Object {
             Self::Mutex(m) => m.as_ptr() as u64,
             Self::RwLock(l) => l.as_ptr() as u64,
             Self::CryptoHasher(h) => h.as_ptr() as u64,
+            Self::Regex(r) => r.as_ptr() as u64,
         }
     }
 }
@@ -667,6 +698,7 @@ impl GcSized for Object {
             Self::Mutex(m) => m.size(),
             Self::RwLock(l) => l.size(),
             Self::CryptoHasher(h) => h.size(),
+            Self::Regex(r) => r.size(),
         }
     }
 }
@@ -691,6 +723,7 @@ impl fmt::Display for Object {
             Self::Mutex(_) => write!(f, "<mutex 0x{:08x}>", self.addr()),
             Self::RwLock(_) => write!(f, "<rwlock 0x{:08x}>", self.addr()),
             Self::CryptoHasher(_) => write!(f, "<crypto_hasher 0x{:08x}>", self.addr()),
+            Self::Regex(_) => write!(f, "<regex 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -715,7 +748,8 @@ impl Object {
             | Self::Receiver(_)
             | Self::Mutex(_)
             | Self::RwLock(_)
-            | Self::CryptoHasher(_) => std::ptr::null(),
+            | Self::CryptoHasher(_)
+            | Self::Regex(_) => std::ptr::null(),
         }
     }
 }

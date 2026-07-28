@@ -7,6 +7,8 @@ pub mod env;
 pub mod fs;
 pub mod io;
 pub mod char_ord;
+pub mod regex;
+mod regex_state;
 pub mod thread;
 pub mod time;
 mod memory;
@@ -15,6 +17,7 @@ pub mod packed_la;
 mod vm;
 
 pub use crypto::{CryptoErrorTag, CRYPTO_WIRING};
+pub use regex::{RegexErrorTag, REGEX_WIRING};
 pub use ffi::*;
 pub use memory::*;
 pub use opcode::*;
