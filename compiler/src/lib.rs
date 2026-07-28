@@ -7306,11 +7306,15 @@ impl Compiler {
                         // Prefer `receiver_type` for identifiers/access; fall
                         // back to `codegen_expr_ty` so inline receivers like
                         // `new Celsius(0).into()` still get boxed.
+                        // Peel Constructor/Sum → Con so `ty_to_value_tag` matches
+                        // instance-head unbox tags (Con(enum) → Instance). Raw
+                        // Constructor types returned None and skipped boxing.
                         if let Some(recv_ty) = self
                             .receiver_type(recv)
                             .or_else(|| self.codegen_expr_ty(recv))
                         {
-                            Self::emit_box_if_needed(&mut bytecode, &recv_ty);
+                            let box_ty = Self::show_lookup_ty_for_instance(&recv_ty);
+                            Self::emit_box_if_needed(&mut bytecode, &box_ty);
                         }
                         let mut nargs = 1u32; // receiver
                         if let Some(items) = args {
