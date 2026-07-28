@@ -63,16 +63,13 @@ test("content-length truncates longer rest") {
     if find_bytes(r.body, x) != 0 { panic "first byte X"; }
 }
 
-test("short body when content-length exceeds rest") {
-    // Current v1 accepts truncated payloads as success (body = full rest).
-    // Lock the behavior so a future BadResponse change is intentional.
-    let raw = to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab");
-    let r = match parse_response(raw) {
-        Result::Ok(v) => v,
-        Result::Err(_) => panic "parse failed",
-    };
-    assert(r.status == 200, "status")?;
-    assert(len(r.body) == 2, "uses available rest")?;
+test("reject truncated body shorter than content-length") {
+    let raw = to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok");
+    let r = parse_response(raw);
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected BadResponse for truncated body")?;
 }
 
 test("reject response without header terminator") {

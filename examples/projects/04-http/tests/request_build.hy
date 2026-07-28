@@ -165,3 +165,41 @@ test("lookup content-length sixteen") {
     if find_bytes(msg, clb) == 999999 { panic "content-length 16"; }
     if find_bytes(msg, closeb) == 999999 { panic "connection"; }
 }
+
+test("reject method with crlf") {
+    let u = match parse_url("http://example.com/") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    let hs = empty_headers();
+    let msg = match build_request_head("GET\r\nX: y", u, hs, 0) {
+        Result::Ok(m) => m,
+        Result::Err(_) => panic "build",
+    };
+    assert(request_line_ok(msg) == 0, "injected method fails request-line check")?;
+}
+
+test("reject header name with crlf") {
+    let names: [string] = [];
+    let values: [string] = [];
+    names[] = "X-Evil\r\nHost";
+    values[] = "ok";
+    assert(headers_have_crlf(names, values) == 1, "header name CRLF")?;
+}
+
+test("reject header value with crlf") {
+    let names: [string] = [];
+    let values: [string] = [];
+    names[] = "X-Trace";
+    values[] = "a\r\nb";
+    assert(headers_have_crlf(names, values) == 1, "header value CRLF")?;
+}
+
+test("extras sanitize rejects injected header line") {
+    let bad = "X-Trace: a\r\nb\r\n";
+    let r = extras_sanitize(bad);
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "extras sanitize BadUrl")?;
+}

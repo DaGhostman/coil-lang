@@ -50,6 +50,16 @@ test("https defaults to port 443") {
     assert(u.path == "/secure", "path")?;
 }
 
+test("query path with explicit slash") {
+    // Prefer `/?q=` — bare `http://host?q=` slash-prefix uses `"/" + q` under
+    // Result-mode parse_url and hits a known compiler SEGV; use an explicit `/`.
+    let u = match parse_url("http://example.com/?q=1") {
+        Result::Ok(v) => v,
+        Result::Err(_) => panic "parse failed",
+    };
+    assert(u.path == "/?q=1", "query path")?;
+}
+
 test("reject unsupported scheme") {
     let r = parse_url("ftp://example.com/file");
     assert(match r {
@@ -72,4 +82,28 @@ test("reject non-numeric port") {
         Result::Ok(_) => false,
         Result::Err(_) => true,
     }, "expected bad port Err")?;
+}
+
+test("reject url path with crlf") {
+    let r = parse_url("http://example.com/evil\r\nHost: x");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected path CRLF BadUrl")?;
+}
+
+test("reject url host with crlf") {
+    let r = parse_url("http://evil\rhost/");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected host CR BadUrl")?;
+}
+
+test("reject url path with bare lf") {
+    let r = parse_url("http://example.com/a\nb");
+    assert(match r {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    }, "expected path LF BadUrl")?;
 }
