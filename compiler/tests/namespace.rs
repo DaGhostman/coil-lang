@@ -71,31 +71,19 @@ fn build_project(
 }
 
 fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
-    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-
-    let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(project_root).expect("chdir to project root");
-
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(original_cwd);
-
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(pair) => pair,
-        Err(()) => {
-            for msg in pipeline.messages() {
-                eprintln!("PIPELINE ERROR: {}", msg.message());
+    with_project_cwd(project_root, || {
+        let mut pipeline = Pipeline::new();
+        let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+            Ok(pair) => pair,
+            Err(()) => {
+                for msg in pipeline.messages() {
+                    eprintln!("PIPELINE ERROR: {}", msg.message());
+                }
+                panic!("compile failed");
             }
-            panic!("compile failed");
-        }
-    };
-
-    run_bytecode(bytecode, constants, &pipeline)
+        };
+        run_bytecode(bytecode, constants, &pipeline)
+    })
 }
 
 fn run_bytecode(
