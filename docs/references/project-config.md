@@ -266,4 +266,4 @@ Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual m
 ## Related documentation
 
 - [Modules reference](modules.md) — `use` / `mod` syntax, FQN rules, glob semantics
-- [Tutorial: Modules](../tutorial/06-modules.md) — walkthrough with `examples/modules.hy`
+- [Tutorial: Modules](../manual/tutorial/06-modules.md) — walkthrough with `examples/modules.hy`

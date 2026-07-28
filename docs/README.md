@@ -21,17 +21,11 @@ cargo run -- examples/print_literal.hy
 
 Expected output: `hello`
 
-See [Getting Started](getting-started.md) for prerequisites, project layout, and a guided first run.
+See [Getting Started](manual/getting-started.md) for prerequisites, project layout, and a guided first run.
 
 ## How programs run
 
-1. **Parse** — the Pratt parser reads `.hy` source into an AST.
-2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
-3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **30**) and written to `out.hyc` on first run. See [Debug line table](reference/debug-info.md).
-5. **Execute** — the VM loads the archive and runs `main`.
-
-Re-run the same binary without deleting `out.hyc` to reuse the cached compile. Delete `out.hyc` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, older than any recorded source (including `use`d modules), or was built for a different entry file.
+Parse → typecheck (HM) → stack codegen + peephole → versioned `.hyc` archive (`ARCHIVE_VERSION` **30**) → VM executes `main`. Cached `out.hyc` is reused until sources/version/entry change; delete it to force a rebuild. Full stage notes: [Internals — Pipeline](internals/pipeline.md).
 
 ## Language at a glance
 
@@ -58,57 +52,42 @@ Re-run the same binary without deleting `out.hyc` to reuse the cached compile. D
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
-| Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` steps `int`/`byte`/`float`; no auto array materialize ([syntax](reference/syntax.md#ranges-lazy)) |
+| Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` steps `int`/`byte`/`float`; no auto array materialize ([syntax](references/syntax.md#ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
-Browse runnable demos in [Examples](examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo) live under [`examples/projects/`](../examples/projects/README.md).
+Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo) live under [`examples/projects/`](../examples/projects/README.md).
 
 ## Documentation
 
-### New to coil?
+Docs are split into three trees:
 
-Work through the tutorial in order. Each chapter builds on the previous one.
+| Tree | Audience | Start here |
+|------|----------|------------|
+| [Manual](manual/getting-started.md) | Learners | Getting started, tutorials 01–11, examples catalog |
+| [References](references/README.md) | Lookup | Syntax, types, keywords, per-API builtin pages |
+| [Internals](internals/README.md) | Contributors / embedders | Pipeline, debug info, opcodes, grammar |
+
+### Manual (tutorial)
 
 | Chapter | Topic |
 |---------|-------|
-| [01 — Basics](tutorial/01-basics.md) | Syntax, functions, `let`, control flow |
-| [02 — Types & Variables](tutorial/02-types-and-variables.md) | Primitives, inference, annotations |
-| [03 — Enums & Match](tutorial/03-enums-and-match.md) | Sum types and pattern matching |
-| [04 — Records & Fields](tutorial/04-records-and-fields.md) | Record variants, field access, nested patterns |
-| [05 — Aggregates](tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
-| [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `coil.toml` |
-| [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
-| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
-| [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
-| [10 — IO streams](tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
-| [11 — OS threads](tutorial/11-threads.md) | `use thread::*`, `spawn` / `join`, channels, mutexes |
+| [Getting Started](manual/getting-started.md) | Build, first run, cache |
+| [01 — Basics](manual/tutorial/01-basics.md) | Syntax, functions, `let`, control flow |
+| [02 — Types & Variables](manual/tutorial/02-types-and-variables.md) | Primitives, inference, annotations |
+| [03 — Enums & Match](manual/tutorial/03-enums-and-match.md) | Sum types and pattern matching |
+| [04 — Records & Fields](manual/tutorial/04-records-and-fields.md) | Record variants, field access, nested patterns |
+| [05 — Aggregates](manual/tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
+| [06 — Modules](manual/tutorial/06-modules.md) | `use`, `mod`, `coil.toml` |
+| [07 — FFI](manual/tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
+| [08 — Coroutines](manual/tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
+| [09 — Error handling](manual/tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
+| [10 — IO streams](manual/tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
+| [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::*`, `spawn` / `join`, channels, mutexes |
+| [Examples catalog](manual/examples.md) | Every file in `examples/`, expected output |
+| [Showcase projects](../examples/projects/README.md) | Multi-file apps + co-located tests |
 
-Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.hy`.
-
-Start here: [Getting Started](getting-started.md)
-
-### Reference
-
-Look up syntax and semantics when you already know what you need.
-
-| Document | Contents |
-|----------|----------|
-| [Syntax](reference/syntax.md) | Grammar overview, declarations, expressions |
-| [Types](reference/types.md) | Type system, aliases, aggregates |
-| [Operators](reference/operators.md) | Arithmetic, comparison, logical, field access |
-| [Keywords](reference/keywords.md) | Reserved words and constructs |
-| [Built-ins](reference/built-ins.md) | `print`, `format`, FFI builtins, natives |
-| [Modules](reference/modules.md) | Namespace rules, `use` resolution |
-| [Project config](reference/project-config.md) | `coil.toml` manifest format |
-| [Error codes](reference/error-codes.md) | Stable `E####` diagnostic codes, SARIF / LSP flags |
-
-### Examples catalog
-
-| Document | Contents |
-|----------|----------|
-| [Examples](examples.md) | Every file in `examples/`, grouped by topic, with expected output |
-| [Showcase projects](../examples/projects/README.md) | Multi-file apps (`01-todo`, `02-adventure`, `03-echo`) + co-located tests |
+Classes (`class`, `impl`, `new`) — see [02 — Types & Variables](manual/tutorial/02-types-and-variables.md) and `examples/classes.hy`. Full API index: [References](references/README.md).
 
 ## Repository layout
 
@@ -118,9 +97,12 @@ coil/
 ├── parser/          # Pratt parser and AST
 ├── compiler/        # HM typechecker, codegen, pipeline, peephole
 ├── machine/         # VM, heap/GC, FFI (libffi)
-├── examples/        # Runnable .hy demos (see examples.md)
+├── examples/        # Runnable .hy demos (see manual/examples.md)
 │   └── projects/    # Showcase multi-file apps + co-located tests
-├── docs/            # This documentation
+├── docs/
+│   ├── manual/      # End-user guide + tutorials
+│   ├── references/  # Language + per-API lookup
+│   └── internals/   # Pipeline, VM notes, grammar
 ├── src/main.rs      # CLI: default build+run, compile, run, test
 └── coil.toml.example  # Example project manifest
 ```
@@ -152,19 +134,19 @@ cargo run --release -- examples/fib.hy
 | `package <file.hy> [-o path] [--check-native]` | Single executable for this OS/arch (embedded `.hyc`) |
 | `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.hy` (default `./tests`); continue after failures unless `--fail-fast` |
 
-For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](getting-started.md).
+For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](manual/getting-started.md).
 
 ## Learn by example
 
 | Goal | Start with |
 |------|------------|
-| First program | [getting-started.md](getting-started.md) → `examples/fib.hy` |
+| First program | [getting-started.md](manual/getting-started.md) → `examples/fib.hy` |
 | Enums & pattern matching | `examples/option.hy`, `examples/result.hy` |
 | Record-shaped variants | `examples/record.hy`, `examples/mixed.hy` |
 | Dicts / anonymous records | `examples/dict.hy` |
 | Generics & traits | `examples/generics.hy`, `examples/hkt_bifunctor.hy`, `examples/gat_pointer.hy`, `examples/existential_show.hy` |
-| Modules | `examples/modules.hy` (see [examples.md](examples.md) for setup) |
+| Modules | `examples/modules.hy` (see [examples.md](manual/examples.md) for setup) |
 | FFI | `examples/strlen.hy`, `examples/ffi_sum.hy`, `examples/ffi_printf.hy` |
 | IO streams | `examples/io_bytes.hy`, `examples/io_file.hy`, `examples/io_eof.hy`, `examples/io_udp.hy` |
 | Coroutines | `examples/coro.hy`, `examples/coro_gen.hy`, `examples/coro_send.hy`, `examples/for_in_coro.hy` |
-| Full catalog | [examples.md](examples.md) |
+| Full catalog | [examples.md](manual/examples.md) |

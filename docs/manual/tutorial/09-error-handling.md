@@ -114,7 +114,7 @@ print "%i", none?.v ?? 0;     // None → 0
 
 `panic msg` aborts immediately with `panic: <msg>` (CLI exit code 1). Prefer `assert` when failure should be recoverable.
 
-See [Built-ins — assert / panic](../reference/built-ins.md#assert-preludetest) and `examples/assert.hy` / `examples/panic.hy`.
+See [Built-ins — assert / panic](../../references/assert.md) and `examples/assert.hy` / `examples/panic.hy`.
 
 ---
 
@@ -128,8 +128,8 @@ See `examples/raise_try.hy` (output `10,neg`), `examples/coalesce.hy` (`bar,hi,7
 
 | Document | Contents |
 |----------|----------|
-| [Operators](../reference/operators.md) | Precedence for `?`, `?.`, `??` |
-| [Types](../reference/types.md) | Built-in Option / Result |
-| [Built-ins](../reference/built-ins.md) | Compiler-provided enums, `assert`, `panic` |
-| [Keywords](../reference/keywords.md) | `raise`, `panic` |
-| [Error codes](../reference/error-codes.md) | E0114–E0117 |
+| [Operators](../../references/operators.md) | Precedence for `?`, `?.`, `??` |
+| [Types](../../references/types.md) | Built-in Option / Result |
+| [Built-ins](../../references/README.md) | Compiler-provided enums, `assert`, `panic` |
+| [Keywords](../../references/keywords.md) | `raise`, `panic` |
+| [Error codes](../../references/error-codes.md) | E0114–E0117 |

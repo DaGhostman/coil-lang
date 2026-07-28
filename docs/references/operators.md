@@ -87,7 +87,7 @@ Static-length zip/broadcast fully unrolls at compile time (including large
 For **dot product**, **cross product**, and bare-array **matrix multiply**,
 use the named helpers `dot`, `cross`, and `matmul`. For matmul via `*`
 (Mul), wrap rows with `matrix(...)` to get a nominal `Matrix` — see
-[Built-ins](built-ins.md#linear-algebra-dot--matmul--cross--matrix).
+[Built-ins](math.md).
 
 ```coil
 (1, 1) + (1, 1);   // (2, 2)
@@ -221,7 +221,7 @@ Field resolution:
 
 ## Error-handling operators (`?`, `?.`, `??`)
 
-Desugared to `match` / `return` / `MakeEnum` — no new opcodes. See [Tutorial: Error handling](../tutorial/09-error-handling.md).
+Desugared to `match` / `return` / `MakeEnum` — no new opcodes. See [Tutorial: Error handling](../manual/tutorial/09-error-handling.md).
 
 | Operator | Form | Operand | Result type | Notes |
 |----------|------|---------|-------------|-------|

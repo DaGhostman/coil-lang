@@ -66,11 +66,11 @@ scalar broadcast:
 ```
 
 Heterogeneous tuples and mismatched arities are compile errors.
-See [Operators — Aggregate arithmetic](../reference/operators.md).
+See [Operators — Aggregate arithmetic](../../references/operators.md).
 
 For linear algebra on bare vectors/arrays, use named helpers (`dot`,
 `cross`, `matmul`). For matmul with `*`, wrap with `matrix(...)` to get
-a `Matrix` — see [Built-ins](../reference/built-ins.md#linear-algebra-dot--matmul--cross--matrix).
+a `Matrix` — see [Built-ins](../../references/math.md).
 
 ---
 
@@ -302,4 +302,4 @@ cargo run -- examples/dict.hy
 
 - [Records and Fields](04-records-and-fields.md) — enum record variants vs anonymous dicts
 - [Types and Variables](02-types-and-variables.md) — type annotations and inference
-- [Types reference](../reference/types.md) — complete type system reference
+- [Types reference](../../references/types.md) — complete type system reference
