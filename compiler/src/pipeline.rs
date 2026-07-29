@@ -152,7 +152,9 @@ impl Pipeline {
             udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
         };
         #[cfg(feature = "tls")]
-        use machine::tls::{tls_decrypt, tls_disable, tls_enable, tls_encrypt};
+        use machine::tls::{
+            tls_client_disable, tls_client_enable, tls_server_disable, tls_server_enable,
+        };
 
         for kind in IoBuiltin::all() {
             // Host registry keys stay uniquely prefixed for TCP/UDP
@@ -179,11 +181,11 @@ impl Pipeline {
                 | IoBuiltin::UdpRecvFrom
                 | IoBuiltin::UdpRecvFromWait => 2,
                 #[cfg(feature = "tls")]
-                IoBuiltin::TlsEnable => 3,
+                IoBuiltin::TlsClientEnable => 3,
                 #[cfg(feature = "tls")]
-                IoBuiltin::TlsDisable | IoBuiltin::TlsDecrypt => 1,
+                IoBuiltin::TlsClientDisable | IoBuiltin::TlsServerDisable => 1,
                 #[cfg(feature = "tls")]
-                IoBuiltin::TlsEncrypt => 2,
+                IoBuiltin::TlsServerEnable => 2,
                 IoBuiltin::UdpSendTo => 4,
             };
             let args = vec![FfiType::Int; arity];
@@ -315,29 +317,29 @@ impl Pipeline {
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsEnable => {
+                        IoBuiltin::TlsClientEnable => {
                             let host = match value_as_string(heap, args[1]) {
                                 Ok(s) => s,
                                 Err(tag) => {
                                     return Ok(Some(as_result_value(heap, Err(tag))));
                                 }
                             };
-                            let r = tls_enable(heap, args[0], &host, args[2]);
+                            let r = tls_client_enable(heap, args[0], &host, args[2]);
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsDisable => {
-                            let r = tls_disable(heap, args[0]);
+                        IoBuiltin::TlsClientDisable => {
+                            let r = tls_client_disable(heap, args[0]);
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsEncrypt => {
-                            let r = tls_encrypt(heap, args[0], args[1]);
+                        IoBuiltin::TlsServerEnable => {
+                            let r = tls_server_enable(heap, args[0], args[1]);
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsDecrypt => {
-                            let r = tls_decrypt(heap, args[0]);
+                        IoBuiltin::TlsServerDisable => {
+                            let r = tls_server_disable(heap, args[0]);
                             as_result_value(heap, r)
                         }
                     };
