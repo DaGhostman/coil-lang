@@ -1278,4 +1278,79 @@ mod tests {
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
     }
+
+    #[test]
+    fn enable_on_closed_is_already_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        stream_close(&mut heap, s).expect("close");
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn disable_on_closed_is_already_closed() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        stream_close(&mut heap, s).expect("close");
+        let err = tls_disable(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn disable_twice_is_invalid() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let s = tls_disable(&mut heap, s).expect("disable");
+        let err = tls_disable(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_rejects_non_bool_verify() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+        let key = heap.intern("verify".into());
+        // Tagged ints that are not 0/1 must be rejected (bools are 0/1).
+        gc.as_mut().set(key, Member::Value(Value::from(2i64)));
+        let opts = Value::from(obj.addr());
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn enable_rejects_non_instance_opts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let err = tls_enable(&mut heap, s, "127.0.0.1", Value::from(0i64)).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
 }
+
