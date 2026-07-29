@@ -228,13 +228,17 @@ fn with_blocking_handshake(
             Err(_) => Some(IoErrorTag::from_kind(e1.kind())),
         },
     };
-    let conn = hs?;
-    if let Some(e) = nb_err {
-        // Drop the live session rather than attach it to a possibly-blocking fd.
-        drop(conn);
-        return Err(e);
+    match (hs, nb_err) {
+        (Ok(conn), None) => Ok(conn),
+        (Ok(conn), Some(e)) => {
+            // Drop the live session rather than attach it to a possibly-blocking fd.
+            drop(conn);
+            Err(e)
+        }
+        (Err(e), None) => Err(e),
+        // Prefer restore failure so callers know the fd may still be blocking.
+        (Err(_), Some(e)) => Err(e),
     }
-    Ok(conn)
 }
 
 /// Parse `opts` record: require `verify: bool`; reject unknown keys / empty `{}`.
