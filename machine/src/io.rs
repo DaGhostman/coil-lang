@@ -141,26 +141,6 @@ pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Resul
     Ok(Value::from(obj.addr()))
 }
 
-/// Wrap an owned TCP fd plus a completed TLS session as a heap `Stream`.
-#[cfg(feature = "tls")]
-pub fn alloc_tls_stream(
-    heap: &mut Heap,
-    fd: OwnedFd,
-    session: crate::tls::TlsSession,
-) -> io::Result<Value> {
-    set_nonblocking(fd.as_raw_fd())?;
-    let (obj, _) = heap.alloc(
-        ObjStream {
-            fd: Some(fd),
-            kind: StreamKind::Tls,
-            closed: false,
-            tls: Some(Box::new(session)),
-        },
-        Object::Stream,
-    );
-    Ok(Value::from(obj.addr()))
-}
-
 pub fn stream_stdin(heap: &mut Heap) -> Result<Value, IoErrorTag> {
     // Dup so closing the Stream does not close process stdin.
     let raw = unsafe { libc::dup(libc::STDIN_FILENO) };

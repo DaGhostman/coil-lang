@@ -4,8 +4,8 @@
 
 Userland HTTP/1.1 client under `stdlib/http` (`get` / `post` / `request`) against
 a local cleartext TCP server in the same project. HTTPS uses
-`tcp::connect` + `io::net::tls::enable(..., { verify: true })` (never insecure
-by default) — not exercised in CI without a local cert.
+`io::net::tls::enable(..., { verify: true })` after TCP connect (never insecure by default) — not exercised
+in CI without a local cert.
 
 ## Run
 

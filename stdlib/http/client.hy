@@ -17,13 +17,21 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
         };
     }
     if scheme == "https" {
+        // Verified TLS only. For local/dev certs use tls::enable(..., { verify: false })
+        // directly — this client never skips trust checks.
         let s = match tcp_connect(host, port) {
             Result::Ok(s) => s,
             Result::Err(_) => http_fail_stream()?,
         };
         return match tls_enable(s, host, { verify: true }) {
             Result::Ok(s) => s,
-            Result::Err(_) => http_fail_stream()?,
+            Result::Err(_) => {
+                match close(s) {
+                    Result::Ok(_) => 0,
+                    Result::Err(_) => 0,
+                };
+                http_fail_stream()?
+            },
         };
     }
     http_err_unsupported_scheme()?;
@@ -56,6 +64,9 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
     let bl = len(body);
     let n = len(headers.names);
     if n > 0 {
+        if headers_have_crlf(headers.names, headers.values) == 1 {
+            http_err_bad_url()?;
+        }
         let extras = format_extra_headers_str(headers.names, headers.values);
         if extras != "__NONE__" {
             let extras = extras_sanitize(extras)?;
@@ -67,6 +78,9 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
         }
     }
     let head = build_request_head(method, u, headers, bl)?;
+    if request_line_ok(head) == 0 {
+        http_err_bad_url()?;
+    }
     return request_send(head, u, body)?;
 }
 

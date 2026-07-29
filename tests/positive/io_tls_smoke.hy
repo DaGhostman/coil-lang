@@ -15,6 +15,18 @@ test("tls enable on non-TCP stream is Err") {
     assert(ok == 1)?;
 }
 
+test("tls disable on non-TLS stream is Err") {
+    let path = "/tmp/coil_tls_harness_disable.bin";
+    let ok = match open(path, "w") {
+        Result::Ok(s) => match disable(s) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
+    };
+    assert(ok == 1)?;
+}
+
 test("tls encrypt empty PEM on non-TCP is Err") {
     let path = "/tmp/coil_tls_harness_encrypt.bin";
     let ok = match open(path, "w") {

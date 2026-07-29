@@ -191,11 +191,8 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut Connection) -> Result<(
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
-                // Socket is still blocking here; WouldBlock/Interrupted are unexpected.
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                    std::thread::yield_now();
-                    continue;
-                }
+                // Socket is blocking for the handshake; only EINTR is expected to retry.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(map_io(e)),
             }
         }
@@ -205,6 +202,28 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut Connection) -> Result<(
         let _ = conn.write_tls(stream).map_err(map_io)?;
     }
     Ok(())
+}
+
+/// Run `build` after flipping `tcp` blocking; always restore non-blocking before
+/// returning the fd to [`ObjStream`] (including on handshake errors).
+fn with_blocking_handshake(
+    tcp: &mut TcpStream,
+    build: impl FnOnce(&mut TcpStream) -> Result<Connection, IoErrorTag>,
+) -> Result<Connection, IoErrorTag> {
+    let hs = (|| -> Result<Connection, IoErrorTag> {
+        tcp.set_nonblocking(false)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        build(tcp)
+    })();
+    let nb_err = tcp
+        .set_nonblocking(true)
+        .err()
+        .map(|e| IoErrorTag::from_kind(e.kind()));
+    let conn = hs?;
+    if let Some(e) = nb_err {
+        return Err(e);
+    }
+    Ok(conn)
 }
 
 /// Parse `opts` record: require `verify: bool`; reject unknown keys / empty `{}`.
@@ -264,17 +283,12 @@ pub fn tls_enable(
 
     // Borrow the fd for handshake without taking ownership from ObjStream.
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = (|| -> Result<Connection, IoErrorTag> {
-        // Blocking handshake (same sync-adapter pattern as `tcp_connect`).
-        tcp.set_nonblocking(false)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    let hs = with_blocking_handshake(&mut tcp, |tcp| {
         let client = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
         let mut conn = Connection::Client(client);
-        handshake_blocking(&mut tcp, &mut conn)?;
-        tcp.set_nonblocking(true)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        handshake_blocking(tcp, &mut conn)?;
         Ok(conn)
-    })();
+    });
     let _ = tcp.into_raw_fd();
 
     let session = match hs? {
@@ -364,16 +378,12 @@ pub fn tls_encrypt(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value,
     })??;
 
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = (|| -> Result<Connection, IoErrorTag> {
-        tcp.set_nonblocking(false)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    let hs = with_blocking_handshake(&mut tcp, |tcp| {
         let server = ServerConnection::new(config).map_err(map_tls_err)?;
         let mut conn = Connection::Server(server);
-        handshake_blocking(&mut tcp, &mut conn)?;
-        tcp.set_nonblocking(true)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        handshake_blocking(tcp, &mut conn)?;
         Ok(conn)
-    })();
+    });
     let _ = tcp.into_raw_fd();
 
     let session = match hs? {
@@ -733,14 +743,77 @@ mod tests {
         handle.join().expect("server thread");
     }
 
+    fn stream_is_nonblocking(heap: &mut Heap, stream: Value) -> bool {
+        let fd = with_stream_mut(heap, stream, |s| s.fd.as_ref().unwrap().as_raw_fd()).unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags as libc::c_int & libc::O_NONBLOCK) != 0
+    }
+
     #[test]
     fn enable_verify_true_rejects_self_signed() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         // Dial `localhost` to match the test cert SAN; failure is trust, not name.
-        let err = tcp_then_enable(&mut heap, "localhost", port as i64, true).unwrap_err();
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        let opts = make_opts(&mut heap, true);
+        let err = tls_enable(&mut heap, s, "localhost", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
+        assert!(
+            stream_is_nonblocking(&mut heap, s),
+            "failed handshake must restore non-blocking"
+        );
+        stream_close(&mut heap, s).ok();
         handle.join().expect("server thread");
+    }
+
+    /// Peer accepts then closes without speaking TLS → handshake fails; the
+    /// original TCP stream must stay Tcp + O_NONBLOCK for later IO.
+    #[test]
+    fn enable_handshake_fail_restores_nonblocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            if let Ok((sock, _)) = listener.accept() {
+                drop(sock);
+            }
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        assert!(stream_is_nonblocking(&mut heap, s));
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::Other);
+        assert_eq!(
+            with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
+            StreamKind::Tcp
+        );
+        assert!(stream_is_nonblocking(&mut heap, s));
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn encrypt_handshake_fail_restores_nonblocking() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            if let Ok((sock, _)) = listener.accept() {
+                drop(sock); // no TLS client → server handshake fails
+            }
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
+        let err = tls_encrypt(&mut heap, s, opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::Other);
+        assert_eq!(
+            with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
+            StreamKind::Tcp
+        );
+        assert!(stream_is_nonblocking(&mut heap, s));
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
     }
 
     #[test]
