@@ -8,6 +8,10 @@ cd "$ROOT"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 
 BIN="${BIN:-$CARGO_TARGET_DIR/release/coil}"
+# Relative BIN is resolved from ROOT so per-project `cd` does not break it.
+if [[ "$BIN" != /* ]]; then
+  BIN="$ROOT/$BIN"
+fi
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 PROJECTS="$ROOT/examples/projects"
 
@@ -17,7 +21,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 failed=0
-for proj in 01-todo 02-adventure 03-echo; do
+for proj in 01-todo 02-adventure 03-echo 04-http; do
   echo "=== $proj tests ==="
   rm -f "$PROJECTS/$proj/out.hyc" "$ROOT/out.hyc"
   if (

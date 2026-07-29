@@ -46,3 +46,7 @@ jobs:
         run: |
           cargo build -q
           ./target/debug/coil test
+
+      - name: Showcase project tests
+        run: |
+          BIN=./target/debug/coil ./examples/projects/run-tests.sh

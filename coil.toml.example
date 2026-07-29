@@ -8,7 +8,8 @@
 # Search roots for `use` resolution. Each path is relative to the
 # directory containing this `coil.toml` file. The compiler searches
 # the roots in order; the first file that exists wins.
-roots = ["./src", "./vendor", "./builtins"]
+# Include a stdlib tree (e.g. coil's `./stdlib`) to import `http::client`, etc.
+roots = ["./src", "./vendor", "./stdlib"]
 
 # The default roots (when no `coil.toml` exists) are just `["src"]`.
 

@@ -42,7 +42,7 @@ Unknown sections or keys are parse errors.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root |
+| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib` (or a path to coil's stdlib) for `http::*` and other userland libraries. |
 
 Example:
 

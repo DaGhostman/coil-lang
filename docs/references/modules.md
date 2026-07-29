@@ -133,6 +133,19 @@ Given a `mod foo;` declaration:
 
 With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
 
+### Shipping / consuming `stdlib`
+
+The coil workspace manifest includes `./stdlib` in `[module].roots` so programs
+can `use http::client::*;` (and future stdlib packages) without vendoring by
+hand. Project manifests should list the same root (or a path to a checkout):
+
+```toml
+[module]
+roots = ["./src", "./stdlib"]
+```
+
+See [HTTP/1.1 client](../manual/http-client.md) for the HTTP API.
+
 ---
 
 ## Namespace rules
