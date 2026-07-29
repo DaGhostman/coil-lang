@@ -62,13 +62,13 @@ See `examples/io_text.hy`.
 |----------|------------------------|----------|
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd process stdio |
 | `open(path, mode)` | `→ Result<Stream, IoError>` | Modes: `"r"`, `"w"`, `"a"`, `"rw"` |
-| `close(s)` | `→ Result<(), IoError>` | Idempotent; GC drop also closes (TLS best-effort `close_notify`) |
+| `close(s)` | `→ Result<(), IoError>` | Idempotent close on GC drop too |
 | `read(s, buf)` | `→ Result<Option<int>, IoError>` | `Ok(Some(n))`, `Ok(None)` = EOF |
 | `write(s, buf)` | `→ Result<int, IoError>` | Partial writes OK |
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
-| `io::net::tls::*` | TLS | `connect` / `connect_insecure` (feature `tls`) |
+| `io::net::tls::*` | TLS | `enable` / `disable` (feature `tls`) |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
 
@@ -131,21 +131,34 @@ See `examples/io_udp.hy`.
 
 ## TLS (`io::net::tls`)
 
-Client TLS via rustls (Cargo feature `tls`, default-on). The handshake
-runs in the host; afterwards you use the normal `Stream` APIs
+Client TLS via rustls (Cargo feature `tls`, default-on). Upgrade a TCP
+`Stream` in place; afterwards you use the normal `Stream` APIs
 (`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
 
 | Function | Signature (simplified) | Behavior |
 |----------|------------------------|----------|
-| `connect(host, port)` | `→ Result<Stream, IoError>` | webpki roots + SNI from `host` |
-| `connect_insecure(host, port)` | same | Skips cert **trust** only — local/dev; never use in production |
+| `enable(s, host, opts)` | `Stream, string, record → Result<Stream, IoError>` | Upgrade TCP→TLS; `opts.verify: bool` **required** |
+| `disable(s)` | `Stream → Result<Stream, IoError>` | Tear TLS down; plaintext on same fd |
 
-Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
-tags yet). IP-literal hosts are accepted for the socket connect;
-`ServerName::try_from` may still treat them as IP server names (not the same
-as omitting SNI). Prefer a DNS `host` when the peer requires classic hostname SNI.
-`connect` / `connect_insecure` block the host thread for TCP connect + handshake
-(same sync-adapter pattern as `tcp_connect`; no timeout in v1).
+```coil
+use io::net::tcp::*;
+use io::net::tls::*;
+
+let s = connect("example.com", 443)?;
+let s = enable(s, "example.com", { verify: true })?;   // webpki roots + SNI
+// … encrypted IO …
+let s = disable(s)?;                                     // plaintext again
+```
+
+`{ verify: false }` skips cert **trust** only (signatures still checked) —
+local/dev; never use in production. `opts` must include `verify`; empty `{}`
+and unknown keys are rejected. Handshake / TLS failures map to `IoError::Other`
+in v1 (no distinct cert/name tags yet). Prefer a DNS `host` when the peer
+requires classic hostname SNI. `enable` blocks the host thread for the
+handshake (same sync-adapter pattern as `tcp::connect`; no timeout in v1).
+`disable` discards unread TLS plaintext. Prefer explicit `close(s)` for a
+clean shutdown; GC drop still sends a best-effort TLS `close_notify` before
+closing the fd.
 
 See `examples/io_tls.hy`.
 

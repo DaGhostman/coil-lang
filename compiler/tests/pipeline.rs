@@ -3414,50 +3414,129 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
-/// HostInvoke + virtual `io::net::tls`: refused connect surfaces as `Result::Err`.
+/// HostInvoke + virtual `io::net::tls`: enable on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_connect_insecure_refused_is_err_via_host_invoke() {
+fn tls_enable_non_tcp_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
+use io::*;
 use io::net::tls::*;
 
-fn refused() -> int {
-    return match connect_insecure("127.0.0.1", 1) {
-        Result::Ok(_) => 0,
-        Result::Err(_) => 1,
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
     };
 }
 
 fn main() {
-    print "%i", refused();
+    let path = "/tmp/coil_tls_enable_kind.bin";
+    let s = open(path, "w")?;
+    let r = enable(s, "127.0.0.1", { verify: false });
+    let code = match r {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    print "%i", code;
 }
 "#,
     );
     assert_eq!(output, "1");
 }
 
-/// HostInvoke wiring for verified `tls_connect` (invalid port → Err, no network).
+/// HostInvoke wiring for `tls_disable` on a non-TLS stream → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_connect_invalid_port_is_err_via_host_invoke() {
+fn tls_disable_on_tcp_is_invalid_input_via_host_invoke() {
     let output = run_example_src(
         r#"
+use io::*;
 use io::net::tls::*;
 
-fn bad_port() -> int {
-    return match connect("localhost", 99999) {
-        Result::Ok(_) => 0,
-        Result::Err(_) => 1,
+fn disable_file_is_err() -> int {
+    let path = "/tmp/coil_tls_disable_kind.bin";
+    return match open(path, "w") {
+        Result::Ok(s) => match disable(s) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
     };
 }
 
 fn main() {
-    print "%i", bad_port();
+    print "%i", disable_file_is_err();
 }
 "#,
     );
     assert_eq!(output, "1");
+}
+
+/// Two-arg `enable` is not a complete call (needs opts record).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_enable_two_arg_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_arity.bin";
+    let s = open(path, "w")?;
+    let r: Result<Stream, IoError> = enable(s, "127.0.0.1");
+}
+"#,
+    );
+    assert!(err.is_err(), "2-arg enable should fail to typecheck as Result");
+}
+
+/// Third arg to `enable` must be a record with `verify: bool`.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_enable_non_record_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, "127.0.0.1", 1)?;
+}
+"#,
+    );
+    assert!(err.is_err(), "non-record opts should fail to typecheck");
+}
+
+/// Empty opts `{}` omit required `verify` → type error.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_enable_empty_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_empty_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, "127.0.0.1", {})?;
+}
+"#,
+    );
+    assert!(err.is_err(), "empty opts should fail to typecheck");
 }
 
 /// Smoke example stays green without public-network TLS.
