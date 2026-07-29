@@ -1029,6 +1029,15 @@ mod tests {
                 kind: IoBuiltin::TlsEnable
             }
         );
+        let disable = vm
+            .resolve_item(&["io".into(), "net".into(), "tls".into()], "disable")
+            .expect("io::net::tls::disable");
+        assert_eq!(
+            disable,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsDisable
+            }
+        );
         let encrypt = vm
             .resolve_item(&["io".into(), "net".into(), "tls".into()], "encrypt")
             .expect("io::net::tls::encrypt");
