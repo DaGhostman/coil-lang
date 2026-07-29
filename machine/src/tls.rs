@@ -112,6 +112,8 @@ fn verified_config() -> Arc<ClientConfig> {
     .clone()
 }
 
+/// Client config for `verify: false` — skips trust/name checks only.
+/// Prefer `verify: true` in production; see tutorial 10 (IO streams).
 fn insecure_config() -> Arc<ClientConfig> {
     static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
