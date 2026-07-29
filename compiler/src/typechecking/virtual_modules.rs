@@ -1017,6 +1017,8 @@ mod tests {
         assert_eq!(IoBuiltin::TlsDisable.native_name(), "tls_disable");
         assert_eq!(IoBuiltin::TlsEncrypt.native_name(), "tls_encrypt");
         assert_eq!(IoBuiltin::TlsDecrypt.native_name(), "tls_decrypt");
+        assert_eq!(IoBuiltin::TlsEnable.as_str(), "enable");
+        assert_eq!(IoBuiltin::TlsDisable.as_str(), "disable");
         assert_eq!(IoBuiltin::TlsEncrypt.as_str(), "encrypt");
         assert_eq!(IoBuiltin::TlsDecrypt.as_str(), "decrypt");
 
