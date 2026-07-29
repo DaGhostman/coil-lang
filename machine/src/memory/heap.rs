@@ -456,7 +456,7 @@ pub enum StreamKind {
     TcpListener,
     /// Datagram socket (`io::net::udp::bind` / `connect`).
     Udp,
-    /// TLS-wrapped TCP (`io::net::tls::connect` / `connect_insecure`).
+    /// TLS-wrapped TCP (`io::net::tls::enable` / `disable`).
     #[cfg(feature = "tls")]
     Tls,
 }
