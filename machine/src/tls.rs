@@ -257,13 +257,24 @@ pub fn tls_enable(
             .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
         let mut conn = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
         handshake_blocking(&mut tcp, &mut conn)?;
-        tcp.set_nonblocking(true)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
         Ok(conn)
     })();
+    // Always restore L0 non-blocking before releasing the fd back to ObjStream
+    // (handshake errors must not leave a blocking TCP stream).
+    let restore = tcp
+        .set_nonblocking(true)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()));
     let _ = tcp.into_raw_fd();
-
-    let conn = hs?;
+    let conn = match hs {
+        Ok(conn) => {
+            restore?;
+            conn
+        }
+        Err(e) => {
+            let _ = restore;
+            return Err(e);
+        }
+    };
     with_stream_mut(heap, stream, |s| {
         s.kind = StreamKind::Tls;
         s.tls = Some(Box::new(TlsSession::new(conn)));
