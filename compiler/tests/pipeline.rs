@@ -3641,6 +3641,126 @@ fn main() {
     assert!(err.is_err(), "empty server enable opts should fail");
 }
 
+/// Parent `io::net::tls` exports nothing — flat `enable` must not resolve.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_flat_parent_enable_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_flat.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, "127.0.0.1", { verify: false })?;
+}
+"#,
+    );
+    assert!(err.is_err(), "flat parent tls::* must not export enable");
+}
+
+/// Legacy `encrypt` / `decrypt` names under server must stay gone.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_legacy_server_encrypt_decrypt_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_legacy_encrypt.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, { cert_pem: "x", key_pem: "y" })?;
+}
+"#,
+    );
+    assert!(err.is_err(), "server::encrypt must not resolve after rename");
+
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_legacy_decrypt.bin";
+    let s = open(path, "w")?;
+    let _ = decrypt(s)?;
+}
+"#,
+    );
+    assert!(err.is_err(), "server::decrypt must not resolve after rename");
+}
+
+/// Same surface name `enable`, different opts records — cross-namespace misuse fails.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_client_opts_on_server_enable_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_cross_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, { verify: false })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "server enable must reject client-shaped {{ verify }} opts"
+    );
+}
+
+/// Both namespaces in one program: HostInvoke routes distinct natives.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_client_and_server_enable_both_invalid_input_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::client::enable as client_enable;
+use io::net::tls::server::enable as server_enable;
+
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+    };
+}
+
+fn main() {
+    let path = "/tmp/coil_tls_both_ns.bin";
+    let s = open(path, "w")?;
+    let c = match client_enable(s, "127.0.0.1", { verify: false }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    let s2 = open(path, "w")?;
+    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem" }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    // File stream → InvalidInput for both; distinct natives both wired.
+    print "%i%i", c, sv;
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
 /// Smoke example stays green without public-network TLS.
 #[cfg(feature = "tls")]
 #[test]

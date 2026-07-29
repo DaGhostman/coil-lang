@@ -1079,6 +1079,49 @@ mod tests {
         );
         assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "enable"));
         assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "encrypt"));
+        assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "decrypt"));
+        assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "connect"));
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "server".into()],
+            "encrypt"
+        ));
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "connect"
+        ));
+
+        let client_disable = vm
+            .resolve_item(
+                &["io".into(), "net".into(), "tls".into(), "client".into()],
+                "disable",
+            )
+            .expect("io::net::tls::client::disable");
+        assert_eq!(
+            client_disable,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsClientDisable
+            }
+        );
+        let server_disable = vm
+            .resolve_item(
+                &["io".into(), "net".into(), "tls".into(), "server".into()],
+                "disable",
+            )
+            .expect("io::net::tls::server::disable");
+        assert_eq!(
+            server_disable,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsServerDisable
+            }
+        );
+        assert_eq!(
+            IoBuiltin::TlsClientDisable.native_name(),
+            "tls_client_disable"
+        );
+        assert_eq!(
+            IoBuiltin::TlsServerDisable.native_name(),
+            "tls_server_disable"
+        );
     }
 
     #[test]
