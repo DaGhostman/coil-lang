@@ -5,11 +5,12 @@ use io::net::tls::*;
 
 test("tls enable on non-TCP stream is Err") {
     let path = "/tmp/coil_tls_harness.bin";
-    let s = open(path, "w")?;
-    let ok = match enable(s, "127.0.0.1", { verify: false }) {
-        Result::Ok(_) => 0,
-        Result::Err(_) => 1,
+    let ok = match open(path, "w") {
+        Result::Ok(s) => match enable(s, "127.0.0.1", { verify: false }) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
     };
-    close(s)?;
     assert(ok == 1)?;
 }

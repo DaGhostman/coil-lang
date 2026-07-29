@@ -407,7 +407,9 @@ pub fn send_close_notify(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorT
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{stream_close, stream_read_to_end, stream_write_all, tcp_connect};
+    use crate::io::{
+        stream_close, stream_open, stream_read_to_end, stream_write_all, tcp_connect,
+    };
     use crate::memory::{Heap, ObjArray, ObjInstance, Object};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::{ServerConfig, ServerConnection};
@@ -648,6 +650,16 @@ mod tests {
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_rejects_file_stream() {
+        let mut heap = Heap::default();
+        let s = stream_open(&mut heap, "/tmp/coil_tls_file_kind.bin", "w").expect("open");
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
     }
 
     #[test]

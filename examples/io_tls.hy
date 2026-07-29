@@ -18,10 +18,7 @@ fn main() {
     let path = "/tmp/coil_tls_smoke.bin";
     let s = open(path, "w")?;
     let msg = match enable(s, "127.0.0.1", { verify: false }) {
-        Result::Ok(s) => {
-            close(s)?;
-            "unexpected-ok"
-        },
+        Result::Ok(_) => "unexpected-ok",
         Result::Err(_) => "tls-ok",
     };
     close(s)?;

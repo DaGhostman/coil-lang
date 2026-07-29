@@ -3417,33 +3417,34 @@ fn main() {
 /// HostInvoke + virtual `io::net::tls`: enable on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_non_tcp_is_invalid_input_via_host_invoke() {
+fn tls_enable_non_tcp_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
 use io::net::tls::*;
 
-fn enable_file_is_err() -> int {
-    let path = "/tmp/coil_tls_enable_kind.bin";
-    let s = match open(path, "w") {
-        Result::Ok(s) => s,
-        Result::Err(_) => return 9,
-    };
-    return match enable(s, "127.0.0.1", { verify: false }) {
-        Result::Ok(_) => 0,
-        Result::Err(e) => match e {
-            IoError::InvalidInput => 1,
-            IoError::WouldBlock => 2,
-            IoError::NotFound => 3,
-            IoError::PermissionDenied => 4,
-            IoError::AlreadyClosed => 5,
-            IoError::Other => 6,
-        },
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
     };
 }
 
 fn main() {
-    print "%i", enable_file_is_err();
+    let path = "/tmp/coil_tls_enable_kind.bin";
+    let s = open(path, "w")?;
+    let r = enable(s, "127.0.0.1", { verify: false });
+    let code = match r {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    print "%i", code;
 }
 "#,
     );
@@ -3461,13 +3462,12 @@ use io::net::tls::*;
 
 fn disable_file_is_err() -> int {
     let path = "/tmp/coil_tls_disable_kind.bin";
-    let s = match open(path, "w") {
-        Result::Ok(s) => s,
-        Result::Err(_) => return 9,
-    };
-    return match disable(s) {
-        Result::Ok(_) => 0,
-        Result::Err(_) => 1,
+    return match open(path, "w") {
+        Result::Ok(s) => match disable(s) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
     };
 }
 
@@ -3479,7 +3479,7 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// Two-arg `enable` must not resolve (only `enable(s, host, opts)`).
+/// Two-arg `enable` is not a complete call (needs opts record).
 #[cfg(feature = "tls")]
 #[test]
 fn tls_enable_two_arg_does_not_compile() {
@@ -3492,11 +3492,11 @@ use io::net::tls::*;
 fn main() {
     let path = "/tmp/coil_tls_arity.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1")?;
+    let r: Result<Stream, IoError> = enable(s, "127.0.0.1");
 }
 "#,
     );
-    assert!(err.is_err(), "2-arg enable should fail to typecheck");
+    assert!(err.is_err(), "2-arg enable should fail to typecheck as Result");
 }
 
 /// Third arg to `enable` must be a record with `verify: bool`.
