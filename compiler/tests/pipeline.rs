@@ -3741,6 +3741,28 @@ fn main() {
     assert!(err.is_err(), "unknown opts key should fail to typecheck");
 }
 
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_unknown_opts_key_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_unknown_opts.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "unknown encrypt opts key should fail to typecheck"
+    );
+}
+
 /// Smoke example stays green without public-network TLS.
 #[cfg(feature = "tls")]
 #[test]
