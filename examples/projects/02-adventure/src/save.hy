@@ -1,6 +1,5 @@
 // Pure save payload encode/decode (2 bytes: room, has_key).
-// File open/read/write stays in `main.hy` — IO HostInvoke from a
-// dependency module currently does not run correctly.
+// File open/read/write stays in `main.hy` for clarity (deps may also call IO).
 
 class SaveData {
     room: int,

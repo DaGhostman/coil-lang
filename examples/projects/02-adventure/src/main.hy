@@ -1,7 +1,7 @@
 // 02-adventure — text adventure over stdin/stdout.
 //
 // Modules: world (rooms/player), commands (byte parse), save (encode/decode).
-// File IO and stdin live here (entry file) — see NOTES.md.
+// File IO and stdin live here for clarity (deps may also call IO + `?`).
 // Input: `read_to_end` once, then split on `\n` (batch / Ctrl+D on a TTY).
 //
 //   rm -f out.hyc

@@ -71,31 +71,19 @@ fn build_project(
 }
 
 fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
-    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-
-    let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(project_root).expect("chdir to project root");
-
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(original_cwd);
-
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(pair) => pair,
-        Err(()) => {
-            for msg in pipeline.messages() {
-                eprintln!("PIPELINE ERROR: {}", msg.message());
+    with_project_cwd(project_root, || {
+        let mut pipeline = Pipeline::new();
+        let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+            Ok(pair) => pair,
+            Err(()) => {
+                for msg in pipeline.messages() {
+                    eprintln!("PIPELINE ERROR: {}", msg.message());
+                }
+                panic!("compile failed");
             }
-            panic!("compile failed");
-        }
-    };
-
-    run_bytecode(bytecode, constants, &pipeline)
+        };
+        run_bytecode(bytecode, constants, &pipeline)
+    })
 }
 
 fn run_bytecode(
@@ -122,12 +110,11 @@ fn run_bytecode(
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
 }
 
-fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String> {
+/// Serialize cwd changes, `chdir` into `root`, run `f`, then restore cwd.
+fn with_project_cwd<R>(root: &PathBuf, f: impl FnOnce() -> R) -> R {
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-
     let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(project_root).expect("chdir to project root");
-
+    std::env::set_current_dir(root).expect("chdir");
     struct CwdGuard(PathBuf);
     impl Drop for CwdGuard {
         fn drop(&mut self) {
@@ -135,15 +122,53 @@ fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String
         }
     }
     let _guard = CwdGuard(original_cwd);
+    f()
+}
 
+/// Compile `entry` and assert every `JumpIfMatch` pool index is in range.
+fn compile_entry_and_assert_jump_if_match_pool_valid(
+    entry: &PathBuf,
+) -> (Vec<common::Byte>, Vec<u64>, Pipeline) {
     let mut pipeline = Pipeline::new();
-    let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
-    assert!(result.is_err(), "expected compile to fail");
-    pipeline
-        .messages()
-        .iter()
-        .map(|m| m.message().to_string())
-        .collect()
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("MSG: {}", msg.message());
+            }
+            panic!("compile failed");
+        }
+    };
+
+    let mut oob = Vec::new();
+    for (i, b) in bytecode.iter().enumerate() {
+        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
+            let idx = (b.operand_u32() & 0xFFFF) as usize;
+            if idx >= constants.len() {
+                oob.push((i, idx));
+            }
+        }
+    }
+    assert!(
+        oob.is_empty(),
+        "JumpIfMatch pool index out of range after multi-file link: \
+         {oob:?} (constants.len() = {})",
+        constants.len()
+    );
+    (bytecode, constants, pipeline)
+}
+
+fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String> {
+    with_project_cwd(project_root, || {
+        let mut pipeline = Pipeline::new();
+        let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
+        assert!(result.is_err(), "expected compile to fail");
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message().to_string())
+            .collect()
+    })
 }
 
 #[test]
@@ -686,46 +711,182 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
     ];
     let (root, entry) = build_project("try_pool", manifest, &files, "src/main.hy");
 
-    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let original_cwd = std::env::current_dir().expect("get cwd");
-    std::env::set_current_dir(&root).expect("chdir");
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(original_cwd);
-
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(pair) => pair,
-        Err(()) => {
-            for msg in pipeline.messages() {
-                eprintln!("MSG: {}", msg.message());
-            }
-            panic!("compile failed");
-        }
-    };
-
-    let mut oob = Vec::new();
-    for (i, b) in bytecode.iter().enumerate() {
-        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
-            let idx = (b.operand_u32() & 0xFFFF) as usize;
-            if idx >= constants.len() {
-                oob.push((i, idx));
-            }
-        }
-    }
-    assert!(
-        oob.is_empty(),
-        "JumpIfMatch pool index out of range after multi-file link: \
-         {oob:?} (constants.len() = {})",
-        constants.len()
-    );
-
-    let output = run_bytecode(bytecode, constants, &pipeline);
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
     assert_eq!(output, "a,b,");
+}
+
+/// Dependency modules that call IO HostInvoke + `?` must share the same
+/// constant pool as the entry (same class of bug as
+/// `multi_file_try_operator_pool_survives_module_link`, but with real Stream
+/// IO rather than thread channels).
+#[test]
+fn multi_file_io_hostinvoke_try_in_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use io::*;
+use helper::write_greeting;
+
+fn main() {
+    write_greeting()?;
+    print "ok";
+}
+"#,
+        ),
+        (
+            "src/helper.hy",
+            r#"
+use io::*;
+
+fn write_greeting() -> Result<(), IoError> {
+    let path = "greeting.bin";
+    let h: byte = 104;
+    let i: byte = 105;
+    let nl: byte = 10;
+    let payload: [byte] = [h, i, nl];
+    let w = open(path, "w")?;
+    write_all(w, payload)?;
+    close(w)?;
+    return ();
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("io_host_try", &manifest, &files, "src/main.hy");
+
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
+    assert_eq!(output, "ok");
+
+    let written = std::fs::read(root.join("greeting.bin")).expect("dependency wrote greeting.bin");
+    assert_eq!(written, b"hi\n");
+}
+
+/// Nested library layout (entry → facade → transport): deepest module owns
+/// Stream IO + `?`. Models stdlib/http calling a transport helper while the
+/// shared constant pool must survive every `compile_module` hop.
+#[test]
+fn multi_file_io_hostinvoke_try_in_nested_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use facade::roundtrip;
+
+fn main() {
+    roundtrip()?;
+    print "ok";
+}
+"#,
+        ),
+        (
+            "src/facade.hy",
+            r#"
+use io::*;
+use transport::write_then_read;
+
+fn roundtrip() -> Result<(), IoError> {
+    write_then_read("nested.bin")?;
+    return ();
+}
+"#,
+        ),
+        (
+            "src/transport.hy",
+            r#"
+use io::*;
+
+fn write_then_read(string path) -> Result<(), IoError> {
+    let a: byte = 65;
+    let b: byte = 66;
+    let payload: [byte] = [a, b];
+    let w = open(path, "w")?;
+    write_all(w, payload)?;
+    close(w)?;
+
+    let r = open(path, "r")?;
+    let out: [byte] = [0, 0];
+    read_exact(r, out)?;
+    close(r)?;
+    return ();
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("io_host_nested", &manifest, &files, "src/main.hy");
+
+    let output = with_project_cwd(&root, || {
+        let (bytecode, constants, pipeline) =
+            compile_entry_and_assert_jump_if_match_pool_valid(&entry);
+        run_bytecode(bytecode, constants, &pipeline)
+    });
+    assert_eq!(output, "ok");
+
+    let written = std::fs::read(root.join("nested.bin")).expect("transport wrote nested.bin");
+    assert_eq!(written, b"AB");
+}
+
+/// Non-entry modules may `use` a sibling module's free functions (the old
+/// echo NOTES caveat about `payload_eq` from `server.hy`). Locks the pattern
+/// this PR's docs now treat as supported.
+#[test]
+fn multi_file_sibling_use_free_fn_from_dependency() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use server::check;
+
+fn main() {
+    print "%i", check();
+}
+"#,
+        ),
+        (
+            "src/protocol.hy",
+            r#"
+fn payload_eq(int a, int b) -> int {
+    if a == b {
+        return 1;
+    }
+    return 0;
+}
+"#,
+        ),
+        (
+            "src/server.hy",
+            r#"
+use protocol::*;
+
+fn check() -> int {
+    return payload_eq(7, 7);
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("sibling_use_dep", &manifest, &files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "1");
 }
 
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

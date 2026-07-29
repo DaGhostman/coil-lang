@@ -49,8 +49,8 @@ Expected gist: Hall → Library (take key) → inventory → Hall → Garden →
 
 ## Ergonomics / gaps noticed
 
-1. **IO HostInvoke from a dependency module is broken** — `open`/`write_all`
-   must live in the entry file (hence thin `save.hy` + IO wrappers in `main`).
+1. Stream IO stays in the entry file for clarity; dependency modules may call
+   IO HostInvoke + `?` (see regression `multi_file_io_hostinvoke_try_in_dependency`).
 2. No `read_line` builtin — batch `read_to_end` + `\n` split (Ctrl+D / pipe).
 3. No `\n` string escapes; prompts use spaces.
 4. Commands compared as `[byte]` (not `from_bytes`).

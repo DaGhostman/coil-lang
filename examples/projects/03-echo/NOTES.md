@@ -4,7 +4,10 @@
 
 Single-process TCP echo: `io::net::tcp` listen/connect/accept_wait, length-prefixed
 framing (`protocol.hy`), pure server/client helpers, and a coroutine that
-supplies payload bytes. Stream IO stays in `main.hy`.
+supplies payload bytes. Stream IO currently lives in `main.hy` for clarity;
+dependency modules may call IO HostInvoke + `?` (see regression
+`multi_file_io_hostinvoke_try_in_dependency`). Sibling free-fn `use` from a
+non-entry module is also supported (`multi_file_sibling_use_free_fn_from_dependency`).
 
 ## Run
 
@@ -29,16 +32,11 @@ Always under `timeout` (the script wraps it).
 | `src/protocol.hy` | `encode_frame` / `frame_len` / `payload_eq` (sibling calls) |
 | `src/server.hy` | Pure echo policy (`echo_reply`) |
 | `src/client.hy` | Pure request body + fixed port |
-| `src/main.hy` | listen → connect → accept → exchange (all Stream IO) |
+| `src/main.hy` | listen → connect → accept → exchange (Stream IO) |
 
 ## Ergonomics / gaps noticed
 
-1. **IO HostInvoke from a dependency module is broken** — TCP helpers that
-   call `listen`/`write_all`/… must live in the entry file.
-2. **`use sibling::*` inside a non-entry module** may not resolve free-fn
-   calls (`payload_eq` from `server.hy` failed) — keep dep modules self-contained
-   or call shared helpers only from the entry.
-3. TCP has **no `local_port`** — fixed port `41235`.
-4. Preferred order: `listen` → `connect` → `accept_wait`.
-5. Prefer `push` / one-byte reads over index assign.
-6. Test harness is CWD-`./tests` only.
+1. TCP has **no `local_port`** — fixed port `41235`.
+2. Preferred order: `listen` → `connect` → `accept_wait`.
+3. Prefer `push` / one-byte reads over index assign.
+4. Test harness is CWD-`./tests` only.

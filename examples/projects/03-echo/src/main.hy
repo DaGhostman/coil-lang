@@ -1,7 +1,7 @@
 // 03-echo — single-process TCP echo (listen + connect + exchange).
 //
 // Modules: protocol (framing), server/client (pure helpers).
-// All Stream IO is in this entry file — see NOTES.md.
+// Stream IO is in this entry file for clarity (deps may also call IO + `?`).
 //
 // Expected output: ok
 

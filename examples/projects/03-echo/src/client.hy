@@ -1,6 +1,5 @@
 // Client-side pure helpers for the echo demo.
-// TCP connect/send/recv stays in `main.hy` (IO HostInvoke from a
-// dependency module currently does not run correctly).
+// TCP connect/send/recv stays in `main.hy` for layout clarity.
 
 fn request_body() -> [byte] {
     let a: byte = 65;
