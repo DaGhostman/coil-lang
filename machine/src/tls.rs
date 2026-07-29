@@ -205,6 +205,7 @@ fn connect_with_config(
     }
     let server_name = parse_server_name(host)?;
     let addr = format!("{host}:{port}");
+    // Blocking TCP connect + full TLS handshake (same sync-adapter pattern as `tcp_connect`).
     let mut stream = TcpStream::connect(&addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     let mut conn = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
     handshake_blocking(&mut stream, &mut conn)?;
@@ -508,7 +509,8 @@ mod tests {
     fn connect_rejects_self_signed_with_verification() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
-        let err = tls_connect(&mut heap, "127.0.0.1", port as i64).unwrap_err();
+        // Dial `localhost` to match the test cert SAN; failure is trust, not name.
+        let err = tls_connect(&mut heap, "localhost", port as i64).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
         handle.join().expect("server thread");
     }

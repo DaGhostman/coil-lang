@@ -138,12 +138,14 @@ runs in the host; afterwards you use the normal `Stream` APIs
 | Function | Signature (simplified) | Behavior |
 |----------|------------------------|----------|
 | `connect(host, port)` | `→ Result<Stream, IoError>` | webpki roots + SNI from `host` |
-| `connect_insecure(host, port)` | same | No certificate verification (local/dev) |
+| `connect_insecure(host, port)` | same | Skips cert **trust** only — local/dev; never use in production |
 
 Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
 tags yet). IP-literal hosts are accepted for the socket connect;
 `ServerName::try_from` may still treat them as IP server names (not the same
 as omitting SNI). Prefer a DNS `host` when the peer requires classic hostname SNI.
+`connect` / `connect_insecure` block the host thread for TCP connect + handshake
+(same sync-adapter pattern as `tcp_connect`; no timeout in v1).
 
 See `examples/io_tls.hy`.
 
