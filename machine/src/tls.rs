@@ -178,11 +178,8 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut ClientConnection) -> Re
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
-                // Socket is still blocking here; WouldBlock/Interrupted are unexpected.
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                    std::thread::yield_now();
-                    continue;
-                }
+                // Socket is blocking for the handshake; only EINTR is expected to retry.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(map_io(e)),
             }
         }
@@ -232,12 +229,22 @@ pub fn tls_enable(
     opts: Value,
 ) -> Result<Value, IoErrorTag> {
     let verify = parse_tls_options(heap, opts)?;
-    let server_name = parse_server_name(host)?;
     let config = if verify {
         verified_config()
     } else {
         insecure_config()
     };
+    tls_enable_with_config(heap, stream, host, config)
+}
+
+/// Shared upgrade path used by [`tls_enable`] and tests with a custom trust store.
+fn tls_enable_with_config(
+    heap: &mut Heap,
+    stream: Value,
+    host: &str,
+    config: Arc<ClientConfig>,
+) -> Result<Value, IoErrorTag> {
+    let server_name = parse_server_name(host)?;
 
     let fd = with_stream_mut(heap, stream, |s| -> Result<RawFd, IoErrorTag> {
         if s.closed || s.fd.is_none() {
@@ -251,30 +258,26 @@ pub fn tls_enable(
 
     // Borrow the fd for handshake without taking ownership from ObjStream.
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
+    // Blocking handshake (same sync-adapter pattern as `tcp_connect`). Always
+    // restore non-blocking before returning the fd to ObjStream — including on
+    // handshake / ClientConnection errors — so L0 poll/read stay valid.
     let hs = (|| -> Result<ClientConnection, IoErrorTag> {
-        // Blocking handshake (same sync-adapter pattern as `tcp_connect`).
         tcp.set_nonblocking(false)
             .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
         let mut conn = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
         handshake_blocking(&mut tcp, &mut conn)?;
         Ok(conn)
     })();
-    // Always restore L0 non-blocking before releasing the fd back to ObjStream
-    // (handshake errors must not leave a blocking TCP stream).
-    let restore = tcp
+    let nb_err = tcp
         .set_nonblocking(true)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()));
+        .err()
+        .map(|e| IoErrorTag::from_kind(e.kind()));
     let _ = tcp.into_raw_fd();
-    let conn = match hs {
-        Ok(conn) => {
-            restore?;
-            conn
-        }
-        Err(e) => {
-            let _ = restore;
-            return Err(e);
-        }
-    };
+
+    let conn = hs?;
+    if let Some(e) = nb_err {
+        return Err(e);
+    }
     with_stream_mut(heap, stream, |s| {
         s.kind = StreamKind::Tls;
         s.tls = Some(Box::new(TlsSession::new(conn)));
@@ -426,24 +429,9 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection};
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
-    use std::os::fd::AsRawFd;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
-
-    fn assert_stream_nonblocking(heap: &mut Heap, stream: Value) {
-        let fd = with_stream_mut(heap, stream, |s| {
-            s.fd.as_ref().expect("open fd").as_raw_fd()
-        })
-        .expect("stream");
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert!(flags >= 0, "F_GETFL failed");
-        assert_ne!(
-            flags & libc::O_NONBLOCK,
-            0,
-            "stream fd must remain O_NONBLOCK"
-        );
-    }
 
     fn make_byte_array(heap: &mut Heap, bytes: &[u8]) -> Value {
         let elements: Vec<Value> = bytes.iter().map(|&b| Value::from(b as i64)).collect();
@@ -481,21 +469,29 @@ mod tests {
         tls_enable(heap, s, host, opts)
     }
 
-    fn test_server_config() -> (Arc<ServerConfig>, String) {
+    fn test_server_config() -> (Arc<ServerConfig>, CertificateDer<'static>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
         let cert_der = CertificateDer::from(cert.cert);
+        let client_trust = cert_der.clone();
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key)
             .expect("server config");
-        (Arc::new(config), "localhost".into())
+        (Arc::new(config), client_trust)
+    }
+
+    fn stream_is_nonblocking(heap: &mut Heap, stream: Value) -> bool {
+        let fd = with_stream_mut(heap, stream, |s| s.fd.as_ref().unwrap().as_raw_fd()).unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags as libc::c_int & libc::O_NONBLOCK) != 0
     }
 
     /// Echo server: read app data, echo it back, then close_notify.
     /// Socket IO is time-bounded so aborted clients cannot hang the suite.
-    fn spawn_tls_echo_server() -> (u16, thread::JoinHandle<()>) {
-        let (cfg, _name) = test_server_config();
+    /// Returns the server leaf cert so tests can pin it for `{ verify: true }`.
+    fn spawn_tls_echo_server() -> (u16, thread::JoinHandle<()>, CertificateDer<'static>) {
+        let (cfg, cert) = test_server_config();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -584,12 +580,12 @@ mod tests {
             }
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).expect("server ready");
-        (port, handle)
+        (port, handle, cert)
     }
 
     #[test]
     fn enable_verify_false_round_trips_bytes() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let msg = make_byte_array(&mut heap, b"hello-tls");
@@ -604,7 +600,7 @@ mod tests {
     /// read_to_end still drains pending writes instead of hanging on poll(read).
     #[test]
     fn enable_verify_false_large_write_then_read_to_end() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -618,11 +614,41 @@ mod tests {
 
     #[test]
     fn enable_verify_true_rejects_self_signed() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         // Dial `localhost` to match the test cert SAN; failure is trust, not name.
-        let err = tcp_then_enable(&mut heap, "localhost", port as i64, true).unwrap_err();
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        let opts = make_opts(&mut heap, true);
+        let err = tls_enable(&mut heap, s, "localhost", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
+        assert!(
+            stream_is_nonblocking(&mut heap, s),
+            "failed handshake must restore non-blocking"
+        );
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Verified enable succeeds when the echo leaf is pinned in a custom root store.
+    #[test]
+    fn enable_verify_true_round_trips_with_pinned_root() {
+        let (port, handle, cert) = spawn_tls_echo_server();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).expect("pin leaf");
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut heap = Heap::default();
+        // Connect by IP; SNI/name must match the cert SAN (`localhost`).
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let s = tls_enable_with_config(&mut heap, s, "localhost", config).expect("enable");
+        let msg = make_byte_array(&mut heap, b"pinned-ok");
+        stream_write_all(&mut heap, s, msg).expect("write_all");
+        let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
+        assert_eq!(array_bytes(&heap, echoed), b"pinned-ok");
+        stream_close(&mut heap, s).expect("close");
         handle.join().expect("server thread");
     }
 
@@ -650,7 +676,7 @@ mod tests {
 
     #[test]
     fn enable_requires_verify_key() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let opts = make_empty_opts(&mut heap);
@@ -662,7 +688,7 @@ mod tests {
 
     #[test]
     fn enable_rejects_unknown_option_key() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
@@ -679,18 +705,8 @@ mod tests {
     }
 
     #[test]
-    fn enable_rejects_file_stream() {
-        let mut heap = Heap::default();
-        let s = stream_open(&mut heap, "/tmp/coil_tls_file_kind.bin", "w").expect("open");
-        let opts = make_opts(&mut heap, false);
-        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
-        assert_eq!(err, IoErrorTag::InvalidInput);
-        stream_close(&mut heap, s).ok();
-    }
-
-    #[test]
     fn enable_rejects_non_tcp_and_double_enable() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let opts = make_opts(&mut heap, false);
@@ -717,7 +733,7 @@ mod tests {
 
     #[test]
     fn enable_disable_returns_tcp_kind() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let s = tls_disable(&mut heap, s).expect("disable");
@@ -733,7 +749,7 @@ mod tests {
 
     #[test]
     fn empty_write_then_double_close() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let empty = make_byte_array(&mut heap, b"");
@@ -742,6 +758,16 @@ mod tests {
         let err = stream_close(&mut heap, s).unwrap_err();
         assert_eq!(err, IoErrorTag::AlreadyClosed);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_rejects_file_stream() {
+        let mut heap = Heap::default();
+        let s = stream_open(&mut heap, "/tmp/coil_tls_file_kind.bin", "w").expect("open");
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
     }
 
     /// Peer accepts then closes without speaking TLS → handshake fails; the
@@ -757,7 +783,7 @@ mod tests {
         });
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        assert_stream_nonblocking(&mut heap, s);
+        assert!(stream_is_nonblocking(&mut heap, s));
         let opts = make_opts(&mut heap, false);
         let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
@@ -767,7 +793,10 @@ mod tests {
             with_stream_mut(&mut heap, s, |st| st.tls.is_none()).unwrap(),
             "failed enable must not attach a session"
         );
-        assert_stream_nonblocking(&mut heap, s);
+        assert!(
+            stream_is_nonblocking(&mut heap, s),
+            "failed handshake must restore non-blocking"
+        );
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
     }
@@ -790,7 +819,7 @@ mod tests {
 
     #[test]
     fn disable_on_closed_is_already_closed() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         stream_close(&mut heap, s).expect("close");
@@ -801,7 +830,7 @@ mod tests {
 
     #[test]
     fn disable_twice_is_invalid() {
-        let (port, handle) = spawn_tls_echo_server();
+        let (port, handle, _) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let s = tls_disable(&mut heap, s).expect("disable");

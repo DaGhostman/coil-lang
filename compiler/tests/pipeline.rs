@@ -3539,7 +3539,6 @@ fn main() {
     assert!(err.is_err(), "empty opts should fail to typecheck");
 }
 
-/// Unknown opts keys are rejected by the closed `verify`-only record scheme.
 #[cfg(feature = "tls")]
 #[test]
 fn tls_enable_unknown_opts_key_does_not_compile() {

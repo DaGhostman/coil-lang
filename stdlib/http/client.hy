@@ -56,6 +56,9 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
     let bl = len(body);
     let n = len(headers.names);
     if n > 0 {
+        if headers_have_crlf(headers.names, headers.values) == 1 {
+            http_err_bad_url()?;
+        }
         let extras = format_extra_headers_str(headers.names, headers.values);
         if extras != "__NONE__" {
             let extras = extras_sanitize(extras)?;
@@ -67,6 +70,9 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
         }
     }
     let head = build_request_head(method, u, headers, bl)?;
+    if request_line_ok(head) == 0 {
+        http_err_bad_url()?;
+    }
     return request_send(head, u, body)?;
 }
 

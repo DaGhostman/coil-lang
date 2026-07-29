@@ -156,7 +156,9 @@ and unknown keys are rejected. Handshake / TLS failures map to `IoError::Other`
 in v1 (no distinct cert/name tags yet). Prefer a DNS `host` when the peer
 requires classic hostname SNI. `enable` blocks the host thread for the
 handshake (same sync-adapter pattern as `tcp::connect`; no timeout in v1).
-`disable` discards unread TLS plaintext.
+`disable` discards unread TLS plaintext. Prefer explicit `close(s)` for a
+clean shutdown; GC drop still sends a best-effort TLS `close_notify` before
+closing the fd.
 
 See `examples/io_tls.hy`.
 

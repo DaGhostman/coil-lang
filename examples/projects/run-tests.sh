@@ -8,6 +8,10 @@ cd "$ROOT"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 
 BIN="${BIN:-$CARGO_TARGET_DIR/release/coil}"
+# Relative BIN is resolved from ROOT so per-project `cd` does not break it.
+if [[ "$BIN" != /* ]]; then
+  BIN="$ROOT/$BIN"
+fi
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 PROJECTS="$ROOT/examples/projects"
 
