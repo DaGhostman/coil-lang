@@ -953,6 +953,10 @@ impl Drop for ObjStream {
         }
         // OwnedFd closes on drop; clear explicitly for clarity.
         self.fd.take();
+        #[cfg(feature = "tls")]
+        {
+            self.tls.take();
+        }
         self.closed = true;
     }
 }

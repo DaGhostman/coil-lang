@@ -17,13 +17,21 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
         };
     }
     if scheme == "https" {
+        // Verified TLS only. For local/dev certs use tls::enable(..., { verify: false })
+        // directly — this client never skips trust checks.
         let s = match tcp_connect(host, port) {
             Result::Ok(s) => s,
             Result::Err(_) => http_fail_stream()?,
         };
         return match tls_enable(s, host, { verify: true }) {
             Result::Ok(s) => s,
-            Result::Err(_) => http_fail_stream()?,
+            Result::Err(_) => {
+                match close(s) {
+                    Result::Ok(_) => 0,
+                    Result::Err(_) => 0,
+                };
+                http_fail_stream()?
+            },
         };
     }
     http_err_unsupported_scheme()?;
