@@ -586,20 +586,23 @@ fn header_name_eq_ci(string a, string b) -> int {
 }
 
 // Host / Content-Length / Connection are always emitted by the client;
-// format_extra_headers_str skips those names (ASCII case-insensitive).
+// format_extra_headers_str skips those names (common ASCII case spellings).
 // Callers must reject header name/value CRLF via headers_have_crlf before
 // formatting; formatting itself stays raise-free and to_bytes-light.
+// Exact `==` only — do not call header_name_eq_ci / to_bytes on live names
+// here (to_bytes invalidates string slots in the headers arrays).
 
 fn is_reserved_request_header(string name) -> int {
-    if header_name_eq_ci(name, "Host") == 1 {
-        return 1;
-    }
-    if header_name_eq_ci(name, "Content-Length") == 1 {
-        return 1;
-    }
-    if header_name_eq_ci(name, "Connection") == 1 {
-        return 1;
-    }
+    if name == "Host" { return 1; }
+    if name == "host" { return 1; }
+    if name == "HOST" { return 1; }
+    if name == "Content-Length" { return 1; }
+    if name == "content-length" { return 1; }
+    if name == "CONTENT-LENGTH" { return 1; }
+    if name == "Content-length" { return 1; }
+    if name == "Connection" { return 1; }
+    if name == "connection" { return 1; }
+    if name == "CONNECTION" { return 1; }
     return 0;
 }
 

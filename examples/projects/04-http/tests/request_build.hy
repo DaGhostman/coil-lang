@@ -150,6 +150,22 @@ test("only reserved headers yield no extras") {
     assert(extras == "__NONE__", "sentinel when all reserved")?;
 }
 
+test("uppercase reserved header spellings are skipped") {
+    let hs = empty_headers();
+    hs = header_add(hs, "HOST", "evil");
+    hs = header_add(hs, "CONTENT-LENGTH", "999");
+    hs = header_add(hs, "CONNECTION", "keep-alive");
+    hs = header_add(hs, "X-Ok", "1");
+    let extras = format_extra_headers_str(hs.names, hs.values);
+    let eb = to_bytes(extras);
+    let okb = to_bytes("X-Ok: 1");
+    let evil = to_bytes("evil");
+    let fake = to_bytes("CONTENT-LENGTH");
+    if find_bytes(eb, okb) == 999999 { panic "keeps custom"; }
+    if find_bytes(eb, evil) != 999999 { panic "skips HOST"; }
+    if find_bytes(eb, fake) != 999999 { panic "skips CONTENT-LENGTH"; }
+}
+
 test("lookup content-length sixteen") {
     let u = match parse_url("http://example.com/") {
         Result::Ok(v) => v,
