@@ -22,7 +22,7 @@ use io::*;
 `enable(..., { verify: true })` trusts **webpki-roots** only in v1 — no custom CA /
 PEM trust opts yet (private PKI needs a follow-up API or host embedding).
 `encrypt` takes PEM `cert_pem` / `key_pem` on an accepted TCP stream (no
-listen-time TLS).
+listen-time TLS; no client certs / mTLS in v1).
 
 Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 

@@ -139,7 +139,7 @@ place (client or server); afterwards you use the normal `Stream` APIs
 |----------|------------------------|----------|
 | `enable(s, host, opts)` | `Stream, string, record → Result<Stream, IoError>` | Client TCP→TLS; `opts.verify: bool` **required** |
 | `disable(s)` | `Stream → Result<Stream, IoError>` | Tear TLS down; plaintext on same fd |
-| `encrypt(s, opts)` | `Stream, record → Result<Stream, IoError>` | Server TCP→TLS; `opts.cert_pem` / `key_pem` **required** |
+| `encrypt(s, opts)` | `Stream, record → Result<Stream, IoError>` | Server TCP→TLS; `opts.cert_pem` / `key_pem` **required** (no client certs / mTLS in v1) |
 | `decrypt(s)` | `Stream → Result<Stream, IoError>` | Same teardown as `disable` |
 
 ```coil
