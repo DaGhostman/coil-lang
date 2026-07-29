@@ -1,12 +1,12 @@
 //! Host-backed TLS client streams via rustls (`io::net::tls`).
 //!
-//! Handshake completes in the host during [`tls_connect`] /
-//! [`tls_connect_insecure`]; afterwards the handle is a normal non-blocking
-//! [`crate::memory::ObjStream`] with [`StreamKind::Tls`](crate::memory::StreamKind::Tls).
+//! [`tls_enable`] upgrades an existing TCP [`crate::memory::ObjStream`] in place
+//! (handshake in the host); [`tls_disable`] tears TLS down and resumes plaintext
+//! on the same fd. After enable, normal Stream read/write encrypt/decrypt.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, OnceLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -18,8 +18,8 @@ use rustls::{
 
 use common::Value;
 
-use crate::io::{alloc_tls_stream, IoErrorTag};
-use crate::memory::Heap;
+use crate::io::{with_stream_mut, IoErrorTag};
+use crate::memory::{Heap, Member, Object, StreamKind};
 
 /// rustls client session state owned by a TLS [`crate::memory::ObjStream`].
 pub struct TlsSession {
@@ -111,8 +111,8 @@ fn insecure_config() -> Arc<ClientConfig> {
     .clone()
 }
 
-/// Dangerous verifier for `connect_insecure`: skips **trust** / name checks only.
-/// TLS 1.2/1.3 record signatures are still verified via the default provider.
+/// Dangerous verifier for `enable(..., { verify: false })`: skips **trust** /
+/// name checks only. TLS 1.2/1.3 record signatures are still verified.
 #[derive(Debug)]
 struct NoCertVerify;
 
@@ -191,40 +191,104 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut ClientConnection) -> Re
     Ok(())
 }
 
-fn connect_with_config(
-    heap: &mut Heap,
-    host: &str,
-    port: i64,
-    config: Arc<ClientConfig>,
-) -> Result<Value, IoErrorTag> {
-    if !(0..=65535).contains(&port) {
+/// Parse `opts` record: require `verify: bool`; reject unknown keys / empty `{}`.
+fn parse_tls_options(heap: &Heap, opts: Value) -> Result<bool, IoErrorTag> {
+    let addr = opts.raw() as u64;
+    let Some(Object::Instance(gc)) = heap.find_object_by_addr(addr) else {
         return Err(IoErrorTag::InvalidInput);
+    };
+    let mut verify: Option<bool> = None;
+    for (key, member) in gc.as_ref().iter_fields() {
+        let name = key.as_ref().data.as_str();
+        match name {
+            "verify" => {
+                let Member::Value(v) = member else {
+                    return Err(IoErrorTag::InvalidInput);
+                };
+                // Bools are tagged like ints in Value; accept 0/1 only.
+                let raw = v.raw() as u64;
+                if raw != 0 && raw != 1 {
+                    return Err(IoErrorTag::InvalidInput);
+                }
+                verify = Some(v.as_bool());
+            }
+            _ => return Err(IoErrorTag::InvalidInput),
+        }
     }
-    let server_name = parse_server_name(host)?;
-    let addr = format!("{host}:{port}");
-    // Blocking TCP connect + full TLS handshake (same sync-adapter pattern as `tcp_connect`).
-    let mut stream = TcpStream::connect(&addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let mut conn = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
-    handshake_blocking(&mut stream, &mut conn)?;
-    stream
-        .set_nonblocking(true)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let fd = stream.into_raw_fd();
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    alloc_tls_stream(heap, owned, TlsSession::new(conn)).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    verify.ok_or(IoErrorTag::InvalidInput)
 }
 
-/// TLS connect with webpki-roots verification + SNI from `host`.
-pub fn tls_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
-    connect_with_config(heap, host, port, verified_config())
-}
-
-/// TLS connect that **disables certificate verification** (local / self-signed only).
+/// Upgrade a TCP `Stream` in place with a TLS client handshake.
 ///
-/// Still performs a real TLS handshake; only the trust store / name checks are
-/// skipped. Prefer [`tls_connect`] for anything beyond local development.
-pub fn tls_connect_insecure(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
-    connect_with_config(heap, host, port, insecure_config())
+/// `opts` must be a record that includes `verify: bool` (required). Returns the
+/// same stream handle with [`StreamKind::Tls`].
+pub fn tls_enable(
+    heap: &mut Heap,
+    stream: Value,
+    host: &str,
+    opts: Value,
+) -> Result<Value, IoErrorTag> {
+    let verify = parse_tls_options(heap, opts)?;
+    let server_name = parse_server_name(host)?;
+    let config = if verify {
+        verified_config()
+    } else {
+        insecure_config()
+    };
+
+    let fd = with_stream_mut(heap, stream, |s| -> Result<RawFd, IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        if s.kind != StreamKind::Tcp || s.tls.is_some() {
+            return Err(IoErrorTag::InvalidInput);
+        }
+        Ok(s.fd.as_ref().unwrap().as_raw_fd())
+    })??;
+
+    // Borrow the fd for handshake without taking ownership from ObjStream.
+    let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
+    let hs = (|| -> Result<ClientConnection, IoErrorTag> {
+        // Blocking handshake (same sync-adapter pattern as `tcp_connect`).
+        tcp.set_nonblocking(false)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        let mut conn = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
+        handshake_blocking(&mut tcp, &mut conn)?;
+        tcp.set_nonblocking(true)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        Ok(conn)
+    })();
+    let _ = tcp.into_raw_fd();
+
+    let conn = hs?;
+    with_stream_mut(heap, stream, |s| {
+        s.kind = StreamKind::Tls;
+        s.tls = Some(Box::new(TlsSession::new(conn)));
+    })?;
+    Ok(stream)
+}
+
+/// Tear down TLS on `stream` and resume plaintext TCP on the same fd.
+///
+/// Sends `close_notify` (best effort), drops the session, sets
+/// [`StreamKind::Tcp`]. Unread TLS plaintext is discarded. Returns the same handle.
+pub fn tls_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        if s.kind != StreamKind::Tls {
+            return Err(IoErrorTag::InvalidInput);
+        }
+        let fd = s.fd.as_ref().unwrap().as_raw_fd();
+        if let Some(tls) = s.tls.as_mut() {
+            let _ = send_close_notify(fd, tls);
+        }
+        s.tls.take();
+        s.kind = StreamKind::Tcp;
+        Ok(())
+    })??;
+    Ok(stream)
 }
 
 fn with_socket_mut<R>(fd: RawFd, f: impl FnOnce(&mut std::fs::File) -> R) -> R {
@@ -340,10 +404,11 @@ pub fn send_close_notify(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorT
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{stream_close, stream_read_to_end, stream_write_all};
-    use crate::memory::{Heap, ObjArray, Object};
+    use crate::io::{stream_close, stream_read_to_end, stream_write_all, tcp_connect};
+    use crate::memory::{Heap, ObjArray, ObjInstance, Object};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::{ServerConfig, ServerConnection};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
@@ -352,6 +417,18 @@ mod tests {
     fn make_byte_array(heap: &mut Heap, bytes: &[u8]) -> Value {
         let elements: Vec<Value> = bytes.iter().map(|&b| Value::from(b as i64)).collect();
         let (obj, _) = heap.alloc(ObjArray { elements }, Object::Array);
+        Value::from(obj.addr())
+    }
+
+    fn make_opts(heap: &mut Heap, verify: bool) -> Value {
+        let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+        let key = heap.intern("verify".into());
+        gc.as_mut().set(key, Member::Value(Value::from(verify)));
+        Value::from(obj.addr())
+    }
+
+    fn make_empty_opts(heap: &mut Heap) -> Value {
+        let (obj, _) = heap.alloc(ObjInstance::default(), Object::Instance);
         Value::from(obj.addr())
     }
 
@@ -365,6 +442,12 @@ mod tests {
                 .collect(),
             _ => panic!("expected array"),
         }
+    }
+
+    fn tcp_then_enable(heap: &mut Heap, host: &str, port: i64, verify: bool) -> Result<Value, IoErrorTag> {
+        let s = tcp_connect(heap, host, port)?;
+        let opts = make_opts(heap, verify);
+        tls_enable(heap, s, host, opts)
     }
 
     fn test_server_config() -> (Arc<ServerConfig>, String) {
@@ -474,10 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn connect_insecure_round_trips_bytes() {
+    fn enable_verify_false_round_trips_bytes() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
-        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let msg = make_byte_array(&mut heap, b"hello-tls");
         stream_write_all(&mut heap, s, msg).expect("write_all");
         let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
@@ -489,10 +572,10 @@ mod tests {
     /// Large payload so rustls may buffer ciphertext across write/flush; ensures
     /// read_to_end still drains pending writes instead of hanging on poll(read).
     #[test]
-    fn connect_insecure_large_write_then_read_to_end() {
+    fn enable_verify_false_large_write_then_read_to_end() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
-        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let msg = make_byte_array(&mut heap, &payload);
         stream_write_all(&mut heap, s, msg).expect("write_all");
@@ -503,65 +586,120 @@ mod tests {
     }
 
     #[test]
-    fn connect_rejects_self_signed_with_verification() {
+    fn enable_verify_true_rejects_self_signed() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         // Dial `localhost` to match the test cert SAN; failure is trust, not name.
-        let err = tls_connect(&mut heap, "localhost", port as i64).unwrap_err();
+        let err = tcp_then_enable(&mut heap, "localhost", port as i64, true).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
         handle.join().expect("server thread");
     }
 
     #[test]
-    fn connect_insecure_invalid_port() {
+    fn enable_rejects_empty_server_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
         let mut heap = Heap::default();
-        let err = tls_connect_insecure(&mut heap, "127.0.0.1", 99999).unwrap_err();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
+        let _ = accept.join();
     }
 
     #[test]
-    fn connect_insecure_negative_port() {
+    fn enable_connection_refused() {
         let mut heap = Heap::default();
-        let err = tls_connect_insecure(&mut heap, "127.0.0.1", -1).unwrap_err();
-        assert_eq!(err, IoErrorTag::InvalidInput);
-    }
-
-    #[test]
-    fn connect_rejects_empty_server_name() {
-        let mut heap = Heap::default();
-        let err = tls_connect_insecure(&mut heap, "", 443).unwrap_err();
-        assert_eq!(err, IoErrorTag::InvalidInput);
-        let err = tls_connect(&mut heap, "", 443).unwrap_err();
-        assert_eq!(err, IoErrorTag::InvalidInput);
-    }
-
-    #[test]
-    fn connect_insecure_connection_refused() {
-        // Port 1 is almost never listening on loopback in CI/dev.
-        let mut heap = Heap::default();
-        let err = tls_connect_insecure(&mut heap, "127.0.0.1", 1).unwrap_err();
+        let err = tcp_then_enable(&mut heap, "127.0.0.1", 1, false).unwrap_err();
         assert_eq!(err, IoErrorTag::Other);
+    }
+
+    #[test]
+    fn enable_requires_verify_key() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_empty_opts(&mut heap);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_rejects_unknown_option_key() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+        let k0 = heap.intern("verify".into());
+        let k1 = heap.intern("alpn".into());
+        gc.as_mut().set(k0, Member::Value(Value::from(false)));
+        gc.as_mut()
+            .set(k1, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
+        let opts = Value::from(obj.addr());
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_rejects_non_tcp_and_double_enable() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let opts = make_opts(&mut heap, false);
+        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn disable_on_tcp_is_invalid() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let err = tls_disable(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn enable_disable_returns_tcp_kind() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let s = tls_disable(&mut heap, s).expect("disable");
+        let kind = with_stream_mut(&mut heap, s, |st| st.kind).expect("kind");
+        assert_eq!(kind, StreamKind::Tcp);
+        assert!(
+            with_stream_mut(&mut heap, s, |st| st.tls.is_none()).unwrap(),
+            "session cleared"
+        );
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
     }
 
     #[test]
     fn empty_write_then_double_close() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
-        let s = tls_connect_insecure(&mut heap, "127.0.0.1", port as i64).expect("connect");
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let empty = make_byte_array(&mut heap, b"");
         stream_write_all(&mut heap, s, empty).expect("empty write_all");
-        // Peer waits for app data; close_notify should still succeed.
         stream_close(&mut heap, s).expect("close");
         let err = stream_close(&mut heap, s).unwrap_err();
         assert_eq!(err, IoErrorTag::AlreadyClosed);
-        // Server may exit early when the client closes without sending data.
         let _ = handle.join();
-    }
-
-    #[test]
-    fn verified_connect_invalid_port() {
-        let mut heap = Heap::default();
-        let err = tls_connect(&mut heap, "localhost", -5).unwrap_err();
-        assert_eq!(err, IoErrorTag::InvalidInput);
     }
 }

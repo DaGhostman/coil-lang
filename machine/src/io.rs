@@ -210,7 +210,7 @@ pub fn stream_open(heap: &mut Heap, path: &str, mode: &str) -> Result<Value, IoE
     alloc_stream(heap, fd, StreamKind::File).map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
-fn with_stream_mut<R>(
+pub(crate) fn with_stream_mut<R>(
     heap: &mut Heap,
     stream: Value,
     f: impl FnOnce(&mut ObjStream) -> R,
