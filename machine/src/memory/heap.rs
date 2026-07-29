@@ -934,7 +934,7 @@ pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
     pub kind: StreamKind,
     pub closed: bool,
-    /// Optional rustls client session (only for [`StreamKind::Tls`]).
+    /// Optional rustls session (client or server; only for [`StreamKind::Tls`]).
     #[cfg(feature = "tls")]
     pub tls: Option<Box<crate::tls::TlsSession>>,
 }

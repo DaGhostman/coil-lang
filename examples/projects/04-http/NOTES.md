@@ -44,7 +44,7 @@ Impl detail: request/response helpers live in `url.hy` so `client` depends on a
   so the client always emits correct values; other custom headers go on the wire)
 - Prefer Result-mode helpers (`status_code` / `response_status`) over raw field
   access when crossing module/Result boundaries
-- `http::client` imports `io::net::tls` — requires Cargo feature `tls` (default-on)
+- `http::client` imports `io::net::tls::client` — requires Cargo feature `tls` (default-on)
 - IPv6 URL literals not supported (first `:` before `/` is treated as the port)
 - Connect / TLS errors collapse to `HttpError::Io`; TLS host errors map to
   `IoError::Other` (no dedicated tags in v1 — deferred by design)

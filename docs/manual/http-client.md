@@ -44,8 +44,10 @@ fn main() {
 
 Requests are HTTP/1.1 with `Host`, `Content-Length`, and `Connection: close`.
 Extra headers passed to `request` are written on the wire; attempts to override
-`Host` / `Content-Length` / `Connection` (common spellings) are ignored so the
-client always emits those itself.
+`Host` / `Content-Length` / `Connection` (common ASCII spellings such as
+`host` / `HOST` / `content-length` / `CONTENT-LENGTH`) are ignored so the
+client always emits those itself. Full Unicode/case-fold matching is out of
+scope for v1 (`to_bytes` would invalidate live header name slots).
 
 ## Example
 
@@ -67,8 +69,10 @@ cd examples/projects/04-http && coil test
 - No redirects, cookies, connection pooling, or timeouts
 - No chunked transfer encoding (uses `Content-Length` or read-to-close)
 - No HTTP/2 / HTTP/3
-- `http::client` requires Cargo feature `tls` (imports `io::net::tls`; default-on)
+- `http::client` requires Cargo feature `tls` (imports `io::net::tls::client`; default-on)
 - IPv6 URL literals are not supported — the first `:` before `/` is the port
+- HTTPS URLs should use a DNS hostname for SNI / cert name checks; literal-IP
+  hosts may fail verification depending on the peer certificate
 - Connect failures and TLS errors collapse to `HttpError::Io`; TLS maps to
   `IoError::Other` (v1 — dedicated tags deferred)
 - Blocking TCP connect / TLS handshake has no timeout (same as raw TCP)

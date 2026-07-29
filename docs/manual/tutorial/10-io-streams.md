@@ -134,14 +134,15 @@ See `examples/io_udp.hy`.
 ## TLS (`io::net::tls::{client,server}`)
 
 TLS via rustls (Cargo feature `tls`, default-on). Upgrade a connected TCP
-`Stream` in place (opportunistic); afterwards use the normal `Stream` APIs.
+`Stream` in place (opportunistic); afterwards use the normal `Stream` APIs
+(`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
 Client and server share the names `enable` / `disable` under separate modules.
 
 | Module | Function | Behavior |
 |--------|----------|----------|
 | `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify: bool` **required** |
 | `tls::client` | `disable(s)` | Tear TLS down; plaintext on same fd |
-| `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem` / `key_pem` **required** |
+| `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem` / `key_pem` **required** (no client certs / mTLS in v1) |
 | `tls::server` | `disable(s)` | Same teardown as client `disable` |
 
 ```coil
@@ -163,10 +164,15 @@ let s = disable(s)?;
 ```
 
 `{ verify: false }` skips cert **trust** only (signatures still checked) —
-local/dev; never use in production. Empty `{}` / unknown keys are rejected.
-Handshake / TLS failures map to `IoError::Other` in v1. Prefer a DNS `host`
-for client SNI. `enable` blocks the host thread for the handshake (no timeout
-in v1). Teardown discards unread TLS plaintext.
+local/dev; never use in production. Client `opts` must include `verify`; server
+`opts` must include PEM strings; empty `{}` / unknown keys are rejected.
+Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
+tags yet). Prefer a DNS `host` for client SNI. `enable` blocks the host thread
+for the handshake (same sync-adapter pattern as `tcp::connect`; no timeout in
+v1). Failed handshakes restore non-blocking on the TCP fd.
+`disable` discards unread TLS plaintext. Prefer explicit `close(s)` for a clean
+shutdown; GC drop still sends a best-effort TLS `close_notify`.
+
 
 See `examples/io_tls.hy`.
 

@@ -3761,6 +3761,107 @@ fn main() {
     assert_eq!(output, "11");
 }
 
+/// HostInvoke: empty PEM strings typecheck but fail at runtime → InvalidInput.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_empty_pem_is_invalid_input_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+    };
+}
+
+fn main() {
+    let path = "/tmp/coil_tls_server_empty_pem.bin";
+    let s = open(path, "w")?;
+    let r = enable(s, { cert_pem: "", key_pem: "" });
+    let code = match r {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    print "%i", code;
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// `cert_pem` / `key_pem` must be strings (not ints).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_non_string_pem_fields_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_server_pem_ty.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, { cert_pem: 1, key_pem: 2 })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "non-string server enable PEM fields should fail to typecheck"
+    );
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn tls_client_enable_unknown_opts_key_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::client::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_client_unknown_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, "127.0.0.1", { verify: false, alpn: "h2" })?;
+}
+"#,
+    );
+    assert!(err.is_err(), "unknown client opts key should fail to typecheck");
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_unknown_opts_key_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_server_unknown_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "unknown server enable opts key should fail to typecheck"
+    );
+}
+
 /// Smoke example stays green without public-network TLS.
 #[cfg(feature = "tls")]
 #[test]

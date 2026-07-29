@@ -20,6 +20,12 @@ use io::*;
 | `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS |
 | `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts |
 
+`enable(..., { verify: true })` trusts **webpki-roots** only in v1 — no custom CA /
+PEM trust opts yet (private PKI needs a follow-up API or host embedding).
+Server `enable` takes PEM `cert_pem` / `key_pem` on an accepted TCP stream (no
+listen-time TLS; no client certs / mTLS in v1).
+
+
 Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.

@@ -420,6 +420,7 @@ dependencies = [
  "machine",
  "parser",
  "proptest",
+ "rcgen",
  "reporting",
  "rkyv",
 ]

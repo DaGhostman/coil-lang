@@ -12,6 +12,8 @@
 //   let s = disable(s)?;
 //
 // Handshake runs in the host; the handle is a normal `Stream`.
+// Machine unit tests cover client enable and server enable round-trips
+// against local sockets (no public network required).
 //
 // Smoke: client enable on a non-TCP stream → Err (InvalidInput).
 use io::*;
