@@ -60,7 +60,9 @@ let s = disable(s)?;
 
 - Same `Stream` APIs: `read` / `write` / `write_all` / `read_exact` / `read_to_end` / `close`.
 - Cargo feature `tls` (default-on), like `crypto`.
-- Out of scope: PEM CA, server TLS, ALPN, client certs.
+- Out of scope (HTTP v1): PEM CA on the client, ALPN, client certs.
+  Server TLS is connection-level `encrypt`/`decrypt` (PEM cert/key opts),
+  separate from the HTTP client path.
 
 ## PR 3 — `stdlib/http`
 

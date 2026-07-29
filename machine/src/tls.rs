@@ -935,8 +935,7 @@ mod tests {
         });
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-        // Add unknown key on a fresh opts instance.
+        // Unknown key on a fresh opts instance.
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
         let (cert_obj, _) = heap.alloc(ObjString::from(cert_pem.as_str()), Object::String);
         let (key_obj, _) = heap.alloc(ObjString::from(key_pem.as_str()), Object::String);
@@ -947,8 +946,6 @@ mod tests {
         gc.as_mut().set(k1, Member::Object(key_obj));
         gc.as_mut()
             .set(k2, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
-        let opts = Value::from(obj.addr());
-        let _ = opts;
         let err = tls_encrypt(&mut heap, s, Value::from(obj.addr())).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();

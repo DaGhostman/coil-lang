@@ -152,7 +152,7 @@ impl Pipeline {
             udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
         };
         #[cfg(feature = "tls")]
-        use machine::tls::{tls_disable, tls_enable};
+        use machine::tls::{tls_decrypt, tls_disable, tls_enable, tls_encrypt};
 
         for kind in IoBuiltin::all() {
             // Host registry keys stay uniquely prefixed for TCP/UDP
@@ -181,7 +181,9 @@ impl Pipeline {
                 #[cfg(feature = "tls")]
                 IoBuiltin::TlsEnable => 3,
                 #[cfg(feature = "tls")]
-                IoBuiltin::TlsDisable => 1,
+                IoBuiltin::TlsDisable | IoBuiltin::TlsDecrypt => 1,
+                #[cfg(feature = "tls")]
+                IoBuiltin::TlsEncrypt => 2,
                 IoBuiltin::UdpSendTo => 4,
             };
             let args = vec![FfiType::Int; arity];
@@ -326,6 +328,16 @@ impl Pipeline {
                         #[cfg(feature = "tls")]
                         IoBuiltin::TlsDisable => {
                             let r = tls_disable(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        #[cfg(feature = "tls")]
+                        IoBuiltin::TlsEncrypt => {
+                            let r = tls_encrypt(heap, args[0], args[1]);
+                            as_result_value(heap, r)
+                        }
+                        #[cfg(feature = "tls")]
+                        IoBuiltin::TlsDecrypt => {
+                            let r = tls_decrypt(heap, args[0]);
                             as_result_value(heap, r)
                         }
                     };

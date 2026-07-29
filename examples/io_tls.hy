@@ -1,14 +1,17 @@
-// TLS client via `io::net::tls` (host rustls; Cargo feature `tls`).
+// TLS via `io::net::tls` (host rustls; Cargo feature `tls`).
 //
+// Client:
 //   let s = connect("example.com", 443)?;
-//   let s = enable(s, "example.com", { verify: true })?;   // webpki roots + SNI
-//   let s = enable(s, "127.0.0.1", { verify: false })?;  // no cert trust (dev)
-//   // then write_all / read / read_exact / read_to_end / close
-//   let s = disable(s)?;  // plaintext on same fd
+//   let s = enable(s, "example.com", { verify: true })?;
+//   let s = disable(s)?;
+//
+// Server (after accept):
+//   let s = encrypt(s, { cert_pem: cert, key_pem: key })?;
+//   let s = decrypt(s)?;
 //
 // Handshake runs in the host; the handle is a normal `Stream`.
-// Machine unit tests cover `enable(..., { verify: false })` against a local
-// rustls echo server (no public network required).
+// Machine unit tests cover client enable and server encrypt round-trips
+// against local sockets (no public network required).
 //
 // Smoke: enable on a non-TCP stream → Err (InvalidInput).
 use io::*;
