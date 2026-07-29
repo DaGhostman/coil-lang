@@ -22,3 +22,4 @@ rkyv = "0.8.12"
 machine = { path = "../machine", default-features = false, features = ["vm_profile", "crypto", "time", "regex", "tls"] }
 proptest = "1"
 libc = "0.2"
+rcgen = "0.13"

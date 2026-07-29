@@ -1100,6 +1100,16 @@ impl Checker {
             }
             #[cfg(feature = "tls")]
             IoBuiltin::TlsDisable => fun(&[stream], res_stream),
+            #[cfg(feature = "tls")]
+            IoBuiltin::TlsEncrypt => {
+                let opts = record(vec![
+                    ("cert_pem".into(), string()),
+                    ("key_pem".into(), string()),
+                ]);
+                fun(&[stream, opts], res_stream)
+            }
+            #[cfg(feature = "tls")]
+            IoBuiltin::TlsDecrypt => fun(&[stream], res_stream),
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
                 fun(&[string(), int()], res_stream)
             }

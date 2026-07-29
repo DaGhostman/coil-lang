@@ -459,7 +459,7 @@ fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
         // Pending TLS ciphertext must go out before we can expect a reply.
         // Prefer writable poll so sync adapters (read_to_end after write) progress.
         let wants_write = with_stream_mut(heap, stream, |s| {
-            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.wants_write())
         })?;
         if wants_write {
             let fd = stream_raw_fd(heap, stream)?;
@@ -477,7 +477,7 @@ fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
     {
         // Prefer draining pending TLS ciphertext when the socket can accept writes.
         let wants = with_stream_mut(heap, stream, |s| {
-            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.conn.wants_write())
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.wants_write())
         })?;
         if wants {
             let fd = stream_raw_fd(heap, stream)?;

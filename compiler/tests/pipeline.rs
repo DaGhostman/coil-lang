@@ -55,6 +55,23 @@ fn run_example_src(src: &str) -> String {
     run_example_src_with_entry(src, None)
 }
 
+/// Escape a Rust string for embedding in a coil `"…"` literal (`\n`, `\\`, `\"`).
+#[cfg(feature = "tls")]
+fn coil_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn compile_src_with_tests(src: &str) -> (Pipeline, Vec<common::Byte>, Vec<u64>) {
     let mut pipeline = Pipeline::new();
     pipeline.set_include_tests(true);
@@ -3539,6 +3556,172 @@ fn main() {
     assert!(err.is_err(), "empty opts should fail to typecheck");
 }
 
+/// HostInvoke: `encrypt` on non-TCP with valid PEM → InvalidInput (kind check).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_non_tcp_is_err_via_host_invoke() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert_pem = coil_escape_string(&cert.cert.pem());
+    let key_pem = coil_escape_string(&cert.key_pair.serialize_pem());
+    let src = format!(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn classify(IoError e) -> int {{
+    return match e {{
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+    }};
+}}
+
+fn main() {{
+    let path = "/tmp/coil_tls_encrypt_kind.bin";
+    let s = open(path, "w")?;
+    let r = encrypt(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}" }});
+    let code = match r {{
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    }};
+    print "%i", code;
+}}
+"#
+    );
+    let output = run_example_src(&src);
+    assert_eq!(output, "1");
+}
+
+/// HostInvoke: empty PEM strings typecheck but fail at runtime → InvalidInput.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_empty_pem_is_invalid_input_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+    };
+}
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_empty_pem.bin";
+    let s = open(path, "w")?;
+    let r = encrypt(s, { cert_pem: "", key_pem: "" });
+    let code = match r {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    print "%i", code;
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// HostInvoke: `decrypt` on non-TLS → Err.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_decrypt_on_file_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_decrypt_kind.bin";
+    let code = match open(path, "w") {
+        Result::Ok(s) => match decrypt(s) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
+    };
+    print "%i", code;
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// `encrypt` opts must be the cert/key record (not an int).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_non_record_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_opts.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, 1)?;
+}
+"#,
+    );
+    assert!(err.is_err(), "non-record encrypt opts should fail to typecheck");
+}
+
+/// Empty `encrypt` opts omit required PEM keys → type error.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_empty_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_empty.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, {})?;
+}
+"#,
+    );
+    assert!(err.is_err(), "empty encrypt opts should fail to typecheck");
+}
+
+/// `cert_pem` / `key_pem` must be strings (not ints).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_non_string_pem_fields_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_pem_ty.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, { cert_pem: 1, key_pem: 2 })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "non-string encrypt PEM fields should fail to typecheck"
+    );
+}
+
 #[cfg(feature = "tls")]
 #[test]
 fn tls_enable_unknown_opts_key_does_not_compile() {
@@ -3556,6 +3739,28 @@ fn main() {
 "#,
     );
     assert!(err.is_err(), "unknown opts key should fail to typecheck");
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn tls_encrypt_unknown_opts_key_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_encrypt_unknown_opts.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "unknown encrypt opts key should fail to typecheck"
+    );
 }
 
 /// Smoke example stays green without public-network TLS.

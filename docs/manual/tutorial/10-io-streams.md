@@ -68,7 +68,7 @@ See `examples/io_text.hy`.
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
-| `io::net::tls::*` | TLS | `enable` / `disable` (feature `tls`) |
+| `io::net::tls::*` | TLS | client `enable`/`disable`, server `encrypt`/`decrypt` (feature `tls`) |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
 
@@ -131,34 +131,40 @@ See `examples/io_udp.hy`.
 
 ## TLS (`io::net::tls`)
 
-Client TLS via rustls (Cargo feature `tls`, default-on). Upgrade a TCP
-`Stream` in place; afterwards you use the normal `Stream` APIs
+TLS via rustls (Cargo feature `tls`, default-on). Upgrade a TCP `Stream` in
+place (client or server); afterwards you use the normal `Stream` APIs
 (`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
 
 | Function | Signature (simplified) | Behavior |
 |----------|------------------------|----------|
-| `enable(s, host, opts)` | `Stream, string, record → Result<Stream, IoError>` | Upgrade TCP→TLS; `opts.verify: bool` **required** |
+| `enable(s, host, opts)` | `Stream, string, record → Result<Stream, IoError>` | Client TCP→TLS; `opts.verify: bool` **required** |
 | `disable(s)` | `Stream → Result<Stream, IoError>` | Tear TLS down; plaintext on same fd |
+| `encrypt(s, opts)` | `Stream, record → Result<Stream, IoError>` | Server TCP→TLS; `opts.cert_pem` / `key_pem` **required** (no client certs / mTLS in v1) |
+| `decrypt(s)` | `Stream → Result<Stream, IoError>` | Same teardown as `disable` |
 
 ```coil
 use io::net::tcp::*;
 use io::net::tls::*;
 
+// Client
 let s = connect("example.com", 443)?;
 let s = enable(s, "example.com", { verify: true })?;   // webpki roots + SNI
-// … encrypted IO …
-let s = disable(s)?;                                     // plaintext again
+let s = disable(s)?;
+
+// Server (after accept)
+let s = encrypt(s, { cert_pem: cert, key_pem: key })?;
+let s = decrypt(s)?;
 ```
 
 `{ verify: false }` skips cert **trust** only (signatures still checked) —
-local/dev; never use in production. `opts` must include `verify`; empty `{}`
-and unknown keys are rejected. Handshake / TLS failures map to `IoError::Other`
-in v1 (no distinct cert/name tags yet). Prefer a DNS `host` when the peer
-requires classic hostname SNI. `enable` blocks the host thread for the
-handshake (same sync-adapter pattern as `tcp::connect`; no timeout in v1).
-`disable` discards unread TLS plaintext. Prefer explicit `close(s)` for a
-clean shutdown; GC drop still sends a best-effort TLS `close_notify` before
-closing the fd.
+local/dev; never use in production. Client `opts` must include `verify`; server
+`opts` must include PEM strings; empty `{}` / unknown keys are rejected.
+Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
+tags yet). Prefer a DNS `host` for client SNI. `enable` / `encrypt` block the
+host thread for the handshake (same sync-adapter pattern as `tcp::connect`; no
+timeout in v1). Failed handshakes restore non-blocking on the TCP fd.
+`disable` / `decrypt` discard unread TLS plaintext. Prefer explicit `close(s)`
+for a clean shutdown; GC drop still sends a best-effort TLS `close_notify`.
 
 See `examples/io_tls.hy`.
 
