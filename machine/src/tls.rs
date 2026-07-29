@@ -239,7 +239,7 @@ fn with_blocking_handshake(
             Err(e)
         }
         (Err(e), None) => Err(e),
-        // Prefer restore failure so callers know the fd may still be blocking.
+        // Prefer restore failure (fd may still be blocking); handshake Other is dropped.
         (Err(_), Some(e)) => Err(e),
     }
 }
@@ -327,8 +327,8 @@ fn member_as_value(member: &Member) -> Result<Value, IoErrorTag> {
     }
 }
 
-/// Parse server `encrypt` opts: require `cert_pem` / `key_pem` strings.
-fn parse_encrypt_options(
+/// Parse server `enable` opts: require `cert_pem` / `key_pem` strings.
+fn parse_server_enable_options(
     heap: &Heap,
     opts: Value,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), IoErrorTag> {
@@ -378,7 +378,7 @@ fn parse_pem_cert_key(
 /// `opts` must include `cert_pem` and `key_pem` (PEM strings). Returns the same
 /// stream handle with [`StreamKind::Tls`].
 pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value, IoErrorTag> {
-    let (certs, key) = parse_encrypt_options(heap, opts)?;
+    let (certs, key) = parse_server_enable_options(heap, opts)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
