@@ -1,6 +1,7 @@
-//! Host-backed TLS streams via rustls (`io::net::tls`).
+//! Host-backed TLS streams via rustls (`io::net::tls::{client,server}`).
 //!
-//! Client: [`tls_enable`] / [`tls_disable`]. Server: [`tls_encrypt`] / [`tls_decrypt`].
+//! Client: [`tls_client_enable`] / [`tls_client_disable`].
+//! Server: [`tls_server_enable`] / [`tls_server_disable`].
 //! Both upgrade a TCP [`crate::memory::ObjStream`] in place; after handshake,
 //! normal Stream read/write use the shared TLS session.
 
@@ -238,7 +239,7 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<bool, IoErrorTag> {
 ///
 /// `opts` must be a record that includes `verify: bool` (required). Returns the
 /// same stream handle with [`StreamKind::Tls`].
-pub fn tls_enable(
+pub fn tls_client_enable(
     heap: &mut Heap,
     stream: Value,
     host: &str,
@@ -345,7 +346,7 @@ fn parse_pem_cert_key(
 ///
 /// `opts` must include `cert_pem` and `key_pem` (PEM strings). Returns the same
 /// stream handle with [`StreamKind::Tls`].
-pub fn tls_encrypt(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value, IoErrorTag> {
+pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value, IoErrorTag> {
     let (certs, key) = parse_encrypt_options(heap, opts)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -392,13 +393,13 @@ pub fn tls_encrypt(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value,
 /// Sends `close_notify` (best effort), drops the session, sets
 /// [`StreamKind::Tcp`]. Unread TLS plaintext is discarded. Returns the same handle.
 ///
-/// Client-facing name; identical to [`tls_decrypt`].
-pub fn tls_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+/// Client-facing name; identical to [`tls_server_disable`].
+pub fn tls_client_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     tls_teardown(heap, stream)
 }
 
-/// Server-facing teardown; identical to [`tls_disable`].
-pub fn tls_decrypt(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+/// Server-facing teardown; identical to [`tls_client_disable`].
+pub fn tls_server_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     tls_teardown(heap, stream)
 }
 
@@ -595,7 +596,7 @@ mod tests {
     fn tcp_then_enable(heap: &mut Heap, host: &str, port: i64, verify: bool) -> Result<Value, IoErrorTag> {
         let s = tcp_connect(heap, host, port)?;
         let opts = make_opts(heap, verify);
-        tls_enable(heap, s, host, opts)
+        tls_client_enable(heap, s, host, opts)
     }
 
     fn test_server_config() -> (Arc<ServerConfig>, String) {
@@ -753,7 +754,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let opts = make_opts(&mut heap, false);
-        let err = tls_enable(&mut heap, s, "", opts).unwrap_err();
+        let err = tls_client_enable(&mut heap, s, "", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         let _ = accept.join();
     }
@@ -771,7 +772,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let opts = make_empty_opts(&mut heap);
-        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
@@ -789,7 +790,7 @@ mod tests {
         gc.as_mut()
             .set(k1, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
         let opts = Value::from(obj.addr());
-        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
@@ -800,7 +801,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = stream_open(&mut heap, "/tmp/coil_tls_file_kind.bin", "w").expect("open");
         let opts = make_opts(&mut heap, false);
-        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
     }
@@ -811,7 +812,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
         let opts = make_opts(&mut heap, false);
-        let err = tls_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
@@ -826,7 +827,7 @@ mod tests {
         });
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        let err = tls_disable(&mut heap, s).unwrap_err();
+        let err = tls_client_disable(&mut heap, s).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
@@ -837,7 +838,7 @@ mod tests {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
-        let s = tls_disable(&mut heap, s).expect("disable");
+        let s = tls_client_disable(&mut heap, s).expect("disable");
         let kind = with_stream_mut(&mut heap, s, |st| st.kind).expect("kind");
         assert_eq!(kind, StreamKind::Tcp);
         assert!(
@@ -879,7 +880,7 @@ mod tests {
             let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_encrypt(&mut heap, s, opts).expect("encrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
             let mut buf = make_byte_array(&mut heap, &[0u8; 64]);
             // Read until we get data (sync adapter style).
             let n = loop {
@@ -919,7 +920,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let opts = make_empty_opts(&mut heap);
-        let err = tls_encrypt(&mut heap, s, opts).unwrap_err();
+        let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
@@ -946,7 +947,7 @@ mod tests {
         gc.as_mut().set(k1, Member::Object(key_obj));
         gc.as_mut()
             .set(k2, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
-        let err = tls_encrypt(&mut heap, s, Value::from(obj.addr())).unwrap_err();
+        let err = tls_server_enable(&mut heap, s, Value::from(obj.addr())).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
@@ -956,9 +957,9 @@ mod tests {
     fn encrypt_rejects_file_stream() {
         let (cert_pem, key_pem) = test_server_pem();
         let mut heap = Heap::default();
-        let s = stream_open(&mut heap, "/tmp/coil_tls_encrypt_file.bin", "w").expect("open");
+        let s = stream_open(&mut heap, "/tmp/coil_tls_server_enable_file.bin", "w").expect("open");
         let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-        let err = tls_encrypt(&mut heap, s, opts).unwrap_err();
+        let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
     }
@@ -979,8 +980,8 @@ mod tests {
             let mut heap = Heap::default();
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_encrypt(&mut heap, s, opts).expect("encrypt");
-            let s = tls_decrypt(&mut heap, s).expect("decrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
+            let s = tls_server_disable(&mut heap, s).expect("decrypt");
             let kind = with_stream_mut(&mut heap, s, |st| st.kind).expect("kind");
             assert_eq!(kind, StreamKind::Tcp);
             stream_close(&mut heap, s).ok();
@@ -1009,9 +1010,9 @@ mod tests {
             let mut heap = Heap::default();
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_encrypt(&mut heap, s, opts).expect("encrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
             let opts2 = make_encrypt_opts(&mut heap, &cert_pem, &key_pem);
-            let err = tls_encrypt(&mut heap, s, opts2).unwrap_err();
+            let err = tls_server_enable(&mut heap, s, opts2).unwrap_err();
             assert_eq!(err, IoErrorTag::InvalidInput);
             stream_close(&mut heap, s).ok();
         });
@@ -1031,7 +1032,7 @@ mod tests {
         });
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        let err = tls_decrypt(&mut heap, s).unwrap_err();
+        let err = tls_server_disable(&mut heap, s).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
