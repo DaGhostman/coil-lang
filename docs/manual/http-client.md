@@ -2,7 +2,8 @@
 
 Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
 It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
-(`io::net::tls::connect`) for `https://` — never insecure by default.
+(`tcp::connect` then `io::net::tls::enable(..., { verify: true })`) for
+`https://` — never insecure by default.
 
 ## Setup
 
@@ -43,8 +44,8 @@ fn main() {
 
 Requests are HTTP/1.1 with `Host`, `Content-Length`, and `Connection: close`.
 Extra headers passed to `request` are written on the wire; attempts to override
-`Host` / `Content-Length` / `Connection` (common spellings) are ignored so the
-client always emits those itself.
+`Host` / `Content-Length` / `Connection` (ASCII case-insensitive) are ignored so
+the client always emits those itself.
 
 ## Example
 
@@ -68,14 +69,16 @@ cd examples/projects/04-http && coil test
 - No HTTP/2 / HTTP/3
 - `http::client` requires Cargo feature `tls` (imports `io::net::tls`; default-on)
 - IPv6 URL literals are not supported — the first `:` before `/` is the port
+- HTTPS URLs should use a DNS hostname for SNI / cert name checks; literal-IP
+  hosts may fail verification depending on the peer certificate
 - Connect failures and TLS errors collapse to `HttpError::Io`; TLS maps to
   `IoError::Other` (v1 — dedicated tags deferred)
 - Blocking TCP connect / TLS handshake has no timeout (same as raw TCP)
 - CR/LF in URL host/path, method, or header names/values → `HttpError::BadUrl`
 - When `Content-Length` exceeds available body bytes → `HttpError::BadResponse`
 - HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
-  certs are out of scope for the demo (use `connect_insecure` only via TLS
-  APIs directly, not through this client)
+  certs are out of scope for the demo (`{ verify: false }` is available on the
+  TLS APIs directly, not through this client)
 
 ### Known compiler note
 

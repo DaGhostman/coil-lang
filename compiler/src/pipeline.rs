@@ -152,7 +152,7 @@ impl Pipeline {
             udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
         };
         #[cfg(feature = "tls")]
-        use machine::tls::{tls_connect, tls_connect_insecure};
+        use machine::tls::{tls_disable, tls_enable};
 
         for kind in IoBuiltin::all() {
             // Host registry keys stay uniquely prefixed for TCP/UDP
@@ -179,7 +179,9 @@ impl Pipeline {
                 | IoBuiltin::UdpRecvFrom
                 | IoBuiltin::UdpRecvFromWait => 2,
                 #[cfg(feature = "tls")]
-                IoBuiltin::TlsConnect | IoBuiltin::TlsConnectInsecure => 2,
+                IoBuiltin::TlsEnable => 3,
+                #[cfg(feature = "tls")]
+                IoBuiltin::TlsDisable => 1,
                 IoBuiltin::UdpSendTo => 4,
             };
             let args = vec![FfiType::Int; arity];
@@ -311,25 +313,19 @@ impl Pipeline {
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsConnect => {
-                            let host = match value_as_string(heap, args[0]) {
+                        IoBuiltin::TlsEnable => {
+                            let host = match value_as_string(heap, args[1]) {
                                 Ok(s) => s,
                                 Err(tag) => {
                                     return Ok(Some(as_result_value(heap, Err(tag))));
                                 }
                             };
-                            let r = tls_connect(heap, &host, args[1].as_int());
+                            let r = tls_enable(heap, args[0], &host, args[2]);
                             as_result_value(heap, r)
                         }
                         #[cfg(feature = "tls")]
-                        IoBuiltin::TlsConnectInsecure => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = tls_connect_insecure(heap, &host, args[1].as_int());
+                        IoBuiltin::TlsDisable => {
+                            let r = tls_disable(heap, args[0]);
                             as_result_value(heap, r)
                         }
                     };

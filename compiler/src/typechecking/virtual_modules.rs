@@ -33,7 +33,7 @@ pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
 /// UDP helpers under `io::net::udp` (`bind`, `send_to`, …).
 pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
 
-/// TLS helpers under `io::net::tls` (`connect`, `connect_insecure`).
+/// TLS helpers under `io::net::tls` (`enable`, `disable`).
 #[cfg(feature = "tls")]
 pub const IO_NET_TLS_MODULE: &str = "io::net::tls";
 
@@ -164,12 +164,12 @@ pub enum IoBuiltin {
     UdpRecvFromWait,
     /// Local bound port of a UDP socket (useful after `bind(..., 0)`).
     UdpLocalPort,
-    /// TLS connect with webpki roots + SNI (`io::net::tls::connect`).
+    /// Upgrade a TCP stream with TLS (`io::net::tls::enable`).
     #[cfg(feature = "tls")]
-    TlsConnect,
-    /// TLS connect without certificate verification.
+    TlsEnable,
+    /// Tear down TLS and resume plaintext TCP (`io::net::tls::disable`).
     #[cfg(feature = "tls")]
-    TlsConnectInsecure,
+    TlsDisable,
 }
 
 impl IoBuiltin {
@@ -199,9 +199,9 @@ impl IoBuiltin {
             Self::UdpRecvFromWait => "recv_from_wait",
             Self::UdpLocalPort => "local_port",
             #[cfg(feature = "tls")]
-            Self::TlsConnect => "connect",
+            Self::TlsEnable => "enable",
             #[cfg(feature = "tls")]
-            Self::TlsConnectInsecure => "connect_insecure",
+            Self::TlsDisable => "disable",
         }
     }
 
@@ -231,9 +231,9 @@ impl IoBuiltin {
             Self::UdpRecvFromWait => "udp_recv_from_wait",
             Self::UdpLocalPort => "udp_local_port",
             #[cfg(feature = "tls")]
-            Self::TlsConnect => "tls_connect",
+            Self::TlsEnable => "tls_enable",
             #[cfg(feature = "tls")]
-            Self::TlsConnectInsecure => "tls_connect_insecure",
+            Self::TlsDisable => "tls_disable",
         }
     }
 
@@ -280,7 +280,7 @@ impl IoBuiltin {
     /// Exports of `io::net::tls`.
     #[cfg(feature = "tls")]
     pub fn tls() -> &'static [IoBuiltin] {
-        &[Self::TlsConnect, Self::TlsConnectInsecure]
+        &[Self::TlsEnable, Self::TlsDisable]
     }
 
     /// Every IO host native (for pipeline registration).
@@ -309,9 +309,9 @@ impl IoBuiltin {
             Self::UdpRecvFromWait,
             Self::UdpLocalPort,
             #[cfg(feature = "tls")]
-            Self::TlsConnect,
+            Self::TlsEnable,
             #[cfg(feature = "tls")]
-            Self::TlsConnectInsecure,
+            Self::TlsDisable,
         ]
     }
 }
@@ -981,47 +981,39 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
-    fn io_net_tls_exports_connect_and_insecure() {
+    fn io_net_tls_exports_enable_and_disable() {
         let vm = VirtualModules::new();
         let exports = vm
             .resolve_glob(&["io".into(), "net".into(), "tls".into()])
             .expect("io::net::tls");
-        assert!(exports.iter().any(|e| e.short_name() == "connect"));
-        assert!(exports.iter().any(|e| e.short_name() == "connect_insecure"));
-        assert_eq!(IoBuiltin::TlsConnect.native_name(), "tls_connect");
-        assert_eq!(
-            IoBuiltin::TlsConnectInsecure.native_name(),
-            "tls_connect_insecure"
-        );
-        assert_eq!(IoBuiltin::TlsConnect.as_str(), "connect");
-        assert_eq!(IoBuiltin::TlsConnectInsecure.as_str(), "connect_insecure");
+        assert!(exports.iter().any(|e| e.short_name() == "enable"));
+        assert!(exports.iter().any(|e| e.short_name() == "disable"));
+        assert_eq!(IoBuiltin::TlsEnable.native_name(), "tls_enable");
+        assert_eq!(IoBuiltin::TlsDisable.native_name(), "tls_disable");
+        assert_eq!(IoBuiltin::TlsEnable.as_str(), "enable");
+        assert_eq!(IoBuiltin::TlsDisable.as_str(), "disable");
 
-        let connect = vm
-            .resolve_item(
-                &["io".into(), "net".into(), "tls".into()],
-                "connect",
-            )
-            .expect("io::net::tls::connect");
+        let enable = vm
+            .resolve_item(&["io".into(), "net".into(), "tls".into()], "enable")
+            .expect("io::net::tls::enable");
         assert_eq!(
-            connect,
+            enable,
             BuiltinExport::IoFn {
-                kind: IoBuiltin::TlsConnect
+                kind: IoBuiltin::TlsEnable
             }
         );
-        let insecure = vm
-            .resolve_item(
-                &["io".into(), "net".into(), "tls".into()],
-                "connect_insecure",
-            )
-            .expect("io::net::tls::connect_insecure");
+        let disable = vm
+            .resolve_item(&["io".into(), "net".into(), "tls".into()], "disable")
+            .expect("io::net::tls::disable");
         assert_eq!(
-            insecure,
+            disable,
             BuiltinExport::IoFn {
-                kind: IoBuiltin::TlsConnectInsecure
+                kind: IoBuiltin::TlsDisable
             }
         );
-        // Surface names must stay unprefixed (native ids carry the tls_ prefix).
-        assert!(!exports.iter().any(|e| e.short_name() == "tls_connect"));
+        assert!(!exports.iter().any(|e| e.short_name() == "tls_enable"));
+        assert!(!exports.iter().any(|e| e.short_name() == "connect"));
+        assert!(!exports.iter().any(|e| e.short_name() == "connect_insecure"));
     }
 
     #[test]

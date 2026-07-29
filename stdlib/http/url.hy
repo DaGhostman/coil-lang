@@ -586,9 +586,22 @@ fn header_name_eq_ci(string a, string b) -> int {
 }
 
 // Host / Content-Length / Connection are always emitted by the client;
-// format_extra_headers_str skips those names (case-sensitive common spellings).
-// Header name/value CRLF is rejected via headers_have_crlf / has_crlf in callers
-// (and unit tests); formatting itself stays raise-free and to_bytes-light.
+// format_extra_headers_str skips those names (ASCII case-insensitive).
+// Callers must reject header name/value CRLF via headers_have_crlf before
+// formatting; formatting itself stays raise-free and to_bytes-light.
+
+fn is_reserved_request_header(string name) -> int {
+    if header_name_eq_ci(name, "Host") == 1 {
+        return 1;
+    }
+    if header_name_eq_ci(name, "Content-Length") == 1 {
+        return 1;
+    }
+    if header_name_eq_ci(name, "Connection") == 1 {
+        return 1;
+    }
+    return 0;
+}
 
 fn format_extra_headers_str([string] names, [string] values) -> string {
     // Precondition: caller ensures there is at least one non-reserved header.
@@ -596,15 +609,7 @@ fn format_extra_headers_str([string] names, [string] values) -> string {
     let i = 0;
     let n = len(names);
     while i < n {
-        let name = names[i];
-        let skip = 0;
-        if name == "Host" { skip = 1; }
-        if name == "host" { skip = 1; }
-        if name == "Content-Length" { skip = 1; }
-        if name == "content-length" { skip = 1; }
-        if name == "Connection" { skip = 1; }
-        if name == "connection" { skip = 1; }
-        if skip == 0 {
+        if is_reserved_request_header(names[i]) == 0 {
             if first == 999999 {
                 first = i;
             }
@@ -617,16 +622,8 @@ fn format_extra_headers_str([string] names, [string] values) -> string {
     let acc = names[first] + ": " + values[first] + "\r\n";
     let j = first + 1;
     while j < n {
-        let name = names[j];
-        let skip = 0;
-        if name == "Host" { skip = 1; }
-        if name == "host" { skip = 1; }
-        if name == "Content-Length" { skip = 1; }
-        if name == "content-length" { skip = 1; }
-        if name == "Connection" { skip = 1; }
-        if name == "connection" { skip = 1; }
-        if skip == 0 {
-            acc = acc + name + ": " + values[j] + "\r\n";
+        if is_reserved_request_header(names[j]) == 0 {
+            acc = acc + names[j] + ": " + values[j] + "\r\n";
         }
         j = j + 1;
     }
