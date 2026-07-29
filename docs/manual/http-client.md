@@ -2,7 +2,8 @@
 
 Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
 It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
-(`io::net::tls::connect`) for `https://` — never insecure by default.
+(`tcp::connect` + `io::net::tls::enable(..., { verify: true })`) for `https://`
+— never insecure by default.
 
 ## Setup
 
@@ -74,8 +75,8 @@ cd examples/projects/04-http && coil test
 - CR/LF in URL host/path, method, or header names/values → `HttpError::BadUrl`
 - When `Content-Length` exceeds available body bytes → `HttpError::BadResponse`
 - HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
-  certs are out of scope for the demo (use `connect_insecure` only via TLS
-  APIs directly, not through this client)
+  certs are out of scope for the demo (use `enable(..., { verify: false })`
+  only via TLS APIs directly, not through this client)
 
 ### Known compiler note
 

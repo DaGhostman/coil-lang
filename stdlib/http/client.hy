@@ -3,7 +3,7 @@
 // multi-glob import bugs across sibling http::* modules.
 use io::*;
 use io::net::tcp::connect as tcp_connect;
-use io::net::tls::connect as tls_connect;
+use io::net::tls::enable as tls_enable;
 use http::url::*;
 
 fn open_stream(Url u) -> Result<Stream, HttpError> {
@@ -17,7 +17,11 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
         };
     }
     if scheme == "https" {
-        return match tls_connect(host, port) {
+        let s = match tcp_connect(host, port) {
+            Result::Ok(s) => s,
+            Result::Err(_) => http_fail_stream()?,
+        };
+        return match tls_enable(s, host, { verify: true }) {
             Result::Ok(s) => s,
             Result::Err(_) => http_fail_stream()?,
         };

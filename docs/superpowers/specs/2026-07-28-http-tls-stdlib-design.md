@@ -17,7 +17,8 @@ Coil programs can open TLS streams from the host and call a userland HTTP/1.1 cl
 coil http::client
     │
     ├─ http  → io::net::tcp::connect
-    └─ https → io::net::tls::connect
+    └─ https → io::net::tcp::connect
+              └─ io::net::tls::enable(s, host, { verify: true })
               └─ Stream (read/write/close)
 ```
 
@@ -26,7 +27,7 @@ coil http::client
 | PR | Scope |
 |----|--------|
 | 1 | Verify multi-module IO HostInvoke + `?` (pool retention already on main); regression golden; update NOTES |
-| 2 | Host `io::net::tls::{connect, connect_insecure}` via rustls |
+| 2 | Host `io::net::tls::{enable, disable}` via rustls |
 | 3 | Coil `stdlib/http` request builder (`get` / `post` / `request`) |
 
 Land serially. Parallelize investigation only.
@@ -34,7 +35,7 @@ Land serially. Parallelize investigation only.
 ## Locked decisions
 
 - TLS handshake stays in the host (rustls); coil never implements the handshake.
-- Certs v1: webpki-roots (Mozilla CA set) + `connect_insecure` for local/dev.
+- Certs v1: webpki-roots (Mozilla CA set) + `enable(..., { verify: false })` for local/dev.
   (OS/native trust store deferred; portable default for embedders/CI.)
 - Custom PEM CA / private roots: deferred.
 - HTTP v1: request builder; HTTP/1.1 only; `Connection: close`.
@@ -49,9 +50,12 @@ Land serially. Parallelize investigation only.
 ## PR 2 — `io::net::tls`
 
 ```coil
+use io::net::tcp::*;
 use io::net::tls::*;
 let s = connect("example.com", 443)?;
-let s = connect_insecure("127.0.0.1", 8443)?;
+let s = enable(s, "example.com", { verify: true })?;
+let s = enable(s, "127.0.0.1", { verify: false })?;  // local/dev
+let s = disable(s)?;
 ```
 
 - Same `Stream` APIs: `read` / `write` / `write_all` / `read_exact` / `read_to_end` / `close`.
@@ -69,7 +73,7 @@ stdlib/http/client.hy
 
 - Wire `./stdlib` in `coil.toml` `[module].roots`.
 - `get` / `post` / `request` → `Result<Response, …>` with status, headers, body (`[byte]`).
-- `http` → TCP; `https` → `tls::connect` (never insecure by default).
+- `http` → TCP; `https` → `tcp::connect` + `tls::enable(..., { verify: true })` (never insecure by default).
 
 ## Explicit non-goals
 
