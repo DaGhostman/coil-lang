@@ -62,7 +62,7 @@ See `examples/io_text.hy`.
 |----------|------------------------|----------|
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd process stdio |
 | `open(path, mode)` | `→ Result<Stream, IoError>` | Modes: `"r"`, `"w"`, `"a"`, `"rw"` |
-| `close(s)` | `→ Result<(), IoError>` | Idempotent close on GC drop too |
+| `close(s)` | `→ Result<(), IoError>` | Idempotent; GC drop also closes (TLS best-effort `close_notify`) |
 | `read(s, buf)` | `→ Result<Option<int>, IoError>` | `Ok(Some(n))`, `Ok(None)` = EOF |
 | `write(s, buf)` | `→ Result<int, IoError>` | Partial writes OK |
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |

@@ -178,11 +178,8 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut ClientConnection) -> Re
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
-                // Socket is still blocking here; WouldBlock/Interrupted are unexpected.
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                    std::thread::yield_now();
-                    continue;
-                }
+                // Socket is blocking for the handshake; only EINTR is expected to retry.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(map_io(e)),
             }
         }
