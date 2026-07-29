@@ -787,7 +787,14 @@ mod tests {
             with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
             StreamKind::Tcp
         );
-        assert!(stream_is_nonblocking(&mut heap, s));
+        assert!(
+            with_stream_mut(&mut heap, s, |st| st.tls.is_none()).unwrap(),
+            "failed enable must not attach a session"
+        );
+        assert!(
+            stream_is_nonblocking(&mut heap, s),
+            "failed handshake must restore non-blocking"
+        );
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
     }
@@ -811,7 +818,14 @@ mod tests {
             with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
             StreamKind::Tcp
         );
-        assert!(stream_is_nonblocking(&mut heap, s));
+        assert!(
+            with_stream_mut(&mut heap, s, |st| st.tls.is_none()).unwrap(),
+            "failed encrypt must not attach a session"
+        );
+        assert!(
+            stream_is_nonblocking(&mut heap, s),
+            "failed handshake must restore non-blocking"
+        );
         stream_close(&mut heap, s).ok();
         let _ = accept.join();
     }
@@ -943,7 +957,7 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut heap = Heap::default();
-            // Steal the bound port via a fresh listen on the same ephemeral… use accept on OS listener.
+            // Signal ready, then accept and run server-side encrypt on the socket.
             ready_tx.send(()).ok();
             let Ok((sock, _)) = listener.accept() else {
                 return;
