@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["crypto", "time", "regex"]
+default = ["crypto", "time", "regex", "tls"]
 crypto = ["machine/crypto"]
 time = ["machine/time"]
 regex = ["machine/regex"]
+tls = ["machine/tls"]
 pratt = []
 
 [dependencies]
@@ -18,6 +19,6 @@ reporting = { path = "../reporting" }
 rkyv = "0.8.12"
 
 [dev-dependencies]
-machine = { path = "../machine", default-features = false, features = ["vm_profile", "crypto", "time", "regex"] }
+machine = { path = "../machine", default-features = false, features = ["vm_profile", "crypto", "time", "regex", "tls"] }
 proptest = "1"
 libc = "0.2"

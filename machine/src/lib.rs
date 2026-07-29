@@ -16,6 +16,8 @@ mod regex_state;
 pub mod thread;
 #[cfg(feature = "time")]
 pub mod time;
+#[cfg(feature = "tls")]
+pub mod tls;
 mod memory;
 mod opcode;
 pub mod packed_la;

@@ -456,6 +456,9 @@ pub enum StreamKind {
     TcpListener,
     /// Datagram socket (`io::net::udp::bind` / `connect`).
     Udp,
+    /// TLS-wrapped TCP (`io::net::tls::enable` / `disable`).
+    #[cfg(feature = "tls")]
+    Tls,
 }
 
 #[derive(Clone, Copy)]
@@ -926,15 +929,28 @@ pub struct ObjFn {
     pub captures: Vec<Value>,
 }
 
-/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP).
+/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP / TLS).
 pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
     pub kind: StreamKind,
     pub closed: bool,
+    /// Optional rustls client session (only for [`StreamKind::Tls`]).
+    #[cfg(feature = "tls")]
+    pub tls: Option<Box<crate::tls::TlsSession>>,
 }
 
 impl Drop for ObjStream {
     fn drop(&mut self) {
+        #[cfg(feature = "tls")]
+        if self.kind == StreamKind::Tls {
+            // Best-effort close_notify so GC without explicit `close()` is not
+            // always an abrupt TCP reset. Errors are ignored in Drop.
+            if let (Some(fd), Some(tls)) = (self.fd.as_ref(), self.tls.as_mut()) {
+                use std::os::fd::AsRawFd;
+                let _ = crate::tls::send_close_notify(fd.as_raw_fd(), tls);
+            }
+            self.tls.take();
+        }
         // OwnedFd closes on drop; clear explicitly for clarity.
         self.fd.take();
         self.closed = true;

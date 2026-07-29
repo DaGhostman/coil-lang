@@ -68,16 +68,18 @@ See `examples/io_text.hy`.
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
+| `io::net::tls::*` | TLS | `enable` / `disable` (feature `tls`) |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
 
-TCP and UDP live in nested virtual modules — import them explicitly
+TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 (like `ffi::types`):
 
 ```coil
 use io::*;
 use io::net::tcp::*;
 use io::net::udp::*;
+use io::net::tls::*;
 ```
 
 ---
@@ -124,6 +126,41 @@ See `examples/io_udp.hy`.
 | `listen(host, port)` | `→ Result<Stream, IoError>` | Listening socket |
 | `accept(s)` | `→ Result<Stream, IoError>` | Non-blocking; `WouldBlock` if empty |
 | `accept_wait(s)` | same | Blocks in the host via `poll` |
+
+---
+
+## TLS (`io::net::tls`)
+
+Client TLS via rustls (Cargo feature `tls`, default-on). Upgrade a TCP
+`Stream` in place; afterwards you use the normal `Stream` APIs
+(`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
+
+| Function | Signature (simplified) | Behavior |
+|----------|------------------------|----------|
+| `enable(s, host, opts)` | `Stream, string, record → Result<Stream, IoError>` | Upgrade TCP→TLS; `opts.verify: bool` **required** |
+| `disable(s)` | `Stream → Result<Stream, IoError>` | Tear TLS down; plaintext on same fd |
+
+```coil
+use io::net::tcp::*;
+use io::net::tls::*;
+
+let s = connect("example.com", 443)?;
+let s = enable(s, "example.com", { verify: true })?;   // webpki roots + SNI
+// … encrypted IO …
+let s = disable(s)?;                                     // plaintext again
+```
+
+`{ verify: false }` skips cert **trust** only (signatures still checked) —
+local/dev; never use in production. `opts` must include `verify`; empty `{}`
+and unknown keys are rejected. Handshake / TLS failures map to `IoError::Other`
+in v1 (no distinct cert/name tags yet). Prefer a DNS `host` when the peer
+requires classic hostname SNI. `enable` blocks the host thread for the
+handshake (same sync-adapter pattern as `tcp::connect`; no timeout in v1).
+`disable` discards unread TLS plaintext. Prefer explicit `close(s)` for a
+clean shutdown; GC drop still sends a best-effort TLS `close_notify` before
+closing the fd.
+
+See `examples/io_tls.hy`.
 
 ---
 

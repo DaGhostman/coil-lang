@@ -23,10 +23,11 @@ name = "fib"
 harness = false
 
 [features]
-default = ["crypto", "time", "regex"]
+default = ["crypto", "time", "regex", "tls"]
 crypto = ["machine/crypto", "compiler/crypto"]
 time = ["machine/time", "compiler/time"]
 regex = ["machine/regex", "compiler/regex"]
+tls = ["machine/tls", "compiler/tls"]
 
 [profile.release]
 opt-level=3

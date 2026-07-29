@@ -20,10 +20,10 @@
 - Coroutines: `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; resume-after-done returns `Value::default()`; `done(h)` → bool via `DoneCoro`.
 - Virtual modules: `prelude` / `prelude::ops` (auto-imported); `ffi` / `ffi::types`, `io`, `thread`, `regex`, `crypto`, `time` (explicit `use`). Host natives go through `HostInvoke` — no new opcodes for those modules.
 - FFI: `use ffi::*` for `dload`/`declare`/`invoke` (ordinary identifiers); tags are `ffi::types::{Int,Ptr,…}` (no global `FFIType`). Returns are `prelude::Result`. Compile-time `extern` blocks need no `use ffi`. `resolve_library` searches entry-script `base_dir`, `coil.toml` `[ffi] search_paths`, then system paths.
-- Virtual `io`: opaque `Stream`/`IoError`; `stdin`/`stdout`/`stderr`/`open`/`read`/`write`/`close` plus sync adapters and `from_bytes`/`to_bytes`; nested `io::net::tcp` / `io::net::udp`. L0 is non-blocking; buffers are `[byte]`.
+- Virtual `io`: opaque `Stream`/`IoError`; `stdin`/`stdout`/`stderr`/`open`/`read`/`write`/`close` plus sync adapters and `from_bytes`/`to_bytes`; nested `io::net::tcp` / `io::net::udp` / `io::net::tls` (`enable` / `disable` on a TCP `Stream`, feature `tls`). L0 is non-blocking; buffers are `[byte]`.
 - Virtual `thread` (`use thread::*`): `spawn`/`join`/`detach`, channels, mutex/rwlock helpers; one `Machine` per OS worker; `Pipeline::wire_thread_program` shares bytecode. Nullary fns seal as `unit -> R` for `spawn(f)`.
 - Virtual `regex` (`use regex::*`): PCRE2 via HostInvoke; opaque `Regex`; flags `i`/`m`/`s`/`x`/`u`.
-- Cargo features `crypto`, `time`, and `regex` (default-on) gate those virtual modules; embedders may use `default-features = false`.
+- Cargo features `crypto`, `time`, `regex`, and `tls` (default-on) gate those virtual modules; embedders may use `default-features = false`.
 - `byte` is `Ty::Con("byte")` (0..=255); integer literals coerce under expected `byte` / `[byte]`. Array annotations `[T]` / `[T; N]` preserve element type in the AST.
 - `ARCHIVE_VERSION` is **30** (`common/src/archive.rs`); bump on incompatible bytecode, tag, or opcode changes.
 - Packed LA (`dot` / `matmul` / `Matrix` ops) lowers to HostInvoke natives in `machine/src/packed_la.rs` — no LA opcodes.
