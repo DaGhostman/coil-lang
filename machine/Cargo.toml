@@ -20,7 +20,7 @@ crypto = [
 ]
 time = ["dep:chrono"]
 regex = ["dep:pcre2"]
-tls = ["dep:rustls", "dep:webpki-roots"]
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 vm_profile = []
 
 [dependencies]
@@ -44,6 +44,7 @@ chrono = { version = "0.4.45", optional = true }
 pcre2 = { version = "0.2", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
 libc = "0.2"
