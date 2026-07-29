@@ -206,6 +206,10 @@ fn handshake_blocking(stream: &mut TcpStream, conn: &mut Connection) -> Result<(
 
 /// Run `build` after flipping `tcp` blocking; always restore non-blocking before
 /// returning the fd to [`ObjStream`] (including on handshake errors).
+///
+/// If restoring `O_NONBLOCK` fails after a successful handshake, the session is
+/// discarded and `Err` is returned with the fd still in TCP mode — callers must
+/// `close` the stream (it may briefly remain blocking).
 fn with_blocking_handshake(
     tcp: &mut TcpStream,
     build: impl FnOnce(&mut TcpStream) -> Result<Connection, IoErrorTag>,
@@ -215,12 +219,19 @@ fn with_blocking_handshake(
             .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
         build(tcp)
     })();
-    let nb_err = tcp
-        .set_nonblocking(true)
-        .err()
-        .map(|e| IoErrorTag::from_kind(e.kind()));
+    // Prefer restoring non-blocking even when `build` failed; retry once if the
+    // first restore attempt fails (extremely rare).
+    let nb_err = match tcp.set_nonblocking(true) {
+        Ok(()) => None,
+        Err(e1) => match tcp.set_nonblocking(true) {
+            Ok(()) => None,
+            Err(_) => Some(IoErrorTag::from_kind(e1.kind())),
+        },
+    };
     let conn = hs?;
     if let Some(e) = nb_err {
+        // Drop the live session rather than attach it to a possibly-blocking fd.
+        drop(conn);
         return Err(e);
     }
     Ok(conn)
