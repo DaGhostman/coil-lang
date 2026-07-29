@@ -3,7 +3,7 @@
 // multi-glob import bugs across sibling http::* modules.
 use io::*;
 use io::net::tcp::connect as tcp_connect;
-use io::net::tls::enable as tls_enable;
+use io::net::tls::client::enable as tls_enable;
 use http::url::*;
 
 fn open_stream(Url u) -> Result<Stream, HttpError> {

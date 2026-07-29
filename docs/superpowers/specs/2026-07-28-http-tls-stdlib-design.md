@@ -9,7 +9,7 @@ Coil programs can open TLS streams from the host and call a userland HTTP/1.1 cl
 
 ## Architecture
 
-- **Transport (VM):** rustls behind `io::net::tls::*`, returning the same opaque `Stream` as TCP/files.
+- **Transport (VM):** rustls behind `io::net::tls::{client,server}`, returning the same opaque `Stream` as TCP/files.
 - **Application (coil):** HTTP/1.1 request/response framing in `stdlib/http/*`.
 - **Prerequisite:** Multi-module IO HostInvoke must work so library modules can own sockets.
 
@@ -18,7 +18,7 @@ coil http::client
     │
     ├─ http  → io::net::tcp::connect
     └─ https → io::net::tcp::connect
-              └─ io::net::tls::enable(s, host, { verify: true })
+              └─ io::net::tls::client::enable(s, host, { verify: true })
               └─ Stream (read/write/close)
 ```
 
@@ -27,7 +27,7 @@ coil http::client
 | PR | Scope |
 |----|--------|
 | 1 | Verify multi-module IO HostInvoke + `?` (pool retention already on main); regression golden; update NOTES |
-| 2 | Host `io::net::tls::{enable, disable}` via rustls |
+| 2 | Host `io::net::tls::{client,server}::{enable, disable}` via rustls |
 | 3 | Coil `stdlib/http` request builder (`get` / `post` / `request`) |
 
 Land serially. Parallelize investigation only.
@@ -51,7 +51,7 @@ Land serially. Parallelize investigation only.
 
 ```coil
 use io::net::tcp::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 let s = connect("example.com", 443)?;
 let s = enable(s, "example.com", { verify: true })?;
 let s = enable(s, "127.0.0.1", { verify: false })?;  // local/dev
@@ -61,7 +61,7 @@ let s = disable(s)?;
 - Same `Stream` APIs: `read` / `write` / `write_all` / `read_exact` / `read_to_end` / `close`.
 - Cargo feature `tls` (default-on), like `crypto`.
 - Out of scope (HTTP v1): PEM CA on the client, ALPN, client certs.
-  Server TLS is connection-level `encrypt`/`decrypt` (PEM cert/key opts),
+  Server TLS is `io::net::tls::server::{enable,disable}` (PEM cert/key opts),
   separate from the HTTP client path.
 
 ## PR 3 — `stdlib/http`
@@ -75,7 +75,7 @@ stdlib/http/client.hy
 
 - Wire `./stdlib` in `coil.toml` `[module].roots`.
 - `get` / `post` / `request` → `Result<Response, …>` with status, headers, body (`[byte]`).
-- `http` → TCP; `https` → `tcp::connect` + `tls::enable(..., { verify: true })` (never insecure by default).
+- `http` → TCP; `https` → `tcp::connect` + `tls::client::enable(..., { verify: true })` (never insecure by default).
 
 ## Explicit non-goals
 

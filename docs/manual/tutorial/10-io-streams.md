@@ -68,7 +68,8 @@ See `examples/io_text.hy`.
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
-| `io::net::tls::*` | TLS | client `enable`/`disable`; server `encrypt`/`decrypt` (feature `tls`) |
+| `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |
+| `io::net::tls::server::*` | TLS server | `enable` / `disable` (feature `tls`) |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
 
@@ -79,7 +80,8 @@ TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 use io::*;
 use io::net::tcp::*;
 use io::net::udp::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
+use io::net::tls::server::*;
 ```
 
 ---
@@ -129,39 +131,42 @@ See `examples/io_udp.hy`.
 
 ---
 
-## TLS (`io::net::tls`)
+## TLS (`io::net::tls::{client,server}`)
 
 TLS via rustls (Cargo feature `tls`, default-on). Upgrade a connected TCP
-`Stream` in place (opportunistic); afterwards use the normal `Stream` APIs
-(`write_all` / `read` / `read_exact` / `read_to_end` / `close`).
+`Stream` in place (opportunistic); afterwards use the normal `Stream` APIs.
+Client and server share the names `enable` / `disable` under separate modules.
 
-| Function | Role | Behavior |
-|----------|------|----------|
-| `enable(s, host, opts)` | client | TCP→TLS; `opts.verify: bool` **required** |
-| `disable(s)` | client | Tear TLS down; plaintext on same fd |
-| `encrypt(s, opts)` | server | TCP→TLS; `opts.cert_pem` / `opts.key_pem` **required** |
-| `decrypt(s)` | server | Same teardown as `disable` |
+| Module | Function | Behavior |
+|--------|----------|----------|
+| `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify: bool` **required** |
+| `tls::client` | `disable(s)` | Tear TLS down; plaintext on same fd |
+| `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem` / `key_pem` **required** |
+| `tls::server` | `disable(s)` | Same teardown as client `disable` |
 
 ```coil
 use io::net::tcp::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
-// Client
 let s = connect("example.com", 443)?;
 let s = enable(s, "example.com", { verify: true })?;
 let s = disable(s)?;
+```
 
-// Server (after accept)
+```coil
+use io::net::tcp::*;
+use io::net::tls::server::*;
+
 let s = accept_wait(listener)?;
-let s = encrypt(s, { cert_pem: cert, key_pem: key })?;
-let s = decrypt(s)?;
+let s = enable(s, { cert_pem: cert, key_pem: key })?;
+let s = disable(s)?;
 ```
 
 `{ verify: false }` skips cert **trust** only (signatures still checked) —
 local/dev; never use in production. Empty `{}` / unknown keys are rejected.
 Handshake / TLS failures map to `IoError::Other` in v1. Prefer a DNS `host`
-for client SNI. `enable` / `encrypt` block the host thread for the handshake
-(no timeout in v1). Teardown discards unread TLS plaintext.
+for client SNI. `enable` blocks the host thread for the handshake (no timeout
+in v1). Teardown discards unread TLS plaintext.
 
 See `examples/io_tls.hy`.
 
