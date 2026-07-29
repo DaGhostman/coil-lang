@@ -1058,7 +1058,9 @@ impl Checker {
 
     /// Scheme for a virtual `io` host native (inserted on `use io::*`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
-        use crate::typechecking::ty::{array, boolean, byte, record, stream_ty, tuple};
+        use crate::typechecking::ty::{array, byte, stream_ty, tuple};
+        #[cfg(feature = "tls")]
+        use crate::typechecking::ty::{boolean, record};
         let stream = stream_ty();
         let bytes = array(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
