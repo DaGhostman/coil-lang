@@ -55,6 +55,22 @@ fn run_example_src(src: &str) -> String {
     run_example_src_with_entry(src, None)
 }
 
+#[cfg(feature = "tls")]
+fn coil_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn compile_src_with_tests(src: &str) -> (Pipeline, Vec<common::Byte>, Vec<u64>) {
     let mut pipeline = Pipeline::new();
     pipeline.set_include_tests(true);
@@ -3543,13 +3559,17 @@ fn main() {
 #[cfg(feature = "tls")]
 #[test]
 fn tls_server_enable_non_tcp_is_err_via_host_invoke() {
-    let output = run_example_src(
+    // Valid PEM so InvalidInput comes from StreamKind (not PEM parse).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert_pem = coil_escape_string(&cert.cert.pem());
+    let key_pem = coil_escape_string(&cert.key_pair.serialize_pem());
+    let src = format!(
         r#"
 use io::*;
 use io::net::tls::server::*;
 
-fn classify(IoError e) -> int {
-    return match e {
+fn classify(IoError e) -> int {{
+    return match e {{
         IoError::WouldBlock => 10,
         IoError::NotFound => 11,
         IoError::PermissionDenied => 12,
@@ -3558,21 +3578,22 @@ fn classify(IoError e) -> int {
         IoError::Other => 15,
         IoError::NotADirectory => 16,
         IoError::AlreadyExists => 17,
-    };
-}
+    }};
+}}
 
-fn main() {
+fn main() {{
     let path = "/tmp/coil_tls_server_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, { cert_pem: "x", key_pem: "y" });
-    let code = match r {
+    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}" }});
+    let code = match r {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
-    };
+    }};
     print "%i", code;
-}
-"#,
+}}
+"#
     );
+    let output = run_example_src(&src);
     assert_eq!(output, "1");
 }
 
