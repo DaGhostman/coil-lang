@@ -1497,4 +1497,175 @@ mod tests {
         multi_op_return_convoy(&mut ops);
         assert!(ops == before);
     }
+
+    #[test]
+    fn multi_op_return_convoy_skips_jump_if_match_into_cluster() {
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_return_convoy_skips_unknown_join_sp() {
+        // Identical suffixes, but then-arm pushes an extra const first so join
+        // heights disagree → SP Unknown → refuse sink.
+        let suf = load_const_add_suffix();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 99,
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    fn load_two_const_add_suffix() -> Vec<IlOp> {
+        vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 2,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+        ]
+    }
+
+    #[test]
+    fn multi_op_return_convoy_prefers_longest_suffix() {
+        // Matching length-4 (and nested length-2/3) — sink the longest once.
+        let suf = load_two_const_add_suffix();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_return_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        let const_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Const { imm: 1 | 2, .. }))
+            .count();
+        let add_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        assert_eq!(const_count, 2, "both consts from the length-4 suffix");
+        assert_eq!(add_count, 1);
+    }
+
+    #[test]
+    fn multi_op_return_convoy_sinks_length_two() {
+        let suf = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_return_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
 }
