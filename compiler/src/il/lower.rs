@@ -232,7 +232,7 @@ fn absolute_jump_targets(slots: &[Slot]) -> std::collections::HashSet<usize> {
 }
 
 fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
-    // Peephole order (see `peephole::try_fuse`); JMPF targets stay symbolic.
+    // Fuse-select order mirrors historical peephole try_fuse; JMPF targets stay symbolic.
     if let Some(s) = try_fuse_load_const_cmp_jmpf_slot(window) {
         return Some((s, 4));
     }
@@ -612,6 +612,41 @@ mod tests {
             *lowered.bytecode[1].bytecode(),
             Instruction::RETURN
         ));
+    }
+
+    #[test]
+    fn lower_fuses_bin_slot_imm() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.push_byte(Byte::new(Instruction::SUB));
+        il.push_byte(Byte::new(Instruction::HALT));
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotImm
+        ));
+        assert_eq!(
+            lowered.bytecode[0].bin_slot_imm_parts(),
+            (Instruction::SUB as u8, 0, 1)
+        );
+    }
+
+    #[test]
+    fn lower_fuses_const_return_imm() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(7));
+        il.push_byte(Byte::new(Instruction::RETURN));
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::ConstReturnImm
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u32(), 7);
     }
 
         #[test]

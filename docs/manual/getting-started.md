@@ -205,7 +205,7 @@ coil/
 │   ├── src/typechecking/  # Hindley–Milner inference
 │   ├── src/pipeline.rs    # Compile driver, multi-file discovery
 │   ├── src/il/            # Compile-time stack IL + label-safe lower/fuse
-│   ├── src/peephole.rs    # Legacy fusion helpers (superseded by il::lower)
+│   ├── src/il/            # Stack IL, opts, fuse-select lowerer
 │   └── tests/             # Golden pipeline and diagnostic tests
 ├── machine/
 │   ├── src/vm.rs          # Bytecode interpreter

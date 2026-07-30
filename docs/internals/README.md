@@ -15,6 +15,6 @@ How coil is structured for contributors and embedders. End-user language docs li
 | Crate | Role |
 |-------|------|
 | `parser` | Pratt parser and AST |
-| `compiler` | HM typechecker, codegen, pipeline, peephole |
+| `compiler` | HM typechecker, stack IL codegen, pipeline |
 | `machine` | VM, heap/GC, FFI (libffi), host natives |
 | `common` | Opcodes, values, archive format |

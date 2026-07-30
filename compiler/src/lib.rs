@@ -4,7 +4,6 @@ mod attrs;
 mod const_fold;
 mod manifest;
 mod monomorphize;
-mod peephole;
 mod pipeline;
 mod strip_tests;
 mod typechecking;

@@ -16,8 +16,8 @@ Each `DebugLoc` records:
 - `file` — index into `source_files` (`u32::MAX` = unknown / synthetic)
 - `start_byte` / `end_byte` — UTF-8 byte range in that source file
 
-The table is updated when the peephole pass fuses instructions
-(`shrink_debug_locs` mirrors `fuse_bytecode`).
+Debug locs are attached to IL ops and carried through `il::lower` fuse-select
+(one loc per final bytecode slot).
 
 ## Archive version
 
