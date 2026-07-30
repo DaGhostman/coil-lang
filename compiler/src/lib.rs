@@ -1298,16 +1298,24 @@ impl Compiler {
             return false;
         }
         // Sole fused return: expand to producer at the call site (no RETURN).
-        if ops.len() == 1
-            && let Some(b) = ops[0].as_plain_byte()
-            && matches!(
-                *b.bytecode(),
-                Instruction::LoadReturnSlot
-                    | Instruction::ConstReturnImm
-                    | Instruction::BinReturn
-            )
-        {
-            return true;
+        if ops.len() == 1 {
+            match &ops[0] {
+                IlOp::LoadReturnSlot { .. }
+                | IlOp::ConstReturnImm { .. }
+                | IlOp::BinReturn { .. } => return true,
+                _ => {
+                    if let Some(b) = ops[0].as_plain_byte()
+                        && matches!(
+                            *b.bytecode(),
+                            Instruction::LoadReturnSlot
+                                | Instruction::ConstReturnImm
+                                | Instruction::BinReturn
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
         }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
@@ -6645,8 +6653,12 @@ impl Compiler {
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
+                let body_end = self.bytecode.len();
                 self.fn_bytecode_spans
-                    .insert(table_key, (body_start, self.bytecode.len()));
+                    .insert(table_key.clone(), (body_start, body_end));
+                let entry = self.fn_entry_labels.get(&table_key).copied();
+                self.bytecode
+                    .record_func(table_key, entry, body_start, body_end);
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
@@ -11172,10 +11184,6 @@ fn main() {
     /// emits a cascade of `JUMP_IF_MATCH` instructions
     /// (one per non-last constructor arm).
     #[test]
-    /// Codegen test 2: a `match` with multiple constructor arms
-    /// emits a cascade of `JUMP_IF_MATCH` instructions
-    /// (one per non-last constructor arm).
-    #[test]
     fn match_emits_jump_if_match_cascade() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
@@ -12923,6 +12931,36 @@ fn main() { print \"%i\", add(3, 4); }",
         assert_eq!(*out[1].bytecode(), Instruction::LOAD);
         assert_eq!(out[1].operand_u32(), 11);
         assert_eq!(*out[2].bytecode(), Instruction::ADD);
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_typed_fused_returns() {
+        use crate::il::IlOp;
+        use common::{DebugLoc, Instruction};
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::ConstReturnImm {
+            imm: 7,
+            loc: DebugLoc::unknown(),
+        }]));
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::LoadReturnSlot {
+            slot: 0,
+            loc: DebugLoc::unknown(),
+        }]));
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::BinReturn {
+            op: Instruction::SUB,
+            loc: DebugLoc::unknown(),
+        }]));
+        // Typed plain return body with a single terminal RETURN.
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::BinSlotSlot {
+                op: Instruction::ADD as u8,
+                a: 0,
+                b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
     }
 
     #[test]

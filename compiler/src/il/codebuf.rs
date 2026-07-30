@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
-    EntryKind, IlBuilder, IlJumpKind, IlOp, Label, Lowered, lower,
+    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower,
 };
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
@@ -17,6 +17,8 @@ pub struct CodeBuf {
     /// Logical code index → entry label from [`Self::bind_fresh_entry`].
     /// Used to rewrite packed CALL/CodePtr Bytes into [`IlOp::Entry`].
     entry_at_offset: HashMap<usize, Label>,
+    /// Per-function spans recorded at function finalize (flat buffer).
+    funcs: Vec<IlFunc>,
 }
 
 impl CodeBuf {
@@ -104,6 +106,23 @@ impl CodeBuf {
         self.lowered = None;
         self.lowered_locs = None;
         self.entry_at_offset.clear();
+        self.funcs.clear();
+    }
+
+    /// Record a function's emitting span and optional entry label.
+    pub fn record_func(
+        &mut self,
+        name: impl Into<String>,
+        entry: Option<Label>,
+        code_start: usize,
+        code_end: usize,
+    ) {
+        self.funcs
+            .push(IlFunc::new(name, entry, code_start, code_end));
+    }
+
+    pub fn funcs(&self) -> &[IlFunc] {
+        &self.funcs
     }
 
     pub fn fresh_label(&mut self) -> Label {
@@ -380,5 +399,36 @@ mod tests {
             Some(label),
             "entry at truncate point must survive for CALL→Entry rewrite"
         );
+    }
+
+    #[test]
+    fn push_lifts_hot_set_bytes_to_typed_ops() {
+        let mut buf = CodeBuf::new();
+        buf.push(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        buf.push(Byte::new(Instruction::CONST).with_const_inline(2));
+        buf.push(Byte::new(Instruction::ADD));
+        buf.push(Byte::new(Instruction::RETURN));
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 2, .. }));
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::ADD, .. }));
+        assert!(matches!(ops[3], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn record_func_tracks_spans_and_clear_drops_them() {
+        let mut buf = CodeBuf::new();
+        let entry = buf.bind_fresh_entry();
+        buf.push(Byte::new(Instruction::ConstReturnImm).with_operand_u32(0));
+        let end = buf.len();
+        buf.record_func("main", Some(entry), 0, end);
+        assert_eq!(buf.funcs().len(), 1);
+        assert_eq!(buf.funcs()[0].name, "main");
+        assert_eq!(buf.funcs()[0].entry, Some(entry));
+        assert_eq!(buf.funcs()[0].code_start, 0);
+        assert_eq!(buf.funcs()[0].code_end, end);
+        buf.clear();
+        assert!(buf.funcs().is_empty());
+        assert!(buf.ops().is_empty());
     }
 }
