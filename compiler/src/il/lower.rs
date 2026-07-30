@@ -649,7 +649,37 @@ mod tests {
         assert_eq!(lowered.bytecode[0].operand_u32(), 7);
     }
 
-        #[test]
+    #[test]
+    fn lower_fuses_load_return_slot() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(3));
+        il.push_byte(Byte::new(Instruction::RETURN));
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::LoadReturnSlot
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u32(), 3);
+    }
+
+    #[test]
+    fn lower_fuses_bin_return() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::ADD));
+        il.push_byte(Byte::new(Instruction::RETURN));
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinReturn
+        ));
+        assert_eq!(lowered.bytecode[0].bin_return_op(), Instruction::ADD as u8);
+    }
+
+    #[test]
     fn lower_resolves_jmpf_with_label() {
         let mut il = IlBuilder::new();
         let exit = il.fresh_label();
@@ -670,6 +700,130 @@ mod tests {
     }
 
     #[test]
+    fn lower_fuses_log_not_jmpf() {
+        let mut il = IlBuilder::new();
+        let exit = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LogNot));
+        il.emit_jump(IlJumpKind::JumpIfFalse, exit);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.bind_label(exit);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::LogNotJmpf
+        ));
+        assert_eq!(lowered.bytecode[0].log_not_jmpf_target(), 2);
+    }
+
+    #[test]
+    fn lower_fuses_load_const_cmp_jmpf_to_bin_slot_imm_jmpf() {
+        let mut il = IlBuilder::new();
+        let exit = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(2));
+        il.push_byte(Byte::new(Instruction::LE));
+        il.emit_jump(IlJumpKind::JumpIfFalse, exit);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.bind_label(exit);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotImmJmpf
+        ));
+        let (op, slot, idx) = lowered.bytecode[0].bin_slot_imm_jmpf_parts();
+        assert_eq!(op, Instruction::LE as u8);
+        assert_eq!(slot, 0);
+        // Pool entry: (pc << 32) | imm; false branch is CONST;HALT → PC 2.
+        let packed = pool[idx];
+        assert_eq!(packed >> 32, 2);
+        assert_eq!(packed as u16, 2);
+    }
+
+    /// JMP-to-join must not land on ConstReturnImm: stacked arm value is ignored.
+    #[test]
+    fn lower_refuses_const_return_fuse_when_label_binds_producer() {
+        let mut il = IlBuilder::new();
+        let join = il.fresh_label();
+        il.bind_label(join);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(7));
+        il.push_byte(Byte::new(Instruction::RETURN));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::CONST
+        ));
+        assert!(matches!(
+            *lowered.bytecode[1].bytecode(),
+            Instruction::RETURN
+        ));
+        assert_eq!(lowered.label_pcs.get(&join.0).copied(), Some(0));
+    }
+
+    /// A mid-window label bind is a fuse barrier (match joins / attr sites).
+    #[test]
+    fn lower_refuses_bin_slot_slot_when_label_mid_window() {
+        let mut il = IlBuilder::new();
+        let mid = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.bind_label(mid);
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        il.push_byte(Byte::new(Instruction::ADD));
+        il.push_byte(Byte::new(Instruction::RETURN));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(
+            !lowered
+                .bytecode
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::BinSlotSlot)),
+            "label mid-window must block BinSlotSlot fuse; got {:?}",
+            lowered
+                .bytecode
+                .iter()
+                .map(|b| b.bytecode())
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::LOAD
+        ));
+        assert_eq!(lowered.label_pcs.get(&mid.0).copied(), Some(1));
+    }
+
+    #[test]
+    fn lower_resolves_jump_if_match_into_pool() {
+        let mut il = IlBuilder::new();
+        let arm = il.fresh_label();
+        il.emit_jump(
+            IlJumpKind::JumpIfMatch { tag: 2, arity: 1 },
+            arm,
+        );
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(0));
+        il.bind_label(arm);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::JumpIfMatch
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u16(0), 2);
+        let idx = lowered.bytecode[0].operand_u16(1);
+        assert_eq!(pool[idx as usize], 2); // HALT at PC 2
+    }
+
+    #[test]
     fn lower_resolves_entry_call() {
         let mut il = IlBuilder::new();
         let entry = il.fresh_label();
@@ -685,6 +839,30 @@ mod tests {
             Instruction::CALL
         ));
         assert_eq!(lowered.bytecode[0].call_parts(), (1, 2));
+    }
+
+    #[test]
+    fn lower_resolves_entry_tail_call_and_code_ptr() {
+        let mut il = IlBuilder::new();
+        let entry = il.fresh_label();
+        il.emit_entry(EntryKind::TailCall, 2, entry);
+        il.emit_entry(EntryKind::CodePtr, 0, entry);
+        il.push_byte(Byte::new(Instruction::HALT));
+        il.bind_label(entry);
+        il.push_byte(Byte::new(Instruction::RETURN));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::TailCall
+        ));
+        assert_eq!(lowered.bytecode[0].call_parts(), (2, 3));
+        assert!(matches!(
+            *lowered.bytecode[1].bytecode(),
+            Instruction::CodePtr
+        ));
+        assert_eq!(lowered.bytecode[1].operand_u32(), 3);
     }
 
     #[test]

@@ -595,6 +595,33 @@ mod tests {
     }
 
     #[test]
+    fn stack_dce_removes_load_store_pop_same_slot() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::LOAD).with_operand_u32(4)),
+            IlOp::byte(Byte::new(Instruction::StorePop).with_operand_u32(4)),
+            IlOp::byte(Byte::new(Instruction::HALT)),
+        ];
+        stack_dce(&mut ops);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::HALT
+        ));
+    }
+
+    #[test]
+    fn stack_dce_keeps_load_store_pop_different_slots() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::LOAD).with_operand_u32(1)),
+            IlOp::byte(Byte::new(Instruction::StorePop).with_operand_u32(2)),
+            IlOp::byte(Byte::new(Instruction::HALT)),
+        ];
+        let before = ops.clone();
+        stack_dce(&mut ops);
+        assert_eq!(ops, before);
+    }
+
+    #[test]
     fn dead_block_drops_after_unconditional_jmp() {
         let mut ops = vec![
             IlOp::Jump {
@@ -622,6 +649,23 @@ mod tests {
         eliminate_dead_blocks(&mut ops);
         assert_eq!(ops.len(), 3);
         assert!(matches!(ops[0], IlOp::Byte { .. }));
+        assert!(matches!(ops[1], IlOp::Label(Label(0))));
+    }
+
+    #[test]
+    fn dead_block_drops_after_fused_return_until_label() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::ConstReturnImm).with_operand_u32(0)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(99)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::HALT)),
+        ];
+        eliminate_dead_blocks(&mut ops);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[0],
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ConstReturnImm
+        ));
         assert!(matches!(ops[1], IlOp::Label(Label(0))));
     }
 
@@ -709,6 +753,24 @@ mod tests {
         let mut ops = vec![
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn return_convoy_skips_conditional_jump_into_cluster() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
                 target: Label(0),
                 loc: common::DebugLoc::unknown(),
             },
@@ -863,6 +925,48 @@ mod tests {
             })
             .count();
         assert_eq!(slot_count, 1, "exactly one BinSlotSlot before RETURN");
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
+        )));
+    }
+
+    #[test]
+    fn bin_join_convoy_sinks_identical_bin_slot_imm() {
+        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::ADD as u8,
+            0,
+            1,
+        );
+        let mut ops = vec![
+            IlOp::byte(imm),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(imm),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        let imm_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinSlotImm
+                )
+            })
+            .count();
+        assert_eq!(imm_count, 1, "exactly one BinSlotImm before RETURN");
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
+            )),
+            "BinSlotImm must stay as slot tail, not BinReturn"
+        );
         assert!(ops.iter().any(|op| matches!(
             op,
             IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
