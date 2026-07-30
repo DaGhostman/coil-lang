@@ -171,10 +171,11 @@ let s = disable(s)?;
 
 `{ verify: false, ca_pem: "", timeout_ms: 0 }` skips cert **trust** only
 (signatures still checked) — local/dev; never use in production. When
-`verify` is true, empty `ca_pem` uses webpki roots; non-empty `ca_pem` is a PEM
-trust bundle. Server `client_ca_pem: ""` means no mTLS; non-empty PEM enables
-client certificate auth. Empty `{}` / unknown keys are rejected, and
-`timeout_ms <= 0` means no handshake deadline.
+`verify` is true, empty `ca_pem` uses webpki roots; non-empty `ca_pem`
+**replaces** webpki with that PEM bundle only (include public roots in the
+bundle if you still need them). Server `client_ca_pem: ""` means no mTLS;
+non-empty PEM enables client certificate auth. Empty `{}` / unknown keys are
+rejected, and `timeout_ms <= 0` means no handshake deadline.
 Handshake / TLS failures map to `IoError::Certificate`, `IoError::Handshake`,
 or `IoError::TimedOut`. Prefer a DNS `host` for client SNI. Failed handshakes
 restore non-blocking on the TCP fd.
@@ -225,7 +226,9 @@ lower to the same host natives (`HostInvoke`).
 `PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other`, `NotADirectory`,
 `AlreadyExists`, `TimedOut`, `Truncated`, `Certificate`, `Handshake`.
 
-Prefer `?` in `Result`-mode helpers (see [Error handling](09-error-handling.md)).
+`TimedOut` is distinct from `WouldBlock` (deadlines / OS timeouts vs
+“try again”). Prefer `?` in `Result`-mode helpers (see
+[Error handling](09-error-handling.md)).
 
 ---
 

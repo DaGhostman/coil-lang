@@ -22,10 +22,19 @@ use io::*;
 | `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS with required opts |
 | `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts, optional mTLS |
 
+`connect` / `connect_timeout` try **every** DNS result under one absolute
+deadline. `listen` / UDP `bind` still use the first resolved address — prefer
+an explicit IP (e.g. `127.0.0.1`) when family order matters.
+
+Socket / stream soft deadlines and OS `TimedOut` map to `IoError::TimedOut`
+(not `WouldBlock`). Call sites that previously treated timeouts as
+`WouldBlock` should match `TimedOut` instead.
+
 TLS client enable takes `enable(s, host, { verify: bool, ca_pem: string, timeout_ms: int })`.
 When `verify` is true, empty `ca_pem` uses **webpki-roots**; non-empty `ca_pem`
-loads a PEM trust bundle. `verify: false` skips cert **trust** only. `timeout_ms <= 0`
-means no handshake deadline.
+**replaces** those roots with the PEM trust bundle only (combine PEMs yourself
+if you still need public CAs). `verify: false` skips cert **trust** only.
+`timeout_ms <= 0` means no handshake deadline.
 
 TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string })`
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
