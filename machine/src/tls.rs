@@ -340,8 +340,9 @@ fn with_handshake(
             drop(conn);
             Err(e)
         }
-        (Err(e), None) => Err(e),
-        (Err(_), Some(e)) => Err(e),
+        // Prefer the handshake/TLS error when both fail — callers care about
+        // Handshake/Certificate/TimedOut more than a rare set_nonblocking miss.
+        (Err(e), _) => Err(e),
     }
 }
 
