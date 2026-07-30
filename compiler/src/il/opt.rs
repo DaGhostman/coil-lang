@@ -17,8 +17,8 @@ pub struct OptimizeOptions {
     pub return_convoy: bool,
     /// Sink identical binop / BinSlot* tails into a return-label cluster.
     pub bin_join_convoy: bool,
-    /// Sink identical multi-op suffixes (len 2..=4) into a return-label cluster.
-    pub multi_op_return_convoy: bool,
+    /// Sink identical multi-op suffixes (len 2..=4) at return / non-return joins.
+    pub multi_op_join_convoy: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -31,7 +31,7 @@ impl Default for OptimizeOptions {
             stack_dce: true,
             return_convoy: true,
             bin_join_convoy: true,
-            multi_op_return_convoy: true,
+            multi_op_join_convoy: true,
         }
     }
 }
@@ -53,8 +53,8 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     if opts.bin_join_convoy {
         bin_join_convoy(ops);
     }
-    if opts.multi_op_return_convoy {
-        multi_op_return_convoy(ops);
+    if opts.multi_op_join_convoy {
+        multi_op_join_convoy(ops);
     }
 }
 
@@ -297,6 +297,15 @@ fn fuse_binop_to_bin_return(op: common::Byte) -> IlOp {
     }
 }
 
+/// Kind of join after a label cluster for multi-op suffix sinking.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum JoinKind {
+    /// Cluster is followed by plain `RETURN`; place suffix before it.
+    Return,
+    /// Cluster is followed by a shared continuation; place suffix after labels.
+    NonReturn,
+}
+
 /// Find `[cluster_start, cluster_end]` of Labels immediately before a plain RETURN at `r`.
 fn return_label_cluster(ops: &[IlOp], r: usize) -> Option<(usize, usize)> {
     if !ops[r].is_plain_return() {
@@ -311,6 +320,52 @@ fn return_label_cluster(ops: &[IlOp], r: usize) -> Option<(usize, usize)> {
         cluster_start -= 1;
     }
     Some((cluster_start, cluster_end))
+}
+
+/// Label run starting at `i` with an unambiguous post-cluster consumer.
+///
+/// Return clusters keep today's rewrite. Non-return requires a non-label
+/// consumer that is not an unconditional jump-only terminator (no local work).
+fn join_label_cluster(ops: &[IlOp], i: usize) -> Option<(usize, usize, JoinKind)> {
+    if !matches!(ops.get(i), Some(IlOp::Label(_))) {
+        return None;
+    }
+    // Only the start of a consecutive label run.
+    if i > 0 && matches!(ops[i - 1], IlOp::Label(_)) {
+        return None;
+    }
+    let cluster_start = i;
+    let mut cluster_end = i;
+    while cluster_end + 1 < ops.len() && matches!(ops[cluster_end + 1], IlOp::Label(_)) {
+        cluster_end += 1;
+    }
+    let after = cluster_end + 1;
+    if after >= ops.len() {
+        return None;
+    }
+    let consumer = &ops[after];
+    if consumer.is_plain_return() {
+        return Some((cluster_start, cluster_end, JoinKind::Return));
+    }
+    // Unconditional jump-only: no local work at the join.
+    if matches!(
+        consumer,
+        IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            ..
+        }
+    ) {
+        return None;
+    }
+    // Fused *Return / HALT: leave to return_convoy / dead_block.
+    if is_return_terminator(consumer) {
+        return None;
+    }
+    // Non-label emitting (or control) consumer — shared continuation.
+    if matches!(consumer, IlOp::Label(_)) {
+        return None;
+    }
+    Some((cluster_start, cluster_end, JoinKind::NonReturn))
 }
 
 /// Sink identical binop / `BinSlot*` tails into a return-label cluster.
@@ -478,19 +533,21 @@ fn suffixes_equal(a: &[IlOp], b: &[IlOp]) -> bool {
             .all(|(x, y)| x.as_encode_byte() == y.as_encode_byte())
 }
 
-/// Sink identical multi-op compute suffixes into a return-label cluster.
+/// Sink identical multi-op compute suffixes into a return or non-return join.
 ///
 /// Length cap is [`MULTI_OP_SUFFIX_MAX`]. Single-op tails stay with
-/// [`bin_join_convoy`] / [`return_convoy`]. Requires agreeing SP at suffix
-/// starts and at the join (see [`super::sp::analyze`]).
-fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
+/// [`bin_join_convoy`] / [`return_convoy`] (return-only; no `len==1` for
+/// non-return). Requires agreeing SP at suffix starts and at the join
+/// (see [`super::sp::analyze`]). Conditional / match edges into the cluster
+/// refuse the sink.
+fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
     let info = super::sp::analyze(ops);
-    // (cluster_start, cluster_end, suffix)
-    let mut joins: Vec<(usize, usize, Vec<IlOp>)> = Vec::new();
-    let mut r = 0usize;
-    while r < ops.len() {
-        let Some((cluster_start, cluster_end)) = return_label_cluster(ops, r) else {
-            r += 1;
+    // (cluster_start, cluster_end, kind, suffix)
+    let mut joins: Vec<(usize, usize, JoinKind, Vec<IlOp>)> = Vec::new();
+    let mut i = 0usize;
+    while i < ops.len() {
+        let Some((cluster_start, cluster_end, kind)) = join_label_cluster(ops, i) else {
+            i += 1;
             continue;
         };
         let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
@@ -500,7 +557,7 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
         let mut ok_edges = true;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
-                kind,
+                kind: jk,
                 target,
                 ..
             } = op
@@ -510,20 +567,20 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
             if !cluster.iter().any(|l| l == target) {
                 continue;
             }
-            if *kind != IlJumpKind::Unconditional {
+            if *jk != IlJumpKind::Unconditional {
                 ok_edges = false;
                 break;
             }
             jump_pred_ends.push(j);
         }
         if !ok_edges || jump_pred_ends.is_empty() {
-            r += 1;
+            i = cluster_end + 1;
             continue;
         }
 
         let join_sp = info.sp_before(cluster_start);
         if !join_sp.is_known() {
-            r += 1;
+            i = cluster_end + 1;
             continue;
         }
 
@@ -557,11 +614,11 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
         }
 
         let Some(suffix) = chosen else {
-            r += 1;
+            i = cluster_end + 1;
             continue;
         };
-        joins.push((cluster_start, cluster_end, suffix));
-        r += 1;
+        joins.push((cluster_start, cluster_end, kind, suffix));
+        i = cluster_end + 1;
     }
 
     if joins.is_empty() {
@@ -569,11 +626,11 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
     }
 
     let mut remove_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    // cluster_start → (cluster_end, suffix to place before RETURN)
-    let mut rewrite: std::collections::HashMap<usize, (usize, Vec<IlOp>)> =
+    // cluster_start → (cluster_end, kind, suffix)
+    let mut rewrite: std::collections::HashMap<usize, (usize, JoinKind, Vec<IlOp>)> =
         std::collections::HashMap::new();
 
-    for (cluster_start, cluster_end, suffix) in &joins {
+    for (cluster_start, cluster_end, kind, suffix) in &joins {
         let len = suffix.len();
         let cluster = label_cluster_ids(ops, *cluster_start, *cluster_end);
         for i in (*cluster_start - len)..*cluster_start {
@@ -592,7 +649,7 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
                 }
             }
         }
-        rewrite.insert(*cluster_start, (*cluster_end, suffix.clone()));
+        rewrite.insert(*cluster_start, (*cluster_end, *kind, suffix.clone()));
     }
 
     let mut out = Vec::with_capacity(ops.len());
@@ -602,14 +659,22 @@ fn multi_op_return_convoy(ops: &mut Vec<IlOp>) {
             idx += 1;
             continue;
         }
-        if let Some((cluster_end, suffix)) = rewrite.remove(&idx) {
+        if let Some((cluster_end, kind, suffix)) = rewrite.remove(&idx) {
             for k in idx..=cluster_end {
                 out.push(ops[k].clone());
             }
             out.extend(suffix);
-            // Keep RETURN after the original cluster.
-            out.push(ops[cluster_end + 1].clone());
-            idx = cluster_end + 2;
+            match kind {
+                JoinKind::Return => {
+                    // Keep RETURN after the original cluster.
+                    out.push(ops[cluster_end + 1].clone());
+                    idx = cluster_end + 2;
+                }
+                JoinKind::NonReturn => {
+                    // Existing post-join ops follow from the original stream.
+                    idx = cluster_end + 1;
+                }
+            }
             continue;
         }
         out.push(ops[idx].clone());
@@ -1366,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_op_return_convoy_sinks_identical_suffix() {
+    fn multi_op_join_convoy_sinks_identical_suffix() {
         // Diamond: both arms end with Load;Const;ADD then join+RETURN.
         let suf = load_const_add_suffix();
         let mut ops = vec![
@@ -1393,7 +1458,7 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
 
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
 
         let load_count = ops
             .iter()
@@ -1418,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_op_return_convoy_skips_disagreeing_suffixes() {
+    fn multi_op_join_convoy_skips_disagreeing_suffixes() {
         // Ord-shaped: one arm LOAD;CONST 0;ADD, other LOAD;CONST 1;ADD.
         let mut ops = vec![
             IlOp::Load {
@@ -1474,12 +1539,12 @@ mod tests {
             },
         ];
         let before = ops.clone();
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
         assert!(ops == before);
     }
 
     #[test]
-    fn multi_op_return_convoy_skips_conditional_into_cluster() {
+    fn multi_op_join_convoy_skips_conditional_into_cluster() {
         let suf = load_const_add_suffix();
         let mut ops = Vec::new();
         ops.extend(suf.clone());
@@ -1494,12 +1559,12 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
         let before = ops.clone();
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
         assert!(ops == before);
     }
 
     #[test]
-    fn multi_op_return_convoy_skips_jump_if_match_into_cluster() {
+    fn multi_op_join_convoy_skips_jump_if_match_into_cluster() {
         let suf = load_const_add_suffix();
         let mut ops = Vec::new();
         ops.extend(suf.clone());
@@ -1514,12 +1579,12 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
         let before = ops.clone();
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
         assert!(ops == before);
     }
 
     #[test]
-    fn multi_op_return_convoy_skips_unknown_join_sp() {
+    fn multi_op_join_convoy_skips_unknown_join_sp() {
         // Identical suffixes, but then-arm pushes an extra const first so join
         // heights disagree → SP Unknown → refuse sink.
         let suf = load_const_add_suffix();
@@ -1551,7 +1616,7 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
         let before = ops.clone();
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
         assert!(ops == before);
     }
 
@@ -1577,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_op_return_convoy_prefers_longest_suffix() {
+    fn multi_op_join_convoy_prefers_longest_suffix() {
         // Matching length-4 (and nested length-2/3) — sink the longest once.
         let suf = load_two_const_add_suffix();
         let mut ops = vec![
@@ -1604,7 +1669,7 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
 
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
 
         let load_count = ops
             .iter()
@@ -1624,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_op_return_convoy_sinks_length_two() {
+    fn multi_op_join_convoy_sinks_length_two() {
         let suf = vec![
             IlOp::Load {
                 slot: 0,
@@ -1659,7 +1724,7 @@ mod tests {
             loc: common::DebugLoc::unknown(),
         });
 
-        multi_op_return_convoy(&mut ops);
+        multi_op_join_convoy(&mut ops);
 
         let load_count = ops
             .iter()
@@ -1667,5 +1732,153 @@ mod tests {
             .count();
         assert_eq!(load_count, 1);
         assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
+    fn multi_op_join_convoy_sinks_identical_suffix_non_return() {
+        // Diamond into shared continuation (StorePop), not RETURN.
+        let suf = load_const_add_suffix();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Halt {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        let add_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .count();
+        assert_eq!(load_count, 1, "suffix should appear once after join");
+        assert_eq!(add_count, 1);
+        // Suffix then StorePop: Load … ADD StorePop Halt
+        let store_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
+            .expect("StorePop kept");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("ADD sunk");
+        assert!(add_idx < store_idx, "suffix before shared continuation");
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Halt { .. })));
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_disagreeing_suffixes_non_return() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::StorePop {
+                slot: 2,
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_conditional_into_non_return_cluster() {
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_jump_only_join() {
+        // Labels followed only by unconditional JMP — no local work.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(9),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(9)));
+        ops.push(IlOp::Halt {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
     }
 }
