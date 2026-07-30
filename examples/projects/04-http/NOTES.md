@@ -4,8 +4,8 @@
 
 Userland HTTP/1.1 client under `stdlib/http` (`get` / `post` / `request`) against
 a local cleartext TCP server in the same project. HTTPS uses
-`tcp::connect` + `io::net::tls::client::enable(..., { verify: true })` (never
-insecure by default) — not exercised in CI without a local cert.
+`tcp::connect` + `io::net::tls::client::enable(..., { verify: true, ca_pem: "", timeout_ms: 0 })`
+(never insecure by default) — not exercised in CI without a local cert.
 
 ## Run
 
@@ -38,7 +38,7 @@ Impl detail: request/response helpers live in `url.hy` so `client` depends on a
 
 ## Limitations (v1)
 
-- No redirects, cookies, pooling, timeouts, HTTP/2+
+- No redirects, cookies, pooling, caller-configured timeouts, HTTP/2+
 - No chunked transfer encoding
 - `Connection: close` only (caller Host / Content-Length / Connection are ignored
   so the client always emits correct values; other custom headers go on the wire)
@@ -47,8 +47,8 @@ Impl detail: request/response helpers live in `url.hy` so `client` depends on a
 - `http::client` imports `io::net::tls::client` — requires Cargo feature `tls` (default-on)
 - IPv6 URL literals not supported (first `:` before `/` is treated as the port)
 - Connect / TLS errors collapse to `HttpError::Io`; TLS host errors map to
-  `IoError::Other` (no dedicated tags in v1 — deferred by design)
-- Blocking connect/handshake has no timeout (same as TCP)
+  raw `IoError` variants only when using IO/TLS APIs directly
+- The stdlib client currently requests no TCP connect or TLS handshake deadline
 - CRLF (CR/LF) in URL host/path, method, or header names/values → `HttpError::BadUrl`
 - `Content-Length` greater than available body bytes → `HttpError::BadResponse`
 

@@ -3503,7 +3503,7 @@ fn classify(IoError e) -> int {
 fn main() {
     let path = "/tmp/coil_tls_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, "127.0.0.1", { verify: false });
+    let r = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3636,7 +3636,7 @@ fn classify(IoError e) -> int {{
 fn main() {{
     let path = "/tmp/coil_tls_server_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}" }});
+    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}", timeout_ms: 0, client_ca_pem: "" }});
     let code = match r {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3727,7 +3727,7 @@ use io::net::tls::*;
 fn main() {
     let path = "/tmp/coil_tls_flat.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 })?;
 }
 "#,
     );
@@ -3747,7 +3747,7 @@ use io::net::tls::server::*;
 fn main() {
     let path = "/tmp/coil_tls_legacy_encrypt.bin";
     let s = open(path, "w")?;
-    let _ = encrypt(s, { cert_pem: "x", key_pem: "y" })?;
+    let _ = encrypt(s, { cert_pem: "x", key_pem: "y", timeout_ms: 0, client_ca_pem: "" })?;
 }
 "#,
     );
@@ -3781,7 +3781,7 @@ use io::net::tls::server::*;
 fn main() {
     let path = "/tmp/coil_tls_cross_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { verify: false })?;
+    let _ = enable(s, { verify: false, ca_pem: "", timeout_ms: 0 })?;
 }
 "#,
     );
@@ -3821,12 +3821,12 @@ fn classify(IoError e) -> int {
 fn main() {
     let path = "/tmp/coil_tls_both_ns.bin";
     let s = open(path, "w")?;
-    let c = match client_enable(s, "127.0.0.1", { verify: false }) {
+    let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 }) {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     };
     let s2 = open(path, "w")?;
-    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem" }) {
+    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem", timeout_ms: 0, client_ca_pem: "" }) {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     };
@@ -3867,7 +3867,7 @@ fn classify(IoError e) -> int {
 fn main() {
     let path = "/tmp/coil_tls_server_empty_pem.bin";
     let s = open(path, "w")?;
-    let r = enable(s, { cert_pem: "", key_pem: "" });
+    let r = enable(s, { cert_pem: "", key_pem: "", timeout_ms: 0, client_ca_pem: "" });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3892,7 +3892,7 @@ use io::net::tls::server::*;
 fn main() {
     let path = "/tmp/coil_tls_server_pem_ty.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { cert_pem: 1, key_pem: 2 })?;
+    let _ = enable(s, { cert_pem: 1, key_pem: 2, timeout_ms: 0, client_ca_pem: "" })?;
 }
 "#,
     );
@@ -3914,7 +3914,7 @@ use io::net::tls::client::*;
 fn main() {
     let path = "/tmp/coil_tls_client_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false, alpn: "h2" })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0, alpn: "h2" })?;
 }
 "#,
     );
@@ -3933,7 +3933,7 @@ use io::net::tls::server::*;
 fn main() {
     let path = "/tmp/coil_tls_server_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
+    let _ = enable(s, { cert_pem: "c", key_pem: "k", timeout_ms: 0, client_ca_pem: "", alpn: "h2" })?;
 }
 "#,
     );
