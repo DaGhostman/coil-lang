@@ -951,6 +951,10 @@ impl Compiler {
             );
             self.bytecode
                 .emit_jump(BbJumpKind::Unconditional, *label);
+            // CALL target 0 returns here (skips the JMP). Label so dead_block
+            // does not treat this as fall-through-after-JMP dead code.
+            let cont = self.bytecode.fresh_label();
+            self.bytecode.bind_label(cont);
             self.bytecode.push(Byte::new(Instruction::POP));
         }
     }
@@ -10104,6 +10108,10 @@ impl Compiler {
         // don't fall into a Num/Ord/Eq/Show thunk body.
         self.program_start_offset = self.bytecode.len() as u32;
         self.setup_entry_offset = self.program_start_offset;
+        // Label the setup / top-level region so `dead_block` keeps it
+        // after prologue HALT / prelude RETURN (reachability is
+        // label-based until entry-aware DCE).
+        self.bytecode.bind_fresh_entry();
         self.mono_plan = monomorphize::plan_monomorphization(module, ast, &self.checker);
 
         let mut program = self.do_compile(ast);
@@ -10129,6 +10137,9 @@ impl Compiler {
             let init_len = inits.len();
             self.bytecode.splice_bytes_at(pos, inits);
             self.bytecode.bump_absolute_entry_targets(pos, init_len);
+            // Splice inserts before any label at `pos`; ensure the init
+            // region itself is labeled so dead_block keeps it.
+            self.bytecode.entry_label_at(pos);
             self.program_start_offset += init_len as u32;
             for offset in self.functions.values_mut() {
                 if *offset >= pos {
@@ -10191,17 +10202,33 @@ impl Compiler {
             }
             best
         };
-        for offset in self.functions.values_mut() {
-            *offset = map(*offset);
+        // Prefer entry labels: IL opts (dead_block) shift emitting indices
+        // before fuse, so raw `functions` / `test_cases` PCs are stale.
+        let resolve_entry = |pre: usize| -> usize {
+            if let Some(label) = self.bytecode.entry_label_for_offset(pre) {
+                if let Some(&pc) = lowered.label_pcs.get(&label.0) {
+                    return pc;
+                }
+            }
+            map(pre)
+        };
+        for (name, offset) in self.functions.iter_mut() {
+            if let Some(label) = self.fn_entry_labels.get(name) {
+                if let Some(&pc) = lowered.label_pcs.get(&label.0) {
+                    *offset = pc;
+                    continue;
+                }
+            }
+            *offset = resolve_entry(*offset);
         }
         for (_, offset) in self.test_cases.iter_mut() {
-            *offset = map(*offset as usize) as u32;
+            *offset = resolve_entry(*offset as usize) as u32;
         }
         for offset in self.mono_offsets.values_mut() {
-            *offset = map(*offset);
+            *offset = resolve_entry(*offset);
         }
-        self.program_start_offset = map(self.program_start_offset as usize) as u32;
-        self.setup_entry_offset = map(self.setup_entry_offset as usize) as u32;
+        self.program_start_offset = resolve_entry(self.program_start_offset as usize) as u32;
+        self.setup_entry_offset = resolve_entry(self.setup_entry_offset as usize) as u32;
 
         self.debug_locs = lowered.debug_locs;
 
@@ -11047,6 +11074,7 @@ test("two") { assert(true)?; }
         }
         None
     }
+
 
     #[test]
     fn fib_compiles_with_fused_superinstructions() {

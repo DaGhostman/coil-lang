@@ -235,23 +235,26 @@ impl CodeBuf {
         }
     }
 
-    /// Truncate to `code_len` emitting ops (labels after that point dropped).
+    /// Truncate to `code_len` emitting ops. Labels bound at PC `code_len`
+    /// (entry labels for the next instruction) are preserved; emitting ops
+    /// at that PC and beyond are dropped.
     pub fn truncate(&mut self, code_len: usize) {
         assert!(self.lowered.is_none());
         let mut emitting = 0usize;
         let mut keep = 0usize;
         for (i, op) in self.il.ops().iter().enumerate() {
-            if emitting == code_len {
-                keep = i;
-                break;
-            }
             if op.emits_code() {
+                if emitting == code_len {
+                    break;
+                }
                 emitting += 1;
+                keep = i + 1;
+            } else if emitting > code_len {
+                break;
+            } else {
+                // Keep labels/markers at PCs `<= code_len` (incl. entry binds).
+                keep = i + 1;
             }
-            keep = i + 1;
-        }
-        if emitting < code_len {
-            return;
         }
         self.il.ops_mut().truncate(keep);
         self.entry_at_offset.retain(|&pc, _| pc < code_len);

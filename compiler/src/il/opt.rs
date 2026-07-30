@@ -16,10 +16,11 @@ pub struct OptimizeOptions {
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
-            // Keep off until more soak; dead-block needs labeled fn entries.
-            jump_thread: false,
-            dead_block: false,
-            stack_dce: false,
+            jump_thread: true,
+            // JMP-over sweep only (not after RETURN); entry labels + CALL-0
+            // continuations labeled.
+            dead_block: true,
+            stack_dce: true,
         }
     }
 }
@@ -83,22 +84,14 @@ fn jump_thread(ops: &mut Vec<IlOp>) {
     }
 }
 
-fn is_terminator(op: &IlOp) -> bool {
-    match op {
+fn is_unconditional_jmp(op: &IlOp) -> bool {
+    matches!(
+        op,
         IlOp::Jump {
             kind: IlJumpKind::Unconditional,
             ..
-        } => true,
-        IlOp::Byte { byte, .. } => matches!(
-            *byte.bytecode(),
-            common::Instruction::RETURN
-                | common::Instruction::HALT
-                | common::Instruction::ConstReturnImm
-                | common::Instruction::LoadReturnSlot
-                | common::Instruction::BinReturn
-        ),
-        _ => false,
-    }
+        }
+    )
 }
 
 fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
@@ -113,7 +106,10 @@ fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
         if !reachable {
             continue;
         }
-        let term = is_terminator(&op);
+        // Only sweep after unconditional JMP. Treating RETURN/HALT as
+        // terminators deleted CALL-0 trampoline continuations and some
+        // attr-inlined tails before those paths were fully labeled.
+        let term = is_unconditional_jmp(&op);
         out.push(op);
         if term {
             reachable = false;
@@ -121,6 +117,7 @@ fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
     }
     *ops = out;
 }
+
 
 fn stack_dce(ops: &mut Vec<IlOp>) {
     let mut out = Vec::with_capacity(ops.len());
@@ -205,9 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn dead_block_drops_after_return() {
+    fn dead_block_drops_after_unconditional_jmp() {
         let mut ops = vec![
-            IlOp::byte(Byte::new(Instruction::RETURN)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
             IlOp::Label(Label(0)),
             IlOp::byte(Byte::new(Instruction::HALT)),

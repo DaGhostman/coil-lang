@@ -51,10 +51,39 @@ impl Slot {
     }
 }
 
+/// True if `op` is a plain `IlOp::Byte` JMP/JMPF/JMPT carrying a real absolute
+/// PC (not the prologue sentinel `u32::MAX`). Symbolic jumps use [`IlOp::Jump`].
+pub fn is_residual_abs_jump(op: &IlOp) -> bool {
+    let IlOp::Byte { byte, .. } = op else {
+        return false;
+    };
+    matches!(
+        *byte.bytecode(),
+        Instruction::JMP | Instruction::JMPF | Instruction::JMPT
+    ) && byte.operand_u32() != u32::MAX
+}
+
+/// Debug/test inventory: panics if any residual absolute control-flow jump
+/// remains as `IlOp::Byte`. Allow [`IlOp::PrologueJmp`] / `u32::MAX` only.
+pub fn assert_no_residual_abs_jumps(ops: &[IlOp]) {
+    for (i, op) in ops.iter().enumerate() {
+        debug_assert!(
+            !is_residual_abs_jump(op),
+            "residual abs JMP/JMPF/JMPT as IlOp::Byte at op index {i}; labelize before opts/fuse"
+        );
+        if is_residual_abs_jump(op) {
+            panic!(
+                "residual abs JMP/JMPF/JMPT as IlOp::Byte at op index {i}; labelize before opts/fuse"
+            );
+        }
+    }
+}
+
 /// Optimize and lower `ops` into VM bytecode.
 pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
     let mut ops = ops.to_vec();
     opt::optimize(&mut ops, &opt::OptimizeOptions::default());
+    assert_no_residual_abs_jumps(&ops);
 
     let mut pre_slots: Vec<Slot> = Vec::with_capacity(ops.len());
     // For each pre-fusion emitting index, labels that bind to it.
@@ -126,10 +155,8 @@ pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
         debug_locs.push(slot.loc());
     }
 
-    // Absolute JMP still in plain Bytes (unmigrated control flow) use
-    // pre-fusion indices — remap once via the fusion origin table.
-    // CALL/CodePtr/MakePolyFn/TailCall/MakeCoro arrive as [`IlOp::Entry`]
-    // (or defer CALL target 0 / missing CodePtr 0) and must not be remapped.
+    // Symbolic jumps are label-resolved at encode. Residual abs JMP Bytes
+    // are forbidden ([`assert_no_residual_abs_jumps`]); this hook is a no-op.
     remap_absolute_targets(&mut bytecode, pool, &pre_to_post, slots.len());
 
     let code_len = bytecode.len();
@@ -155,11 +182,15 @@ fn fuse_slots_with_origins(
         // Do not fuse a window that would pull an op with an incoming
         // label / absolute jump into a fused superinstruction with a
         // preceding op (match joins, attr-inlined absolute JMP→RETURN).
+        // *Return fusions also refuse a label on window[0]: JMP-to-join
+        // lands on ConstReturnImm/LoadReturnSlot/BinReturn and ignores
+        // the stacked arm value.
         let mut fused = None;
         if let Some((f, window)) = try_fuse_slots(&slots[i..], pool) {
             let crosses_label = (1..window).any(|k| binds_at.contains_key(&(i + k)));
             let crosses_abs = (1..window).any(|k| abs_jump_targets.contains(&(i + k)));
-            if !crosses_label && !crosses_abs {
+            let return_at_label = slot_is_return_fusion(&f) && binds_at.contains_key(&i);
+            if !crosses_label && !crosses_abs && !return_at_label {
                 fused = Some((f, window));
             }
         }
@@ -200,11 +231,59 @@ fn absolute_jump_targets(slots: &[Slot]) -> std::collections::HashSet<usize> {
 }
 
 fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
-    // Identity select for now: label resolution + remap of absolute
-    // CALL/JMP. Pattern fuse-select is implemented above/below and gated
-    // off until remaining absolute-JMP producers (attr inline, dynamic
-    // array helpers, early-return) are fully on labels.
-    let _ = (window, pool);
+    // Peephole order (see `peephole::try_fuse`); JMPF targets stay symbolic.
+    if let Some(s) = try_fuse_load_const_cmp_jmpf_slot(window) {
+        return Some((s, 4));
+    }
+    if window.len() >= 3
+        && let (Some(a), Some(b), Some(c)) = (
+            slot_as_byte(&window[0]),
+            slot_as_byte(&window[1]),
+            slot_as_byte(&window[2]),
+        )
+    {
+        let w = [a, b, c];
+        if let Some(fused) = try_fold_const_bin_local(&w, pool) {
+            return Some((Slot::Byte(fused, window[0].loc()), 3));
+        }
+        // BinSlotImm deferred: attr-inlined / for-step fusion mis-resolves
+        // some Entry PCs (see wrap_for CALL→bare RETURN). Re-enable with
+        // stronger entry-label soak.
+        if let Some(fused) = try_fuse_bin_slot_slot_local(&w) {
+            return Some((Slot::Byte(fused, window[0].loc()), 3));
+        }
+    }
+    if window.len() >= 2
+        && let (Some(b0), Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _)) =
+            (slot_as_byte(&window[0]), &window[1])
+    {
+        if *b0.bytecode() == Instruction::BinSlotImm {
+            let (op, slot, imm) = b0.bin_slot_imm_parts();
+            if is_cmp_op(Instruction::from(op)) {
+                return Some((
+                    Slot::BinSlotImmJmpf {
+                        op,
+                        slot: slot as u8,
+                        imm: imm as i16,
+                        target: *tgt,
+                        loc: window[0].loc(),
+                    },
+                    2,
+                ));
+            }
+        }
+        if *b0.bytecode() == Instruction::LogNot {
+            return Some((Slot::LogNotJmpf(*tgt, window[0].loc()), 2));
+        }
+        if is_cmp_op(*b0.bytecode()) {
+            return Some((
+                Slot::CmpJmpf(*b0.bytecode() as u8, *tgt, window[0].loc()),
+                2,
+            ));
+        }
+    }
+    // *Return fusions deferred: even with label-on-window[0] barriers,
+    // attr-inline JMP→RETURN joins still mis-return (wrap_if → 0).
     None
 }
 
@@ -236,6 +315,18 @@ fn slot_as_byte(s: &Slot) -> Option<Byte> {
     match s {
         Slot::Byte(b, _) => Some(*b),
         _ => None,
+    }
+}
+
+fn slot_is_return_fusion(s: &Slot) -> bool {
+    match s {
+        Slot::Byte(b, _) => matches!(
+            *b.bytecode(),
+            Instruction::LoadReturnSlot
+                | Instruction::ConstReturnImm
+                | Instruction::BinReturn
+        ),
+        _ => false,
     }
 }
 
@@ -305,8 +396,9 @@ fn resolve(labels: &HashMap<u32, usize>, target: Label) -> u32 {
     *labels.get(&target.0).unwrap_or(&0) as u32
 }
 
-/// Remap absolute jump targets that still use pre-fusion indices.
-/// Symbolic jumps / entries are already correct — do not touch them.
+/// Remap residual absolute jump targets that still use pre-fusion indices.
+/// Symbolic [`IlOp::Jump`] / fused jmp forms are already label-resolved at
+/// encode — do not touch them (double-remap breaks loop exits under fusion).
 /// Leftover CALL/CodePtr Bytes (defer frame-setup target 0, missing fn
 /// CodePtr 0) are not fusion-sensitive and are left as-is.
 fn remap_absolute_targets(
@@ -315,31 +407,9 @@ fn remap_absolute_targets(
     pre_to_post: &HashMap<usize, usize>,
     len: usize,
 ) {
-    let _ = pool;
-    let map = |t: usize| -> usize {
-        if let Some(&p) = pre_to_post.get(&t) {
-            return p;
-        }
-        let mut best = len;
-        for (&pre, &post) in pre_to_post {
-            if pre >= t && post < best {
-                best = post;
-            }
-        }
-        best
-    };
-    for byte in bytecode.iter_mut() {
-        match *byte.bytecode() {
-            Instruction::JMP | Instruction::JMPT | Instruction::JMPF => {
-                // Prologue JMP sentinel; pipeline patches later.
-                if byte.operand_u32() != u32::MAX {
-                    let t = map(byte.operand_u32() as usize);
-                    *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
-                }
-            }
-            _ => {}
-        }
-    }
+    let _ = (bytecode, pool, pre_to_post, len);
+    // Production emit has no residual abs JMP/JMPF/JMPT as `IlOp::Byte`
+    // (see [`assert_no_residual_abs_jumps`]). Prologue uses `u32::MAX`.
 }
 
 fn is_int_bin_op(i: Instruction) -> bool {
@@ -419,6 +489,7 @@ fn load_slot(byte: &Byte) -> Option<u8> {
     Some(slot as u8)
 }
 
+#[allow(dead_code)] // re-enable with try_fuse_slots once attr Entry PCs soak
 fn try_fuse_bin_slot_imm_local(window: &[Byte; 3]) -> Option<Byte> {
     let slot = load_slot(&window[0])?;
     let imm = i16::try_from(const_inline_value(&window[1])?).ok()?;
@@ -459,6 +530,7 @@ fn try_fold_const_bin_local(window: &[Byte; 3], pool: &mut Vec<u64>) -> Option<B
     Some(Byte::new(Instruction::CONST).with_const_pool(idx as u32))
 }
 
+#[allow(dead_code)] // paired with deferred *Return fuse-select
 fn try_fuse_load_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let slot = load_slot(&window[0])?;
     if *window[1].bytecode() != Instruction::RETURN {
@@ -467,6 +539,7 @@ fn try_fuse_load_return_local(window: &[Byte; 2]) -> Option<Byte> {
     Some(Byte::new(Instruction::LoadReturnSlot).with_operand_u32(slot as u32))
 }
 
+#[allow(dead_code)]
 fn try_fuse_const_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let value = const_inline_value(&window[0])?;
     if *window[1].bytecode() != Instruction::RETURN {
@@ -475,6 +548,7 @@ fn try_fuse_const_return_local(window: &[Byte; 2]) -> Option<Byte> {
     Some(Byte::new(Instruction::ConstReturnImm).with_operand_u32(value as u32))
 }
 
+#[allow(dead_code)]
 fn try_fuse_bin_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let op = *window[0].bytecode();
     if !is_bin_op(op) {
@@ -513,7 +587,6 @@ mod tests {
 
     #[test]
     fn lower_fuses_bin_slot_slot() {
-        // Fuse-select currently identity; keep as label-resolution smoke.
         let mut il = IlBuilder::new();
         il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
         il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(1));
@@ -521,8 +594,15 @@ mod tests {
         il.push_byte(Byte::new(Instruction::RETURN));
         let mut pool = Vec::new();
         let lowered = lower(il.ops(), &mut pool);
-        assert_eq!(lowered.bytecode.len(), 4);
-        assert!(matches!(*lowered.bytecode[2].bytecode(), Instruction::ADD));
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotSlot
+        ));
+        assert!(matches!(
+            *lowered.bytecode[1].bytecode(),
+            Instruction::RETURN
+        ));
     }
 
         #[test]
@@ -537,11 +617,12 @@ mod tests {
 
         let mut pool = Vec::new();
         let lowered = lower(il.ops(), &mut pool);
+        // EQ; JMPF fuses to CmpJmpf (target still label-resolved).
         assert!(matches!(
-            *lowered.bytecode[1].bytecode(),
-            Instruction::JMPF
+            *lowered.bytecode[0].bytecode(),
+            Instruction::CmpJmpf
         ));
-        assert_eq!(lowered.bytecode[1].operand_u32(), 3);
+        assert_eq!(lowered.bytecode[0].cmp_jmpf_parts().1, 2);
     }
 
     #[test]
@@ -560,5 +641,37 @@ mod tests {
             Instruction::CALL
         ));
         assert_eq!(lowered.bytecode[0].call_parts(), (1, 2));
+    }
+
+    #[test]
+    fn residual_abs_jmp_byte_is_detected() {
+        let ops = vec![IlOp::byte(
+            Byte::new(Instruction::JMP).with_operand_u32(42),
+        )];
+        assert!(is_residual_abs_jump(&ops[0]));
+    }
+
+    #[test]
+    fn prologue_sentinel_jmp_is_not_residual() {
+        let ops = vec![
+            IlOp::PrologueJmp {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)),
+        ];
+        assert!(!is_residual_abs_jump(&ops[0]));
+        assert!(!is_residual_abs_jump(&ops[1]));
+        assert_no_residual_abs_jumps(&ops);
+    }
+
+    #[test]
+    #[should_panic(expected = "residual abs JMP")]
+    fn lower_panics_on_residual_abs_jmp_byte() {
+        let ops = vec![
+            IlOp::byte(Byte::new(Instruction::JMP).with_operand_u32(1)),
+            IlOp::byte(Byte::new(Instruction::HALT)),
+        ];
+        let mut pool = Vec::new();
+        let _ = lower(&ops, &mut pool);
     }
 }
