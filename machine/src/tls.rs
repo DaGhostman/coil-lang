@@ -430,11 +430,9 @@ pub fn tls_client_enable(
     })??;
 
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = with_handshake(&mut tcp, deadline, |tcp| {
+    let hs = with_handshake(&mut tcp, deadline, |_tcp| {
         let client = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
-        let mut conn = Connection::Client(client);
-        handshake_with_deadline(tcp, &mut conn, deadline)?;
-        Ok(conn)
+        Ok(Connection::Client(client))
     });
     let _ = tcp.into_raw_fd();
 
@@ -576,11 +574,9 @@ pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<
     let config = server_config_from_opts(opts)?;
 
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = with_handshake(&mut tcp, deadline, |tcp| {
+    let hs = with_handshake(&mut tcp, deadline, |_tcp| {
         let server = ServerConnection::new(config).map_err(map_tls_err)?;
-        let mut conn = Connection::Server(server);
-        handshake_with_deadline(tcp, &mut conn, deadline)?;
-        Ok(conn)
+        Ok(Connection::Server(server))
     });
     let _ = tcp.into_raw_fd();
 
