@@ -412,8 +412,8 @@ fn resolve(labels: &HashMap<u32, usize>, target: Label) -> u32 {
 /// Remap residual absolute jump targets that still use pre-fusion indices.
 /// Symbolic [`IlOp::Jump`] / fused jmp forms are already label-resolved at
 /// encode — do not touch them (double-remap breaks loop exits under fusion).
-/// Leftover CALL/CodePtr Bytes (defer frame-setup target 0, missing fn
-/// CodePtr 0) are not fusion-sensitive and are left as-is.
+/// Leftover CALL/CodePtr Bytes (missing fn CodePtr 0) are not fusion-sensitive
+/// and are left as-is.
 fn remap_absolute_targets(
     bytecode: &mut [Byte],
     pool: &mut [u64],

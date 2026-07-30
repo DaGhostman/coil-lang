@@ -334,8 +334,8 @@ impl CodeBuf {
 
     /// Shift [`Self::entry_at_offset`] keys after a splice that inserts `delta`
     /// emitting ops at `threshold`. Entry ops themselves are symbolic and need
-    /// no rewrite; leftover abs CALL/CodePtr Bytes (defer target 0, missing
-    /// CodePtr 0) are below any real entry PC and are left untouched.
+    /// no rewrite; leftover abs CALL/CodePtr Bytes (missing fn CodePtr 0) are
+    /// below any real entry PC and are left untouched.
     pub fn bump_absolute_entry_targets(&mut self, threshold: usize, delta: usize) {
         if delta == 0 {
             return;
