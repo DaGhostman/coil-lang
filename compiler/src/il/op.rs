@@ -35,7 +35,7 @@ pub enum EntryKind {
 ///
 /// Hot-path ops are first-class variants (lifted on absorb from `Byte`).
 /// [`IlOp::Byte`] remains the escape hatch for the long tail.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum IlOp {
     /// Ordinary VM instruction whose operand is not a code pointer.
     /// Jump/call ops that still embed absolute PCs are accepted for

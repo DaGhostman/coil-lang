@@ -1403,7 +1403,7 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
             .count();
-        assert_eq!(load_count, 1, "suffix should appear once after join; ops={ops:?}");
+        assert_eq!(load_count, 1, "suffix should appear once after join");
         assert_eq!(add_count, 1);
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(0)))));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
@@ -1475,7 +1475,7 @@ mod tests {
         ];
         let before = ops.clone();
         multi_op_return_convoy(&mut ops);
-        assert_eq!(ops, before);
+        assert!(ops == before);
     }
 
     #[test]
@@ -1495,6 +1495,6 @@ mod tests {
         });
         let before = ops.clone();
         multi_op_return_convoy(&mut ops);
-        assert_eq!(ops, before);
+        assert!(ops == before);
     }
 }
