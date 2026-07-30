@@ -400,4 +400,35 @@ mod tests {
             "entry at truncate point must survive for CALL→Entry rewrite"
         );
     }
+
+    #[test]
+    fn push_lifts_hot_set_bytes_to_typed_ops() {
+        let mut buf = CodeBuf::new();
+        buf.push(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        buf.push(Byte::new(Instruction::CONST).with_const_inline(2));
+        buf.push(Byte::new(Instruction::ADD));
+        buf.push(Byte::new(Instruction::RETURN));
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 2, .. }));
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::ADD, .. }));
+        assert!(matches!(ops[3], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn record_func_tracks_spans_and_clear_drops_them() {
+        let mut buf = CodeBuf::new();
+        let entry = buf.bind_fresh_entry();
+        buf.push(Byte::new(Instruction::ConstReturnImm).with_operand_u32(0));
+        let end = buf.len();
+        buf.record_func("main", Some(entry), 0, end);
+        assert_eq!(buf.funcs().len(), 1);
+        assert_eq!(buf.funcs()[0].name, "main");
+        assert_eq!(buf.funcs()[0].entry, Some(entry));
+        assert_eq!(buf.funcs()[0].code_start, 0);
+        assert_eq!(buf.funcs()[0].code_end, end);
+        buf.clear();
+        assert!(buf.funcs().is_empty());
+        assert!(buf.ops().is_empty());
+    }
 }
