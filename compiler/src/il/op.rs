@@ -32,12 +32,40 @@ pub enum EntryKind {
 }
 
 /// One IL instruction. Labels occupy no final bytecode slot.
+///
+/// Hot-path ops are first-class variants (lifted on absorb from `Byte`).
+/// [`IlOp::Byte`] remains the escape hatch for the long tail.
 #[derive(Clone, PartialEq, Eq)]
 pub enum IlOp {
     /// Ordinary VM instruction whose operand is not a code pointer.
     /// Jump/call ops that still embed absolute PCs are accepted for
     /// transitional emit paths; prefer [`IlOp::Jump`] / [`IlOp::Entry`].
     Byte { byte: Byte, loc: DebugLoc },
+    Load { slot: u32, loc: DebugLoc },
+    StorePop { slot: u32, loc: DebugLoc },
+    /// Inline `CONST` only (pool-backed consts stay as [`IlOp::Byte`]).
+    Const { imm: i32, loc: DebugLoc },
+    Dup { loc: DebugLoc },
+    Pop { loc: DebugLoc },
+    Return { loc: DebugLoc },
+    Halt { loc: DebugLoc },
+    /// Plain int/float binop or comparison (stack operands).
+    Bin { op: Instruction, loc: DebugLoc },
+    BinSlotImm {
+        op: u8,
+        slot: u8,
+        imm: i16,
+        loc: DebugLoc,
+    },
+    BinSlotSlot {
+        op: u8,
+        a: u8,
+        b: u8,
+        loc: DebugLoc,
+    },
+    LoadReturnSlot { slot: u32, loc: DebugLoc },
+    ConstReturnImm { imm: u32, loc: DebugLoc },
+    BinReturn { op: Instruction, loc: DebugLoc },
     /// Bind `label` to the next emitting instruction's PC (last bind wins).
     Label(Label),
     /// Control-flow jump with a symbolic target.
@@ -57,16 +85,143 @@ pub enum IlOp {
     PrologueJmp { loc: DebugLoc },
 }
 
+fn is_plain_bin_instruction(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::ADD
+            | Instruction::SUB
+            | Instruction::MUL
+            | Instruction::DIV
+            | Instruction::MOD
+            | Instruction::LE
+            | Instruction::LEQ
+            | Instruction::GT
+            | Instruction::GEQ
+            | Instruction::EQ
+            | Instruction::NEQ
+            | Instruction::Pow
+            | Instruction::BITAND
+            | Instruction::BITOR
+            | Instruction::ADDF
+            | Instruction::SUBF
+            | Instruction::MULF
+            | Instruction::DIVF
+            | Instruction::MODF
+            | Instruction::LEF
+            | Instruction::LEQF
+            | Instruction::GTF
+            | Instruction::GEQF
+            | Instruction::PowF
+            | Instruction::SHL
+            | Instruction::SHR
+            | Instruction::XOR
+            | Instruction::AND
+            | Instruction::OR
+    )
+}
+
 impl IlOp {
     pub fn byte(byte: Byte) -> Self {
-        Self::Byte {
-            byte,
-            loc: DebugLoc::unknown(),
-        }
+        Self::from_plain_byte(byte, DebugLoc::unknown())
     }
 
     pub fn byte_at(byte: Byte, loc: DebugLoc) -> Self {
-        Self::Byte { byte, loc }
+        Self::from_plain_byte(byte, loc)
+    }
+
+    /// Lift a packed `Byte` into a typed hot-set variant when possible.
+    pub fn from_plain_byte(byte: Byte, loc: DebugLoc) -> Self {
+        match *byte.bytecode() {
+            Instruction::LOAD => Self::Load {
+                slot: byte.operand_u32(),
+                loc,
+            },
+            Instruction::StorePop => Self::StorePop {
+                slot: byte.operand_u32(),
+                loc,
+            },
+            Instruction::CONST => {
+                let op = byte.operand_u32();
+                if op & Byte::POOL_FLAG != 0 {
+                    Self::Byte { byte, loc }
+                } else {
+                    Self::Const {
+                        imm: op as i32,
+                        loc,
+                    }
+                }
+            }
+            Instruction::DUPLICATE => Self::Dup { loc },
+            Instruction::POP => Self::Pop { loc },
+            Instruction::RETURN => Self::Return { loc },
+            Instruction::HALT => Self::Halt { loc },
+            Instruction::BinSlotImm => {
+                let (op, slot, imm) = byte.bin_slot_imm_parts();
+                Self::BinSlotImm {
+                    op,
+                    slot: slot as u8,
+                    imm: imm as i16,
+                    loc,
+                }
+            }
+            Instruction::BinSlotSlot => {
+                let (op, a, b) = byte.bin_slot_slot_parts();
+                Self::BinSlotSlot {
+                    op,
+                    a: a as u8,
+                    b: b as u8,
+                    loc,
+                }
+            }
+            Instruction::LoadReturnSlot => Self::LoadReturnSlot {
+                slot: byte.operand_u32(),
+                loc,
+            },
+            Instruction::ConstReturnImm => Self::ConstReturnImm {
+                imm: byte.operand_u32(),
+                loc,
+            },
+            Instruction::BinReturn => Self::BinReturn {
+                op: byte.bin_return_op().into(),
+                loc,
+            },
+            other if is_plain_bin_instruction(other) => Self::Bin { op: other, loc },
+            _ => Self::Byte { byte, loc },
+        }
+    }
+
+    /// Encode this op as a VM `Byte` for lower / round-trip. Control/label → `None`.
+    pub fn as_encode_byte(&self) -> Option<Byte> {
+        Some(match self {
+            IlOp::Byte { byte, .. } => *byte,
+            IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_operand_u32(*slot),
+            IlOp::StorePop { slot, .. } => Byte::new(Instruction::StorePop).with_operand_u32(*slot),
+            IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
+            IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
+            IlOp::Pop { .. } => Byte::new(Instruction::POP),
+            IlOp::Return { .. } => Byte::new(Instruction::RETURN),
+            IlOp::Halt { .. } => Byte::new(Instruction::HALT),
+            IlOp::Bin { op, .. } => Byte::new(*op),
+            IlOp::BinSlotImm {
+                op, slot, imm, ..
+            } => Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(*op, *slot, *imm),
+            IlOp::BinSlotSlot { op, a, b, .. } => {
+                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(*op, *a, *b)
+            }
+            IlOp::LoadReturnSlot { slot, .. } => {
+                Byte::new(Instruction::LoadReturnSlot).with_operand_u32(*slot)
+            }
+            IlOp::ConstReturnImm { imm, .. } => {
+                Byte::new(Instruction::ConstReturnImm).with_operand_u32(*imm)
+            }
+            IlOp::BinReturn { op, .. } => {
+                Byte::new(Instruction::BinReturn).with_bin_return(*op as u8)
+            }
+            IlOp::Label(_)
+            | IlOp::Jump { .. }
+            | IlOp::Entry { .. }
+            | IlOp::PrologueJmp { .. } => return None,
+        })
     }
 
     /// True if this op becomes one (or more) final bytecode slots.
@@ -82,17 +237,31 @@ impl IlOp {
         )
     }
 
-    /// Plain `RETURN` byte (not fused `*Return`).
+    /// Plain `RETURN` (typed or residual `Byte`), not fused `*Return`.
     pub fn is_plain_return(&self) -> bool {
-        matches!(
-            self,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
-        )
+        matches!(self, IlOp::Return { .. })
+            || matches!(
+                self,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
+            )
     }
 
     pub fn loc(&self) -> DebugLoc {
         match self {
             IlOp::Byte { loc, .. }
+            | IlOp::Load { loc, .. }
+            | IlOp::StorePop { loc, .. }
+            | IlOp::Const { loc, .. }
+            | IlOp::Dup { loc }
+            | IlOp::Pop { loc }
+            | IlOp::Return { loc }
+            | IlOp::Halt { loc }
+            | IlOp::Bin { loc, .. }
+            | IlOp::BinSlotImm { loc, .. }
+            | IlOp::BinSlotSlot { loc, .. }
+            | IlOp::LoadReturnSlot { loc, .. }
+            | IlOp::ConstReturnImm { loc, .. }
+            | IlOp::BinReturn { loc, .. }
             | IlOp::Jump { loc, .. }
             | IlOp::Entry { loc, .. }
             | IlOp::PrologueJmp { loc } => *loc,
@@ -103,6 +272,19 @@ impl IlOp {
     pub fn set_loc(&mut self, loc: DebugLoc) {
         match self {
             IlOp::Byte { loc: l, .. }
+            | IlOp::Load { loc: l, .. }
+            | IlOp::StorePop { loc: l, .. }
+            | IlOp::Const { loc: l, .. }
+            | IlOp::Dup { loc: l }
+            | IlOp::Pop { loc: l }
+            | IlOp::Return { loc: l }
+            | IlOp::Halt { loc: l }
+            | IlOp::Bin { loc: l, .. }
+            | IlOp::BinSlotImm { loc: l, .. }
+            | IlOp::BinSlotSlot { loc: l, .. }
+            | IlOp::LoadReturnSlot { loc: l, .. }
+            | IlOp::ConstReturnImm { loc: l, .. }
+            | IlOp::BinReturn { loc: l, .. }
             | IlOp::Jump { loc: l, .. }
             | IlOp::Entry { loc: l, .. }
             | IlOp::PrologueJmp { loc: l } => *l = loc,
@@ -110,18 +292,27 @@ impl IlOp {
         }
     }
 
-    /// If this is a plain `Byte` jump/call that still carries an absolute PC,
-    /// return that PC for transitional tooling. Prefer symbolic forms.
+    /// Encode as `Byte` when this op is a plain data/compute slot (not control).
     pub fn as_plain_byte(&self) -> Option<Byte> {
-        match self {
-            IlOp::Byte { byte, .. } => Some(*byte),
-            _ => None,
-        }
+        self.as_encode_byte()
     }
 
     pub fn instruction(&self) -> Option<Instruction> {
         match self {
             IlOp::Byte { byte, .. } => Some(*byte.bytecode()),
+            IlOp::Load { .. } => Some(Instruction::LOAD),
+            IlOp::StorePop { .. } => Some(Instruction::StorePop),
+            IlOp::Const { .. } => Some(Instruction::CONST),
+            IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
+            IlOp::Pop { .. } => Some(Instruction::POP),
+            IlOp::Return { .. } => Some(Instruction::RETURN),
+            IlOp::Halt { .. } => Some(Instruction::HALT),
+            IlOp::Bin { op, .. } => Some(*op),
+            IlOp::BinSlotImm { .. } => Some(Instruction::BinSlotImm),
+            IlOp::BinSlotSlot { .. } => Some(Instruction::BinSlotSlot),
+            IlOp::LoadReturnSlot { .. } => Some(Instruction::LoadReturnSlot),
+            IlOp::ConstReturnImm { .. } => Some(Instruction::ConstReturnImm),
+            IlOp::BinReturn { .. } => Some(Instruction::BinReturn),
             IlOp::Jump { kind, .. } => Some(match kind {
                 IlJumpKind::Unconditional => Instruction::JMP,
                 IlJumpKind::JumpIfFalse => Instruction::JMPF,
@@ -138,5 +329,66 @@ impl IlOp {
             IlOp::PrologueJmp { .. } => Some(Instruction::JMP),
             IlOp::Label(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_plain_byte_lifts_load_const_bin() {
+        let load = IlOp::from_plain_byte(
+            Byte::new(Instruction::LOAD).with_operand_u32(3),
+            DebugLoc::unknown(),
+        );
+        assert!(matches!(load, IlOp::Load { slot: 3, .. }));
+        let c = IlOp::from_plain_byte(
+            Byte::new(Instruction::CONST).with_const_inline(7),
+            DebugLoc::unknown(),
+        );
+        assert!(matches!(c, IlOp::Const { imm: 7, .. }));
+        let add = IlOp::from_plain_byte(Byte::new(Instruction::ADD), DebugLoc::unknown());
+        assert!(matches!(add, IlOp::Bin { op: Instruction::ADD, .. }));
+    }
+
+    #[test]
+    fn as_encode_byte_round_trips_hot_set() {
+        let ops = [
+            IlOp::Load {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: -1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUB,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::BinSlotSlot {
+                op: Instruction::ADD as u8,
+                a: 0,
+                b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::BinReturn {
+                op: Instruction::MUL,
+                loc: DebugLoc::unknown(),
+            },
+        ];
+        for op in ops {
+            let b = op.as_encode_byte().expect("encode");
+            let again = IlOp::from_plain_byte(b, DebugLoc::unknown());
+            assert_eq!(again.as_encode_byte(), Some(b));
+        }
+    }
+
+    #[test]
+    fn pool_const_stays_byte() {
+        let pool = Byte::new(Instruction::CONST).with_const_pool(0);
+        let op = IlOp::from_plain_byte(pool, DebugLoc::unknown());
+        assert!(matches!(op, IlOp::Byte { .. }));
     }
 }

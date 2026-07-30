@@ -93,13 +93,6 @@ pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
     for op in &ops {
         match op {
             IlOp::Label(Label(id)) => pending.push(*id),
-            IlOp::Byte { byte, loc } => {
-                let idx = pre_slots.len();
-                if !pending.is_empty() {
-                    binds_at.insert(idx, std::mem::take(&mut pending));
-                }
-                pre_slots.push(Slot::Byte(*byte, *loc));
-            }
             IlOp::Jump { kind, target, loc } => {
                 let idx = pre_slots.len();
                 if !pending.is_empty() {
@@ -125,6 +118,17 @@ pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
                     binds_at.insert(idx, std::mem::take(&mut pending));
                 }
                 pre_slots.push(Slot::PrologueJmp(*loc));
+            }
+            // Typed hot-set + residual Byte: encode to Slot::Byte for fuse-select.
+            other => {
+                let Some(byte) = other.as_encode_byte() else {
+                    continue;
+                };
+                let idx = pre_slots.len();
+                if !pending.is_empty() {
+                    binds_at.insert(idx, std::mem::take(&mut pending));
+                }
+                pre_slots.push(Slot::Byte(byte, other.loc()));
             }
         }
     }
