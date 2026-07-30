@@ -2123,6 +2123,72 @@ fn example_io_nested_write_prints_2() {
     assert_eq!(output, "2");
 }
 
+/// `match` used as a statement inside a `while` loop must not double-POP
+/// (match already ends with a fusion-barrier POP). A second POP per iteration
+/// corrupts locals and breaks IO such as `accept_wait` + `write_all` loops.
+#[test]
+fn while_accept_match_write_handles_two_connections() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::Duration;
+
+    const PORT: i64 = 41_299;
+    let src = r#"
+use io::*;
+use io::net::tcp::*;
+
+fn main() {
+    let listener = match listen("127.0.0.1", 41299) {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "listen",
+    };
+    let msg: [byte] = [111, 107];
+    let count = 0;
+    while count < 2 {
+        let server = match accept_wait(listener) {
+            Result::Ok(s) => s,
+            Result::Err(_) => panic "accept",
+        };
+        match write_all(server, msg) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => panic "write",
+        };
+        match close(server) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 0,
+        };
+        count = count + 1;
+    }
+    print "ok";
+}
+"#;
+
+    let server = thread::spawn(|| run_example_src(src));
+
+    for round in 0..2 {
+        let mut connected = false;
+        for attempt in 0..80 {
+            match TcpStream::connect(("127.0.0.1", PORT as u16)) {
+                Ok(mut s) => {
+                    let mut buf = [0u8; 2];
+                    s.read_exact(&mut buf).expect("read");
+                    assert_eq!(&buf, b"ok");
+                    connected = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < 80 => thread::sleep(Duration::from_millis(25)),
+                Err(e) => panic!("connect round {round}: {e}"),
+            }
+        }
+        assert!(connected, "server never accepted round {round}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let output = server.join().expect("server thread");
+    assert_eq!(output, "ok");
+}
+
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {

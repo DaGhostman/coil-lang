@@ -3060,6 +3060,111 @@ impl Compiler {
             .expect("BlockBuilder::finalize: FFI Result unwrap success label bound");
     }
 
+    /// `let x = match e { Result::Ok(v) => v, Result::Err(_) => panic msg }`
+    /// lowering: leave the Ok payload on the stack (no match fusion barrier).
+    /// Emits to [`Self::bytecode`] so JumpIfMatch targets stay absolute when
+    /// nested HostInvoke calls also write there.
+    fn emit_result_unwrap_or_panic_literal(&mut self, panic_msg: &Output<'_>) {
+        let mut bb = BlockBuilder::new();
+        let success = bb.fresh_label();
+        bb.emit_jump_to(
+            success,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            &mut self.bytecode,
+        );
+        self.bytecode.push(Byte::new(Instruction::POP));
+        let mut panic_bc = self.do_compile(panic_msg);
+        self.bytecode.append(&mut panic_bc);
+        self.bytecode.push(Byte::new(Instruction::Panic));
+
+        let success_pos = self.bytecode.len() as u32;
+        bb.bind_label(success, success_pos, &mut self.bytecode, &mut self.constants);
+        bb.finalize()
+            .expect("BlockBuilder::finalize: Result unwrap success label bound");
+    }
+
+    /// Lower `let x = match scrutinee { Result::Ok(v) => v, Result::Err(_) => panic }`.
+    fn emit_let_result_ok_unwrap_or_panic(
+        &mut self,
+        scrutinee: &Output<'_>,
+        panic_msg: &Output<'_>,
+    ) {
+        let pack = self
+            .checker
+            .existential_pack_for_span(scrutinee.0.start, scrutinee.0.end)
+            .cloned();
+        let mut scrutinee_bc = self.do_compile(scrutinee);
+        self.bytecode.append(&mut scrutinee_bc);
+        if let Some(pack) = pack {
+            Self::emit_existential_pack_recipe(
+                &mut self.bytecode,
+                &pack,
+                &self.checker,
+                &self.functions,
+            );
+        }
+        self.emit_result_unwrap_or_panic_literal(panic_msg);
+    }
+
+    /// [`emit_result_unwrap_or_panic_literal`].
+    fn match_is_result_ok_else_panic<'a>(
+        arms: &'a [parser::ast::MatchArm<'a>],
+    ) -> Option<&'a Output<'a>> {
+        use parser::ast::{Expression, Pattern, PatternPayload};
+        if arms.len() != 2 {
+            return None;
+        }
+        let mut panic_body = None;
+        for arm in arms {
+            let Pattern::Constructor {
+                enum_name,
+                variant_name,
+                payload,
+            } = &arm.pattern
+            else {
+                return None;
+            };
+            if !enum_name.ends_with("Result") {
+                return None;
+            }
+            match *variant_name {
+                "Ok" => {
+                    let PatternPayload::Tuple(items) = payload else {
+                        return None;
+                    };
+                    if items.len() != 1 {
+                        return None;
+                    }
+                    let Pattern::Binding { name } = &items[0] else {
+                        return None;
+                    };
+                    match unwrap_expr_output(&arm.body).1.as_ref() {
+                        Expression::Variable(n, _) | Expression::Identifier(n) if *n == *name => {}
+                        _ => return None,
+                    }
+                }
+                "Err" => {
+                    let wildcard = match payload {
+                        PatternPayload::Unit => true,
+                        PatternPayload::Tuple(items) => {
+                            items.len() == 1 && matches!(items[0], Pattern::Wildcard)
+                        }
+                        _ => false,
+                    };
+                    if !wildcard {
+                        return None;
+                    }
+                    let Expression::Panic(msg) = unwrap_expr_output(&arm.body).1.as_ref() else {
+                        return None;
+                    };
+                    panic_body = Some(msg);
+                }
+                _ => return None,
+            }
+        }
+        panic_body
+    }
+
     /// Lower one `%v` argument to a string via the `Show` dictionary /
     /// concrete instance method, leaving an `ObjString` on the stack.
     fn emit_show_for_format_arg(&mut self, arg: &Output) {
@@ -6320,7 +6425,14 @@ impl Compiler {
                         // reserved a hole and made bindings land one slot too
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
-                        self.append_with_existential_pack(&mut bytecode, &children[1]);
+                        let rhs = unwrap_expr_output(&children[1]);
+                        if let Expression::Match { scrutinee, arms } = rhs.1.as_ref()
+                            && let Some(panic_msg) = Self::match_is_result_ok_else_panic(arms)
+                        {
+                            self.emit_let_result_ok_unwrap_or_panic(scrutinee, panic_msg);
+                        } else {
+                            self.append_with_existential_pack(&mut bytecode, &children[1]);
+                        }
                         if is_const {
                             if let Some(val) =
                                 const_fold::eval_expr(&children[1], self.const_env())
@@ -10369,13 +10481,19 @@ impl Compiler {
     }
 }
 
-fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+fn unwrap_expr_output<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
     match expr.1.as_ref() {
-        Expression::Identifier(name) => Some(name),
         Expression::Expr(inner)
         | Expression::Group(inner)
         | Expression::Statement(inner)
-        | Expression::ExprStatement(inner) => unwrapped_identifier(inner),
+        | Expression::ExprStatement(inner) => unwrap_expr_output(inner),
+        _ => expr,
+    }
+}
+
+fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+    match unwrap_expr_output(expr).1.as_ref() {
+        Expression::Identifier(name) => Some(name),
         _ => None,
     }
 }
@@ -10680,6 +10798,78 @@ test("two") { assert(true)?; }
                 "bare `yield expr;` must not be followed by POP (would corrupt the next resume)"
             );
         }
+    }
+
+    #[test]
+    fn debug_result_ok_panic_match_arms() {
+        use parser::ast::Expression;
+        let src = r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "bad",
+    };
+}
+"#;
+        let ast = Pratt::default().parse(src).expect("parse");
+        fn find_match<'a>(e: &'a Expression<'a>) -> Option<&'a [parser::ast::MatchArm<'a>]> {
+            match e {
+                Expression::Match { arms, .. } => Some(arms),
+                Expression::Program(items) | Expression::Block(items) => items
+                    .iter()
+                    .find_map(|inner| find_match(inner.1.as_ref())),
+                Expression::Fragment(items) => {
+                    items.iter().find_map(|(_, inner)| find_match(inner.as_ref()))
+                }
+                Expression::Statement(inner) | Expression::Expr(inner) => {
+                    find_match(inner.1.as_ref())
+                }
+                Expression::Function { body, .. } => body
+                    .as_ref()
+                    .and_then(|b| find_match(b.1.as_ref())),
+                _ => None,
+            }
+        }
+        let arms = find_match(ast.1.as_ref()).expect("match");
+        assert!(
+            Compiler::match_is_result_ok_else_panic(arms).is_some(),
+            "arms: {:?}",
+            arms
+        );
+    }
+
+    /// Same guard for a bare `yield from expr;` statement.
+    #[test]
+    fn let_result_ok_panic_match_lowers_without_match_barrier() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "bad",
+    };
+    print "%i", x;
+}
+"#,
+        );
+        let dup_pop = bc.windows(2).any(|w| {
+            matches!(w[0].bytecode(), Instruction::DUPLICATE)
+                && matches!(w[1].bytecode(), Instruction::POP)
+        });
+        assert!(
+            !dup_pop,
+            "let Result Ok/Err(panic) match should lower without DUPLICATE;POP barrier"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::JumpIfMatch)),
+            "expected JumpIfMatch from lowered unwrap"
+        );
     }
 
     /// Same guard for a bare `yield from expr;` statement.
