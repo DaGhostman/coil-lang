@@ -984,7 +984,7 @@ mod tests {
             let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let mut buf = make_byte_array(&mut heap, &[0u8; 64]);
             // Read until we get data (sync adapter style).
             let n = loop {
@@ -1084,8 +1084,8 @@ mod tests {
             let mut heap = Heap::default();
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
-            let s = tls_server_disable(&mut heap, s).expect("decrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
+            let s = tls_server_disable(&mut heap, s).expect("server disable");
             let kind = with_stream_mut(&mut heap, s, |st| st.kind).expect("kind");
             assert_eq!(kind, StreamKind::Tcp);
             stream_close(&mut heap, s).ok();
@@ -1114,7 +1114,7 @@ mod tests {
             let mut heap = Heap::default();
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
-            let s = tls_server_enable(&mut heap, s, opts).expect("encrypt");
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let opts2 = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
             let err = tls_server_enable(&mut heap, s, opts2).unwrap_err();
             assert_eq!(err, IoErrorTag::InvalidInput);
@@ -1281,7 +1281,7 @@ mod tests {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
-        let s = tls_server_disable(&mut heap, s).expect("decrypt alias");
+        let s = tls_server_disable(&mut heap, s).expect("server disable alias");
         let kind = with_stream_mut(&mut heap, s, |st| st.kind).expect("kind");
         assert_eq!(kind, StreamKind::Tcp);
         stream_close(&mut heap, s).ok();
@@ -1304,7 +1304,7 @@ mod tests {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
-        let s = tls_server_disable(&mut heap, s).expect("decrypt once");
+        let s = tls_server_disable(&mut heap, s).expect("server disable once");
         let err = tls_server_disable(&mut heap, s).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
