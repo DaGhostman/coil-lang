@@ -1881,4 +1881,218 @@ mod tests {
         multi_op_join_convoy(&mut ops);
         assert!(ops == before);
     }
+
+    #[test]
+    fn multi_op_join_convoy_skips_halt_join_consumer() {
+        // HALT after labels is a terminator — leave to dead_block, not NonReturn sink.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Halt {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_fused_return_join_consumer() {
+        // Fused *Return after labels must not be treated as a NonReturn continuation.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::BinReturn {
+            op: Instruction::ADD,
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_jump_if_match_into_non_return_cluster() {
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_unknown_join_sp_non_return() {
+        // Identical suffixes, mismatched arm heights → Unknown join SP → refuse.
+        let suf = load_const_add_suffix();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 99,
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_without_jump_preds() {
+        // Fall-through into a labeled continuation with no JMP preds — refuse.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_sinks_through_label_cluster_non_return() {
+        // Multi-label join: suffix after the whole cluster, before StorePop.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(54),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(54)));
+        ops.push(IlOp::Label(Label(48)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Halt {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(load_count, 1, "suffix should appear once after cluster");
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(54)))));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(48)))));
+        let lab48 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(48))))
+            .expect("inner label");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("ADD sunk");
+        let store_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
+            .expect("StorePop");
+        assert!(lab48 < add_idx && add_idx < store_idx);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_prefers_longest_suffix_non_return() {
+        let suf = load_two_const_add_suffix();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::StorePop {
+            slot: 2,
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        let const_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Const { imm: 1 | 2, .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        assert_eq!(const_count, 2, "length-4 suffix keeps both consts once");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("ADD");
+        let store_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
+            .expect("StorePop");
+        assert!(add_idx < store_idx);
+    }
 }
