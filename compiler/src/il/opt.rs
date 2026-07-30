@@ -109,16 +109,23 @@ fn is_unconditional_jmp(op: &IlOp) -> bool {
 }
 
 fn is_return_terminator(op: &IlOp) -> bool {
-    let IlOp::Byte { byte, .. } = op else {
-        return false;
-    };
     matches!(
-        *byte.bytecode(),
-        Instruction::RETURN
-            | Instruction::HALT
-            | Instruction::LoadReturnSlot
-            | Instruction::ConstReturnImm
-            | Instruction::BinReturn
+        op,
+        IlOp::Return { .. }
+            | IlOp::Halt { .. }
+            | IlOp::LoadReturnSlot { .. }
+            | IlOp::ConstReturnImm { .. }
+            | IlOp::BinReturn { .. }
+    ) || matches!(
+        op.as_encode_byte(),
+        Some(b) if matches!(
+            *b.bytecode(),
+            Instruction::RETURN
+                | Instruction::HALT
+                | Instruction::LoadReturnSlot
+                | Instruction::ConstReturnImm
+                | Instruction::BinReturn
+        )
     )
 }
 
@@ -152,24 +159,38 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
     let mut i = 0;
     while i < ops.len() {
         if i + 1 < ops.len()
-            && matches!(
-                &ops[i],
-                IlOp::Byte { byte, .. } if *byte.bytecode() == common::Instruction::DUPLICATE
-            )
-            && matches!(
-                &ops[i + 1],
-                IlOp::Byte { byte, .. } if *byte.bytecode() == common::Instruction::POP
-            )
+            && matches!(&ops[i], IlOp::Dup { .. })
+            && matches!(&ops[i + 1], IlOp::Pop { .. })
         {
             i += 2;
             continue;
         }
         if i + 1 < ops.len()
-            && let (IlOp::Byte { byte: b0, .. }, IlOp::Byte { byte: b1, .. }) =
+            && let (IlOp::Load { slot: s0, .. }, IlOp::StorePop { slot: s1, .. }) =
                 (&ops[i], &ops[i + 1])
-            && *b0.bytecode() == common::Instruction::LOAD
-            && *b1.bytecode() == common::Instruction::StorePop
+            && s0 == s1
+        {
+            i += 2;
+            continue;
+        }
+        // Residual Byte fallback (pre-absorb fragments / tests).
+        if i + 1 < ops.len()
+            && let (Some(b0), Some(b1)) = (ops[i].as_encode_byte(), ops[i + 1].as_encode_byte())
+            && *b0.bytecode() == Instruction::DUPLICATE
+            && *b1.bytecode() == Instruction::POP
+            && matches!(&ops[i], IlOp::Byte { .. })
+            && matches!(&ops[i + 1], IlOp::Byte { .. })
+        {
+            i += 2;
+            continue;
+        }
+        if i + 1 < ops.len()
+            && let (Some(b0), Some(b1)) = (ops[i].as_encode_byte(), ops[i + 1].as_encode_byte())
+            && *b0.bytecode() == Instruction::LOAD
+            && *b1.bytecode() == Instruction::StorePop
             && b0.operand_u32() == b1.operand_u32()
+            && matches!(&ops[i], IlOp::Byte { .. })
+            && matches!(&ops[i + 1], IlOp::Byte { .. })
         {
             i += 2;
             continue;
@@ -189,14 +210,16 @@ fn is_return_producer(byte: &common::Byte) -> bool {
     }
 }
 
-fn fuse_producer_with_return(producer: common::Byte) -> common::Byte {
+fn fuse_producer_with_return(producer: common::Byte) -> IlOp {
     match *producer.bytecode() {
-        Instruction::LOAD => {
-            common::Byte::new(Instruction::LoadReturnSlot).with_operand_u32(producer.operand_u32())
-        }
-        Instruction::CONST => {
-            common::Byte::new(Instruction::ConstReturnImm).with_operand_u32(producer.operand_u32())
-        }
+        Instruction::LOAD => IlOp::LoadReturnSlot {
+            slot: producer.operand_u32(),
+            loc: common::DebugLoc::unknown(),
+        },
+        Instruction::CONST => IlOp::ConstReturnImm {
+            imm: producer.operand_u32(),
+            loc: common::DebugLoc::unknown(),
+        },
         _ => unreachable!("is_return_producer gate"),
     }
 }
@@ -206,10 +229,8 @@ fn immediate_byte_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byt
     if idx == 0 {
         return None;
     }
-    match &ops[idx - 1] {
-        IlOp::Byte { byte, .. } => Some((idx - 1, *byte)),
-        _ => None,
-    }
+    let b = ops[idx - 1].as_encode_byte()?;
+    Some((idx - 1, b))
 }
 
 fn immediate_producer_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byte)> {
@@ -263,8 +284,11 @@ fn is_bin_join_tail(byte: &common::Byte) -> bool {
     is_plain_binop(byte) || is_bin_slot_tail(byte)
 }
 
-fn fuse_binop_to_bin_return(op: common::Byte) -> common::Byte {
-    common::Byte::new(Instruction::BinReturn).with_bin_return(*op.bytecode() as u8)
+fn fuse_binop_to_bin_return(op: common::Byte) -> IlOp {
+    IlOp::BinReturn {
+        op: *op.bytecode(),
+        loc: common::DebugLoc::unknown(),
+    }
 }
 
 /// Find `[cluster_start, cluster_end]` of Labels immediately before a plain RETURN at `r`.
@@ -350,7 +374,7 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
 
     let mut remove_tail_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // cluster_start → (cluster_end, optional fused BinReturn, keep_slot_tail)
-    let mut rewrite: std::collections::HashMap<usize, (usize, Option<common::Byte>, Option<common::Byte>)> =
+    let mut rewrite: std::collections::HashMap<usize, (usize, Option<IlOp>, Option<common::Byte>)> =
         std::collections::HashMap::new();
 
     for (cluster_start, cluster_end, tail, emit_bin_return) in &joins {
@@ -391,12 +415,12 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             idx += 1;
             continue;
         }
-        if let Some(&(cluster_end, fused, keep_slot)) = rewrite.get(&idx) {
+        if let Some((cluster_end, fused, keep_slot)) = rewrite.remove(&idx) {
             for k in idx..=cluster_end {
                 out.push(ops[k].clone());
             }
             if let Some(f) = fused {
-                out.push(IlOp::byte(f));
+                out.push(f);
                 idx = cluster_end + 2; // skip RETURN
             } else if let Some(slot_tail) = keep_slot {
                 out.push(IlOp::byte(slot_tail));
@@ -492,8 +516,8 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
 
     let mut remove_producer_at: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    // cluster_start → fused byte; keep all labels in [start,end], replace RETURN
-    let mut fuse_at_cluster: std::collections::HashMap<usize, (usize, common::Byte)> =
+    // cluster_start → fused op; keep all labels in [start,end], replace RETURN
+    let mut fuse_at_cluster: std::collections::HashMap<usize, (usize, IlOp)> =
         std::collections::HashMap::new();
 
     for (cluster_start, cluster_end, join, producer) in &joins {
@@ -530,12 +554,12 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             idx += 1;
             continue;
         }
-        if let Some(&(cluster_end, fused)) = fuse_at_cluster.get(&idx) {
+        if let Some((cluster_end, fused)) = fuse_at_cluster.remove(&idx) {
             // Keep Label cluster, replace following RETURN with fused.
             for k in idx..=cluster_end {
                 out.push(ops[k].clone());
             }
-            out.push(IlOp::byte(fused));
+            out.push(fused);
             idx = cluster_end + 2; // skip cluster + RETURN
             continue;
         }
@@ -549,6 +573,10 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
 mod tests {
     use super::*;
     use common::{Byte, Instruction};
+
+    fn is_insn(op: &IlOp, i: Instruction) -> bool {
+        op.instruction() == Some(i)
+    }
 
     #[test]
     fn jump_thread_collapses_goto_goto() {
@@ -603,10 +631,7 @@ mod tests {
         ];
         stack_dce(&mut ops);
         assert_eq!(ops.len(), 1);
-        assert!(matches!(
-            &ops[0],
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::HALT
-        ));
+        assert!(is_insn(&ops[0], Instruction::HALT));
     }
 
     #[test]
@@ -648,7 +673,7 @@ mod tests {
         ];
         eliminate_dead_blocks(&mut ops);
         assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], IlOp::Byte { .. }));
+        assert!(is_insn(&ops[0], Instruction::RETURN));
         assert!(matches!(ops[1], IlOp::Label(Label(0))));
     }
 
@@ -662,10 +687,7 @@ mod tests {
         ];
         eliminate_dead_blocks(&mut ops);
         assert_eq!(ops.len(), 3);
-        assert!(matches!(
-            &ops[0],
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ConstReturnImm
-        ));
+        assert!(is_insn(&ops[0], Instruction::ConstReturnImm));
         assert!(matches!(ops[1], IlOp::Label(Label(0))));
     }
 
@@ -684,17 +706,11 @@ mod tests {
         ];
         return_convoy(&mut ops);
         assert!(
-            ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ConstReturnImm
-            )),
+            ops.iter().any(|op| is_insn(op, Instruction::ConstReturnImm)),
             "expected ConstReturnImm"
         );
         assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::CONST
-            )),
+            !ops.iter().any(|op| is_insn(op, Instruction::CONST)),
             "producers should be stripped"
         );
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(0)))));
@@ -722,11 +738,12 @@ mod tests {
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         return_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::LoadReturnSlot
-                && byte.operand_u32() == 0
-        )));
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::LoadReturnSlot { slot: 0, .. })
+                || op
+                    .as_encode_byte()
+                    .is_some_and(|b| *b.bytecode() == Instruction::LoadReturnSlot && b.operand_u32() == 0)
+        }));
     }
 
     #[test]
@@ -824,17 +841,16 @@ mod tests {
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         return_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ConstReturnImm
-        )));
+        assert!(ops.iter().any(|op| {
+            matches!(
+                op.instruction(),
+                Some(Instruction::ConstReturnImm)
+            ) || matches!(op, IlOp::ConstReturnImm { .. })
+        }));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(54)))));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(48)))));
         assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::CONST
-            )),
+            !ops.iter().any(|op| is_insn(op, Instruction::CONST)),
             "producers should be stripped"
         );
     }
@@ -854,11 +870,12 @@ mod tests {
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         return_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::LoadReturnSlot
-                && byte.operand_u32() == 2
-        )));
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::LoadReturnSlot { slot: 2, .. })
+                || op.as_encode_byte().is_some_and(|b| {
+                    *b.bytecode() == Instruction::LoadReturnSlot && b.operand_u32() == 2
+                })
+        }));
     }
 
     #[test]
@@ -875,23 +892,19 @@ mod tests {
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         bin_join_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
-                && byte.bin_return_op() == Instruction::ADD as u8
-        )));
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::BinReturn { op: Instruction::ADD, .. })
+                || op.as_encode_byte().is_some_and(|b| {
+                    *b.bytecode() == Instruction::BinReturn
+                        && b.bin_return_op() == Instruction::ADD as u8
+                })
+        }));
         assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ADD
-            )),
+            !ops.iter().any(|op| is_insn(op, Instruction::ADD)),
             "plain ADDs should be stripped"
         );
         assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
-            )),
+            !ops.iter().any(|op| is_insn(op, Instruction::RETURN)),
             "RETURN should be replaced by BinReturn"
         );
     }
@@ -917,18 +930,10 @@ mod tests {
         bin_join_convoy(&mut ops);
         let slot_count = ops
             .iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinSlotSlot
-                )
-            })
+            .filter(|op| is_insn(op, Instruction::BinSlotSlot))
             .count();
         assert_eq!(slot_count, 1, "exactly one BinSlotSlot before RETURN");
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
-        )));
+        assert!(ops.iter().any(|op| is_insn(op, Instruction::RETURN)));
     }
 
     #[test]
@@ -952,25 +957,14 @@ mod tests {
         bin_join_convoy(&mut ops);
         let imm_count = ops
             .iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinSlotImm
-                )
-            })
+            .filter(|op| is_insn(op, Instruction::BinSlotImm))
             .count();
         assert_eq!(imm_count, 1, "exactly one BinSlotImm before RETURN");
         assert!(
-            !ops.iter().any(|op| matches!(
-                op,
-                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
-            )),
+            !ops.iter().any(|op| is_insn(op, Instruction::BinReturn)),
             "BinSlotImm must stay as slot tail, not BinReturn"
         );
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
-        )));
+        assert!(ops.iter().any(|op| is_insn(op, Instruction::RETURN)));
     }
 
     #[test]
@@ -1032,12 +1026,40 @@ mod tests {
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         bin_join_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(
-            op,
-            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
-                && byte.bin_return_op() == Instruction::SUB as u8
-        )));
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::BinReturn { op: Instruction::SUB, .. })
+                || op.as_encode_byte().is_some_and(|b| {
+                    *b.bytecode() == Instruction::BinReturn
+                        && b.bin_return_op() == Instruction::SUB as u8
+                })
+        }));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(1)))));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(9)))));
+    }
+
+    #[test]
+    fn return_convoy_accepts_typed_const_ops() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| matches!(op, IlOp::ConstReturnImm { imm: 0, .. })));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Const { .. })));
     }
 }

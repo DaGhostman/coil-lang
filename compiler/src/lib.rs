@@ -1298,16 +1298,24 @@ impl Compiler {
             return false;
         }
         // Sole fused return: expand to producer at the call site (no RETURN).
-        if ops.len() == 1
-            && let Some(b) = ops[0].as_plain_byte()
-            && matches!(
-                *b.bytecode(),
-                Instruction::LoadReturnSlot
-                    | Instruction::ConstReturnImm
-                    | Instruction::BinReturn
-            )
-        {
-            return true;
+        if ops.len() == 1 {
+            match &ops[0] {
+                IlOp::LoadReturnSlot { .. }
+                | IlOp::ConstReturnImm { .. }
+                | IlOp::BinReturn { .. } => return true,
+                _ => {
+                    if let Some(b) = ops[0].as_plain_byte()
+                        && matches!(
+                            *b.bytecode(),
+                            Instruction::LoadReturnSlot
+                                | Instruction::ConstReturnImm
+                                | Instruction::BinReturn
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
         }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
@@ -6645,8 +6653,12 @@ impl Compiler {
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
+                let body_end = self.bytecode.len();
                 self.fn_bytecode_spans
-                    .insert(table_key, (body_start, self.bytecode.len()));
+                    .insert(table_key.clone(), (body_start, body_end));
+                let entry = self.fn_entry_labels.get(&table_key).copied();
+                self.bytecode
+                    .record_func(table_key, entry, body_start, body_end);
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
