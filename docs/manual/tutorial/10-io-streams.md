@@ -66,7 +66,8 @@ See `examples/io_text.hy`.
 | `read(s, buf)` | `→ Result<Option<int>, IoError>` | `Ok(Some(n))`, `Ok(None)` = EOF |
 | `write(s, buf)` | `→ Result<int, IoError>` | Partial writes OK |
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
-| `io::net::tcp::*` | TCP | `connect` / `listen` / `accept` / `accept_wait` |
+| `set_read_timeout` / `set_write_timeout` | sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
+| `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, plus address / shutdown helpers |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
 | `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |
 | `io::net::tls::server::*` | TLS server | `enable` / `disable` (feature `tls`) |
@@ -125,9 +126,14 @@ See `examples/io_udp.hy`.
 | Function | Signature (simplified) | Behavior |
 |----------|------------------------|----------|
 | `connect(host, port)` | `→ Result<Stream, IoError>` | Connected stream; `read` / `write` |
+| `connect_timeout(host, port, ms)` | same | Connect deadline; `ms <= 0` waits forever |
 | `listen(host, port)` | `→ Result<Stream, IoError>` | Listening socket |
 | `accept(s)` | `→ Result<Stream, IoError>` | Non-blocking; `WouldBlock` if empty |
 | `accept_wait(s)` | same | Blocks in the host via `poll` |
+| `accept_wait_timeout(s, ms)` | same | Accept deadline; `ms <= 0` waits forever |
+| `peer_addr(s)` / `local_addr(s)` | `→ Result<(string, int), IoError>` | Connected peer / local socket address |
+| `set_nodelay(s, enabled)` | `→ Result<(), IoError>` | Toggle `TCP_NODELAY` on TCP/TLS streams |
+| `shutdown(s, how)` | `→ Result<(), IoError>` | Half-close: `0` read, `1` write, `2` both |
 
 ---
 
@@ -140,9 +146,9 @@ Client and server share the names `enable` / `disable` under separate modules.
 
 | Module | Function | Behavior |
 |--------|----------|----------|
-| `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify: bool` **required** |
+| `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify`, `ca_pem`, `ca_path`, `timeout_ms` **required** |
 | `tls::client` | `disable(s)` | Tear TLS down; plaintext on same fd |
-| `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem` / `key_pem` **required** (no client certs / mTLS in v1) |
+| `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem`, `key_pem`, `timeout_ms`, `client_ca_pem` **required** |
 | `tls::server` | `disable(s)` | Same teardown as client `disable` |
 
 ```coil
@@ -150,7 +156,7 @@ use io::net::tcp::*;
 use io::net::tls::client::*;
 
 let s = connect("example.com", 443)?;
-let s = enable(s, "example.com", { verify: true })?;
+let s = enable(s, "example.com", { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
 let s = disable(s)?;
 ```
 
@@ -159,17 +165,21 @@ use io::net::tcp::*;
 use io::net::tls::server::*;
 
 let s = accept_wait(listener)?;
-let s = enable(s, { cert_pem: cert, key_pem: key })?;
+let s = enable(s, { cert_pem: cert, key_pem: key, timeout_ms: 0, client_ca_pem: "" })?;
 let s = disable(s)?;
 ```
 
-`{ verify: false }` skips cert **trust** only (signatures still checked) —
-local/dev; never use in production. Client `opts` must include `verify`; server
-`opts` must include PEM strings; empty `{}` / unknown keys are rejected.
-Handshake / TLS failures map to `IoError::Other` in v1 (no distinct cert/name
-tags yet). Prefer a DNS `host` for client SNI. `enable` blocks the host thread
-for the handshake (same sync-adapter pattern as `tcp::connect`; no timeout in
-v1). Failed handshakes restore non-blocking on the TCP fd.
+`{ verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }` skips cert **trust** only
+(signatures still checked) — local/dev; never use in production. When
+`verify` is true, trust always includes webpki roots; `ca_pem` /
+`ca_path` as `Option::Some(...)` **append** extra PEM anchors (from a
+string or file path). `Option::None` means no extras. Server
+`client_ca_pem: ""` means no mTLS; non-empty PEM enables client certificate
+auth. Empty `{}` / unknown keys are rejected, and `timeout_ms <= 0` means no
+handshake deadline.
+Handshake / TLS failures map to `IoError::Certificate`, `IoError::Handshake`,
+or `IoError::TimedOut`. Prefer a DNS `host` for client SNI. Failed handshakes
+restore non-blocking on the TCP fd.
 `client::disable` and `server::disable` share the same teardown (either name
 works on a TLS stream). `disable` discards unread TLS plaintext. Prefer
 explicit `close(s)` for a clean shutdown; GC drop still sends a best-effort
@@ -214,9 +224,12 @@ lower to the same host natives (`HostInvoke`).
 ## Errors
 
 `IoError` variants (unit payloads): `WouldBlock`, `NotFound`,
-`PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other`.
+`PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other`, `NotADirectory`,
+`AlreadyExists`, `TimedOut`, `Truncated`, `Certificate`, `Handshake`.
 
-Prefer `?` in `Result`-mode helpers (see [Error handling](09-error-handling.md)).
+`TimedOut` is distinct from `WouldBlock` (deadlines / OS timeouts vs
+“try again”). Prefer `?` in `Result`-mode helpers (see
+[Error handling](09-error-handling.md)).
 
 ---
 

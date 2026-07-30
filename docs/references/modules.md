@@ -57,8 +57,8 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `prelude::test` | `assert` | Yes (every file) |
 | `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
 | `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — write `use ffi::types::*;` |
-| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters | No — write `use io::*;` |
-| `io::net::tcp` | `connect` / `listen` / `accept` / `accept_wait` | No — write `use io::net::tcp::*;` |
+| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters, stream timeouts | No — write `use io::*;` |
+| `io::net::tcp` | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, address helpers, `set_nodelay`, `shutdown` | No — write `use io::net::tcp::*;` |
 | `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — write `use io::net::udp::*;` |
 | `io::net::tls` | *(none)* | Parent namespace only — import `client` / `server` (feature `tls`) |
 | `io::net::tls::client` | `enable` / `disable` | No — write `use io::net::tls::client::*;` (feature `tls`) |

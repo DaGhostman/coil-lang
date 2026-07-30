@@ -9,24 +9,41 @@ use io::*;
 | Export | Kind | Notes |
 |--------|------|-------|
 | `Stream` | Opaque type | Heap handle; closed on GC drop |
-| `IoError` | Builtin enum | `WouldBlock`, `NotFound`, `PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other` |
+| `IoError` | Builtin enum | `WouldBlock`, `NotFound`, `PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other`, `NotADirectory`, `AlreadyExists`, `TimedOut`, `Truncated`, `Certificate`, `Handshake` |
 | `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
 | `read_exact` / `read_to_end` / `write_all` | Sync adapters | May block in the host via `poll` |
+| `set_read_timeout` / `set_write_timeout` | Sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
 | `from_bytes` / `to_bytes` | Text | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`) |
-| `io::net::tcp::{connect,listen,accept,accept_wait}` | TCP | Nested module — `use io::net::tcp::*;` |
+| `io::net::tcp::{connect,connect_timeout,listen,accept,accept_wait,accept_wait_timeout}` | TCP | Nested module — `use io::net::tcp::*;`; timeout `ms <= 0` waits forever |
+| `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
 | `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
-| `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS |
-| `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts |
+| `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS with required opts |
+| `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts, optional mTLS |
 
-`enable(..., { verify: true })` trusts **webpki-roots** only in v1 — no custom CA /
-PEM trust opts yet (private PKI needs a follow-up API or host embedding).
-Server `enable` takes PEM `cert_pem` / `key_pem` on an accepted TCP stream (no
-listen-time TLS; no client certs / mTLS in v1).
+`connect` / `connect_timeout` try **every** DNS result under one absolute
+deadline. `listen` / UDP `bind` still use the first resolved address — prefer
+an explicit IP (e.g. `127.0.0.1`) when family order matters.
 
+Socket / stream soft deadlines and OS `TimedOut` map to `IoError::TimedOut`
+(not `WouldBlock`). Call sites that previously treated timeouts as
+`WouldBlock` should match `TimedOut` instead.
 
-Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
+TLS client enable takes
+`enable(s, host, { verify: bool, ca_pem: Option<string>, ca_path: Option<string>, timeout_ms: int })`.
+When `verify` is true, trust always starts from **webpki-roots**.
+`ca_pem: Option::Some(pem)` and/or `ca_path: Option::Some(path)` **append**
+extra PEM trust anchors (they do not replace the defaults).
+`Option::None` for both leaves webpki alone. `verify: false` skips cert
+**trust** only. `timeout_ms <= 0` means no handshake deadline.
+
+TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string })`
+on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
+non-empty PEM enables mTLS. `timeout_ms <= 0` means no handshake deadline.
+
+Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still
+uses the `PRINT` opcode (not `stdout`). HTTP remains userland (`stdlib/http`).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 

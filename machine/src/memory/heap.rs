@@ -934,6 +934,10 @@ pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
     pub kind: StreamKind,
     pub closed: bool,
+    /// Soft deadline for sync read adapters / TLS handshake reads (`None` = wait forever).
+    pub read_timeout: Option<std::time::Duration>,
+    /// Soft deadline for sync write adapters / TLS handshake writes (`None` = wait forever).
+    pub write_timeout: Option<std::time::Duration>,
     /// Optional rustls session (client or server; only for [`StreamKind::Tls`]).
     #[cfg(feature = "tls")]
     pub tls: Option<Box<crate::tls::TlsSession>>,

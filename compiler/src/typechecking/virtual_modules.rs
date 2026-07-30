@@ -152,14 +152,22 @@ pub enum IoBuiltin {
     ReadExact,
     ReadToEnd,
     WriteAll,
+    SetReadTimeout,
+    SetWriteTimeout,
     /// Decode `[byte]` as UTF-8 → `Result<string, IoError>`.
     FromBytes,
     /// Encode `string` → `[byte]` (UTF-8).
     ToBytes,
     TcpConnect,
+    TcpConnectTimeout,
     TcpListen,
     TcpAccept,
     TcpAcceptWait,
+    TcpAcceptWaitTimeout,
+    TcpPeerAddr,
+    TcpLocalAddr,
+    TcpSetNodelay,
+    TcpShutdown,
     /// Bind a UDP datagram socket (`host`, `port`; `port` may be `0`).
     UdpBind,
     /// Create a connected UDP socket toward (`host`, `port`).
@@ -200,12 +208,20 @@ impl IoBuiltin {
             Self::ReadExact => "read_exact",
             Self::ReadToEnd => "read_to_end",
             Self::WriteAll => "write_all",
+            Self::SetReadTimeout => "set_read_timeout",
+            Self::SetWriteTimeout => "set_write_timeout",
             Self::FromBytes => "from_bytes",
             Self::ToBytes => "to_bytes",
             Self::TcpConnect => "connect",
+            Self::TcpConnectTimeout => "connect_timeout",
             Self::TcpListen => "listen",
             Self::TcpAccept => "accept",
             Self::TcpAcceptWait => "accept_wait",
+            Self::TcpAcceptWaitTimeout => "accept_wait_timeout",
+            Self::TcpPeerAddr => "peer_addr",
+            Self::TcpLocalAddr => "local_addr",
+            Self::TcpSetNodelay => "set_nodelay",
+            Self::TcpShutdown => "shutdown",
             Self::UdpBind => "bind",
             Self::UdpConnect => "connect",
             Self::UdpSendTo => "send_to",
@@ -232,12 +248,20 @@ impl IoBuiltin {
             | Self::ReadExact
             | Self::ReadToEnd
             | Self::WriteAll
+            | Self::SetReadTimeout
+            | Self::SetWriteTimeout
             | Self::FromBytes
             | Self::ToBytes => self.as_str(),
             Self::TcpConnect => "tcp_connect",
+            Self::TcpConnectTimeout => "tcp_connect_timeout",
             Self::TcpListen => "tcp_listen",
             Self::TcpAccept => "tcp_accept",
             Self::TcpAcceptWait => "tcp_accept_wait",
+            Self::TcpAcceptWaitTimeout => "tcp_accept_wait_timeout",
+            Self::TcpPeerAddr => "tcp_peer_addr",
+            Self::TcpLocalAddr => "tcp_local_addr",
+            Self::TcpSetNodelay => "tcp_set_nodelay",
+            Self::TcpShutdown => "tcp_shutdown",
             Self::UdpBind => "udp_bind",
             Self::UdpConnect => "udp_connect",
             Self::UdpSendTo => "udp_send_to",
@@ -268,6 +292,8 @@ impl IoBuiltin {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::SetReadTimeout,
+            Self::SetWriteTimeout,
             Self::FromBytes,
             Self::ToBytes,
         ]
@@ -277,9 +303,15 @@ impl IoBuiltin {
     pub fn tcp() -> &'static [IoBuiltin] {
         &[
             Self::TcpConnect,
+            Self::TcpConnectTimeout,
             Self::TcpListen,
             Self::TcpAccept,
             Self::TcpAcceptWait,
+            Self::TcpAcceptWaitTimeout,
+            Self::TcpPeerAddr,
+            Self::TcpLocalAddr,
+            Self::TcpSetNodelay,
+            Self::TcpShutdown,
         ]
     }
 
@@ -331,12 +363,20 @@ impl IoBuiltin {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::SetReadTimeout,
+            Self::SetWriteTimeout,
             Self::FromBytes,
             Self::ToBytes,
             Self::TcpConnect,
+            Self::TcpConnectTimeout,
             Self::TcpListen,
             Self::TcpAccept,
             Self::TcpAcceptWait,
+            Self::TcpAcceptWaitTimeout,
+            Self::TcpPeerAddr,
+            Self::TcpLocalAddr,
+            Self::TcpSetNodelay,
+            Self::TcpShutdown,
             Self::UdpBind,
             Self::UdpConnect,
             Self::UdpSendTo,
@@ -1024,6 +1064,12 @@ mod tests {
         assert_eq!(IoBuiltin::UdpBind.native_name(), "udp_bind");
         assert_eq!(IoBuiltin::TcpConnect.as_str(), "connect");
         assert_eq!(IoBuiltin::TcpConnect.native_name(), "tcp_connect");
+        assert_eq!(
+            IoBuiltin::TcpConnectTimeout.native_name(),
+            "tcp_connect_timeout"
+        );
+        assert_eq!(IoBuiltin::TcpPeerAddr.as_str(), "peer_addr");
+        assert_eq!(IoBuiltin::TcpSetNodelay.native_name(), "tcp_set_nodelay");
     }
 
     #[cfg(feature = "tls")]
@@ -1130,9 +1176,18 @@ mod tests {
         let exports = vm.resolve_glob(&["io".into()]).expect("io");
         assert!(exports.iter().any(|e| e.short_name() == "open"));
         assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
+        assert!(exports.iter().any(|e| e.short_name() == "set_read_timeout"));
+        assert!(exports.iter().any(|e| e.short_name() == "set_write_timeout"));
         assert!(!exports.iter().any(|e| e.short_name() == "bind"));
         assert!(!exports.iter().any(|e| e.short_name() == "listen"));
-        assert!(vm.resolves_use(&["io".into(), "net".into(), "tcp".into()], "*"));
+        let tcp_path = ["io".into(), "net".into(), "tcp".into()];
+        assert!(vm.resolves_use(&tcp_path, "*"));
+        assert!(vm.resolves_use(&tcp_path, "connect_timeout"));
+        assert!(vm.resolves_use(&tcp_path, "accept_wait_timeout"));
+        assert!(vm.resolves_use(&tcp_path, "peer_addr"));
+        assert!(vm.resolves_use(&tcp_path, "local_addr"));
+        assert!(vm.resolves_use(&tcp_path, "set_nodelay"));
+        assert!(vm.resolves_use(&tcp_path, "shutdown"));
     }
 
     #[test]
