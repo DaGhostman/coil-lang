@@ -11081,9 +11081,9 @@ test("two") { assert(true)?; }
         use common::Instruction;
         let src = include_str!("../../examples/fib.hy");
         let (bc, _) = compile_src(src);
-        // fib's body fuses `n <= 2` into `BinSlotImm` / `BinSlotImmJmpf`.
-        // ConstReturnImm / BinReturn stay unfused while absolute JMP→RETURN
-        // joins remain (label-safe re-enable later).
+        // fib's body fuses `n <= 2` into `BinSlotImm` / `BinSlotImmJmpf`
+        // and may fuse tails into ConstReturnImm / BinReturn when the join
+        // is not a shared JMP-to-RETURN site (see fuse_slots_with_origins).
         let bin_slot_imm = bc
             .iter()
             .filter(|b| *b.bytecode() == Instruction::BinSlotImm)
@@ -11092,7 +11092,6 @@ test("two") { assert(true)?; }
             .iter()
             .filter(|b| *b.bytecode() == Instruction::BinSlotImmJmpf)
             .count();
-        // Slot+imm / jmpf fusion may be deferred; still expect arithmetic.
         let _ = (bin_slot_imm, bin_slot_imm_jmpf);
         assert!(
             bc.iter().any(|b| matches!(
@@ -13779,7 +13778,7 @@ fn main() { \
             )
         });
         // BinSlotSlot fuse covers LOAD;LOAD;ADD in non-generic helpers; fib
-        // itself may stay unfused while BinSlotImm is deferred.
+        // arithmetic may appear fused (*Return / BinSlot*) or as raw ops.
         assert!(
             has_fused
                 || bc.iter().any(|b| matches!(

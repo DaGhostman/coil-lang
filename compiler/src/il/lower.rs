@@ -182,15 +182,16 @@ fn fuse_slots_with_origins(
         // Do not fuse a window that would pull an op with an incoming
         // label / absolute jump into a fused superinstruction with a
         // preceding op (match joins, attr-inlined absolute JMP→RETURN).
-        // *Return fusions also refuse a label on window[0]: JMP-to-join
+        // *Return fusions also refuse a join on window[0]: JMP-to-join
         // lands on ConstReturnImm/LoadReturnSlot/BinReturn and ignores
-        // the stacked arm value.
+        // the stacked arm value (label bind or absolute JMP target).
         let mut fused = None;
         if let Some((f, window)) = try_fuse_slots(&slots[i..], pool) {
             let crosses_label = (1..window).any(|k| binds_at.contains_key(&(i + k)));
             let crosses_abs = (1..window).any(|k| abs_jump_targets.contains(&(i + k)));
-            let return_at_label = slot_is_return_fusion(&f) && binds_at.contains_key(&i);
-            if !crosses_label && !crosses_abs && !return_at_label {
+            let return_at_join = slot_is_return_fusion(&f)
+                && (binds_at.contains_key(&i) || abs_jump_targets.contains(&i));
+            if !crosses_label && !crosses_abs && !return_at_join {
                 fused = Some((f, window));
             }
         }
@@ -246,9 +247,9 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
         if let Some(fused) = try_fold_const_bin_local(&w, pool) {
             return Some((Slot::Byte(fused, window[0].loc()), 3));
         }
-        // BinSlotImm deferred: attr-inlined / for-step fusion mis-resolves
-        // some Entry PCs (see wrap_for CALL→bare RETURN). Re-enable with
-        // stronger entry-label soak.
+        if let Some(fused) = try_fuse_bin_slot_imm_local(&w) {
+            return Some((Slot::Byte(fused, window[0].loc()), 3));
+        }
         if let Some(fused) = try_fuse_bin_slot_slot_local(&w) {
             return Some((Slot::Byte(fused, window[0].loc()), 3));
         }
@@ -282,8 +283,20 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
             ));
         }
     }
-    // *Return fusions deferred: even with label-on-window[0] barriers,
-    // attr-inline JMP→RETURN joins still mis-return (wrap_if → 0).
+    if window.len() >= 2
+        && let (Some(a), Some(b)) = (slot_as_byte(&window[0]), slot_as_byte(&window[1]))
+    {
+        let w = [a, b];
+        if let Some(fused) = try_fuse_load_return_local(&w) {
+            return Some((Slot::Byte(fused, window[0].loc()), 2));
+        }
+        if let Some(fused) = try_fuse_const_return_local(&w) {
+            return Some((Slot::Byte(fused, window[0].loc()), 2));
+        }
+        if let Some(fused) = try_fuse_bin_return_local(&w) {
+            return Some((Slot::Byte(fused, window[0].loc()), 2));
+        }
+    }
     None
 }
 
@@ -489,7 +502,6 @@ fn load_slot(byte: &Byte) -> Option<u8> {
     Some(slot as u8)
 }
 
-#[allow(dead_code)] // re-enable with try_fuse_slots once attr Entry PCs soak
 fn try_fuse_bin_slot_imm_local(window: &[Byte; 3]) -> Option<Byte> {
     let slot = load_slot(&window[0])?;
     let imm = i16::try_from(const_inline_value(&window[1])?).ok()?;
@@ -530,7 +542,6 @@ fn try_fold_const_bin_local(window: &[Byte; 3], pool: &mut Vec<u64>) -> Option<B
     Some(Byte::new(Instruction::CONST).with_const_pool(idx as u32))
 }
 
-#[allow(dead_code)] // paired with deferred *Return fuse-select
 fn try_fuse_load_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let slot = load_slot(&window[0])?;
     if *window[1].bytecode() != Instruction::RETURN {
@@ -539,7 +550,6 @@ fn try_fuse_load_return_local(window: &[Byte; 2]) -> Option<Byte> {
     Some(Byte::new(Instruction::LoadReturnSlot).with_operand_u32(slot as u32))
 }
 
-#[allow(dead_code)]
 fn try_fuse_const_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let value = const_inline_value(&window[0])?;
     if *window[1].bytecode() != Instruction::RETURN {
@@ -548,7 +558,6 @@ fn try_fuse_const_return_local(window: &[Byte; 2]) -> Option<Byte> {
     Some(Byte::new(Instruction::ConstReturnImm).with_operand_u32(value as u32))
 }
 
-#[allow(dead_code)]
 fn try_fuse_bin_return_local(window: &[Byte; 2]) -> Option<Byte> {
     let op = *window[0].bytecode();
     if !is_bin_op(op) {
