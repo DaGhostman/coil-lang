@@ -350,6 +350,10 @@ mod tests {
             5 => Some(IoErrorTag::Other),
             6 => Some(IoErrorTag::NotADirectory),
             7 => Some(IoErrorTag::AlreadyExists),
+            8 => Some(IoErrorTag::TimedOut),
+            9 => Some(IoErrorTag::Truncated),
+            10 => Some(IoErrorTag::Certificate),
+            11 => Some(IoErrorTag::Handshake),
             _ => None,
         }
     }

@@ -20,6 +20,8 @@ pub const BUILTIN_RESULT_VARIANTS: &[&str] = &["Ok", "Err"];
 pub const BUILTIN_IO_ERROR_ENUM: &str = "IoError";
 
 /// `IoError` variants in tag order.
+///
+/// Append-only: existing discriminants must stay stable for match tags.
 pub const BUILTIN_IO_ERROR_VARIANTS: &[&str] = &[
     "WouldBlock",
     "NotFound",
@@ -29,6 +31,10 @@ pub const BUILTIN_IO_ERROR_VARIANTS: &[&str] = &[
     "Other",
     "NotADirectory",
     "AlreadyExists",
+    "TimedOut",
+    "Truncated",
+    "Certificate",
+    "Handshake",
 ];
 
 /// Built-in `CryptoError` enum name (virtual `crypto` module).
