@@ -3503,7 +3503,7 @@ fn classify(IoError e) -> int {
 fn main() {
     let path = "/tmp/coil_tls_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 });
+    let r = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3727,7 +3727,7 @@ use io::net::tls::*;
 fn main() {
     let path = "/tmp/coil_tls_flat.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
 }
 "#,
     );
@@ -3781,7 +3781,7 @@ use io::net::tls::server::*;
 fn main() {
     let path = "/tmp/coil_tls_cross_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { verify: false, ca_pem: "", timeout_ms: 0 })?;
+    let _ = enable(s, { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
 }
 "#,
     );
@@ -3821,7 +3821,7 @@ fn classify(IoError e) -> int {
 fn main() {
     let path = "/tmp/coil_tls_both_ns.bin";
     let s = open(path, "w")?;
-    let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 }) {
+    let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }) {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     };
@@ -3914,7 +3914,7 @@ use io::net::tls::client::*;
 fn main() {
     let path = "/tmp/coil_tls_client_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0, alpn: "h2" })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "h2" })?;
 }
 "#,
     );

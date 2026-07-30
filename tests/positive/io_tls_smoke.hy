@@ -9,7 +9,7 @@ use io::net::tls::server::disable as server_disable;
 test("tls client enable on non-TCP stream is Err") {
     let path = "/tmp/coil_tls_harness.bin";
     let ok = match open(path, "w") {
-        Result::Ok(s) => match client_enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 }) {
+        Result::Ok(s) => match client_enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }) {
             Result::Ok(_) => 0,
             Result::Err(_) => 1,
         },

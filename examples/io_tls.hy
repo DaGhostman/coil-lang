@@ -3,7 +3,7 @@
 // Client:
 //   use io::net::tls::client::*;
 //   let s = connect("example.com", 443)?;
-//   let s = enable(s, "example.com", { verify: true, ca_pem: "", timeout_ms: 0 })?;
+//   let s = enable(s, "example.com", { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
 //   let s = disable(s)?;
 //
 // Server (after accept):
@@ -22,7 +22,7 @@ use io::net::tls::client::*;
 fn main() {
     let path = "/tmp/coil_tls_smoke.bin";
     let s = open(path, "w")?;
-    let msg = match enable(s, "127.0.0.1", { verify: false, ca_pem: "", timeout_ms: 0 }) {
+    let msg = match enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }) {
         Result::Ok(_) => "unexpected-ok",
         Result::Err(_) => "tls-ok",
     };
