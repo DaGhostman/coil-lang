@@ -146,7 +146,7 @@ Client and server share the names `enable` / `disable` under separate modules.
 
 | Module | Function | Behavior |
 |--------|----------|----------|
-| `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify`, `ca_pem`, `timeout_ms` **required** |
+| `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify`, `ca_pem`, `ca_path`, `timeout_ms` **required** |
 | `tls::client` | `disable(s)` | Tear TLS down; plaintext on same fd |
 | `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem`, `key_pem`, `timeout_ms`, `client_ca_pem` **required** |
 | `tls::server` | `disable(s)` | Same teardown as client `disable` |
@@ -156,7 +156,7 @@ use io::net::tcp::*;
 use io::net::tls::client::*;
 
 let s = connect("example.com", 443)?;
-let s = enable(s, "example.com", { verify: true, ca_pem: "", timeout_ms: 0 })?;
+let s = enable(s, "example.com", { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
 let s = disable(s)?;
 ```
 
@@ -169,13 +169,14 @@ let s = enable(s, { cert_pem: cert, key_pem: key, timeout_ms: 0, client_ca_pem: 
 let s = disable(s)?;
 ```
 
-`{ verify: false, ca_pem: "", timeout_ms: 0 }` skips cert **trust** only
+`{ verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }` skips cert **trust** only
 (signatures still checked) — local/dev; never use in production. When
-`verify` is true, empty `ca_pem` uses webpki roots; non-empty `ca_pem`
-**replaces** webpki with that PEM bundle only (include public roots in the
-bundle if you still need them). Server `client_ca_pem: ""` means no mTLS;
-non-empty PEM enables client certificate auth. Empty `{}` / unknown keys are
-rejected, and `timeout_ms <= 0` means no handshake deadline.
+`verify` is true, trust always includes webpki roots; `ca_pem` /
+`ca_path` as `Option::Some(...)` **append** extra PEM anchors (from a
+string or file path). `Option::None` means no extras. Server
+`client_ca_pem: ""` means no mTLS; non-empty PEM enables client certificate
+auth. Empty `{}` / unknown keys are rejected, and `timeout_ms <= 0` means no
+handshake deadline.
 Handshake / TLS failures map to `IoError::Certificate`, `IoError::Handshake`,
 or `IoError::TimedOut`. Prefer a DNS `host` for client SNI. Failed handshakes
 restore non-blocking on the TCP fd.

@@ -30,11 +30,13 @@ Socket / stream soft deadlines and OS `TimedOut` map to `IoError::TimedOut`
 (not `WouldBlock`). Call sites that previously treated timeouts as
 `WouldBlock` should match `TimedOut` instead.
 
-TLS client enable takes `enable(s, host, { verify: bool, ca_pem: string, timeout_ms: int })`.
-When `verify` is true, empty `ca_pem` uses **webpki-roots**; non-empty `ca_pem`
-**replaces** those roots with the PEM trust bundle only (combine PEMs yourself
-if you still need public CAs). `verify: false` skips cert **trust** only.
-`timeout_ms <= 0` means no handshake deadline.
+TLS client enable takes
+`enable(s, host, { verify: bool, ca_pem: Option<string>, ca_path: Option<string>, timeout_ms: int })`.
+When `verify` is true, trust always starts from **webpki-roots**.
+`ca_pem: Option::Some(pem)` and/or `ca_path: Option::Some(path)` **append**
+extra PEM trust anchors (they do not replace the defaults).
+`Option::None` for both leaves webpki alone. `verify: false` skips cert
+**trust** only. `timeout_ms <= 0` means no handshake deadline.
 
 TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string })`
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;

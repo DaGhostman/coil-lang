@@ -2,7 +2,7 @@
 
 Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
 It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
-(`tcp::connect` + `io::net::tls::client::enable(..., { verify: true, ca_pem: "", timeout_ms: 0 })`)
+(`tcp::connect` + `io::net::tls::client::enable(..., { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })`)
 for `https://` — never insecure by default.
 
 ## Setup
@@ -67,7 +67,7 @@ cd examples/projects/04-http && coil test
 The HTTPS path uses webpki roots and no handshake deadline by default:
 
 ```coil
-tls_enable(s, host, { verify: true, ca_pem: "", timeout_ms: 0 })
+tls_enable(s, host, { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })
 ```
 
 ## Limitations (v1)
@@ -85,8 +85,9 @@ tls_enable(s, host, { verify: true, ca_pem: "", timeout_ms: 0 })
 - CR/LF in URL host/path, method, or header names/values → `HttpError::BadUrl`
 - When `Content-Length` exceeds available body bytes → `HttpError::BadResponse`
 - HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
-  certs need raw `tls::client::enable` with either a custom `ca_pem` bundle or
-  `verify: false`; this client always verifies with webpki roots
+  certs need raw `tls::client::enable` with `ca_pem` / `ca_path`
+  (`Option::Some(...)` appends to webpki) or `verify: false`; this client
+  always verifies with webpki roots (no extras)
 
 ### Known compiler note
 
