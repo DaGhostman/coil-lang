@@ -1342,6 +1342,35 @@ mod tests {
     }
 
     #[test]
+    fn tcp_listen_accept_write_all_twice() {
+        let mut heap = Heap::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let fd = listener.into_raw_fd();
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let listen_stream = alloc_stream(&mut heap, owned, StreamKind::TcpListener).unwrap();
+        let reply = make_byte_array(&mut heap, b"ok");
+
+        for round in 0..2 {
+            let client = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let mut buf = [0u8; 2];
+                s.read_exact(&mut buf).unwrap();
+                assert_eq!(&buf, b"ok");
+            });
+
+            let conn = tcp_accept_wait(&mut heap, listen_stream).expect("accept");
+            stream_write_all(&mut heap, conn, reply).expect("write_all");
+            stream_close(&mut heap, conn).unwrap();
+            client.join().unwrap();
+        }
+
+        stream_close(&mut heap, listen_stream).unwrap();
+    }
+
+    #[test]
     fn tcp_connect_timeout_refused_is_error() {
         let mut heap = Heap::default();
         // Port 1 is almost never listening; short timeout still fails fast.

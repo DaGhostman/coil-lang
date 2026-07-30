@@ -2167,6 +2167,166 @@ fn example_io_nested_write_prints_2() {
     assert_eq!(output, "2");
 }
 
+/// `let server = match accept_wait(listener) { … }` inside a loop must handle
+/// multiple connections (binding matches omit the fusion barrier).
+#[test]
+fn while_accept_match_write_handles_two_connections() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time::Duration;
+
+    const PORT: i64 = 41_299;
+    let src = r#"
+use io::*;
+use io::net::tcp::*;
+
+fn main() {
+    let listener = match listen("127.0.0.1", 41299) {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "listen",
+    };
+    let msg: [byte] = [111, 107];
+    let count = 0;
+    while count < 2 {
+        let server = match accept_wait(listener) {
+            Result::Ok(s) => s,
+            Result::Err(_) => panic "accept",
+        };
+        match write_all(server, msg) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => panic "write",
+        };
+        match close(server) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 0,
+        };
+        count = count + 1;
+    }
+    print "ok";
+}
+"#;
+
+    let server = thread::spawn(|| run_example_src(src));
+
+    for round in 0..2 {
+        let mut connected = false;
+        for attempt in 0..80 {
+            match TcpStream::connect(("127.0.0.1", PORT as u16)) {
+                Ok(mut s) => {
+                    let mut buf = [0u8; 2];
+                    s.read_exact(&mut buf).expect("read");
+                    assert_eq!(&buf, b"ok");
+                    connected = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < 80 => thread::sleep(Duration::from_millis(25)),
+                Err(e) => panic!("connect round {round}: {e}"),
+            }
+        }
+        assert!(connected, "server never accepted round {round}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let output = server.join().expect("server thread");
+    assert_eq!(output, "ok");
+}
+
+/// `let x = match …` inside `while` must not corrupt loop locals across iterations.
+#[test]
+fn while_let_result_ok_panic_match_preserves_locals() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let i = 0;
+    let acc = 0;
+    while i < 3 {
+        let v = match Result::Ok(i) {
+            Result::Ok(x) => x,
+            Result::Err(_) => panic "tick",
+        };
+        acc = acc + v;
+        i = i + 1;
+    }
+    print "%i,%i", acc, i;
+}
+"#,
+    );
+    assert_eq!(output, "3,3");
+}
+
+/// Same guard for `for-in` loop bodies (not only `while`).
+#[test]
+fn for_in_let_match_preserves_accumulator() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let items: [int] = [1, 2, 3];
+    let acc = 0;
+    for n in items {
+        let v = match Result::Ok(n) {
+            Result::Ok(x) => x + 1,
+            Result::Err(_) => panic "tick",
+        };
+        acc = acc + v;
+    }
+    print "%i", acc;
+}
+"#,
+    );
+    assert_eq!(output, "9");
+}
+
+/// Err arm in a binding match must still panic with the literal message.
+#[test]
+fn let_result_ok_panic_match_err_path_panics() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+fn main() {
+    let x = match Result::Err(1) {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "accept",
+    };
+    print "%i", x;
+}
+"#,
+        )
+        .expect("compile");
+    let shared = SharedBuf::new();
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared.clone());
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    assert!(machine.panicked(), "expected language-level panic on Err");
+    let _ = machine.restore_output();
+    let s = shared.into_utf8();
+    assert_eq!(s, "panic: accept");
+}
+
+/// `x = match …` reassignment inside a loop uses the same binding-context
+/// match lowering as `let x = match …`.
+#[test]
+fn while_assignment_match_preserves_locals() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let i = 0;
+    let v = 0;
+    while i < 3 {
+        v = match Result::Ok(i) {
+            Result::Ok(x) => x,
+            Result::Err(_) => panic "tick",
+        };
+        i = i + 1;
+    }
+    print "%i", v;
+}
+"#,
+    );
+    assert_eq!(output, "2");
+}
+
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {

@@ -822,6 +822,11 @@ pub struct Compiler {
     current_function_table_key: Option<String>,
     /// Bytecode span `(start, end)` per function for tiny inlining.
     fn_bytecode_spans: HashMap<String, (usize, usize)>,
+
+    /// When true, [`Expression::Match`] omits the trailing `DUPLICATE; POP`
+    /// fusion barrier. Set while compiling a match whose value is consumed
+    /// immediately by `StorePop` / `StoreStatic` (e.g. `let x = match …`).
+    suppress_match_fusion_barrier: bool,
 }
 
 impl Default for Compiler {
@@ -887,6 +892,7 @@ impl Default for Compiler {
             current_function_qualified: None,
             current_function_table_key: None,
             fn_bytecode_spans: HashMap::new(),
+            suppress_match_fusion_barrier: false,
         }
     }
 }
@@ -3060,6 +3066,39 @@ impl Compiler {
             .expect("BlockBuilder::finalize: FFI Result unwrap success label bound");
     }
 
+    /// True when `expr` is a `match` (after peeling `Expr` wrappers).
+    fn rhs_is_match_expr(expr: &Output<'_>) -> bool {
+        matches!(
+            unwrap_expr_output(expr).1.as_ref(),
+            Expression::Match { .. }
+        )
+    }
+
+    /// True when `body` is just the sole pattern binding (e.g. `Ok(x) => x`).
+    fn match_arm_body_is_identity_binding<'a>(
+        pattern: &parser::ast::Pattern<'a>,
+        body: &Output<'a>,
+    ) -> bool {
+        use parser::ast::{Expression, Pattern, PatternPayload};
+        let body_name = match unwrap_expr_output(body).1.as_ref() {
+            Expression::Identifier(n) | Expression::Variable(n, _) => *n,
+            _ => return false,
+        };
+        fn sole_binding<'a>(pattern: &Pattern<'a>) -> Option<&'a str> {
+            match pattern {
+                Pattern::Binding { name } => Some(name),
+                Pattern::Constructor { payload, .. } => match payload {
+                    PatternPayload::Tuple(items) if items.len() == 1 => {
+                        sole_binding(&items[0])
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        sole_binding(pattern) == Some(body_name)
+    }
+
     /// Lower one `%v` argument to a string via the `Show` dictionary /
     /// concrete instance method, leaving an `ObjString` on the stack.
     fn emit_show_for_format_arg(&mut self, arg: &Output) {
@@ -3378,6 +3417,36 @@ impl Compiler {
         if let Some(pack) = pack {
             Self::emit_existential_pack_recipe(bytecode, &pack, &self.checker, &self.functions);
         }
+    }
+
+    /// Compile `expr` into [`Self::bytecode`] for an immediate store (`let` / `=`).
+    fn emit_binding_rhs(&mut self, expr: &Output) {
+        let prev = self.suppress_match_fusion_barrier;
+        self.suppress_match_fusion_barrier = true;
+        let pack = self
+            .checker
+            .existential_pack_for_span(expr.0.start, expr.0.end)
+            .cloned();
+        let mut expr_bc = self.do_compile(expr);
+        self.bytecode.append(&mut expr_bc);
+        if let Some(pack) = pack {
+            Self::emit_existential_pack_recipe(
+                &mut self.bytecode,
+                &pack,
+                &self.checker,
+                &self.functions,
+            );
+        }
+        self.suppress_match_fusion_barrier = prev;
+    }
+
+    /// Like [`Self::append_with_existential_pack`], but match expressions skip
+    /// the join `DUPLICATE; POP` barrier because the value is stored immediately.
+    fn append_binding_rhs(&mut self, bytecode: &mut Vec<Byte>, expr: &Output) {
+        let prev = self.suppress_match_fusion_barrier;
+        self.suppress_match_fusion_barrier = true;
+        self.append_with_existential_pack(bytecode, expr);
+        self.suppress_match_fusion_barrier = prev;
     }
 
     fn load_tuple_field(bytecode: &mut Vec<Byte>, tuple_slot: u32, index: i32) {
@@ -6267,10 +6336,23 @@ impl Compiler {
             }
             // --- `let (a, b) = expr` / `let { x, y } = expr` ---
             Expression::LetDestructure { pattern, rhs } => {
-                self.append_with_existential_pack(&mut bytecode, rhs);
+                let rhs_is_match = Self::rhs_is_match_expr(rhs);
+                if rhs_is_match {
+                    self.emit_binding_rhs(rhs);
+                } else {
+                    self.append_binding_rhs(&mut bytecode, rhs);
+                }
                 let tmp = self.alloc_temp_slot();
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
-                self.emit_let_pattern_binds(pattern, tmp, &mut bytecode);
+                let store = Byte::new(Instruction::StorePop).with_operand_u32(tmp);
+                if rhs_is_match {
+                    self.bytecode.push(store);
+                    let mut binds = Vec::new();
+                    self.emit_let_pattern_binds(pattern, tmp, &mut binds);
+                    self.bytecode.append(&mut binds);
+                } else {
+                    bytecode.push(store);
+                    self.emit_let_pattern_binds(pattern, tmp, &mut bytecode);
+                }
             }
 
             // --- Let / const bindings ---
@@ -6320,7 +6402,12 @@ impl Compiler {
                         // reserved a hole and made bindings land one slot too
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
-                        self.append_with_existential_pack(&mut bytecode, &children[1]);
+                        let rhs_is_match = Self::rhs_is_match_expr(&children[1]);
+                        if rhs_is_match {
+                            self.emit_binding_rhs(&children[1]);
+                        } else {
+                            self.append_binding_rhs(&mut bytecode, &children[1]);
+                        }
                         if is_const {
                             if let Some(val) =
                                 const_fold::eval_expr(&children[1], self.const_env())
@@ -6329,15 +6416,24 @@ impl Compiler {
                             } else {
                                 let slot = self.alloc_binding_slot(&name);
                                 self.context.constants.insert(slot as usize, true);
-                                bytecode.push(
-                                    Byte::new(Instruction::StorePop).with_operand_u32(slot),
-                                );
+                                let store =
+                                    Byte::new(Instruction::StorePop).with_operand_u32(slot);
+                                if rhs_is_match {
+                                    self.bytecode.push(store);
+                                } else {
+                                    bytecode.push(store);
+                                }
                             }
                             is_binding = true;
                         } else {
                             let slot = self.alloc_binding_slot(&name);
-                            bytecode
-                                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                            let store =
+                                Byte::new(Instruction::StorePop).with_operand_u32(slot);
+                            if rhs_is_match {
+                                self.bytecode.push(store);
+                            } else {
+                                bytecode.push(store);
+                            }
                             is_binding = true;
                         }
                     }
@@ -8852,7 +8948,7 @@ impl Compiler {
                 Expression::QualifiedAccess { owner, member } => {
                     let fqn = format!("{}::{}", owner, member);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
-                        self.append_with_existential_pack(&mut bytecode, value);
+                        self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push(
                             Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
                         );
@@ -8865,28 +8961,28 @@ impl Compiler {
                 } if matches!(fields, parser::ast::EnumConstructPayload::Unit) => {
                     let fqn = format!("{}::{}", enum_name, variant_name);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
-                        self.append_with_existential_pack(&mut bytecode, value);
+                        self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push(
                             Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
                         );
                     }
                 }
                 Expression::Access(target_expr, field) => {
-                    self.append_with_existential_pack(&mut bytecode, value);
+                    self.append_binding_rhs(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::SetField));
                 }
                 Expression::Index(arr, None) => {
                     bytecode.append(&mut self.do_compile(arr));
-                    self.append_with_existential_pack(&mut bytecode, value);
+                    self.append_binding_rhs(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::ArrayPush));
                 }
                 Expression::Index(arr, Some(idx)) => {
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
-                    self.append_with_existential_pack(&mut bytecode, value);
+                    self.append_binding_rhs(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
                     bytecode.append(&mut self.do_compile(arr));
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
@@ -8908,7 +9004,7 @@ impl Compiler {
                         .static_slot_index(&resolved)
                         .or_else(|| self.checker.static_slot_for_module_name(name))
                     {
-                        self.append_with_existential_pack(&mut bytecode, value);
+                        self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push(
                             Byte::new(Instruction::StoreStatic).with_operand_u32(static_slot),
                         );
@@ -8947,7 +9043,7 @@ impl Compiler {
                                 self.messages.push(message);
                             }
                         }
-                        self.append_with_existential_pack(&mut bytecode, value);
+                        self.append_binding_rhs(&mut bytecode, value);
                         bytecode
                             .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
                     } else {
@@ -9837,13 +9933,13 @@ impl Compiler {
                         }
                         self.mono_codegen_var_types.push(arm_binding_tys);
 
-                        // Emit the arm body. Borrow-checker
-                        // note: stage the bytes in a local so
-                        // the `&mut self` from `do_compile`
-                        // doesn't overlap with the
-                        // `&mut self.bytecode` from `extend`.
-                        let body_bc = self.do_compile(&arm.body);
-                        self.bytecode.extend(body_bc);
+                        // Emit the arm body unless it is the sole bound name
+                        // (`Ok(x) => x`): JumpIfMatch already left the payload
+                        // on the stack at the binding slot.
+                        if !Self::match_arm_body_is_identity_binding(&arm.pattern, &arm.body) {
+                            let body_bc = self.do_compile(&arm.body);
+                            self.bytecode.extend(body_bc);
+                        }
 
                         self.mono_codegen_var_types.pop();
 
@@ -9868,25 +9964,11 @@ impl Compiler {
                         }
                     }
 
-                    // Bind `end_label` to a join pad that leaves the
-                    // arm value on the stack (Phase P0 — let x =
-                    // match). Do NOT emit RETURN here: that made
-                    // Match a function terminus so Fragment's
-                    // trailing StorePop was unreachable.
-                    //
-                    // Emit DUPLICATE; POP as a fusion barrier so a
-                    // trailing arm `CONST k` is not peephole-fused
-                    // with a following `RETURN` from `return match`
-                    // (that fusion left JMP-to-end targeting the
-                    // removed RETURN slot and skipped the return).
-                    //
-                    // `return match { … }` still works because
-                    // Expression::Return emits its own RETURN after
-                    // the child. Bare Match as a statement is
-                    // discarded by ExprStatement's POP.
                     let end_pos = self.bytecode.len() as u32;
-                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
-                    self.bytecode.push(Byte::new(Instruction::POP));
+                    if !self.suppress_match_fusion_barrier {
+                        self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                        self.bytecode.push(Byte::new(Instruction::POP));
+                    }
                     bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                     // Validate: every label that had a
@@ -10369,13 +10451,19 @@ impl Compiler {
     }
 }
 
-fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+fn unwrap_expr_output<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
     match expr.1.as_ref() {
-        Expression::Identifier(name) => Some(name),
         Expression::Expr(inner)
         | Expression::Group(inner)
         | Expression::Statement(inner)
-        | Expression::ExprStatement(inner) => unwrapped_identifier(inner),
+        | Expression::ExprStatement(inner) => unwrap_expr_output(inner),
+        _ => expr,
+    }
+}
+
+fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+    match unwrap_expr_output(expr).1.as_ref() {
+        Expression::Identifier(name) => Some(name),
         _ => None,
     }
 }
@@ -10680,6 +10768,75 @@ test("two") { assert(true)?; }
                 "bare `yield expr;` must not be followed by POP (would corrupt the next resume)"
             );
         }
+    }
+
+    fn bytecode_has_dup_pop_barrier(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.windows(2).any(|w| {
+            matches!(w[0].bytecode(), Instruction::DUPLICATE)
+                && matches!(w[1].bytecode(), Instruction::POP)
+        })
+    }
+
+    #[test]
+    fn let_match_omits_fusion_barrier() {
+        let (bc, _pool) = compile_src(
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "bad",
+    };
+    print "%i", x;
+}
+"#,
+        );
+        assert!(
+            !bytecode_has_dup_pop_barrier(&bc),
+            "let x = match should omit DUPLICATE;POP fusion barrier"
+        );
+    }
+
+    #[test]
+    fn return_match_keeps_fusion_barrier() {
+        let (bc, _pool) = compile_src(
+            r#"
+enum Option<T> { None, Some(T) }
+fn foo() -> int {
+    return match Option::Some(1) {
+        Option::None => 0,
+        Option::Some(n) => n,
+    };
+}
+"#,
+        );
+        assert!(
+            bytecode_has_dup_pop_barrier(&bc),
+            "return match must keep DUPLICATE;POP for peephole safety"
+        );
+    }
+
+    #[test]
+    fn assignment_match_omits_fusion_barrier() {
+        let (bc, _pool) = compile_src(
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn main() {
+    let x = 0;
+    x = match Result::Ok(1) {
+        Result::Ok(n) => n,
+        Result::Err(_) => panic "bad",
+    };
+    print "%i", x;
+}
+"#,
+        );
+        assert!(
+            !bytecode_has_dup_pop_barrier(&bc),
+            "x = match should omit fusion barrier before StorePop"
+        );
     }
 
     /// Same guard for a bare `yield from expr;` statement.
@@ -12117,11 +12274,6 @@ fn main() {
             "expected ≥2 JUMP_IF_MATCH (outer A + inner Some); got {}",
             jimp_count
         );
-        assert!(
-            pop_count >= 1,
-            "expected ≥1 POP (placeholder for the inner None Unit); got {}",
-            pop_count
-        );
     }
 
     /// Codegen test 17 : Case 1 — wildcard inner
@@ -12373,23 +12525,15 @@ fn main() {
             jimp_count
         );
 
-        // POPs expected:
-        // - 1 from Match's end-label `DUPLICATE; POP` fusion barrier
-        //   (Phase P0 — keeps peephole from fusing last-arm CONST with
-        //   a following RETURN). The reverse pass must NOT add a
-        //   redundant POP for the Unit sub-pattern; None uses
-        //   JUMP_IF_MATCH now, not a test-chain POP.
-        //
-        // Note: `let _ = match x { ... }` is an Assignment (no
-        // ExprStatement wrapper), so it doesn't add another POP.
+        // Binding `let _ = match` omits the fusion-barrier POP; other POPs
+        // may come from wildcard/None arms only.
         let pop_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::POP))
             .count();
-        assert_eq!(
-            pop_count, 1,
-            "expected 1 POP (match end barrier only); got {} (2+ means reverse-pass double-pop regression)",
-            pop_count
+        assert!(
+            pop_count <= 1,
+            "binding match should not add fusion-barrier POP; got {pop_count}"
         );
     }
 
