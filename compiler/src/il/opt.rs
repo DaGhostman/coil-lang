@@ -1062,4 +1062,109 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, IlOp::ConstReturnImm { imm: 0, .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Const { .. })));
     }
+
+    #[test]
+    fn return_convoy_accepts_typed_load_ops() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        return_convoy(&mut ops);
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, IlOp::LoadReturnSlot { slot: 3, .. })));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Load { .. })));
+    }
+
+    #[test]
+    fn bin_join_convoy_accepts_typed_bin_ops() {
+        let mut ops = vec![
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        bin_join_convoy(&mut ops);
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, IlOp::BinReturn { op: Instruction::MUL, .. })));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Bin { .. })));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
+    fn bin_join_convoy_sinks_typed_bin_slot_imm() {
+        let imm = IlOp::BinSlotImm {
+            op: Instruction::ADD as u8,
+            slot: 0,
+            imm: 1,
+            loc: common::DebugLoc::unknown(),
+        };
+        let mut ops = vec![
+            imm.clone(),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            imm,
+            IlOp::Label(Label(0)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        bin_join_convoy(&mut ops);
+        let imm_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::BinSlotImm { .. }))
+            .count();
+        assert_eq!(imm_count, 1);
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
+    fn stack_dce_removes_typed_dup_pop() {
+        let mut ops = vec![
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Halt {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        stack_dce(&mut ops);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], IlOp::Halt { .. }));
+    }
 }

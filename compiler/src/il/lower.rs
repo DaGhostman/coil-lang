@@ -900,4 +900,58 @@ mod tests {
         let mut pool = Vec::new();
         let _ = lower(&ops, &mut pool);
     }
+
+    /// Typed hot-set ops must encode through lower's `as_encode_byte` path and still fuse.
+    #[test]
+    fn lower_fuses_typed_load_const_bin_ops() {
+        let ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ];
+        let mut pool = Vec::new();
+        let lowered = lower(&ops, &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotSlot
+        ));
+        assert!(matches!(
+            *lowered.bytecode[1].bytecode(),
+            Instruction::RETURN
+        ));
+    }
+
+    #[test]
+    fn lower_fuses_typed_const_return() {
+        let ops = vec![
+            IlOp::Const {
+                imm: 11,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ];
+        let mut pool = Vec::new();
+        let lowered = lower(&ops, &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::ConstReturnImm
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u32(), 11);
+    }
 }
