@@ -728,27 +728,41 @@ fn tcp_stream_addr(
     stream: Value,
     peer: bool,
 ) -> Result<(String, i64), IoErrorTag> {
-    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+    let kind = with_stream_mut(heap, stream, |s| -> Result<StreamKind, IoErrorTag> {
         if s.closed || s.fd.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         match s.kind {
-            StreamKind::Tcp | StreamKind::TcpListener => Ok(()),
+            StreamKind::Tcp | StreamKind::TcpListener => Ok(s.kind),
             #[cfg(feature = "tls")]
-            StreamKind::Tls => Ok(()),
+            StreamKind::Tls => Ok(s.kind),
             _ => Err(IoErrorTag::InvalidInput),
         }
     })??;
-    let fd = stream_raw_fd(heap, stream)?;
-    let sock = unsafe { TcpStream::from_raw_fd(fd) };
-    let result = if peer {
-        sock.peer_addr()
-    } else {
-        sock.local_addr()
+    if peer && kind == StreamKind::TcpListener {
+        return Err(IoErrorTag::InvalidInput);
     }
-    .map(format_socket_addr)
-    .map_err(|e| IoErrorTag::from_kind(e.kind()));
-    let _ = sock.into_raw_fd();
+    let fd = stream_raw_fd(heap, stream)?;
+    let result = if kind == StreamKind::TcpListener {
+        let sock = unsafe { TcpListener::from_raw_fd(fd) };
+        let result = sock
+            .local_addr()
+            .map(format_socket_addr)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()));
+        let _ = sock.into_raw_fd();
+        result
+    } else {
+        let sock = unsafe { TcpStream::from_raw_fd(fd) };
+        let result = if peer {
+            sock.peer_addr()
+        } else {
+            sock.local_addr()
+        }
+        .map(format_socket_addr)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()));
+        let _ = sock.into_raw_fd();
+        result
+    };
     result
 }
 
