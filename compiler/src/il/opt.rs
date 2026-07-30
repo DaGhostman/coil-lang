@@ -2001,15 +2001,26 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_sinks_through_label_cluster_non_return() {
-        // Multi-label join: suffix after the whole cluster, before StorePop.
+        // Multi-label join (JMPF diamond so both arms have known SP): sink after cluster.
         let suf = load_const_add_suffix();
-        let mut ops = Vec::new();
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
         ops.extend(suf.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::Unconditional,
             target: Label(54),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Label(Label(1)));
         ops.extend(suf);
         ops.push(IlOp::Label(Label(54)));
         ops.push(IlOp::Label(Label(48)));
