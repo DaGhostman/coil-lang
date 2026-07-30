@@ -1344,8 +1344,6 @@ impl Compiler {
                     | Instruction::JMP
                     | Instruction::JMPF
                     | Instruction::JMPT
-                    | Instruction::BinSlotImm
-                    | Instruction::BinSlotSlot
                     | Instruction::BinReturn
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
@@ -1366,6 +1364,38 @@ impl Compiler {
                 let slot = byte.operand_u32() as usize;
                 let &tmp = temps.get(slot)?;
                 Some(Byte::new(Instruction::LOAD).with_operand_u32(tmp))
+            }
+            _ => None,
+        }
+    }
+
+    /// Remap callee-frame slots in fused `BinSlot*` to caller temps.
+    ///
+    /// Returns `None` if any slot is out of arity or the remapped index exceeds
+    /// the `u8` packing used by these opcodes.
+    fn remap_bin_slot_for_inline(byte: &Byte, temps: &[u32]) -> Option<Byte> {
+        match *byte.bytecode() {
+            Instruction::BinSlotImm => {
+                let (op, slot, imm) = byte.bin_slot_imm_parts();
+                let &tmp = temps.get(slot)?;
+                if tmp > u8::MAX as u32 {
+                    return None;
+                }
+                Some(
+                    Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(op, tmp as u8, imm as i16),
+                )
+            }
+            Instruction::BinSlotSlot => {
+                let (op, a, b) = byte.bin_slot_slot_parts();
+                let &ta = temps.get(a)?;
+                let &tb = temps.get(b)?;
+                if ta > u8::MAX as u32 || tb > u8::MAX as u32 {
+                    return None;
+                }
+                Some(
+                    Byte::new(Instruction::BinSlotSlot)
+                        .with_bin_slot_slot(op, ta as u8, tb as u8),
+                )
             }
             _ => None,
         }
@@ -1418,6 +1448,14 @@ impl Compiler {
                     return false;
                 };
                 bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp));
+            } else if matches!(
+                byte.bytecode(),
+                Instruction::BinSlotImm | Instruction::BinSlotSlot
+            ) {
+                let Some(remapped) = Self::remap_bin_slot_for_inline(byte, &temps) else {
+                    return false;
+                };
+                bytecode.push(remapped);
             } else {
                 bytecode.push(*byte);
             }
@@ -12671,6 +12709,52 @@ fn main() { print \"%i\", add(3, 4); }",
                 .expect("expand");
         assert_eq!(*expanded.bytecode(), Instruction::LOAD);
         assert_eq!(expanded.operand_u32(), 42);
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_bin_slot_slot_body() {
+        use crate::il::IlOp;
+        use common::{Byte, Instruction};
+        let ops = vec![
+            IlOp::byte(
+                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+                    Instruction::ADD as u8,
+                    0,
+                    1,
+                ),
+            ),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        assert!(Compiler::is_tiny_inline_il(&ops));
+    }
+
+    #[test]
+    fn remap_bin_slot_for_inline_rewrites_slots() {
+        use common::{Byte, Instruction};
+        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 0, 3);
+        let remapped =
+            Compiler::remap_bin_slot_for_inline(&imm, &[10]).expect("remap BinSlotImm");
+        let (op, slot, val) = remapped.bin_slot_imm_parts();
+        assert_eq!(op, Instruction::ADD as u8);
+        assert_eq!(slot, 10);
+        assert_eq!(val, 3);
+
+        let slot_slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::SUB as u8,
+            0,
+            1,
+        );
+        let remapped =
+            Compiler::remap_bin_slot_for_inline(&slot_slot, &[7, 9]).expect("remap BinSlotSlot");
+        let (op, a, b) = remapped.bin_slot_slot_parts();
+        assert_eq!(op, Instruction::SUB as u8);
+        assert_eq!(a, 7);
+        assert_eq!(b, 9);
+
+        assert!(
+            Compiler::remap_bin_slot_for_inline(&slot_slot, &[7]).is_none(),
+            "slot past arity must fail closed"
+        );
     }
 
     /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
