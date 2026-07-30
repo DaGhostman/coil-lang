@@ -25,7 +25,7 @@ See [Getting Started](manual/getting-started.md) for prerequisites, project layo
 
 ## How programs run
 
-Parse → typecheck (HM) → stack codegen + peephole → versioned `.hyc` archive (`ARCHIVE_VERSION` **30**) → VM executes `main`. Cached `out.hyc` is reused until sources/version/entry change; delete it to force a rebuild. Full stage notes: [Internals — Pipeline](internals/pipeline.md).
+Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned `.hyc` archive (`ARCHIVE_VERSION` **30**) → VM executes `main`. Cached `out.hyc` is reused until sources/version/entry change; delete it to force a rebuild. Full stage notes: [Internals — Pipeline](internals/pipeline.md).
 
 ## Language at a glance
 
@@ -96,7 +96,7 @@ Classes (`class`, `impl`, `new`) — see [02 — Types & Variables](manual/tutor
 coil/
 ├── common/          # Shared types: opcodes, values, archive format
 ├── parser/          # Pratt parser and AST
-├── compiler/        # HM typechecker, codegen, pipeline, peephole
+├── compiler/        # HM typechecker, stack IL codegen, pipeline
 ├── machine/         # VM, heap/GC, FFI (libffi)
 ├── examples/        # Runnable .hy demos (see manual/examples.md)
 │   └── projects/    # Showcase multi-file apps + co-located tests
