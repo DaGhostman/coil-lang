@@ -195,9 +195,7 @@ fn fuse_producer_with_return(producer: common::Byte) -> common::Byte {
     }
 }
 
-/// Producer must sit immediately before `idx` (no intervening labels). Skipping
-/// labels would attribute an outer join's CONST/LOAD to a later `Label; RETURN`
-/// bind and fuse away a stacked arm value (Ord Lt diamond).
+/// Producer must sit immediately before `idx` (no intervening labels).
 fn immediate_producer_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byte)> {
     if idx == 0 {
         return None;
@@ -208,22 +206,47 @@ fn immediate_producer_before(ops: &[IlOp], idx: usize) -> Option<(usize, common:
     }
 }
 
-/// Sink identical `LOAD`/`CONST` producers into `Label(L); RETURN` and fuse to
-/// `LoadReturnSlot` / `ConstReturnImm`, rebinding `L` onto the fused op.
+/// Labels from `start` through `end` inclusive (all must be `Label`).
+fn label_cluster_ids(ops: &[IlOp], start: usize, end: usize) -> Vec<Label> {
+    (start..=end)
+        .filter_map(|i| match &ops[i] {
+            IlOp::Label(l) => Some(*l),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Sink identical `LOAD`/`CONST` producers into a return-label cluster and fuse
+/// to `LoadReturnSlot` / `ConstReturnImm`.
+///
+/// A cluster is one or more consecutive `Label`s immediately before bare
+/// `RETURN`. The **first** label is the stack join (JMPs target it); trailing
+/// labels are PC aliases (e.g. `Label(join); Label(ret); RETURN`).
 fn return_convoy(ops: &mut Vec<IlOp>) {
-    let mut joins: Vec<(usize, Label, common::Byte)> = Vec::new();
-    let mut i = 0;
-    while i + 1 < ops.len() {
-        let IlOp::Label(join) = ops[i] else {
-            i += 1;
-            continue;
-        };
-        if !ops[i + 1].is_plain_return() {
-            i += 1;
+    // (cluster_start, cluster_end, join, producer)
+    let mut joins: Vec<(usize, usize, Label, common::Byte)> = Vec::new();
+    let mut r = 0usize;
+    while r < ops.len() {
+        if !ops[r].is_plain_return() {
+            r += 1;
             continue;
         }
-        let Some((_, fall_p)) = immediate_producer_before(ops, i) else {
-            i += 1;
+        if r == 0 || !matches!(ops[r - 1], IlOp::Label(_)) {
+            r += 1;
+            continue;
+        }
+        let cluster_end = r - 1;
+        let mut cluster_start = cluster_end;
+        while cluster_start > 0 && matches!(ops[cluster_start - 1], IlOp::Label(_)) {
+            cluster_start -= 1;
+        }
+        let IlOp::Label(join) = ops[cluster_start] else {
+            r += 1;
+            continue;
+        };
+        let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
+        let Some((_, fall_p)) = immediate_producer_before(ops, cluster_start) else {
+            r += 1;
             continue;
         };
 
@@ -238,7 +261,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             else {
                 continue;
             };
-            if *target != join {
+            if !cluster.iter().any(|l| l == target) {
                 continue;
             }
             if *kind != IlJumpKind::Unconditional {
@@ -256,12 +279,12 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             jump_preds += 1;
         }
         if !ok || jump_preds == 0 {
-            i += 1;
+            r += 1;
             continue;
         }
 
-        joins.push((i, join, fall_p));
-        i += 1;
+        joins.push((cluster_start, cluster_end, join, fall_p));
+        r += 1;
     }
 
     if joins.is_empty() {
@@ -270,11 +293,13 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
 
     let mut remove_producer_at: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    let mut fuse_at_label: std::collections::HashMap<usize, common::Byte> =
+    // cluster_start → fused byte; keep all labels in [start,end], replace RETURN
+    let mut fuse_at_cluster: std::collections::HashMap<usize, (usize, common::Byte)> =
         std::collections::HashMap::new();
 
-    for (lab_idx, join, producer) in &joins {
-        if let Some((fall_idx, p)) = immediate_producer_before(ops, *lab_idx)
+    for (cluster_start, cluster_end, join, producer) in &joins {
+        let cluster = label_cluster_ids(ops, *cluster_start, *cluster_end);
+        if let Some((fall_idx, p)) = immediate_producer_before(ops, *cluster_start)
             && p == *producer
         {
             remove_producer_at.insert(fall_idx);
@@ -285,14 +310,18 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
                 target,
                 ..
             } = op
-                && *target == *join
+                && cluster.iter().any(|l| l == target)
                 && let Some((p_idx, p)) = immediate_producer_before(ops, j)
                 && p == *producer
             {
                 remove_producer_at.insert(p_idx);
             }
         }
-        fuse_at_label.insert(*lab_idx, fuse_producer_with_return(*producer));
+        let _ = join;
+        fuse_at_cluster.insert(
+            *cluster_start,
+            (*cluster_end, fuse_producer_with_return(*producer)),
+        );
     }
 
     let mut out = Vec::with_capacity(ops.len());
@@ -302,10 +331,13 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             idx += 1;
             continue;
         }
-        if let Some(fused) = fuse_at_label.get(&idx) {
-            out.push(ops[idx].clone());
-            out.push(IlOp::byte(*fused));
-            idx += 2;
+        if let Some(&(cluster_end, fused)) = fuse_at_cluster.get(&idx) {
+            // Keep Label cluster, replace following RETURN with fused.
+            for k in idx..=cluster_end {
+                out.push(ops[k].clone());
+            }
+            out.push(IlOp::byte(fused));
+            idx = cluster_end + 2; // skip cluster + RETURN
             continue;
         }
         out.push(ops[idx].clone());
@@ -491,9 +523,8 @@ mod tests {
     }
 
     #[test]
-    fn return_convoy_skips_producer_behind_intervening_label() {
-        // Match/if join binds Label(54) on the stacked value; Label(48) is a
-        // second bind before RETURN. Must not attribute CONST to Label(48).
+    fn return_convoy_skips_disagreeing_consts_in_label_cluster() {
+        // Ord-shaped: Label(join); Label(ret); RETURN with mixed CONST 0/1.
         let mut ops = vec![
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
             IlOp::Jump {
@@ -515,5 +546,57 @@ mod tests {
         let before = ops.clone();
         return_convoy(&mut ops);
         assert!(ops == before);
+    }
+
+    #[test]
+    fn return_convoy_fuses_agreeing_const_through_label_cluster() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(54),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Label(Label(54)),
+            IlOp::Label(Label(48)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ConstReturnImm
+        )));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(54)))));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(48)))));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::CONST
+            )),
+            "producers should be stripped"
+        );
+    }
+
+    #[test]
+    fn return_convoy_fuses_agreeing_load_through_label_cluster() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::LOAD).with_operand_u32(2)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::LOAD).with_operand_u32(2)),
+            IlOp::Label(Label(1)),
+            IlOp::Label(Label(9)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::LoadReturnSlot
+                && byte.operand_u32() == 2
+        )));
     }
 }
