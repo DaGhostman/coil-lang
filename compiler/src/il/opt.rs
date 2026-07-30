@@ -618,7 +618,7 @@ mod tests {
         ];
         let before = ops.clone();
         stack_dce(&mut ops);
-        assert_eq!(ops, before);
+        assert!(ops == before);
     }
 
     #[test]
