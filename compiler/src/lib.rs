@@ -11184,10 +11184,6 @@ fn main() {
     /// emits a cascade of `JUMP_IF_MATCH` instructions
     /// (one per non-last constructor arm).
     #[test]
-    /// Codegen test 2: a `match` with multiple constructor arms
-    /// emits a cascade of `JUMP_IF_MATCH` instructions
-    /// (one per non-last constructor arm).
-    #[test]
     fn match_emits_jump_if_match_cascade() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
