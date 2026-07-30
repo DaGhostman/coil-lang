@@ -257,7 +257,11 @@ impl CodeBuf {
             }
         }
         self.il.ops_mut().truncate(keep);
-        self.entry_at_offset.retain(|&pc, _| pc < code_len);
+        // Keep entries bound at `code_len` (next-emit PC). `discard_compile` of
+        // a const-`if` condition often truncates back to a function's entry PC;
+        // `pc < code_len` would drop that bind and leave later CALLs as stale
+        // absolute PCs (breaks under BinSlotImm fusion).
+        self.entry_at_offset.retain(|&pc, _| pc <= code_len);
     }
 
     /// Plain bytes in the emitting-op range `[start, end)` (labels skipped).
@@ -350,5 +354,27 @@ impl CodeBuf {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::Instruction;
+
+    #[test]
+    fn truncate_keeps_entry_bound_at_code_len() {
+        let mut buf = CodeBuf::new();
+        let label = buf.bind_fresh_entry();
+        let pc = buf.len();
+        assert_eq!(buf.entry_label_for_offset(pc), Some(label));
+        // Simulate discard_compile at a function entry (const-if cond).
+        buf.push(Byte::new(Instruction::CONST).with_operand_u32(1));
+        buf.truncate(pc);
+        assert_eq!(
+            buf.entry_label_for_offset(pc),
+            Some(label),
+            "entry at truncate point must survive for CALL→Entry rewrite"
+        );
     }
 }
