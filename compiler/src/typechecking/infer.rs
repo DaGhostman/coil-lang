@@ -1105,9 +1105,11 @@ impl Checker {
             IoBuiltin::TcpShutdown => fun(&[stream, int()], res_unit),
             #[cfg(feature = "tls")]
             IoBuiltin::TlsClientEnable => {
+                let opt_string = option_app_ty(string());
                 let opts = record(vec![
                     ("verify".into(), boolean()),
-                    ("ca_pem".into(), string()),
+                    ("ca_pem".into(), opt_string.clone()),
+                    ("ca_path".into(), opt_string),
                     ("timeout_ms".into(), int()),
                 ]);
                 fun(&[stream, string(), opts], res_stream)
