@@ -2172,7 +2172,7 @@ fn example_io_nested_write_prints_2() {
 /// corrupts locals and breaks IO such as `accept_wait` + `write_all` loops.
 #[test]
 fn while_accept_match_write_handles_two_connections() {
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;
