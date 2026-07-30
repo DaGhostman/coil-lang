@@ -1094,14 +1094,14 @@ impl Checker {
             }
             IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
             #[cfg(feature = "tls")]
-            IoBuiltin::TlsEnable => {
+            IoBuiltin::TlsClientEnable => {
                 let opts = record(vec![("verify".into(), boolean())]);
                 fun(&[stream, string(), opts], res_stream)
             }
             #[cfg(feature = "tls")]
-            IoBuiltin::TlsDisable => fun(&[stream], res_stream),
+            IoBuiltin::TlsClientDisable => fun(&[stream], res_stream),
             #[cfg(feature = "tls")]
-            IoBuiltin::TlsEncrypt => {
+            IoBuiltin::TlsServerEnable => {
                 let opts = record(vec![
                     ("cert_pem".into(), string()),
                     ("key_pem".into(), string()),
@@ -1109,7 +1109,7 @@ impl Checker {
                 fun(&[stream, opts], res_stream)
             }
             #[cfg(feature = "tls")]
-            IoBuiltin::TlsDecrypt => fun(&[stream], res_stream),
+            IoBuiltin::TlsServerDisable => fun(&[stream], res_stream),
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
                 fun(&[string(), int()], res_stream)
             }

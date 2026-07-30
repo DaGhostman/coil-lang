@@ -55,7 +55,6 @@ fn run_example_src(src: &str) -> String {
     run_example_src_with_entry(src, None)
 }
 
-/// Escape a Rust string for embedding in a coil `"…"` literal (`\n`, `\\`, `\"`).
 #[cfg(feature = "tls")]
 fn coil_escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -3431,14 +3430,14 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
-/// HostInvoke + virtual `io::net::tls`: enable on non-TCP → InvalidInput.
+/// HostInvoke + `io::net::tls::client`: enable on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_non_tcp_is_err_via_host_invoke() {
+fn tls_client_enable_non_tcp_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn classify(IoError e) -> int {
     return match e {
@@ -3468,14 +3467,14 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// HostInvoke wiring for `tls_disable` on a non-TLS stream → InvalidInput.
+/// HostInvoke wiring for client `disable` on a non-TLS stream → Err.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_disable_on_tcp_is_invalid_input_via_host_invoke() {
+fn tls_client_disable_on_file_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn disable_file_is_err() -> int {
     let path = "/tmp/coil_tls_disable_kind.bin";
@@ -3496,15 +3495,15 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// Two-arg `enable` is not a complete call (needs opts record).
+/// Two-arg client `enable` is not a complete call (needs opts record).
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_two_arg_does_not_compile() {
+fn tls_client_enable_two_arg_does_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn main() {
     let path = "/tmp/coil_tls_arity.bin";
@@ -3516,15 +3515,15 @@ fn main() {
     assert!(err.is_err(), "2-arg enable should fail to typecheck as Result");
 }
 
-/// Third arg to `enable` must be a record with `verify: bool`.
+/// Third arg to client `enable` must be a record with `verify: bool`.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_non_record_opts_does_not_compile() {
+fn tls_client_enable_non_record_opts_does_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn main() {
     let path = "/tmp/coil_tls_opts.bin";
@@ -3536,15 +3535,15 @@ fn main() {
     assert!(err.is_err(), "non-record opts should fail to typecheck");
 }
 
-/// Empty opts `{}` omit required `verify` → type error.
+/// Empty client opts `{}` omit required `verify` → type error.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_empty_opts_does_not_compile() {
+fn tls_client_enable_empty_opts_does_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn main() {
     let path = "/tmp/coil_tls_empty_opts.bin";
@@ -3556,17 +3555,18 @@ fn main() {
     assert!(err.is_err(), "empty opts should fail to typecheck");
 }
 
-/// HostInvoke: `encrypt` on non-TCP with valid PEM → InvalidInput (kind check).
+/// HostInvoke: server `enable` on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_encrypt_non_tcp_is_err_via_host_invoke() {
+fn tls_server_enable_non_tcp_is_err_via_host_invoke() {
+    // Valid PEM so InvalidInput comes from StreamKind (not PEM parse).
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let cert_pem = coil_escape_string(&cert.cert.pem());
     let key_pem = coil_escape_string(&cert.key_pair.serialize_pem());
     let src = format!(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::server::*;
 
 fn classify(IoError e) -> int {{
     return match e {{
@@ -3582,9 +3582,9 @@ fn classify(IoError e) -> int {{
 }}
 
 fn main() {{
-    let path = "/tmp/coil_tls_encrypt_kind.bin";
+    let path = "/tmp/coil_tls_server_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = encrypt(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}" }});
+    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}" }});
     let code = match r {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3597,14 +3597,157 @@ fn main() {{
     assert_eq!(output, "1");
 }
 
-/// HostInvoke: empty PEM strings typecheck but fail at runtime → InvalidInput.
+/// HostInvoke: server `disable` on non-TLS → Err.
 #[cfg(feature = "tls")]
 #[test]
-fn tls_encrypt_empty_pem_is_invalid_input_via_host_invoke() {
+fn tls_server_disable_on_file_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_server_disable_kind.bin";
+    let code = match open(path, "w") {
+        Result::Ok(s) => match disable(s) {
+            Result::Ok(_) => 0,
+            Result::Err(_) => 1,
+        },
+        Result::Err(_) => 9,
+    };
+    print "%i", code;
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// Server `enable` opts must be the cert/key record (not an int).
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_non_record_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_server_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, 1)?;
+}
+"#,
+    );
+    assert!(err.is_err(), "non-record server enable opts should fail");
+}
+
+/// Empty server `enable` opts omit required PEM keys → type error.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_empty_opts_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_server_empty.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, {})?;
+}
+"#,
+    );
+    assert!(err.is_err(), "empty server enable opts should fail");
+}
+
+/// Parent `io::net::tls` exports nothing — flat `enable` must not resolve.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_flat_parent_enable_does_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
 use io::net::tls::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_flat.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, "127.0.0.1", { verify: false })?;
+}
+"#,
+    );
+    assert!(err.is_err(), "flat parent tls::* must not export enable");
+}
+
+/// Legacy `encrypt` / `decrypt` names under server must stay gone.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_legacy_server_encrypt_decrypt_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_legacy_encrypt.bin";
+    let s = open(path, "w")?;
+    let _ = encrypt(s, { cert_pem: "x", key_pem: "y" })?;
+}
+"#,
+    );
+    assert!(err.is_err(), "server::encrypt must not resolve after rename");
+
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_legacy_decrypt.bin";
+    let s = open(path, "w")?;
+    let _ = decrypt(s)?;
+}
+"#,
+    );
+    assert!(err.is_err(), "server::decrypt must not resolve after rename");
+}
+
+/// Same surface name `enable`, different opts records — cross-namespace misuse fails.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_client_opts_on_server_enable_do_not_compile() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn main() {
+    let path = "/tmp/coil_tls_cross_opts.bin";
+    let s = open(path, "w")?;
+    let _ = enable(s, { verify: false })?;
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "server enable must reject client-shaped {{ verify }} opts"
+    );
+}
+
+/// Both namespaces in one program: HostInvoke routes distinct natives.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_client_and_server_enable_both_invalid_input_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::client::enable as client_enable;
+use io::net::tls::server::enable as server_enable;
 
 fn classify(IoError e) -> int {
     return match e {
@@ -3620,9 +3763,51 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_encrypt_empty_pem.bin";
+    let path = "/tmp/coil_tls_both_ns.bin";
     let s = open(path, "w")?;
-    let r = encrypt(s, { cert_pem: "", key_pem: "" });
+    let c = match client_enable(s, "127.0.0.1", { verify: false }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    let s2 = open(path, "w")?;
+    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem" }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    // File stream → InvalidInput for both; distinct natives both wired.
+    print "%i%i", c, sv;
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+/// HostInvoke: empty PEM strings typecheck but fail at runtime → InvalidInput.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_server_enable_empty_pem_is_invalid_input_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tls::server::*;
+
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+    };
+}
+
+fn main() {
+    let path = "/tmp/coil_tls_server_empty_pem.bin";
+    let s = open(path, "w")?;
+    let r = enable(s, { cert_pem: "", key_pem: "" });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -3634,132 +3819,67 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// HostInvoke: `decrypt` on non-TLS → Err.
-#[cfg(feature = "tls")]
-#[test]
-fn tls_decrypt_on_file_is_err_via_host_invoke() {
-    let output = run_example_src(
-        r#"
-use io::*;
-use io::net::tls::*;
-
-fn main() {
-    let path = "/tmp/coil_tls_decrypt_kind.bin";
-    let code = match open(path, "w") {
-        Result::Ok(s) => match decrypt(s) {
-            Result::Ok(_) => 0,
-            Result::Err(_) => 1,
-        },
-        Result::Err(_) => 9,
-    };
-    print "%i", code;
-}
-"#,
-    );
-    assert_eq!(output, "1");
-}
-
-/// `encrypt` opts must be the cert/key record (not an int).
-#[cfg(feature = "tls")]
-#[test]
-fn tls_encrypt_non_record_opts_does_not_compile() {
-    let mut pipeline = Pipeline::new();
-    let err = pipeline.compile_src(
-        r#"
-use io::*;
-use io::net::tls::*;
-
-fn main() {
-    let path = "/tmp/coil_tls_encrypt_opts.bin";
-    let s = open(path, "w")?;
-    let _ = encrypt(s, 1)?;
-}
-"#,
-    );
-    assert!(err.is_err(), "non-record encrypt opts should fail to typecheck");
-}
-
-/// Empty `encrypt` opts omit required PEM keys → type error.
-#[cfg(feature = "tls")]
-#[test]
-fn tls_encrypt_empty_opts_does_not_compile() {
-    let mut pipeline = Pipeline::new();
-    let err = pipeline.compile_src(
-        r#"
-use io::*;
-use io::net::tls::*;
-
-fn main() {
-    let path = "/tmp/coil_tls_encrypt_empty.bin";
-    let s = open(path, "w")?;
-    let _ = encrypt(s, {})?;
-}
-"#,
-    );
-    assert!(err.is_err(), "empty encrypt opts should fail to typecheck");
-}
-
 /// `cert_pem` / `key_pem` must be strings (not ints).
 #[cfg(feature = "tls")]
 #[test]
-fn tls_encrypt_non_string_pem_fields_do_not_compile() {
+fn tls_server_enable_non_string_pem_fields_do_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::server::*;
 
 fn main() {
-    let path = "/tmp/coil_tls_encrypt_pem_ty.bin";
+    let path = "/tmp/coil_tls_server_pem_ty.bin";
     let s = open(path, "w")?;
-    let _ = encrypt(s, { cert_pem: 1, key_pem: 2 })?;
+    let _ = enable(s, { cert_pem: 1, key_pem: 2 })?;
 }
 "#,
     );
     assert!(
         err.is_err(),
-        "non-string encrypt PEM fields should fail to typecheck"
+        "non-string server enable PEM fields should fail to typecheck"
     );
 }
 
 #[cfg(feature = "tls")]
 #[test]
-fn tls_enable_unknown_opts_key_does_not_compile() {
+fn tls_client_enable_unknown_opts_key_does_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn main() {
-    let path = "/tmp/coil_tls_unknown_opts.bin";
+    let path = "/tmp/coil_tls_client_unknown_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", { verify: false, alpn: "h2" })?;
 }
 "#,
     );
-    assert!(err.is_err(), "unknown opts key should fail to typecheck");
+    assert!(err.is_err(), "unknown client opts key should fail to typecheck");
 }
 
 #[cfg(feature = "tls")]
 #[test]
-fn tls_encrypt_unknown_opts_key_does_not_compile() {
+fn tls_server_enable_unknown_opts_key_does_not_compile() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 use io::*;
-use io::net::tls::*;
+use io::net::tls::server::*;
 
 fn main() {
-    let path = "/tmp/coil_tls_encrypt_unknown_opts.bin";
+    let path = "/tmp/coil_tls_server_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = encrypt(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
+    let _ = enable(s, { cert_pem: "c", key_pem: "k", alpn: "h2" })?;
 }
 "#,
     );
     assert!(
         err.is_err(),
-        "unknown encrypt opts key should fail to typecheck"
+        "unknown server enable opts key should fail to typecheck"
     );
 }
 

@@ -17,12 +17,14 @@ use io::*;
 | `from_bytes` / `to_bytes` | Text | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`) |
 | `io::net::tcp::{connect,listen,accept,accept_wait}` | TCP | Nested module — `use io::net::tcp::*;` |
 | `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
-| `io::net::tls::{enable,disable,encrypt,decrypt}` | TLS | Nested module (feature `tls`); in-place TCP↔TLS (client/server); same `Stream` APIs |
+| `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS |
+| `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts |
 
 `enable(..., { verify: true })` trusts **webpki-roots** only in v1 — no custom CA /
 PEM trust opts yet (private PKI needs a follow-up API or host embedding).
-`encrypt` takes PEM `cert_pem` / `key_pem` on an accepted TCP stream (no
+Server `enable` takes PEM `cert_pem` / `key_pem` on an accepted TCP stream (no
 listen-time TLS; no client certs / mTLS in v1).
+
 
 Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 

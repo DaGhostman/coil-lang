@@ -3,7 +3,7 @@
 // multi-glob import bugs across sibling http::* modules.
 use io::*;
 use io::net::tcp::connect as tcp_connect;
-use io::net::tls::enable as tls_enable;
+use io::net::tls::client::enable as tls_enable;
 use http::url::*;
 
 fn open_stream(Url u) -> Result<Stream, HttpError> {
@@ -17,7 +17,7 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
         };
     }
     if scheme == "https" {
-        // Verified TLS only. For local/dev certs use tls::enable(..., { verify: false })
+        // Verified TLS only. For local/dev certs use tls::client::enable(..., { verify: false })
         // directly — this client never skips trust checks.
         let s = match tcp_connect(host, port) {
             Result::Ok(s) => s,

@@ -2,8 +2,8 @@
 
 Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
 It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
-(`tcp::connect` then `io::net::tls::enable(..., { verify: true })`) for
-`https://` — never insecure by default.
+(`tcp::connect` + `io::net::tls::client::enable(..., { verify: true })`) for `https://`
+— never insecure by default.
 
 ## Setup
 
@@ -69,7 +69,7 @@ cd examples/projects/04-http && coil test
 - No redirects, cookies, connection pooling, or timeouts
 - No chunked transfer encoding (uses `Content-Length` or read-to-close)
 - No HTTP/2 / HTTP/3
-- `http::client` requires Cargo feature `tls` (imports `io::net::tls`; default-on)
+- `http::client` requires Cargo feature `tls` (imports `io::net::tls::client`; default-on)
 - IPv6 URL literals are not supported — the first `:` before `/` is the port
 - HTTPS URLs should use a DNS hostname for SNI / cert name checks; literal-IP
   hosts may fail verification depending on the peer certificate
@@ -79,8 +79,8 @@ cd examples/projects/04-http && coil test
 - CR/LF in URL host/path, method, or header names/values → `HttpError::BadUrl`
 - When `Content-Length` exceeds available body bytes → `HttpError::BadResponse`
 - HTTPS against public hosts needs a normal PKI trust path; local MITM/dev
-  certs are out of scope for the demo (`{ verify: false }` is available on the
-  TLS APIs directly, not through this client)
+  certs are out of scope for the demo (use `tls::client::enable(..., { verify: false })`
+  only via TLS APIs directly, not through this client)
 
 ### Known compiler note
 

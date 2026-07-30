@@ -1,21 +1,23 @@
-// TLS via `io::net::tls` (host rustls; Cargo feature `tls`).
+// TLS via `io::net::tls::{client,server}` (host rustls; Cargo feature `tls`).
 //
 // Client:
+//   use io::net::tls::client::*;
 //   let s = connect("example.com", 443)?;
 //   let s = enable(s, "example.com", { verify: true })?;
 //   let s = disable(s)?;
 //
 // Server (after accept):
-//   let s = encrypt(s, { cert_pem: cert, key_pem: key })?;
-//   let s = decrypt(s)?;
+//   use io::net::tls::server::*;
+//   let s = enable(s, { cert_pem: cert, key_pem: key })?;
+//   let s = disable(s)?;
 //
 // Handshake runs in the host; the handle is a normal `Stream`.
-// Machine unit tests cover client enable and server encrypt round-trips
+// Machine unit tests cover client enable and server enable round-trips
 // against local sockets (no public network required).
 //
-// Smoke: enable on a non-TCP stream → Err (InvalidInput).
+// Smoke: client enable on a non-TCP stream → Err (InvalidInput).
 use io::*;
-use io::net::tls::*;
+use io::net::tls::client::*;
 
 fn main() {
     let path = "/tmp/coil_tls_smoke.bin";
