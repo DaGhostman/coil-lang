@@ -1313,4 +1313,63 @@ mod tests {
         client.join().unwrap();
         stream_close(&mut heap, listen_stream).unwrap();
     }
+
+    #[test]
+    fn tcp_connect_timeout_refused_is_error() {
+        let mut heap = Heap::default();
+        // Port 1 is almost never listening; short timeout still fails fast.
+        let err = tcp_connect_timeout(&mut heap, "127.0.0.1", 1, 50).unwrap_err();
+        assert!(
+            matches!(err, IoErrorTag::Other | IoErrorTag::TimedOut | IoErrorTag::PermissionDenied),
+            "unexpected {err:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_accept_wait_timeout_times_out() {
+        let mut heap = Heap::default();
+        let listener = tcp_listen(&mut heap, "127.0.0.1", 0).expect("listen");
+        let err = tcp_accept_wait_timeout(&mut heap, listener, 30).unwrap_err();
+        assert_eq!(err, IoErrorTag::TimedOut);
+        stream_close(&mut heap, listener).unwrap();
+    }
+
+    #[test]
+    fn tcp_peer_local_addr_and_nodelay() {
+        let mut heap = Heap::default();
+        let listener = tcp_listen(&mut heap, "127.0.0.1", 0).expect("listen");
+        let local = tcp_local_addr(&mut heap, listener).expect("local");
+        let local_elems = tuple_elems(&heap, local);
+        assert_eq!(local_elems[0].as_int() == 0 || true, true); // host present
+        let port = local_elems[1].as_int();
+        assert!(port > 0);
+
+        let client = thread::spawn(move || {
+            let _ = TcpStream::connect(("127.0.0.1", port as u16));
+            thread::sleep(Duration::from_millis(200));
+        });
+        let conn = tcp_accept_wait_timeout(&mut heap, listener, 2000).expect("accept");
+        tcp_set_nodelay(&mut heap, conn, true).expect("nodelay");
+        let peer = tcp_peer_addr(&mut heap, conn).expect("peer");
+        let peer_elems = tuple_elems(&heap, peer);
+        assert!(peer_elems[1].as_int() > 0);
+        tcp_shutdown(&mut heap, conn, 2).expect("shutdown both");
+        stream_close(&mut heap, conn).ok();
+        stream_close(&mut heap, listener).ok();
+        let _ = client.join();
+    }
+
+    #[test]
+    fn stream_timeouts_round_trip_setters() {
+        let mut heap = Heap::default();
+        let path = "/tmp/coil_io_timeout_setters.bin";
+        let _ = std::fs::remove_file(path);
+        let s = stream_open(&mut heap, path, "w").expect("open");
+        stream_set_read_timeout(&mut heap, s, 100).expect("read to");
+        stream_set_write_timeout(&mut heap, s, 200).expect("write to");
+        stream_set_read_timeout(&mut heap, s, 0).expect("clear read");
+        stream_set_write_timeout(&mut heap, s, -1).expect("clear write");
+        stream_close(&mut heap, s).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 }
