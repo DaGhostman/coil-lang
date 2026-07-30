@@ -2189,6 +2189,68 @@ fn main() {
     assert_eq!(output, "ok");
 }
 
+/// Deterministic stand-in for the accept_wait loop bug: `let x = match … Ok => x /
+/// Err => panic` inside `while` must not corrupt loop locals across iterations.
+#[test]
+fn while_let_result_ok_panic_match_preserves_locals() {
+    let output = run_example_src(
+        r#"
+enum Result<T, E> { Ok(T), Err(E) }
+
+fn tick(n: int) -> Result<int, string> {
+    if n < 3 {
+        return Result::Ok(n);
+    }
+    return Result::Err("done");
+}
+
+fn main() {
+    let i = 0;
+    let acc = 0;
+    while i < 3 {
+        let v = match tick(i) {
+            Result::Ok(x) => x,
+            Result::Err(_) => panic "tick",
+        };
+        acc = acc + v;
+        i = i + 1;
+    }
+    print "%i,%i", acc, i;
+}
+"#,
+    );
+    assert_eq!(output, "3,3");
+}
+
+/// Lowered Err arm must still abort with the literal panic message.
+#[test]
+fn let_result_ok_panic_match_err_path_panics() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
+
+fn main() {
+    let x = match Result::Err(1) {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "accept",
+    };
+    print "%i", x;
+}
+"#,
+        )
+        .expect("compile");
+    let shared = SharedBuf::new();
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared.clone());
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    assert!(machine.panicked(), "expected language-level panic on Err");
+    let _ = machine.restore_output();
+    let s = shared.into_utf8();
+    assert_eq!(s, "panic: accept");
+}
+
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {

@@ -10800,9 +10800,30 @@ test("two") { assert(true)?; }
         }
     }
 
-    #[test]
-    fn debug_result_ok_panic_match_arms() {
+    fn find_match_arms<'a>(
+        e: &'a parser::ast::Expression<'a>,
+    ) -> Option<&'a [parser::ast::MatchArm<'a>]> {
         use parser::ast::Expression;
+        match e {
+            Expression::Match { arms, .. } => Some(arms),
+            Expression::Program(items) | Expression::Block(items) => {
+                items.iter().find_map(|inner| find_match_arms(inner.1.as_ref()))
+            }
+            Expression::Fragment(items) => items
+                .iter()
+                .find_map(|(_, inner)| find_match_arms(inner.as_ref())),
+            Expression::Statement(inner) | Expression::Expr(inner) => {
+                find_match_arms(inner.1.as_ref())
+            }
+            Expression::Function { body, .. } => {
+                body.as_ref().and_then(|b| find_match_arms(b.1.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn result_ok_panic_match_arms_recognized() {
         let src = r#"
 enum Result<T, E> { Ok(T), Err(E) }
 fn foo() -> Result<int, int> { return Result::Ok(0); }
@@ -10814,25 +10835,7 @@ fn main() {
 }
 "#;
         let ast = Pratt::default().parse(src).expect("parse");
-        fn find_match<'a>(e: &'a Expression<'a>) -> Option<&'a [parser::ast::MatchArm<'a>]> {
-            match e {
-                Expression::Match { arms, .. } => Some(arms),
-                Expression::Program(items) | Expression::Block(items) => items
-                    .iter()
-                    .find_map(|inner| find_match(inner.1.as_ref())),
-                Expression::Fragment(items) => {
-                    items.iter().find_map(|(_, inner)| find_match(inner.as_ref()))
-                }
-                Expression::Statement(inner) | Expression::Expr(inner) => {
-                    find_match(inner.1.as_ref())
-                }
-                Expression::Function { body, .. } => body
-                    .as_ref()
-                    .and_then(|b| find_match(b.1.as_ref())),
-                _ => None,
-            }
-        }
-        let arms = find_match(ast.1.as_ref()).expect("match");
+        let arms = find_match_arms(ast.1.as_ref()).expect("match");
         assert!(
             Compiler::match_is_result_ok_else_panic(arms).is_some(),
             "arms: {:?}",
@@ -10840,7 +10843,66 @@ fn main() {
         );
     }
 
-    /// Same guard for a bare `yield from expr;` statement.
+    #[test]
+    fn result_ok_panic_match_arms_err_first_still_recognized() {
+        let src = r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Err(_) => panic "bad",
+        Result::Ok(s) => s,
+    };
+}
+"#;
+        let ast = Pratt::default().parse(src).expect("parse");
+        let arms = find_match_arms(ast.1.as_ref()).expect("match");
+        assert!(
+            Compiler::match_is_result_ok_else_panic(arms).is_some(),
+            "Err-first Ok-identity panic arms should still lower"
+        );
+    }
+
+    #[test]
+    fn result_ok_panic_match_arms_reject_non_identity_ok() {
+        let src = r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s + 1,
+        Result::Err(_) => panic "bad",
+    };
+}
+"#;
+        let ast = Pratt::default().parse(src).expect("parse");
+        let arms = find_match_arms(ast.1.as_ref()).expect("match");
+        assert!(
+            Compiler::match_is_result_ok_else_panic(arms).is_none(),
+            "Ok body must be the bound name for unwrap lowering"
+        );
+    }
+
+    #[test]
+    fn result_ok_panic_match_arms_reject_err_binding() {
+        let src = r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s,
+        Result::Err(e) => panic "bad",
+    };
+}
+"#;
+        let ast = Pratt::default().parse(src).expect("parse");
+        let arms = find_match_arms(ast.1.as_ref()).expect("match");
+        assert!(
+            Compiler::match_is_result_ok_else_panic(arms).is_none(),
+            "Err binding (not wildcard) must not use unwrap lowering"
+        );
+    }
+
     #[test]
     fn let_result_ok_panic_match_lowers_without_match_barrier() {
         use common::Instruction;
@@ -10869,6 +10931,36 @@ fn main() {
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::JumpIfMatch)),
             "expected JumpIfMatch from lowered unwrap"
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::Panic)),
+            "expected Panic on Err path"
+        );
+    }
+
+    #[test]
+    fn let_result_non_identity_ok_match_keeps_fusion_barrier() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
+fn foo() -> Result<int, int> { return Result::Ok(0); }
+fn main() {
+    let x = match foo() {
+        Result::Ok(s) => s + 1,
+        Result::Err(_) => panic "bad",
+    };
+    print "%i", x;
+}
+"#,
+        );
+        let dup_pop = bc.windows(2).any(|w| {
+            matches!(w[0].bytecode(), Instruction::DUPLICATE)
+                && matches!(w[1].bytecode(), Instruction::POP)
+        });
+        assert!(
+            dup_pop,
+            "non-identity Ok arm must keep full match DUPLICATE;POP barrier"
         );
     }
 
