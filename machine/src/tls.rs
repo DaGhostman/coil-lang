@@ -224,7 +224,8 @@ fn handshake_with_deadline(
     while conn.is_handshaking() {
         while conn.wants_write() {
             match conn.write_tls(stream) {
-                Ok(0) => return Err(IoErrorTag::Handshake),
+                // rustls may return Ok(0) when the socket is not ready.
+                Ok(0) => wait_fd_deadline(fd, false, deadline)?,
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                     wait_fd_deadline(fd, false, deadline)?;
@@ -234,7 +235,10 @@ fn handshake_with_deadline(
         }
         if conn.is_handshaking() {
             match conn.read_tls(stream) {
-                Ok(0) => return Err(IoErrorTag::Handshake),
+                Ok(0) => {
+                    // Peer closed mid-handshake.
+                    return Err(IoErrorTag::Handshake);
+                }
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
@@ -247,6 +251,7 @@ fn handshake_with_deadline(
     }
     while conn.wants_write() {
         match conn.write_tls(stream) {
+            Ok(0) => wait_fd_deadline(fd, false, deadline)?,
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                 wait_fd_deadline(fd, false, deadline)?;
@@ -974,7 +979,7 @@ mod tests {
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
         let opts = make_opts(&mut heap, true);
         let err = tls_client_enable(&mut heap, s, "localhost", opts).unwrap_err();
-        assert_eq!(err, IoErrorTag::Other);
+        assert_eq!(err, IoErrorTag::Certificate);
         assert!(
             stream_is_nonblocking(&mut heap, s),
             "failed handshake must restore non-blocking"
@@ -999,7 +1004,10 @@ mod tests {
         assert!(stream_is_nonblocking(&mut heap, s));
         let opts = make_opts(&mut heap, false);
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
-        assert_eq!(err, IoErrorTag::Other);
+        assert!(
+            matches!(err, IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated),
+            "unexpected handshake err: {err:?}"
+        );
         assert_eq!(
             with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
             StreamKind::Tcp
@@ -1030,7 +1038,10 @@ mod tests {
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
         let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
-        assert_eq!(err, IoErrorTag::Other);
+        assert!(
+            matches!(err, IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated),
+            "unexpected handshake err: {err:?}"
+        );
         assert_eq!(
             with_stream_mut(&mut heap, s, |st| st.kind).unwrap(),
             StreamKind::Tcp

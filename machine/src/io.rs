@@ -574,17 +574,50 @@ pub fn tcp_connect_timeout(
     port: i64,
     ms: i64,
 ) -> Result<Value, IoErrorTag> {
-    let addr = resolve_socket_addr(host, port)?;
+    use std::net::ToSocketAddrs;
+    if !(0..=65535).contains(&port) {
+        return Err(IoErrorTag::InvalidInput);
+    }
+    let port = port as u16;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs: Vec<SocketAddr> = if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        (bare, port)
+            .to_socket_addrs()
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))?
+            .collect()
+    };
+    if addrs.is_empty() {
+        return Err(IoErrorTag::NotFound);
+    }
     let timeout = duration_from_timeout_ms(ms);
-    let stream = match timeout {
-        None => TcpStream::connect(addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?,
-        Some(d) => TcpStream::connect_timeout(&addr, d).map_err(|e| {
-            if e.kind() == ErrorKind::TimedOut {
-                IoErrorTag::TimedOut
-            } else {
-                IoErrorTag::from_kind(e.kind())
+    let mut last_err = IoErrorTag::Other;
+    let stream = {
+        let mut connected = None;
+        for addr in addrs {
+            let attempt = match timeout {
+                None => TcpStream::connect(addr).map_err(|e| IoErrorTag::from_kind(e.kind())),
+                Some(d) => TcpStream::connect_timeout(&addr, d).map_err(|e| {
+                    if e.kind() == ErrorKind::TimedOut {
+                        IoErrorTag::TimedOut
+                    } else {
+                        IoErrorTag::from_kind(e.kind())
+                    }
+                }),
+            };
+            match attempt {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_err = e,
             }
-        })?,
+        }
+        connected.ok_or(last_err)?
     };
     stream
         .set_nonblocking(true)
