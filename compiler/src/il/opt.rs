@@ -1,5 +1,7 @@
 //! IL optimization passes unlocked by symbolic labels.
 
+use common::Instruction;
+
 use super::op::{IlJumpKind, IlOp, Label};
 
 /// Options for [`optimize`].
@@ -17,7 +19,7 @@ impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             jump_thread: true,
-            // JMP-over sweep only (not after RETURN); entry labels + CALL-0
+            // JMP + RETURN/HALT/*Return sweep; entry labels + CALL-0
             // continuations labeled.
             dead_block: true,
             stack_dce: true,
@@ -94,6 +96,20 @@ fn is_unconditional_jmp(op: &IlOp) -> bool {
     )
 }
 
+fn is_return_terminator(op: &IlOp) -> bool {
+    let IlOp::Byte { byte, .. } = op else {
+        return false;
+    };
+    matches!(
+        *byte.bytecode(),
+        Instruction::RETURN
+            | Instruction::HALT
+            | Instruction::LoadReturnSlot
+            | Instruction::ConstReturnImm
+            | Instruction::BinReturn
+    )
+}
+
 fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
     let mut out = Vec::with_capacity(ops.len());
     let mut reachable = true;
@@ -106,10 +122,10 @@ fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
         if !reachable {
             continue;
         }
-        // Only sweep after unconditional JMP. Treating RETURN/HALT as
-        // terminators deleted CALL-0 trampoline continuations and some
-        // attr-inlined tails before those paths were fully labeled.
-        let term = is_unconditional_jmp(&op);
+        // Sweep after JMP and RETURN/HALT/*Return. Entry labels + CALL-0
+        // continuations must be labeled so live code is not treated as
+        // fall-through-after-terminator.
+        let term = is_unconditional_jmp(&op) || is_return_terminator(&op);
         out.push(op);
         if term {
             reachable = false;
@@ -215,6 +231,20 @@ mod tests {
         ];
         eliminate_dead_blocks(&mut ops);
         assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[1], IlOp::Label(Label(0))));
+    }
+
+    #[test]
+    fn dead_block_drops_after_return_until_label() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::HALT)),
+        ];
+        eliminate_dead_blocks(&mut ops);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], IlOp::Byte { .. }));
         assert!(matches!(ops[1], IlOp::Label(Label(0))));
     }
 }
