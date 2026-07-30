@@ -2167,9 +2167,8 @@ fn example_io_nested_write_prints_2() {
     assert_eq!(output, "2");
 }
 
-/// `match` used as a statement inside a `while` loop must not double-POP
-/// (match already ends with a fusion-barrier POP). A second POP per iteration
-/// corrupts locals and breaks IO such as `accept_wait` + `write_all` loops.
+/// `let server = match accept_wait(listener) { … }` inside a loop must handle
+/// multiple connections (binding matches omit the fusion barrier).
 #[test]
 fn while_accept_match_write_handles_two_connections() {
     use std::io::Read;
@@ -2233,8 +2232,7 @@ fn main() {
     assert_eq!(output, "ok");
 }
 
-/// Deterministic stand-in for the accept_wait loop bug: `let x = match … Ok => x /
-/// Err => panic` inside `while` must not corrupt loop locals across iterations.
+/// `let x = match …` inside `while` must not corrupt loop locals across iterations.
 #[test]
 fn while_let_result_ok_panic_match_preserves_locals() {
     let output = run_example_src(
@@ -2243,8 +2241,7 @@ fn main() {
     let i = 0;
     let acc = 0;
     while i < 3 {
-        let r = Result::Ok(i);
-        let v = match r {
+        let v = match Result::Ok(i) {
             Result::Ok(x) => x,
             Result::Err(_) => panic "tick",
         };
@@ -2258,7 +2255,29 @@ fn main() {
     assert_eq!(output, "3,3");
 }
 
-/// Lowered Err arm must still abort with the literal panic message.
+/// Same guard for `for-in` loop bodies (not only `while`).
+#[test]
+fn for_in_let_match_preserves_accumulator() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let items: [int] = [1, 2, 3];
+    let acc = 0;
+    for n in items {
+        let v = match Result::Ok(n) {
+            Result::Ok(x) => x + 1,
+            Result::Err(_) => panic "tick",
+        };
+        acc = acc + v;
+    }
+    print "%i", acc;
+}
+"#,
+    );
+    assert_eq!(output, "9");
+}
+
+/// Err arm in a binding match must still panic with the literal message.
 #[test]
 fn let_result_ok_panic_match_err_path_panics() {
     let mut pipeline = Pipeline::new();
