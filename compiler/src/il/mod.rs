@@ -11,6 +11,7 @@ mod func;
 mod lower;
 mod op;
 mod opt;
+mod sp;
 
 pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;
@@ -18,3 +19,4 @@ pub use emit_buf::EmitBuf;
 pub use func::IlFunc;
 pub use lower::{Lowered, lower};
 pub use op::{EntryKind, IlJumpKind, IlOp, Label};
+pub use sp::{Sp, SpInfo, analyze as analyze_sp, stack_delta};
