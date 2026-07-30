@@ -15,6 +15,8 @@ pub struct OptimizeOptions {
     pub stack_dce: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
+    /// Sink identical binop / BinSlot* tails into a return-label cluster.
+    pub bin_join_convoy: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -26,6 +28,7 @@ impl Default for OptimizeOptions {
             dead_block: true,
             stack_dce: true,
             return_convoy: true,
+            bin_join_convoy: true,
         }
     }
 }
@@ -43,6 +46,9 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     }
     if opts.return_convoy {
         return_convoy(ops);
+    }
+    if opts.bin_join_convoy {
+        bin_join_convoy(ops);
     }
 }
 
@@ -196,14 +202,216 @@ fn fuse_producer_with_return(producer: common::Byte) -> common::Byte {
 }
 
 /// Producer must sit immediately before `idx` (no intervening labels).
-fn immediate_producer_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byte)> {
+fn immediate_byte_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byte)> {
     if idx == 0 {
         return None;
     }
     match &ops[idx - 1] {
-        IlOp::Byte { byte, .. } if is_return_producer(byte) => Some((idx - 1, *byte)),
+        IlOp::Byte { byte, .. } => Some((idx - 1, *byte)),
         _ => None,
     }
+}
+
+fn immediate_producer_before(ops: &[IlOp], idx: usize) -> Option<(usize, common::Byte)> {
+    let (i, b) = immediate_byte_before(ops, idx)?;
+    if is_return_producer(&b) {
+        Some((i, b))
+    } else {
+        None
+    }
+}
+
+fn is_plain_binop(byte: &common::Byte) -> bool {
+    matches!(
+        *byte.bytecode(),
+        Instruction::ADD
+            | Instruction::SUB
+            | Instruction::MUL
+            | Instruction::DIV
+            | Instruction::MOD
+            | Instruction::LE
+            | Instruction::LEQ
+            | Instruction::GT
+            | Instruction::GEQ
+            | Instruction::EQ
+            | Instruction::NEQ
+            | Instruction::Pow
+            | Instruction::BITAND
+            | Instruction::BITOR
+            | Instruction::ADDF
+            | Instruction::SUBF
+            | Instruction::MULF
+            | Instruction::DIVF
+            | Instruction::MODF
+            | Instruction::LEF
+            | Instruction::LEQF
+            | Instruction::GTF
+            | Instruction::GEQF
+            | Instruction::PowF
+    )
+}
+
+fn is_bin_slot_tail(byte: &common::Byte) -> bool {
+    matches!(
+        *byte.bytecode(),
+        Instruction::BinSlotImm | Instruction::BinSlotSlot
+    )
+}
+
+/// True if `byte` is a sinkable bin-join tail (plain binop or BinSlot*).
+fn is_bin_join_tail(byte: &common::Byte) -> bool {
+    is_plain_binop(byte) || is_bin_slot_tail(byte)
+}
+
+fn fuse_binop_to_bin_return(op: common::Byte) -> common::Byte {
+    common::Byte::new(Instruction::BinReturn).with_bin_return(*op.bytecode() as u8)
+}
+
+/// Find `[cluster_start, cluster_end]` of Labels immediately before a plain RETURN at `r`.
+fn return_label_cluster(ops: &[IlOp], r: usize) -> Option<(usize, usize)> {
+    if !ops[r].is_plain_return() {
+        return None;
+    }
+    if r == 0 || !matches!(ops[r - 1], IlOp::Label(_)) {
+        return None;
+    }
+    let cluster_end = r - 1;
+    let mut cluster_start = cluster_end;
+    while cluster_start > 0 && matches!(ops[cluster_start - 1], IlOp::Label(_)) {
+        cluster_start -= 1;
+    }
+    Some((cluster_start, cluster_end))
+}
+
+/// Sink identical binop / `BinSlot*` tails into a return-label cluster.
+///
+/// - Plain binop `OP` on every pred → `BinReturn(OP)`.
+/// - Identical `BinSlotImm`/`BinSlotSlot` → keep one copy before `RETURN`.
+fn bin_join_convoy(ops: &mut Vec<IlOp>) {
+    // (cluster_start, cluster_end, tail_byte, emit_bin_return)
+    let mut joins: Vec<(usize, usize, common::Byte, bool)> = Vec::new();
+    let mut r = 0usize;
+    while r < ops.len() {
+        let Some((cluster_start, cluster_end)) = return_label_cluster(ops, r) else {
+            r += 1;
+            continue;
+        };
+        let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
+        let Some((_, fall_t)) = immediate_byte_before(ops, cluster_start) else {
+            r += 1;
+            continue;
+        };
+        if !is_bin_join_tail(&fall_t) {
+            r += 1;
+            continue;
+        }
+
+        let mut ok = true;
+        let mut jump_preds = 0usize;
+        for (j, op) in ops.iter().enumerate() {
+            let IlOp::Jump {
+                kind,
+                target,
+                ..
+            } = op
+            else {
+                continue;
+            };
+            if !cluster.iter().any(|l| l == target) {
+                continue;
+            }
+            if *kind != IlJumpKind::Unconditional {
+                ok = false;
+                break;
+            }
+            let Some((_p_idx, t)) = immediate_byte_before(ops, j) else {
+                ok = false;
+                break;
+            };
+            if t != fall_t {
+                ok = false;
+                break;
+            }
+            jump_preds += 1;
+        }
+        if !ok || jump_preds == 0 {
+            r += 1;
+            continue;
+        }
+
+        let emit_bin_return = is_plain_binop(&fall_t);
+        joins.push((cluster_start, cluster_end, fall_t, emit_bin_return));
+        r += 1;
+    }
+
+    if joins.is_empty() {
+        return;
+    }
+
+    let mut remove_tail_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // cluster_start → (cluster_end, optional fused BinReturn, keep_slot_tail)
+    let mut rewrite: std::collections::HashMap<usize, (usize, Option<common::Byte>, Option<common::Byte>)> =
+        std::collections::HashMap::new();
+
+    for (cluster_start, cluster_end, tail, emit_bin_return) in &joins {
+        let cluster = label_cluster_ids(ops, *cluster_start, *cluster_end);
+        if let Some((fall_idx, t)) = immediate_byte_before(ops, *cluster_start)
+            && t == *tail
+        {
+            remove_tail_at.insert(fall_idx);
+        }
+        for (j, op) in ops.iter().enumerate() {
+            if let IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target,
+                ..
+            } = op
+                && cluster.iter().any(|l| l == target)
+                && let Some((t_idx, t)) = immediate_byte_before(ops, j)
+                && t == *tail
+            {
+                remove_tail_at.insert(t_idx);
+            }
+        }
+        if *emit_bin_return {
+            rewrite.insert(
+                *cluster_start,
+                (*cluster_end, Some(fuse_binop_to_bin_return(*tail)), None),
+            );
+        } else {
+            // Keep one BinSlot* before RETURN after the label cluster.
+            rewrite.insert(*cluster_start, (*cluster_end, None, Some(*tail)));
+        }
+    }
+
+    let mut out = Vec::with_capacity(ops.len());
+    let mut idx = 0;
+    while idx < ops.len() {
+        if remove_tail_at.contains(&idx) {
+            idx += 1;
+            continue;
+        }
+        if let Some(&(cluster_end, fused, keep_slot)) = rewrite.get(&idx) {
+            for k in idx..=cluster_end {
+                out.push(ops[k].clone());
+            }
+            if let Some(f) = fused {
+                out.push(IlOp::byte(f));
+                idx = cluster_end + 2; // skip RETURN
+            } else if let Some(slot_tail) = keep_slot {
+                out.push(IlOp::byte(slot_tail));
+                // Keep the original RETURN after the cluster.
+                out.push(ops[cluster_end + 1].clone());
+                idx = cluster_end + 2;
+            } else {
+                idx = cluster_end + 1;
+            }
+            continue;
+        }
+        out.push(ops[idx].clone());
+        idx += 1;
+    }
+    *ops = out;
 }
 
 /// Labels from `start` through `end` inclusive (all must be `Label`).
@@ -227,19 +435,10 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
     let mut joins: Vec<(usize, usize, Label, common::Byte)> = Vec::new();
     let mut r = 0usize;
     while r < ops.len() {
-        if !ops[r].is_plain_return() {
+        let Some((cluster_start, cluster_end)) = return_label_cluster(ops, r) else {
             r += 1;
             continue;
-        }
-        if r == 0 || !matches!(ops[r - 1], IlOp::Label(_)) {
-            r += 1;
-            continue;
-        }
-        let cluster_end = r - 1;
-        let mut cluster_start = cluster_end;
-        while cluster_start > 0 && matches!(ops[cluster_start - 1], IlOp::Label(_)) {
-            cluster_start -= 1;
-        }
+        };
         let IlOp::Label(join) = ops[cluster_start] else {
             r += 1;
             continue;
@@ -598,5 +797,143 @@ mod tests {
             IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::LoadReturnSlot
                 && byte.operand_u32() == 2
         )));
+    }
+
+    #[test]
+    fn bin_join_convoy_fuses_agreeing_binop_to_bin_return() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
+                && byte.bin_return_op() == Instruction::ADD as u8
+        )));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ADD
+            )),
+            "plain ADDs should be stripped"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
+            )),
+            "RETURN should be replaced by BinReturn"
+        );
+    }
+
+    #[test]
+    fn bin_join_convoy_sinks_identical_bin_slot_slot() {
+        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::ADD as u8,
+            0,
+            1,
+        );
+        let mut ops = vec![
+            IlOp::byte(slot),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(slot),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        let slot_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinSlotSlot
+                )
+            })
+            .count();
+        assert_eq!(slot_count, 1, "exactly one BinSlotSlot before RETURN");
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
+        )));
+    }
+
+    #[test]
+    fn bin_join_convoy_skips_disagreeing_binops() {
+        // Ord-shaped: Lt arm ends in LE, Gt arm in GT — must not convoy.
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::LE)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(54),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::GT)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(54),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::EQ)),
+            IlOp::Label(Label(54)),
+            IlOp::Label(Label(48)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        bin_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn bin_join_convoy_skips_conditional_jump_into_cluster() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        bin_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn bin_join_convoy_fuses_through_label_cluster() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::SUB)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::SUB)),
+            IlOp::Label(Label(1)),
+            IlOp::Label(Label(9)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinReturn
+                && byte.bin_return_op() == Instruction::SUB as u8
+        )));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(1)))));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(9)))));
     }
 }
