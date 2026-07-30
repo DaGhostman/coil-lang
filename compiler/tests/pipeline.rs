@@ -2195,9 +2195,7 @@ fn main() {
 fn while_let_result_ok_panic_match_preserves_locals() {
     let output = run_example_src(
         r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
-fn tick(n: int) -> Result<int, string> {
+fn tick(int n) -> Result<int, string> {
     if n < 3 {
         return Result::Ok(n);
     }
@@ -2229,8 +2227,6 @@ fn let_result_ok_panic_match_err_path_panics() {
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
 fn main() {
     let x = match Result::Err(1) {
         Result::Ok(s) => s,
