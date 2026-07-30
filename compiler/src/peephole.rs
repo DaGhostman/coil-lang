@@ -1,4 +1,9 @@
-//! Post-codegen peephole fusion for common stack sequences.
+#![allow(dead_code)]
+//! Encoding-fusion reference and helpers for unit tests.
+//!
+//! Production fusion runs in [`crate::il::lower`] with label barriers so
+//! join/`RETURN` labels are never pulled into a fused window. These
+//! helpers remain for historical peephole unit tests.
 //!
 //! Recognised convoys collapse into operator-parameterized superinstructions
 //! (`BinSlotImm`, `BinSlotSlot`, `CmpJmpf`, `BinReturn`, etc.). The packed
@@ -90,7 +95,7 @@ fn fuse_bytecode_pass(bytecode: &mut Vec<Byte>, pool: &mut Vec<u64>) -> Vec<Fusi
 }
 
 /// Shift a target offset down by the bytes removed by every fusion
-/// whose window ends at or before it.
+/// whose window ends strictly before it.
 pub fn adjust_target(target: usize, fusion_sites: &[FusionSite]) -> usize {
     let delta: usize = fusion_sites
         .iter()

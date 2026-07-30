@@ -1340,7 +1340,7 @@ impl Pipeline {
         // Finalize (peephole fusion + CodePtr/MakePolyFn relocation) once
         // on the linked buffer, then sync the pipeline output.
         self.compiler.finalize_bytecode();
-        self.bytecode = self.compiler.bytecode.clone();
+        self.bytecode = self.compiler.bytecode_vec();
 
         // Patch the JMP at offset 1 to point to the
         // user-program's `main`. If the source had at
@@ -1467,7 +1467,7 @@ impl Pipeline {
 
         // Final-link peephole fusion (see `Pipeline::compile`).
         self.compiler.finalize_bytecode();
-        self.bytecode = self.compiler.bytecode.clone();
+        self.bytecode = self.compiler.bytecode_vec();
 
         // Patch the JMP at offset 1.
         if let Some(byte) = self.bytecode.get_mut(1) {
