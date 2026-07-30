@@ -237,7 +237,10 @@ impl IlOp {
         )
     }
 
-    /// Plain `RETURN` (typed or residual `Byte`), not fused `*Return`.
+    /// Plain terminal `RETURN` (typed or residual `Byte`).
+    ///
+    /// Fused `*Return` variants are excluded — convoy opts and tiny-inline use
+    /// this to find a real `RETURN` sink, not a fused return producer.
     pub fn is_plain_return(&self) -> bool {
         matches!(self, IlOp::Return { .. })
             || matches!(
@@ -550,6 +553,15 @@ mod tests {
     fn pool_const_stays_byte() {
         let pool = Byte::new(Instruction::CONST).with_const_pool(0);
         let op = IlOp::from_plain_byte(pool, DebugLoc::unknown());
+        assert!(matches!(op, IlOp::Byte { .. }));
+    }
+
+    #[test]
+    fn negative_inline_const_stays_byte() {
+        // Inline CONST uses bit 31 as POOL_FLAG; negative i32 values set it.
+        let neg = Byte::new(Instruction::CONST).with_const_inline(-1);
+        assert_ne!(neg.operand_u32() & Byte::POOL_FLAG, 0);
+        let op = IlOp::from_plain_byte(neg, DebugLoc::unknown());
         assert!(matches!(op, IlOp::Byte { .. }));
     }
 }

@@ -1,4 +1,7 @@
 //! Lightweight per-function IL metadata (flat CodeBuf stays the source of truth).
+//!
+//! Recorded at function finalize for upcoming IL inspection / tooling; the flat
+//! buffer remains authoritative for codegen and lower.
 
 use super::Label;
 
