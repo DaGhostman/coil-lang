@@ -12938,6 +12938,36 @@ fn main() { print \"%i\", add(3, 4); }",
     }
 
     #[test]
+    fn is_tiny_inline_il_accepts_typed_fused_returns() {
+        use crate::il::IlOp;
+        use common::{DebugLoc, Instruction};
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::ConstReturnImm {
+            imm: 7,
+            loc: DebugLoc::unknown(),
+        }]));
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::LoadReturnSlot {
+            slot: 0,
+            loc: DebugLoc::unknown(),
+        }]));
+        assert!(Compiler::is_tiny_inline_il(&[IlOp::BinReturn {
+            op: Instruction::SUB,
+            loc: DebugLoc::unknown(),
+        }]));
+        // Typed plain return body with a single terminal RETURN.
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::BinSlotSlot {
+                op: Instruction::ADD as u8,
+                a: 0,
+                b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+    }
+
+    #[test]
     fn is_tiny_inline_il_accepts_bin_slot_slot_body() {
         use crate::il::IlOp;
         use common::{Byte, Instruction};
