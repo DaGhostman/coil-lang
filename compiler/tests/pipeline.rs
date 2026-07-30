@@ -2304,6 +2304,29 @@ fn main() {
     assert_eq!(s, "panic: accept");
 }
 
+/// `x = match …` reassignment inside a loop uses the same binding-context
+/// match lowering as `let x = match …`.
+#[test]
+fn while_assignment_match_preserves_locals() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let i = 0;
+    let v = 0;
+    while i < 3 {
+        v = match Result::Ok(i) {
+            Result::Ok(x) => x,
+            Result::Err(_) => panic "tick",
+        };
+        i = i + 1;
+    }
+    print "%i", v;
+}
+"#,
+    );
+    assert_eq!(output, "2");
+}
+
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {
