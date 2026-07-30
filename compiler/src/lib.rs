@@ -920,11 +920,10 @@ impl Compiler {
     /// Run registered `defer` thunks in LIFO order.
     ///
     /// For each thunk: LOAD `use (…)` captures from the enclosing frame, then
-    /// `CALL` with that arity (push return IP + new frame whose slots 0..N-1
-    /// are the captures) and a labeled `JMP` to the thunk. The thunk ends in
-    /// `RETURN`, which resumes after the `JMP`. A following `POP` discards the
-    /// thunk's sentinel return value so a pending function return value stays
-    /// on top. Emits into `self.bytecode` so the JMP can target an IL label.
+    /// `CALL` the thunk entry with that arity (push return IP + new frame whose
+    /// slots 0..N-1 are the captures). The thunk ends in `RETURN`, which
+    /// resumes at the next op. A following `POP` discards the thunk's sentinel
+    /// return value so a pending function return value stays on top.
     fn emit_run_defers(&mut self) {
         let defers = self.fn_defers.clone();
         for (label, captures) in defers.iter().rev() {
@@ -945,15 +944,8 @@ impl Compiler {
                     ));
                 }
             }
-            self.bytecode.push(
-                Byte::new(Instruction::CALL).with_call_packed(captures.len() as u32, 0),
-            );
             self.bytecode
-                .emit_jump(BbJumpKind::Unconditional, *label);
-            // CALL target 0 returns here (skips the JMP). Label so dead_block
-            // does not treat this as fall-through-after-JMP dead code.
-            let cont = self.bytecode.fresh_label();
-            self.bytecode.bind_label(cont);
+                .emit_entry(EntryKind::Call, captures.len() as u32, *label);
             self.bytecode.push(Byte::new(Instruction::POP));
         }
     }
@@ -1304,7 +1296,9 @@ impl Compiler {
             && let Some(b) = ops[0].as_plain_byte()
             && matches!(
                 *b.bytecode(),
-                Instruction::LoadReturnSlot | Instruction::ConstReturnImm
+                Instruction::LoadReturnSlot
+                    | Instruction::ConstReturnImm
+                    | Instruction::BinReturn
             )
         {
             return true;
@@ -1367,6 +1361,19 @@ impl Compiler {
             }
             _ => None,
         }
+    }
+
+    /// Expand sole `BinReturn` at a call site: reload caller temps then the plain op.
+    fn expand_bin_return_for_inline(byte: &Byte, temps: &[u32], out: &mut Vec<Byte>) -> bool {
+        if *byte.bytecode() != Instruction::BinReturn {
+            return false;
+        }
+        let op: Instruction = byte.bin_return_op().into();
+        for &tmp in temps {
+            out.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp));
+        }
+        out.push(Byte::new(op));
+        true
     }
 
     /// Remap callee-frame slots in fused `BinSlot*` to caller temps.
@@ -1436,6 +1443,9 @@ impl Compiler {
             && let Some(expanded) = Self::expand_fused_return_for_inline(&slice[0], &temps)
         {
             bytecode.push(expanded);
+            return true;
+        }
+        if slice.len() == 1 && Self::expand_bin_return_for_inline(&slice[0], &temps, bytecode) {
             return true;
         }
         for byte in &slice {
@@ -12709,6 +12719,28 @@ fn main() { print \"%i\", add(3, 4); }",
                 .expect("expand");
         assert_eq!(*expanded.bytecode(), Instruction::LOAD);
         assert_eq!(expanded.operand_u32(), 42);
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_sole_bin_return() {
+        use crate::il::IlOp;
+        use common::{Byte, Instruction};
+        let ops = vec![IlOp::byte(
+            Byte::new(Instruction::BinReturn).with_bin_return(Instruction::ADD as u8),
+        )];
+        assert!(Compiler::is_tiny_inline_il(&ops));
+        let mut out = Vec::new();
+        assert!(Compiler::expand_bin_return_for_inline(
+            &ops[0].as_plain_byte().unwrap(),
+            &[10, 11],
+            &mut out
+        ));
+        assert_eq!(out.len(), 3);
+        assert_eq!(*out[0].bytecode(), Instruction::LOAD);
+        assert_eq!(out[0].operand_u32(), 10);
+        assert_eq!(*out[1].bytecode(), Instruction::LOAD);
+        assert_eq!(out[1].operand_u32(), 11);
+        assert_eq!(*out[2].bytecode(), Instruction::ADD);
     }
 
     #[test]
