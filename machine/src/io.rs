@@ -1365,7 +1365,6 @@ mod tests {
             stream_write_all(&mut heap, conn, reply).expect("write_all");
             stream_close(&mut heap, conn).unwrap();
             client.join().unwrap();
-            eprintln!("round {round} ok");
         }
 
         stream_close(&mut heap, listen_stream).unwrap();
