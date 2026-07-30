@@ -1372,4 +1372,134 @@ mod tests {
         stream_close(&mut heap, s).unwrap();
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn io_error_from_kind_keeps_timed_out_and_truncated() {
+        assert_eq!(
+            IoErrorTag::from_kind(ErrorKind::TimedOut),
+            IoErrorTag::TimedOut
+        );
+        assert_eq!(
+            IoErrorTag::from_kind(ErrorKind::UnexpectedEof),
+            IoErrorTag::Truncated
+        );
+        assert_eq!(
+            IoErrorTag::from_kind(ErrorKind::WouldBlock),
+            IoErrorTag::WouldBlock
+        );
+        assert_ne!(
+            IoErrorTag::from_kind(ErrorKind::TimedOut),
+            IoErrorTag::WouldBlock
+        );
+    }
+
+    #[test]
+    fn duration_from_timeout_ms_clears_non_positive() {
+        assert_eq!(duration_from_timeout_ms(0), None);
+        assert_eq!(duration_from_timeout_ms(-5), None);
+        assert_eq!(
+            duration_from_timeout_ms(25),
+            Some(Duration::from_millis(25))
+        );
+    }
+
+    #[test]
+    fn stream_timeouts_on_closed_are_already_closed() {
+        let mut heap = Heap::default();
+        let path = "/tmp/coil_io_timeout_closed.bin";
+        let _ = std::fs::remove_file(path);
+        let s = stream_open(&mut heap, path, "w").expect("open");
+        stream_close(&mut heap, s).unwrap();
+        assert_eq!(
+            stream_set_read_timeout(&mut heap, s, 10).unwrap_err(),
+            IoErrorTag::AlreadyClosed
+        );
+        assert_eq!(
+            stream_set_write_timeout(&mut heap, s, 10).unwrap_err(),
+            IoErrorTag::AlreadyClosed
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tcp_shutdown_rejects_invalid_how() {
+        let mut heap = Heap::default();
+        let listener = tcp_listen(&mut heap, "127.0.0.1", 0).expect("listen");
+        let port = {
+            let local = tcp_local_addr(&mut heap, listener).expect("local");
+            tuple_elems(&heap, local)[1].as_int()
+        };
+        let client = thread::spawn(move || {
+            let _ = TcpStream::connect(("127.0.0.1", port as u16));
+            thread::sleep(Duration::from_millis(200));
+        });
+        let conn = tcp_accept_wait_timeout(&mut heap, listener, 2000).expect("accept");
+        assert_eq!(
+            tcp_shutdown(&mut heap, conn, 3).unwrap_err(),
+            IoErrorTag::InvalidInput
+        );
+        assert_eq!(
+            tcp_shutdown(&mut heap, conn, -1).unwrap_err(),
+            IoErrorTag::InvalidInput
+        );
+        stream_close(&mut heap, conn).ok();
+        stream_close(&mut heap, listener).ok();
+        let _ = client.join();
+    }
+
+    #[test]
+    fn tcp_read_exact_honors_read_timeout() {
+        let mut heap = Heap::default();
+        let listener = tcp_listen(&mut heap, "127.0.0.1", 0).expect("listen");
+        let port = {
+            let local = tcp_local_addr(&mut heap, listener).expect("local");
+            tuple_elems(&heap, local)[1].as_int()
+        };
+        let peer = thread::spawn(move || {
+            let sock = TcpStream::connect(("127.0.0.1", port as u16)).expect("connect");
+            // Hold the connection open without sending so the peer times out.
+            thread::sleep(Duration::from_millis(400));
+            drop(sock);
+        });
+        let conn = tcp_accept_wait_timeout(&mut heap, listener, 2000).expect("accept");
+        stream_set_read_timeout(&mut heap, conn, 40).expect("set timeout");
+        let buf = make_byte_array(&mut heap, &[0u8; 4]);
+        let err = stream_read_exact(&mut heap, conn, buf).unwrap_err();
+        assert_eq!(err, IoErrorTag::TimedOut);
+        stream_close(&mut heap, conn).ok();
+        stream_close(&mut heap, listener).ok();
+        let _ = peer.join();
+    }
+
+    #[test]
+    fn tcp_connect_localhost_tries_all_resolved_addrs() {
+        // Bind IPv4-only; `localhost` may resolve `::1` first — connect must
+        // still succeed by trying every resolved address.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i64;
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let client = tcp_connect(&mut heap, "localhost", port).expect("localhost connect");
+        stream_close(&mut heap, client).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn alloc_io_error_encodes_new_tags() {
+        let mut heap = Heap::default();
+        for (tag, expected) in [
+            (IoErrorTag::TimedOut, 8u32),
+            (IoErrorTag::Truncated, 9),
+            (IoErrorTag::Certificate, 10),
+            (IoErrorTag::Handshake, 11),
+        ] {
+            let v = alloc_io_error(&mut heap, tag);
+            assert_eq!(enum_tag(&heap, v), Some(expected));
+        }
+        assert_eq!(BUILTIN_IO_ERROR_VARIANTS.len(), 12);
+        assert_eq!(BUILTIN_IO_ERROR_VARIANTS[8], "TimedOut");
+        assert_eq!(BUILTIN_IO_ERROR_VARIANTS[11], "Handshake");
+    }
 }

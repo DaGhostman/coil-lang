@@ -1624,5 +1624,207 @@ mod tests {
         stream_close(&mut heap, s).ok();
         server.join().expect("server");
     }
+
+    #[test]
+    fn enable_with_custom_ca_pem_round_trips() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server_cert = cert_pem.clone();
+        let server_key = key_pem.clone();
+        let server = thread::spawn(move || {
+            let mut heap = Heap::default();
+            ready_tx.send(()).ok();
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let fd = sock.into_raw_fd();
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let opts = make_server_enable_opts(&mut heap, &server_cert, &server_key);
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
+            let mut buf = make_byte_array(&mut heap, &[0u8; 64]);
+            let n = loop {
+                match crate::io::stream_read(&mut heap, s, buf) {
+                    Ok(Some(n)) if n > 0 => break n,
+                    Ok(Some(0)) | Ok(None) => panic!("eof before data"),
+                    Ok(_) | Err(IoErrorTag::WouldBlock) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read {e:?}"),
+                }
+            };
+            let read_bytes = array_bytes(&heap, buf);
+            let echo = make_byte_array(&mut heap, &read_bytes[..n]);
+            stream_write_all(&mut heap, s, echo).expect("echo");
+            stream_close(&mut heap, s).ok();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        // Trust the self-signed leaf via custom CA PEM (leaf-as-CA is fine for tests).
+        let opts = make_opts_full(&mut heap, true, &cert_pem, 0);
+        let s = tls_client_enable(&mut heap, s, "localhost", opts).expect("enable+ca");
+        let msg = make_byte_array(&mut heap, b"ca-ok");
+        stream_write_all(&mut heap, s, msg).expect("write");
+        let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
+        assert_eq!(array_bytes(&heap, echoed), b"ca-ok");
+        stream_close(&mut heap, s).ok();
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn enable_rejects_garbage_ca_pem() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_full(&mut heap, true, "not-a-pem", 0);
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn enable_requires_ca_pem_and_timeout_ms_keys() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+        let k_verify = heap.intern("verify".into());
+        gc.as_mut().set(k_verify, Member::Value(Value::from(false)));
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", Value::from(obj.addr())).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn client_enable_handshake_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = thread::spawn(move || {
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            // Keep the TCP session open without speaking TLS.
+            thread::sleep(Duration::from_millis(500));
+            drop(sock);
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_full(&mut heap, false, "", 40);
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::TimedOut);
+        stream_close(&mut heap, s).ok();
+        let _ = hold.join();
+    }
+
+    #[test]
+    fn server_enable_rejects_garbage_client_ca_pem() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_server_enable_opts_full(&mut heap, &cert_pem, &key_pem, 0, "not-a-ca");
+        let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn server_enable_requires_client_ca_pem_key() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+        let (cert_obj, _) = heap.alloc(ObjString::from(cert_pem.as_str()), Object::String);
+        let (key_obj, _) = heap.alloc(ObjString::from(key_pem.as_str()), Object::String);
+        let k_cert = heap.intern("cert_pem".into());
+        let k_key = heap.intern("key_pem".into());
+        let k_to = heap.intern("timeout_ms".into());
+        gc.as_mut().set(k_cert, Member::Object(cert_obj));
+        gc.as_mut().set(k_key, Member::Object(key_obj));
+        gc.as_mut().set(k_to, Member::Value(Value::from(0i64)));
+        let err = tls_server_enable(&mut heap, s, Value::from(obj.addr())).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn server_mtls_rejects_client_without_certificate() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let (client_ca_pem, _) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            ready_tx.send(()).ok();
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let fd = sock.into_raw_fd();
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let mut heap = Heap::default();
+            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let opts =
+                make_server_enable_opts_full(&mut heap, &cert_pem, &key_pem, 2000, &client_ca_pem);
+            let result = tls_server_enable(&mut heap, s, opts);
+            err_tx.send(result.map(|_| ())).ok();
+            stream_close(&mut heap, s).ok();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        let mut heap = Heap::default();
+        // Client has no client certificate; mTLS server must fail the handshake.
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        let opts = make_opts_full(&mut heap, false, "", 2000);
+        let client_err = tls_client_enable(&mut heap, s, "localhost", opts).err();
+        stream_close(&mut heap, s).ok();
+        let server_err = err_rx.recv_timeout(Duration::from_secs(3)).expect("server result");
+        server.join().expect("server");
+        assert!(
+            client_err.is_some() || server_err.is_err(),
+            "mTLS without client cert must fail on at least one side"
+        );
+        if let Some(e) = client_err {
+            assert!(
+                matches!(
+                    e,
+                    IoErrorTag::Handshake
+                        | IoErrorTag::Certificate
+                        | IoErrorTag::Other
+                        | IoErrorTag::Truncated
+                        | IoErrorTag::TimedOut
+                ),
+                "unexpected client err {e:?}"
+            );
+        }
+        if let Err(e) = server_err {
+            assert!(
+                matches!(
+                    e,
+                    IoErrorTag::Handshake
+                        | IoErrorTag::Certificate
+                        | IoErrorTag::Other
+                        | IoErrorTag::Truncated
+                        | IoErrorTag::TimedOut
+                ),
+                "unexpected server err {e:?}"
+            );
+        }
+    }
 }
 
