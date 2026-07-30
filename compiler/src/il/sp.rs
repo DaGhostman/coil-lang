@@ -26,14 +26,6 @@ impl Sp {
         }
     }
 
-    fn meet(self, other: Sp) -> Sp {
-        match (self, other) {
-            (Sp::Known(a), Sp::Known(b)) if a == b => Sp::Known(a),
-            (Sp::Known(_), Sp::Known(_)) => Sp::Unknown,
-            _ => Sp::Unknown,
-        }
-    }
-
     fn apply(self, delta: Option<i32>) -> Sp {
         match (self, delta) {
             (Sp::Known(h), Some(d)) => Sp::Known(h + d),
