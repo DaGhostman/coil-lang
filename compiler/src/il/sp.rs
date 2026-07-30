@@ -351,4 +351,90 @@ mod tests {
         assert_eq!(info.sp_before(1), Sp::Known(1));
         assert_eq!(info.sp_before(2), Sp::Unknown);
     }
+
+    #[test]
+    fn stack_delta_bin_slot_forms_push_one() {
+        let imm = IlOp::BinSlotImm {
+            op: Instruction::ADD as u8,
+            slot: 0,
+            imm: 1,
+            loc: loc(),
+        };
+        let slot = IlOp::BinSlotSlot {
+            op: Instruction::ADD as u8,
+            a: 0,
+            b: 1,
+            loc: loc(),
+        };
+        assert_eq!(stack_delta(&imm), Some(1));
+        assert_eq!(stack_delta(&slot), Some(1));
+    }
+
+    #[test]
+    fn stack_delta_call_uses_arity_tail_call_unknown() {
+        let call = IlOp::Entry {
+            kind: EntryKind::Call,
+            arity: 2,
+            target: Label(0),
+            loc: loc(),
+        };
+        let tail = IlOp::Entry {
+            kind: EntryKind::TailCall,
+            arity: 1,
+            target: Label(0),
+            loc: loc(),
+        };
+        assert_eq!(stack_delta(&call), Some(-1));
+        assert_eq!(stack_delta(&tail), None);
+    }
+
+    #[test]
+    fn stack_delta_jump_if_match_consumes_scrutinee() {
+        let jmp = IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 2 },
+            target: Label(0),
+            loc: loc(),
+        };
+        assert_eq!(stack_delta(&jmp), Some(-1));
+    }
+
+    #[test]
+    fn call_entry_adjusts_height_by_arity() {
+        // Two args on stack, CALL arity 2 → net −1 (consume args, push result).
+        let ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 2,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(2), Sp::Known(2));
+        assert_eq!(info.sp_before(3), Sp::Known(1));
+    }
+
+    #[test]
+    fn tail_call_cuts_fall_through() {
+        // TailCall is a terminator with unknown delta — no fall-through SP edge.
+        let ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Entry {
+                kind: EntryKind::TailCall,
+                arity: 1,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(1), Sp::Known(1));
+        // Entry edges are not jump edges; label after TailCall has no SP meet.
+        assert_eq!(info.sp_before(2), Sp::Unknown);
+        assert_eq!(info.sp_before(3), Sp::Unknown);
+    }
 }
