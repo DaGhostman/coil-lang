@@ -1644,7 +1644,7 @@ mod tests {
             let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
             let opts = make_server_enable_opts(&mut heap, &server_cert, &server_key);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
-            let mut buf = make_byte_array(&mut heap, &[0u8; 64]);
+            let buf = make_byte_array(&mut heap, &[0u8; 64]);
             let n = loop {
                 match crate::io::stream_read(&mut heap, s, buf) {
                     Ok(Some(n)) if n > 0 => break n,
