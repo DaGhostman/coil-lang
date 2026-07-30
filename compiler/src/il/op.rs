@@ -74,6 +74,22 @@ impl IlOp {
         !matches!(self, IlOp::Label(_))
     }
 
+    /// Jump / Entry / PrologueJmp — not safe to copy as a tiny-inline body.
+    pub fn is_control(&self) -> bool {
+        matches!(
+            self,
+            IlOp::Jump { .. } | IlOp::Entry { .. } | IlOp::PrologueJmp { .. }
+        )
+    }
+
+    /// Plain `RETURN` byte (not fused `*Return`).
+    pub fn is_plain_return(&self) -> bool {
+        matches!(
+            self,
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::RETURN
+        )
+    }
+
     pub fn loc(&self) -> DebugLoc {
         match self {
             IlOp::Byte { loc, .. }
