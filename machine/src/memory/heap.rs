@@ -941,6 +941,16 @@ pub struct ObjStream {
 
 impl Drop for ObjStream {
     fn drop(&mut self) {
+        #[cfg(feature = "tls")]
+        if self.kind == StreamKind::Tls {
+            // Best-effort close_notify so GC without explicit `close()` is not
+            // always an abrupt TCP reset. Errors are ignored in Drop.
+            if let (Some(fd), Some(tls)) = (self.fd.as_ref(), self.tls.as_mut()) {
+                use std::os::fd::AsRawFd;
+                let _ = crate::tls::send_close_notify(fd.as_raw_fd(), tls);
+            }
+            self.tls.take();
+        }
         // OwnedFd closes on drop; clear explicitly for clarity.
         self.fd.take();
         #[cfg(feature = "tls")]
