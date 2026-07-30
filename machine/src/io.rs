@@ -7,7 +7,7 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{
     BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value,
@@ -594,27 +594,40 @@ pub fn tcp_connect_timeout(
     if addrs.is_empty() {
         return Err(IoErrorTag::NotFound);
     }
-    let timeout = duration_from_timeout_ms(ms);
+    // One absolute deadline across all resolved addresses (not per-addr).
+    let deadline = duration_from_timeout_ms(ms).map(|d| Instant::now() + d);
     let mut last_err = IoErrorTag::Other;
     let stream = {
         let mut connected = None;
         for addr in addrs {
-            let attempt = match timeout {
+            let attempt = match deadline {
                 None => TcpStream::connect(addr).map_err(|e| IoErrorTag::from_kind(e.kind())),
-                Some(d) => TcpStream::connect_timeout(&addr, d).map_err(|e| {
-                    if e.kind() == ErrorKind::TimedOut {
-                        IoErrorTag::TimedOut
+                Some(end) => {
+                    let now = Instant::now();
+                    if now >= end {
+                        Err(IoErrorTag::TimedOut)
                     } else {
-                        IoErrorTag::from_kind(e.kind())
+                        TcpStream::connect_timeout(&addr, end - now).map_err(|e| {
+                            if e.kind() == ErrorKind::TimedOut {
+                                IoErrorTag::TimedOut
+                            } else {
+                                IoErrorTag::from_kind(e.kind())
+                            }
+                        })
                     }
-                }),
+                }
             };
             match attempt {
                 Ok(s) => {
                     connected = Some(s);
                     break;
                 }
-                Err(e) => last_err = e,
+                Err(e) => {
+                    last_err = e;
+                    if last_err == IoErrorTag::TimedOut {
+                        break;
+                    }
+                }
             }
         }
         connected.ok_or(last_err)?
@@ -1340,7 +1353,10 @@ mod tests {
         let listener = tcp_listen(&mut heap, "127.0.0.1", 0).expect("listen");
         let local = tcp_local_addr(&mut heap, listener).expect("local");
         let local_elems = tuple_elems(&heap, local);
-        assert_eq!(local_elems[0].as_int() == 0 || true, true); // host present
+        assert_eq!(
+            value_as_string(&heap, local_elems[0]).expect("host"),
+            "127.0.0.1"
+        );
         let port = local_elems[1].as_int();
         assert!(port > 0);
 
