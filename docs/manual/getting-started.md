@@ -204,7 +204,8 @@ coil/
 ├── compiler/
 │   ├── src/typechecking/  # Hindley–Milner inference
 │   ├── src/pipeline.rs    # Compile driver, multi-file discovery
-│   ├── src/peephole.rs    # Opcode fusion pass
+│   ├── src/il/            # Compile-time stack IL + label-safe lower/fuse
+│   ├── src/peephole.rs    # Legacy fusion helpers (superseded by il::lower)
 │   └── tests/             # Golden pipeline and diagnostic tests
 ├── machine/
 │   ├── src/vm.rs          # Bytecode interpreter
@@ -224,21 +225,21 @@ coil/
 | Crate | Role |
 |-------|------|
 | `parser` | Turn `.hy` text into an AST (`Expression`, `Pattern`, declarations) |
-| `compiler` | Typecheck, emit bytecode, peephole-optimize, write `.hyc` archives |
+| `compiler` | Typecheck, emit stack IL, lower/fuse to bytecode, write `.hyc` archives |
 | `machine` | Execute bytecode; manage stack, heap, and automatic GC |
 | `common` | Shared `Instruction` opcodes, `Value` representation, `ArchivedProgram` |
 
 ## Compilation model
 
-coil uses a **single-pass stack codegen** pipeline (with a post-codegen peephole pass). There is no separate register-IR stage in the current tree.
+coil uses **AST → stack IL (symbolic labels) → lower/fuse → bytecode**. There is no separate register-IR stage in the current tree.
 
 ```
 ┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────┐
-│  .hy source │ →  │ Parser (AST) │ →  │ HM checker  │ →  │ Codegen  │
+│  .hy source │ →  │ Parser (AST) │ →  │ HM checker  │ →  │ Stack IL │
 └─────────────┘    └──────────────┘    └─────────────┘    └────┬─────┘
                                                                 │
                     ┌──────────────┐    ┌─────────────┐         ▼
-                    │ VM execute   │ ←  │  out.hyc    │ ←  Peephole
+                    │ VM execute   │ ←  │  out.hyc    │ ←  Lower/fuse
                     └──────────────┘    │  (rkyv)     │
                                         └─────────────┘
 ```
@@ -247,8 +248,8 @@ coil uses a **single-pass stack codegen** pipeline (with a post-codegen peephole
 
 1. **Parse** — `parser::Pratt` builds an AST. Syntax errors are reported with spans.
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
-3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`** (reuse frame, no extra `CALL`+`RETURN`); tiny callees may be inlined at `CALL` sites.
-4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar), folds constant `CONST` pairs (including pool-backed negatives), and relocates jump targets.
+3. **Codegen (IL)** — walks the AST into a stack IL (`compiler/src/il`) with symbolic jump labels. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`**; tiny callees may be inlined at call sites.
+4. **Lower** — after link, `finalize_bytecode` runs IL opts then fuse-select (`BinSlotImm`, `CmpJmpf`, …), assigns PCs once, and emits `Vec<Byte>`. Label binds act as fusion barriers.
 5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **30**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 

@@ -6,9 +6,16 @@ How a `.hy` program becomes running bytecode on the VM.
 
 1. **Parse** — the Pratt parser in `parser/` reads `.hy` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) in `compiler/src/typechecking/` infers types and reports source-anchored diagnostics via ariadne.
-3. **Codegen** — single-pass stack codegen in `compiler/src/lib.rs` emits bytecode, then a peephole fusion pass (`compiler/src/peephole.rs`) may collapse common convoys. Fusion must keep `debug_locs` in sync via `shrink_debug_locs`.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **30** in `common/src/archive.rs`) and written to `out.hyc` (or another path via `compile -o`). See [Debug line table](debug-info.md).
-5. **Execute** — the VM in `machine/` loads the archive and runs `main` (or each `test("…")` case under `coil test`).
+3. **Codegen (stack IL)** — `compiler/src/lib.rs` emits a compile-time stack IL (`compiler/src/il/`) with **symbolic labels** for jumps/joins. Control flow uses `IlOp::Jump` / `IlOp::Label` instead of absolute PCs.
+4. **Lower** — after multi-file link, `finalize_bytecode` runs optional IL opts (defaults off) then `il::lower`: fuse-select with **label and absolute-JMP barriers**, assign PCs once, encode `Vec<Byte>`. Enabled fuse patterns today are conservative (`CONST;CONST;binop` fold); BinSlot*/CmpJmpf/*Return re-enable as absolute JMP joins finish migrating to labels. Residual absolute CALL/JMP remap via the fusion origin table — no post-lower `peephole::fuse_bytecode` / `adjust_target` hot path.
+5. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **30** in `common/src/archive.rs`) and written to `out.hyc` (or another path via `compile -o`). See [Debug line table](debug-info.md).
+6. **Execute** — the VM in `machine/` loads the archive and runs `main` (or each `test("…")` case under `coil test`).
+
+```
+AST + HM → Stack IL (labels) → IL opts → lower/fuse-select → Vec<Byte> → .hyc → VM
+```
+
+The IL is **compile-time only**; the VM and archive format are unchanged.
 
 ## Cache and rebuild
 
@@ -16,7 +23,7 @@ Re-run the same CLI entry without deleting `out.hyc` to reuse the cached compile
 
 ## Multi-file programs
 
-With a `coil.toml`, the pipeline discovers dependencies via `use` / `mod`, compiles each file with a namespace prefix, and links them into one archive. The **entry file** uses the empty namespace. See [Modules](../references/modules.md) and [Project config](../references/project-config.md).
+With a `coil.toml`, the pipeline discovers dependencies via `use` / `mod`, compiles each file with a namespace prefix into one shared IL buffer, and **lowers once** after linking. The **entry file** uses the empty namespace. See [Modules](../references/modules.md) and [Project config](../references/project-config.md).
 
 ## Opcode discipline
 
