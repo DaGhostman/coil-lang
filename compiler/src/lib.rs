@@ -1296,13 +1296,23 @@ impl Compiler {
         if ops.is_empty() || ops.len() > 48 {
             return false;
         }
+        if ops.iter().any(|op| op.is_control()) {
+            return false;
+        }
+        // Sole fused return: expand to producer at the call site (no RETURN).
+        if ops.len() == 1
+            && let Some(b) = ops[0].as_plain_byte()
+            && matches!(
+                *b.bytecode(),
+                Instruction::LoadReturnSlot | Instruction::ConstReturnImm
+            )
+        {
+            return true;
+        }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
         // truncate (else-arm dropped). Only allow a single terminal RETURN
         // and no control-flow jumps.
-        if ops.iter().any(|op| op.is_control()) {
-            return false;
-        }
         let return_idxs: Vec<usize> = ops
             .iter()
             .enumerate()
@@ -1346,6 +1356,21 @@ impl Compiler {
         })
     }
 
+    /// Expand a fused `*Return` byte into the producer left on the caller's stack.
+    fn expand_fused_return_for_inline(byte: &Byte, temps: &[u32]) -> Option<Byte> {
+        match *byte.bytecode() {
+            Instruction::ConstReturnImm => Some(
+                Byte::new(Instruction::CONST).with_const_inline(byte.operand_u32() as i32),
+            ),
+            Instruction::LoadReturnSlot => {
+                let slot = byte.operand_u32() as usize;
+                let &tmp = temps.get(slot)?;
+                Some(Byte::new(Instruction::LOAD).with_operand_u32(tmp))
+            }
+            _ => None,
+        }
+    }
+
     fn try_emit_inline_direct_call(
         &mut self,
         fqn: &str,
@@ -1363,10 +1388,8 @@ impl Compiler {
         if !Self::is_tiny_inline_il(&ops) {
             return false;
         }
-        // Copy path still uses plain bytes (Jump/Entry already refused above).
         let slice = self.bytecode.code_slice_bytes(start, end);
         let arg_slice = args.unwrap_or(&[]);
-        let _lookup = strip_overload_key(fqn);
         let mut temps = Vec::new();
         let flat = self.flatten_call_args_for_emit(arg_slice);
         for arg in &flat {
@@ -1378,6 +1401,12 @@ impl Compiler {
             let tmp = self.alloc_temp_slot();
             bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
             temps.push(tmp);
+        }
+        if slice.len() == 1
+            && let Some(expanded) = Self::expand_fused_return_for_inline(&slice[0], &temps)
+        {
+            bytecode.push(expanded);
+            return true;
         }
         for byte in &slice {
             if matches!(byte.bytecode(), Instruction::RETURN) {
@@ -12612,6 +12641,36 @@ fn main() { print \"%i\", add(3, 4); }",
         // Emitting-only slice (as code_slice_ops would return): Jump + CONST + RETURN
         let emitting: Vec<IlOp> = ops.into_iter().filter(|op| op.emits_code()).collect();
         assert!(!Compiler::is_tiny_inline_il(&emitting));
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_sole_const_return_imm() {
+        use crate::il::IlOp;
+        use common::{Byte, Instruction};
+        let ops = vec![IlOp::byte(
+            Byte::new(Instruction::ConstReturnImm).with_operand_u32(7),
+        )];
+        assert!(Compiler::is_tiny_inline_il(&ops));
+        let expanded =
+            Compiler::expand_fused_return_for_inline(&ops[0].as_plain_byte().unwrap(), &[])
+                .expect("expand");
+        assert_eq!(*expanded.bytecode(), Instruction::CONST);
+        assert_eq!(expanded.operand_u32(), 7);
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_sole_load_return_slot() {
+        use crate::il::IlOp;
+        use common::{Byte, Instruction};
+        let ops = vec![IlOp::byte(
+            Byte::new(Instruction::LoadReturnSlot).with_operand_u32(0),
+        )];
+        assert!(Compiler::is_tiny_inline_il(&ops));
+        let expanded =
+            Compiler::expand_fused_return_for_inline(&ops[0].as_plain_byte().unwrap(), &[42])
+                .expect("expand");
+        assert_eq!(*expanded.bytecode(), Instruction::LOAD);
+        assert_eq!(expanded.operand_u32(), 42);
     }
 
     /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
