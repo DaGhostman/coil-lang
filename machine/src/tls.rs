@@ -378,13 +378,8 @@ fn parse_pem_cert_key(
 /// `opts` must include `cert_pem` and `key_pem` (PEM strings). Returns the same
 /// stream handle with [`StreamKind::Tls`].
 pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value, IoErrorTag> {
-    let (certs, key) = parse_server_enable_options(heap, opts)?;
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|_| IoErrorTag::InvalidInput)?;
-    let config = Arc::new(config);
-
+    // Validate the stream before PEM work so kind/closed errors do not depend
+    // on whether `cert_pem` / `key_pem` parse.
     let fd = with_stream_mut(heap, stream, |s| -> Result<RawFd, IoErrorTag> {
         if s.closed || s.fd.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
@@ -394,6 +389,13 @@ pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<
         }
         Ok(s.fd.as_ref().unwrap().as_raw_fd())
     })??;
+
+    let (certs, key) = parse_server_enable_options(heap, opts)?;
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|_| IoErrorTag::InvalidInput)?;
+    let config = Arc::new(config);
 
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
     let hs = with_blocking_handshake(&mut tcp, |tcp| {
@@ -838,7 +840,7 @@ mod tests {
         );
         assert!(
             with_stream_mut(&mut heap, s, |st| st.tls.is_none()).unwrap(),
-            "failed encrypt must not attach a session"
+            "failed server enable must not attach a session"
         );
         assert!(
             stream_is_nonblocking(&mut heap, s),
