@@ -16,6 +16,8 @@ use common::{
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
 
 /// Tag indices for [`IoError`](common::BUILTIN_IO_ERROR_ENUM).
+///
+/// Append-only — keep discriminants aligned with [`BUILTIN_IO_ERROR_VARIANTS`].
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoErrorTag {
@@ -27,17 +29,23 @@ pub enum IoErrorTag {
     Other = 5,
     NotADirectory = 6,
     AlreadyExists = 7,
+    TimedOut = 8,
+    Truncated = 9,
+    Certificate = 10,
+    Handshake = 11,
 }
 
 impl IoErrorTag {
     pub fn from_kind(kind: ErrorKind) -> Self {
         match kind {
-            ErrorKind::WouldBlock | ErrorKind::TimedOut => Self::WouldBlock,
+            ErrorKind::WouldBlock => Self::WouldBlock,
+            ErrorKind::TimedOut => Self::TimedOut,
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::PermissionDenied => Self::PermissionDenied,
             ErrorKind::InvalidInput => Self::InvalidInput,
             ErrorKind::NotADirectory => Self::NotADirectory,
             ErrorKind::AlreadyExists => Self::AlreadyExists,
+            ErrorKind::UnexpectedEof => Self::Truncated,
             _ => Self::Other,
         }
     }
@@ -125,6 +133,55 @@ fn poll_fd(fd: RawFd, for_read: bool, timeout: Option<Duration>) -> io::Result<b
     }
 }
 
+/// Convert coil millisecond timeout: `<= 0` clears / means wait forever.
+pub fn duration_from_timeout_ms(ms: i64) -> Option<Duration> {
+    if ms <= 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms as u64))
+    }
+}
+
+fn stream_read_timeout(heap: &mut Heap, stream: Value) -> Result<Option<Duration>, IoErrorTag> {
+    with_stream_mut(heap, stream, |s| s.read_timeout)
+}
+
+fn stream_write_timeout(heap: &mut Heap, stream: Value) -> Result<Option<Duration>, IoErrorTag> {
+    with_stream_mut(heap, stream, |s| s.write_timeout)
+}
+
+/// Set soft read deadline for sync adapters (`ms <= 0` clears).
+pub fn stream_set_read_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Result<(), IoErrorTag> {
+    let d = duration_from_timeout_ms(ms);
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        s.read_timeout = d;
+        Ok(())
+    })?
+}
+
+/// Set soft write deadline for sync adapters (`ms <= 0` clears).
+pub fn stream_set_write_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Result<(), IoErrorTag> {
+    let d = duration_from_timeout_ms(ms);
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        s.write_timeout = d;
+        Ok(())
+    })?
+}
+
+fn poll_ready(fd: RawFd, for_read: bool, timeout: Option<Duration>) -> Result<(), IoErrorTag> {
+    match poll_fd(fd, for_read, timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(IoErrorTag::TimedOut),
+        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+    }
+}
+
 /// Wrap an owned fd as a heap `Stream` (always non-blocking).
 pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Result<Value> {
     set_nonblocking(fd.as_raw_fd())?;
@@ -133,6 +190,8 @@ pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Resul
             fd: Some(fd),
             kind,
             closed: false,
+            read_timeout: None,
+            write_timeout: None,
             #[cfg(feature = "tls")]
             tls: None,
         },
@@ -404,6 +463,9 @@ pub fn stream_read_to_end(heap: &mut Heap, stream: Value) -> Result<Value, IoErr
                 }
             }
             Err(IoErrorTag::WouldBlock) => wait_readable(heap, stream)?,
+            // Unclean TLS close is common; bulk readers treat it as EOF with
+            // whatever bytes were already accumulated (L0 `read` still surfaces Truncated).
+            Err(IoErrorTag::Truncated) => break,
             Err(e) => return Err(e),
         }
     }
@@ -445,6 +507,7 @@ pub fn stream_write_all(heap: &mut Heap, stream: Value, buf: Value) -> Result<()
 }
 
 fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
+    let timeout = stream_read_timeout(heap, stream)?;
     #[cfg(feature = "tls")]
     {
         let skip = with_stream_mut(heap, stream, |s| {
@@ -463,16 +526,16 @@ fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
         })?;
         if wants_write {
             let fd = stream_raw_fd(heap, stream)?;
-            poll_fd(fd, false, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-            return Ok(());
+            let write_timeout = stream_write_timeout(heap, stream)?;
+            return poll_ready(fd, false, write_timeout);
         }
     }
     let fd = stream_raw_fd(heap, stream)?;
-    poll_fd(fd, true, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    Ok(())
+    poll_ready(fd, true, timeout)
 }
 
 fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
+    let timeout = stream_write_timeout(heap, stream)?;
     #[cfg(feature = "tls")]
     {
         // Prefer draining pending TLS ciphertext when the socket can accept writes.
@@ -481,13 +544,11 @@ fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
         })?;
         if wants {
             let fd = stream_raw_fd(heap, stream)?;
-            poll_fd(fd, false, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-            return Ok(());
+            return poll_ready(fd, false, timeout);
         }
     }
     let fd = stream_raw_fd(heap, stream)?;
-    poll_fd(fd, false, None).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    Ok(())
+    poll_ready(fd, false, timeout)
 }
 
 fn stream_raw_fd(heap: &mut Heap, stream: Value) -> Result<RawFd, IoErrorTag> {
@@ -503,12 +564,28 @@ fn stream_raw_fd(heap: &mut Heap, stream: Value) -> Result<RawFd, IoErrorTag> {
 // ---- TCP ----
 
 pub fn tcp_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
-    if !(0..=65535).contains(&port) {
-        return Err(IoErrorTag::InvalidInput);
-    }
-    let addr = format!("{host}:{port}");
-    // Blocking connect (sync adapter), then hand back a non-blocking stream.
-    let stream = TcpStream::connect(&addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    tcp_connect_timeout(heap, host, port, 0)
+}
+
+/// Connect with an optional millisecond deadline (`ms <= 0` waits forever).
+pub fn tcp_connect_timeout(
+    heap: &mut Heap,
+    host: &str,
+    port: i64,
+    ms: i64,
+) -> Result<Value, IoErrorTag> {
+    let addr = resolve_socket_addr(host, port)?;
+    let timeout = duration_from_timeout_ms(ms);
+    let stream = match timeout {
+        None => TcpStream::connect(addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?,
+        Some(d) => TcpStream::connect_timeout(&addr, d).map_err(|e| {
+            if e.kind() == ErrorKind::TimedOut {
+                IoErrorTag::TimedOut
+            } else {
+                IoErrorTag::from_kind(e.kind())
+            }
+        })?,
+    };
     stream
         .set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
@@ -518,11 +595,8 @@ pub fn tcp_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoEr
 }
 
 pub fn tcp_listen(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
-    if !(0..=65535).contains(&port) {
-        return Err(IoErrorTag::InvalidInput);
-    }
-    let addr = format!("{host}:{port}");
-    let listener = TcpListener::bind(&addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    let addr = resolve_socket_addr(host, port)?;
+    let listener = TcpListener::bind(addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
@@ -533,10 +607,19 @@ pub fn tcp_listen(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErr
 
 /// Non-blocking accept. `WouldBlock` if nothing pending.
 pub fn tcp_accept(heap: &mut Heap, listener: Value) -> Result<Value, IoErrorTag> {
+    with_stream_mut(heap, listener, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        if s.kind != StreamKind::TcpListener {
+            return Err(IoErrorTag::InvalidInput);
+        }
+        Ok(())
+    })??;
     let fd = stream_raw_fd(heap, listener)?;
     // Reconstruct listener without taking ownership permanently.
-    let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    let result = match listener.accept() {
+    let listener_sock = unsafe { TcpListener::from_raw_fd(fd) };
+    let result = match listener_sock.accept() {
         Ok((stream, _)) => {
             stream
                 .set_nonblocking(true)
@@ -549,21 +632,162 @@ pub fn tcp_accept(heap: &mut Heap, listener: Value) -> Result<Value, IoErrorTag>
         Err(e) => Err(IoErrorTag::from_kind(e.kind())),
     };
     // Don't close the listener fd.
-    let _ = listener.into_raw_fd();
+    let _ = listener_sock.into_raw_fd();
     result
 }
 
 /// Block until a connection is accepted.
 pub fn tcp_accept_wait(heap: &mut Heap, listener: Value) -> Result<Value, IoErrorTag> {
+    tcp_accept_wait_timeout(heap, listener, 0)
+}
+
+/// Accept with an optional millisecond deadline (`ms <= 0` waits forever).
+pub fn tcp_accept_wait_timeout(
+    heap: &mut Heap,
+    listener: Value,
+    ms: i64,
+) -> Result<Value, IoErrorTag> {
+    let deadline = duration_from_timeout_ms(ms).map(|d| std::time::Instant::now() + d);
     loop {
         match tcp_accept(heap, listener) {
-            Err(IoErrorTag::WouldBlock) => wait_readable(heap, listener)?,
-            other => return other,
+            Ok(s) => return Ok(s),
+            Err(IoErrorTag::WouldBlock) => {
+                let remaining = match deadline {
+                    None => None,
+                    Some(end) => {
+                        let now = std::time::Instant::now();
+                        if now >= end {
+                            return Err(IoErrorTag::TimedOut);
+                        }
+                        Some(end - now)
+                    }
+                };
+                let fd = stream_raw_fd(heap, listener)?;
+                poll_ready(fd, true, remaining)?;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
 
+fn format_socket_addr(addr: SocketAddr) -> (String, i64) {
+    match addr {
+        SocketAddr::V4(v4) => (v4.ip().to_string(), i64::from(v4.port())),
+        SocketAddr::V6(v6) => (format!("[{}]", v6.ip()), i64::from(v6.port())),
+    }
+}
+
+fn tcp_stream_addr(
+    heap: &mut Heap,
+    stream: Value,
+    peer: bool,
+) -> Result<(String, i64), IoErrorTag> {
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        match s.kind {
+            StreamKind::Tcp | StreamKind::TcpListener => Ok(()),
+            #[cfg(feature = "tls")]
+            StreamKind::Tls => Ok(()),
+            _ => Err(IoErrorTag::InvalidInput),
+        }
+    })??;
+    let fd = stream_raw_fd(heap, stream)?;
+    let sock = unsafe { TcpStream::from_raw_fd(fd) };
+    let result = if peer {
+        sock.peer_addr()
+    } else {
+        sock.local_addr()
+    }
+    .map(format_socket_addr)
+    .map_err(|e| IoErrorTag::from_kind(e.kind()));
+    let _ = sock.into_raw_fd();
+    result
+}
+
+/// Peer `(host, port)` for a connected TCP/TLS stream.
+pub fn tcp_peer_addr(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+    let (host, port) = tcp_stream_addr(heap, stream, true)?;
+    let host_v = {
+        let gc = heap.intern(host);
+        Value::from(gc.as_ptr() as *mut u8 as u64)
+    };
+    Ok(alloc_tuple2(heap, host_v, Value::from(port)))
+}
+
+/// Local `(host, port)` for a TCP listener or connected TCP/TLS stream.
+pub fn tcp_local_addr(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+    let (host, port) = tcp_stream_addr(heap, stream, false)?;
+    let host_v = {
+        let gc = heap.intern(host);
+        Value::from(gc.as_ptr() as *mut u8 as u64)
+    };
+    Ok(alloc_tuple2(heap, host_v, Value::from(port)))
+}
+
+/// Enable / disable `TCP_NODELAY` on a TCP or TLS stream.
+pub fn tcp_set_nodelay(heap: &mut Heap, stream: Value, enabled: bool) -> Result<(), IoErrorTag> {
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        match s.kind {
+            StreamKind::Tcp => Ok(()),
+            #[cfg(feature = "tls")]
+            StreamKind::Tls => Ok(()),
+            _ => Err(IoErrorTag::InvalidInput),
+        }
+    })??;
+    let fd = stream_raw_fd(heap, stream)?;
+    let sock = unsafe { TcpStream::from_raw_fd(fd) };
+    let result = sock
+        .set_nodelay(enabled)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()));
+    let _ = sock.into_raw_fd();
+    result
+}
+
+/// Half-close a TCP/TLS stream. `how`: `0` read, `1` write, `2` both.
+pub fn tcp_shutdown(heap: &mut Heap, stream: Value, how: i64) -> Result<(), IoErrorTag> {
+    use std::net::Shutdown;
+    let mode = match how {
+        0 => Shutdown::Read,
+        1 => Shutdown::Write,
+        2 => Shutdown::Both,
+        _ => return Err(IoErrorTag::InvalidInput),
+    };
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.fd.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        match s.kind {
+            StreamKind::Tcp => Ok(()),
+            #[cfg(feature = "tls")]
+            StreamKind::Tls => Ok(()),
+            _ => Err(IoErrorTag::InvalidInput),
+        }
+    })??;
+    let fd = stream_raw_fd(heap, stream)?;
+    let sock = unsafe { TcpStream::from_raw_fd(fd) };
+    let result = sock
+        .shutdown(mode)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()));
+    let _ = sock.into_raw_fd();
+    result
+}
+
 // ---- UDP ----
+
+fn alloc_tuple2(heap: &mut Heap, a: Value, b: Value) -> Value {
+    let (obj, _) = heap.alloc(
+        ObjTuple {
+            elements: vec![a, b],
+        },
+        Object::Tuple,
+    );
+    Value::from(obj.addr())
+}
 
 fn alloc_tuple3(heap: &mut Heap, a: Value, b: Value, c: Value) -> Value {
     let (obj, _) = heap.alloc(
@@ -575,13 +799,28 @@ fn alloc_tuple3(heap: &mut Heap, a: Value, b: Value, c: Value) -> Value {
     Value::from(obj.addr())
 }
 
-fn parse_socket_addr(host: &str, port: i64) -> Result<SocketAddr, IoErrorTag> {
+/// Resolve host/port to a single [`SocketAddr`] (IPv4, bracketed/bare IPv6, or DNS).
+fn resolve_socket_addr(host: &str, port: i64) -> Result<SocketAddr, IoErrorTag> {
+    use std::net::{IpAddr, ToSocketAddrs};
     if !(0..=65535).contains(&port) {
         return Err(IoErrorTag::InvalidInput);
     }
-    format!("{host}:{port}")
-        .parse()
-        .map_err(|_| IoErrorTag::InvalidInput)
+    let port = port as u16;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let mut addrs = (bare, port)
+        .to_socket_addrs()
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    addrs.next().ok_or(IoErrorTag::NotFound)
+}
+
+fn parse_socket_addr(host: &str, port: i64) -> Result<SocketAddr, IoErrorTag> {
+    resolve_socket_addr(host, port)
 }
 
 /// Bind a non-blocking UDP socket. `port` may be `0` (ephemeral);
