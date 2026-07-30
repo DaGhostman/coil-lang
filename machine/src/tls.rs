@@ -111,20 +111,24 @@ fn map_io(e: io::Error) -> IoErrorTag {
 fn verified_config() -> Arc<ClientConfig> {
     static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Arc::new(
             ClientConfig::builder()
-                .with_root_certificates(roots)
+                .with_root_certificates(webpki_root_store())
                 .with_no_client_auth(),
         )
     })
     .clone()
 }
 
-fn config_with_ca_pem(ca_pem: &str) -> Result<Arc<ClientConfig>, IoErrorTag> {
+fn webpki_root_store() -> RootCertStore {
     let mut roots = RootCertStore::empty();
-    let mut reader = std::io::Cursor::new(ca_pem.as_bytes());
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// Add PEM certificates from `pem` into `roots` (append; does not clear).
+fn add_pem_certs(roots: &mut RootCertStore, pem: &str) -> Result<(), IoErrorTag> {
+    let mut reader = std::io::Cursor::new(pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| IoErrorTag::InvalidInput)?;
@@ -135,6 +139,26 @@ fn config_with_ca_pem(ca_pem: &str) -> Result<Arc<ClientConfig>, IoErrorTag> {
         roots
             .add(cert)
             .map_err(|_| IoErrorTag::InvalidInput)?;
+    }
+    Ok(())
+}
+
+/// Verified client config: always starts from webpki roots, then appends
+/// optional extra PEM from `ca_pem` and/or a file at `ca_path`.
+fn verified_config_with_extras(
+    ca_pem: Option<&str>,
+    ca_path: Option<&str>,
+) -> Result<Arc<ClientConfig>, IoErrorTag> {
+    if ca_pem.is_none() && ca_path.is_none() {
+        return Ok(verified_config());
+    }
+    let mut roots = webpki_root_store();
+    if let Some(pem) = ca_pem {
+        add_pem_certs(&mut roots, pem)?;
+    }
+    if let Some(path) = ca_path {
+        let pem = std::fs::read_to_string(path).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+        add_pem_certs(&mut roots, &pem)?;
     }
     Ok(Arc::new(
         ClientConfig::builder()
@@ -348,20 +372,42 @@ fn with_handshake(
 
 struct ClientEnableOpts {
     verify: bool,
-    ca_pem: String,
+    ca_pem: Option<String>,
+    ca_path: Option<String>,
     timeout_ms: i64,
 }
 
-/// Parse client `opts`: require `verify`, `ca_pem`, `timeout_ms`.
+/// Decode `Option<string>` from a heap enum (`None` = 0, `Some` = 1).
+fn value_as_option_string(heap: &Heap, v: Value) -> Result<Option<String>, IoErrorTag> {
+    match heap.find_object_by_addr(v.raw() as u64) {
+        Some(Object::Enum(gc)) => {
+            let e = gc.as_ref();
+            match e.tag {
+                0 => Ok(None),
+                1 => {
+                    let payload = e.payload.first().ok_or(IoErrorTag::InvalidInput)?;
+                    let inner = member_as_value(payload)?;
+                    Ok(Some(value_as_string(heap, inner)?))
+                }
+                _ => Err(IoErrorTag::InvalidInput),
+            }
+        }
+        _ => Err(IoErrorTag::InvalidInput),
+    }
+}
+
+/// Parse client `opts`: require `verify`, `ca_pem`, `ca_path`, `timeout_ms`.
 ///
-/// Empty `ca_pem` → webpki roots when `verify`; `timeout_ms <= 0` → no deadline.
+/// `ca_pem` / `ca_path` are `Option<string>`: `None` leaves webpki defaults;
+/// `Some` appends extra trust anchors. `timeout_ms <= 0` → no deadline.
 fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErrorTag> {
     let addr = opts.raw() as u64;
     let Some(Object::Instance(gc)) = heap.find_object_by_addr(addr) else {
         return Err(IoErrorTag::InvalidInput);
     };
     let mut verify: Option<bool> = None;
-    let mut ca_pem: Option<String> = None;
+    let mut ca_pem: Option<Option<String>> = None;
+    let mut ca_path: Option<Option<String>> = None;
     let mut timeout_ms: Option<i64> = None;
     for (key, member) in gc.as_ref().iter_fields() {
         let name = key.as_ref().data.as_str();
@@ -377,7 +423,10 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErr
                 verify = Some(v.as_bool());
             }
             "ca_pem" => {
-                ca_pem = Some(value_as_string(heap, member_as_value(&member)?)?);
+                ca_pem = Some(value_as_option_string(heap, member_as_value(&member)?)?);
+            }
+            "ca_path" => {
+                ca_path = Some(value_as_option_string(heap, member_as_value(&member)?)?);
             }
             "timeout_ms" => {
                 let Member::Value(v) = member else {
@@ -391,6 +440,7 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErr
     Ok(ClientEnableOpts {
         verify: verify.ok_or(IoErrorTag::InvalidInput)?,
         ca_pem: ca_pem.ok_or(IoErrorTag::InvalidInput)?,
+        ca_path: ca_path.ok_or(IoErrorTag::InvalidInput)?,
         timeout_ms: timeout_ms.ok_or(IoErrorTag::InvalidInput)?,
     })
 }
@@ -401,8 +451,9 @@ fn deadline_from_ms(ms: i64) -> Option<std::time::Instant> {
 
 /// Upgrade a TCP `Stream` in place with a TLS client handshake.
 ///
-/// `opts` requires `verify: bool`, `ca_pem: string` (empty → webpki), and
-/// `timeout_ms: int` (`<= 0` → no handshake deadline).
+/// `opts` requires `verify: bool`, `ca_pem: Option<string>`,
+/// `ca_path: Option<string>`, and `timeout_ms: int` (`<= 0` → no handshake
+/// deadline). Extra CA PEM / path **append** to webpki roots when `verify`.
 pub fn tls_client_enable(
     heap: &mut Heap,
     stream: Value,
@@ -413,10 +464,8 @@ pub fn tls_client_enable(
     let server_name = parse_server_name(host)?;
     let config = if !opts.verify {
         insecure_config()
-    } else if opts.ca_pem.is_empty() {
-        verified_config()
     } else {
-        config_with_ca_pem(&opts.ca_pem)?
+        verified_config_with_extras(opts.ca_pem.as_deref(), opts.ca_path.as_deref())?
     };
     let deadline = deadline_from_ms(opts.timeout_ms);
 
@@ -740,7 +789,8 @@ pub fn send_close_notify(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorT
 mod tests {
     use super::*;
     use crate::io::{
-        stream_close, stream_open, stream_read_to_end, stream_write_all, tcp_connect,
+        alloc_option_none, alloc_option_some, stream_close, stream_open, stream_read_to_end,
+        stream_write_all, tcp_connect,
     };
     use crate::memory::{Heap, ObjArray, ObjInstance, ObjString, Object};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -758,17 +808,40 @@ mod tests {
     }
 
     fn make_opts(heap: &mut Heap, verify: bool) -> Value {
-        make_opts_full(heap, verify, "", 0)
+        make_opts_full(heap, verify, None, None, 0)
     }
 
-    fn make_opts_full(heap: &mut Heap, verify: bool, ca_pem: &str, timeout_ms: i64) -> Value {
+    fn option_string_member(heap: &mut Heap, s: Option<&str>) -> Member {
+        let v = match s {
+            None => alloc_option_none(heap),
+            Some(text) => {
+                let (s_obj, _) = heap.alloc(ObjString::from(text), Object::String);
+                alloc_option_some(heap, Value::from(s_obj.addr()))
+            }
+        };
+        Member::Object(
+            heap.find_object_by_addr(v.raw() as u64)
+                .expect("option enum on heap"),
+        )
+    }
+
+    fn make_opts_full(
+        heap: &mut Heap,
+        verify: bool,
+        ca_pem: Option<&str>,
+        ca_path: Option<&str>,
+        timeout_ms: i64,
+    ) -> Value {
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
         let k_verify = heap.intern("verify".into());
         let k_ca = heap.intern("ca_pem".into());
+        let k_path = heap.intern("ca_path".into());
         let k_to = heap.intern("timeout_ms".into());
-        let (ca_obj, _) = heap.alloc(ObjString::from(ca_pem), Object::String);
+        let ca_pem_m = option_string_member(heap, ca_pem);
+        let ca_path_m = option_string_member(heap, ca_path);
         gc.as_mut().set(k_verify, Member::Value(Value::from(verify)));
-        gc.as_mut().set(k_ca, Member::Object(ca_obj));
+        gc.as_mut().set(k_ca, ca_pem_m);
+        gc.as_mut().set(k_path, ca_path_m);
         gc.as_mut().set(k_to, Member::Value(Value::from(timeout_ms)));
         Value::from(obj.addr())
     }
@@ -1661,7 +1734,7 @@ mod tests {
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
         // Trust the self-signed leaf via custom CA PEM (leaf-as-CA is fine for tests).
-        let opts = make_opts_full(&mut heap, true, &cert_pem, 0);
+        let opts = make_opts_full(&mut heap, true, Some(&cert_pem), None, 0);
         let s = tls_client_enable(&mut heap, s, "localhost", opts).expect("enable+ca");
         let msg = make_byte_array(&mut heap, b"ca-ok");
         stream_write_all(&mut heap, s, msg).expect("write");
@@ -1672,11 +1745,88 @@ mod tests {
     }
 
     #[test]
+    fn enable_with_custom_ca_path_round_trips() {
+        let (cert_pem, key_pem) = test_server_pem();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "coil_tls_ca_{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, &cert_pem).expect("write ca");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server_cert = cert_pem.clone();
+        let server_key = key_pem.clone();
+        let server = thread::spawn(move || {
+            let mut heap = Heap::default();
+            ready_tx.send(()).ok();
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let fd = sock.into_raw_fd();
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let opts = make_server_enable_opts(&mut heap, &server_cert, &server_key);
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
+            let buf = make_byte_array(&mut heap, &[0u8; 64]);
+            let n = loop {
+                match crate::io::stream_read(&mut heap, s, buf) {
+                    Ok(Some(n)) if n > 0 => break n,
+                    Ok(Some(0)) | Ok(None) => panic!("eof before data"),
+                    Ok(_) | Err(IoErrorTag::WouldBlock) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read {e:?}"),
+                }
+            };
+            let read_bytes = array_bytes(&heap, buf);
+            let echo = make_byte_array(&mut heap, &read_bytes[..n]);
+            stream_write_all(&mut heap, s, echo).expect("echo");
+            stream_close(&mut heap, s).ok();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        let path_s = path.to_string_lossy();
+        let opts = make_opts_full(&mut heap, true, None, Some(path_s.as_ref()), 0);
+        let s = tls_client_enable(&mut heap, s, "localhost", opts).expect("enable+ca_path");
+        let msg = make_byte_array(&mut heap, b"path-ok");
+        stream_write_all(&mut heap, s, msg).expect("write");
+        let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
+        assert_eq!(array_bytes(&heap, echoed), b"path-ok");
+        stream_close(&mut heap, s).ok();
+        server.join().expect("server");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enable_rejects_missing_ca_path() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_full(
+            &mut heap,
+            true,
+            None,
+            Some("/tmp/coil_tls_missing_ca_does_not_exist.pem"),
+            0,
+        );
+        let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
+        assert!(
+            matches!(err, IoErrorTag::NotFound | IoErrorTag::Other),
+            "unexpected {err:?}"
+        );
+        stream_close(&mut heap, s).ok();
+        let _ = handle.join();
+    }
+
+    #[test]
     fn enable_rejects_garbage_ca_pem() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        let opts = make_opts_full(&mut heap, true, "not-a-pem", 0);
+        let opts = make_opts_full(&mut heap, true, Some("not-a-pem"), None, 0);
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
@@ -1684,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_requires_ca_pem_and_timeout_ms_keys() {
+    fn enable_requires_ca_opts_and_timeout_ms_keys() {
         let (port, handle) = spawn_tls_echo_server();
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
@@ -1711,7 +1861,7 @@ mod tests {
         });
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
-        let opts = make_opts_full(&mut heap, false, "", 40);
+        let opts = make_opts_full(&mut heap, false, None, None, 40);
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::TimedOut);
         stream_close(&mut heap, s).ok();
@@ -1787,7 +1937,7 @@ mod tests {
         let mut heap = Heap::default();
         // Client has no client certificate; mTLS server must fail the handshake.
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
-        let opts = make_opts_full(&mut heap, false, "", 2000);
+        let opts = make_opts_full(&mut heap, false, None, None, 2000);
         let client_err = tls_client_enable(&mut heap, s, "localhost", opts).err();
         stream_close(&mut heap, s).ok();
         let server_err = err_rx.recv_timeout(Duration::from_secs(3)).expect("server result");
