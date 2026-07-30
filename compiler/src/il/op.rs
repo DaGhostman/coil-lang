@@ -494,7 +494,7 @@ mod tests {
                 loc: DebugLoc::unknown(),
             },
             IlOp::Const {
-                imm: -1,
+                imm: 42,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Dup {
