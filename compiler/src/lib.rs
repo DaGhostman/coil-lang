@@ -7,6 +7,7 @@ mod peephole;
 mod pipeline;
 mod strip_tests;
 mod typechecking;
+mod il;
 
 use std::{
     borrow::Borrow,
