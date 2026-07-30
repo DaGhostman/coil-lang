@@ -21,7 +21,7 @@ use common::{
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
-use crate::il::{CodeBuf, EmitBuf};
+use crate::il::{CodeBuf, EmitBuf, EntryKind, Label as IlLabel};
 use crate::const_fold::ConstValue;
 use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
@@ -694,6 +694,8 @@ pub struct Compiler {
 
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
+    /// Entry labels for names in [`Self::functions`] (step-3 binds).
+    fn_entry_labels: HashMap<String, IlLabel>,
     /// Fixed arity + rest flag per function table key. Survives multi-file
     /// `check_program` clears of `Checker::fn_param_names`, so `MakeFn` for
     /// imported names (e.g. `spawn(run_jobs, …)` after `use pool::worker::run_jobs`)
@@ -843,6 +845,7 @@ impl Default for Compiler {
             debug_locs,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
+            fn_entry_labels: HashMap::with_capacity(32),
             fn_arities: HashMap::with_capacity(32),
             module_items: std::collections::HashMap::default(),
             native: HashMap::default(),
@@ -1279,6 +1282,7 @@ impl Compiler {
         let Some(&target) = self.functions.get(&cur) else {
             return false;
         };
+        // Packed abs PC; CodeBuf::push rewrites to IlOp::Entry via entry_at_offset.
         bytecode.push(
             Byte::new(Instruction::TailCall).with_call_packed(arity as u32, target as u32),
         );
@@ -1635,6 +1639,21 @@ impl Compiler {
 
     pub fn function_offset(&self, name: &str) -> Option<usize> {
         self.functions.get(name).copied()
+    }
+
+    /// Bind a fresh entry label at the current PC and register `name`.
+    fn bind_function_entry(&mut self, name: String) -> (usize, IlLabel) {
+        let offset = self.bytecode.len();
+        let label = self.bytecode.bind_fresh_entry();
+        self.functions.insert(name.clone(), offset);
+        self.fn_entry_labels.insert(name, label);
+        (offset, label)
+    }
+
+    /// Entry label for a registered function, if bound.
+    #[allow(dead_code)] // call-site Entry emit / step-5 assert helpers
+    fn fn_entry_label(&self, name: &str) -> Option<IlLabel> {
+        self.fn_entry_labels.get(name).copied()
     }
 
     /// Bytecode offset WHERE the prologue (CALL+JMP+HALT)
@@ -3722,8 +3741,7 @@ impl Compiler {
             if compiler.functions.contains_key(&fqn) {
                 return;
             }
-            compiler.functions.insert(fqn, compiler.bytecode.len());
-            compiler.bytecode.bind_fresh_entry();
+            compiler.bind_function_entry(fqn);
             for slot in 0..2 {
                 compiler
                     .bytecode
@@ -3802,8 +3820,7 @@ impl Compiler {
             if self.functions.contains_key(&fqn) {
                 continue;
             }
-            self.functions.insert(fqn, self.bytecode.len());
-            self.bytecode.bind_fresh_entry();
+            self.bind_function_entry(fqn);
             self.bytecode
                 .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
             self.bytecode.push(Byte::new(Instruction::STRINGIFY));
@@ -3824,8 +3841,7 @@ impl Compiler {
             if self.functions.contains_key(&fqn) {
                 continue;
             }
-            self.functions.insert(fqn, self.bytecode.len());
-            self.bytecode.bind_fresh_entry();
+            self.bind_function_entry(fqn);
             self.bytecode
                 .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
             self.bytecode
@@ -3835,8 +3851,7 @@ impl Compiler {
         {
             let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
             if !self.functions.contains_key(&fqn) {
-                self.functions.insert(fqn, self.bytecode.len());
-                self.bytecode.bind_fresh_entry();
+                self.bind_function_entry(fqn);
                 self.bytecode
                     .push(Byte::new(Instruction::CONST).with_const_inline(0));
                 self.bytecode.push(Byte::new(Instruction::RETURN));
@@ -3845,8 +3860,7 @@ impl Compiler {
         if let Some(native_id) = self.native_id("hash_string") {
             let fqn = Generics::builtin_instance_fqn("Hash", "string", "hash");
             if !self.functions.contains_key(&fqn) {
-                self.functions.insert(fqn, self.bytecode.len());
-                self.bytecode.bind_fresh_entry();
+                self.bind_function_entry(fqn);
                 self.bytecode
                     .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
                 self.bytecode
@@ -3876,8 +3890,7 @@ impl Compiler {
             let Some(native_id) = self.native_id(native_name) else {
                 continue;
             };
-            self.functions.insert(fqn, self.bytecode.len());
-            self.bytecode.bind_fresh_entry();
+            self.bind_function_entry(fqn);
             self.bytecode
                 .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
             self.bytecode
@@ -3910,8 +3923,7 @@ impl Compiler {
             if self.functions.contains_key(&fqn) {
                 continue;
             }
-            self.functions.insert(fqn, self.bytecode.len());
-            self.bytecode.bind_fresh_entry();
+            self.bind_function_entry(fqn);
             self.bytecode
                 .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
             self.bytecode.push(
@@ -3995,9 +4007,7 @@ impl Compiler {
             return;
         };
 
-        self.functions
-            .insert(qualified.clone(), self.bytecode.len());
-        self.bytecode.bind_fresh_entry();
+        self.bind_function_entry(qualified.clone());
         if *is_coro {
             self.coroutine_fns.insert(qualified);
         }
@@ -4208,16 +4218,14 @@ impl Compiler {
                 continue;
             }
 
-            let clone_offset = self.bytecode.len();
             let mono_name = format!(
                 "{}$mono${}",
                 qualified,
                 specialization.key.subst.join("$").replace(' ', "")
             );
-            self.functions.insert(mono_name, clone_offset);
+            let (clone_offset, _) = self.bind_function_entry(mono_name);
             self.mono_offsets
                 .insert(specialization.key.clone(), clone_offset);
-            self.bytecode.bind_fresh_entry();
 
             let prev_fn_vars = std::mem::take(&mut self.context.variables);
             let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
@@ -6068,9 +6076,7 @@ impl Compiler {
             return;
         }
 
-        let main_offset = self.bytecode.len();
-        self.functions.insert("main".to_string(), main_offset);
-        self.bytecode.bind_fresh_entry();
+        self.bind_function_entry("main".to_string());
 
         let prev_vars = std::mem::take(&mut self.context.variables);
         self.context.variables = Interner::default();
@@ -6085,9 +6091,13 @@ impl Compiler {
 
         let mut bb = BlockBuilder::new();
         for (desc, offset) in &cases {
-            self.bytecode.push(
-                Byte::new(Instruction::CALL).with_call_packed(0, *offset),
-            );
+            if let Some(label) = self.bytecode.entry_label_for_offset(*offset as usize) {
+                self.bytecode.emit_entry(EntryKind::Call, 0, label);
+            } else {
+                self.bytecode.push(
+                    Byte::new(Instruction::CALL).with_call_packed(0, *offset),
+                );
+            }
             // Jump if Result::Err (tag 1) — on match, payload (message) is pushed.
             let fail = bb.fresh_label(self.bytecode.il_mut());
             let done = bb.fresh_label(self.bytecode.il_mut());
@@ -6370,9 +6380,8 @@ impl Compiler {
                 } else {
                     qualified.clone()
                 };
-                let fn_offset = self.bytecode.len() as u32;
-                self.functions.insert(table_key.clone(), fn_offset as usize);
-                self.bytecode.bind_fresh_entry();
+                let (fn_offset, _) = self.bind_function_entry(table_key.clone());
+                let fn_offset = fn_offset as u32;
                 self.fn_arities
                     .insert(table_key.clone(), (fixed_arity as u32, has_rest));
                 if table_key != qualified {
@@ -9071,9 +9080,8 @@ impl Compiler {
                 };
                 let case_index = self.test_cases.len();
                 let fn_name = crate::typechecking::Checker::test_case_fn_name(case_index);
-                let offset = self.bytecode.len() as u32;
-                self.functions.insert(fn_name.clone(), offset as usize);
-                self.bytecode.bind_fresh_entry();
+                let (offset, _) = self.bind_function_entry(fn_name.clone());
+                let offset = offset as u32;
                 self.test_cases.push((desc, offset));
 
                 let prev_fn_vars = std::mem::take(&mut self.context.variables);

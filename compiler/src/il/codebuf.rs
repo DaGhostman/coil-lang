@@ -1,5 +1,7 @@
 //! Bytecode buffer backed by stack IL during emit; lowered at finalize.
 
+use std::collections::HashMap;
+
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
@@ -12,6 +14,9 @@ pub struct CodeBuf {
     il: IlBuilder,
     lowered: Option<Vec<Byte>>,
     lowered_locs: Option<Vec<DebugLoc>>,
+    /// Logical code index → entry label from [`Self::bind_fresh_entry`].
+    /// Used to rewrite packed CALL/CodePtr Bytes into [`IlOp::Entry`].
+    entry_at_offset: HashMap<usize, Label>,
 }
 
 impl CodeBuf {
@@ -34,13 +39,49 @@ impl CodeBuf {
         // Error-recovery paths may emit after a failed finalize/lower.
         self.lowered = None;
         self.lowered_locs = None;
-        self.il.push_byte(b);
+        if let Some((kind, arity, label)) = self.entry_from_abs_byte(b) {
+            self.il.emit_entry(kind, arity, label);
+        } else {
+            self.il.push_byte(b);
+        }
     }
 
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
-        self.lowered = None;
-        self.lowered_locs = None;
-        self.il.extend_bytes(iter);
+        for b in iter {
+            self.push(b);
+        }
+    }
+
+    /// If `b` is a call-like op targeting a known entry PC, return Entry parts.
+    fn entry_from_abs_byte(&self, b: Byte) -> Option<(EntryKind, u32, Label)> {
+        match *b.bytecode() {
+            Instruction::CALL => {
+                let (arity, target) = b.call_parts();
+                let label = *self.entry_at_offset.get(&target)?;
+                Some((EntryKind::Call, arity as u32, label))
+            }
+            Instruction::TailCall => {
+                let (arity, target) = b.call_parts();
+                let label = *self.entry_at_offset.get(&target)?;
+                Some((EntryKind::TailCall, arity as u32, label))
+            }
+            Instruction::MakeCoro => {
+                let (arity, target) = b.call_parts();
+                let label = *self.entry_at_offset.get(&target)?;
+                Some((EntryKind::MakeCoro, arity as u32, label))
+            }
+            Instruction::CodePtr => {
+                let target = b.operand_u32() as usize;
+                let label = *self.entry_at_offset.get(&target)?;
+                Some((EntryKind::CodePtr, 0, label))
+            }
+            Instruction::MakePolyFn => {
+                let target = b.operand_u32() as usize;
+                let label = *self.entry_at_offset.get(&target)?;
+                Some((EntryKind::MakePolyFn, 0, label))
+            }
+            _ => None,
+        }
     }
 
     pub fn append(&mut self, other: &mut Vec<Byte>) {
@@ -62,6 +103,7 @@ impl CodeBuf {
         self.il.clear();
         self.lowered = None;
         self.lowered_locs = None;
+        self.entry_at_offset.clear();
     }
 
     pub fn fresh_label(&mut self) -> Label {
@@ -74,10 +116,18 @@ impl CodeBuf {
 
     /// Bind a fresh label at the current emit position (fn / lambda / thunk entry).
     /// Labels do not advance [`Self::len`], so absolute PC tables stay aligned.
+    /// Records the binding so later packed CALL/CodePtr Bytes rewrite to Entry.
     pub fn bind_fresh_entry(&mut self) -> Label {
+        let pc = self.len();
         let label = self.fresh_label();
         self.bind_label(label);
+        self.entry_at_offset.insert(pc, label);
         label
+    }
+
+    /// Look up the entry label bound at logical code index `pc`, if any.
+    pub fn entry_label_for_offset(&self, pc: usize) -> Option<Label> {
+        self.entry_at_offset.get(&pc).copied()
     }
 
     /// Return an existing label bound at logical code index `code_pos`, or insert
@@ -104,6 +154,7 @@ impl CodeBuf {
         }
         let label = self.il.fresh_label();
         self.il.insert_bound_label_at(raw_idx, label);
+        self.entry_at_offset.entry(code_pos).or_insert(label);
         label
     }
 
@@ -203,6 +254,7 @@ impl CodeBuf {
             return;
         }
         self.il.ops_mut().truncate(keep);
+        self.entry_at_offset.retain(|&pc, _| pc < code_len);
     }
 
     /// Plain bytes in the emitting-op range `[start, end)` (labels skipped).
@@ -269,30 +321,20 @@ impl CodeBuf {
         self.il.ops_mut().insert(raw_idx, IlOp::byte(byte));
     }
 
+    /// Shift [`Self::entry_at_offset`] keys after a splice that inserts `delta`
+    /// emitting ops at `threshold`. Entry ops themselves are symbolic and need
+    /// no rewrite; leftover abs CALL/CodePtr Bytes (defer target 0, missing
+    /// CodePtr 0) are below any real entry PC and are left untouched.
     pub fn bump_absolute_entry_targets(&mut self, threshold: usize, delta: usize) {
         if delta == 0 {
             return;
         }
-        for op in self.il.ops_mut() {
-            if let IlOp::Byte { byte, .. } = op {
-                match *byte.bytecode() {
-                    Instruction::CALL | Instruction::MakeCoro | Instruction::TailCall => {
-                        let (arity, target) = byte.call_parts();
-                        if target >= threshold {
-                            *byte = Byte::new(*byte.bytecode())
-                                .with_call_packed(arity as u32, (target + delta) as u32);
-                        }
-                    }
-                    Instruction::CodePtr | Instruction::MakePolyFn => {
-                        let t = byte.operand_u32() as usize;
-                        if t >= threshold {
-                            *byte = Byte::new(*byte.bytecode()).with_operand_u32((t + delta) as u32);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        let mut next = HashMap::with_capacity(self.entry_at_offset.len());
+        for (pc, label) in self.entry_at_offset.drain() {
+            let pc = if pc >= threshold { pc + delta } else { pc };
+            next.insert(pc, label);
         }
+        self.entry_at_offset = next;
     }
 
     pub fn last_byte(&self) -> Option<Byte> {

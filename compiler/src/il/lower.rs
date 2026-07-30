@@ -126,8 +126,10 @@ pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
         debug_locs.push(slot.loc());
     }
 
-    // Absolute PCs still in plain Bytes (unmigrated CALL/CodePtr) use
+    // Absolute JMP still in plain Bytes (unmigrated control flow) use
     // pre-fusion indices — remap once via the fusion origin table.
+    // CALL/CodePtr/MakePolyFn/TailCall/MakeCoro arrive as [`IlOp::Entry`]
+    // (or defer CALL target 0 / missing CodePtr 0) and must not be remapped.
     remap_absolute_targets(&mut bytecode, pool, &pre_to_post, slots.len());
 
     let code_len = bytecode.len();
@@ -303,8 +305,10 @@ fn resolve(labels: &HashMap<u32, usize>, target: Label) -> u32 {
     *labels.get(&target.0).unwrap_or(&0) as u32
 }
 
-/// Remap absolute call/code-pointer targets that still use pre-fusion indices.
-/// Symbolic jumps / fused branches are already correct — do not touch them.
+/// Remap absolute jump targets that still use pre-fusion indices.
+/// Symbolic jumps / entries are already correct — do not touch them.
+/// Leftover CALL/CodePtr Bytes (defer frame-setup target 0, missing fn
+/// CodePtr 0) are not fusion-sensitive and are left as-is.
 fn remap_absolute_targets(
     bytecode: &mut [Byte],
     pool: &mut [u64],
@@ -332,15 +336,6 @@ fn remap_absolute_targets(
                     let t = map(byte.operand_u32() as usize);
                     *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
                 }
-            }
-            Instruction::CALL | Instruction::MakeCoro | Instruction::TailCall => {
-                let (arity, target) = byte.call_parts();
-                let t = map(target);
-                *byte = Byte::new(*byte.bytecode()).with_call_packed(arity as u32, t as u32);
-            }
-            Instruction::CodePtr | Instruction::MakePolyFn => {
-                let t = map(byte.operand_u32() as usize);
-                *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
             }
             _ => {}
         }
@@ -547,5 +542,23 @@ mod tests {
             Instruction::JMPF
         ));
         assert_eq!(lowered.bytecode[1].operand_u32(), 3);
+    }
+
+    #[test]
+    fn lower_resolves_entry_call() {
+        let mut il = IlBuilder::new();
+        let entry = il.fresh_label();
+        il.emit_entry(EntryKind::Call, 1, entry);
+        il.push_byte(Byte::new(Instruction::HALT));
+        il.bind_label(entry);
+        il.push_byte(Byte::new(Instruction::RETURN));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::CALL
+        ));
+        assert_eq!(lowered.bytecode[0].call_parts(), (1, 2));
     }
 }
