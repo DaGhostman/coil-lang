@@ -2107,6 +2107,50 @@ fn example_io_udp_prints_2() {
     assert_eq!(output, "2");
 }
 
+#[test]
+fn io_timeout_and_tcp_helper_hostinvokes_are_wired() {
+    let output = run_example_src(
+        r#"
+use io::*;
+use io::net::tcp::{accept_wait_timeout, connect_timeout, listen, local_addr, set_nodelay, shutdown};
+
+fn main() {
+    let path = "/tmp/coil_io_timeout_tcp_helpers.bin";
+    let file = open(path, "w")?;
+    set_read_timeout(file, 1)?;
+    set_write_timeout(file, 1)?;
+
+    let local_on_file = match local_addr(file) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    let nodelay_on_file = match set_nodelay(file, true) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    let shutdown_on_file = match shutdown(file, 2) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+
+    let listener = listen("127.0.0.1", 0)?;
+    let addr = local_addr(listener)?;
+    let accept_code = match accept_wait_timeout(listener, 1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    let connect_code = match connect_timeout("127.0.0.1", 1, 1) {
+        Result::Ok(_) => 2,
+        Result::Err(_) => 2,
+    };
+
+    print "%i%i%i%i%i", local_on_file, nodelay_on_file, shutdown_on_file, accept_code, connect_code;
+}
+"#,
+    );
+    assert_eq!(output, "11112");
+}
+
 /// Nested IO HostInvoke (`read_to_end(open(...)?)`) must leave the stream on
 /// the stack as the MakeTuple element, not the outer native id.
 #[test]
@@ -3449,6 +3493,10 @@ fn classify(IoError e) -> int {
         IoError::Other => 15,
         IoError::NotADirectory => 16,
         IoError::AlreadyExists => 17,
+        IoError::TimedOut => 18,
+        IoError::Truncated => 19,
+        IoError::Certificate => 20,
+        IoError::Handshake => 21,
     };
 }
 
@@ -3578,6 +3626,10 @@ fn classify(IoError e) -> int {{
         IoError::Other => 15,
         IoError::NotADirectory => 16,
         IoError::AlreadyExists => 17,
+        IoError::TimedOut => 18,
+        IoError::Truncated => 19,
+        IoError::Certificate => 20,
+        IoError::Handshake => 21,
     }};
 }}
 
@@ -3759,6 +3811,10 @@ fn classify(IoError e) -> int {
         IoError::Other => 15,
         IoError::NotADirectory => 16,
         IoError::AlreadyExists => 17,
+        IoError::TimedOut => 18,
+        IoError::Truncated => 19,
+        IoError::Certificate => 20,
+        IoError::Handshake => 21,
     };
 }
 
@@ -3801,6 +3857,10 @@ fn classify(IoError e) -> int {
         IoError::Other => 15,
         IoError::NotADirectory => 16,
         IoError::AlreadyExists => 17,
+        IoError::TimedOut => 18,
+        IoError::Truncated => 19,
+        IoError::Certificate => 20,
+        IoError::Handshake => 21,
     };
 }
 

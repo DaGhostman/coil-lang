@@ -147,8 +147,10 @@ impl Pipeline {
         use machine::io::{
             as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
             stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
-            stream_stderr, stream_stdin, stream_stdout, stream_write, stream_write_all, tcp_accept,
-            tcp_accept_wait, tcp_connect, tcp_listen, to_bytes, udp_bind, udp_connect,
+            stream_set_read_timeout, stream_set_write_timeout, stream_stderr, stream_stdin,
+            stream_stdout, stream_write, stream_write_all, tcp_accept, tcp_accept_wait,
+            tcp_accept_wait_timeout, tcp_connect, tcp_connect_timeout, tcp_listen, tcp_local_addr,
+            tcp_peer_addr, tcp_set_nodelay, tcp_shutdown, to_bytes, udp_bind, udp_connect,
             udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
         };
         #[cfg(feature = "tls")]
@@ -168,18 +170,26 @@ impl Pipeline {
                 | IoBuiltin::ToBytes
                 | IoBuiltin::TcpAccept
                 | IoBuiltin::TcpAcceptWait
+                | IoBuiltin::TcpPeerAddr
+                | IoBuiltin::TcpLocalAddr
                 | IoBuiltin::UdpLocalPort => 1,
                 IoBuiltin::Open
                 | IoBuiltin::Read
                 | IoBuiltin::Write
                 | IoBuiltin::ReadExact
                 | IoBuiltin::WriteAll
+                | IoBuiltin::SetReadTimeout
+                | IoBuiltin::SetWriteTimeout
                 | IoBuiltin::TcpConnect
                 | IoBuiltin::TcpListen
+                | IoBuiltin::TcpAcceptWaitTimeout
+                | IoBuiltin::TcpSetNodelay
+                | IoBuiltin::TcpShutdown
                 | IoBuiltin::UdpBind
                 | IoBuiltin::UdpConnect
                 | IoBuiltin::UdpRecvFrom
                 | IoBuiltin::UdpRecvFromWait => 2,
+                IoBuiltin::TcpConnectTimeout => 3,
                 #[cfg(feature = "tls")]
                 IoBuiltin::TlsClientEnable => 3,
                 #[cfg(feature = "tls")]
@@ -241,6 +251,14 @@ impl Pipeline {
                             let r = stream_write_all(heap, args[0], args[1]);
                             as_result_unit(heap, r)
                         }
+                        IoBuiltin::SetReadTimeout => {
+                            let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
+                            as_result_unit(heap, r)
+                        }
+                        IoBuiltin::SetWriteTimeout => {
+                            let r = stream_set_write_timeout(heap, args[0], args[1].as_int());
+                            as_result_unit(heap, r)
+                        }
                         IoBuiltin::FromBytes => {
                             let r = from_bytes(heap, args[0]);
                             as_result_value(heap, r)
@@ -254,6 +272,17 @@ impl Pipeline {
                                 }
                             };
                             let r = tcp_connect(heap, &host, args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpConnectTimeout => {
+                            let host = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r =
+                                tcp_connect_timeout(heap, &host, args[1].as_int(), args[2].as_int());
                             as_result_value(heap, r)
                         }
                         IoBuiltin::TcpListen => {
@@ -273,6 +302,26 @@ impl Pipeline {
                         IoBuiltin::TcpAcceptWait => {
                             let r = tcp_accept_wait(heap, args[0]);
                             as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpAcceptWaitTimeout => {
+                            let r = tcp_accept_wait_timeout(heap, args[0], args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpPeerAddr => {
+                            let r = tcp_peer_addr(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpLocalAddr => {
+                            let r = tcp_local_addr(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpSetNodelay => {
+                            let r = tcp_set_nodelay(heap, args[0], args[1].as_bool());
+                            as_result_unit(heap, r)
+                        }
+                        IoBuiltin::TcpShutdown => {
+                            let r = tcp_shutdown(heap, args[0], args[1].as_int());
+                            as_result_unit(heap, r)
                         }
                         IoBuiltin::UdpBind => {
                             let host = match value_as_string(heap, args[0]) {

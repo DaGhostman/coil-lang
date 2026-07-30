@@ -1058,9 +1058,9 @@ impl Checker {
 
     /// Scheme for a virtual `io` host native (inserted on `use io::*`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
-        use crate::typechecking::ty::{array, byte, stream_ty, tuple};
+        use crate::typechecking::ty::{array, boolean, byte, stream_ty, tuple};
         #[cfg(feature = "tls")]
-        use crate::typechecking::ty::{boolean, record};
+        use crate::typechecking::ty::record;
         let stream = stream_ty();
         let bytes = array(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
@@ -1071,6 +1071,8 @@ impl Checker {
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
         let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
         let res_string = result_app_ty(string(), io_err.clone());
+        let addr_ty = tuple(vec![string(), int()]);
+        let res_addr = result_app_ty(addr_ty, io_err.clone());
         // `(nbytes, peer_host, peer_port)` from `io::net::udp::recv_from`.
         let recv_from_ty = tuple(vec![int(), string(), int()]);
         let res_recv_from = result_app_ty(recv_from_ty, io_err);
@@ -1087,12 +1089,20 @@ impl Checker {
             IoBuiltin::Write => fun(&[stream, bytes], res_int),
             IoBuiltin::ReadToEnd => fun(&[stream], res_bytes),
             IoBuiltin::WriteAll => fun(&[stream, bytes], res_unit),
+            IoBuiltin::SetReadTimeout | IoBuiltin::SetWriteTimeout => {
+                fun(&[stream, int()], res_unit)
+            }
             IoBuiltin::FromBytes => fun(&[bytes], res_string),
             IoBuiltin::ToBytes => fun(&[string()], bytes),
             IoBuiltin::TcpConnect | IoBuiltin::TcpListen => {
                 fun(&[string(), int()], res_stream)
             }
+            IoBuiltin::TcpConnectTimeout => fun(&[string(), int(), int()], res_stream),
             IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
+            IoBuiltin::TcpAcceptWaitTimeout => fun(&[stream, int()], res_stream),
+            IoBuiltin::TcpPeerAddr | IoBuiltin::TcpLocalAddr => fun(&[stream], res_addr),
+            IoBuiltin::TcpSetNodelay => fun(&[stream, boolean()], res_unit),
+            IoBuiltin::TcpShutdown => fun(&[stream, int()], res_unit),
             #[cfg(feature = "tls")]
             IoBuiltin::TlsClientEnable => {
                 let opts = record(vec![("verify".into(), boolean())]);
