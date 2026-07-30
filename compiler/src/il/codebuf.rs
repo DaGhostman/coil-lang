@@ -266,7 +266,8 @@ impl CodeBuf {
 
     /// Plain bytes in the emitting-op range `[start, end)` (labels skipped).
     /// Jump/Entry ops are omitted from the returned vec — callers that need
-    /// a faithful body copy must reject spans with [`Self::span_has_control_ops`].
+    /// a faithful body copy must reject spans with [`Self::span_has_control_ops`]
+    /// or judge candidacy via [`Self::code_slice_ops`].
     pub fn code_slice_bytes(&self, start: usize, end: usize) -> Vec<Byte> {
         let mut out = Vec::new();
         let mut i = 0usize;
@@ -289,9 +290,9 @@ impl CodeBuf {
         out
     }
 
-    /// True if `[start, end)` contains a Jump/Entry (not safe to tiny-inline
-    /// via [`Self::code_slice_bytes`], which drops those ops).
-    pub fn span_has_control_ops(&self, start: usize, end: usize) -> bool {
+    /// Emitting ops in `[start, end)` (labels skipped; Jump/Entry included).
+    pub fn code_slice_ops(&self, start: usize, end: usize) -> Vec<super::IlOp> {
+        let mut out = Vec::new();
         let mut i = 0usize;
         for op in self.il.ops() {
             if !op.emits_code() {
@@ -301,16 +302,19 @@ impl CodeBuf {
                 break;
             }
             if i >= start {
-                match op {
-                    super::IlOp::Jump { .. }
-                    | super::IlOp::Entry { .. }
-                    | super::IlOp::PrologueJmp { .. } => return true,
-                    _ => {}
-                }
+                out.push(op.clone());
             }
             i += 1;
         }
-        false
+        out
+    }
+
+    /// True if `[start, end)` contains a Jump/Entry (not safe to tiny-inline
+    /// via [`Self::code_slice_bytes`], which drops those ops).
+    pub fn span_has_control_ops(&self, start: usize, end: usize) -> bool {
+        self.code_slice_ops(start, end)
+            .iter()
+            .any(|op| op.is_control())
     }
 
     pub fn insert_byte_at_code(&mut self, code_idx: usize, byte: Byte) {

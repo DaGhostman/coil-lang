@@ -21,7 +21,7 @@ use common::{
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
-use crate::il::{CodeBuf, EmitBuf, EntryKind, Label as IlLabel};
+use crate::il::{CodeBuf, EmitBuf, EntryKind, IlOp, Label as IlLabel};
 use crate::const_fold::ConstValue;
 use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
@@ -1293,26 +1293,32 @@ impl Compiler {
         true
     }
 
-    fn is_tiny_inline_body(slice: &[Byte]) -> bool {
-        if slice.is_empty() || slice.len() > 48 {
+    fn is_tiny_inline_il(ops: &[IlOp]) -> bool {
+        if ops.is_empty() || ops.len() > 48 {
             return false;
         }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
         // truncate (else-arm dropped). Only allow a single terminal RETURN
         // and no control-flow jumps.
-        let return_idxs: Vec<usize> = slice
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| matches!(b.bytecode(), Instruction::RETURN))
-            .map(|(i, _)| i)
-            .collect();
-        if return_idxs.len() != 1 || return_idxs[0] != slice.len() - 1 {
+        if ops.iter().any(|op| op.is_control()) {
             return false;
         }
-        !slice.iter().any(|b| {
+        let return_idxs: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.is_plain_return())
+            .map(|(i, _)| i)
+            .collect();
+        if return_idxs.len() != 1 || return_idxs[0] != ops.len() - 1 {
+            return false;
+        }
+        !ops.iter().any(|op| {
+            let Some(b) = op.as_plain_byte() else {
+                return true;
+            };
             matches!(
-                b.bytecode(),
+                *b.bytecode(),
                 Instruction::CALL
                     | Instruction::TailCall
                     | Instruction::MakeCoro
@@ -1354,15 +1360,12 @@ impl Compiler {
         if self.checker.fn_has_rest(&lookup) {
             return false;
         }
+        let ops = self.bytecode.code_slice_ops(start, end);
+        if !Self::is_tiny_inline_il(&ops) {
+            return false;
+        }
+        // Copy path still uses plain bytes (Jump/Entry already refused above).
         let slice = self.bytecode.code_slice_bytes(start, end);
-        // `code_slice_bytes` drops Jump/Entry ops; refuse spans that had any
-        // so match/`if` bodies cannot be inlined as straight-line garbage.
-        if self.bytecode.span_has_control_ops(start, end) {
-            return false;
-        }
-        if !Self::is_tiny_inline_body(&slice) {
-            return false;
-        }
         let arg_slice = args.unwrap_or(&[]);
         let _lookup = strip_overload_key(fqn);
         let mut temps = Vec::new();
@@ -12591,6 +12594,25 @@ fn main() { print \"%i\", add(3, 4); }",
             }),
             "expected inlined add to emit a binary op in bytecode"
         );
+    }
+
+    #[test]
+    fn is_tiny_inline_il_rejects_jump_span() {
+        use crate::il::{IlJumpKind, IlOp, Label};
+        use common::{Byte, DebugLoc, Instruction};
+        let ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        // Emitting-only slice (as code_slice_ops would return): Jump + CONST + RETURN
+        let emitting: Vec<IlOp> = ops.into_iter().filter(|op| op.emits_code()).collect();
+        assert!(!Compiler::is_tiny_inline_il(&emitting));
     }
 
     /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
