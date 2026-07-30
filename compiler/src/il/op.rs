@@ -353,24 +353,184 @@ mod tests {
     }
 
     #[test]
+    fn from_plain_byte_lifts_store_dup_pop_return_halt() {
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::StorePop).with_operand_u32(5),
+                DebugLoc::unknown(),
+            ),
+            IlOp::StorePop { slot: 5, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::DUPLICATE), DebugLoc::unknown()),
+            IlOp::Dup { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::POP), DebugLoc::unknown()),
+            IlOp::Pop { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::RETURN), DebugLoc::unknown()),
+            IlOp::Return { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::HALT), DebugLoc::unknown()),
+            IlOp::Halt { .. }
+        ));
+    }
+
+    #[test]
+    fn from_plain_byte_lifts_bin_slot_and_fused_returns() {
+        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::ADD as u8,
+            2,
+            -3,
+        );
+        assert!(matches!(
+            IlOp::from_plain_byte(imm, DebugLoc::unknown()),
+            IlOp::BinSlotImm {
+                op,
+                slot: 2,
+                imm: -3,
+                ..
+            } if op == Instruction::ADD as u8
+        ));
+        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::SUB as u8,
+            0,
+            1,
+        );
+        assert!(matches!(
+            IlOp::from_plain_byte(slot, DebugLoc::unknown()),
+            IlOp::BinSlotSlot {
+                op,
+                a: 0,
+                b: 1,
+                ..
+            } if op == Instruction::SUB as u8
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::LoadReturnSlot).with_operand_u32(4),
+                DebugLoc::unknown(),
+            ),
+            IlOp::LoadReturnSlot { slot: 4, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::ConstReturnImm).with_operand_u32(9),
+                DebugLoc::unknown(),
+            ),
+            IlOp::ConstReturnImm { imm: 9, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::BinReturn).with_bin_return(Instruction::MUL as u8),
+                DebugLoc::unknown(),
+            ),
+            IlOp::BinReturn {
+                op: Instruction::MUL,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn long_tail_and_control_stay_unlifted_or_unencoded() {
+        let host = IlOp::from_plain_byte(Byte::new(Instruction::HostInvoke), DebugLoc::unknown());
+        assert!(matches!(host, IlOp::Byte { .. }));
+        let jmp = IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: DebugLoc::unknown(),
+        };
+        assert!(jmp.as_encode_byte().is_none());
+        assert!(jmp.is_control());
+        let entry = IlOp::Entry {
+            kind: EntryKind::Call,
+            arity: 1,
+            target: Label(1),
+            loc: DebugLoc::unknown(),
+        };
+        assert!(entry.as_encode_byte().is_none());
+        assert!(entry.is_control());
+        assert!(IlOp::Label(Label(0)).as_encode_byte().is_none());
+        assert!(!IlOp::Label(Label(0)).emits_code());
+    }
+
+    #[test]
+    fn is_plain_return_excludes_fused_returns() {
+        assert!(IlOp::Return {
+            loc: DebugLoc::unknown()
+        }
+        .is_plain_return());
+        assert!(IlOp::byte(Byte::new(Instruction::RETURN)).is_plain_return());
+        assert!(!IlOp::ConstReturnImm {
+            imm: 0,
+            loc: DebugLoc::unknown()
+        }
+        .is_plain_return());
+        assert!(!IlOp::LoadReturnSlot {
+            slot: 0,
+            loc: DebugLoc::unknown()
+        }
+        .is_plain_return());
+        assert!(!IlOp::BinReturn {
+            op: Instruction::ADD,
+            loc: DebugLoc::unknown()
+        }
+        .is_plain_return());
+    }
+
+    #[test]
     fn as_encode_byte_round_trips_hot_set() {
         let ops = [
             IlOp::Load {
                 slot: 2,
                 loc: DebugLoc::unknown(),
             },
+            IlOp::StorePop {
+                slot: 3,
+                loc: DebugLoc::unknown(),
+            },
             IlOp::Const {
                 imm: -1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Dup {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Halt {
                 loc: DebugLoc::unknown(),
             },
             IlOp::Bin {
                 op: Instruction::SUB,
                 loc: DebugLoc::unknown(),
             },
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 1,
+                imm: 4,
+                loc: DebugLoc::unknown(),
+            },
             IlOp::BinSlotSlot {
                 op: Instruction::ADD as u8,
                 a: 0,
                 b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::LoadReturnSlot {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::ConstReturnImm {
+                imm: 5,
                 loc: DebugLoc::unknown(),
             },
             IlOp::BinReturn {
@@ -382,6 +542,7 @@ mod tests {
             let b = op.as_encode_byte().expect("encode");
             let again = IlOp::from_plain_byte(b, DebugLoc::unknown());
             assert_eq!(again.as_encode_byte(), Some(b));
+            assert!(again == op);
         }
     }
 
