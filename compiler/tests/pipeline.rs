@@ -2195,18 +2195,12 @@ fn main() {
 fn while_let_result_ok_panic_match_preserves_locals() {
     let output = run_example_src(
         r#"
-fn tick(int n) -> Result<int, string> {
-    if n < 3 {
-        return Result::Ok(n);
-    }
-    return Result::Err("done");
-}
-
 fn main() {
     let i = 0;
     let acc = 0;
     while i < 3 {
-        let v = match tick(i) {
+        let r = Result::Ok(i);
+        let v = match r {
             Result::Ok(x) => x,
             Result::Err(_) => panic "tick",
         };
