@@ -1,8 +1,8 @@
 //! Lightweight per-function IL metadata.
 //!
-//! Recorded at function finalize; [`super::IlModule::from_flat`] splits the
-//! flat stream into owned bodies for scoped opts / CFG GVN. Emitting spans
-//! remain the source of truth until split.
+//! Recorded at function finalize on the flat [`super::CodeBuf`]. At lower time
+//! [`super::IlModule::from_flat`] takes ownership of each body's ops for scoped
+//! opts / CFG GVN; emitting spans are the split keys until then.
 
 use super::Label;
 

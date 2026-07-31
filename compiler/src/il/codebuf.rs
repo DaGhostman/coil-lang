@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
-    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower_with_funcs,
+    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlModule, IlOp, Label, Lowered, lower_module,
 };
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
@@ -315,8 +315,11 @@ impl CodeBuf {
         );
     }
 
+    /// Rebuild an owning [`IlModule`] from the flat emit stream and lower once.
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
-        let lowered = lower_with_funcs(self.il.ops(), &self.funcs, pool);
+        let mut module =
+            IlModule::from_flat(self.il.ops(), &self.funcs).with_entries(self.entry_at_offset.clone());
+        let lowered = lower_module(&mut module, pool);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
         lowered

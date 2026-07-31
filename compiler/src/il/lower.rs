@@ -83,25 +83,37 @@ pub fn assert_no_residual_abs_jumps(ops: &[IlOp]) {
 /// Optimize and lower `ops` into VM bytecode.
 ///
 /// When `funcs` is empty, opts run on the whole buffer (unit tests). Production
-/// [`super::CodeBuf::lower_in_place`] passes recorded [`IlFunc`] spans so opts
-/// stay inside each function and leave prologue / glue alone.
+/// [`super::CodeBuf::lower_in_place`] rebuilds an owning [`super::IlModule`] and
+/// lowers through [`lower_module`].
 #[allow(dead_code)] // used by unit tests / re-exports
 pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
     lower_with_funcs(ops, &[], pool)
 }
 
-/// Like [`lower`], but scopes IL opts to each [`IlFunc`] emitting span.
+/// Rebuild [`super::IlModule`] from flat ops + spans, then [`lower_module`].
 pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> Lowered {
-    let mut ops = ops.to_vec();
-    opt::optimize_per_func(&mut ops, funcs, &opt::OptimizeOptions::default());
-    assert_no_residual_abs_jumps(&ops);
+    let mut module = super::IlModule::from_flat(ops, funcs);
+    lower_module(&mut module, pool)
+}
+
+/// Optimize an owning [`super::IlModule`] and lower once (fuse-select + PC assign).
+///
+/// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
+pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
+    let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default());
+    lower_optimized(&flat, pool)
+}
+
+/// Fuse-select + PC assign for an already-optimized op stream (no IL opts).
+pub(crate) fn lower_optimized(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
+    assert_no_residual_abs_jumps(ops);
 
     let mut pre_slots: Vec<Slot> = Vec::with_capacity(ops.len());
     // For each pre-fusion emitting index, labels that bind to it.
     let mut binds_at: HashMap<usize, Vec<u32>> = HashMap::new();
     let mut pending: Vec<u32> = Vec::new();
 
-    for op in &ops {
+    for op in ops {
         match op {
             IlOp::Label(Label(id)) => pending.push(*id),
             IlOp::Jump { kind, target, loc } => {
