@@ -151,3 +151,56 @@ impl<T: Default + std::fmt::Debug, const N: usize> std::fmt::Debug for Stack<T, 
         write!(f, "{:?}", &self.stack[..self.cursor])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Stack;
+
+    #[test]
+    fn duplicate_copies_tos_without_changing_original() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(7);
+        s.duplicate();
+        assert_eq!(s.tell(), 2);
+        assert_eq!(s.pop(), 7);
+        assert_eq!(s.pop(), 7);
+    }
+
+    #[test]
+    fn copy_slots_moves_args_toward_frame_base() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(10);
+        s.push(20);
+        s.push(30);
+        s.push(40);
+        // TailCall-shaped: frame base 0, args at [2, 3).
+        s.copy_slots(0, 2, 2);
+        assert_eq!(s[0], 30);
+        assert_eq!(s[1], 40);
+        assert_eq!(s[2], 30);
+        assert_eq!(s[3], 40);
+    }
+
+    #[test]
+    fn copy_slots_noop_when_dst_equals_src_or_len_zero() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(1);
+        s.push(2);
+        s.copy_slots(0, 0, 2);
+        s.copy_slots(0, 1, 0);
+        assert_eq!(s[0], 1);
+        assert_eq!(s[1], 2);
+    }
+
+    #[test]
+    fn as_slice_excludes_slots_past_cursor_after_pop() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(11);
+        s.push(22);
+        assert_eq!(s.as_slice(), &[11, 22]);
+        let _ = s.pop();
+        assert_eq!(s.as_slice(), &[11]);
+        // Full buffer still holds the stale TOS for GC live-slice contrast.
+        assert_eq!(s.buffer()[1], 22);
+    }
+}
