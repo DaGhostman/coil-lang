@@ -1845,9 +1845,8 @@ impl<const S: usize> Machine<S> {
                     let args: &[Value] = match Self::find_object_by_addr(&self.heap, tuple_addr) {
                         Some(crate::memory::Object::Tuple(gc)) => {
                             let elems = &gc.as_ref().elements;
-                            // SAFETY: natives must not free/move the args tuple while
-                            // `invoke` runs (tuple stays reachable on the operand stack
-                            // until after this handler finishes).
+                            // SAFETY: `tuple_val` keeps the tuple alive until invoke
+                            // returns; VM GC runs only after the native finishes.
                             unsafe { std::slice::from_raw_parts(elems.as_ptr(), elems.len()) }
                         }
                         _ => &[],
