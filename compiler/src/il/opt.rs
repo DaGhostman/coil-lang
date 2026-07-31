@@ -2032,6 +2032,130 @@ mod tests {
     }
 
     #[test]
+    fn multi_op_join_convoy_prefers_longest_suffix_via_jump_if_match() {
+        // Net-+1 len-4 suffix so sequential JumpIfMatch diamonds agree at join.
+        let suf = load_not_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        let not_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.as_encode_byte().as_ref().map(|b| *b.bytecode()),
+                    Some(Instruction::NOT)
+                )
+            })
+            .count();
+        assert_eq!(load_count, 1);
+        assert_eq!(not_count, 1, "length-4 JumpIfMatch template keeps NOT");
+        let jim_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Jump {
+                        kind: IlJumpKind::JumpIfMatch { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(jim_count, 2, "JumpIfMatch ops survive jump-pred rewrite");
+    }
+
+    #[test]
+    fn multi_op_join_convoy_sinks_jump_if_match_through_label_cluster() {
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            target: Label(54),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
+            target: Label(54),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(54)));
+        ops.push(IlOp::Label(Label(48)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        let lab54 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(54))))
+            .expect("outer join");
+        let lab48 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(48))))
+            .expect("inner label");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("ADD sunk");
+        assert!(lab54 < lab48 && lab48 < add_idx);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_skips_mixed_jump_if_match_jmp_unknown_sp() {
+        // JumpIfMatch (−1) + unconditional JMP (0) into same join → Unknown SP.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
     fn multi_op_join_convoy_skips_unknown_join_sp() {
         // Identical suffixes, but then-arm pushes an extra const first so join
         // heights disagree → SP Unknown → refuse sink.
