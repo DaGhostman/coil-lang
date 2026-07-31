@@ -4141,7 +4141,20 @@ impl Compiler {
     /// Look up a function's scheme and peel to its return type.
     fn fn_return_ty(&self, name: &str) -> Option<crate::typechecking::Ty> {
         use crate::typechecking::subst::apply_ty_prune;
-        let scheme = self.checker.env().lookup(name)?;
+        let scheme = self
+            .checker
+            .env()
+            .lookup(name)
+            .or_else(|| {
+                self.current_function_qualified
+                    .as_deref()
+                    .and_then(|q| self.checker.env().lookup(q))
+            })
+            .or_else(|| {
+                self.current_function_table_key
+                    .as_deref()
+                    .and_then(|q| self.checker.env().lookup(q))
+            })?;
         let applied = apply_ty_prune(self.checker.subst(), &scheme.ty);
         Some(Self::peel_fn_return_ty(&applied))
     }
@@ -4170,7 +4183,11 @@ impl Compiler {
             return true;
         }
         match &t {
-            Ty::Con(name) => matches!(name.as_str(), UNIT | INT | BYTE | BOOL | FLOAT),
+            Ty::Con(name) => {
+                matches!(name.as_str(), UNIT | INT | BYTE | BOOL | FLOAT)
+                    // Incomplete / placeholder types — do not spuriously E0111.
+                    || name == "unknown"
+            }
             Ty::Var(_) => true,
             _ => false,
         }
@@ -4180,8 +4197,9 @@ impl Compiler {
     fn fallthrough_allows_zero(&self, name: &str) -> bool {
         use crate::typechecking::ty::result_ok_err;
         let Some(ret) = self.fn_return_ty(name) else {
-            // No scheme — fail closed (do not silently emit zero).
-            return false;
+            // No scheme (e.g. some inherent methods) — allow zero rather than
+            // false-positive E0111; annotated unsafe returns are looked up.
+            return true;
         };
         if self.compiling_result_mode {
             if let Some((ok, _)) = result_ok_err(&ret) {
