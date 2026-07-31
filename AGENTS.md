@@ -4,7 +4,8 @@
 
 - Run tests with a 64MB memory limit to catch leaks; exceeding it likely indicates a memory leak.
 - Use `poop` for CPU performance baselines: `./scripts/poop_baseline.sh` (or `cargo build --release && poop -d 6000 "./target/release/coil examples/fib_bench.hy" && rm out.hyc`). Soft check before/after opt changes — not a hard CI fail.
-- Use parallel sub-agents scoped to disjoint files or modules for large tasks (docs, comment cleanup, exploration).
+- Use sub-agents for large tasks (scoped to disjoint files/modules); avoid over-parallelizing — give specific, scoped instructions so each agent can finish independently.
+- For VM/runtime performance work, prefer alloc reduction, hot-loop tuning, bounds-check elimination, and `promise!` over adding opcodes or compile-time IL optimizations.
 - Draft implementation plans before large language-feature work; do not edit attached plan files during implementation.
 - New language features require full HM typechecker integration and updated user-facing docs in `docs/`.
 - Include minimal runnable examples with clear expected output before committing feature work.
@@ -27,7 +28,7 @@
 - `byte` is `Ty::Con("byte")` (0..=255); integer literals coerce under expected `byte` / `[byte]`. Array annotations `[T]` / `[T; N]` preserve element type in the AST.
 - `ARCHIVE_VERSION` is **30** (`common/src/archive.rs`); bump on incompatible bytecode, tag, or opcode changes.
 - Packed LA (`dot` / `matmul` / `Matrix` ops) lowers to HostInvoke natives in `machine/src/packed_la.rs` — no LA opcodes.
-- Primitive casts (`CastIntToFloat` … `CastBoolToInt`) are appended after `TailCall`; `CastBoolToInt` is the last `Instruction` variant.
+- Primitive casts (`CastIntToFloat` … `CastBoolToInt`) are the last `Instruction` variants.
 - Static slots: `LoadStatic`/`StoreStatic`; `static_slot_count` is in the archive envelope. Archives also carry `source_files` + `debug_locs` (one per bytecode slot).
 - Codegen: scalar const folding (`ConstEnv`), constant branch/loop elimination, loop unroll (≤8 trips, no `break`/`continue`), optional tiny direct-call inlining, `TailCall` for eligible self-recursive returns.
 - `prelude::test::assert` is auto-imported (`Result<(), string>`); `panic` aborts the VM (CLI/`coil test` treat it as failure).
@@ -52,6 +53,32 @@
 - Path completeness (HM): named functions (not async, not trait sig stubs) must `always_exits` when the return is a concrete non-unit type — missing paths are `E0111` (`ReturnMismatch`). `return`/`raise`/`panic` and proven-infinite `while`/`for` (bool const-fold) type as `never` and join via absorbing Never. Unreachable code after an exit is `E0118` (warning); `defer` dominated by / inside an infinite loop is `E0123` (warning). Bare `return;` returns unit. Unit / open-var returns may still fall through: codegen emits defers + `CONST 0; RETURN` (Result-mode Ok-wraps unit Ok only) — no invent for `Option`/`int`/`string`/ADTs.
 - Soft CPU baseline: `./scripts/poop_baseline.sh`.
 - `cargo clippy` fails on a pre-existing `#[deny(clippy::mut_from_ref)]` in `Gc::payload_mut`; use `cargo check --workspace` as the lint gate.
+
+## Cursor Cloud specific instructions
+
+Cloud agents use `.cursor/environment.json` + `.cursor/Dockerfile`. Pre-installed tools:
+
+| Tool | Purpose |
+|------|---------|
+| `poop` | Instruction-count / HW-counter baselines (`perf_event_open`) |
+| `valgrind` | Memcheck leak runs, Callgrind profiles (`callgrind_annotate`) |
+| `heaptrack` | Heap allocation tracing (`heaptrack ./target/release/coil …`) |
+| `hyperfine` | Wall-clock timing comparisons |
+| `lua` | Baseline comparison in `scripts/vm_bench.sh` |
+
+Common commands (delete `out.hyc` after source edits):
+
+```bash
+cargo test --workspace
+cargo build --release --workspace
+./scripts/poop_baseline.sh
+./scripts/vm_bench.sh
+ulimit -v 65536 && ./target/debug/coil test
+valgrind --leak-check=full --error-exitcode=1 ./target/debug/coil examples/fib.hy
+valgrind --tool=callgrind --callgrind-out-file=callgrind.out ./target/release/coil examples/fib_bench.hy
+```
+
+Use `--release` for benchmarks and `poop`; use debug builds for valgrind memcheck (heap alloc traces are noisy in debug).
 
 ## Dev gotchas
 
