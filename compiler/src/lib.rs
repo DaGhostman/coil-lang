@@ -1291,7 +1291,7 @@ impl Compiler {
     }
 
     fn is_tiny_inline_il(ops: &[IlOp]) -> bool {
-        if ops.is_empty() || ops.len() > 48 {
+        if ops.is_empty() || ops.len() > 64 {
             return false;
         }
         if ops.iter().any(|op| op.is_control()) {
@@ -1317,6 +1317,10 @@ impl Compiler {
                 }
             }
         }
+        // Pure micro-body: ≤3 compute ops + terminal Return / fused *Return.
+        if Self::is_pure_micro_inline_il(ops) {
+            return true;
+        }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
         // truncate (else-arm dropped). Only allow a single terminal RETURN
@@ -1330,11 +1334,88 @@ impl Compiler {
         if return_idxs.len() != 1 || return_idxs[0] != ops.len() - 1 {
             return false;
         }
-        !ops.iter().any(|op| {
-            let Some(b) = op.as_plain_byte() else {
-                return true;
-            };
+        !ops.iter().any(|op| Self::inline_forbidden_op(op))
+    }
+
+    /// ≤3 pure producers + terminal Return / fused *Return (Load/Const/Bin/…).
+    fn is_pure_micro_inline_il(ops: &[IlOp]) -> bool {
+        if ops.is_empty() || ops.len() > 4 {
+            return false;
+        }
+        let last = ops.last().unwrap();
+        let terminal_ok = last.is_plain_return()
+            || matches!(
+                last,
+                IlOp::LoadReturnSlot { .. }
+                    | IlOp::ConstReturnImm { .. }
+                    | IlOp::BinReturn { .. }
+            )
+            || matches!(
+                last.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::LoadReturnSlot
+                        | Instruction::ConstReturnImm
+                        | Instruction::BinReturn
+                        | Instruction::RETURN
+                )
+            );
+        if !terminal_ok {
+            return false;
+        }
+        let compute = &ops[..ops.len() - 1];
+        if compute.len() > 3 {
+            return false;
+        }
+        compute.iter().all(|op| {
             matches!(
+                op,
+                IlOp::Load { .. }
+                    | IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::Dup { .. }
+                    | IlOp::Bin { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. }
+            ) || matches!(
+                op.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::LOAD
+                        | Instruction::CONST
+                        | Instruction::DUPLICATE
+                        | Instruction::ADD
+                        | Instruction::SUB
+                        | Instruction::MUL
+                        | Instruction::DIV
+                        | Instruction::MOD
+                        | Instruction::BinSlotImm
+                        | Instruction::BinSlotSlot
+                        | Instruction::EQ
+                        | Instruction::NEQ
+                        | Instruction::LE
+                        | Instruction::LEQ
+                        | Instruction::GT
+                        | Instruction::GEQ
+                )
+            )
+        })
+    }
+
+    fn inline_forbidden_op(op: &IlOp) -> bool {
+        matches!(
+            op,
+            IlOp::HostInvoke { .. }
+                | IlOp::Print { .. }
+                | IlOp::GetField { .. }
+                | IlOp::SetField { .. }
+                | IlOp::LoadField { .. }
+                | IlOp::MakeTuple { .. }
+                | IlOp::MakeArray { .. }
+                | IlOp::MakeEnum { .. }
+        ) || match op.as_plain_byte() {
+            None => true,
+            Some(b) => matches!(
                 *b.bytecode(),
                 Instruction::CALL
                     | Instruction::TailCall
@@ -1349,6 +1430,9 @@ impl Compiler {
                     | Instruction::JumpIfMatch
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
+                    | Instruction::PRINT
+                    | Instruction::GetField
+                    | Instruction::SetField
                     | Instruction::JMP
                     | Instruction::JMPF
                     | Instruction::JMPT
@@ -1358,8 +1442,8 @@ impl Compiler {
                     | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
-            )
-        })
+            ),
+        }
     }
 
     /// Expand a fused `*Return` byte into the producer left on the caller's stack.
@@ -12917,6 +13001,38 @@ fn main() { print \"%i\", add(3, 4); }",
                 op: Instruction::ADD as u8,
                 a: 0,
                 b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_pure_micro_body() {
+        use crate::il::IlOp;
+        use common::DebugLoc;
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+        assert!(!Compiler::is_tiny_inline_il(&[
+            IlOp::HostInvoke {
+                arity: 1,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Return {

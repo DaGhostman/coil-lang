@@ -79,6 +79,7 @@ pub trait EmitBuf {
         self.push_byte(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
     }
 
+    #[allow(dead_code)]
     fn push_print(&mut self) {
         self.push_byte(Byte::new(Instruction::PRINT));
     }

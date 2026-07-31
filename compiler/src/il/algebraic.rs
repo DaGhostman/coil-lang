@@ -3,7 +3,7 @@
 use common::Instruction;
 
 use super::op::IlOp;
-use super::sp::{self, Sp};
+use super::sp;
 
 /// Cheap identity / strength rewrites. Refuses when SP-in mid-window is Unknown.
 pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
@@ -170,6 +170,7 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
 mod tests {
     use super::*;
     use common::DebugLoc;
+    use super::sp::Sp;
 
     fn loc() -> DebugLoc {
         DebugLoc::unknown()
