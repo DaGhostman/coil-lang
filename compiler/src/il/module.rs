@@ -379,6 +379,7 @@ mod tests {
             stack_dce: false,
             mem_fwd: false,
             algebraic: false,
+            licm: false,
             return_convoy: false,
             bin_join_convoy: false,
             multi_op_join_convoy: true,

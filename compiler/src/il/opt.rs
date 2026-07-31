@@ -17,6 +17,8 @@ pub struct OptimizeOptions {
     pub mem_fwd: bool,
     /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
     pub algebraic: bool,
+    /// Hoist invariant Const/Load out of Known-SP natural loops.
+    pub licm: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
     /// Sink identical binop / BinSlot* tails into a return-label cluster.
@@ -35,6 +37,7 @@ impl Default for OptimizeOptions {
             stack_dce: true,
             mem_fwd: true,
             algebraic: true,
+            licm: true,
             return_convoy: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
@@ -59,6 +62,9 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     }
     if opts.algebraic {
         super::algebraic::algebraic_simplify(ops);
+    }
+    if opts.licm {
+        super::licm::licm(ops);
     }
     if opts.return_convoy {
         return_convoy(ops);

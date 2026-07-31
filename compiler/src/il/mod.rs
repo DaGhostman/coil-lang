@@ -10,6 +10,7 @@ mod codebuf;
 mod emit_buf;
 mod func;
 mod gvn;
+mod licm;
 mod lower;
 mod module;
 mod op;
