@@ -4159,32 +4159,49 @@ impl Compiler {
         Some(Self::peel_fn_return_ty(&applied))
     }
 
-    /// True when `Value::default()` (`0`) is a valid representation for `ty`.
-    ///
-    /// Safe for unit / int / byte / bool / float, open vars (statement bodies),
-    /// and `Option<_>` (encodes as `None`). `Result` / `string` / ADTs are not.
-    fn ty_allows_zero_default(ty: &crate::typechecking::Ty) -> bool {
-        use crate::typechecking::{
-            Ty,
-            ty::{BOOL, BYTE, FLOAT, INT, UNIT, is_option_ty, option_inner, result_ok_err},
-        };
+    /// True when `ty` is unit / `()` (safe Ok payload for Result fall-through).
+    fn ty_is_unit_like(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::{Ty, ty::UNIT};
         let mut t = ty.clone();
         while let Ty::Forall { body, .. } = t {
             t = *body;
         }
-        if is_option_ty(&t) {
+        match &t {
+            Ty::Con(name) => name == UNIT,
+            Ty::Tuple(items) if items.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    /// Ok payload that may be invented as `CONST 0` + Ok-wrap on fall-through.
+    ///
+    /// Unit and open vars (bodies that only use `?` / `assert`) are safe;
+    /// concrete non-unit Oks (`int`, `string`, …) are not.
+    fn ty_allows_result_ok_fallthrough(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::Ty;
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        if Self::ty_is_unit_like(&t) {
             return true;
         }
-        if crate::typechecking::ty::is_result_ty(&t) {
-            if let Some((ok, _)) = result_ok_err(&t) {
-                return Self::ty_allows_zero_default(&ok);
-            }
-            // `Result<(), E>` often has an empty Ok payload — still Ok-wrap 0.
-            return true;
-        }
-        if let Some(inner) = option_inner(&t) {
-            let _ = inner;
-            return true;
+        matches!(&t, Ty::Var(_)) || matches!(&t, Ty::Con(n) if n == "unknown")
+    }
+
+    /// True when `Value::default()` (`0`) is a valid representation for `ty`.
+    ///
+    /// Safe for unit / int / byte / bool / float, open vars (statement bodies),
+    /// and empty tuples. `Option` / `Result` / `string` / ADTs need a real
+    /// constructor (or an explicit `return`).
+    fn ty_allows_zero_default(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::{
+            Ty,
+            ty::{BOOL, BYTE, FLOAT, INT, UNIT},
+        };
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
         }
         match &t {
             Ty::Con(name) => {
@@ -4199,9 +4216,9 @@ impl Compiler {
         }
     }
 
-    /// Whether an implicit fall-through `CONST 0` is valid for `name`'s return.
+    /// Whether an implicit fall-through is valid for `name`'s return.
     fn fallthrough_allows_zero(&self, name: &str) -> bool {
-        use crate::typechecking::ty::result_ok_err;
+        use crate::typechecking::ty::{is_option_ty, result_ok_err};
         // Async fn bodies complete with a sentinel; the `coroutine<…>` value
         // is produced by MakeCoro at the call site.
         if self.coroutine_fns.contains(name)
@@ -4215,9 +4232,17 @@ impl Compiler {
         let Some(ret) = self.fn_return_ty(name) else {
             return true;
         };
+        // `Option` fall-through emits `None` (not raw `0`) in
+        // [`Self::emit_fallthrough_return`].
+        if is_option_ty(&ret) {
+            return true;
+        }
         if self.compiling_result_mode {
+            // Result-mode may Ok-wrap an implicit unit (`Result<(), E>` /
+            // test cases) or an unresolved Ok var after `?`. Do not invent
+            // `Ok(0)` for a concrete non-unit Ok (e.g. `Result<int, …>`).
             if let Some((ok, _)) = result_ok_err(&ret) {
-                return Self::ty_allows_zero_default(&ok);
+                return Self::ty_allows_result_ok_fallthrough(&ok);
             }
             return true;
         }
@@ -4231,6 +4256,7 @@ impl Compiler {
 
     /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
     fn emit_fallthrough_return(&mut self, name: &str, span: SimpleSpan) {
+        use crate::typechecking::ty::is_option_ty;
         self.emit_run_defers();
         if !self.fallthrough_allows_zero(name) {
             let ret_s = self
@@ -4250,9 +4276,19 @@ impl Compiler {
             ));
             self.messages.push(message);
         }
-        self.bytecode.push_const(0);
-        if self.compiling_result_mode {
-            Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+        let opt_none = self
+            .fn_return_ty(name)
+            .as_ref()
+            .is_some_and(is_option_ty);
+        if opt_none {
+            // `Option::None` = tag 0, arity 0.
+            self.bytecode
+                .push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+        } else {
+            self.bytecode.push_const(0);
+            if self.compiling_result_mode {
+                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+            }
         }
         self.bytecode.push_return();
     }
