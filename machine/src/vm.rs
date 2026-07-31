@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{
     ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte,
-    ProgramDebug, Value, byte_to_position, promise, unlikely,
+    ProgramDebug, Value, byte_to_position, likely, promise, unlikely,
 };
 
 use crate::{
@@ -737,16 +737,18 @@ impl<const S: usize> Machine<S> {
         let caller = self.frames.get_mut();
         *ip = caller.tell();
         *sp = caller.get();
-        if let Some(ctx) = self.resume_stack.last() {
-            if self.frames.len() <= ctx.frame_depth {
-                self.with_coroutine_mut(ctx.coro.as_ptr() as u64, |coro| {
-                    coro.state = CoroState::Done;
-                    coro.saved_stack.clear();
-                    coro.saved_frames.clear();
-                    coro.yield_from = None;
-                });
-                self.resume_stack.pop();
-            }
+        // Coroutine resume bookkeeping is cold for ordinary calls (fib).
+        if unlikely(!self.resume_stack.is_empty())
+            && let Some(ctx) = self.resume_stack.last()
+            && self.frames.len() <= ctx.frame_depth
+        {
+            self.with_coroutine_mut(ctx.coro.as_ptr() as u64, |coro| {
+                coro.state = CoroState::Done;
+                coro.saved_stack.clear();
+                coro.saved_frames.clear();
+                coro.yield_from = None;
+            });
+            self.resume_stack.pop();
         }
     }
 
@@ -1101,13 +1103,15 @@ impl<const S: usize> Machine<S> {
     /// Stash a return value when `execute` runs inside [`Self::call_function`].
     #[inline]
     fn capture_nested_return(&mut self, ret_val: Value) -> bool {
-        let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
-        if self.nested_depth > 0 && self.frames.len() == nested_target {
-            self.nested_return = Some(ret_val);
-            true
-        } else {
-            false
+        // Nested FFI/host calls are rare; keep the hot RETURN path branch-free.
+        if unlikely(self.nested_depth > 0) {
+            let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+            if self.frames.len() == nested_target {
+                self.nested_return = Some(ret_val);
+                return true;
+            }
         }
+        false
     }
 
     /// Type-erased entry for libffi callback trampolines (monomorphized per `S`).
@@ -1426,14 +1430,22 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::CALL => {
                     let (arity, target) = opcode.call_parts();
-                    let return_ip = ip + if target == 0 { 1 } else { 0 };
                     let callee_sp = self.stack.tell() - arity;
-                    self.frames.get_mut().seek(return_ip);
-                    self.frames
-                        .setup_current_and_advance(|frame| frame.set(callee_sp));
-                    sp = callee_sp;
-                    if target != 0 {
+                    // Direct calls dominate (fib recursion); avoid the
+                    // indirect `target == 0` return-ip adjustment on that path.
+                    if likely(target != 0) {
+                        self.frames.rewrite_top_and_push(
+                            |caller| caller.seek(ip),
+                            |frame| frame.set(callee_sp),
+                        );
+                        sp = callee_sp;
                         ip = target;
+                    } else {
+                        self.frames.rewrite_top_and_push(
+                            |caller| caller.seek(ip + 1),
+                            |frame| frame.set(callee_sp),
+                        );
+                        sp = callee_sp;
                     }
                 }
                 Instruction::TailCall => {
@@ -1501,35 +1513,33 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(ret_val);
                     self.after_return(&mut ip, &mut sp);
                 }
-                // Fused `LOAD slot; CONST imm; <binop>`.
+                // Fused `LOAD slot; CONST imm; <binop>` — compute in place
+                // (same shape as `BinSlotSlot`) to avoid two temp pushes.
                 Instruction::BinSlotImm => {
                     let (op, slot, imm) = opcode.bin_slot_imm_parts();
                     let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                    let rhs = Value::from(imm);
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(lhs.as_int() + rhs.as_int()),
+                        Instruction::SUB => Value::from(lhs.as_int() - rhs.as_int()),
+                        Instruction::MUL => Value::from(lhs.as_int() * rhs.as_int()),
+                        Instruction::DIV => Value::from(lhs.as_int() / rhs.as_int()),
+                        Instruction::MOD => Value::from(lhs.as_int() % rhs.as_int()),
                         Instruction::Pow => {
-                            let sp = self.stack.tell();
-                            let rhs = self.stack[sp - 1].as_int().max(0) as u32;
-                            let lhs = self.stack[sp - 2].as_int();
-                            self.stack[sp - 2].replace(lhs.pow(rhs) as u64);
-                            self.stack.seek(sp - 1);
+                            let exp = rhs.as_int().max(0) as u32;
+                            Value::from(lhs.as_int().pow(exp))
                         }
-                        Instruction::BITAND => binary!(self.stack, &, as_int),
-                        Instruction::BITOR => binary!(self.stack, |, as_int),
-                        _ => {}
-                    }
+                        Instruction::BITAND => Value::from(lhs.as_int() & rhs.as_int()),
+                        Instruction::BITOR => Value::from(lhs.as_int() | rhs.as_int()),
+                        Instruction::LE => Value::from((lhs.raw() < rhs.raw()) as i64),
+                        Instruction::LEQ => Value::from((lhs.raw() <= rhs.raw()) as i64),
+                        Instruction::GT => Value::from((lhs.raw() > rhs.raw()) as i64),
+                        Instruction::GEQ => Value::from((lhs.raw() >= rhs.raw()) as i64),
+                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
+                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        _ => Value::default(),
+                    };
+                    self.stack.push(result);
                 }
                 // Fused `<cmp>; JMPF target`.
                 Instruction::CmpJmpf => {
@@ -1551,31 +1561,28 @@ impl<const S: usize> Machine<S> {
                         ip = target;
                     }
                 }
+                // Fused `LOAD slot; CONST imm; <cmp>; JMPF` without stack traffic.
                 Instruction::BinSlotImmJmpf => {
                     let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
                     let packed = constants.get(pool_idx).copied().unwrap_or(0);
                     let imm = packed as u32 as i32 as i64;
                     let target = (packed >> 32) as usize;
                     let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {
-                            self.stack.pop();
-                            self.stack.pop();
-                        }
-                    }
-                    if !self.stack.pop().as_bool() {
+                    let rhs = Value::from(imm);
+                    let cond = match Instruction::from(op) {
+                        Instruction::LE => lhs.raw() < rhs.raw(),
+                        Instruction::LEQ => lhs.raw() <= rhs.raw(),
+                        Instruction::GT => lhs.raw() > rhs.raw(),
+                        Instruction::GEQ => lhs.raw() >= rhs.raw(),
+                        Instruction::EQ => lhs.raw() == rhs.raw(),
+                        Instruction::NEQ => lhs.raw() != rhs.raw(),
+                        Instruction::LEF => lhs.as_float() < rhs.as_float(),
+                        Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
+                        Instruction::GTF => lhs.as_float() > rhs.as_float(),
+                        Instruction::GEQF => lhs.as_float() >= rhs.as_float(),
+                        _ => true,
+                    };
+                    if !cond {
                         ip = target;
                     }
                 }
@@ -1607,30 +1614,35 @@ impl<const S: usize> Machine<S> {
                     self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::BinReturn => {
-                    match Instruction::from(opcode.bin_return_op()) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
-                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
-                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
-                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
-                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
-                    let ret_val = self.stack.pop();
+                    // Compute result without leaving an intermediate TOS;
+                    // return unwind reseeks the stack anyway.
+                    let tos = self.stack.tell();
+                    promise!(tos >= 2);
+                    let lhs = self.stack[tos - 2];
+                    let rhs = self.stack[tos - 1];
+                    let ret_val = match Instruction::from(opcode.bin_return_op()) {
+                        Instruction::ADD => Value::from(lhs.as_int() + rhs.as_int()),
+                        Instruction::SUB => Value::from(lhs.as_int() - rhs.as_int()),
+                        Instruction::MUL => Value::from(lhs.as_int() * rhs.as_int()),
+                        Instruction::DIV => Value::from(lhs.as_int() / rhs.as_int()),
+                        Instruction::MOD => Value::from(lhs.as_int() % rhs.as_int()),
+                        Instruction::ADDF => Value::from(lhs.as_float() + rhs.as_float()),
+                        Instruction::SUBF => Value::from(lhs.as_float() - rhs.as_float()),
+                        Instruction::MULF => Value::from(lhs.as_float() * rhs.as_float()),
+                        Instruction::DIVF => Value::from(lhs.as_float() / rhs.as_float()),
+                        Instruction::MODF => Value::from(lhs.as_float() % rhs.as_float()),
+                        Instruction::LE => Value::from((lhs.raw() < rhs.raw()) as i64),
+                        Instruction::LEQ => Value::from((lhs.raw() <= rhs.raw()) as i64),
+                        Instruction::GT => Value::from((lhs.raw() > rhs.raw()) as i64),
+                        Instruction::GEQ => Value::from((lhs.raw() >= rhs.raw()) as i64),
+                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
+                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::LEF => Value::from((lhs.as_float() < rhs.as_float()) as i64),
+                        Instruction::LEQF => Value::from((lhs.as_float() <= rhs.as_float()) as i64),
+                        Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
+                        Instruction::GEQF => Value::from((lhs.as_float() >= rhs.as_float()) as i64),
+                        _ => Value::default(),
+                    };
                     if self.capture_nested_return(ret_val) {
                         return false;
                     }
@@ -3141,32 +3153,33 @@ mod tests {
     }
 
     /// Fused fib body for dispatch-count regression tests, using the
-    /// operator-parameterized superinstructions (`BinSlotImm`,
-    /// `ConstReturnImm`, `BinReturn`). Real recursion: fib(n) =
-    /// fib(n-1) + fib(n-2), base case fib(<=2) = 1.
-    fn fused_fib_bytecode(n: i64) -> Vec<Byte> {
+    /// operator-parameterized superinstructions (`BinSlotImmJmpf`,
+    /// `BinSlotImm`, `ConstReturnImm`, `BinReturn`). Real recursion:
+    /// fib(n) = fib(n-1) + fib(n-2), base case fib(<=2) = 1.
+    fn fused_fib_bytecode(n: i64) -> (Vec<Byte>, Vec<u64>) {
         let leq = Instruction::LEQ as u8;
         let sub = Instruction::SUB as u8;
         let add = Instruction::ADD as u8;
-        vec![
+        // Pool: jmpf (imm=2, target=5).
+        let pool = vec![((5u64) << 32) | (2u16 as u64)];
+        let code = vec![
             Byte::new(Instruction::CONST).with_const_inline(n as i32),
             Byte::new(Instruction::CALL).with_call_packed(1, 3),
             Byte::new(Instruction::HALT),
-            // 3: if !(n <= 2) jump to 6 (recurse); else fall through.
-            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(leq, 0, 2),
-            Byte::new(Instruction::JMPF).with_operand_u32(6),
-            // 5: base case → return 1.
+            // 3: if !(n <= 2) jump to 5 (recurse); else fall through.
+            Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(leq, 0, 0),
+            // 4: base case → return 1.
             Byte::new(Instruction::ConstReturnImm).with_operand_u32(1),
-            // 6: fib(n - 1)
+            // 5: fib(n - 1)
             Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 1),
             Byte::new(Instruction::CALL).with_call_packed(1, 3),
-            // 8: fib(n - 2)
-            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            // 7: fib(n - 2)
             Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 2),
             Byte::new(Instruction::CALL).with_call_packed(1, 3),
-            // 11: return fib(n-1) + fib(n-2)
+            // 9: return fib(n-1) + fib(n-2)
             Byte::new(Instruction::BinReturn).with_bin_return(add),
-        ]
+        ];
+        (code, pool)
     }
 
     #[test]
@@ -3199,7 +3212,8 @@ mod tests {
         let unfused_ops = dispatch_count();
 
         reset_dispatch_count();
-        Machine::<512>::default().run(&fused_fib_bytecode(13));
+        let (code, pool) = fused_fib_bytecode(13);
+        Machine::<512>::default().run_with_pool(&code, &pool, 0);
         let fused_ops = dispatch_count();
 
         // Both forms recurse identically, so the unfused run must
