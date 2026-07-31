@@ -1,10 +1,11 @@
-// `defer` runs on function exit (return or fall-through), LIFO.
+// `defer` runs on function exit (`return` / `return;`), LIFO.
 // Outer locals must be listed in `use (…)` — same capture rule as lambdas.
 fn with_cleanup() {
     defer {
         print "leave";
     }
     print "enter";
+    return;
 }
 
 fn lifo() {
@@ -15,6 +16,7 @@ fn lifo() {
         print "2";
     }
     print "0";
+    return;
 }
 
 // Early `return` still runs deferred cleanup.
@@ -47,4 +49,5 @@ fn main() {
     print "%i", early_return(0);
     print ",";
     print "%i", capture_n(5);
+    return;
 }

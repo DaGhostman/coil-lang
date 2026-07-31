@@ -8,4 +8,5 @@ fn fib(int n) -> int {
 
 fn main() {
     print "%i", fib(10);
+    return;
 }

@@ -103,7 +103,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             Some(t) => t.clone(),
             None => Ty::Var(*v),
         },
-        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } | Ty::Never => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(Box::new(apply_ty(subst, a)), Box::new(apply_ty(subst, b))),
         Ty::App(c, args) => Ty::App(
             Box::new(apply_ty(subst, c)),

@@ -36,7 +36,10 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0115` | `InvalidCoalesce` | `??` on non-Option/non-Result |
 | `E0116` | `InvalidOptionalAccess` | `?.` on non-Option (e.g. Result) |
 | `E0117` | `ConflictingErrorType` | Mixed Option/Result modes or conflicting `E` in one function |
+| `E0118` | `UnreachableCode` | Code after a diverging statement (warning) |
 | `E0119` | `GenericTypeError` | Other type error |
+| `E0120`–`E0122` | Overload family | Wrong arity / duplicate / ambiguous overload |
+| `E0123` | `DeferNeverRuns` | `defer` never runs on function exit (warning) |
 | `E0200`–`E0212` | Enum / match family | Duplicate enum, unknown variant, non-exhaustive match, field errors, … |
 | `E0300`–`E0301` | Format family | Specifier / arity mismatch |
 | `E0400`–`E0405` | Aggregate / FFI family | Index OOB, array element mismatch, `declare`/`invoke` arity, … |

@@ -257,7 +257,7 @@ pub(crate) fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> T
             Some(&new) => Ty::Var(new),
             None => Ty::Var(*v),
         },
-        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } | Ty::Never => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(
             Box::new(substitute_vars(a, mapping)),
             Box::new(substitute_vars(b, mapping)),

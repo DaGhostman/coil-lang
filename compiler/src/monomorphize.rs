@@ -513,7 +513,7 @@ fn contains_var(ty: &Ty) -> bool {
         Ty::Record { fields } => fields.iter().any(|(_, ty)| contains_var(ty)),
         Ty::Forall { body, .. } => contains_var(body),
         Ty::Readonly(inner) => contains_var(inner),
-        Ty::Con(_) | Ty::Existential { .. } => false,
+        Ty::Con(_) | Ty::Existential { .. } | Ty::Never => false,
     }
 }
 

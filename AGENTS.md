@@ -49,7 +49,8 @@
 
 - `Heap::find_object_by_addr` / VM lookup use the addr index (O(1)). GC mark still walks the intrusive list; `Gc::payload_mut` remains a clippy lint exception (`cargo check` is the gate).
 - `codegen_var_types` remains for match/method/free-fn Identifier codegen. Lambdas consume arg NodeIds via `assign_fn_arg_node_ids` (no Identifier span prefer). Free-fn/method assign deferred — enabling it broke Hash derive and constraint-kind; side-table retirement deferred.
-- Implicit fall-through is type-directed: unit/int/byte/bool/float → `CONST 0; RETURN`; `Option` → `MakeEnum` `None`; Result-mode Ok-wraps when Ok is unit, an open var, or a zero-safe scalar (not `string`/ADTs); otherwise `E0111` (`ReturnMismatch`) and still completes the epilogue.
+- Path completeness (HM): named functions (not async, not trait sig stubs) must `always_exits` when the return is a concrete non-unit type — missing paths are `E0111` (`ReturnMismatch`). `return`/`raise`/`panic` and proven-infinite `while`/`for` (bool const-fold) type as `never` and join via absorbing Never. Unreachable code after an exit is `E0118` (warning); `defer` dominated by / inside an infinite loop is `E0123` (warning). Bare `return;` returns unit. Unit / open-var returns may still fall through: codegen emits defers + `CONST 0; RETURN` (Result-mode Ok-wraps unit Ok only) — no invent for `Option`/`int`/`string`/ADTs.
+- Soft CPU baseline: `./scripts/poop_baseline.sh`.
 - `cargo clippy` fails on a pre-existing `#[deny(clippy::mut_from_ref)]` in `Gc::payload_mut`; use `cargo check --workspace` as the lint gate.
 
 ## Dev gotchas

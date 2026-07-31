@@ -88,7 +88,7 @@ pub struct ForInInfo {
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
+    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
     result_ok_err, result_ty, schemaize_payload, schemaize_ty, string, subst_payload_params,
     subst_ty_params, unit as unit_ty, readonly_ty, strip_readonly,
 };
@@ -304,6 +304,9 @@ pub struct Checker {
     /// Names declared with `const`, tracked per lexical scope so assignment
     /// diagnostics can distinguish immutable bindings from mutable `let`s.
     const_scopes: Vec<HashSet<String>>,
+
+    /// Foldable values for `const` bindings (loop-condition const eval).
+    const_fold_env: HashMap<String, super::const_eval::ConstVal>,
 
     /// Global static slots (`static let` / `static const` / class `static` fields).
     /// Key = FQN (`module::name` or `Class::field`). Persists across modules.
@@ -585,6 +588,7 @@ impl Checker {
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
             const_scopes: vec![HashSet::new()],
+            const_fold_env: HashMap::new(),
             static_slots: HashMap::new(),
             static_slot_types: HashMap::new(),
             next_static_slot: 0,
@@ -1661,7 +1665,7 @@ impl Checker {
                     .iter()
                     .all(|t| self.is_thread_sendable_ty(t))
             }),
-            Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } => false,
+            Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } | Ty::Never => false,
         }
     }
 
@@ -1938,7 +1942,7 @@ impl Checker {
             Ty::Record { fields } => fields.iter().any(|(_, t)| Self::ty_contains_open_var(t)),
             Ty::Constructor { owner, .. } => Self::ty_contains_open_var(owner),
             Ty::Readonly(inner) => Self::ty_contains_open_var(inner),
-            Ty::Con(_) | Ty::Sum { .. } | Ty::Existential { .. } => false,
+            Ty::Con(_) | Ty::Sum { .. } | Ty::Existential { .. } | Ty::Never => false,
         }
     }
 
@@ -2085,7 +2089,8 @@ impl Checker {
             | Ty::Record { .. }
             | Ty::Existential { .. }
             | Ty::Forall { .. }
-            | Ty::Readonly(_) => Kind::Type,
+            | Ty::Readonly(_)
+            | Ty::Never => Kind::Type,
         }
     }
 
@@ -3815,7 +3820,12 @@ impl Checker {
                     let it = self.infer(iterable);
                     self.unify(&it, &boolean(), &iterable.0.into_range(), "while condition");
                     let _ = self.infer(body);
-                    unit_ty()
+                    let lookup = |name: &str| self.const_fold_env.get(name).copied();
+                    if super::control_flow::is_infinite_loop(expr, &lookup) {
+                        never()
+                    } else {
+                        unit_ty()
+                    }
                 }
             }
             Expression::For {
@@ -3833,7 +3843,12 @@ impl Checker {
                 if let Some(step) = step {
                     let _ = self.infer(step);
                 }
-                unit_ty()
+                let lookup = |name: &str| self.const_fold_env.get(name).copied();
+                if super::control_flow::is_infinite_loop(expr, &lookup) {
+                    never()
+                } else {
+                    unit_ty()
+                }
             }
 
             // ---- Return ----
@@ -3850,17 +3865,14 @@ impl Checker {
                 if let Some(ret) = self.current_return_ty.clone() {
                     self.coerce_or_unify(&ret, &ty, Some(e), &e.0.into_range(), "return value");
                 }
-                ty
+                never()
             }
 
             // ---- raise / ? / ?? / ?. ----
             Expression::Raise(e) => {
                 let err_ty = self.infer(e);
-                let ok_ty = self.ensure_result_mode(&err_ty, &e.0.into_range());
-                // `raise` is diverging for the current expression;
-                // give it the Ok type so it can appear in expression
-                // position (e.g. as a branch value).
-                ok_ty
+                let _ok_ty = self.ensure_result_mode(&err_ty, &e.0.into_range());
+                never()
             }
 
             Expression::Panic(e) => {
@@ -3871,8 +3883,7 @@ impl Checker {
                     &e.0.into_range(),
                     "panic message",
                 );
-                // Diverging: fresh ty var so it can appear in any expression position.
-                Ty::Var(self.counter.fresh())
+                never()
             }
 
             Expression::Try(inner) => {
@@ -5736,6 +5747,11 @@ impl Checker {
                                 let pruned = apply_ty_prune(&self.subst, &var_ty);
                                 self.record_codegen_var_type(n.to_string(), pruned.clone());
                                 self.warn_shallow_const_binding(n, &pruned, child.0.into_range());
+                                if let Some(cv) = super::const_eval::eval_const(next, &|name| {
+                                    self.const_fold_env.get(name).copied()
+                                }) {
+                                    self.const_fold_env.insert(n.to_string(), cv);
+                                }
                                 self.maybe_record_polyfn_binding(
                                     (child.0.start, child.0.end),
                                     &pruned,
@@ -6720,7 +6736,8 @@ impl Checker {
                     result_ty = body_ty;
                     first = false;
                 } else {
-                    self.unify(&result_ty, &body_ty, &body.0.into_range(), "if branch");
+                    result_ty =
+                        self.join_ty(&result_ty, &body_ty, &body.0.into_range(), "if branch");
                 }
             }
         }
@@ -8157,6 +8174,17 @@ impl Checker {
         }
     }
 
+    /// Join two branch/arm types, absorbing [`Ty::Never`].
+    fn join_ty(&mut self, a: &Ty, b: &Ty, range: &Range<usize>, ctx: &str) -> Ty {
+        let a = apply_ty_prune(&self.subst, a);
+        let b = apply_ty_prune(&self.subst, b);
+        match (&a, &b) {
+            (Ty::Never, _) => b,
+            (_, Ty::Never) => a,
+            _ => self.unify(&a, &b, range, ctx),
+        }
+    }
+
     /// Unify two types under the current substitution, updating
     /// `self.subst` on success. On failure, record a message and return
     /// a fresh variable so inference can continue.
@@ -9159,7 +9187,8 @@ impl Checker {
             | Ty::Existential { .. }
             | Ty::Fun(_, _)
             | Ty::Forall { .. }
-            | Ty::Readonly(_) => None,
+            | Ty::Readonly(_)
+            | Ty::Never => None,
         }
     }
 
@@ -10600,6 +10629,55 @@ impl Checker {
         // Free-fn arg NodeId assign deferred (Hash / constraint-kind). Lambdas
         // call `assign_fn_arg_node_ids` at their infer site.
         let _ = self.infer(body);
+        let body_is_stub = self.current_typeclass.is_some()
+            && (matches!(
+                body.1.as_ref(),
+                Expression::Block(stmts) if stmts.is_empty()
+            ) || matches!(body.1.as_ref(), Expression::Noop(_)));
+        if !is_coro && !body_is_stub {
+            let lookup = |name: &str| self.const_fold_env.get(name).copied();
+            let cf = super::control_flow::analyze_fn_body(body, &lookup);
+            self.messages.extend(cf.messages);
+            if !cf.always_exits {
+                let ret = self
+                    .current_return_ty
+                    .as_ref()
+                    .map(|t| apply_ty_prune(&self.subst, t))
+                    .unwrap_or_else(unit_ty);
+                // Unit / open vars may fall through (codegen emits a unit
+                // epilogue with defers). Concrete non-unit returns must exit.
+                let allow_fallthrough = matches!(&ret, Ty::Var(_))
+                    || matches!(&ret, Ty::Con(n) if n == "unknown")
+                    || matches!(&ret, Ty::Never)
+                    || matches!(&ret, Ty::Con(n) if n == crate::typechecking::ty::UNIT)
+                    || matches!(&ret, Ty::Tuple(items) if items.is_empty())
+                    || (self.fn_result_mode.is_some()
+                        && result_ok_err(&ret)
+                            .map(|(ok, _)| {
+                                let ok = apply_ty_prune(&self.subst, &ok);
+                                matches!(&ok, Ty::Var(_))
+                                    || matches!(&ok, Ty::Con(n) if n == crate::typechecking::ty::UNIT)
+                                    || matches!(&ok, Ty::Tuple(items) if items.is_empty())
+                            })
+                            .unwrap_or(false));
+                if !allow_fallthrough {
+                    let ret_s =
+                        crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ret);
+                    let mut message = Message::error(
+                        ErrorCode::ReturnMismatch,
+                        format!(
+                            "function `{name}` reaches the end without returning a value of type `{ret_s}`"
+                        ),
+                        body.0.into_range(),
+                    );
+                    message.push(Label::new(
+                        "add an explicit `return` on every path".to_string(),
+                        body.0.into_range(),
+                    ));
+                    self.messages.push(message);
+                }
+            }
+        }
         self.fn_codegen_baselines.pop();
         self.pop_scope();
 
@@ -12787,12 +12865,8 @@ impl Checker {
                 result_ty = body_ty;
                 first = false;
             } else {
-                self.unify(
-                    &result_ty,
-                    &body_ty,
-                    &arm.body.0.into_range(),
-                    "match arm body",
-                );
+                result_ty =
+                    self.join_ty(&result_ty, &body_ty, &arm.body.0.into_range(), "match arm body");
             }
 
             // Step 6: pop the per-arm env frame.
@@ -15259,8 +15333,8 @@ mod tests {
 
     #[test]
     fn return_inside_expression() {
-        // Without an enclosing function, return just returns the value's type.
-        assert_ok("return 42", int());
+        // `return` is a diverging expression regardless of enclosing context.
+        assert_ok("return 42", never());
     }
 
     // ---- Block ----
@@ -18467,7 +18541,7 @@ fn f(int n) {
     #[test]
     fn try_on_result_propagates_ok_payload() {
         let src = r#"
-fn inner() { raise "e"; return 1; }
+fn inner() { raise "e"; }
 fn outer() {
     let v = inner()?;
     return v;

@@ -1235,8 +1235,14 @@ impl<'pratt> Pratt<'pratt> {
     {
         keyword!("return")
             .labelled("return")
-            .ignore_then(self.expr())
-            .map_with(|result, e| (e.span(), Box::new(Expression::Return(result))))
+            .ignore_then(self.expr().or_not())
+            .map_with(|opt, e| {
+                let span = e.span();
+                let result = opt.unwrap_or_else(|| {
+                    (span, Box::new(Expression::Tuple(Vec::new())))
+                });
+                (span, Box::new(Expression::Return(result)))
+            })
     }
 
     fn raise_(
@@ -5998,6 +6004,21 @@ mod tests_generics {
                 assert!(body.is_some());
                 assert_eq!(attrs.len(), 1);
                 assert!(matches!(&attrs[0].args, ast::AttrArgs::String("desc")));
+                let body = body.as_ref().unwrap();
+                match body.1.as_ref() {
+                    Expression::Block(stmts) => {
+                        assert!(matches!(
+                            stmts[0].1.as_ref(),
+                            Expression::Statement(inner)
+                                if matches!(
+                                    inner.1.as_ref(),
+                                    Expression::Return(r)
+                                        if matches!(r.1.as_ref(), Expression::Tuple(t) if t.is_empty())
+                                )
+                        ));
+                    }
+                    other => panic!("expected Block, got {:?}", other),
+                }
             }
             other => panic!("expected Function, got {:?}", other),
         }
