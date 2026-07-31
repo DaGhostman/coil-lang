@@ -13574,6 +13574,27 @@ print \"%i\", len(a); \
         );
     }
 
+    /// Empty `Option` bodies emit `MakeEnum` None (tag 0, arity 0), not bare
+    /// `CONST 0` — raw zero is not a reliable `None` at runtime.
+    #[test]
+    fn fallthrough_option_emits_make_enum_none() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn opt() -> Option<int> {}\
+ fn main() { let _ = opt(); }",
+        );
+        let make_none = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MakeEnum)
+                && b.operand_u32() & 0xFFFF == 0
+                && (b.operand_u32() >> 16) & 0xFFFF == 0
+        });
+        assert!(
+            make_none,
+            "Option fall-through should emit MakeEnum None; got {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Nested multi-field records emit scratch relocate (LOAD+StorePop)
     /// then UnpackAt with operands `[arity, scratch_slot]` — not in-place
     /// at the outer field (which would clobber siblings).
