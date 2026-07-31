@@ -1072,13 +1072,13 @@ impl Compiler {
                 } else {
                     let bits = Value::from(*n).raw() as u64;
                     let idx = self.intern_constant(bits);
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                    bytecode.push_const_pool(idx);
                 }
             }
             ConstValue::Float(n) => {
                 let bits = Value::from(*n).raw() as u64;
                 let idx = self.intern_constant(bits);
-                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                bytecode.push_const_pool(idx);
             }
             ConstValue::Bool(b) => {
                 bytecode.push(Byte::new_with_value(Instruction::CONST, Value::from(*b).raw() as _));
@@ -1291,7 +1291,7 @@ impl Compiler {
     }
 
     fn is_tiny_inline_il(ops: &[IlOp]) -> bool {
-        if ops.is_empty() || ops.len() > 48 {
+        if ops.is_empty() || ops.len() > 64 {
             return false;
         }
         if ops.iter().any(|op| op.is_control()) {
@@ -1317,6 +1317,10 @@ impl Compiler {
                 }
             }
         }
+        // Pure micro-body: ≤3 compute ops + terminal Return / fused *Return.
+        if Self::is_pure_micro_inline_il(ops) {
+            return true;
+        }
         // Inliner copies opcodes until the first `RETURN` and leaves that
         // value on the stack. Early-return / branched bodies therefore
         // truncate (else-arm dropped). Only allow a single terminal RETURN
@@ -1330,11 +1334,88 @@ impl Compiler {
         if return_idxs.len() != 1 || return_idxs[0] != ops.len() - 1 {
             return false;
         }
-        !ops.iter().any(|op| {
-            let Some(b) = op.as_plain_byte() else {
-                return true;
-            };
+        !ops.iter().any(|op| Self::inline_forbidden_op(op))
+    }
+
+    /// ≤3 pure producers + terminal Return / fused *Return (Load/Const/Bin/…).
+    fn is_pure_micro_inline_il(ops: &[IlOp]) -> bool {
+        if ops.is_empty() || ops.len() > 4 {
+            return false;
+        }
+        let last = ops.last().unwrap();
+        let terminal_ok = last.is_plain_return()
+            || matches!(
+                last,
+                IlOp::LoadReturnSlot { .. }
+                    | IlOp::ConstReturnImm { .. }
+                    | IlOp::BinReturn { .. }
+            )
+            || matches!(
+                last.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::LoadReturnSlot
+                        | Instruction::ConstReturnImm
+                        | Instruction::BinReturn
+                        | Instruction::RETURN
+                )
+            );
+        if !terminal_ok {
+            return false;
+        }
+        let compute = &ops[..ops.len() - 1];
+        if compute.len() > 3 {
+            return false;
+        }
+        compute.iter().all(|op| {
             matches!(
+                op,
+                IlOp::Load { .. }
+                    | IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::Dup { .. }
+                    | IlOp::Bin { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. }
+            ) || matches!(
+                op.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::LOAD
+                        | Instruction::CONST
+                        | Instruction::DUPLICATE
+                        | Instruction::ADD
+                        | Instruction::SUB
+                        | Instruction::MUL
+                        | Instruction::DIV
+                        | Instruction::MOD
+                        | Instruction::BinSlotImm
+                        | Instruction::BinSlotSlot
+                        | Instruction::EQ
+                        | Instruction::NEQ
+                        | Instruction::LE
+                        | Instruction::LEQ
+                        | Instruction::GT
+                        | Instruction::GEQ
+                )
+            )
+        })
+    }
+
+    fn inline_forbidden_op(op: &IlOp) -> bool {
+        matches!(
+            op,
+            IlOp::HostInvoke { .. }
+                | IlOp::Print { .. }
+                | IlOp::GetField { .. }
+                | IlOp::SetField { .. }
+                | IlOp::LoadField { .. }
+                | IlOp::MakeTuple { .. }
+                | IlOp::MakeArray { .. }
+                | IlOp::MakeEnum { .. }
+        ) || match op.as_plain_byte() {
+            None => true,
+            Some(b) => matches!(
                 *b.bytecode(),
                 Instruction::CALL
                     | Instruction::TailCall
@@ -1349,6 +1430,9 @@ impl Compiler {
                     | Instruction::JumpIfMatch
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
+                    | Instruction::PRINT
+                    | Instruction::GetField
+                    | Instruction::SetField
                     | Instruction::JMP
                     | Instruction::JMPF
                     | Instruction::JMPT
@@ -1358,8 +1442,8 @@ impl Compiler {
                     | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
-            )
-        })
+            ),
+        }
     }
 
     /// Expand a fused `*Return` byte into the producer left on the caller's stack.
@@ -2438,7 +2522,7 @@ impl Compiler {
         if is_float {
             let bits = Value::from(-1.0f64).raw() as u64;
             let idx = self.intern_constant(bits);
-            bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            bytecode.push_const_pool(idx);
             bytecode.push(Byte::new(Instruction::MULF));
         } else {
             bytecode.push(Byte::new(Instruction::NEG));
@@ -3389,7 +3473,7 @@ impl Compiler {
             self.bytecode
                 .push_load(record_slot);
             Self::emit_raw_string_literal(&mut self.bytecode, name);
-            self.bytecode.push(Byte::new(Instruction::GetField));
+            self.bytecode.push_get_field();
             self.emit_show_for_stack_value(field_ty);
             let slot = self.alloc_temp_slot();
             self.bytecode
@@ -3855,9 +3939,7 @@ impl Compiler {
         }
         self.bytecode
             .push_make_tuple(arity as u32);
-        self.bytecode.push(
-            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
-        );
+        self.bytecode.push_host_invoke(arity as u32);
         // Restore: caller owns counting the result value if it needs to.
         self.expr_depth = depth_on_entry;
     }
@@ -4013,8 +4095,7 @@ impl Compiler {
                 self.bytecode.push_unbox_value(ValueTag::String as u32);
                 self.bytecode
                     .push_make_tuple(1);
-                self.bytecode
-                    .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
+                self.bytecode.push_host_invoke(1);
                 self.bytecode.push_return();
             }
         }
@@ -4044,8 +4125,7 @@ impl Compiler {
             self.bytecode.push_unbox_value(ValueTag::Array as u32);
             self.bytecode
                 .push_make_tuple(arity);
-            self.bytecode
-                .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+            self.bytecode.push_host_invoke(arity);
             self.bytecode.push_return();
         }
 
@@ -4766,14 +4846,14 @@ impl Compiler {
                         LetPattern::Binding { name } => {
                             bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
-                            bytecode.push(Byte::new(Instruction::GetField));
+                            bytecode.push_get_field();
                             let slot = self.alloc_binding_slot(name);
                             bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
                             bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
-                            bytecode.push(Byte::new(Instruction::GetField));
+                            bytecode.push_get_field();
                             let nested_slot = self.alloc_temp_slot();
                             bytecode
                                 .push_store_pop(nested_slot);
@@ -4967,14 +5047,14 @@ impl Compiler {
                 self.bytecode
                     .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "start");
-                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode.push_get_field();
                 self.bytecode
                     .push_store_pop(cur_slot);
 
                 self.bytecode
                     .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "end");
-                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode.push_get_field();
                 self.bytecode
                     .push_store_pop(end_slot);
             }
@@ -5033,7 +5113,7 @@ impl Compiler {
             let bits = Value::from(1.0_f64).raw() as u64;
             let idx = self.intern_constant(bits);
             self.bytecode
-                .push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                .push_const_pool(idx);
             self.bytecode.push(Byte::new(Instruction::ADDF));
         } else {
             self.bytecode
@@ -5386,7 +5466,7 @@ impl Compiler {
             Expression::Access(receiver, field) => {
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
-                bytecode.push(Byte::new(Instruction::GetField));
+                bytecode.push_get_field();
                 matches!(
                     self.receiver_type(receiver),
                     Some(crate::typechecking::Ty::Con(ref n))
@@ -5431,7 +5511,7 @@ impl Compiler {
                 }
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
-                bytecode.push(Byte::new(Instruction::SetField));
+                bytecode.push_set_field();
             }
             Expression::Index(arr, Some(idx)) => {
                 // Always stash the RHS — `StoreIndex` pops value/index/array.
@@ -6207,7 +6287,7 @@ impl Compiler {
         self.expr_depth += 1;
         let arity = value_args.len() + 1; // + meta
         bytecode.push_make_tuple(arity as u32);
-        bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        bytecode.push_host_invoke(arity as u32);
         self.expr_depth = depth_on_entry;
         true
     }
@@ -6298,7 +6378,7 @@ impl Compiler {
             self.bytecode.push_pop();
             let msg = format!("> Test \"{desc}\" failed\n");
             self.emit_string_literal(&msg);
-            self.bytecode.push(Byte::new(Instruction::PRINT));
+            self.bytecode.push_print();
             // failed += 1
             self.bytecode
                 .push_load(failed_slot);
@@ -7051,7 +7131,7 @@ impl Compiler {
                         bytecode.append(&mut self.do_compile(arg));
                         bytecode.push_load(tmp_inst);
                         self.emit_field_name(&mut bytecode, fname);
-                        bytecode.push(Byte::new(Instruction::SetField));
+                        bytecode.push_set_field();
                         bytecode.push_pop();
                     }
                 }
@@ -7762,9 +7842,7 @@ impl Compiler {
                         }
                         self.bytecode
                             .push_make_tuple(arity as u32);
-                        self.bytecode.push(
-                            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
-                        );
+                        self.bytecode.push_host_invoke(arity as u32);
                         self.expr_depth = depth_on_entry;
                     } else if let Some(offset) = self.functions.get(&n).copied() {
                         let mono_offset = self.mono_call_offset(&n, args.as_ref());
@@ -8889,7 +8967,7 @@ impl Compiler {
             Expression::Float(num) => {
                 let bits = Value::from(*num).raw() as u64;
                 let idx = self.intern_constant(bits);
-                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                bytecode.push_const_pool(idx);
             }
             Expression::String(str) => {
                 let escaped = unescape_coil_string(str);
@@ -8987,7 +9065,7 @@ impl Compiler {
                     self.append_binding_rhs(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
-                    bytecode.push(Byte::new(Instruction::SetField));
+                    bytecode.push_set_field();
                 }
                 Expression::Index(arr, None) => {
                     bytecode.append(&mut self.do_compile(arr));
@@ -10023,7 +10101,7 @@ impl Compiler {
                     bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     self.emit_field_name(&mut bytecode, field);
-                    bytecode.push(Byte::new(Instruction::GetField));
+                    bytecode.push_get_field();
                 } else {
                     // Unknown receiver — do not emit GetField (enum
                     // match bindings historically lacked side-table
@@ -10172,7 +10250,7 @@ impl Compiler {
                     self.bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
-                    self.bytecode.push(Byte::new(Instruction::GetField));
+                    self.bytecode.push_get_field();
                 } else {
                     self.bytecode.push_load_field(0);
                 }
@@ -12923,6 +13001,48 @@ fn main() { print \"%i\", add(3, 4); }",
                 op: Instruction::ADD as u8,
                 a: 0,
                 b: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_pure_micro_body() {
+        use crate::il::IlOp;
+        use common::DebugLoc;
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+        // ConstPool is a pure producer in the widened micro-inline set.
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::ConstPool {
+                idx: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
+        assert!(!Compiler::is_tiny_inline_il(&[
+            IlOp::HostInvoke {
+                arity: 1,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Return {

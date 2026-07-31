@@ -21,7 +21,7 @@ pub trait EmitBuf {
         self.push_byte(Byte::new(Instruction::StorePop).with_operand_u32(slot));
     }
 
-    /// Inline `CONST` (pool-backed consts stay on [`Self::push_byte`]).
+    /// Inline `CONST` (pool-backed: [`Self::push_const_pool`]).
     fn push_const(&mut self, imm: i32) {
         self.push_byte(Byte::new(Instruction::CONST).with_const_inline(imm));
     }
@@ -65,6 +65,27 @@ pub trait EmitBuf {
 
     fn push_load_field(&mut self, index: u32) {
         self.push_byte(Byte::new(Instruction::LoadField).with_operand_u32(index));
+    }
+
+    fn push_get_field(&mut self) {
+        self.push_byte(Byte::new(Instruction::GetField));
+    }
+
+    fn push_set_field(&mut self) {
+        self.push_byte(Byte::new(Instruction::SetField));
+    }
+
+    fn push_host_invoke(&mut self, arity: u32) {
+        self.push_byte(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+    }
+
+    #[allow(dead_code)]
+    fn push_print(&mut self) {
+        self.push_byte(Byte::new(Instruction::PRINT));
+    }
+
+    fn push_const_pool(&mut self, idx: u32) {
+        self.push_byte(Byte::new(Instruction::CONST).with_const_pool(idx));
     }
 }
 
@@ -126,6 +147,26 @@ impl EmitBuf for CodeBuf {
 
     fn push_load_field(&mut self, index: u32) {
         CodeBuf::push_load_field(self, index);
+    }
+
+    fn push_get_field(&mut self) {
+        CodeBuf::push_get_field(self);
+    }
+
+    fn push_set_field(&mut self) {
+        CodeBuf::push_set_field(self);
+    }
+
+    fn push_host_invoke(&mut self, arity: u32) {
+        CodeBuf::push_host_invoke(self, arity);
+    }
+
+    fn push_print(&mut self) {
+        CodeBuf::push_print(self);
+    }
+
+    fn push_const_pool(&mut self, idx: u32) {
+        CodeBuf::push_const_pool(self, idx);
     }
 }
 
@@ -197,14 +238,50 @@ mod tests {
     }
 
     #[test]
-    fn codebuf_emit_buf_trait_lifts_box_unbox_load_field() {
+    fn codebuf_emit_buf_trait_lifts_residual_typed() {
         let mut buf = CodeBuf::new();
-        EmitBuf::push_box_value(&mut buf, 5);
-        EmitBuf::push_unbox_value(&mut buf, 6);
-        EmitBuf::push_load_field(&mut buf, 1);
+        EmitBuf::push_const_pool(&mut buf, 4);
+        EmitBuf::push_get_field(&mut buf);
+        EmitBuf::push_set_field(&mut buf);
+        EmitBuf::push_host_invoke(&mut buf, 2);
+        EmitBuf::push_print(&mut buf);
         let ops = buf.ops();
-        assert!(matches!(ops[0], IlOp::BoxValue { tag: 5, .. }));
-        assert!(matches!(ops[1], IlOp::UnboxValue { tag: 6, .. }));
-        assert!(matches!(ops[2], IlOp::LoadField { index: 1, .. }));
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 4, .. }));
+        assert!(matches!(ops[1], IlOp::GetField { .. }));
+        assert!(matches!(ops[2], IlOp::SetField { .. }));
+        assert!(matches!(ops[3], IlOp::HostInvoke { arity: 2, .. }));
+        assert!(matches!(ops[4], IlOp::Print { .. }));
+    }
+
+    #[test]
+    fn vec_emit_buf_packs_residual_typed() {
+        let mut buf: Vec<Byte> = Vec::new();
+        EmitBuf::push_const_pool(&mut buf, 4);
+        EmitBuf::push_get_field(&mut buf);
+        EmitBuf::push_set_field(&mut buf);
+        EmitBuf::push_host_invoke(&mut buf, 2);
+        EmitBuf::push_print(&mut buf);
+        assert_eq!(*buf[0].bytecode(), Instruction::CONST);
+        assert_eq!(buf[0].operand_u32() & Byte::POOL_FLAG, Byte::POOL_FLAG);
+        assert_eq!(buf[0].operand_u32() & !Byte::POOL_FLAG, 4);
+        assert_eq!(*buf[1].bytecode(), Instruction::GetField);
+        assert_eq!(*buf[2].bytecode(), Instruction::SetField);
+        assert_eq!(*buf[3].bytecode(), Instruction::HostInvoke);
+        assert_eq!(buf[3].operand_u32(), 2);
+        assert_eq!(*buf[4].bytecode(), Instruction::PRINT);
+    }
+
+    #[test]
+    fn codebuf_push_byte_absorbs_residual_typed() {
+        let mut buf = CodeBuf::new();
+        buf.push(Byte::new(Instruction::CONST).with_const_pool(1));
+        buf.push(Byte::new(Instruction::GetField));
+        buf.push(Byte::new(Instruction::PRINT));
+        buf.push(Byte::new(Instruction::HostInvoke).with_operand_u32(0));
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 1, .. }));
+        assert!(matches!(ops[1], IlOp::GetField { .. }));
+        assert!(matches!(ops[2], IlOp::Print { .. }));
+        assert!(matches!(ops[3], IlOp::HostInvoke { arity: 0, .. }));
     }
 }

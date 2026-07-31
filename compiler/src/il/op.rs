@@ -45,8 +45,10 @@ pub enum IlOp {
     Byte { byte: Byte, loc: DebugLoc },
     Load { slot: u32, loc: DebugLoc },
     StorePop { slot: u32, loc: DebugLoc },
-    /// Inline `CONST` only (pool-backed consts stay as [`IlOp::Byte`]).
+    /// Inline `CONST` only (non-negative; pool / high-bit forms use [`IlOp::ConstPool`]).
     Const { imm: i32, loc: DebugLoc },
+    /// Pool-backed `CONST` (`POOL_FLAG | idx`); also absorbs high-bit inline encodings.
+    ConstPool { idx: u32, loc: DebugLoc },
     Dup { loc: DebugLoc },
     Pop { loc: DebugLoc },
     /// `Index` — pop array + index, push element.
@@ -60,6 +62,14 @@ pub enum IlOp {
     BoxValue { tag: u32, loc: DebugLoc },
     UnboxValue { tag: u32, loc: DebugLoc },
     LoadField { index: u32, loc: DebugLoc },
+    /// Dict / class field read — pop target + name, push value.
+    GetField { loc: DebugLoc },
+    /// Dict / class field write — pop value + target + name, push value.
+    SetField { loc: DebugLoc },
+    /// Host native call — pop fn id + args tuple; push result (delta −1).
+    HostInvoke { arity: u32, loc: DebugLoc },
+    /// Print TOS string (consume).
+    Print { loc: DebugLoc },
     Return { loc: DebugLoc },
     Halt { loc: DebugLoc },
     /// Plain int/float binop or comparison (stack operands).
@@ -157,7 +167,10 @@ impl IlOp {
             Instruction::CONST => {
                 let op = byte.operand_u32();
                 if op & Byte::POOL_FLAG != 0 {
-                    Self::Byte { byte, loc }
+                    Self::ConstPool {
+                        idx: op & !Byte::POOL_FLAG,
+                        loc,
+                    }
                 } else {
                     Self::Const {
                         imm: op as i32,
@@ -193,6 +206,13 @@ impl IlOp {
                 index: byte.operand_u32(),
                 loc,
             },
+            Instruction::GetField => Self::GetField { loc },
+            Instruction::SetField => Self::SetField { loc },
+            Instruction::HostInvoke => Self::HostInvoke {
+                arity: byte.operand_u32(),
+                loc,
+            },
+            Instruction::PRINT => Self::Print { loc },
             Instruction::RETURN => Self::Return { loc },
             Instruction::HALT => Self::Halt { loc },
             Instruction::BinSlotImm => {
@@ -237,6 +257,7 @@ impl IlOp {
             IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_operand_u32(*slot),
             IlOp::StorePop { slot, .. } => Byte::new(Instruction::StorePop).with_operand_u32(*slot),
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
+            IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Byte::new(Instruction::POP),
             IlOp::Index { .. } => Byte::new(Instruction::Index),
@@ -258,6 +279,12 @@ impl IlOp {
             IlOp::LoadField { index, .. } => {
                 Byte::new(Instruction::LoadField).with_operand_u32(*index)
             }
+            IlOp::GetField { .. } => Byte::new(Instruction::GetField),
+            IlOp::SetField { .. } => Byte::new(Instruction::SetField),
+            IlOp::HostInvoke { arity, .. } => {
+                Byte::new(Instruction::HostInvoke).with_operand_u32(*arity)
+            }
+            IlOp::Print { .. } => Byte::new(Instruction::PRINT),
             IlOp::Return { .. } => Byte::new(Instruction::RETURN),
             IlOp::Halt { .. } => Byte::new(Instruction::HALT),
             IlOp::Bin { op, .. } => Byte::new(*op),
@@ -314,6 +341,7 @@ impl IlOp {
             | IlOp::Load { loc, .. }
             | IlOp::StorePop { loc, .. }
             | IlOp::Const { loc, .. }
+            | IlOp::ConstPool { loc, .. }
             | IlOp::Dup { loc }
             | IlOp::Pop { loc }
             | IlOp::Index { loc }
@@ -323,6 +351,10 @@ impl IlOp {
             | IlOp::BoxValue { loc, .. }
             | IlOp::UnboxValue { loc, .. }
             | IlOp::LoadField { loc, .. }
+            | IlOp::GetField { loc }
+            | IlOp::SetField { loc }
+            | IlOp::HostInvoke { loc, .. }
+            | IlOp::Print { loc }
             | IlOp::Return { loc }
             | IlOp::Halt { loc }
             | IlOp::Bin { loc, .. }
@@ -345,6 +377,7 @@ impl IlOp {
             | IlOp::Load { loc: l, .. }
             | IlOp::StorePop { loc: l, .. }
             | IlOp::Const { loc: l, .. }
+            | IlOp::ConstPool { loc: l, .. }
             | IlOp::Dup { loc: l }
             | IlOp::Pop { loc: l }
             | IlOp::Index { loc: l }
@@ -354,6 +387,10 @@ impl IlOp {
             | IlOp::BoxValue { loc: l, .. }
             | IlOp::UnboxValue { loc: l, .. }
             | IlOp::LoadField { loc: l, .. }
+            | IlOp::GetField { loc: l }
+            | IlOp::SetField { loc: l }
+            | IlOp::HostInvoke { loc: l, .. }
+            | IlOp::Print { loc: l }
             | IlOp::Return { loc: l }
             | IlOp::Halt { loc: l }
             | IlOp::Bin { loc: l, .. }
@@ -380,7 +417,7 @@ impl IlOp {
             IlOp::Byte { byte, .. } => Some(*byte.bytecode()),
             IlOp::Load { .. } => Some(Instruction::LOAD),
             IlOp::StorePop { .. } => Some(Instruction::StorePop),
-            IlOp::Const { .. } => Some(Instruction::CONST),
+            IlOp::Const { .. } | IlOp::ConstPool { .. } => Some(Instruction::CONST),
             IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Some(Instruction::POP),
             IlOp::Index { .. } => Some(Instruction::Index),
@@ -390,6 +427,10 @@ impl IlOp {
             IlOp::BoxValue { .. } => Some(Instruction::BoxValue),
             IlOp::UnboxValue { .. } => Some(Instruction::UnboxValue),
             IlOp::LoadField { .. } => Some(Instruction::LoadField),
+            IlOp::GetField { .. } => Some(Instruction::GetField),
+            IlOp::SetField { .. } => Some(Instruction::SetField),
+            IlOp::HostInvoke { .. } => Some(Instruction::HostInvoke),
+            IlOp::Print { .. } => Some(Instruction::PRINT),
             IlOp::Return { .. } => Some(Instruction::RETURN),
             IlOp::Halt { .. } => Some(Instruction::HALT),
             IlOp::Bin { op, .. } => Some(*op),
@@ -575,9 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn long_tail_and_control_stay_unlifted_or_unencoded() {
-        let host = IlOp::from_plain_byte(Byte::new(Instruction::HostInvoke), DebugLoc::unknown());
-        assert!(matches!(host, IlOp::Byte { .. }));
+    fn long_tail_control_stays_unencoded() {
         let jmp = IlOp::Jump {
             kind: IlJumpKind::Unconditional,
             target: Label(0),
@@ -595,6 +634,29 @@ mod tests {
         assert!(entry.is_control());
         assert!(IlOp::Label(Label(0)).as_encode_byte().is_none());
         assert!(!IlOp::Label(Label(0)).emits_code());
+    }
+
+    #[test]
+    fn from_plain_byte_lifts_host_print_get_set_field() {
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::HostInvoke).with_operand_u32(2),
+                DebugLoc::unknown(),
+            ),
+            IlOp::HostInvoke { arity: 2, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::PRINT), DebugLoc::unknown()),
+            IlOp::Print { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::GetField), DebugLoc::unknown()),
+            IlOp::GetField { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::SetField), DebugLoc::unknown()),
+            IlOp::SetField { .. }
+        ));
     }
 
     #[test]
@@ -714,18 +776,50 @@ mod tests {
     }
 
     #[test]
-    fn pool_const_stays_byte() {
-        let pool = Byte::new(Instruction::CONST).with_const_pool(0);
+    fn pool_const_lifts_to_const_pool() {
+        let pool = Byte::new(Instruction::CONST).with_const_pool(3);
         let op = IlOp::from_plain_byte(pool, DebugLoc::unknown());
-        assert!(matches!(op, IlOp::Byte { .. }));
+        assert!(matches!(op, IlOp::ConstPool { idx: 3, .. }));
+        assert_eq!(op.as_encode_byte(), Some(pool));
     }
 
     #[test]
-    fn negative_inline_const_stays_byte() {
+    fn negative_inline_const_lifts_as_const_pool_encoding() {
         // Inline CONST uses bit 31 as POOL_FLAG; negative i32 values set it.
+        // Absorb as ConstPool so encoding round-trips (same bit pattern).
         let neg = Byte::new(Instruction::CONST).with_const_inline(-1);
         assert_ne!(neg.operand_u32() & Byte::POOL_FLAG, 0);
         let op = IlOp::from_plain_byte(neg, DebugLoc::unknown());
-        assert!(matches!(op, IlOp::Byte { .. }));
+        assert!(matches!(op, IlOp::ConstPool { .. }));
+        assert_eq!(op.as_encode_byte(), Some(neg));
+    }
+
+    #[test]
+    fn as_encode_byte_round_trips_residual_typed() {
+        let ops = [
+            IlOp::ConstPool {
+                idx: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::GetField {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::SetField {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::HostInvoke {
+                arity: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Print {
+                loc: DebugLoc::unknown(),
+            },
+        ];
+        for op in ops {
+            let b = op.as_encode_byte().expect("encode");
+            let again = IlOp::from_plain_byte(b, DebugLoc::unknown());
+            assert_eq!(again.as_encode_byte(), Some(b));
+            assert!(again == op);
+        }
     }
 }
