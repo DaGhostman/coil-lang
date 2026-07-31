@@ -4,6 +4,7 @@
 //! label-targeted jumps). [`lower`] assigns PCs once, selecting fused
 //! encodings along the way — no post-shrink jump relocation.
 
+mod algebraic;
 mod builder;
 mod codebuf;
 mod emit_buf;

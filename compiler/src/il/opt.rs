@@ -15,6 +15,8 @@ pub struct OptimizeOptions {
     pub stack_dce: bool,
     /// `StorePop s; Load s` → `Dup; StorePop s`; dead-store elimination.
     pub mem_fwd: bool,
+    /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
+    pub algebraic: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
     /// Sink identical binop / BinSlot* tails into a return-label cluster.
@@ -32,6 +34,7 @@ impl Default for OptimizeOptions {
             dead_block: true,
             stack_dce: true,
             mem_fwd: true,
+            algebraic: true,
             return_convoy: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
@@ -53,6 +56,9 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     if opts.mem_fwd {
         mem_fwd(ops);
         dead_store(ops);
+    }
+    if opts.algebraic {
+        super::algebraic::algebraic_simplify(ops);
     }
     if opts.return_convoy {
         return_convoy(ops);
