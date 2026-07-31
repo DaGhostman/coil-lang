@@ -4321,29 +4321,46 @@ fn main() {
 }
 
 #[test]
-fn fallthrough_option_and_result_int_allowed() {
-    // Option and Result with zero-safe Ok are treated as fallthrough-safe
-    // by the type gate (compile must succeed). Runtime Option encoding of
-    // bare `0` is not asserted here.
-    let mut pipeline = Pipeline::new();
-    let result = pipeline.compile_src(
+fn fallthrough_option_emits_none_at_runtime() {
+    // Option fall-through must emit MakeEnum None — bare CONST 0 is not None.
+    let output = run_example_src(
         r#"
 fn opt() -> Option<int> {}
-fn ok_res() -> Result<int, string> {}
+
 fn main() {
-    let _ = opt();
-    let _ = ok_res();
+    print "%i", match opt() {
+        Option::None => 1,
+        Option::Some(_) => 0,
+    };
 }
 "#,
     );
-    assert!(
-        result.is_ok(),
-        "Option / Result<int,_> fall-through should compile; msgs={:?}",
-        pipeline
-            .messages()
-            .iter()
-            .map(|m| m.message())
-            .collect::<Vec<_>>()
+    assert_eq!(output, "1", "empty Option body must fall through as None");
+}
+
+#[test]
+fn fallthrough_result_zero_safe_ok_wraps_at_runtime() {
+    // Annotated Result enters result-mode; zero-safe Ok scalars Ok-wrap CONST 0.
+    let output = run_example_src(
+        r#"
+fn ok_int() -> Result<int, string> {}
+fn ok_unit() -> Result<(), string> {}
+
+fn main() {
+    print "%i,", match ok_int() {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    };
+    print "%i", match ok_unit() {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+"#,
+    );
+    assert_eq!(
+        output, "0,1",
+        "Result<int,_> / Result<(),_> fall-through must Ok-wrap"
     );
 }
 
