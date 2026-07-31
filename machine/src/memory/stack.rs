@@ -28,20 +28,25 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     pub fn pop(&mut self) -> T {
         promise!(self.cursor > 0);
         self.cursor -= 1;
-        self.stack[self.cursor]
+        // SAFETY: cursor was in `1..=N` before decrement.
+        unsafe { *self.stack.get_unchecked(self.cursor) }
     }
 
     #[inline]
     pub fn push(&mut self, value: T) {
         promise!(self.cursor < N);
-        self.stack[self.cursor] = value;
+        // SAFETY: promise! guarantees cursor < N.
+        unsafe {
+            *self.stack.get_unchecked_mut(self.cursor) = value;
+        }
         self.cursor += 1;
     }
 
     #[inline]
     pub fn peek(&self) -> &T {
         promise!(self.cursor > 0);
-        &self.stack[self.cursor - 1]
+        // SAFETY: cursor > 0 and ≤ N.
+        unsafe { self.stack.get_unchecked(self.cursor - 1) }
     }
 
     #[inline]
@@ -53,7 +58,36 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     #[inline]
     pub fn top(&mut self) -> &mut T {
         promise!(self.cursor > 0);
-        &mut self.stack[self.cursor - 1]
+        // SAFETY: cursor > 0 and ≤ N.
+        unsafe { self.stack.get_unchecked_mut(self.cursor - 1) }
+    }
+
+    /// Duplicate TOS without going through `peek` + `push`.
+    #[inline]
+    pub fn duplicate(&mut self) {
+        promise!(self.cursor > 0);
+        promise!(self.cursor < N);
+        // SAFETY: both indices are in-bounds by the promises above.
+        unsafe {
+            let v = *self.stack.get_unchecked(self.cursor - 1);
+            *self.stack.get_unchecked_mut(self.cursor) = v;
+        }
+        self.cursor += 1;
+    }
+
+    /// Copy `len` values from `src` to `dst` (forward; caller ensures non-overlap or `dst <= src`).
+    #[inline]
+    pub fn copy_slots(&mut self, dst: usize, src: usize, len: usize) {
+        promise!(dst + len <= N);
+        promise!(src + len <= N);
+        if dst == src || len == 0 {
+            return;
+        }
+        // SAFETY: ranges fit in the fixed buffer.
+        unsafe {
+            let ptr = self.stack.as_mut_ptr();
+            std::ptr::copy(ptr.add(src), ptr.add(dst), len);
+        }
     }
 
     #[inline]
@@ -79,7 +113,9 @@ impl<T: Default, const N: usize> Index<Range<usize>> for Stack<T, N> {
 
     fn index(&self, index: Range<usize>) -> &Self::Output {
         promise!(index.end <= N);
-        &self.stack[index]
+        promise!(index.start <= index.end);
+        // SAFETY: range is within the fixed buffer.
+        unsafe { self.stack.get_unchecked(index) }
     }
 }
 
@@ -96,14 +132,16 @@ impl<T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         promise!(index < N);
-        &self.stack[index]
+        // SAFETY: promise! guarantees index < N.
+        unsafe { self.stack.get_unchecked(index) }
     }
 }
 
 impl<T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         promise!(index < N);
-        &mut self.stack[index]
+        // SAFETY: promise! guarantees index < N.
+        unsafe { self.stack.get_unchecked_mut(index) }
     }
 }
 
@@ -111,5 +149,58 @@ impl<T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
 impl<T: Default + std::fmt::Debug, const N: usize> std::fmt::Debug for Stack<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", &self.stack[..self.cursor])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stack;
+
+    #[test]
+    fn duplicate_copies_tos_without_changing_original() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(7);
+        s.duplicate();
+        assert_eq!(s.tell(), 2);
+        assert_eq!(s.pop(), 7);
+        assert_eq!(s.pop(), 7);
+    }
+
+    #[test]
+    fn copy_slots_moves_args_toward_frame_base() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(10);
+        s.push(20);
+        s.push(30);
+        s.push(40);
+        // TailCall-shaped: frame base 0, args at [2, 3).
+        s.copy_slots(0, 2, 2);
+        assert_eq!(s[0], 30);
+        assert_eq!(s[1], 40);
+        assert_eq!(s[2], 30);
+        assert_eq!(s[3], 40);
+    }
+
+    #[test]
+    fn copy_slots_noop_when_dst_equals_src_or_len_zero() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(1);
+        s.push(2);
+        s.copy_slots(0, 0, 2);
+        s.copy_slots(0, 1, 0);
+        assert_eq!(s[0], 1);
+        assert_eq!(s[1], 2);
+    }
+
+    #[test]
+    fn as_slice_excludes_slots_past_cursor_after_pop() {
+        let mut s = Stack::<i64, 8>::new();
+        s.push(11);
+        s.push(22);
+        assert_eq!(s.as_slice(), &[11, 22]);
+        let _ = s.pop();
+        assert_eq!(s.as_slice(), &[11]);
+        // Full buffer still holds the stale TOS for GC live-slice contrast.
+        assert_eq!(s.buffer()[1], 22);
     }
 }
