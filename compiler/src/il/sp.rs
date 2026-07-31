@@ -143,6 +143,9 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         | Instruction::OR => Some(-1),
         Instruction::NOT | Instruction::NEG => Some(0),
         Instruction::BinSlotImm | Instruction::BinSlotSlot => Some(1),
+        Instruction::BinSlotImmJmpf | Instruction::BinSlotSlotJmpf => Some(0),
+        Instruction::CmpJmpf => Some(-2),
+        Instruction::LogNotJmpf => Some(-1),
         Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => {
             Some(-1)
         }

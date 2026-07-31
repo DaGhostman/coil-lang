@@ -616,8 +616,17 @@ impl ArchivedByte {
         ((o >> 24) as u8, (o & 0xFFFF) as usize)
     }
 
+    pub fn cmp_jmpf_is_pool(&self) -> bool {
+        (u32::from(self.operands) & (1u32 << 16)) != 0
+    }
+
     pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
         self.operands = (((op as u32) << 24) | (target as u32)).into();
+        self
+    }
+
+    pub fn with_cmp_jmpf_pool(mut self, op: u8, pool_idx: u16) -> Self {
+        self.operands = (((op as u32) << 24) | (1u32 << 16) | (pool_idx as u32)).into();
         self
     }
 
@@ -664,8 +673,32 @@ impl ArchivedByte {
         self
     }
 
+    pub fn with_log_not_jmpf_pool(mut self, pool_idx: u16) -> Self {
+        self.operands = ((1u32 << 16) | (pool_idx as u32)).into();
+        self
+    }
+
     pub fn log_not_jmpf_target(&self) -> usize {
         (u32::from(self.operands) & 0xFFFF) as usize
+    }
+
+    pub fn log_not_jmpf_is_pool(&self) -> bool {
+        (u32::from(self.operands) & (1u32 << 16)) != 0
+    }
+
+    pub fn with_bin_slot_slot_jmpf(mut self, op: u8, a: u8, pool_idx: u16) -> Self {
+        let packed = ((op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
     }
 
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
