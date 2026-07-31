@@ -3192,7 +3192,7 @@ impl Compiler {
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
         self.bytecode
-            .push(Byte::new(Instruction::LoadField).with_operand_u32(1));
+            .push_load_field(1);
         self.bytecode.push(Byte::new(Instruction::Panic));
         bb.bind_label(success, self.bytecode.il_mut());
         bb.finalize()
@@ -3894,13 +3894,13 @@ impl Compiler {
                     .push_load(slot);
                 compiler
                     .bytecode
-                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                    .push_unbox_value(tag as u32);
             }
             compiler.bytecode.push(Byte::new(op));
             if boxes_result {
                 compiler
                     .bytecode
-                    .push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+                    .push_box_value(tag as u32);
             }
             compiler.bytecode.push_return();
         };
@@ -3991,7 +3991,7 @@ impl Compiler {
             self.bytecode
                 .push_load(0);
             self.bytecode
-                .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                .push_unbox_value(tag as u32);
             self.bytecode.push_return();
         }
         {
@@ -4010,9 +4010,7 @@ impl Compiler {
                     .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
                 self.bytecode
                     .push_load(0);
-                self.bytecode.push(
-                    Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::String as u32),
-                );
+                self.bytecode.push_unbox_value(ValueTag::String as u32);
                 self.bytecode
                     .push_make_tuple(1);
                 self.bytecode
@@ -4040,14 +4038,10 @@ impl Compiler {
                 .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
             self.bytecode
                 .push_load(0);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Instance as u32),
-            );
+            self.bytecode.push_unbox_value(ValueTag::Instance as u32);
             self.bytecode
                 .push_load(1);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Array as u32),
-            );
+            self.bytecode.push_unbox_value(ValueTag::Array as u32);
             self.bytecode
                 .push_make_tuple(arity);
             self.bytecode
@@ -4071,14 +4065,10 @@ impl Compiler {
             self.bind_function_entry(fqn);
             self.bytecode
                 .push_load(0);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(from_tag as u32),
-            );
+            self.bytecode.push_unbox_value(from_tag as u32);
             self.bytecode.push(Byte::new(cast_op));
             if from_tag != to_tag {
-                self.bytecode.push(
-                    Byte::new(Instruction::BoxValue).with_operand_u32(to_tag as u32),
-                );
+                self.bytecode.push_box_value(to_tag as u32);
             }
             self.bytecode.push_return();
         }
@@ -4304,7 +4294,7 @@ impl Compiler {
     /// type is already open (Ty::Var), or if a tag cannot be determined.
     fn emit_box_if_needed(bytecode: &mut impl EmitBuf, ty: &crate::typechecking::Ty) {
         if let Some(tag) = Self::ty_to_value_tag(ty) {
-            bytecode.push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+            bytecode.push_box_value(tag as u32);
         }
     }
 
@@ -4315,7 +4305,7 @@ impl Compiler {
     fn emit_unbox_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
         if let Some(tag) = Self::ty_to_value_tag(ty) {
             // UnboxValue operand: [15:0] = ValueTag as u16.
-            bytecode.push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            bytecode.push_unbox_value(tag as u32);
         }
     }
 
@@ -4368,7 +4358,7 @@ impl Compiler {
                 self.bytecode
                     .push_load(slot as u32);
                 self.bytecode
-                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                    .push_unbox_value(tag as u32);
                 self.bytecode
                     .push_store_pop(slot as u32);
             }
@@ -5251,7 +5241,7 @@ impl Compiler {
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode
-            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+            .push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
         self.bytecode
             .push_store_pop(it_slot);
@@ -5267,7 +5257,7 @@ impl Compiler {
         self.bytecode
             .push_load(it_slot);
         self.bytecode
-            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+            .push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
 
         // `Option::None` → exit (JumpIfMatch pops unit None).
@@ -10149,9 +10139,7 @@ impl Compiler {
                     None
                 };
                 if let Some(field_index) = enum_field_index {
-                    bytecode.push(
-                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
-                    );
+                    bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::GetField));
@@ -10160,7 +10148,7 @@ impl Compiler {
                     // match bindings historically lacked side-table
                     // types). LoadField(0) keeps the stack balanced;
                     // VM hardens non-enum receivers.
-                    bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
+                    bytecode.push_load_field(0);
                 }
             }
 
@@ -10300,14 +10288,12 @@ impl Compiler {
                     None
                 };
                 if let Some(field_index) = enum_field_index {
-                    self.bytecode.push(
-                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
-                    );
+                    self.bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
                     self.bytecode.push(Byte::new(Instruction::GetField));
                 } else {
-                    self.bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
+                    self.bytecode.push_load_field(0);
                 }
                 Self::emit_ok_or_some_wrap(&mut self.bytecode, true);
                 bb.bind_label(end, self.bytecode.il_mut());

@@ -56,6 +56,7 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
             Some(1 - *arity as i32)
         }
         IlOp::MakeEnum { arity, .. } => Some(1 - *arity as i32),
+        IlOp::BoxValue { .. } | IlOp::UnboxValue { .. } | IlOp::LoadField { .. } => Some(0),
         IlOp::Bin { .. } => Some(-1),
         // Slot forms push a computed value without consuming eval-stack args.
         IlOp::BinSlotImm { .. } | IlOp::BinSlotSlot { .. } => Some(1),
@@ -143,6 +144,7 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::JMP => Some(0),
         Instruction::JMPF | Instruction::JMPT => Some(-1),
         Instruction::Index => Some(-1),
+        Instruction::BoxValue | Instruction::UnboxValue | Instruction::LoadField => Some(0),
         Instruction::MakeTuple | Instruction::MakeArray => {
             Some(1 - byte.operand_u32() as i32)
         }

@@ -54,6 +54,18 @@ pub trait EmitBuf {
     fn push_make_enum(&mut self, tag: u16, arity: u16) {
         self.push_byte(Byte::new(Instruction::MakeEnum).with_operands_u16([tag, arity]));
     }
+
+    fn push_box_value(&mut self, tag: u32) {
+        self.push_byte(Byte::new(Instruction::BoxValue).with_operand_u32(tag));
+    }
+
+    fn push_unbox_value(&mut self, tag: u32) {
+        self.push_byte(Byte::new(Instruction::UnboxValue).with_operand_u32(tag));
+    }
+
+    fn push_load_field(&mut self, index: u32) {
+        self.push_byte(Byte::new(Instruction::LoadField).with_operand_u32(index));
+    }
 }
 
 impl EmitBuf for Vec<Byte> {
@@ -102,6 +114,18 @@ impl EmitBuf for CodeBuf {
 
     fn push_make_enum(&mut self, tag: u16, arity: u16) {
         CodeBuf::push_make_enum(self, tag, arity);
+    }
+
+    fn push_box_value(&mut self, tag: u32) {
+        CodeBuf::push_box_value(self, tag);
+    }
+
+    fn push_unbox_value(&mut self, tag: u32) {
+        CodeBuf::push_unbox_value(self, tag);
+    }
+
+    fn push_load_field(&mut self, index: u32) {
+        CodeBuf::push_load_field(self, index);
     }
 }
 

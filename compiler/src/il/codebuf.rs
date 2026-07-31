@@ -116,6 +116,21 @@ impl CodeBuf {
         self.il.push_make_enum(tag, arity);
     }
 
+    pub fn push_box_value(&mut self, tag: u32) {
+        self.invalidate_lowered();
+        self.il.push_box_value(tag);
+    }
+
+    pub fn push_unbox_value(&mut self, tag: u32) {
+        self.invalidate_lowered();
+        self.il.push_unbox_value(tag);
+    }
+
+    pub fn push_load_field(&mut self, index: u32) {
+        self.invalidate_lowered();
+        self.il.push_load_field(index);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
