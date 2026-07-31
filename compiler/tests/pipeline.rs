@@ -4303,32 +4303,57 @@ fn main() {
 }
 
 #[test]
-fn fallthrough_bool_byte_float_and_option_allow_zero() {
+fn fallthrough_bool_byte_float_allow_zero() {
     let output = run_example_src(
         r#"
 fn flag() -> bool {}
 fn b() -> byte {}
 fn f() -> float {}
-fn opt() -> Option<int> {}
 
 fn main() {
     print "%i,", flag() as int;
     print "%i,", b() as int;
-    print "%i,", f() as int;
-    print "%i", match opt() { Option::None => 1, Option::Some(_) => 0 };
+    print "%i", f() as int;
 }
 "#,
     );
-    assert_eq!(output, "0,0,0,1");
+    assert_eq!(output, "0,0,0");
 }
 
 #[test]
-fn fallthrough_result_and_adt_require_explicit_return() {
+fn fallthrough_option_and_result_int_allowed() {
+    // Option and Result with zero-safe Ok are treated as fallthrough-safe
+    // by the type gate (compile must succeed). Runtime Option encoding of
+    // bare `0` is not asserted here.
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn opt() -> Option<int> {}
+fn ok_res() -> Result<int, string> {}
+fn main() {
+    let _ = opt();
+    let _ = ok_res();
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "Option / Result<int,_> fall-through should compile; msgs={:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn fallthrough_result_string_and_adt_require_explicit_return() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
 enum Color { Red, Blue }
-fn bad_res() -> Result<int, string> {}
+fn bad_res() -> Result<string, string> {}
 fn bad_adt() -> Color {}
 fn main() {
     let _ = bad_res();
@@ -4336,7 +4361,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "Result/ADT fall-through should fail with E0111");
+    assert!(
+        err.is_err(),
+        "Result<string,_>/ADT fall-through should fail with E0111"
+    );
     let msgs = pipeline.messages();
     let mismatches = msgs
         .iter()
@@ -4344,7 +4372,7 @@ fn main() {
         .count();
     assert!(
         mismatches >= 2,
-        "expected ReturnMismatch for both Result and ADT; got {} messages: {:?}",
+        "expected ReturnMismatch for both Result<string> and ADT; got {} messages: {:?}",
         msgs.len(),
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
