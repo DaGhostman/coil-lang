@@ -267,15 +267,9 @@ impl<const S: usize> Machine<S> {
     // }
 
     /// Free function so `execute` can borrow `frames` and `heap` separately.
+    /// Delegates to [`Heap::find_object_by_addr`] (O(1) addr index).
     fn find_object_by_addr(heap: &Heap, addr: u64) -> Option<Object> {
-        let mut current = heap.head_for_lookup();
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                return Some(reference);
-            }
-            current = reference.get_next();
-        }
-        None
+        heap.find_object_by_addr(addr)
     }
 
     #[allow(dead_code)]

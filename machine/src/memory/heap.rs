@@ -40,17 +40,11 @@ impl Heap {
     /// for FFI. The returned pointer is leaked for the duration of the call.
     #[must_use]
     pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
-        let mut current = self.head_for_lookup();
-        while let Some(reference) = current {
-            if reference.addr() == addr
-                && let crate::memory::Object::String(gc) = reference
-            {
-                let s: std::ffi::CString =
-                    std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
-                let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
-                return Some(boxed.as_ptr());
-            }
-            current = reference.get_next();
+        if let Some(crate::memory::Object::String(gc)) = self.find_object_by_addr(addr) {
+            let s: std::ffi::CString =
+                std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
+            let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
+            return Some(boxed.as_ptr());
         }
         None
     }
@@ -294,15 +288,8 @@ impl Heap {
         addr: u64,
         f: impl FnOnce(&mut ObjCryptoHasher) -> R,
     ) -> Option<R> {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::CryptoHasher(gc) = reference {
-                    return Some(f(gc.payload_mut()));
-                }
-                return None;
-            }
-            current = reference.get_next();
+        if let Some(Object::CryptoHasher(gc)) = self.find_object_by_addr(addr) {
+            return Some(f(gc.payload_mut()));
         }
         None
     }
@@ -313,35 +300,21 @@ impl Heap {
         addr: u64,
         f: impl FnOnce(&mut ObjRegex) -> R,
     ) -> Option<R> {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::Regex(gc) = reference {
-                    return Some(f(gc.payload_mut()));
-                }
-                return None;
-            }
-            current = reference.get_next();
+        if let Some(Object::Regex(gc)) = self.find_object_by_addr(addr) {
+            return Some(f(gc.payload_mut()));
         }
         None
     }
 
     /// Write back scratch-buffer values into a live `ObjArray`.
     pub fn update_array_elements(&mut self, addr: u64, values: &[i64]) {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::Array(mut gc) = reference {
-                    let arr = gc.as_mut();
-                    for (i, &v) in values.iter().enumerate() {
-                        if i < arr.elements.len() {
-                            arr.elements[i] = Value::from(v);
-                        }
-                    }
+        if let Some(Object::Array(mut gc)) = self.find_object_by_addr(addr) {
+            let arr = gc.as_mut();
+            for (i, &v) in values.iter().enumerate() {
+                if i < arr.elements.len() {
+                    arr.elements[i] = Value::from(v);
                 }
-                return;
             }
-            current = reference.get_next();
         }
     }
 
@@ -1817,5 +1790,119 @@ mod tests {
             "outer enum at 0x{:x} was collected despite being a GC root",
             outer_addr
         );
+    }
+
+    #[test]
+    fn find_object_by_addr_hit_and_miss() {
+        let mut heap = Heap::default();
+        let (obj, _) = heap.alloc(ObjString::from("hi"), Object::String);
+        let addr = obj.addr();
+        assert!(matches!(
+            heap.find_object_by_addr(addr),
+            Some(Object::String(_))
+        ));
+        assert!(heap.find_object_by_addr(addr.wrapping_add(1)).is_none());
+    }
+
+    #[test]
+    fn find_object_by_addr_clears_after_sweep() {
+        let mut heap = Heap::default();
+        let (obj, _) = heap.alloc(ObjString::from("gone"), Object::String);
+        let addr = obj.addr();
+        assert!(heap.find_object_by_addr(addr).is_some());
+        // No roots → sweep removes the object and its addr_index entry.
+        unsafe { heap.sweep() };
+        assert!(
+            heap.find_object_by_addr(addr).is_none(),
+            "swept object must leave the O(1) addr index"
+        );
+    }
+
+    #[test]
+    fn cstr_from_addr_string_hit_and_type_miss() {
+        let mut heap = Heap::default();
+        let (s_obj, _) = heap.alloc(ObjString::from("coil"), Object::String);
+        let (arr_obj, _) = heap.alloc(
+            ObjArray {
+                elements: vec![Value::from(1i64)],
+            },
+            Object::Array,
+        );
+
+        let ptr = heap
+            .cstr_from_addr(s_obj.addr())
+            .expect("string addr must yield a cstr");
+        let got = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("utf8");
+        assert_eq!(got, "coil");
+
+        assert!(
+            heap.cstr_from_addr(arr_obj.addr()).is_none(),
+            "non-string live addr must miss"
+        );
+        assert!(heap.cstr_from_addr(0).is_none());
+    }
+
+    #[test]
+    fn cstr_from_addr_rejects_embedded_nul() {
+        let mut heap = Heap::default();
+        let (obj, _) = heap.alloc(ObjString::from("a\0b"), Object::String);
+        assert!(
+            heap.cstr_from_addr(obj.addr()).is_none(),
+            "embedded NUL cannot become a CString"
+        );
+    }
+
+    #[test]
+    fn update_array_elements_writes_and_truncates_excess() {
+        let mut heap = Heap::default();
+        let (obj, gc) = heap.alloc(
+            ObjArray {
+                elements: vec![Value::from(0i64), Value::from(0i64)],
+            },
+            Object::Array,
+        );
+        let addr = obj.addr();
+        heap.update_array_elements(addr, &[10, 20, 30]);
+        assert_eq!(gc.as_ref().elements[0].as_int(), 10);
+        assert_eq!(gc.as_ref().elements[1].as_int(), 20);
+        assert_eq!(gc.as_ref().elements.len(), 2);
+    }
+
+    #[test]
+    fn update_array_elements_noops_missing_or_wrong_type() {
+        let mut heap = Heap::default();
+        let (s_obj, _) = heap.alloc(ObjString::from("x"), Object::String);
+        heap.update_array_elements(s_obj.addr(), &[1]);
+        heap.update_array_elements(0, &[1]);
+        assert!(matches!(
+            heap.find_object_by_addr(s_obj.addr()),
+            Some(Object::String(_))
+        ));
+    }
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn with_crypto_hasher_rejects_wrong_type() {
+        let mut heap = Heap::default();
+        let (obj, _) = heap.alloc(ObjString::from("not-hasher"), Object::String);
+        assert!(heap
+            .with_crypto_hasher(obj.addr(), |_| panic!("must not run"))
+            .is_none());
+        assert!(heap
+            .with_crypto_hasher(0, |_| panic!("must not run"))
+            .is_none());
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn with_regex_rejects_wrong_type() {
+        let mut heap = Heap::default();
+        let (obj, _) = heap.alloc(ObjString::from("not-regex"), Object::String);
+        assert!(heap
+            .with_regex(obj.addr(), |_| panic!("must not run"))
+            .is_none());
+        assert!(heap.with_regex(0, |_| panic!("must not run")).is_none());
     }
 }
