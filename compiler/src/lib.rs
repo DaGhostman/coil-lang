@@ -4175,8 +4175,12 @@ impl Compiler {
         if is_option_ty(&t) {
             return true;
         }
-        if let Some((ok, _)) = result_ok_err(&t) {
-            return Self::ty_allows_zero_default(&ok);
+        if crate::typechecking::ty::is_result_ty(&t) {
+            if let Some((ok, _)) = result_ok_err(&t) {
+                return Self::ty_allows_zero_default(&ok);
+            }
+            // `Result<(), E>` often has an empty Ok payload — still Ok-wrap 0.
+            return true;
         }
         if let Some(inner) = option_inner(&t) {
             let _ = inner;
