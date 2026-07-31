@@ -10,11 +10,6 @@ pub trait EmitBuf {
     fn push(&mut self, b: Byte) {
         self.push_byte(b);
     }
-    fn extend_from_slice_bytes(&mut self, bytes: &[Byte]) {
-        for &b in bytes {
-            self.push_byte(b);
-        }
-    }
 
     /// Hot-path `LOAD` (typed on [`CodeBuf`], packed `Byte` on `Vec`).
     fn push_load(&mut self, slot: u32) {
@@ -32,6 +27,10 @@ pub trait EmitBuf {
     }
 
     /// Hot-path `RETURN`.
+    ///
+    /// Kept for `Vec` / `&mut impl EmitBuf`; `CodeBuf` callers usually hit the
+    /// inherent method (which shadows this in method resolution).
+    #[allow(dead_code)]
     fn push_return(&mut self) {
         self.push_byte(Byte::new(Instruction::RETURN));
     }
@@ -60,6 +59,7 @@ impl EmitBuf for CodeBuf {
         CodeBuf::push_const(self, imm);
     }
 
+    #[allow(dead_code)]
     fn push_return(&mut self) {
         CodeBuf::push_return(self);
     }

@@ -21,6 +21,8 @@ pub struct CodeBuf {
     funcs: Vec<IlFunc>,
 }
 
+// Public IL API retained for opts/tests, peephole, and recovery paths.
+#[allow(dead_code)]
 impl CodeBuf {
     pub fn new() -> Self {
         Self::default()
@@ -84,19 +86,9 @@ impl CodeBuf {
         self.il.push_load(slot);
     }
 
-    pub fn push_load_at(&mut self, slot: u32, loc: DebugLoc) {
-        self.invalidate_lowered();
-        self.il.push_load_at(slot, loc);
-    }
-
     pub fn push_store_pop(&mut self, slot: u32) {
         self.invalidate_lowered();
         self.il.push_store_pop(slot);
-    }
-
-    pub fn push_store_pop_at(&mut self, slot: u32, loc: DebugLoc) {
-        self.invalidate_lowered();
-        self.il.push_store_pop_at(slot, loc);
     }
 
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {

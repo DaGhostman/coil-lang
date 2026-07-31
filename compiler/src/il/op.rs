@@ -17,6 +17,8 @@ impl Label {
 pub enum IlJumpKind {
     Unconditional,
     JumpIfFalse,
+    /// Complete jump set (JMPT); constructed in opts/tests, matched in lower/sp.
+    #[allow(dead_code)]
     JumpIfTrue,
     JumpIfMatch { tag: u32, arity: u32 },
 }
@@ -125,6 +127,7 @@ impl IlOp {
         Self::from_plain_byte(byte, DebugLoc::unknown())
     }
 
+    #[allow(dead_code)]
     pub fn byte_at(byte: Byte, loc: DebugLoc) -> Self {
         Self::from_plain_byte(byte, loc)
     }
@@ -272,6 +275,7 @@ impl IlOp {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_loc(&mut self, loc: DebugLoc) {
         match self {
             IlOp::Byte { loc: l, .. }
@@ -300,6 +304,7 @@ impl IlOp {
         self.as_encode_byte()
     }
 
+    #[allow(dead_code)]
     pub fn instruction(&self) -> Option<Instruction> {
         match self {
             IlOp::Byte { byte, .. } => Some(*byte.bytecode()),

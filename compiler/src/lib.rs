@@ -15019,7 +15019,6 @@ fn main() {
 
 #[cfg(test)]
 mod fallthrough_probe {
-    use super::*;
     #[test]
     fn probe_string_fallthrough_diag() {
         let mut p = crate::pipeline::Pipeline::new();

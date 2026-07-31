@@ -19,4 +19,3 @@ pub use emit_buf::EmitBuf;
 pub use func::IlFunc;
 pub use lower::{Lowered, lower};
 pub use op::{EntryKind, IlJumpKind, IlOp, Label};
-pub use sp::{Sp, SpInfo, analyze as analyze_sp, stack_delta};

@@ -44,18 +44,6 @@ impl BlockBuilder {
         l
     }
 
-    /// Allocate a label without recording it on a shared parent builder's
-    /// counter — prefer [`fresh_label`] with the module `IlBuilder`.
-    pub fn fresh_label_local(&mut self, il: &mut IlBuilder) -> Label {
-        self.fresh_label(il)
-    }
-
-    pub fn emit_jump(&mut self, kind: JumpKind, il: &mut IlBuilder) -> Label {
-        let label = self.fresh_label(il);
-        self.emit_jump_to(label, kind, il);
-        label
-    }
-
     pub fn emit_jump_to(&mut self, target: Label, kind: JumpKind, il: &mut IlBuilder) {
         self.targeted.push(target);
         il.emit_jump(kind, target);

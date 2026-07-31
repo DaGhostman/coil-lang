@@ -9,6 +9,8 @@ use super::op::{EntryKind, IlJumpKind, IlOp, Label};
 /// Error from [`IlBuilder::finalize`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IlError {
+    /// Reserved for explicit finalize checks; lower currently remaps unbound targets.
+    #[allow(dead_code)]
     UnboundLabel(Label),
 }
 
@@ -35,6 +37,8 @@ pub struct IlBuilder {
     bound: BTreeSet<u32>,
 }
 
+// Public IL API retained for opts/tests and future emit paths.
+#[allow(dead_code)]
 impl IlBuilder {
     pub fn new() -> Self {
         Self::default()
@@ -156,19 +160,11 @@ impl IlBuilder {
         });
     }
 
-    pub fn push_load_at(&mut self, slot: u32, loc: DebugLoc) {
-        self.push_op(IlOp::Load { slot, loc });
-    }
-
     pub fn push_store_pop(&mut self, slot: u32) {
         self.push_op(IlOp::StorePop {
             slot,
             loc: DebugLoc::unknown(),
         });
-    }
-
-    pub fn push_store_pop_at(&mut self, slot: u32, loc: DebugLoc) {
-        self.push_op(IlOp::StorePop { slot, loc });
     }
 
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
