@@ -405,8 +405,6 @@ mod tests {
     }
 
     #[test]
-    
-    #[test]
     fn from_plain_byte_lifts_index_make_tuple_array_enum() {
         assert!(matches!(
             IlOp::from_plain_byte(Byte::new(Instruction::Index), DebugLoc::unknown()),

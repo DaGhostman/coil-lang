@@ -61,6 +61,11 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
 /// Run [`optimize`] on each [`super::IlFunc`] emitting span; leave prologue and
 /// inter-function glue untouched. Falls back to whole-buffer opts when `funcs`
 /// is empty (unit tests / buffers without `record_func`).
+///
+/// [`multi_op_join_convoy`] always runs on the full buffer afterward: its SP
+/// join gates are fail-closed only with whole-module height context; scoping
+/// it to a body slice can treat a JMPF/fall-through diamond as Known and
+/// sink incorrectly (e.g. `examples/fib.hy`).
 pub fn optimize_per_func(
     ops: &mut Vec<IlOp>,
     funcs: &[super::IlFunc],
@@ -70,6 +75,10 @@ pub fn optimize_per_func(
         optimize(ops, opts);
         return;
     }
+
+    let mut per = opts.clone();
+    let run_multi = per.multi_op_join_convoy;
+    per.multi_op_join_convoy = false;
 
     let mut ranges: Vec<(usize, usize)> = funcs
         .iter()
@@ -84,8 +93,12 @@ pub fn optimize_per_func(
             continue;
         }
         let mut slice = ops[raw_start..raw_end].to_vec();
-        optimize(&mut slice, opts);
+        optimize(&mut slice, &per);
         ops.splice(raw_start..raw_end, slice);
+    }
+
+    if run_multi {
+        multi_op_join_convoy(ops);
     }
 }
 

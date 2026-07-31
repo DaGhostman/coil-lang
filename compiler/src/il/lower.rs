@@ -85,6 +85,7 @@ pub fn assert_no_residual_abs_jumps(ops: &[IlOp]) {
 /// When `funcs` is empty, opts run on the whole buffer (unit tests). Production
 /// [`super::CodeBuf::lower_in_place`] passes recorded [`IlFunc`] spans so opts
 /// stay inside each function and leave prologue / glue alone.
+#[allow(dead_code)] // used by unit tests / re-exports
 pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
     lower_with_funcs(ops, &[], pool)
 }

@@ -17,5 +17,6 @@ pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;
 pub use emit_buf::EmitBuf;
 pub use func::IlFunc;
+#[allow(unused_imports)]
 pub use lower::{Lowered, lower, lower_with_funcs};
 pub use op::{EntryKind, IlJumpKind, IlOp, Label};
