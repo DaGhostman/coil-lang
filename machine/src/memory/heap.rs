@@ -20,6 +20,12 @@ pub struct Heap {
     head: Option<Object>,
     /// O(1) lookup of live objects by address (updated on alloc/sweep).
     addr_index: HashMap<u64, Object>,
+    /// Reused mark-set across collections (avoids alloc per GC).
+    gc_mark_set: HashSet<u64>,
+    /// Reused gray worklist / root buffers across collections.
+    gc_gray: Vec<Object>,
+    gc_root_objects: Vec<Object>,
+    gc_roots: Vec<u64>,
 }
 
 impl Default for Heap {
@@ -31,6 +37,10 @@ impl Default for Heap {
             strings: Table::default(),
             head: None,
             addr_index: HashMap::new(),
+            gc_mark_set: HashSet::new(),
+            gc_gray: Vec::new(),
+            gc_root_objects: Vec::new(),
+            gc_roots: Vec::new(),
         }
     }
 }
@@ -259,17 +269,45 @@ impl Heap {
     }
 
     pub fn trace(&mut self, values: &[u64]) {
-        let roots: HashSet<u64> = values.iter().copied().collect();
+        self.gc_mark_set.clear();
+        self.gc_mark_set.extend(values.iter().copied());
+        let mut gray = std::mem::take(&mut self.gc_gray);
+        gray.clear();
         let mut current = self.head;
 
-        let mut gray = Vec::with_capacity(values.len());
         while let Some(reference) = current {
-            if !reference.is_marked() && roots.contains(&reference.addr()) {
+            if !reference.is_marked() && self.gc_mark_set.contains(&reference.addr()) {
                 reference.mark(&mut gray);
             }
 
             current = reference.get_next();
         }
+        gray.clear();
+        self.gc_gray = gray;
+    }
+
+    /// Take the reusable GC root address buffer (caller must restore via [`Self::restore_gc_roots`]).
+    pub fn take_gc_roots(&mut self) -> Vec<u64> {
+        let mut roots = std::mem::take(&mut self.gc_roots);
+        roots.clear();
+        roots
+    }
+
+    pub fn restore_gc_roots(&mut self, roots: Vec<u64>) {
+        self.gc_roots = roots;
+    }
+
+    pub fn take_gc_worklists(&mut self) -> (Vec<Object>, Vec<Object>) {
+        let mut gray = std::mem::take(&mut self.gc_gray);
+        let mut root_objects = std::mem::take(&mut self.gc_root_objects);
+        gray.clear();
+        root_objects.clear();
+        (gray, root_objects)
+    }
+
+    pub fn restore_gc_worklists(&mut self, gray: Vec<Object>, root_objects: Vec<Object>) {
+        self.gc_gray = gray;
+        self.gc_root_objects = root_objects;
     }
 
     /// Head of the intrusive object list (for address lookup).

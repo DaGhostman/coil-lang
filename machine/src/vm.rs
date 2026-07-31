@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{
     ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte,
-    ProgramDebug, Value, byte_to_position, promise, unlikely,
+    ProgramDebug, Value, byte_to_position, likely, promise, unlikely,
 };
 
 use crate::{
@@ -313,47 +313,44 @@ impl<const S: usize> Machine<S> {
     /// Convert a runtime value to a display string (Show / `%v` / STRINGIFY).
     fn stringify_value(heap: &Heap, v: Value) -> String {
         let addr = v.raw() as u64;
-        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
-            match Self::find_object_by_addr(heap, addr) {
-                Some(Object::Boxed(gc)) => {
-                    let b = gc.as_ref();
-                    match ValueTag::from_u16(b.tag) {
-                        Some(ValueTag::Int) => match &b.payload {
-                            Member::Value(iv) => iv.as_int().to_string(),
-                            _ => "?".into(),
-                        },
-                        Some(ValueTag::Float) => match &b.payload {
-                            Member::Value(iv) => format!("{:?}", iv.as_float()),
-                            _ => "?".into(),
-                        },
-                        Some(ValueTag::Bool) => match &b.payload {
-                            Member::Value(iv) => {
-                                if iv.as_int() != 0 {
-                                    "true".into()
-                                } else {
-                                    "false".into()
-                                }
-                            }
-                            _ => "?".into(),
-                        },
-                        Some(ValueTag::String) => match &b.payload {
-                            Member::Object(o) => {
-                                Self::object_string_value(heap, &Value::from(o.addr()))
-                            }
-                            Member::Value(iv) => Self::object_string_value(heap, iv),
-                        },
-                        Some(ValueTag::Unit) => "()".into(),
-                        _ => "?".into(),
-                    }
-                }
-                Some(Object::String(gc)) => gc.as_ref().data.clone(),
-                _ => v.as_int().to_string(),
-            }
-        } else if v.raw().is_null() {
+        if v.raw().is_null() {
             // `Value::default()` / unit / false-ish null pointer.
-            "0".into()
-        } else {
-            v.as_int().to_string()
+            return "0".into();
+        }
+        match Self::find_object_by_addr(heap, addr) {
+            Some(Object::Boxed(gc)) => {
+                let b = gc.as_ref();
+                match ValueTag::from_u16(b.tag) {
+                    Some(ValueTag::Int) => match &b.payload {
+                        Member::Value(iv) => iv.as_int().to_string(),
+                        _ => "?".into(),
+                    },
+                    Some(ValueTag::Float) => match &b.payload {
+                        Member::Value(iv) => format!("{:?}", iv.as_float()),
+                        _ => "?".into(),
+                    },
+                    Some(ValueTag::Bool) => match &b.payload {
+                        Member::Value(iv) => {
+                            if iv.as_int() != 0 {
+                                "true".into()
+                            } else {
+                                "false".into()
+                            }
+                        }
+                        _ => "?".into(),
+                    },
+                    Some(ValueTag::String) => match &b.payload {
+                        Member::Object(o) => {
+                            Self::object_string_value(heap, &Value::from(o.addr()))
+                        }
+                        Member::Value(iv) => Self::object_string_value(heap, iv),
+                    },
+                    Some(ValueTag::Unit) => "()".into(),
+                    _ => "?".into(),
+                }
+            }
+            Some(Object::String(gc)) => gc.as_ref().data.clone(),
+            Some(_) | None => v.as_int().to_string(),
         }
     }
 
@@ -416,18 +413,14 @@ impl<const S: usize> Machine<S> {
         resume_stack: &[ResumeCtx],
         alloc_counter: &mut usize,
     ) {
-        let mut roots: Vec<u64> = stack
-            .buffer()
-            .iter()
-            .filter_map(|v| {
-                let addr = v.raw() as u64;
-                if addr != 0 && heap.contains_addr(addr as *mut u8) {
-                    Some(addr)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut roots = heap.take_gc_roots();
+        // Only live operand-stack slots (not the full 8192 buffer).
+        for v in stack.as_slice() {
+            let addr = v.raw() as u64;
+            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+                roots.push(addr);
+            }
+        }
 
         for ctx in resume_stack {
             roots.push(ctx.coro.as_ptr() as u64);
@@ -439,7 +432,7 @@ impl<const S: usize> Machine<S> {
                 roots.push(gc.as_ptr() as u64);
                 for v in &gc.as_ref().saved_stack {
                     let addr = v.raw() as u64;
-                    if addr != 0 && heap.contains_addr(addr as *mut u8) {
+                    if addr != 0 && heap.find_object_by_addr(addr).is_some() {
                         roots.push(addr);
                     }
                 }
@@ -451,9 +444,8 @@ impl<const S: usize> Machine<S> {
 
         heap.trace(&roots);
 
-        let mut gray: Vec<Object> = Vec::new();
+        let (mut gray, mut root_objects) = heap.take_gc_worklists();
         let mut current = heap.head_for_lookup();
-        let mut root_objects: Vec<Object> = Vec::new();
         while let Some(reference) = current {
             if reference.is_marked() {
                 root_objects.push(reference);
@@ -472,6 +464,8 @@ impl<const S: usize> Machine<S> {
         // SAFETY: all reachable objects were marked above.
         unsafe { heap.sweep() };
 
+        heap.restore_gc_worklists(gray, root_objects);
+        heap.restore_gc_roots(roots);
         *alloc_counter = 0;
     }
 
@@ -502,7 +496,7 @@ impl<const S: usize> Machine<S> {
 
     fn mark_value_if_heap(heap: &Heap, v: Value, gray: &mut Vec<Object>) {
         let addr = v.raw() as u64;
-        if addr == 0 || !heap.contains_addr(addr as *mut u8) {
+        if addr == 0 {
             return;
         }
         if let Some(child) = Self::find_object_by_addr(heap, addr) {
@@ -1077,10 +1071,16 @@ impl<const S: usize> Machine<S> {
         let code: &[Byte] = unsafe {
             std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
         };
-        let constants = self.program_constants.clone();
+        // Borrow constants without cloning; stable while `program_constants` is not resized.
+        let constants: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                self.program_constants.as_ptr(),
+                self.program_constants.len(),
+            )
+        };
         let mut ip = offset as usize;
         loop {
-            let paused = self.execute(code, &constants, ip);
+            let paused = self.execute(code, constants, ip);
             if let Some(pending) = self.pending_ffi.take() {
                 let resume_ip = pending.resume_ip;
                 self.finish_pending_ffi_invoke(pending);
@@ -1151,7 +1151,9 @@ impl<const S: usize> Machine<S> {
             #[cfg(any(test, feature = "vm_profile"))]
             VM_DISPATCH_COUNT.with(|c| c.fetch_add(1, Ordering::Relaxed));
 
-            let opcode = &code[ip];
+            // SAFETY: loop condition guarantees `ip < code.len()`.
+            promise!(ip < code.len());
+            let opcode = unsafe { code.get_unchecked(ip) };
             ip += 1;
 
             #[cfg(debug_assertions)]
@@ -1179,7 +1181,7 @@ impl<const S: usize> Machine<S> {
                     self.stack.pop();
                 }
                 Instruction::DUPLICATE => {
-                    self.stack.push(*self.stack.peek());
+                    self.stack.duplicate();
                 }
                 Instruction::CONST => {
                     let op = opcode.operand_u32();
@@ -1202,8 +1204,9 @@ impl<const S: usize> Machine<S> {
                     // already wrote match bindings into slot positions.
                 }
                 Instruction::LOAD => {
-                    self.stack
-                        .push(self.stack[sp + opcode.operand_u32() as usize]);
+                    let slot = opcode.operand_u32() as usize;
+                    promise!(sp + slot < 8192);
+                    self.stack.push(self.stack[sp + slot]);
                 }
                 Instruction::INC => {
                     let (slot, prefix, is_float) = opcode.inc_dec_parts();
@@ -1368,7 +1371,7 @@ impl<const S: usize> Machine<S> {
                             .alloc(ObjString::from(message.as_str()), Object::String);
 
                         self.alloc_counter += 1;
-                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                             Self::gc_collect(
                                 &mut self.heap,
                                 &self.stack,
@@ -1390,7 +1393,7 @@ impl<const S: usize> Machine<S> {
                         .heap
                         .alloc(ObjString::from(text.as_str()), Object::String);
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -1432,17 +1435,16 @@ impl<const S: usize> Machine<S> {
                     self.frames
                         .setup_current_and_advance(|frame| frame.set(callee_sp));
                     sp = callee_sp;
-                    if target != 0 {
+                    if likely(target != 0) {
                         ip = target;
                     }
                 }
                 Instruction::TailCall => {
                     let (arity, target) = opcode.call_parts();
                     let callee_sp = self.frames.get().get();
-                    for i in (0..arity).rev() {
-                        let val = self.stack.pop();
-                        self.stack[callee_sp + i] = val;
-                    }
+                    let src = self.stack.tell() - arity;
+                    // Args sit at TOS; frame base is at or below them.
+                    self.stack.copy_slots(callee_sp, src, arity);
                     self.stack.seek(callee_sp + arity);
                     // Match CALL: `sp` is the frame base (locals start at slot 0),
                     // not past the args. Using `callee_sp + arity` would make
@@ -1480,7 +1482,7 @@ impl<const S: usize> Machine<S> {
                     let _ = r.as_mut();
 
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -1504,78 +1506,79 @@ impl<const S: usize> Machine<S> {
                 // Fused `LOAD slot; CONST imm; <binop>`.
                 Instruction::BinSlotImm => {
                     let (op, slot, imm) = opcode.bin_slot_imm_parts();
+                    promise!(sp + slot < 8192);
                     let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                    let rhs = Value::from(imm);
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(lhs.as_int() + imm),
+                        Instruction::SUB => Value::from(lhs.as_int() - imm),
+                        Instruction::MUL => Value::from(lhs.as_int() * imm),
+                        Instruction::DIV => Value::from(lhs.as_int() / imm),
+                        Instruction::MOD => Value::from(lhs.as_int() % imm),
+                        Instruction::LE => Value::from((lhs.raw() < rhs.raw()) as i64),
+                        Instruction::LEQ => Value::from((lhs.raw() <= rhs.raw()) as i64),
+                        Instruction::GT => Value::from((lhs.raw() > rhs.raw()) as i64),
+                        Instruction::GEQ => Value::from((lhs.raw() >= rhs.raw()) as i64),
+                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
+                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
                         Instruction::Pow => {
-                            let sp = self.stack.tell();
-                            let rhs = self.stack[sp - 1].as_int().max(0) as u32;
-                            let lhs = self.stack[sp - 2].as_int();
-                            self.stack[sp - 2].replace(lhs.pow(rhs) as u64);
-                            self.stack.seek(sp - 1);
+                            let exp = imm.max(0) as u32;
+                            Value::from(lhs.as_int().pow(exp))
                         }
-                        Instruction::BITAND => binary!(self.stack, &, as_int),
-                        Instruction::BITOR => binary!(self.stack, |, as_int),
-                        _ => {}
-                    }
+                        Instruction::BITAND => Value::from(lhs.as_int() & imm),
+                        Instruction::BITOR => Value::from(lhs.as_int() | imm),
+                        _ => Value::default(),
+                    };
+                    self.stack.push(result);
                 }
                 // Fused `<cmp>; JMPF target`.
                 Instruction::CmpJmpf => {
                     let (op, target) = opcode.cmp_jmpf_parts();
-                    match Instruction::from(op) {
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
-                    if !self.stack.pop().as_bool() {
+                    let tos = self.stack.tell();
+                    promise!(tos >= 2);
+                    let rhs = self.stack[tos - 1];
+                    let lhs = self.stack[tos - 2];
+                    self.stack.seek(tos - 2);
+                    let taken = match Instruction::from(op) {
+                        Instruction::LE => lhs.raw() < rhs.raw(),
+                        Instruction::LEQ => lhs.raw() <= rhs.raw(),
+                        Instruction::GT => lhs.raw() > rhs.raw(),
+                        Instruction::GEQ => lhs.raw() >= rhs.raw(),
+                        Instruction::EQ => lhs.raw() == rhs.raw(),
+                        Instruction::NEQ => lhs.raw() != rhs.raw(),
+                        Instruction::LEF => lhs.as_float() < rhs.as_float(),
+                        Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
+                        Instruction::GTF => lhs.as_float() > rhs.as_float(),
+                        Instruction::GEQF => lhs.as_float() >= rhs.as_float(),
+                        _ => false,
+                    };
+                    if !taken {
                         ip = target;
                     }
                 }
                 Instruction::BinSlotImmJmpf => {
                     let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
-                    let packed = constants.get(pool_idx).copied().unwrap_or(0);
+                    promise!(pool_idx < constants.len());
+                    let packed = unsafe { *constants.get_unchecked(pool_idx) };
                     let imm = packed as u32 as i32 as i64;
                     let target = (packed >> 32) as usize;
+                    promise!(sp + slot < 8192);
                     let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {
-                            self.stack.pop();
-                            self.stack.pop();
-                        }
-                    }
-                    if !self.stack.pop().as_bool() {
+                    let rhs = Value::from(imm);
+                    let taken = match Instruction::from(op) {
+                        Instruction::LE => lhs.raw() < rhs.raw(),
+                        Instruction::LEQ => lhs.raw() <= rhs.raw(),
+                        Instruction::GT => lhs.raw() > rhs.raw(),
+                        Instruction::GEQ => lhs.raw() >= rhs.raw(),
+                        Instruction::EQ => lhs.raw() == rhs.raw(),
+                        Instruction::NEQ => lhs.raw() != rhs.raw(),
+                        Instruction::LEF => lhs.as_float() < rhs.as_float(),
+                        Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
+                        Instruction::GTF => lhs.as_float() > rhs.as_float(),
+                        Instruction::GEQF => lhs.as_float() >= rhs.as_float(),
+                        _ => false,
+                    };
+                    if !taken {
                         ip = target;
                     }
                 }
@@ -1607,30 +1610,37 @@ impl<const S: usize> Machine<S> {
                     self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::BinReturn => {
-                    match Instruction::from(opcode.bin_return_op()) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
-                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
-                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
-                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
-                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
-                    let ret_val = self.stack.pop();
+                    let tos = self.stack.tell();
+                    promise!(tos >= 2);
+                    let rhs = self.stack[tos - 1];
+                    let lhs = self.stack[tos - 2];
+                    let ret_val = match Instruction::from(opcode.bin_return_op()) {
+                        Instruction::ADD => Value::from(lhs.as_int() + rhs.as_int()),
+                        Instruction::SUB => Value::from(lhs.as_int() - rhs.as_int()),
+                        Instruction::MUL => Value::from(lhs.as_int() * rhs.as_int()),
+                        Instruction::DIV => Value::from(lhs.as_int() / rhs.as_int()),
+                        Instruction::MOD => Value::from(lhs.as_int() % rhs.as_int()),
+                        Instruction::ADDF => Value::from(lhs.as_float() + rhs.as_float()),
+                        Instruction::SUBF => Value::from(lhs.as_float() - rhs.as_float()),
+                        Instruction::MULF => Value::from(lhs.as_float() * rhs.as_float()),
+                        Instruction::DIVF => Value::from(lhs.as_float() / rhs.as_float()),
+                        Instruction::MODF => Value::from(lhs.as_float() % rhs.as_float()),
+                        Instruction::LE => Value::from((lhs.raw() < rhs.raw()) as i64),
+                        Instruction::LEQ => Value::from((lhs.raw() <= rhs.raw()) as i64),
+                        Instruction::GT => Value::from((lhs.raw() > rhs.raw()) as i64),
+                        Instruction::GEQ => Value::from((lhs.raw() >= rhs.raw()) as i64),
+                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
+                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::LEF => Value::from((lhs.as_float() < rhs.as_float()) as i64),
+                        Instruction::LEQF => {
+                            Value::from((lhs.as_float() <= rhs.as_float()) as i64)
+                        }
+                        Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
+                        Instruction::GEQF => {
+                            Value::from((lhs.as_float() >= rhs.as_float()) as i64)
+                        }
+                        _ => Value::default(),
+                    };
                     if self.capture_nested_return(ret_val) {
                         return false;
                     }
@@ -1641,6 +1651,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::BinSlotSlot => {
                     let (op, a, b) = opcode.bin_slot_slot_parts();
+                    promise!(sp + a < 8192);
+                    promise!(sp + b < 8192);
                     let va = self.stack[sp + a];
                     let vb = self.stack[sp + b];
                     let result = match Instruction::from(op) {
@@ -1830,9 +1842,15 @@ impl<const S: usize> Machine<S> {
                     let tuple_addr = tuple_val.raw() as u64;
                     let fn_id_val = self.stack.pop();
                     let fn_id = fn_id_val.as_int() as usize;
-                    let args: Vec<Value> = match Self::find_object_by_addr(&self.heap, tuple_addr) {
-                        Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
-                        _ => Vec::new(),
+                    let args: &[Value] = match Self::find_object_by_addr(&self.heap, tuple_addr) {
+                        Some(crate::memory::Object::Tuple(gc)) => {
+                            let elems = &gc.as_ref().elements;
+                            // SAFETY: natives must not free/move the args tuple while
+                            // `invoke` runs (tuple stays reachable on the operand stack
+                            // until after this handler finishes).
+                            unsafe { std::slice::from_raw_parts(elems.as_ptr(), elems.len()) }
+                        }
+                        _ => &[],
                     };
                     // Packed LA (and other host natives) allocate via
                     // `heap.alloc` inside the closure; count those so GC
@@ -1840,7 +1858,7 @@ impl<const S: usize> Machine<S> {
                     // allocator on a hot path.
                     let live_before = self.heap.live_object_count();
                     match self.natives.get_by_id(fn_id) {
-                        Some(native) => match native.invoke(&mut self.heap, &args) {
+                        Some(native) => match native.invoke(&mut self.heap, args) {
                             Ok(Some(v)) => self.stack.push(v),
                             Ok(None) => {}
                             #[cfg(debug_assertions)]
@@ -1859,7 +1877,7 @@ impl<const S: usize> Machine<S> {
                         .saturating_sub(live_before);
                     if allocated > 0 {
                         self.alloc_counter += allocated;
-                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                             Self::gc_collect(
                                 &mut self.heap,
                                 &self.stack,
@@ -1908,7 +1926,7 @@ impl<const S: usize> Machine<S> {
                     let gc_string = self.heap.intern(value);
 
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -1938,13 +1956,9 @@ impl<const S: usize> Machine<S> {
 
                     let mut payload: Vec<Member> = Vec::with_capacity(values.len());
                     for v in values {
-                        if self.heap.contains_addr(v.raw()) {
-                            let addr = v.raw() as u64;
-                            if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
-                                payload.push(Member::Object(o));
-                            } else {
-                                payload.push(Member::Value(v));
-                            }
+                        let addr = v.raw() as u64;
+                        if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
+                            payload.push(Member::Object(o));
                         } else {
                             payload.push(Member::Value(v));
                         }
@@ -1954,7 +1968,7 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
 
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -1986,7 +2000,7 @@ impl<const S: usize> Machine<S> {
                         let (object, _) = self.heap.alloc(obj_array, Object::Array);
                         object.addr()
                     };
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2050,7 +2064,7 @@ impl<const S: usize> Machine<S> {
                             instance.set(key, member);
                         }
                     }
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2181,7 +2195,7 @@ impl<const S: usize> Machine<S> {
                         },
                         Object::Array,
                     );
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2370,7 +2384,7 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2471,13 +2485,13 @@ impl<const S: usize> Machine<S> {
                     // First-class ObjFn: merge new args into holes / captures.
                     let fn_obj = {
                         let addr = raw.raw() as u64;
-                        if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
+                        if raw.raw().is_null() {
+                            None
+                        } else {
                             self.heap.find_object_by_addr(addr).and_then(|o| match o {
                                 Object::Fn(gc) => Some(gc),
                                 _ => None,
                             })
-                        } else {
-                            None
                         }
                     };
 
@@ -2551,7 +2565,7 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.alloc_counter += 1;
-                            if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                                 Self::gc_collect(
                                     &mut self.heap,
                                     &self.stack,
@@ -2571,7 +2585,6 @@ impl<const S: usize> Machine<S> {
                                 let v = remaining_new[0];
                                 let addr = v.raw() as u64;
                                 if !v.raw().is_null()
-                                    && self.heap.contains_addr(v.raw())
                                     && matches!(
                                         Self::find_object_by_addr(&self.heap, addr),
                                         Some(Object::Array(_))
@@ -2619,15 +2632,13 @@ impl<const S: usize> Machine<S> {
 
                     let (target, captured) = {
                         let addr = raw.raw() as u64;
-                        if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
-                            if let Some(Object::PolyFn(gc)) =
-                                self.heap.find_object_by_addr(addr)
-                            {
-                                let pfn = gc.as_ref();
-                                (pfn.entry as usize, pfn.captured_dicts.clone())
-                            } else {
-                                (raw.as_int() as usize, Vec::new())
-                            }
+                        if raw.raw().is_null() {
+                            (raw.as_int() as usize, Vec::new())
+                        } else if let Some(Object::PolyFn(gc)) =
+                            self.heap.find_object_by_addr(addr)
+                        {
+                            let pfn = gc.as_ref();
+                            (pfn.entry as usize, pfn.captured_dicts.clone())
                         } else {
                             (raw.as_int() as usize, Vec::new())
                         }
@@ -2724,7 +2735,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::Fn);
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2764,23 +2775,17 @@ impl<const S: usize> Machine<S> {
                     let tag = (opcode.operand_u32() & 0xFFFF) as u16;
                     let v = self.stack.pop();
                     let addr = v.raw() as u64;
-                    let payload = if addr != 0
-                        && self.heap.contains_addr(addr as *mut u8)
-                    {
-                        if let Some(obj) =
-                            Self::find_object_by_addr(&self.heap, addr)
-                        {
-                            Member::Object(obj)
-                        } else {
-                            Member::Value(v)
-                        }
+                    let payload = if addr == 0 {
+                        Member::Value(v)
+                    } else if let Some(obj) = Self::find_object_by_addr(&self.heap, addr) {
+                        Member::Object(obj)
                     } else {
                         Member::Value(v)
                     };
                     let boxed = ObjBoxed { tag, payload };
                     let (object, _) = self.heap.alloc(boxed, Object::Boxed);
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2820,7 +2825,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2840,8 +2845,10 @@ impl<const S: usize> Machine<S> {
                         captured_dicts[slot] = if addr == 0 {
                             // Unresolved evidence — filled at CallIndirect.
                             None
-                        } else if self.heap.contains_addr(addr as *mut u8) {
-                            Self::find_object_by_addr(&self.heap, addr).map(Member::Object)
+                        } else if let Some(obj) =
+                            Self::find_object_by_addr(&self.heap, addr)
+                        {
+                            Some(Member::Object(obj))
                         } else {
                             Some(Member::Value(value))
                         };
@@ -2853,7 +2860,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
                             &self.stack,
@@ -2872,23 +2879,24 @@ impl<const S: usize> Machine<S> {
                     /// Uses `Heap::find_object_by_addr` (O(1) via addr index).
                     fn classify_dyn(v: Value, heap: &Heap) -> (ValueTag, Value) {
                         let addr = v.raw() as u64;
-                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
-                            if let Some(obj) = heap.find_object_by_addr(addr) {
-                                return match obj {
-                                    Object::Boxed(gc) => {
-                                        let b = gc.as_ref();
-                                        let tag = ValueTag::from_u16(b.tag)
-                                            .unwrap_or(ValueTag::Int);
-                                        let inner = match &b.payload {
-                                            Member::Value(iv) => *iv,
-                                            Member::Object(o) => Value::from(o.addr()),
-                                        };
-                                        (tag, inner)
-                                    }
-                                    Object::String(_) => (ValueTag::String, v),
-                                    _ => (ValueTag::Int, v),
-                                };
-                            }
+                        if v.raw().is_null() {
+                            return (ValueTag::Int, v);
+                        }
+                        if let Some(obj) = heap.find_object_by_addr(addr) {
+                            return match obj {
+                                Object::Boxed(gc) => {
+                                    let b = gc.as_ref();
+                                    let tag =
+                                        ValueTag::from_u16(b.tag).unwrap_or(ValueTag::Int);
+                                    let inner = match &b.payload {
+                                        Member::Value(iv) => *iv,
+                                        Member::Object(o) => Value::from(o.addr()),
+                                    };
+                                    (tag, inner)
+                                }
+                                Object::String(_) => (ValueTag::String, v),
+                                _ => (ValueTag::Int, v),
+                            };
                         }
                         (ValueTag::Int, v)
                     }
@@ -2924,7 +2932,7 @@ impl<const S: usize> Machine<S> {
                                 Object::String,
                             );
                             self.alloc_counter += 1;
-                            if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                                 Self::gc_collect(
                                     &mut self.heap,
                                     &self.stack,
@@ -2957,13 +2965,14 @@ impl<const S: usize> Machine<S> {
                 Instruction::DynCmp => {
                     fn classify_int_dyn(v: Value, heap: &Heap) -> i64 {
                         let addr = v.raw() as u64;
-                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
-                            if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
-                                return match &gc.as_ref().payload {
-                                    Member::Value(iv) => iv.as_int(),
-                                    Member::Object(_) => 0,
-                                };
-                            }
+                        if v.raw().is_null() {
+                            return v.as_int();
+                        }
+                        if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
+                            return match &gc.as_ref().payload {
+                                Member::Value(iv) => iv.as_int(),
+                                Member::Object(_) => 0,
+                            };
                         }
                         v.as_int()
                     }
@@ -2984,13 +2993,14 @@ impl<const S: usize> Machine<S> {
                 Instruction::DynEq | Instruction::DynNe => {
                     fn classify_raw_dyn(v: Value, heap: &Heap) -> u64 {
                         let addr = v.raw() as u64;
-                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
-                            if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
-                                return match &gc.as_ref().payload {
-                                    Member::Value(iv) => iv.raw() as u64,
-                                    Member::Object(o) => o.addr(),
-                                };
-                            }
+                        if v.raw().is_null() {
+                            return v.raw() as u64;
+                        }
+                        if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
+                            return match &gc.as_ref().payload {
+                                Member::Value(iv) => iv.raw() as u64,
+                                Member::Object(o) => o.addr(),
+                            };
                         }
                         v.raw() as u64
                     }
@@ -3008,63 +3018,7 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::DynPrint => {
                     let v = self.stack.pop();
-                    let addr = v.raw() as u64;
-                    let text = if !v.raw().is_null()
-                        && self.heap.contains_addr(v.raw())
-                    {
-                        if let Some(obj) = self.heap.find_object_by_addr(addr) {
-                            match obj {
-                                Object::Boxed(gc) => {
-                                    let b = gc.as_ref();
-                                    match ValueTag::from_u16(b.tag) {
-                                        Some(ValueTag::Int) => {
-                                            match &b.payload {
-                                                Member::Value(iv) => iv.as_int().to_string(),
-                                                _ => "?".to_string(),
-                                            }
-                                        }
-                                        Some(ValueTag::Float) => {
-                                            match &b.payload {
-                                                Member::Value(iv) => {
-                                                    format!("{:.?}", iv.as_float())
-                                                }
-                                                _ => "?".to_string(),
-                                            }
-                                        }
-                                        Some(ValueTag::Bool) => {
-                                            match &b.payload {
-                                                Member::Value(iv) => {
-                                                    if iv.as_int() != 0 { "true" } else { "false" }
-                                                        .to_string()
-                                                }
-                                                _ => "?".to_string(),
-                                            }
-                                        }
-                                        Some(ValueTag::String) => {
-                                            match &b.payload {
-                                                Member::Object(o) => {
-                                                    Self::object_string_value(
-                                                        &self.heap,
-                                                        &Value::from(o.addr()),
-                                                    )
-                                                }
-                                                Member::Value(iv) => {
-                                                    Self::object_string_value(&self.heap, iv)
-                                                }
-                                            }
-                                        }
-                                        _ => "?".to_string(),
-                                    }
-                                }
-                                Object::String(gc) => gc.as_ref().data.clone(),
-                                _ => "?".to_string(),
-                            }
-                        } else {
-                            "?".to_string()
-                        }
-                    } else {
-                        v.as_int().to_string()
-                    };
+                    let text = Self::stringify_value(&self.heap, v);
                     if let Some(out) = self.output.as_mut() {
                         let _ = write!(out, "{text}");
                     } else {
