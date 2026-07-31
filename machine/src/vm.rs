@@ -2304,6 +2304,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::UnpackAt => {
                     // Unpack enum at `sp + slot_offset` in place (nested record patterns).
+                    // Scratch-area codegen may unpack past the current cursor; extend
+                    // `tell` so subsequent LOAD/StorePop see the written slots.
                     let operands = opcode.operand_u32();
                     let slot_offset = (operands & 0xFFFF) as usize;
                     let _arity = (operands >> 16) as usize;
@@ -2329,6 +2331,10 @@ impl<const S: usize> Machine<S> {
                                     Member::Object(o) => Value::from(o.addr()),
                                 };
                                 self.stack[slot + i] = value;
+                            }
+                            let end = slot + enum_ref.payload.len();
+                            if self.stack.tell() < end {
+                                self.stack.seek(end);
                             }
                         }
                     }

@@ -1630,38 +1630,26 @@ fn emit_pattern_binding<'compiler>(
                 }
             }
             PatternPayload::Record(fields) => {
-                // Declaration-order walk; nested records use UnpackAt at non-top slots.
+                // Declaration-order walk. Nested records unpack into a
+                // scratch region past this record's field slots so
+                // multi-field inners cannot clobber sibling outers.
                 // `record_base` is the first payload slot for this record
                 // (normally 1; higher when trailing dict locals precede
                 // the match).
                 let record_base = *next_slot;
+                let n_fields = parent_decl_order.len() as u32;
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                     fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
                     let field_slot = record_base + i as u32;
                     if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {
-                        // If the sub-pattern is a nested
-                        // record, emit `UnpackAt` with the
-                        // slot position of the OUTER field
-                        // (= `field_slot`). The slot-based
-                        // UNPACK writes the inner record's
-                        // payload values to consecutive
-                        // positions starting at `field_slot`,
-                        // overwriting the nested record's
-                        // enum value.
+                        // Nested record + consume: copy the enum into a
+                        // scratch base (≥ end of this record's fields /
+                        // prior scratch), UnpackAt there, then bind from
+                        // scratch. Plain siblings after a nested unpack
+                        // relocate field_slot → next_slot before binding.
                         //
-                        // `is_outer` is captured by value
-                        // from the enclosing Record arm
-                        // call. When `is_outer = true`, we're
-                        // walking the OUTER record's fields
-                        // — nested records at this level need
-                        // `UnpackAt`. When `is_outer = false`
-                        // (we're recursing into a nested
-                        // record's fields), nested records
-                        // ALSO need `UnpackAt` (one level
-                        // deeper). Either way, emit it when
-                        // the sub-pattern is a nested record
-                        // AND `consume_values = true`.
+                        // UnpackAt operands: [31:16]=arity, [15:0]=slot.
                         if consume_values
                             && let Pattern::Constructor {
                                 enum_name: sub_enum,
@@ -1671,14 +1659,28 @@ fn emit_pattern_binding<'compiler>(
                         {
                             let inner_arity =
                                 checker.payload_tys_for(sub_enum, sub_variant).len() as u16;
+                            let scratch_base = (*next_slot).max(record_base + n_fields);
+                            if scratch_base != field_slot {
+                                bytecode.push(
+                                    Byte::new(Instruction::LOAD).with_operand_u32(field_slot),
+                                );
+                                bytecode.push(
+                                    Byte::new(Instruction::StorePop)
+                                        .with_operand_u32(scratch_base),
+                                );
+                            }
                             bytecode.push(
                                 Byte::new(Instruction::UnpackAt)
-                                    .with_operands_u16([field_slot as u16, inner_arity]),
+                                    .with_operands_u16([inner_arity, scratch_base as u16]),
+                            );
+                            *next_slot = scratch_base;
+                        } else if consume_values && field_slot != *next_slot {
+                            bytecode
+                                .push(Byte::new(Instruction::LOAD).with_operand_u32(field_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::StorePop).with_operand_u32(*next_slot),
                             );
                         }
-                        // Compute the sub-pattern's own
-                        // record decl_order if it's a record
-                        // constructor (for unbounded nesting).
                         let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
                             enum_name: sub_enum,
                             variant_name: sub_variant,
@@ -13504,6 +13506,54 @@ print \"%i\", len(a); \
             store_count >= 1,
             "expected at least one STORE for the inner Binding `v`; got {}",
             store_count
+        );
+    }
+
+    /// Nested multi-field records emit scratch relocate (LOAD+StorePop)
+    /// then UnpackAt with operands `[arity, scratch_slot]` — not in-place
+    /// at the outer field (which would clobber siblings).
+    #[test]
+    fn match_nested_multifield_record_emits_scratch_unpack_at() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "enum Inner { I { x: int, y: int } } \
+ enum Wrap { W { inner: Inner, name: int } } \
+ match Wrap::W { inner: Inner::I { x: 1, y: 2 }, name: 3 } { \
+ Wrap::W { inner: Inner::I { x, y }, name } => x + y + name, \
+ };",
+        );
+
+        let unpack_at: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::UnpackAt))
+            .collect();
+        assert!(
+            !unpack_at.is_empty(),
+            "expected UnpackAt for nested Inner::I"
+        );
+        for b in &unpack_at {
+            let ops = b.operand_u32();
+            let slot = ops & 0xFFFF;
+            let arity = ops >> 16;
+            assert_eq!(arity, 2, "inner record arity must be in [31:16]; got {ops:#x}");
+            // Outer has 2 fields; scratch starts at record_base + 2 (payload_base
+            // is 0 for bare expression matches, 1 inside functions).
+            assert!(
+                slot >= 2,
+                "scratch slot must be past outer field region; got slot={slot}"
+            );
+        }
+        let load_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LOAD))
+            .count();
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        assert!(
+            load_count >= 1 && store_pop_count >= 1,
+            "expected LOAD+StorePop to relocate nested enum into scratch; LOAD={load_count} StorePop={store_pop_count}"
         );
     }
 

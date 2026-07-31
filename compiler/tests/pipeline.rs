@@ -1214,6 +1214,36 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
+/// Nested multi-field record patterns must not clobber sibling outer fields.
+/// Pre-fix, in-place `UnpackAt` at the outer field slot overwrote later
+/// siblings when the inner arity exceeded one.
+#[test]
+fn nested_multifield_record_pattern_preserves_sibling() {
+    let output = run_example_src(
+        r#"
+enum Inner {
+    I { x: int, y: int },
+}
+enum Wrap {
+    W { inner: Inner, name: int },
+}
+fn both(Wrap w) -> int {
+    return match w {
+        Wrap::W { inner: Inner::I { x, y }, name } => x + y + name,
+    };
+}
+fn main() {
+    let w = Wrap::W { inner: Inner::I { x: 10, y: 20 }, name: 3 };
+    print "%i", both(w);
+}
+"#,
+    );
+    assert_eq!(
+        output, "33",
+        "inner fields and outer sibling `name` must all bind correctly"
+    );
+}
+
 fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
