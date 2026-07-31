@@ -167,6 +167,61 @@ impl IlBuilder {
         });
     }
 
+    pub fn push_pop(&mut self) {
+        self.push_op(IlOp::Pop {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_index(&mut self) {
+        self.push_op(IlOp::Index {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_make_tuple(&mut self, arity: u32) {
+        self.push_op(IlOp::MakeTuple {
+            arity,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_make_array(&mut self, arity: u32) {
+        self.push_op(IlOp::MakeArray {
+            arity,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_make_enum(&mut self, tag: u16, arity: u16) {
+        self.push_op(IlOp::MakeEnum {
+            tag,
+            arity,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_box_value(&mut self, tag: u32) {
+        self.push_op(IlOp::BoxValue {
+            tag,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_unbox_value(&mut self, tag: u32) {
+        self.push_op(IlOp::UnboxValue {
+            tag,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_load_field(&mut self, index: u32) {
+        self.push_op(IlOp::LoadField {
+            index,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
         for b in bytes {
             self.push_byte(b);

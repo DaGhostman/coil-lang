@@ -49,6 +49,17 @@ pub enum IlOp {
     Const { imm: i32, loc: DebugLoc },
     Dup { loc: DebugLoc },
     Pop { loc: DebugLoc },
+    /// `Index` — pop array + index, push element.
+    Index { loc: DebugLoc },
+    /// `MakeTuple` — pop `arity` values, push tuple.
+    MakeTuple { arity: u32, loc: DebugLoc },
+    /// `MakeArray` — pop `arity` values, push array.
+    MakeArray { arity: u32, loc: DebugLoc },
+    /// `MakeEnum` — pop `arity` payloads, push enum with `tag`.
+    MakeEnum { tag: u16, arity: u16, loc: DebugLoc },
+    BoxValue { tag: u32, loc: DebugLoc },
+    UnboxValue { tag: u32, loc: DebugLoc },
+    LoadField { index: u32, loc: DebugLoc },
     Return { loc: DebugLoc },
     Halt { loc: DebugLoc },
     /// Plain int/float binop or comparison (stack operands).
@@ -156,6 +167,32 @@ impl IlOp {
             }
             Instruction::DUPLICATE => Self::Dup { loc },
             Instruction::POP => Self::Pop { loc },
+            Instruction::Index => Self::Index { loc },
+            Instruction::MakeTuple => Self::MakeTuple {
+                arity: byte.operand_u32(),
+                loc,
+            },
+            Instruction::MakeArray => Self::MakeArray {
+                arity: byte.operand_u32(),
+                loc,
+            },
+            Instruction::MakeEnum => Self::MakeEnum {
+                tag: byte.operand_u16(0),
+                arity: byte.operand_u16(1),
+                loc,
+            },
+            Instruction::BoxValue => Self::BoxValue {
+                tag: byte.operand_u32(),
+                loc,
+            },
+            Instruction::UnboxValue => Self::UnboxValue {
+                tag: byte.operand_u32(),
+                loc,
+            },
+            Instruction::LoadField => Self::LoadField {
+                index: byte.operand_u32(),
+                loc,
+            },
             Instruction::RETURN => Self::Return { loc },
             Instruction::HALT => Self::Halt { loc },
             Instruction::BinSlotImm => {
@@ -202,6 +239,25 @@ impl IlOp {
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Byte::new(Instruction::POP),
+            IlOp::Index { .. } => Byte::new(Instruction::Index),
+            IlOp::MakeTuple { arity, .. } => {
+                Byte::new(Instruction::MakeTuple).with_operand_u32(*arity)
+            }
+            IlOp::MakeArray { arity, .. } => {
+                Byte::new(Instruction::MakeArray).with_operand_u32(*arity)
+            }
+            IlOp::MakeEnum { tag, arity, .. } => {
+                Byte::new(Instruction::MakeEnum).with_operands_u16([*tag, *arity])
+            }
+            IlOp::BoxValue { tag, .. } => {
+                Byte::new(Instruction::BoxValue).with_operand_u32(*tag)
+            }
+            IlOp::UnboxValue { tag, .. } => {
+                Byte::new(Instruction::UnboxValue).with_operand_u32(*tag)
+            }
+            IlOp::LoadField { index, .. } => {
+                Byte::new(Instruction::LoadField).with_operand_u32(*index)
+            }
             IlOp::Return { .. } => Byte::new(Instruction::RETURN),
             IlOp::Halt { .. } => Byte::new(Instruction::HALT),
             IlOp::Bin { op, .. } => Byte::new(*op),
@@ -260,6 +316,13 @@ impl IlOp {
             | IlOp::Const { loc, .. }
             | IlOp::Dup { loc }
             | IlOp::Pop { loc }
+            | IlOp::Index { loc }
+            | IlOp::MakeTuple { loc, .. }
+            | IlOp::MakeArray { loc, .. }
+            | IlOp::MakeEnum { loc, .. }
+            | IlOp::BoxValue { loc, .. }
+            | IlOp::UnboxValue { loc, .. }
+            | IlOp::LoadField { loc, .. }
             | IlOp::Return { loc }
             | IlOp::Halt { loc }
             | IlOp::Bin { loc, .. }
@@ -284,6 +347,13 @@ impl IlOp {
             | IlOp::Const { loc: l, .. }
             | IlOp::Dup { loc: l }
             | IlOp::Pop { loc: l }
+            | IlOp::Index { loc: l }
+            | IlOp::MakeTuple { loc: l, .. }
+            | IlOp::MakeArray { loc: l, .. }
+            | IlOp::MakeEnum { loc: l, .. }
+            | IlOp::BoxValue { loc: l, .. }
+            | IlOp::UnboxValue { loc: l, .. }
+            | IlOp::LoadField { loc: l, .. }
             | IlOp::Return { loc: l }
             | IlOp::Halt { loc: l }
             | IlOp::Bin { loc: l, .. }
@@ -313,6 +383,13 @@ impl IlOp {
             IlOp::Const { .. } => Some(Instruction::CONST),
             IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Some(Instruction::POP),
+            IlOp::Index { .. } => Some(Instruction::Index),
+            IlOp::MakeTuple { .. } => Some(Instruction::MakeTuple),
+            IlOp::MakeArray { .. } => Some(Instruction::MakeArray),
+            IlOp::MakeEnum { .. } => Some(Instruction::MakeEnum),
+            IlOp::BoxValue { .. } => Some(Instruction::BoxValue),
+            IlOp::UnboxValue { .. } => Some(Instruction::UnboxValue),
+            IlOp::LoadField { .. } => Some(Instruction::LoadField),
             IlOp::Return { .. } => Some(Instruction::RETURN),
             IlOp::Halt { .. } => Some(Instruction::HALT),
             IlOp::Bin { op, .. } => Some(*op),
@@ -358,6 +435,60 @@ mod tests {
         assert!(matches!(c, IlOp::Const { imm: 7, .. }));
         let add = IlOp::from_plain_byte(Byte::new(Instruction::ADD), DebugLoc::unknown());
         assert!(matches!(add, IlOp::Bin { op: Instruction::ADD, .. }));
+    }
+
+    #[test]
+    fn from_plain_byte_lifts_index_make_tuple_array_enum() {
+        assert!(matches!(
+            IlOp::from_plain_byte(Byte::new(Instruction::Index), DebugLoc::unknown()),
+            IlOp::Index { .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+                DebugLoc::unknown(),
+            ),
+            IlOp::MakeTuple { arity: 2, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::MakeArray).with_operand_u32(3),
+                DebugLoc::unknown(),
+            ),
+            IlOp::MakeArray { arity: 3, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::MakeEnum).with_operands_u16([9, 1]),
+                DebugLoc::unknown(),
+            ),
+            IlOp::MakeEnum { tag: 9, arity: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn from_plain_byte_lifts_box_unbox_load_field() {
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::BoxValue).with_operand_u32(3),
+                DebugLoc::unknown(),
+            ),
+            IlOp::BoxValue { tag: 3, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::UnboxValue).with_operand_u32(4),
+                DebugLoc::unknown(),
+            ),
+            IlOp::UnboxValue { tag: 4, .. }
+        ));
+        assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::LoadField).with_operand_u32(2),
+                DebugLoc::unknown(),
+            ),
+            IlOp::LoadField { index: 2, .. }
+        ));
     }
 
     #[test]
@@ -543,6 +674,34 @@ mod tests {
             },
             IlOp::BinReturn {
                 op: Instruction::MUL,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Index {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeTuple {
+                arity: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeArray {
+                arity: 3,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeEnum {
+                tag: 9,
+                arity: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::BoxValue {
+                tag: 3,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::UnboxValue {
+                tag: 4,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::LoadField {
+                index: 2,
                 loc: DebugLoc::unknown(),
             },
         ];

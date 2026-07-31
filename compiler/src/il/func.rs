@@ -1,7 +1,8 @@
-//! Lightweight per-function IL metadata (flat CodeBuf stays the source of truth).
+//! Lightweight per-function IL metadata.
 //!
-//! Recorded at function finalize for upcoming IL inspection / tooling; the flat
-//! buffer remains authoritative for codegen and lower.
+//! Recorded at function finalize; [`super::IlModule::from_flat`] splits the
+//! flat stream into owned bodies for scoped opts / CFG GVN. Emitting spans
+//! remain the source of truth until split.
 
 use super::Label;
 

@@ -34,6 +34,38 @@ pub trait EmitBuf {
     fn push_return(&mut self) {
         self.push_byte(Byte::new(Instruction::RETURN));
     }
+
+    fn push_pop(&mut self) {
+        self.push_byte(Byte::new(Instruction::POP));
+    }
+
+    fn push_index(&mut self) {
+        self.push_byte(Byte::new(Instruction::Index));
+    }
+
+    fn push_make_tuple(&mut self, arity: u32) {
+        self.push_byte(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+    }
+
+    fn push_make_array(&mut self, arity: u32) {
+        self.push_byte(Byte::new(Instruction::MakeArray).with_operand_u32(arity));
+    }
+
+    fn push_make_enum(&mut self, tag: u16, arity: u16) {
+        self.push_byte(Byte::new(Instruction::MakeEnum).with_operands_u16([tag, arity]));
+    }
+
+    fn push_box_value(&mut self, tag: u32) {
+        self.push_byte(Byte::new(Instruction::BoxValue).with_operand_u32(tag));
+    }
+
+    fn push_unbox_value(&mut self, tag: u32) {
+        self.push_byte(Byte::new(Instruction::UnboxValue).with_operand_u32(tag));
+    }
+
+    fn push_load_field(&mut self, index: u32) {
+        self.push_byte(Byte::new(Instruction::LoadField).with_operand_u32(index));
+    }
 }
 
 impl EmitBuf for Vec<Byte> {
@@ -63,6 +95,38 @@ impl EmitBuf for CodeBuf {
     fn push_return(&mut self) {
         CodeBuf::push_return(self);
     }
+
+    fn push_pop(&mut self) {
+        CodeBuf::push_pop(self);
+    }
+
+    fn push_index(&mut self) {
+        CodeBuf::push_index(self);
+    }
+
+    fn push_make_tuple(&mut self, arity: u32) {
+        CodeBuf::push_make_tuple(self, arity);
+    }
+
+    fn push_make_array(&mut self, arity: u32) {
+        CodeBuf::push_make_array(self, arity);
+    }
+
+    fn push_make_enum(&mut self, tag: u16, arity: u16) {
+        CodeBuf::push_make_enum(self, tag, arity);
+    }
+
+    fn push_box_value(&mut self, tag: u32) {
+        CodeBuf::push_box_value(self, tag);
+    }
+
+    fn push_unbox_value(&mut self, tag: u32) {
+        CodeBuf::push_unbox_value(self, tag);
+    }
+
+    fn push_load_field(&mut self, index: u32) {
+        CodeBuf::push_load_field(self, index);
+    }
 }
 
 #[cfg(test)]
@@ -90,7 +154,6 @@ mod tests {
 
     #[test]
     fn codebuf_emit_buf_trait_lifts_hot_path_ops() {
-        // Codegen uses `&mut impl EmitBuf`; trait overrides must lift, not pack Bytes.
         let mut buf = CodeBuf::new();
         EmitBuf::push_load(&mut buf, 1);
         EmitBuf::push_store_pop(&mut buf, 2);
@@ -101,5 +164,47 @@ mod tests {
         assert!(matches!(ops[1], IlOp::StorePop { slot: 2, .. }));
         assert!(matches!(ops[2], IlOp::Const { imm: 0, .. }));
         assert!(matches!(ops[3], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn codebuf_lifts_longtail_aggregate_ops() {
+        let mut buf = CodeBuf::new();
+        EmitBuf::push_index(&mut buf);
+        EmitBuf::push_make_tuple(&mut buf, 2);
+        EmitBuf::push_make_array(&mut buf, 3);
+        EmitBuf::push_make_enum(&mut buf, 7, 1);
+        EmitBuf::push_pop(&mut buf);
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::Index { .. }));
+        assert!(matches!(ops[1], IlOp::MakeTuple { arity: 2, .. }));
+        assert!(matches!(ops[2], IlOp::MakeArray { arity: 3, .. }));
+        assert!(matches!(ops[3], IlOp::MakeEnum { tag: 7, arity: 1, .. }));
+        assert!(matches!(ops[4], IlOp::Pop { .. }));
+    }
+
+    #[test]
+    fn vec_emit_buf_packs_box_unbox_load_field() {
+        let mut buf: Vec<Byte> = Vec::new();
+        EmitBuf::push_box_value(&mut buf, 3);
+        EmitBuf::push_unbox_value(&mut buf, 4);
+        EmitBuf::push_load_field(&mut buf, 2);
+        assert_eq!(*buf[0].bytecode(), Instruction::BoxValue);
+        assert_eq!(buf[0].operand_u32(), 3);
+        assert_eq!(*buf[1].bytecode(), Instruction::UnboxValue);
+        assert_eq!(buf[1].operand_u32(), 4);
+        assert_eq!(*buf[2].bytecode(), Instruction::LoadField);
+        assert_eq!(buf[2].operand_u32(), 2);
+    }
+
+    #[test]
+    fn codebuf_emit_buf_trait_lifts_box_unbox_load_field() {
+        let mut buf = CodeBuf::new();
+        EmitBuf::push_box_value(&mut buf, 5);
+        EmitBuf::push_unbox_value(&mut buf, 6);
+        EmitBuf::push_load_field(&mut buf, 1);
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::BoxValue { tag: 5, .. }));
+        assert!(matches!(ops[1], IlOp::UnboxValue { tag: 6, .. }));
+        assert!(matches!(ops[2], IlOp::LoadField { index: 1, .. }));
     }
 }

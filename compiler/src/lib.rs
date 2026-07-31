@@ -340,7 +340,7 @@ fn emit_inner_test<'compiler>(
             for sub in parts {
                 match sub {
                     Pattern::Wildcard => {
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode.push_pop();
                     }
                     Pattern::Binding { name } => {
                         let slot = next_available_slot(match_bindings_per_arm, payload_base);
@@ -388,13 +388,13 @@ fn emit_inner_test<'compiler>(
                                     bytecode.il_mut(),
                                 );
                             } else {
-                                bytecode.push(Byte::new(Instruction::POP));
+                                bytecode.push_pop();
                             }
                         } else {
                             // Last arm in the group — emit POP to
                             // consume the inner value. The arm
                             // body is reached by fall-through.
-                            bytecode.push(Byte::new(Instruction::POP));
+                            bytecode.push_pop();
                         }
                     }
                 }
@@ -418,13 +418,13 @@ fn emit_inner_test<'compiler>(
                         // POP to discard the value (the test
                         // chain always consumes every slot, so
                         // this is unconditional).
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode.push_pop();
                         continue;
                     }
                 };
                 match sub_pat {
                     Pattern::Wildcard => {
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode.push_pop();
                     }
                     Pattern::Binding { name } => {
                         let slot = next_available_slot(match_bindings_per_arm, payload_base);
@@ -473,14 +473,14 @@ fn emit_inner_test<'compiler>(
                                     bytecode.il_mut(),
                                 );
                             } else {
-                                bytecode.push(Byte::new(Instruction::POP));
+                                bytecode.push_pop();
                             }
                         } else {
                             // Last arm in the group — emit POP
                             // to consume the inner value. The
                             // arm body is reached by
                             // fall-through.
-                            bytecode.push(Byte::new(Instruction::POP));
+                            bytecode.push_pop();
                         }
                     }
                 }
@@ -952,7 +952,7 @@ impl Compiler {
             }
             self.bytecode
                 .emit_entry(EntryKind::Call, captures.len() as u32, *label);
-            self.bytecode.push(Byte::new(Instruction::POP));
+            self.bytecode.push_pop();
         }
     }
 
@@ -1531,7 +1531,7 @@ fn emit_pattern_binding<'compiler>(
     match pattern {
         Pattern::Wildcard => {
             if consume_values {
-                bytecode.push(Byte::new(Instruction::POP));
+                bytecode.push_pop();
             }
         }
         Pattern::Binding { name } => {
@@ -1565,7 +1565,7 @@ fn emit_pattern_binding<'compiler>(
                 // caller expects a value on the stack
                 // (`consume_values = true`).
                 if consume_values && !is_outer {
-                    bytecode.push(Byte::new(Instruction::POP));
+                    bytecode.push_pop();
                 }
             }
             PatternPayload::Tuple(parts) => {
@@ -1713,7 +1713,7 @@ fn emit_pattern_binding<'compiler>(
                         // values; we POP them so the slot
                         // cursor advances correctly for
                         // subsequent fields.
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode.push_pop();
                     }
                     // else: `consume_values = false` —
                     // the test chain already consumed the
@@ -2045,13 +2045,9 @@ impl Compiler {
                 }
             }
             if self.checker.fn_tuple_rest(fn_name) {
-                bytecode.push(
-                    Byte::new(Instruction::MakeTuple).with_operand_u32(rest.len() as u32),
-                );
+                bytecode.push_make_tuple(rest.len() as u32);
             } else {
-                bytecode.push(
-                    Byte::new(Instruction::MakeArray).with_operand_u32(rest.len() as u32),
-                );
+                bytecode.push_make_array(rest.len() as u32);
             }
             return (fixed.len() + 1) as u32;
         }
@@ -2112,7 +2108,7 @@ impl Compiler {
             bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
         ) {
-            bytecode.push(Byte::new(Instruction::POP));
+            bytecode.push_pop();
         }
     }
 
@@ -2163,7 +2159,7 @@ impl Compiler {
         bytecode.push_load(dict_slot);
         bytecode.push_load(dict_slot);
         bytecode.push_const(method_slot as i32);
-        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push_index();
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
         true
     }
@@ -2225,7 +2221,7 @@ impl Compiler {
                     |c, bc, i| {
                         bc.push_load(t0);
                         bc.push_const(i as i32);
-                        bc.push(Byte::new(Instruction::Index));
+                        bc.push_index();
                         c.emit_neg_tos(bc, elem_is_float);
                     },
                     true,
@@ -2247,7 +2243,7 @@ impl Compiler {
                             |c, bc, i| {
                                 bc.push_load(t0);
                                 bc.push_const(i as i32);
-                                bc.push(Byte::new(Instruction::Index));
+                                bc.push_index();
                                 c.emit_neg_tos(bc, elem_is_float);
                             },
                             false,
@@ -2281,10 +2277,10 @@ impl Compiler {
                     |_c, bc, i| {
                         bc.push_load(t0);
                         bc.push_const(i as i32);
-                        bc.push(Byte::new(Instruction::Index));
+                        bc.push_index();
                         bc.push_load(t1);
                         bc.push_const(i as i32);
-                        bc.push(Byte::new(Instruction::Index));
+                        bc.push_index();
                         bc.push(Byte::new(scalar_instr(op, elem_is_float)));
                     },
                     true,
@@ -2311,10 +2307,10 @@ impl Compiler {
                     |_c, bc, i| {
                         bc.push_load(t0);
                         bc.push_const(i as i32);
-                        bc.push(Byte::new(Instruction::Index));
+                        bc.push_index();
                         bc.push_load(t1);
                         bc.push_const(i as i32);
-                        bc.push(Byte::new(Instruction::Index));
+                        bc.push_index();
                         bc.push(Byte::new(scalar_instr(op, elem_is_float)));
                     },
                     false,
@@ -2354,14 +2350,14 @@ impl Compiler {
                             ScalarSide::Right => {
                                 bc.push_load(t_vec);
                                 bc.push_const(i as i32);
-                                bc.push(Byte::new(Instruction::Index));
+                                bc.push_index();
                                 bc.push_load(t_sc);
                             }
                             ScalarSide::Left => {
                                 bc.push_load(t_sc);
                                 bc.push_load(t_vec);
                                 bc.push_const(i as i32);
-                                bc.push(Byte::new(Instruction::Index));
+                                bc.push_index();
                             }
                         }
                         bc.push(Byte::new(scalar_instr(op, elem_is_float)));
@@ -2405,14 +2401,14 @@ impl Compiler {
                                     ScalarSide::Right => {
                                         bc.push_load(t_vec);
                                         bc.push_const(i as i32);
-                                        bc.push(Byte::new(Instruction::Index));
+                                        bc.push_index();
                                         bc.push_load(t_sc);
                                     }
                                     ScalarSide::Left => {
                                         bc.push_load(t_sc);
                                         bc.push_load(t_vec);
                                         bc.push_const(i as i32);
-                                        bc.push(Byte::new(Instruction::Index));
+                                        bc.push_index();
                                     }
                                 }
                                 bc.push(Byte::new(scalar_instr(op, elem_is_float)));
@@ -2463,9 +2459,9 @@ impl Compiler {
             emit_elem(self, bytecode, i);
         }
         if as_tuple {
-            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+            bytecode.push_make_tuple(n as u32);
         } else {
-            bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+            bytecode.push_make_array(n as u32);
         }
     }
 
@@ -2479,7 +2475,7 @@ impl Compiler {
         self.bytecode
             .push_store_pop(len_slot);
         self.bytecode
-            .push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+            .push_make_array(0);
         self.bytecode
             .push_store_pop(out);
         self.bytecode
@@ -2505,7 +2501,7 @@ impl Compiler {
             .push_load(src);
         self.bytecode
             .push_load(idx);
-        self.bytecode.push(Byte::new(Instruction::Index));
+        self.bytecode.push_index();
         {
             let mut neg_bc = Vec::new();
             self.emit_neg_tos(&mut neg_bc, elem_is_float);
@@ -2563,7 +2559,7 @@ impl Compiler {
         self.bytecode
             .push_store_pop(len_slot);
         self.bytecode
-            .push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+            .push_make_array(0);
         self.bytecode
             .push_store_pop(out);
         self.bytecode
@@ -2591,7 +2587,7 @@ impl Compiler {
                     .push_load(t_vec);
                 self.bytecode
                     .push_load(idx);
-                self.bytecode.push(Byte::new(Instruction::Index));
+                self.bytecode.push_index();
                 self.bytecode
                     .push_load(t_sc);
             }
@@ -2602,7 +2598,7 @@ impl Compiler {
                     .push_load(t_vec);
                 self.bytecode
                     .push_load(idx);
-                self.bytecode.push(Byte::new(Instruction::Index));
+                self.bytecode.push_index();
             }
         }
         self.bytecode.push(Byte::new(scalar_instr));
@@ -3074,7 +3070,7 @@ impl Compiler {
         }
         let arity = tuple_elements.len() as u32;
         self.bytecode
-            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+            .push_make_tuple(arity);
 
         if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, ret_type) {
             emit_ffi_type_const(&mut self.bytecode, tag, aux);
@@ -3155,7 +3151,7 @@ impl Compiler {
         }
         let arity = tuple_elements.len() as u32;
         self.bytecode
-            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+            .push_make_tuple(arity);
 
         let mut operand = arity & 0xFFFF;
         if variadic {
@@ -3169,8 +3165,7 @@ impl Compiler {
                 for &(tag, aux) in &tags {
                     emit_ffi_type_const(&mut self.bytecode, tag, aux);
                 }
-                self.bytecode
-                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(tags.len() as u32));
+                self.bytecode.push_make_tuple(tags.len() as u32);
                 operand |= 1 << 16;
             }
         }
@@ -3197,7 +3192,7 @@ impl Compiler {
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
         self.bytecode
-            .push(Byte::new(Instruction::LoadField).with_operand_u32(1));
+            .push_load_field(1);
         self.bytecode.push(Byte::new(Instruction::Panic));
         bb.bind_label(success, self.bytecode.il_mut());
         bb.finalize()
@@ -3256,7 +3251,7 @@ impl Compiler {
                     .push_load(dict_slot);
                 self.bytecode
                     .push_const(method_slot as i32);
-                self.bytecode.push(Byte::new(Instruction::Index));
+                self.bytecode.push_index();
                 self.bytecode
                     .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
                 return;
@@ -3367,7 +3362,7 @@ impl Compiler {
                 .push_load(tuple_slot);
             self.bytecode
                 .push_const(idx as i32);
-            self.bytecode.push(Byte::new(Instruction::Index));
+            self.bytecode.push_index();
             self.emit_show_for_stack_value(item_ty);
             let slot = self.alloc_temp_slot();
             self.bytecode
@@ -3524,7 +3519,7 @@ impl Compiler {
                 .unwrap_or(0);
             bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
         }
-        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
+        bytecode.push_make_tuple(n_methods);
         true
     }
 
@@ -3542,7 +3537,7 @@ impl Compiler {
             checker,
             functions,
         ) {
-            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(2));
+            bytecode.push_make_tuple(2);
         }
     }
 
@@ -3592,7 +3587,7 @@ impl Compiler {
     fn load_tuple_field(bytecode: &mut Vec<Byte>, tuple_slot: u32, index: i32) {
         bytecode.push_load(tuple_slot);
         bytecode.push_const(index);
-        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push_index();
     }
 
     fn emit_existential_method_call(
@@ -3629,7 +3624,7 @@ impl Compiler {
         Self::load_tuple_field(bytecode, pack_slot, 1);
         Self::load_tuple_field(bytecode, pack_slot, 1);
         bytecode.push_const(hint.method_slot as i32);
-        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push_index();
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(hint.arity as u32 + 1));
         true
     }
@@ -3859,7 +3854,7 @@ impl Compiler {
             self.expr_depth += 1;
         }
         self.bytecode
-            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+            .push_make_tuple(arity as u32);
         self.bytecode.push(
             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
         );
@@ -3899,13 +3894,13 @@ impl Compiler {
                     .push_load(slot);
                 compiler
                     .bytecode
-                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                    .push_unbox_value(tag as u32);
             }
             compiler.bytecode.push(Byte::new(op));
             if boxes_result {
                 compiler
                     .bytecode
-                    .push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+                    .push_box_value(tag as u32);
             }
             compiler.bytecode.push_return();
         };
@@ -3996,7 +3991,7 @@ impl Compiler {
             self.bytecode
                 .push_load(0);
             self.bytecode
-                .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                .push_unbox_value(tag as u32);
             self.bytecode.push_return();
         }
         {
@@ -4015,11 +4010,9 @@ impl Compiler {
                     .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
                 self.bytecode
                     .push_load(0);
-                self.bytecode.push(
-                    Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::String as u32),
-                );
+                self.bytecode.push_unbox_value(ValueTag::String as u32);
                 self.bytecode
-                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
+                    .push_make_tuple(1);
                 self.bytecode
                     .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
                 self.bytecode.push_return();
@@ -4045,16 +4038,12 @@ impl Compiler {
                 .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
             self.bytecode
                 .push_load(0);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Instance as u32),
-            );
+            self.bytecode.push_unbox_value(ValueTag::Instance as u32);
             self.bytecode
                 .push_load(1);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Array as u32),
-            );
+            self.bytecode.push_unbox_value(ValueTag::Array as u32);
             self.bytecode
-                .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+                .push_make_tuple(arity);
             self.bytecode
                 .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
             self.bytecode.push_return();
@@ -4076,14 +4065,10 @@ impl Compiler {
             self.bind_function_entry(fqn);
             self.bytecode
                 .push_load(0);
-            self.bytecode.push(
-                Byte::new(Instruction::UnboxValue).with_operand_u32(from_tag as u32),
-            );
+            self.bytecode.push_unbox_value(from_tag as u32);
             self.bytecode.push(Byte::new(cast_op));
             if from_tag != to_tag {
-                self.bytecode.push(
-                    Byte::new(Instruction::BoxValue).with_operand_u32(to_tag as u32),
-                );
+                self.bytecode.push_box_value(to_tag as u32);
             }
             self.bytecode.push_return();
         }
@@ -4272,7 +4257,7 @@ impl Compiler {
         if opt_none {
             // `Option::None` = tag 0, arity 0.
             self.bytecode
-                .push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+                .push_make_enum(0, 0);
         } else {
             self.bytecode.push_const(0);
             if self.compiling_result_mode {
@@ -4309,7 +4294,7 @@ impl Compiler {
     /// type is already open (Ty::Var), or if a tag cannot be determined.
     fn emit_box_if_needed(bytecode: &mut impl EmitBuf, ty: &crate::typechecking::Ty) {
         if let Some(tag) = Self::ty_to_value_tag(ty) {
-            bytecode.push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+            bytecode.push_box_value(tag as u32);
         }
     }
 
@@ -4320,7 +4305,7 @@ impl Compiler {
     fn emit_unbox_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
         if let Some(tag) = Self::ty_to_value_tag(ty) {
             // UnboxValue operand: [15:0] = ValueTag as u16.
-            bytecode.push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            bytecode.push_unbox_value(tag as u32);
         }
     }
 
@@ -4373,7 +4358,7 @@ impl Compiler {
                 self.bytecode
                     .push_load(slot as u32);
                 self.bytecode
-                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                    .push_unbox_value(tag as u32);
                 self.bytecode
                     .push_store_pop(slot as u32);
             }
@@ -4877,14 +4862,14 @@ impl Compiler {
                         LetPattern::Binding { name } => {
                             bytecode.push_load(src_slot);
                             bytecode.push_const(idx as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             let slot = self.alloc_binding_slot(name);
                             bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
                             bytecode.push_load(src_slot);
                             bytecode.push_const(idx as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             let nested_slot = self.alloc_temp_slot();
                             bytecode
                                 .push_store_pop(nested_slot);
@@ -4968,7 +4953,7 @@ impl Compiler {
             .push_load(arr_slot);
         self.bytecode
             .push_load(idx_slot);
-        self.bytecode.push(Byte::new(Instruction::Index));
+        self.bytecode.push_index();
         self.bytecode
             .push_store_pop(binding_slot);
 
@@ -5017,10 +5002,10 @@ impl Compiler {
                 .push_load(tup_slot);
             self.bytecode
                 .push_const(i as i32);
-            self.bytecode.push(Byte::new(Instruction::Index));
+            self.bytecode.push_index();
         }
         self.bytecode
-            .push(Byte::new(Instruction::MakeArray).with_operand_u32(arity as u32));
+            .push_make_array(arity as u32);
         self.emit_for_in_array_loop(body, binding_name, true, None);
     }
 
@@ -5256,7 +5241,7 @@ impl Compiler {
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode
-            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+            .push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
         self.bytecode
             .push_store_pop(it_slot);
@@ -5272,7 +5257,7 @@ impl Compiler {
         self.bytecode
             .push_load(it_slot);
         self.bytecode
-            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+            .push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
 
         // `Option::None` → exit (JumpIfMatch pops unit None).
@@ -5536,7 +5521,7 @@ impl Compiler {
                 bytecode.push_store_pop(tmp_idx);
                 bytecode.push_load(tmp_arr);
                 bytecode.push_load(tmp_idx);
-                bytecode.push(Byte::new(Instruction::Index));
+                bytecode.push_index();
                 false
             }
             Expression::Index(_, None) => false,
@@ -5586,12 +5571,12 @@ impl Compiler {
                 if leave_value_on_stack {
                     // StoreIndex leaves the value on the stack; keep it.
                 } else {
-                    bytecode.push(Byte::new(Instruction::POP));
+                    bytecode.push_pop();
                 }
             }
             Expression::Index(_, None) => {}
             _ => {
-                bytecode.push(Byte::new(Instruction::POP));
+                bytecode.push_pop();
             }
         }
     }
@@ -5665,7 +5650,7 @@ impl Compiler {
             bytecode.push_store_pop(tmp_idx);
             bytecode.push_load(tmp_arr);
             bytecode.push_load(tmp_idx);
-            bytecode.push(Byte::new(Instruction::Index));
+            bytecode.push_index();
             bytecode.append(&mut self.do_compile(rhs));
             bytecode.push(Byte::new(Self::binop_for_assign_op(op, false)));
             let tmp_val = self.alloc_temp_slot();
@@ -5716,13 +5701,13 @@ impl Compiler {
             bytecode.push_store_pop(tmp_idx);
             bytecode.push_load(tmp_arr);
             bytecode.push_load(tmp_idx);
-            bytecode.push(Byte::new(Instruction::Index));
+            bytecode.push_index();
             let tmp_old = if !prefix {
                 let t = self.alloc_temp_slot();
                 bytecode.push_store_pop(t);
                 bytecode.push_load(tmp_arr);
                 bytecode.push_load(tmp_idx);
-                bytecode.push(Byte::new(Instruction::Index));
+                bytecode.push_index();
                 t
             } else {
                 0
@@ -5892,12 +5877,12 @@ impl Compiler {
     /// Wrap the top-of-stack value as `Ok(v)` (Result) or `Some(v)` (Option).
     fn emit_ok_or_some_wrap(bytecode: &mut impl EmitBuf, is_option: bool) {
         let tag = if is_option { 1u16 } else { 0u16 }; // Some=1, Ok=0
-        bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([tag, 1]));
+        bytecode.push_make_enum(tag, 1);
     }
 
     /// Wrap the top-of-stack value as `Result::Err(e)`.
     fn emit_result_err(bytecode: &mut impl EmitBuf) {
-        bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
+        bytecode.push_make_enum(1, 1); // Err tag=1 arity=1
     }
 
     /// Emit `Matrix` ops (`*`, `+`, `-`, unary `-`) when the typechecker
@@ -6005,10 +5990,10 @@ impl Compiler {
                 for i in 0..length {
                     bytecode.push_load(t0);
                     bytecode.push_const(i as i32);
-                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push_index();
                     bytecode.push_load(t1);
                     bytecode.push_const(i as i32);
-                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push_index();
                     bytecode.push(Byte::new(mul));
                     if i > 0 {
                         bytecode.push(Byte::new(add));
@@ -6047,7 +6032,7 @@ impl Compiler {
                 ] {
                     bytecode.push_load(src);
                     bytecode.push_const(i);
-                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push_index();
                     bytecode.push_store_pop(slot);
                 }
                 // i = ay*bz - az*by
@@ -6075,9 +6060,9 @@ impl Compiler {
                 bytecode.push(Byte::new(mul));
                 bytecode.push(Byte::new(sub));
                 if left_is_tuple {
-                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(3));
+                    bytecode.push_make_tuple(3);
                 } else {
-                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(3));
+                    bytecode.push_make_array(3);
                 }
             }
             LinearAlgebraKind::MatMul {
@@ -6105,15 +6090,15 @@ impl Compiler {
                             // A[i][t]
                             bytecode.push_load(t0);
                             bytecode.push_const(i as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             bytecode.push_const(t as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             // B[t][j]
                             bytecode.push_load(t1);
                             bytecode.push_const(t as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             bytecode.push_const(j as i32);
-                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push_index();
                             bytecode.push(Byte::new(mul));
                             if t > 0 {
                                 bytecode.push(Byte::new(add));
@@ -6121,15 +6106,15 @@ impl Compiler {
                         }
                     }
                     if row_is_tuple {
-                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                        bytecode.push_make_tuple(n as u32);
                     } else {
-                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                        bytecode.push_make_array(n as u32);
                     }
                 }
                 if outer_is_tuple {
-                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                    bytecode.push_make_tuple(m as u32);
                 } else {
-                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                    bytecode.push_make_array(m as u32);
                 }
             }
             LinearAlgebraKind::MatrixZip {
@@ -6152,26 +6137,26 @@ impl Compiler {
                     for j in 0..n {
                         bytecode.push_load(t0);
                         bytecode.push_const(i as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push_const(j as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push_load(t1);
                         bytecode.push_const(i as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push_const(j as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push(Byte::new(cell_op));
                     }
                     if row_is_tuple {
-                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                        bytecode.push_make_tuple(n as u32);
                     } else {
-                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                        bytecode.push_make_array(n as u32);
                     }
                 }
                 if outer_is_tuple {
-                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                    bytecode.push_make_tuple(m as u32);
                 } else {
-                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                    bytecode.push_make_array(m as u32);
                 }
             }
             LinearAlgebraKind::MatrixNeg {
@@ -6185,21 +6170,21 @@ impl Compiler {
                     for j in 0..n {
                         bytecode.push_load(t0);
                         bytecode.push_const(i as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push_const(j as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         self.emit_neg_tos(bytecode, elem_is_float);
                     }
                     if row_is_tuple {
-                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                        bytecode.push_make_tuple(n as u32);
                     } else {
-                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                        bytecode.push_make_array(n as u32);
                     }
                 }
                 if outer_is_tuple {
-                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                    bytecode.push_make_tuple(m as u32);
                 } else {
-                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                    bytecode.push_make_array(m as u32);
                 }
             }
         }
@@ -6340,7 +6325,7 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
         self.expr_depth += 1;
         let arity = value_args.len() + 1; // + meta
-        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+        bytecode.push_make_tuple(arity as u32);
         bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
         self.expr_depth = depth_on_entry;
         true
@@ -6425,11 +6410,11 @@ impl Compiler {
                 self.bytecode.il_mut(),
             );
             // Ok path: discard whole Result enum.
-            self.bytecode.push(Byte::new(Instruction::POP));
+            self.bytecode.push_pop();
             bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
             bb.bind_label(fail, self.bytecode.il_mut());
             // Discard Err message payload.
-            self.bytecode.push(Byte::new(Instruction::POP));
+            self.bytecode.push_pop();
             let msg = format!("> Test \"{desc}\" failed\n");
             self.emit_string_literal(&msg);
             self.bytecode.push(Byte::new(Instruction::PRINT));
@@ -6930,7 +6915,7 @@ impl Compiler {
                     bytecode.append(&mut bc);
                 }
                 let arity = items.len() as u32;
-                bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+                bytecode.push_make_tuple(arity);
             }
             Expression::Array(items) => {
                 for c in items {
@@ -6938,7 +6923,7 @@ impl Compiler {
                     bytecode.append(&mut bc);
                 }
                 let arity = items.len() as u32;
-                bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(arity));
+                bytecode.push_make_array(arity);
             }
             // --- Dict literals ---
             Expression::Dict(items) => {
@@ -6995,7 +6980,7 @@ impl Compiler {
                 bytecode.append(&mut target_bc);
                 let mut index_bc = self.do_compile(index);
                 bytecode.append(&mut index_bc);
-                bytecode.push(Byte::new(Instruction::Index));
+                bytecode.push_index();
             }
             Expression::Index(_, None) => {}
             Expression::Readonly(inner) => {
@@ -7186,7 +7171,7 @@ impl Compiler {
                         bytecode.push_load(tmp_inst);
                         self.emit_field_name(&mut bytecode, fname);
                         bytecode.push(Byte::new(Instruction::SetField));
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode.push_pop();
                     }
                 }
                 }
@@ -7571,7 +7556,7 @@ impl Compiler {
                         bytecode.push_load(dict_slot);
                         bytecode.push_load(dict_slot);
                         bytecode.push_const(hint.method_slot as i32);
-                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push_index();
                         bytecode.push(
                             Byte::new(Instruction::CallIndirect)
                                 .with_operand_u32(hint.arity as u32 + 1),
@@ -7852,7 +7837,7 @@ impl Compiler {
                             }
                         }
                         self.bytecode
-                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                            .push_make_tuple(arity as u32);
                         let mut operand = arity as u32 & 0xFFFF;
                         if variadic {
                             let call_span = (span.start, span.end);
@@ -7867,10 +7852,7 @@ impl Compiler {
                                 for &(tag, aux) in &tags {
                                     emit_ffi_type_const(&mut self.bytecode, tag, aux);
                                 }
-                                self.bytecode.push(
-                                    Byte::new(Instruction::MakeTuple)
-                                        .with_operand_u32(tags.len() as u32),
-                                );
+                                self.bytecode.push_make_tuple(tags.len() as u32);
                                 operand |= 1 << 16;
                             }
                         }
@@ -7898,7 +7880,7 @@ impl Compiler {
                             }
                         }
                         self.bytecode
-                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                            .push_make_tuple(arity as u32);
                         self.bytecode.push(
                             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                         );
@@ -9218,7 +9200,7 @@ impl Compiler {
                 }
                 _ => {
                     bytecode.append(&mut self.do_compile(value));
-                    bytecode.push(Byte::new(Instruction::POP));
+                    bytecode.push_pop();
                 }
             },
 
@@ -9335,7 +9317,7 @@ impl Compiler {
                     }
                     let arity = arg_type_tags.len() as u32;
                     self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+                        .push_make_tuple(arity);
                     // Push the ret type tag (top of stack for DeclareFFI).
                     let (ret_tag, ret_aux) = decl
                         .returns
@@ -9542,9 +9524,7 @@ impl Compiler {
 
                 // Emit MAKE_ENUM with the tag (upper 16) and
                 // arity (lower 16) packed in the operand.
-                bytecode.push(
-                    Byte::new(Instruction::MakeEnum).with_operands_u16([tag as u16, arity as u16]),
-                );
+                bytecode.push_make_enum(tag as u16, arity as u16);
             }
             // --- Match codegen (threaded layout) ---
             // Forward: scrutinee, JUMP_IF_MATCH cascade, last-arm UNPACK/POP/STORE.
@@ -9552,7 +9532,7 @@ impl Compiler {
             Expression::Match { scrutinee, arms } => {
                 if arms.is_empty() {
                     bytecode.append(&mut self.do_compile(scrutinee));
-                    bytecode.push(Byte::new(Instruction::POP));
+                    bytecode.push_pop();
                 } else {
                     let mut bb = BlockBuilder::new();
                     let end_label = bb.fresh_label(self.bytecode.il_mut());
@@ -9643,7 +9623,7 @@ impl Compiler {
                                 Pattern::Wildcard => {
                                     // Wildcard arm — POP the
                                     // scrutinee.
-                                    self.bytecode.push(Byte::new(Instruction::POP));
+                                    self.bytecode.push_pop();
                                 }
                                 Pattern::Binding { name } => {
                                     // Binding arm — STORE the
@@ -10095,7 +10075,7 @@ impl Compiler {
                     // Label binds are also IL fusion barriers for return-match sites.
                     if !self.suppress_match_fusion_barrier {
                         self.bytecode.push(Byte::new(Instruction::DUPLICATE));
-                        self.bytecode.push(Byte::new(Instruction::POP));
+                        self.bytecode.push_pop();
                     }
                     bb.bind_label(end_label, self.bytecode.il_mut());
 
@@ -10159,9 +10139,7 @@ impl Compiler {
                     None
                 };
                 if let Some(field_index) = enum_field_index {
-                    bytecode.push(
-                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
-                    );
+                    bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::GetField));
@@ -10170,7 +10148,7 @@ impl Compiler {
                     // match bindings historically lacked side-table
                     // types). LoadField(0) keeps the stack balanced;
                     // VM hardens non-enum receivers.
-                    bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
+                    bytecode.push_load_field(0);
                 }
             }
 
@@ -10254,7 +10232,7 @@ impl Compiler {
                     self.bytecode.il_mut(),
                 );
                 // Miss: discard failure, evaluate rhs, jump to end.
-                self.bytecode.push(Byte::new(Instruction::POP));
+                self.bytecode.push_pop();
                 let rhs_bc = self.do_compile(rhs);
                 self.bytecode.extend(rhs_bc);
                 bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
@@ -10310,14 +10288,12 @@ impl Compiler {
                     None
                 };
                 if let Some(field_index) = enum_field_index {
-                    self.bytecode.push(
-                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
-                    );
+                    self.bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
                     self.bytecode.push(Byte::new(Instruction::GetField));
                 } else {
-                    self.bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
+                    self.bytecode.push_load_field(0);
                 }
                 Self::emit_ok_or_some_wrap(&mut self.bytecode, true);
                 bb.bind_label(end, self.bytecode.il_mut());
@@ -10438,6 +10414,7 @@ impl Compiler {
             let init_len = inits.len();
             self.bytecode.splice_bytes_at(pos, inits);
             self.bytecode.bump_absolute_entry_targets(pos, init_len);
+            self.bytecode.bump_func_spans(pos, init_len);
             // Splice inserts before any label at `pos`; ensure the init
             // region itself is labeled so dead_block keeps it.
             self.bytecode.entry_label_at(pos);
@@ -10470,6 +10447,7 @@ impl Compiler {
             let main_label = self.bytecode.entry_label_at(main_off);
             self.bytecode.insert_jump_at(jmp_pos, main_label);
             self.bytecode.bump_absolute_entry_targets(jmp_pos, 1);
+            self.bytecode.bump_func_spans(jmp_pos, 1);
             for offset in self.functions.values_mut() {
                 if *offset >= jmp_pos {
                     *offset += 1;

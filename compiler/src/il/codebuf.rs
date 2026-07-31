@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
-    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower,
+    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower_with_funcs,
 };
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
@@ -91,6 +91,46 @@ impl CodeBuf {
         self.il.push_store_pop(slot);
     }
 
+    pub fn push_pop(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_pop();
+    }
+
+    pub fn push_index(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_index();
+    }
+
+    pub fn push_make_tuple(&mut self, arity: u32) {
+        self.invalidate_lowered();
+        self.il.push_make_tuple(arity);
+    }
+
+    pub fn push_make_array(&mut self, arity: u32) {
+        self.invalidate_lowered();
+        self.il.push_make_array(arity);
+    }
+
+    pub fn push_make_enum(&mut self, tag: u16, arity: u16) {
+        self.invalidate_lowered();
+        self.il.push_make_enum(tag, arity);
+    }
+
+    pub fn push_box_value(&mut self, tag: u32) {
+        self.invalidate_lowered();
+        self.il.push_box_value(tag);
+    }
+
+    pub fn push_unbox_value(&mut self, tag: u32) {
+        self.invalidate_lowered();
+        self.il.push_unbox_value(tag);
+    }
+
+    pub fn push_load_field(&mut self, index: u32) {
+        self.invalidate_lowered();
+        self.il.push_load_field(index);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
@@ -166,6 +206,21 @@ impl CodeBuf {
 
     pub fn funcs(&self) -> &[IlFunc] {
         &self.funcs
+    }
+
+    /// Shift recorded [`IlFunc`] emitting spans after a splice at `threshold`.
+    pub fn bump_func_spans(&mut self, threshold: usize, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        for f in &mut self.funcs {
+            if f.code_start >= threshold {
+                f.code_start += delta;
+            }
+            if f.code_end >= threshold {
+                f.code_end += delta;
+            }
+        }
     }
 
     pub fn fresh_label(&mut self) -> Label {
@@ -261,7 +316,7 @@ impl CodeBuf {
     }
 
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
-        let lowered = lower(self.il.ops(), pool);
+        let lowered = lower_with_funcs(self.il.ops(), &self.funcs, pool);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
         lowered
