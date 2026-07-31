@@ -4193,15 +4193,15 @@ impl Compiler {
                     || name == "unknown"
             }
             Ty::Var(_) => true,
+            // `()` / empty tuple is unit-like.
+            Ty::Tuple(items) if items.is_empty() => true,
             _ => false,
         }
     }
 
     /// Whether an implicit fall-through `CONST 0` is valid for `name`'s return.
     fn fallthrough_allows_zero(&self, name: &str) -> bool {
-        use crate::typechecking::ty::result_ok_err;
-        // Async fn bodies complete with a sentinel; the `coroutine<…>` value
-        // is produced by MakeCoro at the call site.
+        use crate::typechecking::ty::{is_result_ty, result_ok_err};
         if self.coroutine_fns.contains(name)
             || self
                 .current_function_qualified
@@ -4211,24 +4211,31 @@ impl Compiler {
             return true;
         }
         let Some(ret) = self.fn_return_ty(name) else {
-            // No scheme (e.g. some inherent methods) — allow zero rather than
-            // false-positive E0111; annotated unsafe returns are looked up.
             return true;
         };
-        if self.compiling_result_mode {
+        let allow = if self.compiling_result_mode {
             if let Some((ok, _)) = result_ok_err(&ret) {
-                return Self::ty_allows_zero_default(&ok);
+                Self::ty_allows_zero_default(&ok)
+            } else {
+                true
             }
-            // Still emit Ok-wrap of zero when the Result peel fails.
-            return true;
-        }
-        // Bare `coroutine<…>` scheme (e.g. looked up without coroutine_fns).
-        if let crate::typechecking::Ty::App(con, _) = &ret
+        } else if let crate::typechecking::Ty::App(con, _) = &ret
             && matches!(con.as_ref(), crate::typechecking::Ty::Con(n) if n == "coroutine")
         {
-            return true;
+            true
+        } else {
+            Self::ty_allows_zero_default(&ret)
+        };
+        if name == "main" {
+            eprintln!(
+                "FALLTHROUGH_DBG main result_mode={} is_result={} peel={:?} allow={} ret={ret:?}",
+                self.compiling_result_mode,
+                is_result_ty(&ret),
+                result_ok_err(&ret),
+                allow
+            );
         }
-        Self::ty_allows_zero_default(&ret)
+        allow
     }
 
     /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
