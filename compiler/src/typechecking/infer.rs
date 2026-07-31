@@ -10913,8 +10913,10 @@ impl Checker {
     /// stays lockstep with codegen.
     ///
     /// Codegen's `do_compile(args)` consumes the `Fragment` id and each
-    /// `Argument` id, but does **not** walk type-annotation children
-    /// (those IDs are minted by `pre_walk` and left unused on both sides).
+    /// `Argument` id, but does **not** walk type-annotation children.
+    /// Those annotation ids stay in the pre-walk stream and are consumed
+    /// by the next sibling (the body) on both sides — aligned with each
+    /// other, still orphaned vs the annotation nodes themselves.
     /// Caching the parsed parameter types at the Argument ids lets
     /// `lookup_at` serve parameter types without the name side-table.
     fn assign_fn_arg_node_ids(&mut self, args: &Output, arg_tys: &[(String, Ty)]) {
