@@ -553,29 +553,32 @@ fn is_cond_join_pred_kind(kind: IlJumpKind) -> bool {
     )
 }
 
+fn is_match_join_pred_kind(kind: IlJumpKind) -> bool {
+    matches!(kind, IlJumpKind::JumpIfMatch { .. })
+}
+
 /// Producer / bin-tail index before a jump into a return convoy.
 ///
-/// Unconditional: immediate op before the JMP. Conditional: value under the
-/// condition (`…; producer; cond; JMPF/JMPT`) — the condition stays put.
-/// `JumpIfMatch` is refused (match diamonds stay on [`multi_op_join_convoy`]).
+/// Unconditional / JumpIfMatch: immediate op before the jump.
+/// Conditional: value under the condition (`…; producer; cond; JMPF/JMPT`).
 fn convoy_pred_tail_before(
     ops: &[IlOp],
     jump_idx: usize,
     kind: IlJumpKind,
 ) -> Option<(usize, common::Byte)> {
     match kind {
-        IlJumpKind::Unconditional => immediate_byte_before(ops, jump_idx),
+        IlJumpKind::Unconditional | IlJumpKind::JumpIfMatch { .. } => {
+            immediate_byte_before(ops, jump_idx)
+        }
         IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue => {
             if jump_idx < 2 {
                 return None;
             }
             let cond = ops[jump_idx - 1].as_encode_byte()?;
-            // Condition must be a real stack producer/consumer op, not empty.
             let _ = cond;
             let b = ops[jump_idx - 2].as_encode_byte()?;
             Some((jump_idx - 2, b))
         }
-        IlJumpKind::JumpIfMatch { .. } => None,
     }
 }
 
@@ -609,8 +612,9 @@ fn convoy_pred_bin_tail_before(
 ///
 /// - Plain binop `OP` on every pred → `BinReturn(OP)`.
 /// - Identical `BinSlotImm`/`BinSlotSlot` → keep one copy before `RETURN`.
-/// - Preds may be `JMP` or `JMPF`/`JMPT` (value under cond); not mixed with each
-///   other, and not `JumpIfMatch`. Join SP must be Known ([`super::sp`]).
+/// - Preds may be `JMP`, `JMPF`/`JMPT`, or all-`JumpIfMatch` (not mixed across
+///   those three classes). Join SP must be Known for cond / match / jump-only
+///   templates ([`super::sp`]).
 fn bin_join_convoy(ops: &mut Vec<IlOp>) {
     let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, tail_byte, emit_bin_return)
@@ -629,6 +633,7 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
         let mut jump_preds: Vec<(usize, IlJumpKind)> = Vec::new();
         let mut saw_uncond = false;
         let mut saw_cond = false;
+        let mut saw_match = false;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
                 kind,
@@ -641,19 +646,18 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             if !cluster.iter().any(|l| l == target) {
                 continue;
             }
-            if matches!(kind, IlJumpKind::JumpIfMatch { .. }) {
-                ok = false;
-                break;
-            }
             if *kind == IlJumpKind::Unconditional {
                 saw_uncond = true;
             } else if is_cond_join_pred_kind(*kind) {
                 saw_cond = true;
+            } else if is_match_join_pred_kind(*kind) {
+                saw_match = true;
             } else {
                 ok = false;
                 break;
             }
-            if saw_uncond && saw_cond {
+            let classes = u8::from(saw_uncond) + u8::from(saw_cond) + u8::from(saw_match);
+            if classes > 1 {
                 ok = false;
                 break;
             }
@@ -679,7 +683,7 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        let has_cond = saw_cond;
+        let has_cond = saw_cond || saw_match;
         if has_cond && !info.sp_before(cluster_start).is_known() {
             r += 1;
             continue;
@@ -1068,9 +1072,8 @@ fn label_cluster_ids(ops: &[IlOp], start: usize, end: usize) -> Vec<Label> {
 /// `RETURN`. The **first** label is the stack join (JMPs target it); trailing
 /// labels are PC aliases (e.g. `Label(join); Label(ret); RETURN`).
 ///
-/// Preds may be `JMP` or `JMPF`/`JMPT` (value under condition); not mixed, and
-/// not `JumpIfMatch`. Join SP must be Known. Jump-pred-only joins (no
-/// fall-through producer) use the first pred as the template.
+/// Preds may be `JMP`, `JMPF`/`JMPT`, or all-`JumpIfMatch` (not mixed across
+/// those classes). Join SP must be Known for cond / match / jump-only joins.
 fn return_convoy(ops: &mut Vec<IlOp>) {
     let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, join, producer)
@@ -1093,6 +1096,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
         let mut jump_preds: Vec<(usize, IlJumpKind)> = Vec::new();
         let mut saw_uncond = false;
         let mut saw_cond = false;
+        let mut saw_match = false;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
                 kind,
@@ -1105,19 +1109,18 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             if !cluster.iter().any(|l| l == target) {
                 continue;
             }
-            if matches!(kind, IlJumpKind::JumpIfMatch { .. }) {
-                ok = false;
-                break;
-            }
             if *kind == IlJumpKind::Unconditional {
                 saw_uncond = true;
             } else if is_cond_join_pred_kind(*kind) {
                 saw_cond = true;
+            } else if is_match_join_pred_kind(*kind) {
+                saw_match = true;
             } else {
                 ok = false;
                 break;
             }
-            if saw_uncond && saw_cond {
+            let classes = u8::from(saw_uncond) + u8::from(saw_cond) + u8::from(saw_match);
+            if classes > 1 {
                 ok = false;
                 break;
             }
@@ -1141,7 +1144,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        let has_cond = saw_cond;
+        let has_cond = saw_cond || saw_match;
         if has_cond && !info.sp_before(cluster_start).is_known() {
             r += 1;
             continue;
@@ -1637,11 +1640,78 @@ mod tests {
     }
 
     #[test]
-    fn return_convoy_skips_jump_if_match_pred() {
+    fn return_convoy_fuses_agreeing_const_via_jump_if_match() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::ConstReturnImm { imm: 0, .. })
+                || matches!(
+                    op.instruction(),
+                    Some(Instruction::ConstReturnImm)
+                )
+        }));
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        IlOp::Jump {
+                            kind: IlJumpKind::JumpIfMatch { .. },
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn return_convoy_skips_mixed_jump_if_match_and_jmp() {
         let mut ops = vec![
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn return_convoy_skips_jump_if_match_unknown_join_sp() {
+        // FORMAT poisons SP; JumpIfMatch diamond must refuse.
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::FORMAT)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
                 target: Label(0),
                 loc: common::DebugLoc::unknown(),
             },
@@ -1905,7 +1975,38 @@ mod tests {
     }
 
     #[test]
-    fn bin_join_convoy_skips_jump_if_match_pred() {
+    fn bin_join_convoy_fuses_agreeing_binop_via_jump_if_match() {
+        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::ADD as u8,
+            0,
+            1,
+        );
+        let mut ops = vec![
+            IlOp::byte(imm),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(imm),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        let imm_count = ops
+            .iter()
+            .filter(|op| is_insn(op, Instruction::BinSlotImm))
+            .count();
+        assert_eq!(imm_count, 1, "identical BinSlotImm sunk once before RETURN");
+    }
+
+    #[test]
+    fn bin_join_convoy_skips_mixed_jump_if_match_and_jmp() {
         let mut ops = vec![
             IlOp::byte(Byte::new(Instruction::ADD)),
             IlOp::Jump {
@@ -1915,7 +2016,7 @@ mod tests {
             },
             IlOp::byte(Byte::new(Instruction::ADD)),
             IlOp::Jump {
-                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                kind: IlJumpKind::Unconditional,
                 target: Label(0),
                 loc: common::DebugLoc::unknown(),
             },
