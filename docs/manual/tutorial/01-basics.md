@@ -265,7 +265,7 @@ fn example() {
 }
 ```
 
-A `defer` block runs when the **enclosing function** exits — whether by `return` or by falling off the end of the body. It does **not** run if the VM aborts via `panic`. Multiple `defer` statements in one function run in **last-in, first-out (LIFO)** order: the defer written last runs first. Functions with a `defer` are not self-tail-call optimized so cleanup always runs.
+A `defer` block runs when the **enclosing function** exits — via `return` / `return;` or by falling off the end of a **unit** body (codegen still runs deferred cleanup). It does **not** run if the VM aborts via `panic`, and defers scheduled before a non-terminating `while true` loop never run on function exit (`E0123` warning). Multiple `defer` statements in one function run in **last-in, first-out (LIFO)** order: the defer written last runs first. Functions with a `defer` are not self-tail-call optimized so cleanup always runs.
 
 Outer locals are **not** visible inside a defer unless you list them in an explicit `use (…)` capture list (same rule as lambdas):
 
@@ -516,7 +516,7 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 7. **`else if` vs separate `if`s** — Chained `else if` runs at most one branch. Separate `if` statements can each run (as in FizzBuzz when a number is divisible by both 3 and 5).
 
-8. **Implicit return at end of function** — Relying on falling off the end without `return` may yield `0`. Be explicit for public APIs.
+8. **Missing `return` on non-unit functions** — Falling off the end is only allowed for unit (and open) returns. `-> int` / `-> string` / `Option` / … need an explicit `return` on every path (or a proven `while true` loop). Use `return;` for early exit from unit functions.
 
 9. **Parentheses in tuples vs grouping** — `(1 + 2)` is a grouped expression; `(1, 2)` is a two-element tuple (covered in [Aggregates](05-aggregates.md)). A single-element tuple requires a trailing comma: `(1,)`.
 
