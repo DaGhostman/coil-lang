@@ -2779,6 +2779,22 @@ fn example_lambda_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Nested typed lambdas must keep Fragment/Argument NodeIds lockstep with
+/// codegen (`assign_fn_arg_node_ids`); a desync surfaces as wrong results or
+/// compile failure rather than Identifier span prefer.
+#[test]
+fn nested_typed_lambdas_print_sum() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let add = fn (int x) => fn (int y) => x + y;
+    print "%i", add(40)(2);
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
 #[test]
 fn example_method_overload_prints_1116() {
     let output = run_example("examples/method_overload.hy");

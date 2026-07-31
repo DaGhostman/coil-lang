@@ -16162,6 +16162,115 @@ fn main() {
     }
 
     #[test]
+    fn lambda_multi_arg_node_ids_cached() {
+        let src = "let f = fn (int x, int y) => x + y; let _ = f(1, 2);";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "{:?}", c.messages());
+        let ast = Pratt::default().parse(src).expect("parse");
+
+        fn collect_lambda_arg_spans(node: &parser::ast::Output<'_>) -> Vec<(usize, usize)> {
+            use parser::ast::Expression;
+            let mut out = Vec::new();
+            match node.1.as_ref() {
+                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
+                    for c in cs {
+                        out.extend(collect_lambda_arg_spans(c));
+                    }
+                }
+                Expression::Variable(_, Some(value)) | Expression::Constant(_, Some(value)) => {
+                    out.extend(collect_lambda_arg_spans(value));
+                }
+                Expression::Lambda { args, .. } => {
+                    if let Expression::Fragment(children) = args.1.as_ref() {
+                        for child in children {
+                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                                out.push((child.0.start, child.0.end));
+                            }
+                        }
+                    }
+                }
+                Expression::Expr(e)
+                | Expression::Statement(e)
+                | Expression::ExprStatement(e)
+                | Expression::Group(e) => out.extend(collect_lambda_arg_spans(e)),
+                _ => {}
+            }
+            out
+        }
+
+        let spans = collect_lambda_arg_spans(&ast);
+        assert_eq!(spans.len(), 2, "expected two Argument nodes");
+        for (start, end) in spans {
+            assert_eq!(
+                c.lookup_for_codegen_span(start, end),
+                Some(int()),
+                "each lambda Argument span must cache int"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lambda_arg_node_ids_cached() {
+        // Nested lambdas both consume Fragment+Argument NodeIds; body cache
+        // must stay lockstep (no Identifier span prefer for args).
+        let src = "let f = fn (int x) => fn (int y) => x + y; let _ = f(1)(2);";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "{:?}", c.messages());
+        let ast = Pratt::default().parse(src).expect("parse");
+
+        fn collect_lambda_arg_spans(node: &parser::ast::Output<'_>) -> Vec<(usize, usize)> {
+            use parser::ast::Expression;
+            let mut out = Vec::new();
+            match node.1.as_ref() {
+                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
+                    for c in cs {
+                        out.extend(collect_lambda_arg_spans(c));
+                    }
+                }
+                Expression::Variable(_, Some(value)) | Expression::Constant(_, Some(value)) => {
+                    out.extend(collect_lambda_arg_spans(value));
+                }
+                Expression::Lambda { args, body, .. } => {
+                    if let Expression::Fragment(children) = args.1.as_ref() {
+                        for child in children {
+                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                                out.push((child.0.start, child.0.end));
+                            }
+                        }
+                    }
+                    out.extend(collect_lambda_arg_spans(body));
+                }
+                Expression::Expr(e)
+                | Expression::Statement(e)
+                | Expression::ExprStatement(e)
+                | Expression::Group(e)
+                | Expression::ImplicitReturn(e)
+                | Expression::Return(e) => out.extend(collect_lambda_arg_spans(e)),
+                Expression::Call { name, args } => {
+                    out.extend(collect_lambda_arg_spans(name));
+                    out.extend(collect_lambda_arg_spans(args));
+                }
+                Expression::Add(a, b) | Expression::Sub(a, b) | Expression::Mul(a, b) => {
+                    out.extend(collect_lambda_arg_spans(a));
+                    out.extend(collect_lambda_arg_spans(b));
+                }
+                _ => {}
+            }
+            out
+        }
+
+        let spans = collect_lambda_arg_spans(&ast);
+        assert_eq!(spans.len(), 2, "outer and inner Argument spans");
+        for (start, end) in spans {
+            assert_eq!(
+                c.lookup_for_codegen_span(start, end),
+                Some(int()),
+                "nested lambda Argument spans must cache int"
+            );
+        }
+    }
+
+    #[test]
     fn cache_is_populated_after_check_program() {
         // After infer, every pre-walked node should have a cached type.
         let (mut c, _) = check("1 + 2;");
