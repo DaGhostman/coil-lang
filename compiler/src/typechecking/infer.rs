@@ -16196,6 +16196,54 @@ fn main() {
     }
 
     #[test]
+    fn lambda_arg_node_ids_cached_before_body() {
+        // Lambdas also call `assign_fn_arg_node_ids`; Argument spans must
+        // cache the parameter type (not a body type stolen via id skew).
+        let src = "let f = fn (int x) => x; let _ = f(1);";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "{:?}", c.messages());
+
+        let ast = Pratt::default().parse(src).expect("parse");
+
+        fn find_lambda_arg_span(node: &parser::ast::Output<'_>) -> Option<(usize, usize)> {
+            use parser::ast::Expression;
+            match node.1.as_ref() {
+                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
+                    cs.iter().find_map(find_lambda_arg_span)
+                }
+                Expression::Variable(_, Some(value)) | Expression::Constant(_, Some(value)) => {
+                    find_lambda_arg_span(value)
+                }
+                Expression::Lambda { args, .. } => {
+                    if let Expression::Fragment(children) = args.1.as_ref() {
+                        children.iter().find_map(|child| {
+                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                                Some((child.0.start, child.0.end))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Expression::Expr(e)
+                | Expression::Statement(e)
+                | Expression::ExprStatement(e)
+                | Expression::Group(e) => find_lambda_arg_span(e),
+                _ => None,
+            }
+        }
+
+        let (start, end) = find_lambda_arg_span(&ast).expect("lambda Argument span");
+        assert_eq!(
+            c.lookup_for_codegen_span(start, end),
+            Some(int()),
+            "lambda Argument span must cache the parameter type"
+        );
+    }
+
+    #[test]
     fn cache_is_populated_after_check_program() {
         // After infer, every pre-walked node should have a cached type.
         let (mut c, _) = check("1 + 2;");
