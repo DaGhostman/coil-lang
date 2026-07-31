@@ -49,7 +49,7 @@
 
 - `find_object_by_addr` is O(n) over the live heap; hot paths that classify pointers still walk the intrusive list.
 - `codegen_var_types` is a side-table workaround for pre-walk / infer ID misalignment inside function bodies (`infer_function` skips args). Prefer aligning ID minting long-term.
-- Implicit fall-through is type-directed: unit/int/byte/bool/float → `CONST 0; RETURN`; `Option` → `MakeEnum` `None`; Result-mode only when Ok is unit or an open var (Ok-wrap); otherwise `E0111` (`ReturnMismatch`) and still completes the epilogue.
+- Implicit fall-through is type-directed: unit/int/byte/bool/float → `CONST 0; RETURN`; `Option` → `MakeEnum` `None`; Result-mode Ok-wraps when Ok is unit, an open var, or a zero-safe scalar (not `string`/ADTs); otherwise `E0111` (`ReturnMismatch`) and still completes the epilogue.
 - `cargo clippy` fails on a pre-existing `#[deny(clippy::mut_from_ref)]` in `Gc::payload_mut`; use `cargo check --workspace` as the lint gate.
 
 ## Dev gotchas

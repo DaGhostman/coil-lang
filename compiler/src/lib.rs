@@ -4175,8 +4175,8 @@ impl Compiler {
 
     /// Ok payload that may be invented as `CONST 0` + Ok-wrap on fall-through.
     ///
-    /// Unit and open vars (bodies that only use `?` / `assert`) are safe;
-    /// concrete non-unit Oks (`int`, `string`, …) are not.
+    /// Unit, open vars (bodies that only use `?` / `assert`), and zero-safe
+    /// scalars (`int`/`bool`/…) are Ok; `string` / ADTs are not.
     fn ty_allows_result_ok_fallthrough(ty: &crate::typechecking::Ty) -> bool {
         use crate::typechecking::Ty;
         let mut t = ty.clone();
@@ -4186,7 +4186,10 @@ impl Compiler {
         if Self::ty_is_unit_like(&t) {
             return true;
         }
-        matches!(&t, Ty::Var(_)) || matches!(&t, Ty::Con(n) if n == "unknown")
+        if matches!(&t, Ty::Var(_)) || matches!(&t, Ty::Con(n) if n == "unknown") {
+            return true;
+        }
+        Self::ty_allows_zero_default(&t)
     }
 
     /// True when `Value::default()` (`0`) is a valid representation for `ty`.
@@ -4238,9 +4241,8 @@ impl Compiler {
             return true;
         }
         if self.compiling_result_mode {
-            // Result-mode may Ok-wrap an implicit unit (`Result<(), E>` /
-            // test cases) or an unresolved Ok var after `?`. Do not invent
-            // `Ok(0)` for a concrete non-unit Ok (e.g. `Result<int, …>`).
+            // Result-mode Ok-wraps unit / open Ok / zero-safe scalars.
+            // Refuse inventing Ok for `string` / ADT payloads.
             if let Some((ok, _)) = result_ok_err(&ret) {
                 return Self::ty_allows_result_ok_fallthrough(&ok);
             }
