@@ -552,4 +552,36 @@ mod tests {
         assert!(buf.funcs().is_empty());
         assert!(buf.ops().is_empty());
     }
+
+    /// Production finalize: owning `IlModule` + entry map must still resolve CALL.
+    #[test]
+    fn lower_in_place_resolves_entry_call_through_module() {
+        let mut buf = CodeBuf::new();
+        let entry = buf.bind_fresh_entry();
+        let start = buf.len();
+        buf.push_const(7);
+        buf.push_return();
+        let end = buf.len();
+        buf.record_func("f", Some(entry), start, end);
+
+        // Packed CALL to entry PC → Entry rewrite; lives in epilogue after split.
+        buf.push(Byte::new(Instruction::CALL).with_call_packed(0, start as u32));
+        buf.push(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = buf.lower_in_place(&mut pool);
+        assert!(
+            matches!(*lowered.bytecode[0].bytecode(), Instruction::ConstReturnImm),
+            "body Const+Return must fuse through lower_module"
+        );
+        assert_eq!(lowered.bytecode[0].operand_u32(), 7);
+        assert!(matches!(*lowered.bytecode[1].bytecode(), Instruction::CALL));
+        assert_eq!(
+            lowered.bytecode[1].call_parts(),
+            (0, 0),
+            "CALL must target fused entry PC after owning-module lower"
+        );
+        assert!(matches!(*lowered.bytecode[2].bytecode(), Instruction::HALT));
+        assert_eq!(buf.as_slice().len(), lowered.bytecode.len());
+    }
 }

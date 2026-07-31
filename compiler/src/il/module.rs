@@ -240,6 +240,24 @@ mod tests {
         assert_eq!(m.funcs[0].meta.entry, Some(Label(9)));
     }
 
+    /// Empty `funcs` must not discard a previously attached entry map when rebuilding.
+    #[test]
+    fn with_entries_survives_empty_funcs_from_flat() {
+        let ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let mut entries = HashMap::new();
+        entries.insert(0usize, Label(3));
+        let m = IlModule::from_flat(&ops, &[]).with_entries(entries);
+        assert!(m.funcs.is_empty());
+        assert_eq!(m.prologue.len(), 2);
+        assert_eq!(m.entry_at_offset.get(&0), Some(&Label(3)));
+    }
+
     #[test]
     fn empty_funcs_optimizes_whole_buffer() {
         let mut m = IlModule {

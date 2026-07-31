@@ -506,4 +506,47 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 1, .. })));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 2, .. })));
     }
+
+    #[test]
+    fn join_cse_keeps_load_when_join_sp_unknown() {
+        // PRINT fail-closes SP; Known-SP Load join CSE must not fire.
+        let mut ops = vec![
+            IlOp::byte(common::Byte::new(common::Instruction::PRINT)),
+            IlOp::Const {
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Label(Label(2)),
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        let join = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(2))))
+            .unwrap();
+        let info = sp::analyze(&ops);
+        assert!(
+            !info.sp_before(join).is_known(),
+            "precondition: join SP must be Unknown"
+        );
+        cfg_gvn(&mut ops);
+        let loads = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { slot: 3, .. }))
+            .count();
+        assert_eq!(loads, 3, "Unknown SP must keep join Load");
+    }
 }
