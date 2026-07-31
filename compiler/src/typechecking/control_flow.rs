@@ -71,9 +71,13 @@ fn walk(
                     i += 1;
                     continue;
                 }
-                match child.1.as_ref() {
+                // Function-body stmts are `Statement`-wrapped; nested block
+                // items from the recursive statement parser are bare. Peel so
+                // both shapes register defers / infinite loops the same way.
+                let peeled = peel_stmt(child);
+                match peeled.1.as_ref() {
                     Expression::Defer { .. } => {
-                        let span = child.0.into_range();
+                        let span = peeled.0.into_range();
                         if inside_infinite {
                             warn_defer_never(messages, span.clone(), None);
                         } else {
@@ -186,6 +190,17 @@ pub fn is_infinite_loop(expr: &Output<'_>, lookup: &dyn Fn(&str) -> Option<Const
             eval_bool_const(cond, lookup) == Some(true) && !may_break(body, 0)
         }
         _ => false,
+    }
+}
+
+/// Peel `Statement` / expr wrappers so block item classification matches nested bodies.
+fn peel_stmt<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
+    match expr.1.as_ref() {
+        Expression::Statement(inner)
+        | Expression::Expr(inner)
+        | Expression::ExprStatement(inner)
+        | Expression::Group(inner) => peel_stmt(inner),
+        _ => expr,
     }
 }
 
@@ -337,6 +352,48 @@ mod tests {
             cf.messages
                 .iter()
                 .any(|m| m.code() == Some(ErrorCode::DeferNeverRuns))
+        );
+    }
+
+    fn stmt(inner: Output<'_>) -> Output<'_> {
+        out(Expression::Statement(inner))
+    }
+
+    #[test]
+    fn statement_wrapped_defer_before_while_true_warns() {
+        let defer = stmt(out(Expression::Defer {
+            captures: vec![],
+            body: block(vec![]),
+        }));
+        let loop_ = stmt(while_loop(Expression::Bool(true), block(vec![])));
+        let body = block(vec![defer, loop_]);
+        let cf = analyze_fn_body(&body, &|_| None);
+        assert!(cf.always_exits, "while true should still exit");
+        assert!(
+            cf.messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::DeferNeverRuns)),
+            "Statement-wrapped defer before infinite while must warn; msgs={:?}",
+            cf.messages.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn statement_wrapped_defer_inside_while_true_warns() {
+        let defer = stmt(out(Expression::Defer {
+            captures: vec![],
+            body: block(vec![]),
+        }));
+        let loop_ = stmt(while_loop(Expression::Bool(true), block(vec![defer])));
+        let body = block(vec![loop_]);
+        let cf = analyze_fn_body(&body, &|_| None);
+        assert!(cf.always_exits);
+        assert!(
+            cf.messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::DeferNeverRuns)),
+            "Statement-wrapped defer inside infinite while must warn; msgs={:?}",
+            cf.messages.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
 }
