@@ -6410,6 +6410,8 @@ impl Compiler {
             if let Some(label) = self.bytecode.entry_label_for_offset(*offset as usize) {
                 self.bytecode.emit_entry(EntryKind::Call, 0, label);
             } else {
+                // Fallback for cases without a bound entry label (should be rare
+                // after `bind_function_entry`); packed CALL(0, pc) keeps harness green.
                 self.bytecode.push(
                     Byte::new(Instruction::CALL).with_call_packed(0, *offset),
                 );

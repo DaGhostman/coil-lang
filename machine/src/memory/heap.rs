@@ -40,17 +40,11 @@ impl Heap {
     /// for FFI. The returned pointer is leaked for the duration of the call.
     #[must_use]
     pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
-        let mut current = self.head_for_lookup();
-        while let Some(reference) = current {
-            if reference.addr() == addr
-                && let crate::memory::Object::String(gc) = reference
-            {
-                let s: std::ffi::CString =
-                    std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
-                let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
-                return Some(boxed.as_ptr());
-            }
-            current = reference.get_next();
+        if let Some(crate::memory::Object::String(gc)) = self.find_object_by_addr(addr) {
+            let s: std::ffi::CString =
+                std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
+            let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
+            return Some(boxed.as_ptr());
         }
         None
     }
@@ -294,15 +288,8 @@ impl Heap {
         addr: u64,
         f: impl FnOnce(&mut ObjCryptoHasher) -> R,
     ) -> Option<R> {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::CryptoHasher(gc) = reference {
-                    return Some(f(gc.payload_mut()));
-                }
-                return None;
-            }
-            current = reference.get_next();
+        if let Some(Object::CryptoHasher(gc)) = self.find_object_by_addr(addr) {
+            return Some(f(gc.payload_mut()));
         }
         None
     }
@@ -313,35 +300,21 @@ impl Heap {
         addr: u64,
         f: impl FnOnce(&mut ObjRegex) -> R,
     ) -> Option<R> {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::Regex(gc) = reference {
-                    return Some(f(gc.payload_mut()));
-                }
-                return None;
-            }
-            current = reference.get_next();
+        if let Some(Object::Regex(gc)) = self.find_object_by_addr(addr) {
+            return Some(f(gc.payload_mut()));
         }
         None
     }
 
     /// Write back scratch-buffer values into a live `ObjArray`.
     pub fn update_array_elements(&mut self, addr: u64, values: &[i64]) {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let Object::Array(mut gc) = reference {
-                    let arr = gc.as_mut();
-                    for (i, &v) in values.iter().enumerate() {
-                        if i < arr.elements.len() {
-                            arr.elements[i] = Value::from(v);
-                        }
-                    }
+        if let Some(Object::Array(mut gc)) = self.find_object_by_addr(addr) {
+            let arr = gc.as_mut();
+            for (i, &v) in values.iter().enumerate() {
+                if i < arr.elements.len() {
+                    arr.elements[i] = Value::from(v);
                 }
-                return;
             }
-            current = reference.get_next();
         }
     }
 

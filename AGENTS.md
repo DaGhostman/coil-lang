@@ -47,7 +47,7 @@
 
 ## Known limitations
 
-- `find_object_by_addr` is O(n) over the live heap; hot paths that classify pointers still walk the intrusive list.
+- `Heap::find_object_by_addr` / VM lookup use the addr index (O(1)). GC mark still walks the intrusive list; `Gc::payload_mut` remains a clippy lint exception (`cargo check` is the gate).
 - `codegen_var_types` remains for match/method/free-fn Identifier codegen. Lambdas consume arg NodeIds via `assign_fn_arg_node_ids` (no Identifier span prefer). Free-fn/method assign deferred — enabling it broke Hash derive and constraint-kind; side-table retirement deferred.
 - Implicit fall-through is type-directed: unit/int/byte/bool/float → `CONST 0; RETURN`; `Option` → `MakeEnum` `None`; Result-mode Ok-wraps when Ok is unit, an open var, or a zero-safe scalar (not `string`/ADTs); otherwise `E0111` (`ReturnMismatch`) and still completes the epilogue.
 - `cargo clippy` fails on a pre-existing `#[deny(clippy::mut_from_ref)]` in `Gc::payload_mut`; use `cargo check --workspace` as the lint gate.
