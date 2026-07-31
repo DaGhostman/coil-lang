@@ -58,6 +58,73 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     }
 }
 
+/// Run [`optimize`] on each [`super::IlFunc`] emitting span; leave prologue and
+/// inter-function glue untouched. Falls back to whole-buffer opts when `funcs`
+/// is empty (unit tests / buffers without `record_func`).
+pub fn optimize_per_func(
+    ops: &mut Vec<IlOp>,
+    funcs: &[super::IlFunc],
+    opts: &OptimizeOptions,
+) {
+    if funcs.is_empty() {
+        optimize(ops, opts);
+        return;
+    }
+
+    let mut ranges: Vec<(usize, usize)> = funcs
+        .iter()
+        .filter(|f| f.code_start < f.code_end)
+        .map(|f| emitting_range_to_raw(ops, f.code_start, f.code_end))
+        .filter(|(s, e)| s < e)
+        .collect();
+    ranges.sort_by_key(|&(s, _)| s);
+    // Process from the end so earlier raw indices stay valid after splices.
+    for &(raw_start, raw_end) in ranges.iter().rev() {
+        if raw_end > ops.len() || raw_start >= raw_end {
+            continue;
+        }
+        let mut slice = ops[raw_start..raw_end].to_vec();
+        optimize(&mut slice, opts);
+        ops.splice(raw_start..raw_end, slice);
+    }
+}
+
+/// Map inclusive-exclusive emitting indices to a raw op range, including
+/// leading labels bound at `emit_start`.
+fn emitting_range_to_raw(ops: &[IlOp], emit_start: usize, emit_end: usize) -> (usize, usize) {
+    let mut emitting = 0usize;
+    let mut raw_start: Option<usize> = None;
+    let mut raw_end: Option<usize> = None;
+    for (i, op) in ops.iter().enumerate() {
+        if emitting == emit_start && raw_start.is_none() {
+            let mut s = i;
+            while s > 0 && !ops[s - 1].emits_code() {
+                s -= 1;
+            }
+            raw_start = Some(s);
+        }
+        if !op.emits_code() {
+            continue;
+        }
+        emitting += 1;
+        if emitting == emit_end {
+            raw_end = Some(i + 1);
+            break;
+        }
+    }
+    (
+        raw_start.unwrap_or(0),
+        raw_end.unwrap_or_else(|| {
+            // emit_end past buffer: take through end once start was found.
+            if raw_start.is_some() {
+                ops.len()
+            } else {
+                0
+            }
+        }),
+    )
+}
+
 fn label_targets(ops: &[IlOp]) -> std::collections::HashMap<u32, usize> {
     let mut map = std::collections::HashMap::new();
     for (i, op) in ops.iter().enumerate() {
@@ -2697,5 +2764,57 @@ mod tests {
             .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
             .expect("StorePop");
         assert!(add_idx < store_idx);
+    }
+
+    #[test]
+    fn optimize_per_func_leaves_prologue_glue_untouched() {
+        // Prologue: DUPLICATE; POP (would DCE on whole buffer).
+        // Func body at emitting [2, 5): CONST 1; DUPLICATE; POP; RETURN
+        // → only the func's DUP/POP pair is removed.
+        let mut ops = vec![
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+            // Glue after the function: another DUP; POP that must survive.
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let funcs = vec![super::super::IlFunc::new("f", None, 2, 6)];
+        optimize_per_func(&mut ops, &funcs, &OptimizeOptions::default());
+
+        assert!(
+            matches!(ops[0], IlOp::Dup { .. }) && matches!(ops[1], IlOp::Pop { .. }),
+            "prologue DUP/POP must survive"
+        );
+        assert!(
+            matches!(ops.last(), Some(IlOp::Pop { .. })),
+            "trailing glue DUP/POP must survive"
+        );
+        let body_dups = ops[2..ops.len() - 2]
+            .iter()
+            .filter(|op| matches!(op, IlOp::Dup { .. }))
+            .count();
+        assert_eq!(body_dups, 0, "func-body DUP/POP should DCE");
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
     }
 }

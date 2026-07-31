@@ -1,7 +1,7 @@
 //! Lightweight per-function IL metadata (flat CodeBuf stays the source of truth).
 //!
-//! Recorded at function finalize for upcoming IL inspection / tooling; the flat
-//! buffer remains authoritative for codegen and lower.
+//! Recorded at function finalize; [`super::opt::optimize_per_func`] scopes opts
+//! to these emitting spans. The flat buffer remains authoritative for lower.
 
 use super::Label;
 

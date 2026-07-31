@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use common::{Byte, DebugLoc, Instruction};
 
+use super::func::IlFunc;
 use super::op::{EntryKind, IlJumpKind, IlOp, Label};
 use super::opt;
 
@@ -80,9 +81,18 @@ pub fn assert_no_residual_abs_jumps(ops: &[IlOp]) {
 }
 
 /// Optimize and lower `ops` into VM bytecode.
+///
+/// When `funcs` is empty, opts run on the whole buffer (unit tests). Production
+/// [`super::CodeBuf::lower_in_place`] passes recorded [`IlFunc`] spans so opts
+/// stay inside each function and leave prologue / glue alone.
 pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
+    lower_with_funcs(ops, &[], pool)
+}
+
+/// Like [`lower`], but scopes IL opts to each [`IlFunc`] emitting span.
+pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> Lowered {
     let mut ops = ops.to_vec();
-    opt::optimize(&mut ops, &opt::OptimizeOptions::default());
+    opt::optimize_per_func(&mut ops, funcs, &opt::OptimizeOptions::default());
     assert_no_residual_abs_jumps(&ops);
 
     let mut pre_slots: Vec<Slot> = Vec::with_capacity(ops.len());

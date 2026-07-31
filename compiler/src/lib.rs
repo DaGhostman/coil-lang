@@ -10428,6 +10428,7 @@ impl Compiler {
             let init_len = inits.len();
             self.bytecode.splice_bytes_at(pos, inits);
             self.bytecode.bump_absolute_entry_targets(pos, init_len);
+            self.bytecode.bump_func_spans(pos, init_len);
             // Splice inserts before any label at `pos`; ensure the init
             // region itself is labeled so dead_block keeps it.
             self.bytecode.entry_label_at(pos);
@@ -10460,6 +10461,7 @@ impl Compiler {
             let main_label = self.bytecode.entry_label_at(main_off);
             self.bytecode.insert_jump_at(jmp_pos, main_label);
             self.bytecode.bump_absolute_entry_targets(jmp_pos, 1);
+            self.bytecode.bump_func_spans(jmp_pos, 1);
             for offset in self.functions.values_mut() {
                 if *offset >= jmp_pos {
                     *offset += 1;

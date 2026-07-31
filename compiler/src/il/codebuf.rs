@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
-    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower,
+    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower_with_funcs,
 };
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
@@ -193,6 +193,21 @@ impl CodeBuf {
         &self.funcs
     }
 
+    /// Shift recorded [`IlFunc`] emitting spans after a splice at `threshold`.
+    pub fn bump_func_spans(&mut self, threshold: usize, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        for f in &mut self.funcs {
+            if f.code_start >= threshold {
+                f.code_start += delta;
+            }
+            if f.code_end >= threshold {
+                f.code_end += delta;
+            }
+        }
+    }
+
     pub fn fresh_label(&mut self) -> Label {
         self.il.fresh_label()
     }
@@ -286,7 +301,7 @@ impl CodeBuf {
     }
 
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
-        let lowered = lower(self.il.ops(), pool);
+        let lowered = lower_with_funcs(self.il.ops(), &self.funcs, pool);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
         lowered
