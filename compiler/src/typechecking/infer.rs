@@ -15333,8 +15333,8 @@ mod tests {
 
     #[test]
     fn return_inside_expression() {
-        // Without an enclosing function, return just returns the value's type.
-        assert_ok("return 42", int());
+        // `return` is a diverging expression regardless of enclosing context.
+        assert_ok("return 42", never());
     }
 
     // ---- Block ----
@@ -18541,7 +18541,7 @@ fn f(int n) {
     #[test]
     fn try_on_result_propagates_ok_payload() {
         let src = r#"
-fn inner() { raise "e"; return 1; }
+fn inner() { raise "e"; }
 fn outer() {
     let v = inner()?;
     return v;
