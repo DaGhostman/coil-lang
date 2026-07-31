@@ -4339,6 +4339,40 @@ fn main() {
 }
 
 #[test]
+fn fallthrough_async_yield_only_does_not_e0111() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+async fn gen_three() {
+    yield 0;
+    yield 1;
+    yield 2;
+}
+async fn outer() {
+    yield from gen_three();
+}
+async fn parameterized(int base) {
+    yield base;
+    yield base + 1;
+    yield base + 2;
+}
+fn main() {
+    let _ = resume gen_three();
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "yield-only async bodies must not E0111 on fall-through: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn fallthrough_result_zero_safe_ok_wraps_at_runtime() {
     // Annotated Result enters result-mode; zero-safe Ok scalars Ok-wrap CONST 0.
     let output = run_example_src(
