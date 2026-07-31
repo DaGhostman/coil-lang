@@ -5145,4 +5145,190 @@ mod tests {
         ]);
         assert_eq!(vm.pop().as_int(), 0);
     }
+
+    /// Live-slice GC must not treat POP'd slots past `tell` as roots.
+    /// Rooting the full 8192 buffer would keep the tag-99 enum alive forever.
+    #[test]
+    fn gc_does_not_root_stale_slots_past_tell() {
+        use crate::memory::Object;
+        use std::collections::HashSet;
+
+        let mut vm = Machine::<256>::default();
+        let n: usize = 200;
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 8);
+        bytecode.push(const_int(0));
+        bytecode.push(make_enum(99, 1)); // distinctive tag — then POP so only stale.
+        bytecode.push(Byte::new(Instruction::POP));
+        for _ in 0..n {
+            bytecode.push(const_int(0));
+            bytecode.push(make_enum(0, 1));
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        bytecode.push(Byte::new(Instruction::HALT));
+        vm.run(&bytecode);
+
+        let mut tag99 = HashSet::new();
+        for obj in vm.heap().into_iter() {
+            if let Object::Enum(gc) = obj {
+                if gc.as_ref().tag == 99 {
+                    tag99.insert(obj.addr());
+                }
+            }
+        }
+        assert!(
+            tag99.is_empty(),
+            "POP'd enum must not survive via stale buffer slots; still live: {tag99:?}"
+        );
+    }
+
+    /// Fused CmpJmpf: false comparison jumps; true comparison falls through.
+    #[test]
+    fn cmp_jmpf_jumps_when_false_falls_through_when_true() {
+        // 3 < 5 → taken=true → fall through → push 1
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(3),
+            const_int(5),
+            Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(Instruction::LE as u8, 5),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0), // target 5
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+
+        // 5 < 3 → taken=false → jump → push 0
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(3),
+            Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(Instruction::LE as u8, 5),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// Fused float CmpJmpf uses as_float paths (not raw bit compares).
+    #[test]
+    fn cmp_jmpf_float_leq_falls_through_on_equal() {
+        let a = 1.5f64.to_bits();
+        let b = 1.5f64.to_bits();
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(Instruction::LEQF as u8, 6),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0), // unreachable if LEQF falls through
+                Byte::new(Instruction::HALT),
+            ],
+            &[a, b],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    /// BinSlotImmJmpf reads packed (target<<32)|imm from the constant pool.
+    #[test]
+    fn bin_slot_imm_jmpf_uses_pool_imm_and_target() {
+        let leq = Instruction::LEQ as u8;
+        // n=3; if !(n <= 2) jump to done(push 0); else push 1
+        // packed: imm=2 in low 32, target=8 in high 32
+        let packed = (8u64 << 32) | (2u32 as u64);
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(3),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                // 3: frame with n in slot 0
+                Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(leq, 0, 0),
+                // 4: n <= 2 was true → fall through
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                // 6: padding so target 8 is unambiguous
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::HALT),
+                // 8: jumped here when n <= 2 is false
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // n=2 → LEQ true → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(2),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(leq, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    /// In-register BinSlotImm Pow avoids the old push/binary stack dance.
+    #[test]
+    fn bin_slot_imm_pow_computes_without_stack_roundtrip() {
+        let pow = Instruction::Pow as u8;
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(2),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(pow, 0, 3),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 8);
+    }
+
+    /// HostInvoke borrows tuple elements as `&[Value]` (no clone); native must
+    /// still observe args and may allocate without dangling the slice.
+    #[test]
+    fn host_invoke_slice_args_readable_during_allocating_native() {
+        use crate::ffi::FfiSignatureBuilder;
+        use crate::memory::{FfiType, ObjString, Object};
+
+        let sig = FfiSignatureBuilder::new("sum_alloc")
+            .arg(FfiType::Int)
+            .arg(FfiType::Int)
+            .ret(FfiType::Int)
+            .build()
+            .unwrap();
+        let mut vm = Machine::<32>::default();
+        let fn_id = vm.register_fn(sig, |heap, args| {
+            assert_eq!(args.len(), 2);
+            let sum = args[0].as_int() + args[1].as_int();
+            // Allocate while the args slice is live — must not free the tuple.
+            let (_obj, _) = heap.alloc(ObjString::from("scratch"), Object::String);
+            Ok(Some(Value::from(sum)))
+        });
+        // Stack order: fn_id under tuple (HostInvoke pops tuple, then fn_id).
+        vm.run(&[
+            Byte::new(Instruction::CONST).with_value_u32(fn_id as u32),
+            const_int(20),
+            const_int(22),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::HostInvoke).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
 }
