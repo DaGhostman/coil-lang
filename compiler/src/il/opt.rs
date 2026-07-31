@@ -272,7 +272,8 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
             && let (Some(b0), Some(b1)) = (ops[i].as_encode_byte(), ops[i + 1].as_encode_byte())
             && *b0.bytecode() == Instruction::LOAD
             && (*b1.bytecode() == Instruction::STORE || *b1.bytecode() == Instruction::StorePop)
-            && b0.operand_u32() == b1.operand_u32()
+            && b0.load_store_single_slot().is_some()
+            && b0.load_store_single_slot() == b1.load_store_single_slot()
             && matches!(&ops[i], IlOp::Byte { .. })
             && matches!(&ops[i + 1], IlOp::Byte { .. })
         {
@@ -411,7 +412,9 @@ fn dead_store(ops: &mut Vec<IlOp>) {
 /// True if `byte` is a sinkable return producer (`LOAD s` or inline `CONST k`).
 fn is_return_producer(byte: &common::Byte) -> bool {
     match *byte.bytecode() {
-        Instruction::LOAD => byte.operand_u32() <= 255,
+        Instruction::LOAD => byte
+            .load_store_single_slot()
+            .is_some_and(|s| s <= 255),
         Instruction::CONST => byte.operand_u32() & common::Byte::POOL_FLAG == 0,
         _ => false,
     }
@@ -420,7 +423,7 @@ fn is_return_producer(byte: &common::Byte) -> bool {
 fn fuse_producer_with_return(producer: common::Byte) -> IlOp {
     match *producer.bytecode() {
         Instruction::LOAD => IlOp::LoadReturnSlot {
-            slot: producer.operand_u32(),
+            slot: producer.load_store_single_slot().expect("is_return_producer gate"),
             loc: common::DebugLoc::unknown(),
         },
         Instruction::CONST => IlOp::ConstReturnImm {

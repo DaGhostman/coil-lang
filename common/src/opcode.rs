@@ -19,6 +19,8 @@ pub enum Instruction {
     DUPLICATE,
     POP,
     CONST,
+    // STORE/LOAD: [31:24]=n (1..=3), [23:16]=s2, [15:8]=s1, [7:0]=s0;
+    // n==0 → wide single slot in [23:0]. See `with_load_store_*`.
     STORE,
     LOAD,
     CALL,
@@ -543,6 +545,77 @@ impl Byte {
         let o = self.operands;
         ((o >> 3) as usize, (o & 0b100) != 0, (o & 0b010) != 0)
     }
+
+    /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
+    pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
+        debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
+        self.operands =
+            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        self
+    }
+
+    /// Wide single-slot LOAD/STORE escape: `n==0`, slot in low 24 bits.
+    pub fn with_load_store_wide(mut self, slot: u32) -> Self {
+        debug_assert!(slot <= 0x00FF_FFFF, "LOAD/STORE wide slot exceeds 24 bits");
+        self.operands = slot & 0x00FF_FFFF;
+        self
+    }
+
+    /// Single-slot LOAD/STORE: `n=1` when `slot <= 255`, else wide (`n=0`).
+    pub fn with_load_store_slot(self, slot: u32) -> Self {
+        if slot > 255 {
+            self.with_load_store_wide(slot)
+        } else {
+            self.with_load_store_packed(1, slot as u8, 0, 0)
+        }
+    }
+
+    /// Slot count for packed LOAD/STORE (`n==0` → 1).
+    pub fn load_store_count(&self) -> usize {
+        let n = (self.operands >> 24) as u8;
+        if n == 0 {
+            1
+        } else {
+            n as usize
+        }
+    }
+
+    /// Slot at index `i` within a packed LOAD/STORE (`i < load_store_count()`).
+    pub fn load_store_slot_at(&self, i: usize) -> u32 {
+        let n = (self.operands >> 24) as u8;
+        if n == 0 {
+            debug_assert!(i == 0);
+            return self.operands & 0x00FF_FFFF;
+        }
+        match i {
+            0 => self.operands & 0xFF,
+            1 => (self.operands >> 8) & 0xFF,
+            2 => (self.operands >> 16) & 0xFF,
+            _ => unreachable!("LOAD/STORE slot index out of range"),
+        }
+    }
+
+    /// Single-slot LOAD/STORE (`n==0` or `n==1`); `None` when `n > 1`.
+    pub fn load_store_single_slot(&self) -> Option<u32> {
+        let n = (self.operands >> 24) as u8;
+        match n {
+            0 => Some(self.operands & 0x00FF_FFFF),
+            1 => Some(self.operands & 0xFF),
+            _ => None,
+        }
+    }
+
+    /// Packed parts `(n, s0, s1, s2)`. For `n==0`, returns `(0, low24 as u8 truncated, 0, 0)` —
+    /// prefer [`load_store_single_slot`] / [`load_store_slot_at`] for wide slots.
+    pub fn load_store_parts(&self) -> (u8, u8, u8, u8) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            (o & 0xFF) as u8,
+            ((o >> 8) & 0xFF) as u8,
+            ((o >> 16) & 0xFF) as u8,
+        )
+    }
 }
 
 impl ArchivedByte {
@@ -781,6 +854,69 @@ impl ArchivedByte {
         self.operands = ((slot << 3) | ((prefix as u32) << 2) | ((is_float as u32) << 1)).into();
         self
     }
+
+    /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
+    pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
+        debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
+        let packed =
+            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    /// Wide single-slot LOAD/STORE escape: `n==0`, slot in low 24 bits.
+    pub fn with_load_store_wide(mut self, slot: u32) -> Self {
+        debug_assert!(slot <= 0x00FF_FFFF, "LOAD/STORE wide slot exceeds 24 bits");
+        self.operands = (slot & 0x00FF_FFFF).into();
+        self
+    }
+
+    /// Single-slot LOAD/STORE: `n=1` when `slot <= 255`, else wide (`n=0`).
+    pub fn with_load_store_slot(self, slot: u32) -> Self {
+        if slot > 255 {
+            self.with_load_store_wide(slot)
+        } else {
+            self.with_load_store_packed(1, slot as u8, 0, 0)
+        }
+    }
+
+    /// Slot count for packed LOAD/STORE (`n==0` → 1).
+    pub fn load_store_count(&self) -> usize {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        if n == 0 {
+            1
+        } else {
+            n as usize
+        }
+    }
+
+    /// Slot at index `i` within a packed LOAD/STORE.
+    pub fn load_store_slot_at(&self, i: usize) -> u32 {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        if n == 0 {
+            debug_assert!(i == 0);
+            return o & 0x00FF_FFFF;
+        }
+        match i {
+            0 => o & 0xFF,
+            1 => (o >> 8) & 0xFF,
+            2 => (o >> 16) & 0xFF,
+            _ => unreachable!("LOAD/STORE slot index out of range"),
+        }
+    }
+
+    /// Single-slot LOAD/STORE (`n==0` or `n==1`); `None` when `n > 1`.
+    pub fn load_store_single_slot(&self) -> Option<u32> {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        match n {
+            0 => Some(o & 0x00FF_FFFF),
+            1 => Some(o & 0xFF),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -950,6 +1086,33 @@ mod tests {
             ss.bin_slot_slot_store_parts(),
             (Instruction::BITAND as u8, 1, 3, 4)
         );
+    }
+
+    #[test]
+    fn load_store_packed_round_trip() {
+        let load3 = Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2);
+        assert_eq!(load3.load_store_count(), 3);
+        assert_eq!(load3.load_store_slot_at(0), 0);
+        assert_eq!(load3.load_store_slot_at(1), 1);
+        assert_eq!(load3.load_store_slot_at(2), 2);
+        assert_eq!(load3.load_store_parts(), (3, 0, 1, 2));
+        assert!(load3.load_store_single_slot().is_none());
+
+        let store2 = Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0);
+        assert_eq!(store2.load_store_count(), 2);
+        assert_eq!(store2.load_store_slot_at(0), 4);
+        assert_eq!(store2.load_store_slot_at(1), 5);
+        assert_eq!(store2.load_store_parts(), (2, 4, 5, 0));
+
+        let single = Byte::new(Instruction::LOAD).with_load_store_slot(7);
+        assert_eq!(single.load_store_single_slot(), Some(7));
+        assert_eq!(single.load_store_count(), 1);
+        assert_eq!(single.load_store_parts().0, 1);
+
+        let wide = Byte::new(Instruction::STORE).with_load_store_slot(300);
+        assert_eq!(wide.load_store_single_slot(), Some(300));
+        assert_eq!(wide.load_store_parts().0, 0);
+        assert_eq!(wide.operand_u32() & 0x00FF_FFFF, 300);
     }
 }
 

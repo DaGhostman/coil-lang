@@ -362,6 +362,13 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
             return Some((Slot::Byte(fused, window[0].loc()), 2));
         }
     }
+    // After patterns that consume individual LOAD/STORE: pack adjacent runs.
+    if let Some((fused, n)) = try_fuse_packed_loads(window) {
+        return Some((fused, n));
+    }
+    if let Some((fused, n)) = try_fuse_packed_stores(window) {
+        return Some((fused, n));
+    }
     None
 }
 
@@ -669,7 +676,7 @@ fn load_slot(byte: &Byte) -> Option<u8> {
     if *byte.bytecode() != Instruction::LOAD {
         return None;
     }
-    let slot = byte.operand_u32();
+    let slot = byte.load_store_single_slot()?;
     if slot > 255 {
         return None;
     }
@@ -683,7 +690,7 @@ fn store_slot_u8(byte: &Byte) -> Option<u8> {
     ) {
         return None;
     }
-    let slot = byte.operand_u32();
+    let slot = byte.load_store_single_slot()?;
     if slot > 255 {
         return None;
     }
@@ -697,7 +704,81 @@ fn store_slot_u32(byte: &Byte) -> Option<u32> {
     ) {
         return None;
     }
-    Some(byte.operand_u32())
+    byte.load_store_single_slot()
+}
+
+/// Adjacent `LOAD`×2/3 → one packed `LOAD` (`n` in `[31:24]`).
+fn try_fuse_packed_loads(window: &[Slot]) -> Option<(Slot, usize)> {
+    for n in [3usize, 2] {
+        if window.len() < n {
+            continue;
+        }
+        let mut slots = [0u8; 3];
+        let mut ok = true;
+        for i in 0..n {
+            let Some(b) = slot_as_byte(&window[i]) else {
+                ok = false;
+                break;
+            };
+            let Some(s) = load_slot(&b) else {
+                ok = false;
+                break;
+            };
+            slots[i] = s;
+        }
+        if ok {
+            return Some((
+                Slot::Byte(
+                    Byte::new(Instruction::LOAD).with_load_store_packed(
+                        n as u8,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                    ),
+                    window[0].loc(),
+                ),
+                n,
+            ));
+        }
+    }
+    None
+}
+
+/// Adjacent `STORE`×2/3 → one packed `STORE` (TOS → first listed slot).
+fn try_fuse_packed_stores(window: &[Slot]) -> Option<(Slot, usize)> {
+    for n in [3usize, 2] {
+        if window.len() < n {
+            continue;
+        }
+        let mut slots = [0u8; 3];
+        let mut ok = true;
+        for i in 0..n {
+            let Some(b) = slot_as_byte(&window[i]) else {
+                ok = false;
+                break;
+            };
+            let Some(s) = store_slot_u8(&b) else {
+                ok = false;
+                break;
+            };
+            slots[i] = s;
+        }
+        if ok {
+            return Some((
+                Slot::Byte(
+                    Byte::new(Instruction::STORE).with_load_store_packed(
+                        n as u8,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                    ),
+                    window[0].loc(),
+                ),
+                n,
+            ));
+        }
+    }
+    None
 }
 
 fn try_fuse_bin_slot_imm_local(window: &[Byte; 3]) -> Option<Byte> {
@@ -1116,6 +1197,62 @@ mod tests {
         assert_eq!(src, 0);
         assert_eq!(pool[idx] >> 32, 1);
         assert_eq!(pool[idx] as u16, 7);
+    }
+
+    #[test]
+    fn lower_packs_three_adjacent_loads() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(2));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::LOAD
+        ));
+        assert_eq!(lowered.bytecode[0].load_store_parts(), (3, 0, 1, 2));
+        assert_eq!(lowered.bytecode[0].load_store_count(), 3);
+    }
+
+    #[test]
+    fn lower_packs_two_adjacent_stores_ordering() {
+        // Consecutive STORE s0; STORE s1 pops TOS→s0 then next→s1.
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        il.push_byte(Byte::new(Instruction::STORE).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::STORE
+        ));
+        assert_eq!(lowered.bytecode[0].load_store_parts(), (2, 0, 1, 0));
+        assert_eq!(lowered.bytecode[0].load_store_slot_at(0), 0);
+        assert_eq!(lowered.bytecode[0].load_store_slot_at(1), 1);
+    }
+
+    #[test]
+    fn lower_refuses_packed_loads_when_label_mid_window() {
+        let mut il = IlBuilder::new();
+        let mid = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        il.bind_label(mid);
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 3);
+        assert_eq!(lowered.bytecode[0].load_store_single_slot(), Some(0));
+        assert_eq!(lowered.bytecode[1].load_store_single_slot(), Some(1));
+        assert_eq!(lowered.label_pcs.get(&mid.0).copied(), Some(1));
     }
 
     /// JMP-to-join must not land on ConstReturnImm: stacked arm value is ignored.

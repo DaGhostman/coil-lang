@@ -1204,21 +1204,27 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(offset));
                 }
                 Instruction::STORE => {
-                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
-                    // is newly allocated, but never shrink past higher locals —
-                    // locals and the operand stack share memory.
-                    let slot = sp + opcode.operand_u32() as usize;
-                    let val = self.stack.pop();
-                    self.stack[slot] = val;
-                    let tell = self.stack.tell();
-                    if tell < slot + 1 {
-                        self.stack.seek(slot + 1);
+                    // Pop TOS into each listed slot (packed n=1..=3, or wide n=0).
+                    // Extend the cursor when a slot is newly allocated, but never
+                    // shrink past higher locals — locals and the operand stack share memory.
+                    let count = opcode.load_store_count();
+                    for i in 0..count {
+                        let slot = sp + opcode.load_store_slot_at(i) as usize;
+                        let val = self.stack.pop();
+                        self.stack[slot] = val;
+                        let tell = self.stack.tell();
+                        if tell < slot + 1 {
+                            self.stack.seek(slot + 1);
+                        }
                     }
                 }
                 Instruction::LOAD => {
-                    let slot = opcode.operand_u32() as usize;
-                    promise!(sp + slot < 8192);
-                    self.stack.push(self.stack[sp + slot]);
+                    let count = opcode.load_store_count();
+                    for i in 0..count {
+                        let slot = opcode.load_store_slot_at(i) as usize;
+                        promise!(sp + slot < 8192);
+                        self.stack.push(self.stack[sp + slot]);
+                    }
                 }
                 Instruction::INC => {
                     let (slot, prefix, is_float) = opcode.inc_dec_parts();
@@ -2526,12 +2532,16 @@ impl<const S: usize> Machine<S> {
                 // Deprecated discriminant alias of `STORE` (same handler).
                 // Compiler never emits StorePop; kept for archived bytecode.
                 Instruction::StorePop => {
-                    let slot = sp + opcode.operand_u32() as usize;
-                    let val = self.stack.pop();
-                    self.stack[slot] = val;
-                    let tell = self.stack.tell();
-                    if tell < slot + 1 {
-                        self.stack.seek(slot + 1);
+                    // Deprecated alias of STORE — same packed multi-slot semantics.
+                    let count = opcode.load_store_count();
+                    for i in 0..count {
+                        let slot = sp + opcode.load_store_slot_at(i) as usize;
+                        let val = self.stack.pop();
+                        self.stack[slot] = val;
+                        let tell = self.stack.tell();
+                        if tell < slot + 1 {
+                            self.stack.seek(slot + 1);
+                        }
                     }
                 }
                 Instruction::MakeCoro => {
@@ -3257,14 +3267,14 @@ mod tests {
     }
 
     fn store_pop(slot: u32) -> Byte {
-        Byte::new(Instruction::STORE).with_operand_u32(slot)
+        Byte::new(Instruction::STORE).with_load_store_slot(slot)
     }
 
     /// Build a `LOAD` byte that pushes `stack[frame.sp + slot]`
     /// onto the stack. Used to verify that a value previously
     /// written by `STORE_POP` is read back correctly.
     fn load(slot: u32) -> Byte {
-        Byte::new(Instruction::LOAD).with_operand_u32(slot)
+        Byte::new(Instruction::LOAD).with_load_store_slot(slot)
     }
 
     /// Fused fib body for dispatch-count regression tests, using the
@@ -4017,6 +4027,51 @@ mod tests {
         // Top of stack should be 42 — proving both the
         // write-to-slot and the pop-and-write semantics.
         assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Packed LOAD n=3 pushes s0, then s1, then s2 (same order as consecutive LOADs).
+    #[test]
+    fn packed_load_n3_pushes_slots_in_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            store_pop(0),
+            const_int(20),
+            store_pop(1),
+            const_int(30),
+            store_pop(2),
+            Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 30); // s2 last pushed
+        assert_eq!(vm.pop().as_int(), 20);
+        assert_eq!(vm.pop().as_int(), 10); // s0 first pushed
+    }
+
+    /// Packed STORE n=3: TOS → s0, then next → s1, then next → s2.
+    /// Values sit above the local region so pops do not clobber destinations.
+    #[test]
+    fn packed_store_n3_pops_into_slots_in_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(0),
+            store_pop(0),
+            const_int(0),
+            store_pop(1),
+            const_int(0),
+            store_pop(2),
+            const_int(10),
+            const_int(20),
+            const_int(30), // TOS
+            Byte::new(Instruction::STORE).with_load_store_packed(3, 0, 1, 2),
+            load(0),
+            load(1),
+            load(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 10); // slot 2
+        assert_eq!(vm.pop().as_int(), 20); // slot 1
+        assert_eq!(vm.pop().as_int(), 30); // slot 0 got TOS
     }
 
     #[test]

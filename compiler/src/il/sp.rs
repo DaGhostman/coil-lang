@@ -110,8 +110,20 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
 fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
     match insn {
         Instruction::LOAD | Instruction::CONST | Instruction::DUPLICATE | Instruction::STRING
-        | Instruction::CodePtr | Instruction::MakePolyFn => Some(1),
-        Instruction::POP | Instruction::StorePop | Instruction::STORE => Some(-1),
+        | Instruction::CodePtr | Instruction::MakePolyFn => {
+            if insn == Instruction::LOAD {
+                Some(byte.load_store_count() as i32)
+            } else {
+                Some(1)
+            }
+        }
+        Instruction::POP | Instruction::StorePop | Instruction::STORE => {
+            if matches!(insn, Instruction::STORE | Instruction::StorePop) {
+                Some(-(byte.load_store_count() as i32))
+            } else {
+                Some(-1)
+            }
+        }
         Instruction::ADD
         | Instruction::SUB
         | Instruction::MUL

@@ -156,13 +156,13 @@ impl IlOp {
     /// Lift a packed `Byte` into a typed hot-set variant when possible.
     pub fn from_plain_byte(byte: Byte, loc: DebugLoc) -> Self {
         match *byte.bytecode() {
-            Instruction::LOAD => Self::Load {
-                slot: byte.operand_u32(),
-                loc,
+            Instruction::LOAD => match byte.load_store_single_slot() {
+                Some(slot) => Self::Load { slot, loc },
+                None => Self::Byte { byte, loc },
             },
-            Instruction::STORE | Instruction::StorePop => Self::StorePop {
-                slot: byte.operand_u32(),
-                loc,
+            Instruction::STORE | Instruction::StorePop => match byte.load_store_single_slot() {
+                Some(slot) => Self::StorePop { slot, loc },
+                None => Self::Byte { byte, loc },
             },
             Instruction::CONST => {
                 let op = byte.operand_u32();
@@ -254,8 +254,10 @@ impl IlOp {
     pub fn as_encode_byte(&self) -> Option<Byte> {
         Some(match self {
             IlOp::Byte { byte, .. } => *byte,
-            IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_operand_u32(*slot),
-            IlOp::StorePop { slot, .. } => Byte::new(Instruction::STORE).with_operand_u32(*slot),
+            IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_load_store_slot(*slot),
+            IlOp::StorePop { slot, .. } => {
+                Byte::new(Instruction::STORE).with_load_store_slot(*slot)
+            },
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),

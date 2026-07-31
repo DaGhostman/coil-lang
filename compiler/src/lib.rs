@@ -1456,7 +1456,7 @@ impl Compiler {
             Instruction::LoadReturnSlot => {
                 let slot = byte.operand_u32() as usize;
                 let &tmp = temps.get(slot)?;
-                Some(Byte::new(Instruction::LOAD).with_operand_u32(tmp))
+                Some(Byte::new(Instruction::LOAD).with_load_store_slot(tmp))
             }
             _ => None,
         }
@@ -1552,8 +1552,10 @@ impl Compiler {
                 break;
             }
             if matches!(byte.bytecode(), Instruction::LOAD) {
-                let slot = byte.operand_u32() as usize;
-                let Some(&tmp) = temps.get(slot) else {
+                let Some(slot) = byte.load_store_single_slot() else {
+                    return false;
+                };
+                let Some(&tmp) = temps.get(slot as usize) else {
                     return false;
                 };
                 bytecode.push_load(tmp);
@@ -12869,17 +12871,44 @@ fn main() {
             store_pop_count
         );
 
-        // The STORE_POP slot operand should be 0 — `x` is the
-        // first (and only) local in `main`.
+        // The STORE slot should be 0 — `x` is the first (and only) local in `main`.
         let store_pop = bc
             .iter()
             .find(|b| matches!(b.bytecode(), Instruction::STORE))
-            .expect("expected at least one STORE_POP");
+            .expect("expected at least one STORE");
         assert_eq!(
-            store_pop.operand_u32(),
-            0,
-            "expected STORE_POP slot=0 for the first local `x`; got {}",
-            store_pop.operand_u32()
+            store_pop.load_store_single_slot(),
+            Some(0),
+            "expected STORE slot=0 for the first local `x`; got {:?}",
+            store_pop.load_store_single_slot()
+        );
+    }
+
+    /// Call-site arg prep `add(x, y, z)` packs three LOADs into one `LOAD` with `n=3`.
+    #[test]
+    fn call_arg_prep_packs_three_loads() {
+        use common::Instruction;
+        // Keep `add` large enough that tiny-inline will not absorb the call.
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b, int c) -> int { \
+ if a < 0 { return 0; } \
+ return a + b + c; \
+ } \
+ fn main() { \
+ let x = 1; \
+ let y = 2; \
+ let z = 3; \
+ print \"%i\", add(x, y, z); \
+ }",
+        );
+        let packed = bc.iter().find(|b| {
+            matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3
+        });
+        let packed = packed.expect("expected one LOAD with n=3 for add(x,y,z) arg prep");
+        assert_eq!(
+            packed.load_store_parts(),
+            (3, 0, 1, 2),
+            "arg prep should load locals x,y,z in order"
         );
     }
 
@@ -12900,7 +12929,7 @@ fn main() {
         let store_pops: Vec<u32> = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STORE))
-            .map(|b| b.operand_u32())
+            .filter_map(|b| b.load_store_single_slot())
             .collect();
         assert!(
             store_pops.len() >= 2,
@@ -13077,7 +13106,7 @@ fn main() { print \"%i\", add(3, 4); }",
             Compiler::expand_fused_return_for_inline(&ops[0].as_plain_byte().unwrap(), &[42])
                 .expect("expand");
         assert_eq!(*expanded.bytecode(), Instruction::LOAD);
-        assert_eq!(expanded.operand_u32(), 42);
+        assert_eq!(expanded.load_store_single_slot(), Some(42));
     }
 
     #[test]
@@ -13096,9 +13125,9 @@ fn main() { print \"%i\", add(3, 4); }",
         ));
         assert_eq!(out.len(), 3);
         assert_eq!(*out[0].bytecode(), Instruction::LOAD);
-        assert_eq!(out[0].operand_u32(), 10);
+        assert_eq!(out[0].load_store_single_slot(), Some(10));
         assert_eq!(*out[1].bytecode(), Instruction::LOAD);
-        assert_eq!(out[1].operand_u32(), 11);
+        assert_eq!(out[1].load_store_single_slot(), Some(11));
         assert_eq!(*out[2].bytecode(), Instruction::ADD);
     }
 

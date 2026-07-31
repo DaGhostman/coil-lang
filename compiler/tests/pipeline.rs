@@ -979,7 +979,10 @@ fn let_binding_emits_store_pop_in_bytecode() {
 
     let binding_store_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::STORE) && b.operand_u32() == 0)
+        .filter(|b| {
+            matches!(b.bytecode(), Instruction::STORE)
+                && b.load_store_single_slot() == Some(0)
+        })
         .count();
     assert_eq!(
         binding_store_count, 2,
