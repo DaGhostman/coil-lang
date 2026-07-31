@@ -16248,7 +16248,11 @@ fn main() {
                 | Expression::Return(e) => out.extend(collect_lambda_arg_spans(e)),
                 Expression::Call { name, args } => {
                     out.extend(collect_lambda_arg_spans(name));
-                    out.extend(collect_lambda_arg_spans(args));
+                    if let Some(args) = args {
+                        for a in args {
+                            out.extend(collect_lambda_arg_spans(a));
+                        }
+                    }
                 }
                 Expression::Add(a, b) | Expression::Sub(a, b) | Expression::Mul(a, b) => {
                     out.extend(collect_lambda_arg_spans(a));
