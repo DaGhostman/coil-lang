@@ -448,11 +448,73 @@ fn join_label_cluster(ops: &[IlOp], i: usize) -> Option<(usize, usize, JoinKind)
     Some((cluster_start, cluster_end, JoinKind::NonReturn))
 }
 
+fn is_cond_join_pred_kind(kind: IlJumpKind) -> bool {
+    matches!(
+        kind,
+        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue
+    )
+}
+
+/// Producer / bin-tail index before a jump into a return convoy.
+///
+/// Unconditional: immediate op before the JMP. Conditional: value under the
+/// condition (`…; producer; cond; JMPF/JMPT`) — the condition stays put.
+/// `JumpIfMatch` is refused (match diamonds stay on [`multi_op_join_convoy`]).
+fn convoy_pred_tail_before(
+    ops: &[IlOp],
+    jump_idx: usize,
+    kind: IlJumpKind,
+) -> Option<(usize, common::Byte)> {
+    match kind {
+        IlJumpKind::Unconditional => immediate_byte_before(ops, jump_idx),
+        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue => {
+            if jump_idx < 2 {
+                return None;
+            }
+            let cond = ops[jump_idx - 1].as_encode_byte()?;
+            // Condition must be a real stack producer/consumer op, not empty.
+            let _ = cond;
+            let b = ops[jump_idx - 2].as_encode_byte()?;
+            Some((jump_idx - 2, b))
+        }
+        IlJumpKind::JumpIfMatch { .. } => None,
+    }
+}
+
+fn convoy_pred_producer_before(
+    ops: &[IlOp],
+    jump_idx: usize,
+    kind: IlJumpKind,
+) -> Option<(usize, common::Byte)> {
+    let (i, b) = convoy_pred_tail_before(ops, jump_idx, kind)?;
+    if is_return_producer(&b) {
+        Some((i, b))
+    } else {
+        None
+    }
+}
+
+fn convoy_pred_bin_tail_before(
+    ops: &[IlOp],
+    jump_idx: usize,
+    kind: IlJumpKind,
+) -> Option<(usize, common::Byte)> {
+    let (i, b) = convoy_pred_tail_before(ops, jump_idx, kind)?;
+    if is_bin_join_tail(&b) {
+        Some((i, b))
+    } else {
+        None
+    }
+}
+
 /// Sink identical binop / `BinSlot*` tails into a return-label cluster.
 ///
 /// - Plain binop `OP` on every pred → `BinReturn(OP)`.
 /// - Identical `BinSlotImm`/`BinSlotSlot` → keep one copy before `RETURN`.
+/// - Preds may be `JMP` or `JMPF`/`JMPT` (value under cond); not mixed with each
+///   other, and not `JumpIfMatch`. Join SP must be Known ([`super::sp`]).
 fn bin_join_convoy(ops: &mut Vec<IlOp>) {
+    let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, tail_byte, emit_bin_return)
     let mut joins: Vec<(usize, usize, common::Byte, bool)> = Vec::new();
     let mut r = 0usize;
@@ -462,17 +524,13 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             continue;
         };
         let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
-        let Some((_, fall_t)) = immediate_byte_before(ops, cluster_start) else {
-            r += 1;
-            continue;
-        };
-        if !is_bin_join_tail(&fall_t) {
-            r += 1;
-            continue;
-        }
+
+        let fall = immediate_byte_before(ops, cluster_start).filter(|(_, t)| is_bin_join_tail(t));
 
         let mut ok = true;
-        let mut jump_preds = 0usize;
+        let mut jump_preds: Vec<(usize, IlJumpKind)> = Vec::new();
+        let mut saw_uncond = false;
+        let mut saw_cond = false;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
                 kind,
@@ -485,27 +543,120 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             if !cluster.iter().any(|l| l == target) {
                 continue;
             }
-            if *kind != IlJumpKind::Unconditional {
+            if matches!(kind, IlJumpKind::JumpIfMatch { .. }) {
                 ok = false;
                 break;
             }
-            let Some((_p_idx, t)) = immediate_byte_before(ops, j) else {
-                ok = false;
-                break;
-            };
-            if t != fall_t {
+            if *kind == IlJumpKind::Unconditional {
+                saw_uncond = true;
+            } else if is_cond_join_pred_kind(*kind) {
+                saw_cond = true;
+            } else {
                 ok = false;
                 break;
             }
-            jump_preds += 1;
+            if saw_uncond && saw_cond {
+                ok = false;
+                break;
+            }
+            jump_preds.push((j, *kind));
         }
-        if !ok || jump_preds == 0 {
+        if !ok || jump_preds.is_empty() {
             r += 1;
             continue;
         }
 
-        let emit_bin_return = is_plain_binop(&fall_t);
-        joins.push((cluster_start, cluster_end, fall_t, emit_bin_return));
+        let has_cond = saw_cond;
+        if has_cond && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
+
+        let Some((_, template)) = fall.or_else(|| {
+            let (j, k) = jump_preds[0];
+            convoy_pred_bin_tail_before(ops, j, k)
+        }) else {
+            r += 1;
+            continue;
+        };
+
+        if has_cond {
+            let Some(template_sp) = fall
+                .map(|(i, _)| i)
+                .or_else(|| {
+                    let (j, k) = jump_preds[0];
+                    convoy_pred_bin_tail_before(ops, j, k).map(|(i, _)| i)
+                })
+                .and_then(|i| info.sp_before(i).known())
+            else {
+                r += 1;
+                continue;
+            };
+
+            if let Some((fi, ft)) = fall {
+                if ft != template {
+                    r += 1;
+                    continue;
+                }
+                let Some(fsp) = info.sp_before(fi).known() else {
+                    r += 1;
+                    continue;
+                };
+                if fsp != template_sp {
+                    r += 1;
+                    continue;
+                }
+            }
+
+            for &(j, k) in &jump_preds {
+                let Some((ti, t)) = convoy_pred_bin_tail_before(ops, j, k) else {
+                    ok = false;
+                    break;
+                };
+                if t != template {
+                    ok = false;
+                    break;
+                }
+                let Some(jsp) = info.sp_before(ti).known() else {
+                    ok = false;
+                    break;
+                };
+                if jsp != template_sp {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                r += 1;
+                continue;
+            }
+        } else {
+            // Unconditional-only: identical tails (legacy; no SP gate — fall-through
+            // arms after JMP are often SP-unreachable in linear analysis).
+            if let Some((_, ft)) = fall {
+                if ft != template {
+                    r += 1;
+                    continue;
+                }
+            }
+            for &(j, k) in &jump_preds {
+                let Some((_, t)) = convoy_pred_bin_tail_before(ops, j, k) else {
+                    ok = false;
+                    break;
+                };
+                if t != template {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                r += 1;
+                continue;
+            }
+        }
+
+        let emit_bin_return = is_plain_binop(&template);
+        joins.push((cluster_start, cluster_end, template, emit_bin_return));
         r += 1;
     }
 
@@ -526,13 +677,18 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             remove_tail_at.insert(fall_idx);
         }
         for (j, op) in ops.iter().enumerate() {
-            if let IlOp::Jump {
-                kind: IlJumpKind::Unconditional,
+            let IlOp::Jump {
+                kind,
                 target,
                 ..
             } = op
-                && cluster.iter().any(|l| l == target)
-                && let Some((t_idx, t)) = immediate_byte_before(ops, j)
+            else {
+                continue;
+            };
+            if !cluster.iter().any(|l| l == target) {
+                continue;
+            }
+            if let Some((t_idx, t)) = convoy_pred_bin_tail_before(ops, j, *kind)
                 && t == *tail
             {
                 remove_tail_at.insert(t_idx);
@@ -806,7 +962,12 @@ fn label_cluster_ids(ops: &[IlOp], start: usize, end: usize) -> Vec<Label> {
 /// A cluster is one or more consecutive `Label`s immediately before bare
 /// `RETURN`. The **first** label is the stack join (JMPs target it); trailing
 /// labels are PC aliases (e.g. `Label(join); Label(ret); RETURN`).
+///
+/// Preds may be `JMP` or `JMPF`/`JMPT` (value under condition); not mixed, and
+/// not `JumpIfMatch`. Join SP must be Known. Jump-pred-only joins (no
+/// fall-through producer) use the first pred as the template.
 fn return_convoy(ops: &mut Vec<IlOp>) {
+    let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, join, producer)
     let mut joins: Vec<(usize, usize, Label, common::Byte)> = Vec::new();
     let mut r = 0usize;
@@ -820,13 +981,13 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             continue;
         };
         let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
-        let Some((_, fall_p)) = immediate_producer_before(ops, cluster_start) else {
-            r += 1;
-            continue;
-        };
+
+        let fall = immediate_producer_before(ops, cluster_start);
 
         let mut ok = true;
-        let mut jump_preds = 0usize;
+        let mut jump_preds: Vec<(usize, IlJumpKind)> = Vec::new();
+        let mut saw_uncond = false;
+        let mut saw_cond = false;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
                 kind,
@@ -839,26 +1000,117 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             if !cluster.iter().any(|l| l == target) {
                 continue;
             }
-            if *kind != IlJumpKind::Unconditional {
+            if matches!(kind, IlJumpKind::JumpIfMatch { .. }) {
                 ok = false;
                 break;
             }
-            let Some((_p_idx, p)) = immediate_producer_before(ops, j) else {
-                ok = false;
-                break;
-            };
-            if p != fall_p {
+            if *kind == IlJumpKind::Unconditional {
+                saw_uncond = true;
+            } else if is_cond_join_pred_kind(*kind) {
+                saw_cond = true;
+            } else {
                 ok = false;
                 break;
             }
-            jump_preds += 1;
+            if saw_uncond && saw_cond {
+                ok = false;
+                break;
+            }
+            jump_preds.push((j, *kind));
         }
-        if !ok || jump_preds == 0 {
+        if !ok || jump_preds.is_empty() {
             r += 1;
             continue;
         }
 
-        joins.push((cluster_start, cluster_end, join, fall_p));
+        let has_cond = saw_cond;
+        if has_cond && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
+
+        let Some((_, template)) = fall.or_else(|| {
+            let (j, k) = jump_preds[0];
+            convoy_pred_producer_before(ops, j, k)
+        }) else {
+            r += 1;
+            continue;
+        };
+
+        if has_cond {
+            let Some(template_sp) = fall
+                .map(|(i, _)| i)
+                .or_else(|| {
+                    let (j, k) = jump_preds[0];
+                    convoy_pred_producer_before(ops, j, k).map(|(i, _)| i)
+                })
+                .and_then(|i| info.sp_before(i).known())
+            else {
+                r += 1;
+                continue;
+            };
+
+            if let Some((fi, fp)) = fall {
+                if fp != template {
+                    r += 1;
+                    continue;
+                }
+                let Some(fsp) = info.sp_before(fi).known() else {
+                    r += 1;
+                    continue;
+                };
+                if fsp != template_sp {
+                    r += 1;
+                    continue;
+                }
+            }
+
+            for &(j, k) in &jump_preds {
+                let Some((pi, p)) = convoy_pred_producer_before(ops, j, k) else {
+                    ok = false;
+                    break;
+                };
+                if p != template {
+                    ok = false;
+                    break;
+                }
+                let Some(jsp) = info.sp_before(pi).known() else {
+                    ok = false;
+                    break;
+                };
+                if jsp != template_sp {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                r += 1;
+                continue;
+            }
+        } else {
+            if let Some((_, fp)) = fall {
+                if fp != template {
+                    r += 1;
+                    continue;
+                }
+            }
+            for &(j, k) in &jump_preds {
+                let Some((_, p)) = convoy_pred_producer_before(ops, j, k) else {
+                    ok = false;
+                    break;
+                };
+                if p != template {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                r += 1;
+                continue;
+            }
+        }
+
+        joins.push((cluster_start, cluster_end, join, template));
         r += 1;
     }
 
@@ -880,13 +1132,18 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             remove_producer_at.insert(fall_idx);
         }
         for (j, op) in ops.iter().enumerate() {
-            if let IlOp::Jump {
-                kind: IlJumpKind::Unconditional,
+            let IlOp::Jump {
+                kind,
                 target,
                 ..
             } = op
-                && cluster.iter().any(|l| l == target)
-                && let Some((p_idx, p)) = immediate_producer_before(ops, j)
+            else {
+                continue;
+            };
+            if !cluster.iter().any(|l| l == target) {
+                continue;
+            }
+            if let Some((p_idx, p)) = convoy_pred_producer_before(ops, j, *kind)
                 && p == *producer
             {
                 remove_producer_at.insert(p_idx);
@@ -1136,6 +1393,7 @@ mod tests {
 
     #[test]
     fn return_convoy_skips_conditional_jump_into_cluster() {
+        // CONST immediately before JMPF is the condition, not a value-under-cond.
         let mut ops = vec![
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
             IlOp::Jump {
@@ -1144,6 +1402,100 @@ mod tests {
                 loc: common::DebugLoc::unknown(),
             },
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn return_convoy_fuses_agreeing_const_via_jmpf() {
+        // Value under condition on both JMPF arms. POP between arms keeps join SP Known
+        // (fall-through after JMPF would otherwise accumulate height).
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(7)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(7)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::ConstReturnImm { imm: 7, .. })
+                || (is_insn(op, Instruction::ConstReturnImm)
+                    && op.as_encode_byte().map(|b| b.operand_u32()) == Some(7))
+        }));
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        IlOp::Jump {
+                            kind: IlJumpKind::JumpIfFalse,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn return_convoy_skips_mixed_jmpf_and_jmp() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        return_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn return_convoy_skips_jump_if_match_pred() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
             IlOp::Label(Label(0)),
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
@@ -1361,6 +1713,40 @@ mod tests {
         let before = ops.clone();
         bin_join_convoy(&mut ops);
         assert!(ops == before);
+    }
+
+    #[test]
+    fn bin_join_convoy_fuses_agreeing_binop_via_jmpf() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(2)),
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(2)),
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        bin_join_convoy(&mut ops);
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::BinReturn { op: Instruction::ADD, .. })
+                || is_insn(op, Instruction::BinReturn)
+        }));
     }
 
     #[test]
