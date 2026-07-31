@@ -467,8 +467,6 @@ mod tests {
     }
 
     #[test]
-    
-    #[test]
     fn from_plain_byte_lifts_box_unbox_load_field() {
         assert!(matches!(
             IlOp::from_plain_byte(
@@ -676,6 +674,34 @@ mod tests {
             },
             IlOp::BinReturn {
                 op: Instruction::MUL,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Index {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeTuple {
+                arity: 2,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeArray {
+                arity: 3,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::MakeEnum {
+                tag: 9,
+                arity: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::BoxValue {
+                tag: 3,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::UnboxValue {
+                tag: 4,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::LoadField {
+                index: 2,
                 loc: DebugLoc::unknown(),
             },
         ];

@@ -331,20 +331,22 @@ mod tests {
     use super::*;
     use common::DebugLoc;
 
+    fn loc() -> DebugLoc {
+        DebugLoc::unknown()
+    }
+
     #[test]
     fn within_block_dup_replaces_second_identical_const() {
         let mut ops = vec![
             IlOp::Const {
                 imm: 3,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
             IlOp::Const {
                 imm: 3,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
-            IlOp::Return {
-                loc: DebugLoc::unknown(),
-            },
+            IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
         assert!(matches!(ops[0], IlOp::Const { imm: 3, .. }));
@@ -352,45 +354,117 @@ mod tests {
     }
 
     #[test]
-    fn join_cse_drops_redundant_const_when_preds_agree() {
-        // CONST 1; JMP L; CONST 1; JMP L; Label L; CONST 1; RETURN
-        // → join CONST removed (both preds leave 1).
+    fn within_block_dup_replaces_second_identical_load() {
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+    }
+
+    #[test]
+    fn within_block_store_pop_is_barrier() {
+        // Effectful StorePop must reset numbering — second Const stays Const.
         let mut ops = vec![
             IlOp::Const {
-                imm: 1,
-                loc: DebugLoc::unknown(),
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 0, loc: loc() },
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[2], IlOp::Const { imm: 3, .. }));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+    }
+
+    #[test]
+    fn join_cse_drops_redundant_const_on_jmpf_diamond() {
+        // JMPF diamond with agreeing Known SP: join CONST is redundant.
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: loc(),
             },
             IlOp::Jump {
-                kind: IlJumpKind::Unconditional,
-                target: Label(0),
-                loc: DebugLoc::unknown(),
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
             },
             IlOp::Const {
                 imm: 1,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
-                target: Label(0),
-                loc: DebugLoc::unknown(),
+                target: Label(2),
+                loc: loc(),
             },
-            IlOp::Label(Label(0)),
+            IlOp::Label(Label(1)),
             IlOp::Const {
                 imm: 1,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
-            IlOp::Return {
-                loc: DebugLoc::unknown(),
+            IlOp::Label(Label(2)),
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
             },
+            IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
         let consts = ops
             .iter()
             .filter(|op| matches!(op, IlOp::Const { imm: 1, .. }))
             .count();
-        // Pred consts kept; join copy dropped when SP agrees.
-        // Linear SP may mark join Unknown — then CSE refuses (safe).
-        assert!(consts >= 2);
+        assert_eq!(consts, 2, "pred consts kept; join copy dropped");
         assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
+    fn join_cse_keeps_disagreeing_const() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const {
+                imm: 2,
+                loc: loc(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_len = ops.len();
+        cfg_gvn(&mut ops);
+        assert_eq!(ops.len(), before_len, "disagreeing preds must not drop join");
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 1, .. })));
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 2, .. })));
     }
 }

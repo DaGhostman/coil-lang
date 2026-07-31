@@ -1435,6 +1435,51 @@ mod tests {
     }
 
     #[test]
+    fn return_convoy_fuses_agreeing_const_via_jmpt() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(9)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfTrue,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(9)),
+            IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfTrue,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        return_convoy(&mut ops);
+        assert!(ops.iter().any(|op| {
+            matches!(op, IlOp::ConstReturnImm { imm: 9, .. })
+                || (is_insn(op, Instruction::ConstReturnImm)
+                    && op.as_encode_byte().map(|b| b.operand_u32()) == Some(9))
+        }));
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        IlOp::Jump {
+                            kind: IlJumpKind::JumpIfTrue,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn return_convoy_skips_mixed_jmpf_and_jmp() {
         let mut ops = vec![
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
@@ -1724,6 +1769,29 @@ mod tests {
             matches!(op, IlOp::BinReturn { op: Instruction::ADD, .. })
                 || is_insn(op, Instruction::BinReturn)
         }));
+    }
+
+    #[test]
+    fn bin_join_convoy_skips_jump_if_match_pred() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::ADD)),
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 0 },
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::byte(Byte::new(Instruction::RETURN)),
+        ];
+        let before = ops.clone();
+        bin_join_convoy(&mut ops);
+        assert!(ops == before);
     }
 
     #[test]

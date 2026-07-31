@@ -181,4 +181,30 @@ mod tests {
         assert!(matches!(ops[3], IlOp::MakeEnum { tag: 7, arity: 1, .. }));
         assert!(matches!(ops[4], IlOp::Pop { .. }));
     }
+
+    #[test]
+    fn vec_emit_buf_packs_box_unbox_load_field() {
+        let mut buf: Vec<Byte> = Vec::new();
+        EmitBuf::push_box_value(&mut buf, 3);
+        EmitBuf::push_unbox_value(&mut buf, 4);
+        EmitBuf::push_load_field(&mut buf, 2);
+        assert_eq!(*buf[0].bytecode(), Instruction::BoxValue);
+        assert_eq!(buf[0].operand_u32(), 3);
+        assert_eq!(*buf[1].bytecode(), Instruction::UnboxValue);
+        assert_eq!(buf[1].operand_u32(), 4);
+        assert_eq!(*buf[2].bytecode(), Instruction::LoadField);
+        assert_eq!(buf[2].operand_u32(), 2);
+    }
+
+    #[test]
+    fn codebuf_emit_buf_trait_lifts_box_unbox_load_field() {
+        let mut buf = CodeBuf::new();
+        EmitBuf::push_box_value(&mut buf, 5);
+        EmitBuf::push_unbox_value(&mut buf, 6);
+        EmitBuf::push_load_field(&mut buf, 1);
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::BoxValue { tag: 5, .. }));
+        assert!(matches!(ops[1], IlOp::UnboxValue { tag: 6, .. }));
+        assert!(matches!(ops[2], IlOp::LoadField { index: 1, .. }));
+    }
 }

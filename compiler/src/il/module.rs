@@ -125,29 +125,44 @@ impl IlModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::il::op::{IlJumpKind, Label};
-    use common::DebugLoc;
+    use crate::il::op::{IlJumpKind, IlOp, Label};
+    use common::{Byte, DebugLoc, Instruction};
+
+    fn loc() -> DebugLoc {
+        DebugLoc::unknown()
+    }
+
+    fn load_const_add_suffix() -> Vec<IlOp> {
+        vec![
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+        ]
+    }
 
     #[test]
     fn from_flat_splits_prologue_body_epilogue() {
         let ops = vec![
             IlOp::Const {
                 imm: 1,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
-            IlOp::Pop {
-                loc: DebugLoc::unknown(),
-            },
+            IlOp::Pop { loc: loc() },
             IlOp::Const {
                 imm: 2,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
-            IlOp::Return {
-                loc: DebugLoc::unknown(),
-            },
-            IlOp::Halt {
-                loc: DebugLoc::unknown(),
-            },
+            IlOp::Return { loc: loc() },
+            IlOp::Halt { loc: loc() },
         ];
         let funcs = vec![IlFunc::new("f", None, 2, 4)];
         let m = IlModule::from_flat(&ops, &funcs);
@@ -159,27 +174,73 @@ mod tests {
     }
 
     #[test]
-    fn optimize_and_flatten_dces_body_only() {
+    fn from_flat_preserves_inter_func_glue() {
+        // prologue | f0 body | glue | f1 body | epilogue
         let ops = vec![
-            IlOp::Dup {
-                loc: DebugLoc::unknown(),
-            },
-            IlOp::Pop {
-                loc: DebugLoc::unknown(),
+            IlOp::Const {
+                imm: 0,
+                loc: loc(),
             },
             IlOp::Const {
                 imm: 1,
-                loc: DebugLoc::unknown(),
+                loc: loc(),
             },
-            IlOp::Dup {
-                loc: DebugLoc::unknown(),
+            IlOp::Return { loc: loc() },
+            IlOp::Dup { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Const {
+                imm: 2,
+                loc: loc(),
             },
-            IlOp::Pop {
-                loc: DebugLoc::unknown(),
+            IlOp::Return { loc: loc() },
+            IlOp::Halt { loc: loc() },
+        ];
+        let funcs = vec![
+            IlFunc::new("a", None, 1, 3),
+            IlFunc::new("b", None, 5, 7),
+        ];
+        let m = IlModule::from_flat(&ops, &funcs);
+        assert_eq!(m.prologue.len(), 1);
+        assert_eq!(m.funcs.len(), 2);
+        assert_eq!(m.glue.len(), 1);
+        assert_eq!(m.glue[0].len(), 2);
+        assert!(matches!(m.glue[0][0], IlOp::Dup { .. }));
+        assert_eq!(m.epilogue.len(), 1);
+        assert_eq!(m.to_flat().len(), ops.len());
+    }
+
+    #[test]
+    fn empty_funcs_optimizes_whole_buffer() {
+        let mut m = IlModule {
+            prologue: vec![
+                IlOp::Dup { loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Const {
+                    imm: 1,
+                    loc: loc(),
+                },
+                IlOp::Return { loc: loc() },
+            ],
+            ..IlModule::default()
+        };
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        assert!(!flat.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+        assert!(flat.iter().any(|op| matches!(op, IlOp::ConstReturnImm { .. })
+            || matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
+    fn optimize_and_flatten_dces_body_only() {
+        let ops = vec![
+            IlOp::Dup { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
             },
-            IlOp::Return {
-                loc: DebugLoc::unknown(),
-            },
+            IlOp::Dup { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Return { loc: loc() },
         ];
         let funcs = vec![IlFunc::new("f", None, 2, 6)];
         let mut m = IlModule::from_flat(&ops, &funcs);
@@ -192,5 +253,82 @@ mod tests {
         assert!(!flat[2..].iter().any(|op| matches!(op, IlOp::Dup { .. })));
         let _ = IlJumpKind::Unconditional;
         let _ = Label(0);
+    }
+
+    #[test]
+    fn multi_op_on_full_buffer_refuses_when_prologue_poisons_sp() {
+        // PRINT in prologue Unknown-poisons SP. Scoped multi_op on the body
+        // alone would see Known SP and sink; whole-buffer multi_op must refuse.
+        let suf = load_const_add_suffix();
+        let mut ops = vec![IlOp::byte(Byte::new(Instruction::PRINT))];
+        let body_start = ops.len();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return { loc: loc() });
+        let body_emit_end = ops.iter().filter(|op| op.emits_code()).count();
+
+        // Confirm scoped multi_op would incorrectly sink.
+        let mut body_only: Vec<IlOp> = ops[body_start..].to_vec();
+        opt::multi_op_join_convoy(&mut body_only);
+        let scoped_loads = body_only
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(
+            scoped_loads, 1,
+            "precondition: body-only multi_op sinks (Known SP)"
+        );
+
+        let funcs = vec![IlFunc::new("f", None, 1, body_emit_end)];
+        let mut m = IlModule::from_flat(&ops, &funcs);
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        let loads = flat
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(
+            loads, 2,
+            "full-buffer multi_op must refuse when prologue poisons SP"
+        );
+    }
+
+    #[test]
+    fn multi_op_on_full_buffer_still_sinks_clean_body() {
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return { loc: loc() });
+        let emit_end = ops.iter().filter(|op| op.emits_code()).count();
+        let funcs = vec![IlFunc::new("f", None, 0, emit_end)];
+        let mut m = IlModule::from_flat(&ops, &funcs);
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        let loads = flat
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(loads, 1, "clean body must still sink via whole-buffer multi_op");
     }
 }

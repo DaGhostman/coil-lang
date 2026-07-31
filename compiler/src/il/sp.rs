@@ -410,6 +410,65 @@ mod tests {
     }
 
     #[test]
+    fn stack_delta_typed_longtail_ops() {
+        assert_eq!(
+            stack_delta(&IlOp::Index { loc: loc() }),
+            Some(-1)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::MakeTuple {
+                arity: 3,
+                loc: loc(),
+            }),
+            Some(-2)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::MakeArray {
+                arity: 2,
+                loc: loc(),
+            }),
+            Some(-1)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::MakeEnum {
+                tag: 1,
+                arity: 0,
+                loc: loc(),
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::MakeEnum {
+                tag: 1,
+                arity: 2,
+                loc: loc(),
+            }),
+            Some(-1)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::BoxValue {
+                tag: 0,
+                loc: loc(),
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::UnboxValue {
+                tag: 0,
+                loc: loc(),
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::LoadField {
+                index: 1,
+                loc: loc(),
+            }),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn call_entry_adjusts_height_by_arity() {
         // Two args on stack, CALL arity 2 → net −1 (consume args, push result).
         let ops = vec![
