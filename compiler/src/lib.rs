@@ -4016,9 +4016,8 @@ impl Compiler {
             let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
             if !self.functions.contains_key(&fqn) {
                 self.bind_function_entry(fqn);
-                self.bytecode
-                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
             }
         }
         if let Some(native_id) = self.native_id("hash_string") {
@@ -4213,14 +4212,11 @@ impl Compiler {
             ));
             self.messages.push(message);
         }
-        self.bytecode.push(Byte::new_with_value(
-            Instruction::CONST,
-            Value::default().raw() as _,
-        ));
+        self.bytecode.push_const(0);
         if self.compiling_result_mode {
             Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
         }
-        self.bytecode.push(Byte::new(Instruction::RETURN));
+        self.bytecode.push_return();
     }
 
     /// True when IL ops in `[op_start, ops.len())` end with a return terminator
@@ -6408,11 +6404,8 @@ impl Compiler {
         self.emit_string_literal("tests failed");
         self.bytecode.push(Byte::new(Instruction::Panic));
         bb.bind_label(end_lbl, self.bytecode.il_mut());
-        self.bytecode.push(Byte::new_with_value(
-            Instruction::CONST,
-            Value::default().raw() as _,
-        ));
-        self.bytecode.push(Byte::new(Instruction::RETURN));
+        self.bytecode.push_const(0);
+        self.bytecode.push_return();
 
         bb.finalize()
             .expect("BlockBuilder::finalize: virtual test main labels bound");
@@ -6802,12 +6795,9 @@ impl Compiler {
                         Expression::Block(items) if items.is_empty()
                     );
                     if body_empty {
-                        self.bytecode.push(Byte::new_with_value(
-                            Instruction::CONST,
-                            Value::default().raw() as _,
-                        ));
+                        self.bytecode.push_const(0);
                     }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                    self.bytecode.push_return();
                 }
                 self.context.variables = prev_fn_vars;
 
@@ -6996,7 +6986,7 @@ impl Compiler {
                 self.bytecode.append(&mut bytecode);
                 self.emit_run_defers();
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                    self.bytecode.push_return();
                 }
             }
             Expression::Yield(expr) => {
@@ -7395,11 +7385,8 @@ impl Compiler {
                 self.bytecode.append(&mut body_bc);
                 self.context.variables = prev_vars;
 
-                self.bytecode.push(Byte::new_with_value(
-                    Instruction::CONST,
-                    Value::from(0i64).raw() as _,
-                ));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
 
                 bb.bind_label(after, self.bytecode.il_mut());
                 bb.finalize()
@@ -10161,7 +10148,9 @@ impl Compiler {
                 self.emit_bytes(*span, &expr_bc);
                 Self::emit_result_err(&mut self.bytecode);
                 self.pad_debug_locs();
-                self.emit_byte(*span, Byte::new(Instruction::RETURN));
+                let loc = self.loc_for_span(*span);
+                self.bytecode.push_return_at(loc);
+                self.debug_locs.push(loc);
             }
             Expression::Panic(expr) => {
                 let expr_bc = self.do_compile(expr);
@@ -10187,7 +10176,7 @@ impl Compiler {
                     self.bytecode.il_mut(),
                 );
                 // Miss: failure value still on stack — propagate via RETURN.
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_return();
                 bb.bind_label(success, self.bytecode.il_mut());
                 bb.finalize()
                     .expect("BlockBuilder::finalize: Try success label bound");

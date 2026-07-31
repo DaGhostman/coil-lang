@@ -48,6 +48,37 @@ impl CodeBuf {
         }
     }
 
+    fn invalidate_lowered(&mut self) {
+        self.lowered = None;
+        self.lowered_locs = None;
+    }
+
+    /// Append a typed IL op (prefer for hot-set Const/Return/Load/…).
+    pub fn push_op(&mut self, op: IlOp) {
+        self.invalidate_lowered();
+        self.il.push_op(op);
+    }
+
+    pub fn push_const(&mut self, imm: i32) {
+        self.invalidate_lowered();
+        self.il.push_const(imm);
+    }
+
+    pub fn push_const_at(&mut self, imm: i32, loc: DebugLoc) {
+        self.invalidate_lowered();
+        self.il.push_const_at(imm, loc);
+    }
+
+    pub fn push_return(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_return();
+    }
+
+    pub fn push_return_at(&mut self, loc: DebugLoc) {
+        self.invalidate_lowered();
+        self.il.push_return_at(loc);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
@@ -413,6 +444,16 @@ mod tests {
         assert!(matches!(ops[1], IlOp::Const { imm: 2, .. }));
         assert!(matches!(ops[2], IlOp::Bin { op: Instruction::ADD, .. }));
         assert!(matches!(ops[3], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn push_const_and_return_emit_typed_ops() {
+        let mut buf = CodeBuf::new();
+        buf.push_const(0);
+        buf.push_return();
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
     }
 
     #[test]
