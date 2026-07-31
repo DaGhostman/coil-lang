@@ -414,7 +414,7 @@ statement ::= while_stmt
 | `defer` | `defer [use (ident,*)] { statement* }` (runs on enclosing function exit, LIFO; outer locals require `use`) |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
-| `return` | `return expr ';'` |
+| `return` | `return [expr] ';'` (`return;` returns unit) |
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
 | `for` (C-style) | `for '(' init ';' cond ';' step ')' block` |
