@@ -8,7 +8,9 @@ mod builder;
 mod codebuf;
 mod emit_buf;
 mod func;
+mod gvn;
 mod lower;
+mod module;
 mod op;
 mod opt;
 mod sp;
@@ -19,4 +21,5 @@ pub use emit_buf::EmitBuf;
 pub use func::IlFunc;
 #[allow(unused_imports)]
 pub use lower::{Lowered, lower, lower_with_funcs};
+pub use module::{IlFuncBody, IlModule};
 pub use op::{EntryKind, IlJumpKind, IlOp, Label};

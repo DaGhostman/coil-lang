@@ -62,10 +62,9 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
 /// inter-function glue untouched. Falls back to whole-buffer opts when `funcs`
 /// is empty (unit tests / buffers without `record_func`).
 ///
-/// [`multi_op_join_convoy`] always runs on the full buffer afterward: its SP
-/// join gates are fail-closed only with whole-module height context; scoping
-/// it to a body slice can treat a JMPF/fall-through diamond as Known and
-/// sink incorrectly (e.g. `examples/fib.hy`).
+/// Uses [`super::IlModule`] to own per-func op buffers, runs CFG GVN on each
+/// body, then [`multi_op_join_convoy`] on the full buffer: scoped multi_op can
+/// treat JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
 pub fn optimize_per_func(
     ops: &mut Vec<IlOp>,
     funcs: &[super::IlFunc],
@@ -76,35 +75,13 @@ pub fn optimize_per_func(
         return;
     }
 
-    let mut per = opts.clone();
-    let run_multi = per.multi_op_join_convoy;
-    per.multi_op_join_convoy = false;
-
-    let mut ranges: Vec<(usize, usize)> = funcs
-        .iter()
-        .filter(|f| f.code_start < f.code_end)
-        .map(|f| emitting_range_to_raw(ops, f.code_start, f.code_end))
-        .filter(|(s, e)| s < e)
-        .collect();
-    ranges.sort_by_key(|&(s, _)| s);
-    // Process from the end so earlier raw indices stay valid after splices.
-    for &(raw_start, raw_end) in ranges.iter().rev() {
-        if raw_end > ops.len() || raw_start >= raw_end {
-            continue;
-        }
-        let mut slice = ops[raw_start..raw_end].to_vec();
-        optimize(&mut slice, &per);
-        ops.splice(raw_start..raw_end, slice);
-    }
-
-    if run_multi {
-        multi_op_join_convoy(ops);
-    }
+    let mut module = super::IlModule::from_flat(ops, funcs);
+    *ops = module.optimize_and_flatten(opts);
 }
 
 /// Map inclusive-exclusive emitting indices to a raw op range, including
 /// leading labels bound at `emit_start`.
-fn emitting_range_to_raw(ops: &[IlOp], emit_start: usize, emit_end: usize) -> (usize, usize) {
+pub(crate) fn emitting_range_to_raw(ops: &[IlOp], emit_start: usize, emit_end: usize) -> (usize, usize) {
     let mut emitting = 0usize;
     let mut raw_start: Option<usize> = None;
     let mut raw_end: Option<usize> = None;
@@ -788,7 +765,7 @@ fn is_multi_op_join_pred_kind(kind: IlJumpKind) -> bool {
 /// (see [`super::sp::analyze`]). Accepts `JMP` / `JMPF` / `JMPT` /
 /// `JumpIfMatch` into the cluster. When fall-through has no suffix, the
 /// template comes from the first jump pred.
-fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
+pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
     let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, kind, suffix)
     let mut joins: Vec<(usize, usize, JoinKind, Vec<IlOp>)> = Vec::new();
