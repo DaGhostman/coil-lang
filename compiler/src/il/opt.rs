@@ -543,12 +543,6 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        let has_cond = saw_cond;
-        if has_cond && !info.sp_before(cluster_start).is_known() {
-            r += 1;
-            continue;
-        }
-
         let Some((_, template)) = fall.or_else(|| {
             let (j, k) = jump_preds[0];
             convoy_pred_bin_tail_before(ops, j, k)
@@ -556,6 +550,19 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             r += 1;
             continue;
         };
+
+        // Jump-pred-only template (no fall-through bin tail): refuse when join SP
+        // is Unknown — e.g. match arms with different heights (`examples/tree.hy`).
+        if fall.is_none() && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
+
+        let has_cond = saw_cond;
+        if has_cond && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
 
         if has_cond {
             let Some(template_sp) = fall
@@ -1000,12 +1007,6 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        let has_cond = saw_cond;
-        if has_cond && !info.sp_before(cluster_start).is_known() {
-            r += 1;
-            continue;
-        }
-
         let Some((_, template)) = fall.or_else(|| {
             let (j, k) = jump_preds[0];
             convoy_pred_producer_before(ops, j, k)
@@ -1013,6 +1014,17 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             r += 1;
             continue;
         };
+
+        if fall.is_none() && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
+
+        let has_cond = saw_cond;
+        if has_cond && !info.sp_before(cluster_start).is_known() {
+            r += 1;
+            continue;
+        }
 
         if has_cond {
             let Some(template_sp) = fall
@@ -3260,5 +3272,89 @@ mod tests {
             .count();
         assert_eq!(body_dups, 0, "func-body DUP/POP should DCE");
         assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    /// Regression: jmp-pred-only bin tail at a shared return label must refuse when
+    /// join SP is Unknown (`examples/tree.hy` sum_tree match arms).
+    #[test]
+    fn bin_join_convoy_refuses_unknown_sp_jump_pred_only_join() {
+        let mut ops = vec![
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch {
+                    tag: 0,
+                    arity: 0,
+                },
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Entry {
+                kind: super::super::EntryKind::Call,
+                arity: 1,
+                target: Label(99),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Entry {
+                kind: super::super::EntryKind::Call,
+                arity: 1,
+                target: Label(99),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Pop {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let adds_before = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .count();
+        bin_join_convoy(&mut ops);
+        let adds_after = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .count();
+        assert_eq!(adds_after, adds_before);
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::BinReturn { .. })));
     }
 }
