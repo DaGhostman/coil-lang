@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use common::{Byte, DebugLoc, Instruction};
 
 use super::{
-    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlOp, Label, Lowered, lower_with_funcs,
+    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlModule, IlOp, Label, Lowered, lower_module,
 };
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
@@ -315,8 +315,11 @@ impl CodeBuf {
         );
     }
 
+    /// Rebuild an owning [`IlModule`] from the flat emit stream and lower once.
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
-        let lowered = lower_with_funcs(self.il.ops(), &self.funcs, pool);
+        let mut module =
+            IlModule::from_flat(self.il.ops(), &self.funcs).with_entries(self.entry_at_offset.clone());
+        let lowered = lower_module(&mut module, pool);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
         lowered
@@ -548,5 +551,37 @@ mod tests {
         buf.clear();
         assert!(buf.funcs().is_empty());
         assert!(buf.ops().is_empty());
+    }
+
+    /// Production finalize: owning `IlModule` + entry map must still resolve CALL.
+    #[test]
+    fn lower_in_place_resolves_entry_call_through_module() {
+        let mut buf = CodeBuf::new();
+        let entry = buf.bind_fresh_entry();
+        let start = buf.len();
+        buf.push_const(7);
+        buf.push_return();
+        let end = buf.len();
+        buf.record_func("f", Some(entry), start, end);
+
+        // Packed CALL to entry PC → Entry rewrite; lives in epilogue after split.
+        buf.push(Byte::new(Instruction::CALL).with_call_packed(0, start as u32));
+        buf.push(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = buf.lower_in_place(&mut pool);
+        let ops: Vec<_> = lowered.bytecode.iter().map(|b| *b.bytecode()).collect();
+        // Entry label binds the Const producer, so ConstReturnImm fuse is refused.
+        assert!(
+            matches!(ops.as_slice(), [Instruction::CONST, Instruction::RETURN, Instruction::CALL, Instruction::HALT]),
+            "unexpected lowered ops: {ops:?}"
+        );
+        assert_eq!(lowered.bytecode[0].operand_u32(), 7);
+        assert_eq!(
+            lowered.bytecode[2].call_parts(),
+            (0, 0),
+            "CALL must target entry PC after owning-module lower"
+        );
+        assert_eq!(buf.as_slice().len(), lowered.bytecode.len());
     }
 }

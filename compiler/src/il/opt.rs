@@ -62,9 +62,13 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
 /// inter-function glue untouched. Falls back to whole-buffer opts when `funcs`
 /// is empty (unit tests / buffers without `record_func`).
 ///
-/// Uses [`super::IlModule`] to own per-func op buffers, runs CFG GVN on each
-/// body, then [`multi_op_join_convoy`] on the full buffer: scoped multi_op can
-/// treat JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
+/// Thin flat-buffer wrapper over [`super::IlModule::optimize_and_flatten`].
+/// Production lower uses [`super::lower_module`] on an owning module; this
+/// stays for unit tests that mutate a bare `Vec<IlOp>`.
+///
+/// Whole-buffer [`multi_op_join_convoy`] is required: scoped multi_op can treat
+/// JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
+#[allow(dead_code)]
 pub fn optimize_per_func(
     ops: &mut Vec<IlOp>,
     funcs: &[super::IlFunc],
@@ -3300,12 +3304,9 @@ mod tests {
                 slot: 2,
                 loc: common::DebugLoc::unknown(),
             },
-            IlOp::Entry {
-                kind: super::super::EntryKind::Call,
-                arity: 1,
-                target: Label(99),
-                loc: common::DebugLoc::unknown(),
-            },
+            // Unknown stack effect poisons SP into the join (real match diamonds
+            // with effectful ops must not convoy on jump-pred-only templates).
+            IlOp::byte(common::Byte::new(Instruction::PRINT)),
             IlOp::Bin {
                 op: Instruction::ADD,
                 loc: common::DebugLoc::unknown(),
@@ -3314,12 +3315,7 @@ mod tests {
                 slot: 3,
                 loc: common::DebugLoc::unknown(),
             },
-            IlOp::Entry {
-                kind: super::super::EntryKind::Call,
-                arity: 1,
-                target: Label(99),
-                loc: common::DebugLoc::unknown(),
-            },
+            IlOp::byte(common::Byte::new(Instruction::PRINT)),
             IlOp::Bin {
                 op: Instruction::ADD,
                 loc: common::DebugLoc::unknown(),
@@ -3345,6 +3341,15 @@ mod tests {
                 loc: common::DebugLoc::unknown(),
             },
         ];
+        let info = crate::il::sp::analyze(&ops);
+        let lab2 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(2))))
+            .unwrap();
+        assert!(
+            !info.sp_before(lab2).is_known(),
+            "precondition: join SP must be Unknown"
+        );
         let adds_before = ops
             .iter()
             .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))

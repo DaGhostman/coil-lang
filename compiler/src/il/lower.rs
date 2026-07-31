@@ -83,25 +83,37 @@ pub fn assert_no_residual_abs_jumps(ops: &[IlOp]) {
 /// Optimize and lower `ops` into VM bytecode.
 ///
 /// When `funcs` is empty, opts run on the whole buffer (unit tests). Production
-/// [`super::CodeBuf::lower_in_place`] passes recorded [`IlFunc`] spans so opts
-/// stay inside each function and leave prologue / glue alone.
+/// [`super::CodeBuf::lower_in_place`] rebuilds an owning [`super::IlModule`] and
+/// lowers through [`lower_module`].
 #[allow(dead_code)] // used by unit tests / re-exports
 pub fn lower(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
     lower_with_funcs(ops, &[], pool)
 }
 
-/// Like [`lower`], but scopes IL opts to each [`IlFunc`] emitting span.
+/// Rebuild [`super::IlModule`] from flat ops + spans, then [`lower_module`].
 pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> Lowered {
-    let mut ops = ops.to_vec();
-    opt::optimize_per_func(&mut ops, funcs, &opt::OptimizeOptions::default());
-    assert_no_residual_abs_jumps(&ops);
+    let mut module = super::IlModule::from_flat(ops, funcs);
+    lower_module(&mut module, pool)
+}
+
+/// Optimize an owning [`super::IlModule`] and lower once (fuse-select + PC assign).
+///
+/// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
+pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
+    let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default());
+    lower_optimized(&flat, pool)
+}
+
+/// Fuse-select + PC assign for an already-optimized op stream (no IL opts).
+pub(crate) fn lower_optimized(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
+    assert_no_residual_abs_jumps(ops);
 
     let mut pre_slots: Vec<Slot> = Vec::with_capacity(ops.len());
     // For each pre-fusion emitting index, labels that bind to it.
     let mut binds_at: HashMap<usize, Vec<u32>> = HashMap::new();
     let mut pending: Vec<u32> = Vec::new();
 
-    for op in &ops {
+    for op in ops {
         match op {
             IlOp::Label(Label(id)) => pending.push(*id),
             IlOp::Jump { kind, target, loc } => {
@@ -964,5 +976,88 @@ mod tests {
             Instruction::ConstReturnImm
         ));
         assert_eq!(lowered.bytecode[0].operand_u32(), 11);
+    }
+
+    /// `lower_with_funcs` must rebuild an owning module, scope body opts, then lower once.
+    #[test]
+    fn lower_with_funcs_scopes_body_opts_then_lowers_once() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Dup { loc },
+            IlOp::Pop { loc },
+            IlOp::Const { imm: 5, loc },
+            IlOp::Return { loc },
+            IlOp::Dup { loc },
+            IlOp::Pop { loc },
+        ];
+        let funcs = vec![IlFunc::new("f", None, 2, 4)];
+        let mut pool = Vec::new();
+        let lowered = lower_with_funcs(&ops, &funcs, &mut pool);
+        assert!(
+            matches!(*lowered.bytecode[0].bytecode(), Instruction::DUPLICATE),
+            "prologue must survive scoped opts"
+        );
+        assert!(matches!(*lowered.bytecode[1].bytecode(), Instruction::POP));
+        assert!(
+            matches!(*lowered.bytecode[2].bytecode(), Instruction::ConstReturnImm),
+            "body Const+Return must fuse in the single lower"
+        );
+        assert_eq!(lowered.bytecode[2].operand_u32(), 5);
+        assert!(
+            matches!(*lowered.bytecode[3].bytecode(), Instruction::DUPLICATE),
+            "trailing glue must survive"
+        );
+        assert!(matches!(*lowered.bytecode[4].bytecode(), Instruction::POP));
+    }
+
+    /// `lower_module` must run CFG GVN on bodies before the single fuse/PC lower.
+    #[test]
+    fn lower_module_runs_gvn_load_join_cse_before_lower() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 0, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc,
+            },
+            IlOp::Load { slot: 3, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc,
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load { slot: 3, loc },
+            IlOp::Label(Label(2)),
+            IlOp::Load { slot: 3, loc },
+            IlOp::Return { loc },
+        ];
+        let emit_end = ops.iter().filter(|op| op.emits_code()).count();
+        let funcs = vec![IlFunc::new("f", None, 0, emit_end)];
+        let mut module = super::super::IlModule::from_flat(&ops, &funcs);
+        let mut pool = Vec::new();
+        let lowered = lower_module(&mut module, &mut pool);
+        let loads = lowered
+            .bytecode
+            .iter()
+            .filter(|b| matches!(*b.bytecode(), Instruction::LOAD))
+            .count();
+        assert_eq!(
+            loads, 2,
+            "join Load CSE via lower_module GVN; got {:?}",
+            lowered
+                .bytecode
+                .iter()
+                .map(|b| *b.bytecode())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            lowered
+                .bytecode
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::RETURN)),
+            "stack value from pred Load must still return"
+        );
     }
 }

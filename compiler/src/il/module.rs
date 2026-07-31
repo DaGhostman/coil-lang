@@ -1,30 +1,41 @@
-//! Per-function IL module view over the flat [`super::CodeBuf`] stream.
+//! Per-function IL module: owning view rebuilt at finalize from flat emit.
 //!
-//! Splits recorded [`super::IlFunc`] emitting spans into owned bodies for
-//! scoped opts / GVN, then concatenates back. Prologue and inter-function
-//! glue stay outside function bodies.
+//! Codegen keeps a flat [`super::CodeBuf`] stream. At lower time the buffer is
+//! split into owned function bodies (plus prologue / glue / epilogue), opts and
+//! CFG GVN run per body, then the stream is concatenated for whole-buffer
+//! `multi_op_join_convoy` and a single fuse/PC lower.
+
+use std::collections::HashMap;
 
 use super::func::IlFunc;
-use super::op::IlOp;
+use super::op::{IlOp, Label};
 use super::opt::{self, OptimizeOptions};
 
 /// One function's owned IL ops (labels inclusive at span edges).
 #[derive(Clone)]
 pub struct IlFuncBody {
-    #[allow(dead_code)] // retained for tooling / IlModule consumers
+    /// Span / entry metadata from emit-time [`IlFunc`].
+    #[allow(dead_code)] // retained for module hooks / diagnostics
     pub meta: IlFunc,
     pub ops: Vec<IlOp>,
 }
 
 /// Flat stream partitioned into prologue, function bodies, and glue.
+///
+/// Rebuilt at finalize; bodies are the source of truth for per-func opts/GVN
+/// until [`Self::optimize_and_flatten`] concatenates for multi_op + lower.
 #[derive(Clone, Default)]
 pub struct IlModule {
     pub prologue: Vec<IlOp>,
     pub funcs: Vec<IlFuncBody>,
-    /// Ops after the last function (and any between-func gaps folded in order).
-    /// Between-func glue is stored in [`IlFuncBody`] order via [`Self::glue`].
+    /// Gap after `funcs[i]` (before the next func or epilogue).
     pub glue: Vec<Vec<IlOp>>,
     pub epilogue: Vec<IlOp>,
+    /// Logical emitting PC → entry label (copied from [`super::CodeBuf`] at finalize).
+    ///
+    /// CALL/CodePtr rewrite to `IlOp::Entry` happens at emit time on `CodeBuf`;
+    /// this map is retained for diagnostics and future module-level remapping.
+    pub entry_at_offset: HashMap<usize, Label>,
 }
 
 impl IlModule {
@@ -39,6 +50,7 @@ impl IlModule {
                 funcs: Vec::new(),
                 glue: Vec::new(),
                 epilogue: Vec::new(),
+                entry_at_offset: HashMap::new(),
             };
         }
 
@@ -80,6 +92,12 @@ impl IlModule {
             module.epilogue = ops[cursor..].to_vec();
         }
         module
+    }
+
+    /// Attach entry-label map from the emit-time [`super::CodeBuf`].
+    pub fn with_entries(mut self, entry_at_offset: HashMap<usize, Label>) -> Self {
+        self.entry_at_offset = entry_at_offset;
+        self
     }
 
     /// Concatenate prologue / bodies / glue / epilogue into one op stream.
@@ -175,7 +193,6 @@ mod tests {
 
     #[test]
     fn from_flat_preserves_inter_func_glue() {
-        // prologue | f0 body | glue | f1 body | epilogue
         let ops = vec![
             IlOp::Const {
                 imm: 0,
@@ -207,6 +224,41 @@ mod tests {
         assert!(matches!(m.glue[0][0], IlOp::Dup { .. }));
         assert_eq!(m.epilogue.len(), 1);
         assert_eq!(m.to_flat().len(), ops.len());
+    }
+
+    #[test]
+    fn with_entries_preserves_entry_map() {
+        let ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let funcs = vec![IlFunc::new("f", Some(Label(9)), 0, 2)];
+        let mut entries = HashMap::new();
+        entries.insert(0usize, Label(9));
+        let m = IlModule::from_flat(&ops, &funcs).with_entries(entries);
+        assert_eq!(m.entry_at_offset.get(&0), Some(&Label(9)));
+        assert_eq!(m.funcs[0].meta.entry, Some(Label(9)));
+    }
+
+    /// Empty `funcs` must not discard a previously attached entry map when rebuilding.
+    #[test]
+    fn with_entries_survives_empty_funcs_from_flat() {
+        let ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let mut entries = HashMap::new();
+        entries.insert(0usize, Label(3));
+        let m = IlModule::from_flat(&ops, &[]).with_entries(entries);
+        assert!(m.funcs.is_empty());
+        assert_eq!(m.prologue.len(), 2);
+        assert_eq!(m.entry_at_offset.get(&0), Some(&Label(3)));
     }
 
     #[test]
@@ -257,8 +309,6 @@ mod tests {
 
     #[test]
     fn multi_op_on_full_buffer_refuses_when_prologue_poisons_sp() {
-        // PRINT in prologue Unknown-poisons SP. Scoped multi_op on the body
-        // alone would see Known SP and sink; whole-buffer multi_op must refuse.
         let suf = load_const_add_suffix();
         let mut ops = vec![IlOp::byte(Byte::new(Instruction::PRINT))];
         let body_start = ops.len();
@@ -278,7 +328,6 @@ mod tests {
         ops.push(IlOp::Return { loc: loc() });
         let body_emit_end = ops.iter().filter(|op| op.emits_code()).count();
 
-        // Confirm scoped multi_op would incorrectly sink.
         let mut body_only: Vec<IlOp> = ops[body_start..].to_vec();
         opt::multi_op_join_convoy(&mut body_only);
         let scoped_loads = body_only
@@ -324,7 +373,6 @@ mod tests {
         let emit_end = ops.iter().filter(|op| op.emits_code()).count();
         let funcs = vec![IlFunc::new("f", None, 0, emit_end)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        // Isolate multi_op: return/bin convoy would otherwise rewrite the join.
         let flat = m.optimize_and_flatten(&OptimizeOptions {
             jump_thread: false,
             dead_block: false,
