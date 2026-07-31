@@ -4124,6 +4124,125 @@ impl Compiler {
         }
     }
 
+    /// Peel `forall` / function arrows to the final return type.
+    fn peel_fn_return_ty(ty: &crate::typechecking::Ty) -> crate::typechecking::Ty {
+        use crate::typechecking::Ty;
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        while let Ty::Fun(_, ret) = t {
+            t = *ret;
+        }
+        t
+    }
+
+    /// Look up a function's scheme and peel to its return type.
+    fn fn_return_ty(&self, name: &str) -> Option<crate::typechecking::Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        let scheme = self.checker.env().lookup(name)?;
+        let applied = apply_ty_prune(self.checker.subst(), &scheme.ty);
+        Some(Self::peel_fn_return_ty(&applied))
+    }
+
+    /// True when `Value::default()` (`0`) is a valid representation for `ty`.
+    ///
+    /// Safe for unit / int / byte / bool / float, open vars (statement bodies),
+    /// and `Option<_>` (encodes as `None`). `Result` / `string` / ADTs are not.
+    fn ty_allows_zero_default(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::{
+            Ty,
+            ty::{BOOL, BYTE, FLOAT, INT, UNIT, is_option_ty, option_inner, result_ok_err},
+        };
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        if is_option_ty(&t) {
+            return true;
+        }
+        if let Some((ok, _)) = result_ok_err(&t) {
+            return Self::ty_allows_zero_default(&ok);
+        }
+        if let Some(inner) = option_inner(&t) {
+            let _ = inner;
+            return true;
+        }
+        match &t {
+            Ty::Con(name) => matches!(name.as_str(), UNIT | INT | BYTE | BOOL | FLOAT),
+            Ty::Var(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether an implicit fall-through `CONST 0` is valid for `name`'s return.
+    fn fallthrough_allows_zero(&self, name: &str) -> bool {
+        use crate::typechecking::ty::result_ok_err;
+        let Some(ret) = self.fn_return_ty(name) else {
+            // No scheme — fail closed (do not silently emit zero).
+            return false;
+        };
+        if self.compiling_result_mode {
+            if let Some((ok, _)) = result_ok_err(&ret) {
+                return Self::ty_allows_zero_default(&ok);
+            }
+        }
+        Self::ty_allows_zero_default(&ret)
+    }
+
+    /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
+    fn emit_fallthrough_return(&mut self, name: &str, span: SimpleSpan) {
+        self.emit_run_defers();
+        if !self.fallthrough_allows_zero(name) {
+            let ret_s = self
+                .fn_return_ty(name)
+                .map(|t| format!("{t}"))
+                .unwrap_or_else(|| "unknown".into());
+            let mut message = Message::error(
+                ErrorCode::ReturnMismatch,
+                format!(
+                    "function `{name}` reaches the end without returning a value of type `{ret_s}`"
+                ),
+                span.into_range(),
+            );
+            message.push(DiagLabel::new(
+                "add an explicit `return` (implicit `0` is not valid for this type)".to_string(),
+                span.into_range(),
+            ));
+            self.messages.push(message);
+        }
+        self.bytecode.push(Byte::new_with_value(
+            Instruction::CONST,
+            Value::default().raw() as _,
+        ));
+        if self.compiling_result_mode {
+            Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+        }
+        self.bytecode.push(Byte::new(Instruction::RETURN));
+    }
+
+    /// True when IL ops in `[op_start, ops.len())` end with a return terminator
+    /// (labels skipped). `op_start` must be an index into [`CodeBuf::ops`], not
+    /// an emitting-code length from [`CodeBuf::len`].
+    fn region_ends_with_return(&self, op_start: usize) -> bool {
+        let ops = self.bytecode.ops();
+        let mut i = ops.len();
+        while i > op_start {
+            i -= 1;
+            match &ops[i] {
+                IlOp::Label(_) => continue,
+                IlOp::Return { .. }
+                | IlOp::LoadReturnSlot { .. }
+                | IlOp::ConstReturnImm { .. }
+                | IlOp::BinReturn { .. }
+                | IlOp::Halt { .. } => return true,
+                op if op.is_plain_return() => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Emit a `BoxValue` instruction for a concrete `Ty` at a generic
     /// call argument boundary (concrete→generic).  Does nothing when the
     /// type is already open (Ty::Var), or if a tag cannot be determined.
@@ -4201,22 +4320,12 @@ impl Compiler {
         for dict_idx in 0..dict_arity {
             self.context.variables.intern(format!("__dict{}", dict_idx));
         }
+        let body_op_start = self.bytecode.ops().len();
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
 
-        if !matches!(
-            self.bytecode.last_byte().map(|b| *b.bytecode()),
-            Some(Instruction::RETURN)
-        ) {
-            self.emit_run_defers();
-            self.bytecode.push(Byte::new_with_value(
-                Instruction::CONST,
-                Value::default().raw() as _,
-            ));
-            if self.compiling_result_mode {
-                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-            }
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+        if !self.region_ends_with_return(body_op_start) {
+            self.emit_fallthrough_return(name, body.0);
         }
 
         self.fn_defers = prev_fn_defers;
@@ -4400,22 +4509,12 @@ impl Compiler {
             let prev_fn_defers = std::mem::take(&mut self.fn_defers);
             let mut a = self.do_compile(args);
             self.bytecode.append(&mut a);
+            let body_op_start = self.bytecode.ops().len();
             let mut c = self.do_compile(body);
             self.bytecode.append(&mut c);
 
-            if !matches!(
-                self.bytecode.last_byte().map(|b| *b.bytecode()),
-                Some(Instruction::RETURN)
-            ) {
-                self.emit_run_defers();
-                self.bytecode.push(Byte::new_with_value(
-                    Instruction::CONST,
-                    Value::default().raw() as _,
-                ));
-                if self.compiling_result_mode {
-                    Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                }
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+            if !self.region_ends_with_return(body_op_start) {
+                self.emit_fallthrough_return(source_name, body.0);
             }
 
             self.fn_defers = prev_fn_defers;
@@ -6626,6 +6725,7 @@ impl Compiler {
                 self.bytecode.append(&mut a);
 
                 let body_start = self.bytecode.len();
+                let body_op_start = self.bytecode.ops().len();
                 let prev_active = self.active_fn_name.take();
                 let prev_fn_defers = std::mem::take(&mut self.fn_defers);
                 self.active_fn_name = Some(name.to_string());
@@ -6633,19 +6733,8 @@ impl Compiler {
                 self.active_fn_name = prev_active;
                 self.bytecode.append(&mut c);
 
-                if !matches!(
-                    self.bytecode.last_byte().map(|b| *b.bytecode()),
-                    Some(Instruction::RETURN)
-                ) {
-                    self.emit_run_defers();
-                    self.bytecode.push(Byte::new_with_value(
-                        Instruction::CONST,
-                        Value::default().raw() as _,
-                    ));
-                    if self.compiling_result_mode {
-                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                    }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                if !self.region_ends_with_return(body_op_start) {
+                    self.emit_fallthrough_return(name, body.0);
                 }
 
                 self.fn_defers = prev_fn_defers;
@@ -9285,21 +9374,13 @@ impl Compiler {
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
 
+                let body_op_start = self.bytecode.ops().len();
                 let mut body_bc = self.do_compile(body);
                 self.bytecode.append(&mut body_bc);
 
-                if !matches!(
-                    self.bytecode.last_byte().map(|b| *b.bytecode()),
-                    Some(Instruction::RETURN)
-                ) {
-                    self.bytecode.push(Byte::new_with_value(
-                        Instruction::CONST,
-                        Value::default().raw() as _,
-                    ));
-                    if self.compiling_result_mode {
-                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                    }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                if !self.region_ends_with_return(body_op_start) {
+                    // Test cases are typed as unit / Result<(), string> — zero is safe.
+                    self.emit_fallthrough_return(&fn_name, body.0);
                 }
 
                 self.compiling_result_mode = prev_result_mode;
@@ -14837,4 +14918,26 @@ fn main() {
         );
     }
 
+}
+
+#[cfg(test)]
+mod fallthrough_probe {
+    use super::*;
+    #[test]
+    fn probe_string_fallthrough_diag() {
+        let mut p = crate::pipeline::Pipeline::new();
+        let src = "fn bad() -> string {}\nfn main() { let _ = bad(); }\n";
+        let r = p.compile_src(src);
+        let c = p.compiler_mut();
+        let ty = c.fn_return_ty("bad");
+        let allow = c.fallthrough_allows_zero("bad");
+        let scheme = c.checker.env().lookup("bad").map(|s| format!("{}", s.ty));
+        let msgs: Vec<_> = p
+            .messages()
+            .iter()
+            .map(|m| (m.code(), m.message().to_string()))
+            .collect();
+        eprintln!("result_ok={} ty={ty:?} allow={allow} scheme={scheme:?} msgs={msgs:?}", r.is_ok());
+        assert!(r.is_err(), "ty={ty:?} allow={allow} scheme={scheme:?}");
+    }
 }

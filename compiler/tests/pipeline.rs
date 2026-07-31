@@ -4191,3 +4191,50 @@ fn main() {
     );
     assert_eq!(output, "true,true,true,true,true");
 }
+
+#[test]
+fn fallthrough_string_return_requires_explicit_return() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+fn bad() -> string {
+    // no return
+}
+
+fn main() {
+    print "%s", bad();
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "missing return for string should fail with E0111"
+    );
+    let msgs = pipeline.messages();
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch)),
+        "expected ReturnMismatch; got {} messages",
+        msgs.len()
+    );
+}
+
+#[test]
+fn fallthrough_unit_and_int_still_allow_zero() {
+    let output = run_example_src(
+        r#"
+fn unitish() {
+    let x = 1;
+}
+
+fn answer() -> int {
+    // implicit 0
+}
+
+fn main() {
+    unitish();
+    print "%i", answer();
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
