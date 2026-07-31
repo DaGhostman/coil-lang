@@ -1727,6 +1727,124 @@ mod tests {
     }
 
     #[test]
+    fn multi_op_join_convoy_skips_mixed_jmpf_jmp_unknown_sp() {
+        // Identical S on both arms, but JMPF is −1 vs JMP 0 at the join → Unknown.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_jump_pred_template_keeps_pre_join_ops() {
+        // All-jump diamond: template from jump preds. Ops between last JMP and
+        // the join label are not the suffix — must not be stripped.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Load {
+            slot: 9,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Const {
+            imm: 7,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load9 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Load { slot: 9, .. }))
+            .expect("pre-join Load kept");
+        let const7 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Const { imm: 7, .. }))
+            .expect("pre-join Const kept");
+        let lab = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .expect("join label");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("suffix sunk after join");
+        assert!(load9 < const7 && const7 < lab && lab < add_idx);
+        let sunk_loads = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
+            .count();
+        assert_eq!(sunk_loads, 1);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_prefers_longest_suffix_via_jmpf() {
+        let suf = load_two_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        let const_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Const { imm: 1 | 2, .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        assert_eq!(const_count, 2, "length-4 jump-pred template keeps both consts");
+    }
+
+    #[test]
     fn multi_op_join_convoy_skips_jump_if_match_into_cluster() {
         let suf = load_const_add_suffix();
         let mut ops = Vec::new();
@@ -1998,7 +2116,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_op_join_convoy_skips_conditional_into_non_return_cluster() {
+    fn multi_op_join_convoy_skips_jmpf_fallthrough_unknown_sp_non_return() {
+        // JMPF + fall-through identical S: join SP Unknown → refuse (same as return).
         let suf = load_const_add_suffix();
         let mut ops = Vec::new();
         ops.extend(suf.clone());
