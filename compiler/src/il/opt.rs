@@ -13,6 +13,8 @@ pub struct OptimizeOptions {
     pub dead_block: bool,
     /// Drop redundant `DUPLICATE; POP` and `LOAD s; StorePop s`.
     pub stack_dce: bool,
+    /// `StorePop s; Load s` → `Dup; StorePop s`; dead-store elimination.
+    pub mem_fwd: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
     /// Sink identical binop / BinSlot* tails into a return-label cluster.
@@ -29,6 +31,7 @@ impl Default for OptimizeOptions {
             // continuations labeled.
             dead_block: true,
             stack_dce: true,
+            mem_fwd: true,
             return_convoy: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
@@ -46,6 +49,10 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
     }
     if opts.stack_dce {
         stack_dce(ops);
+    }
+    if opts.mem_fwd {
+        mem_fwd(ops);
+        dead_store(ops);
     }
     if opts.return_convoy {
         return_convoy(ops);
@@ -264,6 +271,110 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
         }
         out.push(ops[i].clone());
         i += 1;
+    }
+    *ops = out;
+}
+
+/// `StorePop s; Load s` → `Dup; StorePop s` (value stays on stack after store).
+fn mem_fwd(ops: &mut Vec<IlOp>) {
+    let mut i = 0;
+    while i + 1 < ops.len() {
+        let slot_loc = {
+            match (&ops[i], &ops[i + 1]) {
+                (IlOp::StorePop { slot: s0, loc }, IlOp::Load { slot: s1, .. }) if s0 == s1 => {
+                    Some((*s0, *loc))
+                }
+                _ => None,
+            }
+        };
+        if let Some((slot, loc)) = slot_loc {
+            ops[i] = IlOp::Dup { loc };
+            ops[i + 1] = IlOp::StorePop { slot, loc };
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn slot_used_by(op: &IlOp, slot: u32) -> bool {
+    match op {
+        IlOp::Load { slot: s, .. } | IlOp::LoadReturnSlot { slot: s, .. } => *s == slot,
+        IlOp::BinSlotImm { slot: s, .. } => *s as u32 == slot,
+        IlOp::BinSlotSlot { a, b, .. } => *a as u32 == slot || *b as u32 == slot,
+        _ => false,
+    }
+}
+
+fn is_store_barrier(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::HostInvoke { .. }
+            | IlOp::Print { .. }
+            | IlOp::Entry { .. }
+            | IlOp::SetField { .. }
+            | IlOp::Jump { .. }
+            | IlOp::Label(_)
+            | IlOp::Return { .. }
+            | IlOp::Halt { .. }
+            | IlOp::LoadReturnSlot { .. }
+            | IlOp::ConstReturnImm { .. }
+            | IlOp::BinReturn { .. }
+    )
+}
+
+/// Drop `StorePop s` (and a preceding dead producer / Dup) when `s` is unused
+/// before the next store to `s` or a control/effect barrier. Straight-line only.
+fn dead_store(ops: &mut Vec<IlOp>) {
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let IlOp::StorePop { slot, .. } = &ops[i] else {
+            i += 1;
+            continue;
+        };
+        let slot = *slot;
+        let mut used = false;
+        let mut j = i + 1;
+        while j < ops.len() {
+            if is_store_barrier(&ops[j]) {
+                break;
+            }
+            if matches!(&ops[j], IlOp::StorePop { slot: s, .. } if *s == slot) {
+                break;
+            }
+            if slot_used_by(&ops[j], slot) {
+                used = true;
+                break;
+            }
+            j += 1;
+        }
+        if !used {
+            // Only when the stored value is otherwise dead: Dup;StorePop or
+            // Const/Load/ConstPool immediately before.
+            if i > 0 {
+                match &ops[i - 1] {
+                    IlOp::Dup { .. }
+                    | IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::Load { .. } => {
+                        remove.insert(i - 1);
+                        remove.insert(i);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    if remove.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (idx, op) in ops.iter().enumerate() {
+        if !remove.contains(&idx) {
+            out.push(op.clone());
+        }
     }
     *ops = out;
 }
@@ -1965,6 +2076,77 @@ mod tests {
         stack_dce(&mut ops);
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], IlOp::Halt { .. }));
+    }
+
+    #[test]
+    fn mem_fwd_store_pop_load_becomes_dup_store() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 7,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        mem_fwd(&mut ops);
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+        assert!(matches!(ops[2], IlOp::StorePop { slot: 3, .. }));
+    }
+
+    #[test]
+    fn dead_store_drops_dup_store_when_slot_unused() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Dup {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 9,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store(&mut ops);
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+        assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
+    }
+
+    #[test]
+    fn dead_store_keeps_store_when_slot_loaded() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 9,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 9,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store(&mut ops);
+        assert!(ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 9, .. })));
     }
 
     fn load_const_add_suffix() -> Vec<IlOp> {

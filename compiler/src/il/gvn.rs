@@ -2,12 +2,13 @@
 //!
 //! Builds a simple block CFG from labels and jumps inside one function body,
 //! then CSE's identical pure stack producers (`Const` / `Load` / `Bin` /
-//! `BinSlot*` / `Index`) within a block. At joins, sinks a redundant producer
-//! only when every predecessor ends with the same pure op and SP-in agrees.
+//! `BinSlot*` / `Index` / `LoadField`) within a block. At joins, sinks a
+//! redundant producer (or length-2 pure tail) when every predecessor ends with
+//! the same ops and SP-in agrees.
 //!
 //! Limitations: no SSA rename of slots; effectful ops (`StorePop`, calls,
-//! HostInvoke, …) are barriers; does not replace Ord-sensitive convoy refuse
-//! rules — GVN feeds cleaner identical tails into those passes.
+//! HostInvoke, SetField, …) are barriers; does not replace Ord-sensitive convoy
+//! refuse rules — GVN feeds cleaner identical tails into those passes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,12 +22,14 @@ fn is_pure_producer(op: &IlOp) -> bool {
     matches!(
         op,
         IlOp::Const { .. }
+            | IlOp::ConstPool { .. }
             | IlOp::Load { .. }
             | IlOp::Bin { .. }
             | IlOp::BinSlotImm { .. }
             | IlOp::BinSlotSlot { .. }
             | IlOp::Index { .. }
             | IlOp::Dup { .. }
+            | IlOp::LoadField { .. }
     ) || matches!(
         op.as_encode_byte(),
         Some(b) if matches!(
@@ -42,6 +45,42 @@ fn is_pure_producer(op: &IlOp) -> bool {
                 | Instruction::BinSlotSlot
                 | Instruction::Index
                 | Instruction::DUPLICATE
+                | Instruction::LoadField
+        )
+    )
+}
+
+fn is_mem_barrier(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::StorePop { .. }
+            | IlOp::SetField { .. }
+            | IlOp::HostInvoke { .. }
+            | IlOp::Print { .. }
+            | IlOp::Entry { .. }
+            | IlOp::MakeTuple { .. }
+            | IlOp::MakeArray { .. }
+            | IlOp::MakeEnum { .. }
+            | IlOp::BoxValue { .. }
+            | IlOp::GetField { .. }
+    ) || matches!(
+        op.as_encode_byte(),
+        Some(b) if matches!(
+            *b.bytecode(),
+            Instruction::StorePop
+                | Instruction::SetField
+                | Instruction::HostInvoke
+                | Instruction::PRINT
+                | Instruction::CALL
+                | Instruction::TailCall
+                | Instruction::MakeCoro
+                | Instruction::GetField
+                | Instruction::MakeTuple
+                | Instruction::MakeArray
+                | Instruction::MakeEnum
+                | Instruction::BoxValue
+                | Instruction::FORMAT
+                | Instruction::FfiInvoke
         )
     )
 }
@@ -171,16 +210,13 @@ fn preds_of(blocks: &[Block]) -> Vec<Vec<usize>> {
     preds
 }
 
-/// Local CSE within each block: drop `op; op` when both are the same pure
-/// producer (second is redundant on the stack — only for Dup of identical
-/// Const/Load pairs we replace with Dup; for now remove exact `Const k; Const k`
-/// by replacing the second with `Dup`).
+/// Local CSE within each block: identical Const/Load → Dup; then LoadField CSE.
 fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
     for b in blocks {
         let mut last_key: Option<u64> = None;
         let mut last_idx: Option<usize> = None;
         for i in b.start..b.end {
-            if matches!(ops[i], IlOp::Label(_)) {
+            if matches!(ops[i], IlOp::Label(_)) || is_mem_barrier(&ops[i]) {
                 last_key = None;
                 last_idx = None;
                 continue;
@@ -195,11 +231,13 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 && k == pk
                 && matches!(
                     &ops[pi],
-                    IlOp::Const { .. } | IlOp::Load { .. }
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
                 )
-                && matches!(&ops[i], IlOp::Const { .. } | IlOp::Load { .. })
+                && matches!(
+                    &ops[i],
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                )
             {
-                // Replace second identical Const/Load with Dup.
                 ops[i] = IlOp::Dup {
                     loc: ops[i].loc(),
                 };
@@ -211,11 +249,83 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
             last_idx = Some(i);
         }
     }
+    load_field_cse(ops, blocks);
 }
 
-/// At a join block, if every pred ends with the same pure Const/Load and the
-/// join's first emitting op is that same producer, drop the join copy (preds
-/// already leave it on the stack). Requires Known agreeing SP at join.
+/// `Load s; LoadField i; Load s; LoadField i` → drop second Load, replace second
+/// LoadField with `Dup` when only labels intervene (field still TOS).
+fn load_field_cse(ops: &mut Vec<IlOp>, blocks: &[Block]) {
+    let mut remove: HashSet<usize> = HashSet::new();
+    for b in blocks {
+        let mut last: Option<(u32, u32, usize)> = None; // slot, index, field_idx
+        let mut i = b.start;
+        while i < b.end {
+            if matches!(ops[i], IlOp::Label(_)) {
+                i += 1;
+                continue;
+            }
+            if is_mem_barrier(&ops[i]) {
+                last = None;
+                i += 1;
+                continue;
+            }
+            if i + 1 < b.end
+                && let (IlOp::Load { slot, .. }, IlOp::LoadField { index, loc }) =
+                    (&ops[i], &ops[i + 1])
+            {
+                let slot = *slot;
+                let index = *index;
+                let loc = *loc;
+                if let Some((ps, pi, fi)) = last
+                    && ps == slot
+                    && pi == index
+                {
+                    let mut only_labels = true;
+                    for j in fi + 1..i {
+                        if !matches!(ops[j], IlOp::Label(_)) {
+                            only_labels = false;
+                            break;
+                        }
+                    }
+                    if only_labels {
+                        remove.insert(i);
+                        ops[i + 1] = IlOp::Dup { loc };
+                        last = Some((slot, index, i + 1));
+                        i += 2;
+                        continue;
+                    }
+                }
+                last = Some((slot, index, i + 1));
+                i += 2;
+                continue;
+            }
+            if !matches!(
+                &ops[i],
+                IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. }
+            ) {
+                last = None;
+            }
+            i += 1;
+        }
+    }
+    if remove.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if !remove.contains(&i) {
+            out.push(op.clone());
+        }
+    }
+    *ops = out;
+}
+
+/// At a join block, if every pred ends with the same pure Const/Load (or the
+/// same length-2 pure tail) and the join starts with that copy, drop the join
+/// copy. Requires Known agreeing SP at join.
 fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
     if blocks.is_empty() {
         return;
@@ -231,14 +341,32 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
         if !info.sp_before(b.start).is_known() {
             continue;
         }
-        // First emitting op in the join block.
+
+        // Prefer length-2 pure tail CSE, then single Const/Load.
+        if let Some(tail) = join_pure_tail(ops, b.start, b.end, 2) {
+            let keys: Vec<u64> = tail.iter().filter_map(|&i| producer_key(&ops[i])).collect();
+            if keys.len() == 2
+                && preds[bi].iter().all(|&p| {
+                    pred_tail_keys(ops, &blocks[p], 2).as_ref() == Some(&keys)
+                })
+            {
+                for &i in &tail {
+                    remove.insert(i);
+                }
+                continue;
+            }
+        }
+
         let mut join_prod = None;
         for i in b.start..b.end {
             if matches!(ops[i], IlOp::Label(_)) {
                 continue;
             }
             if is_pure_producer(&ops[i])
-                && matches!(&ops[i], IlOp::Const { .. } | IlOp::Load { .. })
+                && matches!(
+                    &ops[i],
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                )
             {
                 join_prod = Some(i);
             }
@@ -253,27 +381,7 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
 
         let mut ok = true;
         for &p in &preds[bi] {
-            let pe = blocks[p].end;
-            if pe == blocks[p].start {
-                ok = false;
-                break;
-            }
-            // Last emitting op before terminator / jump.
-            let mut found = None;
-            for i in (blocks[p].start..pe).rev() {
-                if matches!(ops[i], IlOp::Label(_)) {
-                    continue;
-                }
-                if matches!(ops[i], IlOp::Jump { .. }) {
-                    continue;
-                }
-                if is_return_like(&ops[i]) {
-                    continue;
-                }
-                found = Some(i);
-                break;
-            }
-            let Some(pi) = found else {
+            let Some(pi) = last_emitting_non_jump(ops, &blocks[p]) else {
                 ok = false;
                 break;
             };
@@ -281,7 +389,10 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 ok = false;
                 break;
             }
-            if !matches!(&ops[pi], IlOp::Const { .. } | IlOp::Load { .. }) {
+            if !matches!(
+                &ops[pi],
+                IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+            ) {
                 ok = false;
                 break;
             }
@@ -301,6 +412,80 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
         }
     }
     *ops = out;
+}
+
+fn last_emitting_non_jump(ops: &[IlOp], b: &Block) -> Option<usize> {
+    if b.end == b.start {
+        return None;
+    }
+    for i in (b.start..b.end).rev() {
+        if matches!(ops[i], IlOp::Label(_)) {
+            continue;
+        }
+        if matches!(ops[i], IlOp::Jump { .. }) {
+            continue;
+        }
+        if is_return_like(&ops[i]) {
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// First `len` consecutive pure producers in a join block (skipping labels).
+fn join_pure_tail(ops: &[IlOp], start: usize, end: usize, len: usize) -> Option<Vec<usize>> {
+    let mut idxs = Vec::with_capacity(len);
+    for i in start..end {
+        if matches!(ops[i], IlOp::Label(_)) {
+            continue;
+        }
+        if !is_pure_producer(&ops[i]) {
+            break;
+        }
+        // Length-2 join CSE: Const/Load/Bin/BinSlot/Index/LoadField only.
+        if !matches!(
+            &ops[i],
+            IlOp::Const { .. }
+                | IlOp::ConstPool { .. }
+                | IlOp::Load { .. }
+                | IlOp::Bin { .. }
+                | IlOp::BinSlotImm { .. }
+                | IlOp::BinSlotSlot { .. }
+                | IlOp::Index { .. }
+                | IlOp::LoadField { .. }
+                | IlOp::Dup { .. }
+        ) {
+            break;
+        }
+        idxs.push(i);
+        if idxs.len() == len {
+            return Some(idxs);
+        }
+    }
+    None
+}
+
+fn pred_tail_keys(ops: &[IlOp], b: &Block, len: usize) -> Option<Vec<u64>> {
+    let mut emitting = Vec::new();
+    for i in b.start..b.end {
+        if matches!(ops[i], IlOp::Label(_) | IlOp::Jump { .. }) || is_return_like(&ops[i]) {
+            continue;
+        }
+        emitting.push(i);
+    }
+    if emitting.len() < len {
+        return None;
+    }
+    let tail = &emitting[emitting.len() - len..];
+    let mut keys = Vec::with_capacity(len);
+    for &i in tail {
+        if !is_pure_producer(&ops[i]) {
+            return None;
+        }
+        keys.push(producer_key(&ops[i])?);
+    }
+    Some(keys)
 }
 
 fn is_return_like(op: &IlOp) -> bool {
@@ -548,5 +733,99 @@ mod tests {
             .filter(|op| matches!(op, IlOp::Load { slot: 3, .. }))
             .count();
         assert_eq!(loads, 3, "Unknown SP must keep join Load");
+    }
+
+    #[test]
+    fn load_field_cse_replaces_redundant_pair_with_dup() {
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::LoadField {
+                index: 1,
+                loc: loc(),
+            },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::LoadField {
+                index: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 0, .. }));
+        assert!(matches!(ops[1], IlOp::LoadField { index: 1, .. }));
+        assert!(matches!(ops[2], IlOp::Dup { .. }));
+        assert_eq!(ops.len(), 4);
+    }
+
+    #[test]
+    fn load_field_cse_refuses_across_set_field() {
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::LoadField {
+                index: 1,
+                loc: loc(),
+            },
+            IlOp::SetField { loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::LoadField {
+                index: 1,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.len();
+        cfg_gvn(&mut ops);
+        assert_eq!(ops.len(), before);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, IlOp::LoadField { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn join_cse_drops_length_two_pure_tail() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Const {
+                imm: 2,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Const {
+                imm: 2,
+                loc: loc(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Const {
+                imm: 2,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        let join_loads = ops
+            .iter()
+            .skip_while(|op| !matches!(op, IlOp::Label(Label(2))))
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
+            .count();
+        assert_eq!(join_loads, 0, "length-2 join tail should be sunk");
     }
 }

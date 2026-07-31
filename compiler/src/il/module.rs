@@ -377,6 +377,7 @@ mod tests {
             jump_thread: false,
             dead_block: false,
             stack_dce: false,
+            mem_fwd: false,
             return_convoy: false,
             bin_join_convoy: false,
             multi_op_join_convoy: true,
