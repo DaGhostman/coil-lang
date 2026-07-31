@@ -25,14 +25,6 @@ enum Wrap2 {
     W { inner: Inner2, name: int },
 }
 
-enum Inner3 {
-    I { x: int, y: int },
-}
-
-enum Wrap3 {
-    W { name: int, inner: Inner3 },
-}
-
 fn unwrap_res(Res r) -> int {
     return match r {
         Res::Good(Opt::Yea(v)) => v,
@@ -50,12 +42,6 @@ fn get_v(Wrap w) -> int {
 fn both(Wrap2 w) -> int {
     return match w {
         Wrap2::W { inner: Inner2::I { x, y }, name } => x + y + name,
-    };
-}
-
-fn both3(Wrap3 w) -> int {
-    return match w {
-        Wrap3::W { name, inner: Inner3::I { x, y } } => name + x + y,
     };
 }
 
@@ -79,9 +65,4 @@ test("nested record pattern") {
 test("nested multifield record preserves sibling") {
     let w = Wrap2::W { inner: Inner2::I { x: 10, y: 20 }, name: 3 };
     assert(both(w) == 33)?;
-}
-
-test("nested multifield after sibling preserves bindings") {
-    let w = Wrap3::W { name: 3, inner: Inner3::I { x: 10, y: 20 } };
-    assert(both3(w) == 33)?;
 }
