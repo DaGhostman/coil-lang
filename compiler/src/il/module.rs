@@ -32,6 +32,9 @@ pub struct IlModule {
     pub glue: Vec<Vec<IlOp>>,
     pub epilogue: Vec<IlOp>,
     /// Logical emitting PC → entry label (copied from [`super::CodeBuf`] at finalize).
+    ///
+    /// CALL/CodePtr rewrite to `IlOp::Entry` happens at emit time on `CodeBuf`;
+    /// this map is retained for diagnostics and future module-level remapping.
     pub entry_at_offset: HashMap<usize, Label>,
 }
 
