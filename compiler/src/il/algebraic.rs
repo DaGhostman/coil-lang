@@ -284,6 +284,53 @@ mod tests {
     }
 
     #[test]
+    fn zero_plus_load_folds_to_load() {
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Load { slot: 5, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 5, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn bin_slot_imm_mul_zero_to_const_zero() {
+        let mut ops = vec![
+            IlOp::BinSlotImm {
+                op: Instruction::MUL as u8,
+                slot: 2,
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
+    }
+
+    #[test]
+    fn const_pool_plus_zero_folds_to_pool() {
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 3, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 3, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
     fn analyze_known_gate_smoke() {
         let ops = vec![IlOp::Const { imm: 1, loc: loc() }];
         assert!(matches!(sp::analyze(&ops).sp_before(0), Sp::Known(0)));

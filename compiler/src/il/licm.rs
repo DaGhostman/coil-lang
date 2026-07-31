@@ -261,4 +261,148 @@ mod tests {
         licm(&mut ops);
         assert_eq!(ops.len(), before.len());
     }
+
+    #[test]
+    fn hoists_load_when_slot_not_stored() {
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header]
+                .iter()
+                .any(|op| matches!(op, IlOp::Load { slot: 2, .. })),
+            "invariant Load should hoist to preheader"
+        );
+        assert!(
+            !ops[header + 1..]
+                .iter()
+                .take_while(|op| !matches!(op, IlOp::Jump { .. }))
+                .any(|op| matches!(op, IlOp::Load { slot: 2, .. })),
+            "Load should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn redirects_external_entry_to_preheader() {
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 7, loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        // First jump is external entry — must target preheader, not header.
+        let IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target,
+            ..
+        } = &ops[0]
+        else {
+            panic!("expected entry jump");
+        };
+        assert_ne!(*target, Label(0), "external entry must not keep header target");
+        let latch = ops
+            .iter()
+            .rposition(|op| {
+                matches!(
+                    op,
+                    IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: Label(0),
+                        ..
+                    }
+                )
+            })
+            .expect("latch back-edge to header");
+        assert!(latch > 0);
+    }
+
+    #[test]
+    fn refuses_when_host_invoke_in_loop() {
+        let mut ops = vec![
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::HostInvoke {
+                arity: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        licm(&mut ops);
+        assert!(ops == before, "HostInvoke is an effect barrier");
+    }
+
+    #[test]
+    fn refuses_when_jump_if_match_in_loop() {
+        let mut ops = vec![
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Halt { loc: loc() },
+        ];
+        let before = ops.clone();
+        licm(&mut ops);
+        assert!(ops == before, "JumpIfMatch is a control barrier");
+    }
+
+    #[test]
+    fn refuses_when_header_sp_unknown() {
+        let mut ops = vec![
+            IlOp::byte(common::Byte::new(common::Instruction::FORMAT)),
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        licm(&mut ops);
+        assert!(ops == before, "Unknown header SP must refuse hoist");
+    }
 }

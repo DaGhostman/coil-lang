@@ -571,6 +571,40 @@ mod tests {
     }
 
     #[test]
+    fn within_block_host_invoke_is_barrier() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::HostInvoke {
+                arity: 0,
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[2], IlOp::Const { imm: 3, .. }));
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+    }
+
+    #[test]
+    fn within_block_const_pool_dup_cse() {
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 2, loc: loc() },
+            IlOp::ConstPool { idx: 2, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+    }
+
+    #[test]
     fn join_cse_drops_redundant_const_on_jmpf_diamond() {
         // JMPF diamond with agreeing Known SP: join CONST is redundant.
         let mut ops = vec![
