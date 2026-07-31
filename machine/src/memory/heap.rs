@@ -1943,4 +1943,59 @@ mod tests {
             .is_none());
         assert!(heap.with_regex(0, |_| panic!("must not run")).is_none());
     }
+
+    #[test]
+    fn gc_scratch_buffers_round_trip_take_restore() {
+        let mut heap = Heap::default();
+        let mut roots = heap.take_gc_roots();
+        roots.push(1);
+        roots.push(2);
+        heap.restore_gc_roots(roots);
+
+        let (mut gray, mut root_objects) = heap.take_gc_worklists();
+        assert!(gray.is_empty());
+        assert!(root_objects.is_empty());
+        // Capacity may be retained after clear; restore must not panic.
+        gray.reserve(4);
+        root_objects.reserve(4);
+        heap.restore_gc_worklists(gray, root_objects);
+
+        let roots2 = heap.take_gc_roots();
+        // Prior contents were cleared on take; buffer is reusable.
+        assert!(roots2.is_empty());
+        heap.restore_gc_roots(roots2);
+    }
+
+    #[test]
+    fn repeated_trace_reuses_mark_set_without_leaking_prior_roots() {
+        let mut heap = Heap::default();
+        let (keep, _) = heap.alloc(ObjString::from("keep"), Object::String);
+        let (drop_me, _) = heap.alloc(ObjString::from("drop"), Object::String);
+        let keep_addr = keep.addr();
+        let drop_addr = drop_me.addr();
+
+        // First collection: only `keep` is a root.
+        heap.trace(&[keep_addr]);
+        let mut gray = Vec::new();
+        keep.mark_references(&mut gray);
+        unsafe { heap.sweep() };
+
+        let live = live_object_addrs(&heap);
+        assert!(live.contains(&keep_addr));
+        assert!(!live.contains(&drop_addr));
+
+        // Second collection with empty roots must not resurrect drop_me via a
+        // stale mark-set entry from the previous trace.
+        let (orphan, _) = heap.alloc(ObjString::from("orphan"), Object::String);
+        let orphan_addr = orphan.addr();
+        heap.trace(&[]);
+        unsafe { heap.sweep() };
+        let live = live_object_addrs(&heap);
+        assert!(
+            !live.contains(&orphan_addr),
+            "empty-root trace must not keep prior mark-set addresses alive"
+        );
+        // `keep` was unmarked after sweep and not re-rooted — also gone.
+        assert!(!live.contains(&keep_addr));
+    }
 }
