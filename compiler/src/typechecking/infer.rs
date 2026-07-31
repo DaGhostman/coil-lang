@@ -16213,7 +16213,7 @@ fn main() {
     fn nested_lambda_arg_node_ids_cached() {
         // Nested lambdas both consume Fragment+Argument NodeIds; body cache
         // must stay lockstep (no Identifier span prefer for args).
-        let src = "let f = fn (int x) => fn (int y) => x + y; let _ = f(1)(2);";
+        let src = "let f = fn (int x) => fn (int y) use (x) => x + y; let g = f(1); let _ = g(2);";
         let (c, _) = check(src);
         assert!(c.messages().is_empty(), "{:?}", c.messages());
         let ast = Pratt::default().parse(src).expect("parse");

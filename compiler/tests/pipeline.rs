@@ -2787,8 +2787,9 @@ fn nested_typed_lambdas_print_sum() {
     let output = run_example_src(
         r#"
 fn main() {
-    let add = fn (int x) => fn (int y) => x + y;
-    print "%i", add(40)(2);
+    let add = fn (int x) => fn (int y) use (x) => x + y;
+    let add40 = add(40);
+    print "%i", add40(2);
 }
 "#,
     );
