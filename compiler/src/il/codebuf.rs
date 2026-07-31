@@ -91,6 +91,31 @@ impl CodeBuf {
         self.il.push_store_pop(slot);
     }
 
+    pub fn push_pop(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_pop();
+    }
+
+    pub fn push_index(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_index();
+    }
+
+    pub fn push_make_tuple(&mut self, arity: u32) {
+        self.invalidate_lowered();
+        self.il.push_make_tuple(arity);
+    }
+
+    pub fn push_make_array(&mut self, arity: u32) {
+        self.invalidate_lowered();
+        self.il.push_make_array(arity);
+    }
+
+    pub fn push_make_enum(&mut self, tag: u16, arity: u16) {
+        self.invalidate_lowered();
+        self.il.push_make_enum(tag, arity);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
