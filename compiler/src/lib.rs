@@ -4098,6 +4098,7 @@ impl Compiler {
     }
 
     /// Peel `forall` / function arrows to the final return type.
+    #[allow(dead_code)]
     fn peel_fn_return_ty(ty: &crate::typechecking::Ty) -> crate::typechecking::Ty {
         use crate::typechecking::Ty;
         let mut t = ty.clone();
@@ -4111,6 +4112,8 @@ impl Compiler {
     }
 
     /// Look up a function's scheme and peel to its return type.
+    /// Lookup declared return type for diagnostics / tooling.
+    #[allow(dead_code)]
     fn fn_return_ty(&self, name: &str) -> Option<crate::typechecking::Ty> {
         use crate::typechecking::subst::apply_ty_prune;
         let scheme = self
@@ -4131,138 +4134,16 @@ impl Compiler {
         Some(Self::peel_fn_return_ty(&applied))
     }
 
-    /// True when `ty` is unit / `()` (safe Ok payload for Result fall-through).
-    fn ty_is_unit_like(ty: &crate::typechecking::Ty) -> bool {
-        use crate::typechecking::{Ty, ty::UNIT};
-        let mut t = ty.clone();
-        while let Ty::Forall { body, .. } = t {
-            t = *body;
-        }
-        match &t {
-            Ty::Con(name) => name == UNIT,
-            Ty::Tuple(items) if items.is_empty() => true,
-            _ => false,
-        }
-    }
-
-    /// Ok payload that may be invented as `CONST 0` + Ok-wrap on fall-through.
+    /// Emit defers + unit fall-through return when a body does not end in a return.
     ///
-    /// Unit, open vars (bodies that only use `?` / `assert`), and zero-safe
-    /// scalars (`int`/`bool`/…) are Ok; `string` / ADTs are not.
-    fn ty_allows_result_ok_fallthrough(ty: &crate::typechecking::Ty) -> bool {
-        use crate::typechecking::Ty;
-        let mut t = ty.clone();
-        while let Ty::Forall { body, .. } = t {
-            t = *body;
-        }
-        if Self::ty_is_unit_like(&t) {
-            return true;
-        }
-        if matches!(&t, Ty::Var(_)) || matches!(&t, Ty::Con(n) if n == "unknown") {
-            return true;
-        }
-        Self::ty_allows_zero_default(&t)
-    }
-
-    /// True when `Value::default()` (`0`) is a valid representation for `ty`.
-    ///
-    /// Safe for unit / int / byte / bool / float, open vars (statement bodies),
-    /// and empty tuples. `Option` / `Result` / `string` / ADTs need a real
-    /// constructor (or an explicit `return`).
-    fn ty_allows_zero_default(ty: &crate::typechecking::Ty) -> bool {
-        use crate::typechecking::{
-            Ty,
-            ty::{BOOL, BYTE, FLOAT, INT, UNIT},
-        };
-        let mut t = ty.clone();
-        while let Ty::Forall { body, .. } = t {
-            t = *body;
-        }
-        match &t {
-            Ty::Con(name) => {
-                matches!(name.as_str(), UNIT | INT | BYTE | BOOL | FLOAT)
-                    // Incomplete / placeholder types — do not spuriously E0111.
-                    || name == "unknown"
-            }
-            Ty::Var(_) => true,
-            // `()` / empty tuple is unit-like.
-            Ty::Tuple(items) if items.is_empty() => true,
-            _ => false,
-        }
-    }
-
-    /// Whether an implicit fall-through is valid for `name`'s return.
-    fn fallthrough_allows_zero(&self, name: &str) -> bool {
-        use crate::typechecking::ty::{is_option_ty, result_ok_err};
-        // Async fn bodies complete with a sentinel; the `coroutine<…>` value
-        // is produced by MakeCoro at the call site.
-        if self.coroutine_fns.contains(name)
-            || self
-                .current_function_qualified
-                .as_ref()
-                .is_some_and(|q| self.coroutine_fns.contains(q))
-        {
-            return true;
-        }
-        let Some(ret) = self.fn_return_ty(name) else {
-            return true;
-        };
-        // `Option` fall-through emits `None` (not raw `0`) in
-        // [`Self::emit_fallthrough_return`].
-        if is_option_ty(&ret) {
-            return true;
-        }
-        if self.compiling_result_mode {
-            // Result-mode Ok-wraps unit / open Ok / zero-safe scalars.
-            // Refuse inventing Ok for `string` / ADT payloads.
-            if let Some((ok, _)) = result_ok_err(&ret) {
-                return Self::ty_allows_result_ok_fallthrough(&ok);
-            }
-            return true;
-        }
-        if let crate::typechecking::Ty::App(con, _) = &ret
-            && matches!(con.as_ref(), crate::typechecking::Ty::Con(n) if n == "coroutine")
-        {
-            return true;
-        }
-        Self::ty_allows_zero_default(&ret)
-    }
-
-    /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
-    fn emit_fallthrough_return(&mut self, name: &str, span: SimpleSpan) {
-        use crate::typechecking::ty::is_option_ty;
+    /// Non-unit missing returns are diagnosed by HM (E0111). This epilogue only
+    /// invents a unit/`0` sentinel (plus Result Ok-wrap in result-mode) so frames
+    /// unwind and defers run. No Option/`None` invent.
+    fn emit_fallthrough_return(&mut self, _name: &str, _span: SimpleSpan) {
         self.emit_run_defers();
-        if !self.fallthrough_allows_zero(name) {
-            let ret_s = self
-                .fn_return_ty(name)
-                .map(|t| format!("{t}"))
-                .unwrap_or_else(|| "unknown".into());
-            let mut message = Message::error(
-                ErrorCode::ReturnMismatch,
-                format!(
-                    "function `{name}` reaches the end without returning a value of type `{ret_s}`"
-                ),
-                span.into_range(),
-            );
-            message.push(DiagLabel::new(
-                "add an explicit `return` (implicit `0` is not valid for this type)".to_string(),
-                span.into_range(),
-            ));
-            self.messages.push(message);
-        }
-        let opt_none = self
-            .fn_return_ty(name)
-            .as_ref()
-            .is_some_and(is_option_ty);
-        if opt_none {
-            // `Option::None` = tag 0, arity 0.
-            self.bytecode
-                .push_make_enum(0, 0);
-        } else {
-            self.bytecode.push_const(0);
-            if self.compiling_result_mode {
-                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-            }
+        self.bytecode.push_const(0);
+        if self.compiling_result_mode {
+            Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
         }
         self.bytecode.push_return();
     }
@@ -13513,27 +13394,6 @@ print \"%i\", len(a); \
         );
     }
 
-    /// Empty `Option` bodies emit `MakeEnum` None (tag 0, arity 0), not bare
-    /// `CONST 0` — raw zero is not a reliable `None` at runtime.
-    #[test]
-    fn fallthrough_option_emits_make_enum_none() {
-        use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn opt() -> Option<int> {}\
- fn main() { let _ = opt(); }",
-        );
-        let make_none = bc.iter().any(|b| {
-            matches!(b.bytecode(), Instruction::MakeEnum)
-                && b.operand_u32() & 0xFFFF == 0
-                && (b.operand_u32() >> 16) & 0xFFFF == 0
-        });
-        assert!(
-            make_none,
-            "Option fall-through should emit MakeEnum None; got {:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
-        );
-    }
-
     /// Nested multi-field records emit scratch relocate (LOAD+StorePop)
     /// then UnpackAt with operands `[arity, scratch_slot]` — not in-place
     /// at the outer field (which would clobber siblings).
@@ -14993,25 +14853,4 @@ fn main() {
         );
     }
 
-}
-
-#[cfg(test)]
-mod fallthrough_probe {
-    #[test]
-    fn probe_string_fallthrough_diag() {
-        let mut p = crate::pipeline::Pipeline::new();
-        let src = "fn bad() -> string {}\nfn main() { let _ = bad(); }\n";
-        let r = p.compile_src(src);
-        let c = p.compiler_mut();
-        let ty = c.fn_return_ty("bad");
-        let allow = c.fallthrough_allows_zero("bad");
-        let scheme = c.checker.env().lookup("bad").map(|s| format!("{}", s.ty));
-        let msgs: Vec<_> = p
-            .messages()
-            .iter()
-            .map(|m| (m.code(), m.message().to_string()))
-            .collect();
-        eprintln!("result_ok={} ty={ty:?} allow={allow} scheme={scheme:?} msgs={msgs:?}", r.is_ok());
-        assert!(r.is_err(), "ty={ty:?} allow={allow} scheme={scheme:?}");
-    }
 }
