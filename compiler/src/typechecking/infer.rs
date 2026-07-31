@@ -4404,8 +4404,6 @@ impl Checker {
                         .insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
                 }
-                // Match codegen: consume Fragment + Argument IDs before body.
-                self.assign_fn_arg_node_ids(args, &arg_tys);
 
                 let ret_slot = Ty::Var(self.counter.fresh());
                 let prev_ret = self.current_return_ty.replace(ret_slot.clone());
@@ -10597,11 +10595,6 @@ impl Checker {
             baseline.insert(arg_name.clone());
         }
         self.fn_codegen_baselines.push(baseline);
-        // Consume arg list NodeIds the same way codegen's `do_compile(args)`
-        // does (Fragment + each Argument; type annotation children are
-        // skipped on both sides). Without this, body nodes steal arg IDs
-        // and the infer cache diverges from emit_idx.
-        self.assign_fn_arg_node_ids(args, &arg_tys);
         let _ = self.infer(body);
         self.fn_codegen_baselines.pop();
         self.pop_scope();
@@ -10907,65 +10900,6 @@ impl Checker {
 
     pub fn spread_call_arity_at(&self, start: usize, end: usize) -> Option<usize> {
         self.spread_call_arity.get(&(start, end)).copied()
-    }
-
-    /// Assign NodeIds for a function/lambda parameter list so body infer
-    /// stays lockstep with codegen.
-    ///
-    /// Codegen's `do_compile(args)` consumes the `Fragment` id and each
-    /// `Argument` id, but does **not** walk type-annotation children.
-    /// Those annotation ids stay in the pre-walk stream and are consumed
-    /// by the next sibling (the body) on both sides — aligned with each
-    /// other, still orphaned vs the annotation nodes themselves.
-    /// Caching the parsed parameter types at the Argument ids lets
-    /// `lookup_at` serve parameter types without the name side-table.
-    fn assign_fn_arg_node_ids(&mut self, args: &Output, arg_tys: &[(String, Ty)]) {
-        match args.1.as_ref() {
-            Expression::Fragment(children) => {
-                if self.next_id_idx >= self.ids.ids().len() {
-                    return;
-                }
-                let frag_id = self.ids.ids()[self.next_id_idx];
-                self.next_id_idx += 1;
-                self.cache.insert(frag_id, unit_ty());
-
-                let mut ty_idx = 0usize;
-                for child in children {
-                    if self.next_id_idx >= self.ids.ids().len() {
-                        break;
-                    }
-                    let id = self.ids.ids()[self.next_id_idx];
-                    self.next_id_idx += 1;
-                    let ty = if let Expression::Argument(..) = child.1.as_ref() {
-                        let t = arg_tys
-                            .get(ty_idx)
-                            .map(|(_, t)| t.clone())
-                            .unwrap_or_else(unit_ty);
-                        ty_idx += 1;
-                        t
-                    } else {
-                        unit_ty()
-                    };
-                    self.cache.insert(id, ty.clone());
-                    self.codegen_types_by_span
-                        .entry((child.0.start, child.0.end))
-                        .or_insert(ty);
-                }
-            }
-            _ => {
-                // Unexpected shape — still advance one id if present so
-                // a lone node cannot permanently desync the body.
-                if self.next_id_idx < self.ids.ids().len() {
-                    let id = self.ids.ids()[self.next_id_idx];
-                    self.next_id_idx += 1;
-                    let ty = arg_tys
-                        .first()
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_else(unit_ty);
-                    self.cache.insert(id, ty);
-                }
-            }
-        }
     }
 
     /// Parse a function's argument list (a `Fragment` of
@@ -16111,139 +16045,6 @@ fn main() {
     }
 
     // ---- Type cache ----
-
-    #[test]
-    fn fn_arg_node_ids_cached_before_body() {
-        // Regression: `infer_function` used to skip Fragment/Argument NodeIds
-        // while codegen's `do_compile(args)` consumed them. Body nodes then
-        // stole arg ids, so `lookup_at(arg_id)` saw a body type (e.g. unit
-        // for the Block) instead of the parameter type.
-        let src = "fn f(int x) -> int { return x; }";
-        let (c, _) = check(src);
-        assert!(c.messages().is_empty(), "{:?}", c.messages());
-
-        let ast = Pratt::default().parse(src).expect("parse");
-        let ids = c.id_table().ids();
-
-        // Walk pre-walk order, consuming ids the way codegen does for a
-        // free function. Param type-annotation children are minted by
-        // pre_walk but neither codegen nor `assign_fn_arg_node_ids` walks
-        // them — those ids are left for the next sibling (body) to consume,
-        // which keeps infer ↔ emit aligned (still orphaned vs pre_walk).
-        fn walk_codegen_aligned(
-            node: &parser::ast::Output<'_>,
-            ids: &[NodeId],
-            idx: &mut usize,
-            on_argument: &mut dyn FnMut(NodeId),
-            on_body_ident: &mut dyn FnMut(NodeId),
-        ) {
-            use parser::ast::Expression;
-            let id = ids[*idx];
-            *idx += 1;
-            match node.1.as_ref() {
-                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
-                    for child in cs {
-                        walk_codegen_aligned(child, ids, idx, on_argument, on_body_ident);
-                    }
-                }
-                Expression::Function { args, body, .. } => {
-                    walk_codegen_aligned(args, ids, idx, on_argument, on_body_ident);
-                    if let Some(body) = body {
-                        walk_codegen_aligned(body, ids, idx, on_argument, on_body_ident);
-                    }
-                }
-                Expression::Argument(_, _, _) => {
-                    on_argument(id);
-                    // Do not walk / skip the type annotation: leave its
-                    // minted id for the body (matches codegen).
-                }
-                Expression::Identifier(_) => on_body_ident(id),
-                Expression::Expr(e)
-                | Expression::Statement(e)
-                | Expression::ExprStatement(e)
-                | Expression::Return(e)
-                | Expression::ImplicitReturn(e)
-                | Expression::Group(e) => {
-                    walk_codegen_aligned(e, ids, idx, on_argument, on_body_ident);
-                }
-                _ => {}
-            }
-        }
-
-        let mut arg_id = None;
-        let mut body_ident_id = None;
-        let mut idx = 0usize;
-        walk_codegen_aligned(
-            &ast,
-            ids,
-            &mut idx,
-            &mut |id| arg_id = Some(id),
-            &mut |id| body_ident_id = Some(id),
-        );
-
-        let arg_id = arg_id.expect("expected Argument NodeId");
-        assert_eq!(
-            c.lookup_at(arg_id),
-            Some(int()),
-            "Argument NodeId must cache the parameter type (got {:?})",
-            c.lookup_at(arg_id)
-        );
-        // Body Identifier may still resolve via env / codegen_var_types; the
-        // critical lockstep fix is that Argument ids are no longer stolen by
-        // the body.
-        assert_eq!(
-            c.codegen_var_type("x").map(|t| apply_ty_prune(c.subst(), t)),
-            Some(int())
-        );
-    }
-
-    #[test]
-    fn lambda_arg_node_ids_cached_before_body() {
-        // Lambdas also call `assign_fn_arg_node_ids`; Argument spans must
-        // cache the parameter type (not a body type stolen via id skew).
-        let src = "let f = fn (int x) => x; let _ = f(1);";
-        let (c, _) = check(src);
-        assert!(c.messages().is_empty(), "{:?}", c.messages());
-
-        let ast = Pratt::default().parse(src).expect("parse");
-
-        fn find_lambda_arg_span(node: &parser::ast::Output<'_>) -> Option<(usize, usize)> {
-            use parser::ast::Expression;
-            match node.1.as_ref() {
-                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
-                    cs.iter().find_map(find_lambda_arg_span)
-                }
-                Expression::Variable(_, Some(value)) | Expression::Constant(_, Some(value)) => {
-                    find_lambda_arg_span(value)
-                }
-                Expression::Lambda { args, .. } => {
-                    if let Expression::Fragment(children) = args.1.as_ref() {
-                        children.iter().find_map(|child| {
-                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
-                                Some((child.0.start, child.0.end))
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                }
-                Expression::Expr(e)
-                | Expression::Statement(e)
-                | Expression::ExprStatement(e)
-                | Expression::Group(e) => find_lambda_arg_span(e),
-                _ => None,
-            }
-        }
-
-        let (start, end) = find_lambda_arg_span(&ast).expect("lambda Argument span");
-        assert_eq!(
-            c.lookup_for_codegen_span(start, end),
-            Some(int()),
-            "lambda Argument span must cache the parameter type"
-        );
-    }
 
     #[test]
     fn cache_is_populated_after_check_program() {
