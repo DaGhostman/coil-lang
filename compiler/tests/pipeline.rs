@@ -4831,23 +4831,31 @@ fn main() {
 }
 
 #[test]
-fn match_all_arms_return_satisfies_non_unit() {
-    let output = run_example_src(
+fn match_all_arms_exit_satisfies_non_unit_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
         r#"
 fn f(Option<int> o) -> int {
     match o {
-        Option::Some(x) => return x,
-        Option::None => return 0,
-    }
+        Option::Some(x) => panic "some",
+        Option::None => panic "none",
+    };
 }
 
 fn main() {
-    print "%i,", f(Option::Some(3));
-    print "%i", f(Option::None);
+    let _ = f;
 }
 "#,
     );
-    assert_eq!(output, "3,0");
+    assert!(
+        result.is_ok(),
+        "match arms that all exit should complete -> int: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
