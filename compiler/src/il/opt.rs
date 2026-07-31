@@ -1752,66 +1752,28 @@ mod tests {
         assert!(ops == before);
     }
 
-    #[test]
-    fn multi_op_join_convoy_jump_pred_template_keeps_pre_join_ops() {
-        // All-jump diamond: template from jump preds. Ops between last JMP and
-        // the join label are not the suffix — must not be stripped.
-        let suf = load_const_add_suffix();
-        let mut ops = Vec::new();
-        ops.extend(suf.clone());
-        ops.push(IlOp::Jump {
-            kind: IlJumpKind::Unconditional,
-            target: Label(0),
-            loc: common::DebugLoc::unknown(),
-        });
-        ops.extend(suf);
-        ops.push(IlOp::Jump {
-            kind: IlJumpKind::Unconditional,
-            target: Label(0),
-            loc: common::DebugLoc::unknown(),
-        });
-        ops.push(IlOp::Load {
-            slot: 9,
-            loc: common::DebugLoc::unknown(),
-        });
-        ops.push(IlOp::Const {
-            imm: 7,
-            loc: common::DebugLoc::unknown(),
-        });
-        ops.push(IlOp::Label(Label(0)));
-        ops.push(IlOp::Return {
-            loc: common::DebugLoc::unknown(),
-        });
-
-        multi_op_join_convoy(&mut ops);
-
-        let load9 = ops
-            .iter()
-            .position(|op| matches!(op, IlOp::Load { slot: 9, .. }))
-            .expect("pre-join Load kept");
-        let const7 = ops
-            .iter()
-            .position(|op| matches!(op, IlOp::Const { imm: 7, .. }))
-            .expect("pre-join Const kept");
-        let lab = ops
-            .iter()
-            .position(|op| matches!(op, IlOp::Label(Label(0))))
-            .expect("join label");
-        let add_idx = ops
-            .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
-            .expect("suffix sunk after join");
-        assert!(load9 < const7 && const7 < lab && lab < add_idx);
-        let sunk_loads = ops
-            .iter()
-            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
-            .count();
-        assert_eq!(sunk_loads, 1);
+    fn load_not_const_add_suffix() -> Vec<IlOp> {
+        // Net SP +1 (needed for sequential JMPF diamonds to agree at the join).
+        vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::NOT)),
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+        ]
     }
 
     #[test]
     fn multi_op_join_convoy_prefers_longest_suffix_via_jmpf() {
-        let suf = load_two_const_add_suffix();
+        let suf = load_not_const_add_suffix();
         let mut ops = Vec::new();
         ops.extend(suf.clone());
         ops.push(IlOp::Jump {
@@ -1836,12 +1798,80 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))
             .count();
+        let not_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.as_encode_byte().as_ref().map(|b| *b.bytecode()),
+                    Some(Instruction::NOT)
+                )
+            })
+            .count();
         let const_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Const { imm: 1 | 2, .. }))
+            .filter(|op| matches!(op, IlOp::Const { imm: 1, .. }))
             .count();
         assert_eq!(load_count, 1);
-        assert_eq!(const_count, 2, "length-4 jump-pred template keeps both consts");
+        assert_eq!(not_count, 1, "length-4 jump-pred template keeps NOT");
+        assert_eq!(const_count, 1);
+        let jmpf_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Jump {
+                        kind: IlJumpKind::JumpIfFalse,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(jmpf_count, 2, "JMPFs must not be stripped by jump-pred rewrite");
+    }
+
+    #[test]
+    fn multi_op_join_convoy_sinks_jmpf_through_label_cluster() {
+        // Jump-pred template into a multi-label return cluster.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(54),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(54),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(54)));
+        ops.push(IlOp::Label(Label(48)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load_count = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .count();
+        assert_eq!(load_count, 1);
+        let lab54 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(54))))
+            .expect("outer join");
+        let lab48 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(48))))
+            .expect("inner label");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("ADD sunk");
+        assert!(lab54 < lab48 && lab48 < add_idx);
     }
 
     #[test]
