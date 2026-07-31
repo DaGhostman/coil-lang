@@ -1830,6 +1830,63 @@ mod tests {
     }
 
     #[test]
+    fn multi_op_join_convoy_jump_pred_template_keeps_pre_join_ops() {
+        // All-jump diamond: ops between last pred and join are not the suffix.
+        let suf = load_const_add_suffix();
+        let mut ops = Vec::new();
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.extend(suf);
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        // Net-zero pre-join junk — must survive (Load+StorePop, not part of S).
+        ops.push(IlOp::Load {
+            slot: 9,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::StorePop {
+            slot: 9,
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        multi_op_join_convoy(&mut ops);
+
+        let load9 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Load { slot: 9, .. }))
+            .expect("pre-join Load kept");
+        let store9 = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::StorePop { slot: 9, .. }))
+            .expect("pre-join StorePop kept");
+        let lab = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .expect("join label");
+        let add_idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .expect("suffix sunk after join");
+        assert!(load9 < store9 && store9 < lab && lab < add_idx);
+        let sunk_loads = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
+            .count();
+        assert_eq!(sunk_loads, 1);
+    }
+
+    #[test]
     fn multi_op_join_convoy_sinks_jmpf_through_label_cluster() {
         // Jump-pred template into a multi-label return cluster.
         let suf = load_const_add_suffix();
