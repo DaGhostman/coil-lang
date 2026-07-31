@@ -1178,7 +1178,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::CastBoolToInt as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlotJmpf as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1548,13 +1548,24 @@ impl<const S: usize> Machine<S> {
                         }
                         Instruction::BITAND => Value::from(lhs.as_int() & imm),
                         Instruction::BITOR => Value::from(lhs.as_int() | imm),
+                        Instruction::SHL => Value::from(lhs.as_int() << imm),
+                        Instruction::SHR => Value::from(lhs.as_int() >> imm),
+                        Instruction::XOR => Value::from(lhs.as_int() ^ imm),
+                        Instruction::AND => Value::from(lhs.as_bool() && rhs.as_bool()),
+                        Instruction::OR => Value::from(lhs.as_bool() || rhs.as_bool()),
                         _ => Value::default(),
                     };
                     self.stack.push(result);
                 }
-                // Fused `<cmp>; JMPF target`.
+                // Fused `<cmp|cond>; JMPF target`.
                 Instruction::CmpJmpf => {
-                    let (op, target) = opcode.cmp_jmpf_parts();
+                    let (op, t) = opcode.cmp_jmpf_parts();
+                    let target = if opcode.cmp_jmpf_is_pool() {
+                        promise!(t < constants.len());
+                        unsafe { *constants.get_unchecked(t) as usize }
+                    } else {
+                        t
+                    };
                     let tos = self.stack.tell();
                     promise!(tos >= 2);
                     let rhs = self.stack[tos - 1];
@@ -1571,13 +1582,18 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
                         Instruction::GTF => lhs.as_float() > rhs.as_float(),
                         Instruction::GEQF => lhs.as_float() >= rhs.as_float(),
+                        Instruction::AND => lhs.as_bool() && rhs.as_bool(),
+                        Instruction::OR => lhs.as_bool() || rhs.as_bool(),
+                        Instruction::BITAND => Value::from(lhs.as_int() & rhs.as_int()).as_bool(),
+                        Instruction::BITOR => Value::from(lhs.as_int() | rhs.as_int()).as_bool(),
+                        Instruction::XOR => Value::from(lhs.as_int() ^ rhs.as_int()).as_bool(),
                         _ => false,
                     };
                     if !taken {
                         ip = target;
                     }
                 }
-                // Fused `LOAD slot; CONST imm; <cmp>; JMPF` without stack traffic.
+                // Fused `LOAD slot; CONST imm; <cond>; JMPF` without stack traffic.
                 Instruction::BinSlotImmJmpf => {
                     let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
                     promise!(pool_idx < constants.len());
@@ -1598,6 +1614,11 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
                         Instruction::GTF => lhs.as_float() > rhs.as_float(),
                         Instruction::GEQF => lhs.as_float() >= rhs.as_float(),
+                        Instruction::AND => lhs.as_bool() && rhs.as_bool(),
+                        Instruction::OR => lhs.as_bool() || rhs.as_bool(),
+                        Instruction::BITAND => Value::from(lhs.as_int() & imm).as_bool(),
+                        Instruction::BITOR => Value::from(lhs.as_int() | imm).as_bool(),
+                        Instruction::XOR => Value::from(lhs.as_int() ^ imm).as_bool(),
                         _ => false,
                     };
                     if !taken {
@@ -1605,9 +1626,48 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::LogNotJmpf => {
-                    let target = opcode.log_not_jmpf_target();
+                    let t = opcode.log_not_jmpf_target();
+                    let target = if opcode.log_not_jmpf_is_pool() {
+                        promise!(t < constants.len());
+                        unsafe { *constants.get_unchecked(t) as usize }
+                    } else {
+                        t
+                    };
                     let val = self.stack.pop();
                     if val.as_int() != 0 {
+                        ip = target;
+                    }
+                }
+                // Fused `BinSlotSlot; JMPF` — pool packs (target<<32)|b.
+                Instruction::BinSlotSlotJmpf => {
+                    let (op, a, pool_idx) = opcode.bin_slot_slot_jmpf_parts();
+                    promise!(pool_idx < constants.len());
+                    let packed = unsafe { *constants.get_unchecked(pool_idx) };
+                    let b = (packed as u32 & 0xFF) as usize;
+                    let target = (packed >> 32) as usize;
+                    promise!(sp + a < 8192);
+                    promise!(sp + b < 8192);
+                    let va = self.stack[sp + a];
+                    let vb = self.stack[sp + b];
+                    let taken = match Instruction::from(op) {
+                        Instruction::LE => va.raw() < vb.raw(),
+                        Instruction::LEQ => va.raw() <= vb.raw(),
+                        Instruction::GT => va.raw() > vb.raw(),
+                        Instruction::GEQ => va.raw() >= vb.raw(),
+                        Instruction::EQ => va.raw() == vb.raw(),
+                        Instruction::NEQ => va.raw() != vb.raw(),
+                        Instruction::LEF => va.as_float() < vb.as_float(),
+                        Instruction::LEQF => va.as_float() <= vb.as_float(),
+                        Instruction::GTF => va.as_float() > vb.as_float(),
+                        Instruction::GEQF => va.as_float() >= vb.as_float(),
+                        Instruction::AND => va.as_bool() && vb.as_bool(),
+                        Instruction::OR => va.as_bool() || vb.as_bool(),
+                        Instruction::BITAND => Value::from(va.as_int() & vb.as_int()).as_bool(),
+                        Instruction::BITOR => Value::from(va.as_int() | vb.as_int()).as_bool(),
+                        Instruction::XOR => Value::from(va.as_int() ^ vb.as_int()).as_bool(),
+                        _ => false,
+                    };
+                    if !taken {
                         ip = target;
                     }
                 }
@@ -1659,6 +1719,17 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQF => Value::from((lhs.as_float() <= rhs.as_float()) as i64),
                         Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
                         Instruction::GEQF => Value::from((lhs.as_float() >= rhs.as_float()) as i64),
+                        Instruction::BITAND => Value::from(lhs.as_int() & rhs.as_int()),
+                        Instruction::BITOR => Value::from(lhs.as_int() | rhs.as_int()),
+                        Instruction::SHL => Value::from(lhs.as_int() << rhs.as_int()),
+                        Instruction::SHR => Value::from(lhs.as_int() >> rhs.as_int()),
+                        Instruction::XOR => Value::from(lhs.as_int() ^ rhs.as_int()),
+                        Instruction::AND => Value::from(lhs.as_bool() && rhs.as_bool()),
+                        Instruction::OR => Value::from(lhs.as_bool() || rhs.as_bool()),
+                        Instruction::Pow => {
+                            let exp = rhs.as_int().max(0) as u32;
+                            Value::from(lhs.as_int().pow(exp))
+                        }
                         _ => Value::default(),
                     };
                     if self.capture_nested_return(ret_val) {
@@ -1687,6 +1758,11 @@ impl<const S: usize> Machine<S> {
                         }
                         Instruction::BITAND => Value::from(va.as_int() & vb.as_int()),
                         Instruction::BITOR => Value::from(va.as_int() | vb.as_int()),
+                        Instruction::SHL => Value::from(va.as_int() << vb.as_int()),
+                        Instruction::SHR => Value::from(va.as_int() >> vb.as_int()),
+                        Instruction::XOR => Value::from(va.as_int() ^ vb.as_int()),
+                        Instruction::AND => Value::from(va.as_bool() && vb.as_bool()),
+                        Instruction::OR => Value::from(va.as_bool() || vb.as_bool()),
                         Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
                         Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
                         Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
@@ -5300,6 +5376,115 @@ mod tests {
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    /// BinSlotSlotJmpf: two-local compare + JMPF without stack traffic.
+    #[test]
+    fn bin_slot_slot_jmpf_jumps_when_compare_false() {
+        let le = Instruction::LE as u8;
+        // pool: b=1, target=8
+        let packed = (8u64 << 32) | 1u64;
+        // a=3, b=5 → 3<5 true → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(3),
+                const_int(5),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                // 4: frame slots 0,1
+                Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                // 8: jumped when compare false
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+
+        // a=5, b=3 → 5<3 false → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(5),
+                const_int(3),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// CmpJmpf / LogNotJmpf resolve large targets via the constant pool.
+    #[test]
+    fn cmp_jmpf_and_log_not_jmpf_pool_targets() {
+        let target = 5usize;
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                const_int(5),
+                const_int(3),
+                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(Instruction::LE as u8, 0),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[target as u64],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                const_int(1), // nonzero → LogNotJmpf jumps
+                Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(0),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[4u64],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// BinSlotImm covers bitwise and logical ops.
+    #[test]
+    fn bin_slot_imm_bitwise_and_logical() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(0b1011),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::BITAND as u8, 0, 1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::AND as u8, 0, 1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert!(vm.pop().as_bool());
     }
 
     /// In-register BinSlotImm Pow avoids the old push/binary stack dance.

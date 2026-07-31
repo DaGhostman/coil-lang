@@ -1439,6 +1439,7 @@ impl Compiler {
                     | Instruction::BinReturn
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
                     | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
@@ -11365,6 +11366,7 @@ fn main() {
                 matches!(
                     b.bytecode(),
                     Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf | Instruction::LogNotJmpf
                 )
             })
             .count()
@@ -11375,10 +11377,29 @@ fn main() {
         for b in bc {
             match b.bytecode() {
                 Instruction::JMPF => return Some(b.operand_u32() as usize),
-                Instruction::CmpJmpf => return Some(b.cmp_jmpf_parts().1),
+                Instruction::CmpJmpf => {
+                    let (_, t) = b.cmp_jmpf_parts();
+                    return if b.cmp_jmpf_is_pool() {
+                        pool.get(t).map(|p| *p as usize)
+                    } else {
+                        Some(t)
+                    };
+                }
                 Instruction::BinSlotImmJmpf => {
                     let pool_idx = b.bin_slot_imm_jmpf_parts().2;
                     return pool.get(pool_idx).map(|p| (*p >> 32) as usize);
+                }
+                Instruction::BinSlotSlotJmpf => {
+                    let pool_idx = b.bin_slot_slot_jmpf_parts().2;
+                    return pool.get(pool_idx).map(|p| (*p >> 32) as usize);
+                }
+                Instruction::LogNotJmpf => {
+                    let t = b.log_not_jmpf_target();
+                    return if b.log_not_jmpf_is_pool() {
+                        pool.get(t).map(|p| *p as usize)
+                    } else {
+                        Some(t)
+                    };
                 }
                 _ => {}
             }
@@ -11468,6 +11489,60 @@ fn main() {
         );
     }
 
+    /// Two-local compare `a < b` fuses to `BinSlotSlotJmpf`.
+    #[test]
+    fn two_local_compare_if_fuses_bin_slot_slot_jmpf() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn cmp(int a, int b) -> int { \
+               if a < b { return 1; } \
+               return 0; \
+             }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| *b.bytecode() == Instruction::BinSlotSlotJmpf
+                    && b.bin_slot_slot_jmpf_parts().0 == Instruction::LE as u8),
+            "expected BinSlotSlotJmpf(LE) for a < b; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x & 1` fuses to `BinSlotImm(BITAND)` (and jmpf when used as a condition).
+    #[test]
+    fn bitand_imm_fuses_bin_slot_imm() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn lowbit(int x) -> int { return x & 1; }");
+        assert!(
+            bc.iter().any(|b| {
+                *b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::BITAND as u8
+                    && b.bin_slot_imm_parts().2 == 1
+            }),
+            "expected BinSlotImm(BITAND, 1); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Eager `a && b` as an if-condition fuses to `BinSlotSlotJmpf(AND)`.
+    #[test]
+    fn logical_and_if_fuses_bin_slot_slot_jmpf() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn both(bool a, bool b) -> int { \
+               if a && b { return 1; } \
+               return 0; \
+             }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| *b.bytecode() == Instruction::BinSlotSlotJmpf
+                    && b.bin_slot_slot_jmpf_parts().0 == Instruction::AND as u8),
+            "expected BinSlotSlotJmpf(AND) for a && b; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Loop exit jump must land past the back-edge `JMP`, even after
     /// peephole fusion relocates jump targets. The condition may fuse
     /// to `CmpJmpf` (large limit) or `BinSlotImmJmpf` (inline limit).
@@ -11491,6 +11566,7 @@ fn main() {
                 Instruction::JMPF
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
                     | Instruction::LogNotJmpf
             )),
             "while condition should emit a false-jump"
@@ -11524,6 +11600,7 @@ fn main() {
                 matches!(
                     b.bytecode(),
                     Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf | Instruction::LogNotJmpf
                 )
             })
             .expect("loop should emit an exit branch");
@@ -13177,6 +13254,7 @@ print \"%i\", s; \
                 Instruction::JMPF
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
                     | Instruction::LogNotJmpf
             )
         });

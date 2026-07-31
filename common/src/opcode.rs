@@ -244,6 +244,10 @@ pub enum Instruction {
     CastByteToInt,
     CastIntToBool,
     CastBoolToInt,
+
+    /// `BinSlotSlot; JMPF t` — pool packs slot b (low 8) + target (high 32).
+    /// Operands: [31:24] op, [23:16] a, [15:0] pool index (mirrors BinSlotImmJmpf).
+    BinSlotSlotJmpf,
 }
 
 impl From<u8> for Instruction {
@@ -394,8 +398,15 @@ impl Byte {
         )
     }
 
+    /// CmpJmpf direct target: [31:24] op, [15:0] PC (bit 16 clear).
     pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
         self.operands = ((op as u32) << 24) | (target as u32);
+        self
+    }
+
+    /// CmpJmpf pool target: [31:24] op, bit 16 set, [15:0] pool index → absolute PC.
+    pub fn with_cmp_jmpf_pool(mut self, op: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | (1u32 << 16) | (pool_idx as u32);
         self
     }
 
@@ -404,6 +415,10 @@ impl Byte {
             (self.operands >> 24) as u8,
             (self.operands & 0xFFFF) as usize,
         )
+    }
+
+    pub fn cmp_jmpf_is_pool(&self) -> bool {
+        (self.operands & (1u32 << 16)) != 0
     }
 
     pub fn with_bin_return(mut self, op: u8) -> Self {
@@ -435,14 +450,24 @@ impl Byte {
         )
     }
 
-    /// LogNotJmpf: [15:0] false-branch target.
+    /// LogNotJmpf direct target: [15:0] PC (bit 16 clear).
     pub fn with_log_not_jmpf(mut self, target: u16) -> Self {
         self.operands = target as u32;
         self
     }
 
+    /// LogNotJmpf pool target: bit 16 set, [15:0] pool index → absolute PC.
+    pub fn with_log_not_jmpf_pool(mut self, pool_idx: u16) -> Self {
+        self.operands = (1u32 << 16) | (pool_idx as u32);
+        self
+    }
+
     pub fn log_not_jmpf_target(&self) -> usize {
         (self.operands & 0xFFFF) as usize
+    }
+
+    pub fn log_not_jmpf_is_pool(&self) -> bool {
+        (self.operands & (1u32 << 16)) != 0
     }
 
     pub fn bin_slot_slot_parts(&self) -> (u8, usize, usize) {
@@ -451,6 +476,21 @@ impl Byte {
             (o >> 24) as u8,
             ((o >> 16) & 0xFF) as usize,
             ((o >> 8) & 0xFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotJmpf: [31:24] op, [23:16] a, [15:0] pool index.
+    pub fn with_bin_slot_slot_jmpf(mut self, op: u8, a: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
         )
     }
 
@@ -758,9 +798,30 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::CastBoolToInt as u8;
+        let last = Instruction::BinSlotSlotJmpf as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
+    }
+
+    #[test]
+    fn bin_slot_slot_jmpf_and_pool_cmp_log_not_pack() {
+        let j = Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+            Instruction::LE as u8,
+            1,
+            7,
+        );
+        assert_eq!(
+            j.bin_slot_slot_jmpf_parts(),
+            (Instruction::LE as u8, 1, 7)
+        );
+
+        let cmp = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(Instruction::EQ as u8, 3);
+        assert!(cmp.cmp_jmpf_is_pool());
+        assert_eq!(cmp.cmp_jmpf_parts(), (Instruction::EQ as u8, 3));
+
+        let n = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(9);
+        assert!(n.log_not_jmpf_is_pool());
+        assert_eq!(n.log_not_jmpf_target(), 9);
     }
 }
 
