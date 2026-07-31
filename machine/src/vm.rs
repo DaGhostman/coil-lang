@@ -4856,6 +4856,34 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 5);
     }
 
+    /// Scratch-area nested records unpack past the live cursor; UnpackAt must
+    /// extend `tell` so a later push does not overwrite the written payload.
+    #[test]
+    fn unpack_at_extends_tell_when_payload_past_cursor() {
+        let mut vm = Machine::<8>::default();
+        // Slot 0 = sibling 99; slot 1 = enum{3,7} (arity 2). UnpackAt@1 writes
+        // payload into slots 1..3. Without seek(3), the next push would clobber
+        // slot 2.
+        vm.run(&[
+            const_int(99),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(7),
+            const_int(3),
+            make_enum(0, 2),
+            Byte::new(Instruction::StorePop).with_operand_u32(1),
+            unpack_at(1, 2),
+            const_int(111),
+            load(0),
+            load(1),
+            load(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 7, "payload[1] must survive push after UnpackAt");
+        assert_eq!(vm.pop().as_int(), 3, "payload[0] at slot 1");
+        assert_eq!(vm.pop().as_int(), 99, "sibling at slot 0 preserved");
+        assert_eq!(vm.pop().as_int(), 111, "push must land past unpacked payload");
+    }
+
     #[test]
     fn get_field_missing_returns_minus_one() {
         let mut vm = Machine::<16>::default();
