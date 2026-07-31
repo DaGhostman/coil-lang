@@ -189,4 +189,31 @@ mod tests {
             Some(true)
         );
     }
+
+    #[test]
+    fn and_short_circuits_on_false_left() {
+        // Right side is non-foldable; left false must still yield false.
+        let e = out(Expression::And(
+            out(Expression::Bool(false)),
+            out(Expression::Identifier("unknown")),
+        ));
+        assert_eq!(eval_bool_const(&e, &|_| None), Some(false));
+    }
+
+    #[test]
+    fn or_short_circuits_on_true_left() {
+        let e = out(Expression::Or(
+            out(Expression::Bool(true)),
+            out(Expression::Identifier("unknown")),
+        ));
+        assert_eq!(eval_bool_const(&e, &|_| None), Some(true));
+    }
+
+    #[test]
+    fn int_nonzero_is_truthy_for_loop_conds() {
+        let e = out(Expression::Integer(1));
+        assert_eq!(eval_bool_const(&e, &|_| None), Some(true));
+        let z = out(Expression::Integer(0));
+        assert_eq!(eval_bool_const(&z, &|_| None), Some(false));
+    }
 }

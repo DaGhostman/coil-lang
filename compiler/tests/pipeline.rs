@@ -4548,6 +4548,328 @@ fn main() {
     );
 }
 
+#[test]
+fn unreachable_after_while_true_is_warning() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn f() -> int {
+    while true {
+    }
+    print "dead";
+}
+
+fn main() {
+    let _ = f;
+}
+"#,
+    );
+    assert!(result.is_ok(), "unreachable after infinite loop is warning");
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::UnreachableCode)
+                && *m.kind() == reporting::MessageKind::WARNING)
+    );
+}
+
+#[test]
+fn defer_dominated_by_while_true_warns_e0123() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn f() -> int {
+    defer { print "d"; }
+    while true {
+    }
+}
+
+fn main() {
+    let _ = f;
+}
+"#,
+    );
+    assert!(result.is_ok(), "E0123 is a warning: {:?}", pipeline.messages());
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::DeferNeverRuns)
+                && *m.kind() == reporting::MessageKind::WARNING),
+        "expected DeferNeverRuns dominated by while true"
+    );
+}
+
+#[test]
+fn defer_inside_while_true_warns_e0123() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn f() -> int {
+    while true {
+        defer { print "d"; }
+    }
+}
+
+fn main() {
+    let _ = f;
+}
+"#,
+    );
+    assert!(result.is_ok(), "E0123 is a warning: {:?}", pipeline.messages());
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::DeferNeverRuns)
+                && *m.kind() == reporting::MessageKind::WARNING),
+        "expected DeferNeverRuns inside while true"
+    );
+}
+
+#[test]
+fn while_true_with_break_requires_explicit_return() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+fn f() -> int {
+    while true {
+        break;
+    }
+}
+
+fn main() {
+    let _ = f;
+}
+"#,
+    );
+    assert!(err.is_err(), "break defeats infinite-loop path proof");
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch))
+    );
+}
+
+#[test]
+fn const_true_while_satisfies_non_unit_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn forever() -> int {
+    const loop = true;
+    while loop {
+    }
+}
+
+fn main() {
+    let _ = forever;
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "const-folded while cond should complete -> int: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn for_true_satisfies_non_unit_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn forever() -> int {
+    for (; true; ) {
+    }
+}
+
+fn main() {
+    let _ = forever;
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "for (; true; ) without break should complete -> int: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn raise_path_satisfies_result_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn boom() -> Result<int, string> {
+    raise "x";
+}
+
+fn main() {
+    let _ = boom;
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "raise should count as exit for Result return: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn panic_path_satisfies_non_unit_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn boom() -> int {
+    panic "x";
+}
+
+fn main() {
+    let _ = boom;
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "panic should count as exit for -> int: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn if_without_else_requires_explicit_return() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+fn f(bool b) -> int {
+    if b {
+        return 1;
+    }
+}
+
+fn main() {
+    let _ = f;
+}
+"#,
+    );
+    assert!(err.is_err(), "if without else must not satisfy -> int");
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch))
+    );
+}
+
+#[test]
+fn if_else_returns_satisfy_non_unit_return() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn f(bool b) -> int {
+    if b {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn main() {
+    print "%i,", f(true);
+    print "%i", f(false);
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "if/else returns should complete -> int: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn never_join_match_panic_arm_types_as_int() {
+    let output = run_example_src(
+        r#"
+fn unwrap(Option<int> o) -> int {
+    return match o {
+        Option::Some(x) => x,
+        Option::None => panic "none",
+    };
+}
+
+fn main() {
+    print "%i", unwrap(Option::Some(7));
+}
+"#,
+    );
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn match_all_arms_return_satisfies_non_unit() {
+    let output = run_example_src(
+        r#"
+fn f(Option<int> o) -> int {
+    match o {
+        Option::Some(x) => return x,
+        Option::None => return 0,
+    }
+}
+
+fn main() {
+    print "%i,", f(Option::Some(3));
+    print "%i", f(Option::None);
+}
+"#,
+    );
+    assert_eq!(output, "3,0");
+}
+
+#[test]
+fn unit_fallthrough_still_runs_defers() {
+    let output = run_example_src(
+        r#"
+fn f() {
+    defer { print "d"; }
+    print "b";
+}
+
+fn main() {
+    f();
+}
+"#,
+    );
+    assert_eq!(
+        output, "bd",
+        "unit epilogue must still emit defers before CONST 0; RETURN"
+    );
+}
+
 /// Nested multifield record that is not the first outer field must still
 /// relocate into scratch and preserve the preceding sibling binding.
 #[test]

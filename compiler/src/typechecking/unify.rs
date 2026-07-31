@@ -572,6 +572,22 @@ mod tests {
     }
 
     #[test]
+    fn unify_never_absorbs_concrete_without_binding() {
+        // Bottom unifies with any type and must not invent a subst binding.
+        assert_eq!(unify(&Ty::Never, &int()).unwrap(), Subst::empty());
+        assert_eq!(unify(&string(), &Ty::Never).unwrap(), Subst::empty());
+        assert_eq!(unify(&Ty::Never, &Ty::Never).unwrap(), Subst::empty());
+    }
+
+    #[test]
+    fn unify_never_with_var_does_not_bind_var() {
+        // Never arms precede Var bind — α stays free so joins stay absorbing.
+        let s = unify(&Ty::Never, &v(0)).unwrap();
+        assert_eq!(s, Subst::empty());
+        assert_eq!(apply_ty(&s, &v(0)), v(0));
+    }
+
+    #[test]
     fn unify_var_with_constructor_binds() {
         let s = unify(&v(0), &int()).unwrap();
         assert_eq!(apply_ty(&s, &v(0)), int());

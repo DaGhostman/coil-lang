@@ -243,3 +243,100 @@ fn warn_defer_never(
     }
     messages.push(msg);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parser::SimpleSpan;
+    use parser::ast::Expression;
+
+    fn out<'a>(expr: Expression<'a>) -> Output<'a> {
+        (SimpleSpan::from(0..0), Box::new(expr))
+    }
+
+    fn block<'a>(children: Vec<Output<'a>>) -> Output<'a> {
+        out(Expression::Block(children))
+    }
+
+    fn while_loop<'a>(cond: Expression<'a>, body: Output<'a>) -> Output<'a> {
+        out(Expression::Loop {
+            identifier: None,
+            iterable: out(cond),
+            body,
+        })
+    }
+
+    #[test]
+    fn return_always_exits() {
+        let body = block(vec![out(Expression::Return(out(Expression::Integer(1))))]);
+        assert!(always_exits(&body, &|_| None));
+    }
+
+    #[test]
+    fn while_true_without_break_always_exits() {
+        let body = block(vec![while_loop(Expression::Bool(true), block(vec![]))]);
+        assert!(always_exits(&body, &|_| None));
+    }
+
+    #[test]
+    fn while_true_with_break_does_not_always_exit() {
+        let body = block(vec![while_loop(
+            Expression::Bool(true),
+            block(vec![out(Expression::Break)]),
+        )]);
+        assert!(!always_exits(&body, &|_| None));
+    }
+
+    #[test]
+    fn nested_break_does_not_defeat_outer_infinite_while() {
+        // break in an inner loop only exits depth 0 of that loop; outer while
+        // true {} with no outer break remains infinite.
+        let inner = while_loop(
+            Expression::Bool(false),
+            block(vec![out(Expression::Break)]),
+        );
+        let body = block(vec![while_loop(Expression::Bool(true), block(vec![inner]))]);
+        assert!(always_exits(&body, &|_| None));
+    }
+
+    #[test]
+    fn if_without_else_does_not_always_exit() {
+        let then = out(Expression::Branch(
+            Some(out(Expression::Bool(true))),
+            block(vec![out(Expression::Return(out(Expression::Integer(1))))]),
+        ));
+        let body = block(vec![out(Expression::If(vec![then]))]);
+        assert!(!always_exits(&body, &|_| None));
+    }
+
+    #[test]
+    fn analyze_fn_body_warns_unreachable_after_return() {
+        let body = block(vec![
+            out(Expression::Return(out(Expression::Integer(1)))),
+            out(Expression::Integer(2)),
+        ]);
+        let cf = analyze_fn_body(&body, &|_| None);
+        assert!(cf.always_exits);
+        assert!(
+            cf.messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::UnreachableCode))
+        );
+    }
+
+    #[test]
+    fn analyze_fn_body_warns_defer_before_infinite_loop() {
+        let defer = out(Expression::Defer {
+            captures: vec![],
+            body: block(vec![]),
+        });
+        let body = block(vec![defer, while_loop(Expression::Bool(true), block(vec![]))]);
+        let cf = analyze_fn_body(&body, &|_| None);
+        assert!(cf.always_exits);
+        assert!(
+            cf.messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::DeferNeverRuns))
+        );
+    }
+}
