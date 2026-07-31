@@ -20,6 +20,12 @@ pub struct Heap {
     head: Option<Object>,
     /// O(1) lookup of live objects by address (updated on alloc/sweep).
     addr_index: HashMap<u64, Object>,
+    /// Reused mark-set across collections (avoids alloc per GC).
+    gc_mark_set: HashSet<u64>,
+    /// Reused gray worklist / root buffers across collections.
+    gc_gray: Vec<Object>,
+    gc_root_objects: Vec<Object>,
+    gc_roots: Vec<u64>,
 }
 
 impl Default for Heap {
@@ -31,6 +37,10 @@ impl Default for Heap {
             strings: Table::default(),
             head: None,
             addr_index: HashMap::new(),
+            gc_mark_set: HashSet::new(),
+            gc_gray: Vec::new(),
+            gc_root_objects: Vec::new(),
+            gc_roots: Vec::new(),
         }
     }
 }
@@ -259,17 +269,45 @@ impl Heap {
     }
 
     pub fn trace(&mut self, values: &[u64]) {
-        let roots: HashSet<u64> = values.iter().copied().collect();
+        self.gc_mark_set.clear();
+        self.gc_mark_set.extend(values.iter().copied());
+        let mut gray = std::mem::take(&mut self.gc_gray);
+        gray.clear();
         let mut current = self.head;
 
-        let mut gray = Vec::with_capacity(values.len());
         while let Some(reference) = current {
-            if !reference.is_marked() && roots.contains(&reference.addr()) {
+            if !reference.is_marked() && self.gc_mark_set.contains(&reference.addr()) {
                 reference.mark(&mut gray);
             }
 
             current = reference.get_next();
         }
+        gray.clear();
+        self.gc_gray = gray;
+    }
+
+    /// Take the reusable GC root address buffer (caller must restore via [`Self::restore_gc_roots`]).
+    pub fn take_gc_roots(&mut self) -> Vec<u64> {
+        let mut roots = std::mem::take(&mut self.gc_roots);
+        roots.clear();
+        roots
+    }
+
+    pub fn restore_gc_roots(&mut self, roots: Vec<u64>) {
+        self.gc_roots = roots;
+    }
+
+    pub fn take_gc_worklists(&mut self) -> (Vec<Object>, Vec<Object>) {
+        let mut gray = std::mem::take(&mut self.gc_gray);
+        let mut root_objects = std::mem::take(&mut self.gc_root_objects);
+        gray.clear();
+        root_objects.clear();
+        (gray, root_objects)
+    }
+
+    pub fn restore_gc_worklists(&mut self, gray: Vec<Object>, root_objects: Vec<Object>) {
+        self.gc_gray = gray;
+        self.gc_root_objects = root_objects;
     }
 
     /// Head of the intrusive object list (for address lookup).
@@ -1904,5 +1942,60 @@ mod tests {
             .with_regex(obj.addr(), |_| panic!("must not run"))
             .is_none());
         assert!(heap.with_regex(0, |_| panic!("must not run")).is_none());
+    }
+
+    #[test]
+    fn gc_scratch_buffers_round_trip_take_restore() {
+        let mut heap = Heap::default();
+        let mut roots = heap.take_gc_roots();
+        roots.push(1);
+        roots.push(2);
+        heap.restore_gc_roots(roots);
+
+        let (mut gray, mut root_objects) = heap.take_gc_worklists();
+        assert!(gray.is_empty());
+        assert!(root_objects.is_empty());
+        // Capacity may be retained after clear; restore must not panic.
+        gray.reserve(4);
+        root_objects.reserve(4);
+        heap.restore_gc_worklists(gray, root_objects);
+
+        let roots2 = heap.take_gc_roots();
+        // Prior contents were cleared on take; buffer is reusable.
+        assert!(roots2.is_empty());
+        heap.restore_gc_roots(roots2);
+    }
+
+    #[test]
+    fn repeated_trace_reuses_mark_set_without_leaking_prior_roots() {
+        let mut heap = Heap::default();
+        let (keep, _) = heap.alloc(ObjString::from("keep"), Object::String);
+        let (drop_me, _) = heap.alloc(ObjString::from("drop"), Object::String);
+        let keep_addr = keep.addr();
+        let drop_addr = drop_me.addr();
+
+        // First collection: only `keep` is a root.
+        heap.trace(&[keep_addr]);
+        let mut gray = Vec::new();
+        keep.mark_references(&mut gray);
+        unsafe { heap.sweep() };
+
+        let live = live_object_addrs(&heap);
+        assert!(live.contains(&keep_addr));
+        assert!(!live.contains(&drop_addr));
+
+        // Second collection with empty roots must not resurrect drop_me via a
+        // stale mark-set entry from the previous trace.
+        let (orphan, _) = heap.alloc(ObjString::from("orphan"), Object::String);
+        let orphan_addr = orphan.addr();
+        heap.trace(&[]);
+        unsafe { heap.sweep() };
+        let live = live_object_addrs(&heap);
+        assert!(
+            !live.contains(&orphan_addr),
+            "empty-root trace must not keep prior mark-set addresses alive"
+        );
+        // `keep` was unmarked after sweep and not re-rooted — also gone.
+        assert!(!live.contains(&keep_addr));
     }
 }
