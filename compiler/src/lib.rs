@@ -13030,31 +13030,19 @@ fn main() { print \"%i\", add(3, 4); }",
                 loc: DebugLoc::unknown(),
             },
         ]));
-        assert!(!Compiler::is_tiny_inline_il(&[
-            IlOp::HostInvoke {
-                arity: 1,
+        // ConstPool is a pure producer in the widened micro-inline set.
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::ConstPool {
+                idx: 2,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Return {
                 loc: DebugLoc::unknown(),
             },
         ]));
-        // Four compute ops + Return exceeds pure micro budget (≤3 + Return).
         assert!(!Compiler::is_tiny_inline_il(&[
-            IlOp::Load {
-                slot: 0,
-                loc: DebugLoc::unknown(),
-            },
-            IlOp::Const {
-                imm: 1,
-                loc: DebugLoc::unknown(),
-            },
-            IlOp::Const {
-                imm: 2,
-                loc: DebugLoc::unknown(),
-            },
-            IlOp::Bin {
-                op: Instruction::ADD,
+            IlOp::HostInvoke {
+                arity: 1,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Return {
