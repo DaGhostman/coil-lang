@@ -5390,16 +5390,8 @@ impl Compiler {
                 Some(Ty::Record { fields: tys })
             }
             Expression::Identifier(name) => self
-                // Prefer HM span cache (aligned for free-fn bodies after
-                // `assign_fn_arg_node_ids`). Fall back to the name side-table
-                // for match bindings / remaining misalignment cases.
-                .checker
-                .lookup_for_codegen_span(node.0.start, node.0.end)
-                .or_else(|| {
-                    self.codegen_var_type_for(name).map(|t| {
-                        crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
-                    })
-                }),
+                .codegen_var_type_for(name)
+                .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
             // `Construct` / `Instantiate` must NOT collapse to a bare
             // `Ty::Con(name)`: generic apps like `Option::Some(42)` are
             // `Option<int>` (`Ty::App`), and call-site dictionary emission
@@ -5808,13 +5800,10 @@ impl Compiler {
             | Expression::Statement(inner)
             | Expression::ExprStatement(inner) => self.receiver_type(inner),
             Expression::Identifier(name) => {
-                self.checker
-                    .lookup_for_codegen_span(receiver.0.start, receiver.0.end)
-                    .or_else(|| {
-                        self.codegen_var_type_for(name).map(|t| {
-                            crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
-                        })
-                    })
+                self.codegen_var_type_for(name).map(|t| {
+                    // Apply substitution so inferred record types resolve fully.
+                    crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
+                })
             }
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;

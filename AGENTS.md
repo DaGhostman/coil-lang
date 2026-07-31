@@ -48,7 +48,7 @@
 ## Known limitations
 
 - `find_object_by_addr` is O(n) over the live heap; hot paths that classify pointers still walk the intrusive list.
-- `codegen_var_types` is a side-table workaround for pre-walk / infer ID misalignment inside function bodies. **Partial progress:** `infer_function` / lambdas now assign Fragment + Argument NodeIds (matching codegen's `do_compile(args)`), so free-fn / lambda body caches line up with `emit_idx`; Identifier codegen prefers the span cache before the name table. Remaining: Method/Function wrapper IDs when callers bypass `infer` (impl / typeclass methods), param type-annotation ids still stolen by the body (both sides), and retiring the side table for match bindings.
+- `codegen_var_types` is a side-table workaround for pre-walk / infer ID misalignment inside function bodies (`infer_function` skips args). Prefer aligning ID minting long-term.
 - Implicit fall-through uses type-directed `CONST 0; RETURN` only when `0` is valid for the return type (unit/int/byte/bool/float/`Option` as `None`); otherwise emits `E0111` (`ReturnMismatch`) and still completes the epilogue.
 - `cargo clippy` fails on a pre-existing `#[deny(clippy::mut_from_ref)]` in `Gc::payload_mut`; use `cargo check --workspace` as the lint gate.
 
