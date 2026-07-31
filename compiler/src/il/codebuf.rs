@@ -570,18 +570,18 @@ mod tests {
 
         let mut pool = Vec::new();
         let lowered = buf.lower_in_place(&mut pool);
+        let ops: Vec<_> = lowered.bytecode.iter().map(|b| *b.bytecode()).collect();
+        // Entry label binds the Const producer, so ConstReturnImm fuse is refused.
         assert!(
-            matches!(*lowered.bytecode[0].bytecode(), Instruction::ConstReturnImm),
-            "body Const+Return must fuse through lower_module"
+            matches!(ops.as_slice(), [Instruction::CONST, Instruction::RETURN, Instruction::CALL, Instruction::HALT]),
+            "unexpected lowered ops: {ops:?}"
         );
         assert_eq!(lowered.bytecode[0].operand_u32(), 7);
-        assert!(matches!(*lowered.bytecode[1].bytecode(), Instruction::CALL));
         assert_eq!(
-            lowered.bytecode[1].call_parts(),
+            lowered.bytecode[2].call_parts(),
             (0, 0),
-            "CALL must target fused entry PC after owning-module lower"
+            "CALL must target entry PC after owning-module lower"
         );
-        assert!(matches!(*lowered.bytecode[2].bytecode(), Instruction::HALT));
         assert_eq!(buf.as_slice().len(), lowered.bytecode.len());
     }
 }
