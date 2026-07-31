@@ -4404,6 +4404,8 @@ impl Checker {
                         .insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
                 }
+                // Match codegen: consume Fragment + Argument IDs before body.
+                self.assign_fn_arg_node_ids(args, &arg_tys);
 
                 let ret_slot = Ty::Var(self.counter.fresh());
                 let prev_ret = self.current_return_ty.replace(ret_slot.clone());
@@ -10595,6 +10597,8 @@ impl Checker {
             baseline.insert(arg_name.clone());
         }
         self.fn_codegen_baselines.push(baseline);
+        // Free-fn arg NodeId assign deferred (Hash / constraint-kind). Lambdas
+        // call `assign_fn_arg_node_ids` at their infer site.
         let _ = self.infer(body);
         self.fn_codegen_baselines.pop();
         self.pop_scope();
@@ -10900,6 +10904,59 @@ impl Checker {
 
     pub fn spread_call_arity_at(&self, start: usize, end: usize) -> Option<usize> {
         self.spread_call_arity.get(&(start, end)).copied()
+    }
+
+    /// Assign NodeIds for a function/lambda parameter list so body infer
+    /// stays lockstep with codegen.
+    ///
+    /// Codegen's `do_compile(args)` consumes the `Fragment` id and each
+    /// `Argument` id, but does **not** walk type-annotation children.
+    /// Identifier codegen still uses `codegen_var_types` (no span prefer).
+    fn assign_fn_arg_node_ids(&mut self, args: &Output, arg_tys: &[(String, Ty)]) {
+        match args.1.as_ref() {
+            Expression::Fragment(children) => {
+                if self.next_id_idx >= self.ids.ids().len() {
+                    return;
+                }
+                let frag_id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                self.cache.insert(frag_id, unit_ty());
+
+                let mut ty_idx = 0usize;
+                for child in children {
+                    if self.next_id_idx >= self.ids.ids().len() {
+                        break;
+                    }
+                    let id = self.ids.ids()[self.next_id_idx];
+                    self.next_id_idx += 1;
+                    let ty = if let Expression::Argument(..) = child.1.as_ref() {
+                        let t = arg_tys
+                            .get(ty_idx)
+                            .map(|(_, t)| t.clone())
+                            .unwrap_or_else(unit_ty);
+                        ty_idx += 1;
+                        t
+                    } else {
+                        unit_ty()
+                    };
+                    self.cache.insert(id, ty.clone());
+                    self.codegen_types_by_span
+                        .entry((child.0.start, child.0.end))
+                        .or_insert(ty);
+                }
+            }
+            _ => {
+                if self.next_id_idx < self.ids.ids().len() {
+                    let id = self.ids.ids()[self.next_id_idx];
+                    self.next_id_idx += 1;
+                    let ty = arg_tys
+                        .first()
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or_else(unit_ty);
+                    self.cache.insert(id, ty);
+                }
+            }
+        }
     }
 
     /// Parse a function's argument list (a `Fragment` of
@@ -16045,6 +16102,64 @@ fn main() {
     }
 
     // ---- Type cache ----
+
+    #[test]
+    fn free_fn_arg_still_in_codegen_var_types() {
+        // Free-fn `assign_fn_arg_node_ids` is deferred (Hash / constraint-kind).
+        // Params remain available via the name side-table.
+        let src = "fn f(int x) -> int { return x; }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "{:?}", c.messages());
+        assert_eq!(
+            c.codegen_var_type("x").map(|t| apply_ty_prune(c.subst(), t)),
+            Some(int())
+        );
+    }
+
+    #[test]
+    fn lambda_arg_node_ids_cached_before_body() {
+        let src = "let f = fn (int x) => x; let _ = f(1);";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "{:?}", c.messages());
+        let ast = Pratt::default().parse(src).expect("parse");
+
+        fn find_lambda_arg_span(node: &parser::ast::Output<'_>) -> Option<(usize, usize)> {
+            use parser::ast::Expression;
+            match node.1.as_ref() {
+                Expression::Program(cs) | Expression::Block(cs) | Expression::Fragment(cs) => {
+                    cs.iter().find_map(find_lambda_arg_span)
+                }
+                Expression::Variable(_, Some(value)) | Expression::Constant(_, Some(value)) => {
+                    find_lambda_arg_span(value)
+                }
+                Expression::Lambda { args, .. } => {
+                    if let Expression::Fragment(children) = args.1.as_ref() {
+                        children.iter().find_map(|child| {
+                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                                Some((child.0.start, child.0.end))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Expression::Expr(e)
+                | Expression::Statement(e)
+                | Expression::ExprStatement(e)
+                | Expression::Group(e) => find_lambda_arg_span(e),
+                _ => None,
+            }
+        }
+
+        let (start, end) = find_lambda_arg_span(&ast).expect("lambda Argument span");
+        assert_eq!(
+            c.lookup_for_codegen_span(start, end),
+            Some(int()),
+            "lambda Argument span must cache the parameter type"
+        );
+    }
 
     #[test]
     fn cache_is_populated_after_check_program() {
