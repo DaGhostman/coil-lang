@@ -176,7 +176,6 @@ fn preds_of(blocks: &[Block]) -> Vec<Vec<usize>> {
 /// Const/Load pairs we replace with Dup; for now remove exact `Const k; Const k`
 /// by replacing the second with `Dup`).
 fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
-    let mut remove: HashSet<usize> = HashSet::new();
     for b in blocks {
         let mut last_key: Option<u64> = None;
         let mut last_idx: Option<usize> = None;
@@ -210,7 +209,6 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
             }
             last_key = key;
             last_idx = Some(i);
-            let _ = remove;
         }
     }
 }
