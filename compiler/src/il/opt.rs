@@ -31,8 +31,6 @@ impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             jump_thread: true,
-            // JMP + RETURN/HALT/*Return sweep; entry labels + CALL-0
-            // continuations labeled.
             dead_block: true,
             stack_dce: true,
             mem_fwd: true,
@@ -287,8 +285,11 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
     *ops = out;
 }
 
-/// `StorePop s; Load s` → `Dup; StorePop s` (value stays on stack after store).
+/// `StorePop s; Load s` → `Dup; StorePop s` when the value stays on stack after
+/// store. Refused when SP-in is `s + 1` (TOS aliases the slot in the shared
+/// stack/locals frame — e.g. tuple `let` temps at slot 0).
 fn mem_fwd(ops: &mut Vec<IlOp>) {
+    let sp = super::sp::analyze(ops);
     let mut i = 0;
     while i + 1 < ops.len() {
         let slot_loc = {
@@ -300,10 +301,16 @@ fn mem_fwd(ops: &mut Vec<IlOp>) {
             }
         };
         if let Some((slot, loc)) = slot_loc {
-            ops[i] = IlOp::Dup { loc };
-            ops[i + 1] = IlOp::StorePop { slot, loc };
-            i += 2;
-            continue;
+            let refuse = match sp.sp_before(i) {
+                super::sp::Sp::Known(h) => h == slot as i32 + 1,
+                super::sp::Sp::Unknown => true,
+            } || mem_fwd_load_feeds_index(ops, i + 1);
+            if !refuse {
+                ops[i] = IlOp::Dup { loc };
+                ops[i + 1] = IlOp::StorePop { slot, loc };
+                i += 2;
+                continue;
+            }
         }
         i += 1;
     }
@@ -335,6 +342,12 @@ fn is_store_barrier(op: &IlOp) -> bool {
     )
 }
 
+/// True when `Load` at `load_idx` is the tuple-destructure reload (`Const; Index`).
+fn mem_fwd_load_feeds_index(ops: &[IlOp], load_idx: usize) -> bool {
+    matches!(ops.get(load_idx + 1), Some(IlOp::Const { .. }))
+        && matches!(ops.get(load_idx + 2), Some(IlOp::Index { .. }))
+}
+
 /// Drop `StorePop s` (and a preceding dead producer / Dup) when `s` is unused
 /// before the next store to `s` or a control/effect barrier. Straight-line only.
 fn dead_store(ops: &mut Vec<IlOp>) {
@@ -350,6 +363,10 @@ fn dead_store(ops: &mut Vec<IlOp>) {
         let mut j = i + 1;
         while j < ops.len() {
             if is_store_barrier(&ops[j]) {
+                // Jumps/labels may reach a later Load on a back-edge (loop-carried).
+                if !matches!(&ops[j], IlOp::Return { .. } | IlOp::Halt { .. }) {
+                    used = true;
+                }
                 break;
             }
             if matches!(&ops[j], IlOp::StorePop { slot: s, .. } if *s == slot) {
@@ -1304,6 +1321,74 @@ mod tests {
 
     fn is_insn(op: &IlOp, i: Instruction) -> bool {
         op.instruction() == Some(i)
+    }
+
+    #[test]
+    fn mem_fwd_refuses_when_load_feeds_index() {
+        let mut ops = vec![
+            IlOp::StorePop {
+                slot: 5,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Index {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        mem_fwd(&mut ops);
+        assert!(matches!(ops[0], IlOp::StorePop { slot: 5, .. }));
+        assert!(matches!(ops[1], IlOp::Load { slot: 5, .. }));
+    }
+
+    #[test]
+    fn mem_fwd_refuses_when_tos_aliases_store_slot() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 2,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::MakeTuple {
+                arity: 2,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Index {
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let before = ops.clone();
+        mem_fwd(&mut ops);
+        assert!(matches!(ops[3], IlOp::StorePop { slot: 0, .. }));
+        assert!(matches!(ops[4], IlOp::Load { slot: 0, .. }));
+        assert_eq!(ops.len(), before.len());
     }
 
     #[test]
@@ -2301,6 +2386,39 @@ mod tests {
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::ConstPool { .. })));
         assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn dead_store_keeps_loop_carried_store_before_jump() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store(&mut ops);
+        assert!(ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 0, .. })));
     }
 
     #[test]
