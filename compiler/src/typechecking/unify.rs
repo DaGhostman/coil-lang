@@ -365,6 +365,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             unify_with(subst, o1.as_ref(), o2.as_ref())
         }
 
+        // Never unifies with anything (bottom): join absorbs it without binding.
+        (Ty::Never, Ty::Never) => Ok(subst.clone()),
+        (Ty::Never, _) | (_, Ty::Never) => Ok(subst.clone()),
+
         // Type variable on either side: bind, with occurs check.
         (Ty::Var(v), t) => bind_var(subst, v, t),
         (t, Ty::Var(v)) => bind_var(subst, v, t),

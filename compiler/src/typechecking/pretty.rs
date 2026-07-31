@@ -199,6 +199,7 @@ fn format_ty_renamed(
                 format!("forall {}. {} where {}", vars, body_s, multi.join(", "))
             }
         }
+        Ty::Never => "never".to_string(),
     }
 }
 
@@ -206,6 +207,7 @@ impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Ty::Var(v) => write!(f, "t{}", v.raw()),
+            Ty::Never => write!(f, "never"),
             Ty::Con(name) => write!(f, "{}", name),
             Ty::Fun(a, b) => {
                 if needs_paren(a) {

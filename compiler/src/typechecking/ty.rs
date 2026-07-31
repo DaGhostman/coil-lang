@@ -63,6 +63,9 @@ pub enum Ty {
         constraints: Vec<Constraint>,
         body: Box<Ty>,
     },
+    /// Bottom type for diverging control flow (`return`/`raise`/`panic`/proven
+    /// infinite loops). Checker-only — never a runtime/ABI type.
+    Never,
 }
 
 /// Array length: compile-time constant or runtime-known.
@@ -386,6 +389,11 @@ pub fn unit() -> Ty {
     Ty::Con(UNIT.into())
 }
 
+/// Build the checker-only bottom type for diverging expressions.
+pub fn never() -> Ty {
+    Ty::Never
+}
+
 /// Build `Option<T>` as a type application.
 pub fn option_app_ty(inner: Ty) -> Ty {
     Ty::App(
@@ -614,6 +622,7 @@ pub fn subst_ty_params(ty: &Ty, params: &std::collections::HashMap<String, Ty>) 
             body: Box::new(subst_ty_params(body, params)),
         },
         Ty::Readonly(inner) => Ty::Readonly(Box::new(subst_ty_params(inner, params))),
+        Ty::Never => Ty::Never,
     }
 }
 
@@ -644,7 +653,7 @@ pub fn schemaize_ty(ty: &Ty, var_to_name: &std::collections::HashMap<TyVarId, St
             .get(id)
             .map(|n| Ty::Con(n.clone()))
             .unwrap_or_else(|| ty.clone()),
-        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } | Ty::Never => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(
             Box::new(schemaize_ty(a, var_to_name)),
             Box::new(schemaize_ty(b, var_to_name)),
@@ -723,7 +732,7 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         Ty::Var(v) => {
             acc.insert(*v);
         }
-        Ty::Con(_) | Ty::Existential { .. } => {}
+        Ty::Con(_) | Ty::Existential { .. } | Ty::Never => {}
         Ty::Fun(a, b) => {
             go(a, acc);
             go(b, acc);
