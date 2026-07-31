@@ -324,7 +324,15 @@ mod tests {
         let emit_end = ops.iter().filter(|op| op.emits_code()).count();
         let funcs = vec![IlFunc::new("f", None, 0, emit_end)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        // Isolate multi_op: return/bin convoy would otherwise rewrite the join.
+        let flat = m.optimize_and_flatten(&OptimizeOptions {
+            jump_thread: false,
+            dead_block: false,
+            stack_dce: false,
+            return_convoy: false,
+            bin_join_convoy: false,
+            multi_op_join_convoy: true,
+        });
         let loads = flat
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))
