@@ -79,6 +79,26 @@ impl CodeBuf {
         self.il.push_return_at(loc);
     }
 
+    pub fn push_load(&mut self, slot: u32) {
+        self.invalidate_lowered();
+        self.il.push_load(slot);
+    }
+
+    pub fn push_load_at(&mut self, slot: u32, loc: DebugLoc) {
+        self.invalidate_lowered();
+        self.il.push_load_at(slot, loc);
+    }
+
+    pub fn push_store_pop(&mut self, slot: u32) {
+        self.invalidate_lowered();
+        self.il.push_store_pop(slot);
+    }
+
+    pub fn push_store_pop_at(&mut self, slot: u32, loc: DebugLoc) {
+        self.invalidate_lowered();
+        self.il.push_store_pop_at(slot, loc);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
@@ -454,6 +474,16 @@ mod tests {
         let ops = buf.ops();
         assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
         assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn push_load_and_store_pop_emit_typed_ops() {
+        let mut buf = CodeBuf::new();
+        buf.push_load(3);
+        buf.push_store_pop(4);
+        let ops = buf.ops();
+        assert!(matches!(ops[0], IlOp::Load { slot: 3, .. }));
+        assert!(matches!(ops[1], IlOp::StorePop { slot: 4, .. }));
     }
 
     #[test]

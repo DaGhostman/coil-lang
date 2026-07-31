@@ -936,7 +936,7 @@ impl Compiler {
             for cap in captures {
                 if let Some(slot) = self.lookup_slot(cap) {
                     self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                        .push_load(slot);
                 } else {
                     // Typecheck should have rejected unknown captures; emit a
                     // zero so the CALL arity still matches.
@@ -1068,7 +1068,7 @@ impl Compiler {
         match v {
             ConstValue::Int(n) => {
                 if (0..=i32::MAX as i64).contains(n) {
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(*n as i32));
+                    bytecode.push_const(*n as i32);
                 } else {
                     let bits = Value::from(*n).raw() as u64;
                     let idx = self.intern_constant(bits);
@@ -1141,7 +1141,7 @@ impl Compiler {
             }
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
-            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(shift as i32));
+            bytecode.push_const(shift as i32);
             bytecode.push(Byte::new(Instruction::SHL));
             true
         } else {
@@ -1384,7 +1384,7 @@ impl Compiler {
         }
         let op: Instruction = byte.bin_return_op().into();
         for &tmp in temps {
-            out.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp));
+            out.push_load(tmp);
         }
         out.push(Byte::new(op));
         true
@@ -1450,7 +1450,7 @@ impl Compiler {
             };
             bytecode.append(&mut self.do_compile(value));
             let tmp = self.alloc_temp_slot();
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+            bytecode.push_store_pop(tmp);
             temps.push(tmp);
         }
         if slice.len() == 1
@@ -1471,7 +1471,7 @@ impl Compiler {
                 let Some(&tmp) = temps.get(slot) else {
                     return false;
                 };
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp));
+                bytecode.push_load(tmp);
             } else if matches!(
                 byte.bytecode(),
                 Instruction::BinSlotImm | Instruction::BinSlotSlot
@@ -1661,13 +1661,8 @@ fn emit_pattern_binding<'compiler>(
                                 checker.payload_tys_for(sub_enum, sub_variant).len() as u16;
                             let scratch_base = (*next_slot).max(record_base + n_fields);
                             if scratch_base != field_slot {
-                                bytecode.push(
-                                    Byte::new(Instruction::LOAD).with_operand_u32(field_slot),
-                                );
-                                bytecode.push(
-                                    Byte::new(Instruction::StorePop)
-                                        .with_operand_u32(scratch_base),
-                                );
+                                bytecode.push_load(field_slot);
+                                bytecode.push_store_pop(scratch_base);
                             }
                             bytecode.push(
                                 Byte::new(Instruction::UnpackAt)
@@ -1676,10 +1671,8 @@ fn emit_pattern_binding<'compiler>(
                             *next_slot = scratch_base;
                         } else if consume_values && field_slot != *next_slot {
                             bytecode
-                                .push(Byte::new(Instruction::LOAD).with_operand_u32(field_slot));
-                            bytecode.push(
-                                Byte::new(Instruction::StorePop).with_operand_u32(*next_slot),
-                            );
+                                .push_load(field_slot);
+                            bytecode.push_store_pop(*next_slot);
                         }
                         let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
                             enum_name: sub_enum,
@@ -2167,9 +2160,9 @@ impl Compiler {
         };
         bytecode.append(&mut self.do_compile(lhs));
         bytecode.append(&mut self.do_compile(rhs));
-        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
-        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
-        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
+        bytecode.push_load(dict_slot);
+        bytecode.push_load(dict_slot);
+        bytecode.push_const(method_slot as i32);
         bytecode.push(Byte::new(Instruction::Index));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
         true
@@ -2225,13 +2218,13 @@ impl Compiler {
             } => {
                 let t0 = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(lhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.push_store_pop(t0);
                 self.emit_zip_loop(
                     bytecode,
                     arity,
                     |c, bc, i| {
-                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push_load(t0);
+                        bc.push_const(i as i32);
                         bc.push(Byte::new(Instruction::Index));
                         c.emit_neg_tos(bc, elem_is_float);
                     },
@@ -2245,15 +2238,15 @@ impl Compiler {
             } => {
                 let t0 = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(lhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.push_store_pop(t0);
                 match length {
                     Some(n) => {
                         self.emit_zip_loop(
                             bytecode,
                             n,
                             |c, bc, i| {
-                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push_load(t0);
+                                bc.push_const(i as i32);
                                 bc.push(Byte::new(Instruction::Index));
                                 c.emit_neg_tos(bc, elem_is_float);
                             },
@@ -2278,19 +2271,19 @@ impl Compiler {
                 let t0 = self.alloc_temp_slot();
                 let t1 = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(lhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.push_store_pop(t0);
                 bytecode.append(&mut self.do_compile(rhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                bytecode.push_store_pop(t1);
                 let op = info.op;
                 self.emit_zip_loop(
                     bytecode,
                     arity,
                     |_c, bc, i| {
-                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push_load(t0);
+                        bc.push_const(i as i32);
                         bc.push(Byte::new(Instruction::Index));
-                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
-                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push_load(t1);
+                        bc.push_const(i as i32);
                         bc.push(Byte::new(Instruction::Index));
                         bc.push(Byte::new(scalar_instr(op, elem_is_float)));
                     },
@@ -2308,19 +2301,19 @@ impl Compiler {
                 let t0 = self.alloc_temp_slot();
                 let t1 = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(lhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.push_store_pop(t0);
                 bytecode.append(&mut self.do_compile(rhs));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                bytecode.push_store_pop(t1);
                 let op = info.op;
                 self.emit_zip_loop(
                     bytecode,
                     length,
                     |_c, bc, i| {
-                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push_load(t0);
+                        bc.push_const(i as i32);
                         bc.push(Byte::new(Instruction::Index));
-                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
-                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push_load(t1);
+                        bc.push_const(i as i32);
                         bc.push(Byte::new(Instruction::Index));
                         bc.push(Byte::new(scalar_instr(op, elem_is_float)));
                     },
@@ -2341,15 +2334,15 @@ impl Compiler {
                 match scalar_on {
                     ScalarSide::Right => {
                         bytecode.append(&mut self.do_compile(lhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.push_store_pop(t_vec);
                         bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.push_store_pop(t_sc);
                     }
                     ScalarSide::Left => {
                         bytecode.append(&mut self.do_compile(lhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.push_store_pop(t_sc);
                         bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.push_store_pop(t_vec);
                     }
                 }
                 let op = info.op;
@@ -2359,15 +2352,15 @@ impl Compiler {
                     |_c, bc, i| {
                         match scalar_on {
                             ScalarSide::Right => {
-                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
-                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push_load(t_vec);
+                                bc.push_const(i as i32);
                                 bc.push(Byte::new(Instruction::Index));
-                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                bc.push_load(t_sc);
                             }
                             ScalarSide::Left => {
-                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
-                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
-                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push_load(t_sc);
+                                bc.push_load(t_vec);
+                                bc.push_const(i as i32);
                                 bc.push(Byte::new(Instruction::Index));
                             }
                         }
@@ -2390,15 +2383,15 @@ impl Compiler {
                 match scalar_on {
                     ScalarSide::Right => {
                         bytecode.append(&mut self.do_compile(lhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.push_store_pop(t_vec);
                         bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.push_store_pop(t_sc);
                     }
                     ScalarSide::Left => {
                         bytecode.append(&mut self.do_compile(lhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.push_store_pop(t_sc);
                         bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.push_store_pop(t_vec);
                     }
                 }
                 let op = info.op;
@@ -2410,21 +2403,15 @@ impl Compiler {
                             |_c, bc, i| {
                                 match scalar_on {
                                     ScalarSide::Right => {
-                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
-                                        bc.push(
-                                            Byte::new(Instruction::CONST)
-                                                .with_const_inline(i as i32),
-                                        );
+                                        bc.push_load(t_vec);
+                                        bc.push_const(i as i32);
                                         bc.push(Byte::new(Instruction::Index));
-                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                        bc.push_load(t_sc);
                                     }
                                     ScalarSide::Left => {
-                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
-                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
-                                        bc.push(
-                                            Byte::new(Instruction::CONST)
-                                                .with_const_inline(i as i32),
-                                        );
+                                        bc.push_load(t_sc);
+                                        bc.push_load(t_vec);
+                                        bc.push_const(i as i32);
                                         bc.push(Byte::new(Instruction::Index));
                                     }
                                 }
@@ -2487,18 +2474,18 @@ impl Compiler {
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+            .push_load(src);
         self.bytecode.push(Byte::new(Instruction::ArrayLen));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+            .push_store_pop(len_slot);
         self.bytecode
             .push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+            .push_store_pop(out);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(0));
+            .push_const(0);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+            .push_store_pop(idx);
 
         let mut bb = BlockBuilder::new();
         let loop_top = bb.fresh_label(self.bytecode.il_mut());
@@ -2506,18 +2493,18 @@ impl Compiler {
         bb.bind_label(loop_top, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+            .push_load(idx);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+            .push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(end, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+            .push_load(out);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+            .push_load(src);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+            .push_load(idx);
         self.bytecode.push(Byte::new(Instruction::Index));
         {
             let mut neg_bc = Vec::new();
@@ -2526,19 +2513,19 @@ impl Compiler {
         }
         self.bytecode.push(Byte::new(Instruction::ArrayPush));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+            .push_store_pop(out);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+            .push_load(idx);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(1));
+            .push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+            .push_store_pop(idx);
 
         bb.emit_jump_to(loop_top, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(end, self.bytecode.il_mut());
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+            .push_load(out);
         bb.finalize()
             .expect("BlockBuilder::finalize: dynamic unary array labels bound");
     }
@@ -2571,18 +2558,18 @@ impl Compiler {
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+            .push_load(t_vec);
         self.bytecode.push(Byte::new(Instruction::ArrayLen));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+            .push_store_pop(len_slot);
         self.bytecode
             .push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+            .push_store_pop(out);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(0));
+            .push_const(0);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+            .push_store_pop(idx);
 
         let mut bb = BlockBuilder::new();
         let loop_top = bb.fresh_label(self.bytecode.il_mut());
@@ -2590,50 +2577,50 @@ impl Compiler {
         bb.bind_label(loop_top, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+            .push_load(idx);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+            .push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(end, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+            .push_load(out);
         match scalar_on {
             ScalarSide::Right => {
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                    .push_load(t_vec);
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                    .push_load(idx);
                 self.bytecode.push(Byte::new(Instruction::Index));
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                    .push_load(t_sc);
             }
             ScalarSide::Left => {
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                    .push_load(t_sc);
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                    .push_load(t_vec);
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                    .push_load(idx);
                 self.bytecode.push(Byte::new(Instruction::Index));
             }
         }
         self.bytecode.push(Byte::new(scalar_instr));
         self.bytecode.push(Byte::new(Instruction::ArrayPush));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+            .push_store_pop(out);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+            .push_load(idx);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(1));
+            .push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+            .push_store_pop(idx);
 
         bb.emit_jump_to(loop_top, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(end, self.bytecode.il_mut());
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+            .push_load(out);
         bb.finalize()
             .expect("BlockBuilder::finalize: dynamic broadcast array labels bound");
     }
@@ -2871,13 +2858,13 @@ impl Compiler {
         bytecode.append(&mut self.do_compile(lhs));
         Self::emit_box_if_needed(bytecode, &lookup_ty);
         let lhs_slot = self.alloc_temp_slot();
-        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(lhs_slot));
+        bytecode.push_store_pop(lhs_slot);
         bytecode.append(&mut self.do_compile(rhs));
         Self::emit_box_if_needed(bytecode, &lookup_ty);
         let rhs_slot = self.alloc_temp_slot();
-        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(rhs_slot));
-        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(lhs_slot));
-        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(rhs_slot));
+        bytecode.push_store_pop(rhs_slot);
+        bytecode.push_load(lhs_slot);
+        bytecode.push_load(rhs_slot);
         Self::emit_call_indirect(bytecode, offset as u32, 2);
         true
     }
@@ -2961,7 +2948,7 @@ impl Compiler {
                 }
                 let slot = self.alloc_temp_slot();
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    .push_store_pop(slot);
                 arg_slots.push(slot);
                 emitted += 1;
             }
@@ -2971,13 +2958,13 @@ impl Compiler {
                 self.bytecode.extend(bc);
                 let slot = self.alloc_temp_slot();
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    .push_store_pop(slot);
                 arg_slots.push(slot);
             }
             self.emit_string_literal(&rewritten);
             for slot in arg_slots {
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    .push_load(slot);
             }
             self.bytecode
                 .push(Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32));
@@ -3264,11 +3251,11 @@ impl Compiler {
                 let mut arg_bc = self.do_compile(arg);
                 self.bytecode.append(&mut arg_bc);
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                    .push_load(dict_slot);
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                    .push_load(dict_slot);
                 self.bytecode
-                    .push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
+                    .push_const(method_slot as i32);
                 self.bytecode.push(Byte::new(Instruction::Index));
                 self.bytecode
                     .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
@@ -3372,26 +3359,26 @@ impl Compiler {
     fn emit_tuple_show_for_stack_value(&mut self, items: &[Ty]) {
         let tuple_slot = self.alloc_temp_slot();
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(tuple_slot));
+            .push_store_pop(tuple_slot);
 
         let mut element_slots = Vec::with_capacity(items.len());
         for (idx, item_ty) in items.iter().enumerate() {
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
+                .push_load(tuple_slot);
             self.bytecode
-                .push(Byte::new(Instruction::CONST).with_const_inline(idx as i32));
+                .push_const(idx as i32);
             self.bytecode.push(Byte::new(Instruction::Index));
             self.emit_show_for_stack_value(item_ty);
             let slot = self.alloc_temp_slot();
             self.bytecode
-                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                .push_store_pop(slot);
             element_slots.push(slot);
         }
 
         self.emit_string_literal(&Self::tuple_show_format(items.len()));
         for slot in element_slots {
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                .push_load(slot);
         }
         self.bytecode
             .push(Byte::new(Instruction::FORMAT).with_operand_u32(items.len() as u32));
@@ -3400,25 +3387,25 @@ impl Compiler {
     fn emit_record_show_for_stack_value(&mut self, fields: &[(String, Ty)]) {
         let record_slot = self.alloc_temp_slot();
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(record_slot));
+            .push_store_pop(record_slot);
 
         let mut field_slots = Vec::with_capacity(fields.len());
         for (name, field_ty) in fields {
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(record_slot));
+                .push_load(record_slot);
             Self::emit_raw_string_literal(&mut self.bytecode, name);
             self.bytecode.push(Byte::new(Instruction::GetField));
             self.emit_show_for_stack_value(field_ty);
             let slot = self.alloc_temp_slot();
             self.bytecode
-                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                .push_store_pop(slot);
             field_slots.push(slot);
         }
 
         self.emit_string_literal(&Self::record_show_format(fields));
         for slot in field_slots {
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                .push_load(slot);
         }
         self.bytecode
             .push(Byte::new(Instruction::FORMAT).with_operand_u32(fields.len() as u32));
@@ -3603,8 +3590,8 @@ impl Compiler {
     }
 
     fn load_tuple_field(bytecode: &mut Vec<Byte>, tuple_slot: u32, index: i32) {
-        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
-        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(index));
+        bytecode.push_load(tuple_slot);
+        bytecode.push_const(index);
         bytecode.push(Byte::new(Instruction::Index));
     }
 
@@ -3632,7 +3619,7 @@ impl Compiler {
 
         let pack_slot = self.alloc_temp_slot();
         bytecode.append(&mut self.do_compile(pack_expr));
-        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(pack_slot));
+        bytecode.push_store_pop(pack_slot);
 
         // Pack layout: tuple[0] = boxed value, tuple[1] = dictionary tuple.
         Self::load_tuple_field(bytecode, pack_slot, 0);
@@ -3641,7 +3628,7 @@ impl Compiler {
         }
         Self::load_tuple_field(bytecode, pack_slot, 1);
         Self::load_tuple_field(bytecode, pack_slot, 1);
-        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(hint.method_slot as i32));
+        bytecode.push_const(hint.method_slot as i32);
         bytecode.push(Byte::new(Instruction::Index));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(hint.arity as u32 + 1));
         true
@@ -3789,7 +3776,7 @@ impl Compiler {
 
         for dict_index in 0..dict_arity {
             if let Some(slot) = self.lookup_slot(&format!("__dict{}", dict_index)) {
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                bytecode.push_load(slot);
                 continue;
             }
 
@@ -3808,7 +3795,7 @@ impl Compiler {
             });
             if synthesized.is_none() {
                 // Unresolved sentinel — CallIndirect fills from app evidence.
-                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+                bytecode.push_const(0);
             }
         }
         dict_arity
@@ -3909,7 +3896,7 @@ impl Compiler {
             for slot in 0..2 {
                 compiler
                     .bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    .push_load(slot);
                 compiler
                     .bytecode
                     .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
@@ -3920,7 +3907,7 @@ impl Compiler {
                     .bytecode
                     .push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
             }
-            compiler.bytecode.push(Byte::new(Instruction::RETURN));
+            compiler.bytecode.push_return();
         };
 
         for (ty, tag, arithmetic, comparisons) in [
@@ -3986,9 +3973,9 @@ impl Compiler {
             }
             self.bind_function_entry(fqn);
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                .push_load(0);
             self.bytecode.push(Byte::new(Instruction::STRINGIFY));
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+            self.bytecode.push_return();
         }
 
         // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
@@ -4007,10 +3994,10 @@ impl Compiler {
             }
             self.bind_function_entry(fqn);
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                .push_load(0);
             self.bytecode
                 .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+            self.bytecode.push_return();
         }
         {
             let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
@@ -4027,7 +4014,7 @@ impl Compiler {
                 self.bytecode
                     .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                    .push_load(0);
                 self.bytecode.push(
                     Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::String as u32),
                 );
@@ -4035,7 +4022,7 @@ impl Compiler {
                     .push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
                 self.bytecode
                     .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_return();
             }
         }
 
@@ -4057,12 +4044,12 @@ impl Compiler {
             self.bytecode
                 .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                .push_load(0);
             self.bytecode.push(
                 Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Instance as u32),
             );
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(1));
+                .push_load(1);
             self.bytecode.push(
                 Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Array as u32),
             );
@@ -4070,7 +4057,7 @@ impl Compiler {
                 .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
             self.bytecode
                 .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+            self.bytecode.push_return();
         }
 
         let into_pairs = [
@@ -4088,7 +4075,7 @@ impl Compiler {
             }
             self.bind_function_entry(fqn);
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+                .push_load(0);
             self.bytecode.push(
                 Byte::new(Instruction::UnboxValue).with_operand_u32(from_tag as u32),
             );
@@ -4098,7 +4085,7 @@ impl Compiler {
                     Byte::new(Instruction::BoxValue).with_operand_u32(to_tag as u32),
                 );
             }
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+            self.bytecode.push_return();
         }
     }
 
@@ -4384,11 +4371,11 @@ impl Compiler {
         for (slot, ty) in argument_unbox_tys.iter().enumerate() {
             if let Some(tag) = ty.as_ref().and_then(Self::ty_to_value_tag) {
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot as u32));
+                    .push_load(slot as u32);
                 self.bytecode
                     .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot as u32));
+                    .push_store_pop(slot as u32);
             }
         }
         for dict_idx in 0..dict_arity {
@@ -4879,32 +4866,28 @@ impl Compiler {
         match pattern {
             LetPattern::Wildcard => {}
             LetPattern::Binding { name } => {
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                bytecode.push_load(src_slot);
                 let slot = self.alloc_binding_slot(name);
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                bytecode.push_store_pop(slot);
             }
             LetPattern::Tuple(parts) => {
                 for (idx, part) in parts.iter().enumerate() {
                     match part {
                         LetPattern::Wildcard => {}
                         LetPattern::Binding { name } => {
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
-                            bytecode.push(
-                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
-                            );
+                            bytecode.push_load(src_slot);
+                            bytecode.push_const(idx as i32);
                             bytecode.push(Byte::new(Instruction::Index));
                             let slot = self.alloc_binding_slot(name);
-                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                            bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
-                            bytecode.push(
-                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
-                            );
+                            bytecode.push_load(src_slot);
+                            bytecode.push_const(idx as i32);
                             bytecode.push(Byte::new(Instruction::Index));
                             let nested_slot = self.alloc_temp_slot();
                             bytecode
-                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                                .push_store_pop(nested_slot);
                             self.emit_let_pattern_binds(nested, nested_slot, bytecode);
                         }
                     }
@@ -4915,19 +4898,19 @@ impl Compiler {
                     match &pf.pattern {
                         LetPattern::Wildcard => {}
                         LetPattern::Binding { name } => {
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
                             bytecode.push(Byte::new(Instruction::GetField));
                             let slot = self.alloc_binding_slot(name);
-                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                            bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
                             bytecode.push(Byte::new(Instruction::GetField));
                             let nested_slot = self.alloc_temp_slot();
                             bytecode
-                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                                .push_store_pop(nested_slot);
                             self.emit_let_pattern_binds(nested, nested_slot, bytecode);
                         }
                     }
@@ -4955,11 +4938,11 @@ impl Compiler {
             self.bytecode.extend(iter_bc);
         }
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(arr_slot));
+            .push_store_pop(arr_slot);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(0));
+            .push_const(0);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx_slot));
+            .push_store_pop(idx_slot);
 
         // Consume binding Identifier NodeId (iterable → binding → body).
         let _ = self.next_emit_id();
@@ -4973,21 +4956,21 @@ impl Compiler {
 
         // cond: idx < len(arr)  (LE is `<`)
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+            .push_load(idx_slot);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(arr_slot));
+            .push_load(arr_slot);
         self.bytecode.push(Byte::new(Instruction::ArrayLen));
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
         // x = arr[idx]
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(arr_slot));
+            .push_load(arr_slot);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+            .push_load(idx_slot);
         self.bytecode.push(Byte::new(Instruction::Index));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+            .push_store_pop(binding_slot);
 
         self.loop_stack.push((continue_label, exit_label));
         self.loop_bbs.push(bb);
@@ -5003,12 +4986,12 @@ impl Compiler {
         bb.bind_label(continue_label, self.bytecode.il_mut());
         // idx = idx + 1
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+            .push_load(idx_slot);
         self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(1));
+            .push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx_slot));
+            .push_store_pop(idx_slot);
 
         bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(exit_label, self.bytecode.il_mut());
@@ -5028,12 +5011,12 @@ impl Compiler {
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(tup_slot));
+            .push_store_pop(tup_slot);
         for i in 0..arity {
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(tup_slot));
+                .push_load(tup_slot);
             self.bytecode
-                .push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                .push_const(i as i32);
             self.bytecode.push(Byte::new(Instruction::Index));
         }
         self.bytecode
@@ -5081,9 +5064,7 @@ impl Compiler {
                             let val = s + k as i64;
                             let mut trip_bc = Vec::new();
                             self.emit_const_value(&ConstValue::Int(val), &mut trip_bc);
-                            trip_bc.push(
-                                Byte::new(Instruction::StorePop).with_operand_u32(binding_slot),
-                            );
+                            trip_bc.push_store_pop(binding_slot);
                             let mut body_bc = self.do_compile(body);
                             trip_bc.append(&mut body_bc);
                             self.bytecode.append(&mut trip_bc);
@@ -5104,32 +5085,32 @@ impl Compiler {
                 let start_bc = self.do_compile(start);
                 self.bytecode.extend(start_bc);
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+                    .push_store_pop(cur_slot);
                 let end_bc = self.do_compile(end);
                 self.bytecode.extend(end_bc);
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+                    .push_store_pop(end_slot);
             }
             _ => {
                 let range_slot = self.alloc_temp_slot();
                 let iter_bc = self.do_compile(iterable);
                 self.bytecode.extend(iter_bc);
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(range_slot));
+                    .push_store_pop(range_slot);
 
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                    .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "start");
                 self.bytecode.push(Byte::new(Instruction::GetField));
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+                    .push_store_pop(cur_slot);
 
                 self.bytecode
-                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                    .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "end");
                 self.bytecode.push(Byte::new(Instruction::GetField));
                 self.bytecode
-                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+                    .push_store_pop(end_slot);
             }
         }
 
@@ -5145,9 +5126,9 @@ impl Compiler {
 
         // cond: cur < end  (half-open) or cur <= end (inclusive)
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+            .push_load(cur_slot);
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(end_slot));
+            .push_load(end_slot);
         self.bytecode.push(Byte::new(if float {
             if inclusive {
                 Instruction::LEQF
@@ -5163,9 +5144,9 @@ impl Compiler {
 
         // x = cur
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+            .push_load(cur_slot);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+            .push_store_pop(binding_slot);
 
         self.loop_stack.push((continue_label, exit_label));
         self.loop_bbs.push(bb);
@@ -5181,7 +5162,7 @@ impl Compiler {
         bb.bind_label(continue_label, self.bytecode.il_mut());
         // cur = cur + 1  (or + 1.0 for float)
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+            .push_load(cur_slot);
         if float {
             let bits = Value::from(1.0_f64).raw() as u64;
             let idx = self.intern_constant(bits);
@@ -5190,11 +5171,11 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::ADDF));
         } else {
             self.bytecode
-                .push(Byte::new(Instruction::CONST).with_const_inline(1));
+                .push_const(1);
             self.bytecode.push(Byte::new(Instruction::ADD));
         }
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+            .push_store_pop(cur_slot);
 
         bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(exit_label, self.bytecode.il_mut());
@@ -5209,7 +5190,7 @@ impl Compiler {
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
+            .push_store_pop(handle_slot);
 
         let _ = self.next_emit_id();
         let binding_slot = self.alloc_binding_slot(binding_name);
@@ -5220,14 +5201,14 @@ impl Compiler {
         bb.bind_label(top_label, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+            .push_load(handle_slot);
         self.bytecode
             .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+            .push_store_pop(binding_slot);
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+            .push_load(handle_slot);
         self.bytecode.push(Byte::new(Instruction::DoneCoro));
         self.bytecode.push(Byte::new(Instruction::LogNot));
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
@@ -5278,7 +5259,7 @@ impl Compiler {
             .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
         Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(it_slot));
+            .push_store_pop(it_slot);
 
         let _ = self.next_emit_id();
         let binding_slot = self.alloc_binding_slot(binding_name);
@@ -5289,7 +5270,7 @@ impl Compiler {
         bb.bind_label(top_label, self.bytecode.il_mut());
 
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(it_slot));
+            .push_load(it_slot);
         self.bytecode
             .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
         Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
@@ -5307,7 +5288,7 @@ impl Compiler {
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+            .push_store_pop(binding_slot);
 
         self.loop_stack.push((top_label, exit_label));
         self.loop_bbs.push(bb);
@@ -5530,7 +5511,7 @@ impl Compiler {
         match target.1.as_ref() {
             Expression::Identifier(name) => {
                 if let Some(slot) = self.variable_slot(name) {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    bytecode.push_load(slot);
                     self.is_float_ty(target)
                 } else {
                     false
@@ -5550,11 +5531,11 @@ impl Compiler {
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(arr));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                bytecode.push_store_pop(tmp_arr);
                 bytecode.append(&mut self.do_compile(idx));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                bytecode.push_store_pop(tmp_idx);
+                bytecode.push_load(tmp_arr);
+                bytecode.push_load(tmp_idx);
                 bytecode.push(Byte::new(Instruction::Index));
                 false
             }
@@ -5575,7 +5556,7 @@ impl Compiler {
                     if leave_value_on_stack {
                         bytecode.push(Byte::new(Instruction::DUPLICATE));
                     }
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    bytecode.push_store_pop(slot);
                 }
             }
             Expression::Access(receiver, field) => {
@@ -5593,14 +5574,14 @@ impl Compiler {
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 let tmp_val = self.alloc_temp_slot();
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                bytecode.push_store_pop(tmp_val);
                 bytecode.append(&mut self.do_compile(arr));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                bytecode.push_store_pop(tmp_arr);
                 bytecode.append(&mut self.do_compile(idx));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                bytecode.push_store_pop(tmp_idx);
+                bytecode.push_load(tmp_arr);
+                bytecode.push_load(tmp_idx);
+                bytecode.push_load(tmp_val);
                 bytecode.push(Byte::new(Instruction::StoreIndex));
                 if leave_value_on_stack {
                     // StoreIndex leaves the value on the stack; keep it.
@@ -5679,19 +5660,19 @@ impl Compiler {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+            bytecode.push_store_pop(tmp_arr);
             bytecode.append(&mut self.do_compile(idx));
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push_store_pop(tmp_idx);
+            bytecode.push_load(tmp_arr);
+            bytecode.push_load(tmp_idx);
             bytecode.push(Byte::new(Instruction::Index));
             bytecode.append(&mut self.do_compile(rhs));
             bytecode.push(Byte::new(Self::binop_for_assign_op(op, false)));
             let tmp_val = self.alloc_temp_slot();
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            bytecode.push_store_pop(tmp_val);
+            bytecode.push_load(tmp_arr);
+            bytecode.push_load(tmp_idx);
+            bytecode.push_load(tmp_val);
             bytecode.push(Byte::new(Instruction::StoreIndex));
             return;
         }
@@ -5730,17 +5711,17 @@ impl Compiler {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+            bytecode.push_store_pop(tmp_arr);
             bytecode.append(&mut self.do_compile(idx));
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push_store_pop(tmp_idx);
+            bytecode.push_load(tmp_arr);
+            bytecode.push_load(tmp_idx);
             bytecode.push(Byte::new(Instruction::Index));
             let tmp_old = if !prefix {
                 let t = self.alloc_temp_slot();
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                bytecode.push_store_pop(t);
+                bytecode.push_load(tmp_arr);
+                bytecode.push_load(tmp_idx);
                 bytecode.push(Byte::new(Instruction::Index));
                 t
             } else {
@@ -5752,15 +5733,15 @@ impl Compiler {
             ));
             bytecode.push(Byte::new(Instruction::ADD));
             let tmp_val = self.alloc_temp_slot();
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            bytecode.push_store_pop(tmp_val);
+            bytecode.push_load(tmp_arr);
+            bytecode.push_load(tmp_idx);
+            bytecode.push_load(tmp_val);
             bytecode.push(Byte::new(Instruction::StoreIndex));
             if prefix {
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                bytecode.push_load(tmp_val);
             } else {
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_old));
+                bytecode.push_load(tmp_old);
             }
             return;
         }
@@ -5768,7 +5749,7 @@ impl Compiler {
         let is_float = self.emit_read_lvalue(bytecode, target);
         let tmp_old = if !prefix {
             let tmp = self.alloc_temp_slot();
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+            bytecode.push_store_pop(tmp);
             tmp
         } else {
             0
@@ -5790,7 +5771,7 @@ impl Compiler {
         if prefix {
             self.emit_read_lvalue(bytecode, target);
         } else {
-            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_old));
+            bytecode.push_load(tmp_old);
         }
     }
 
@@ -5994,11 +5975,11 @@ impl Compiler {
 
         let t0 = self.alloc_temp_slot();
         bytecode.append(&mut self.do_compile(&args[0]));
-        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+        bytecode.push_store_pop(t0);
         let t1 = if needs_two {
             let slot = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(&args[1]));
-            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            bytecode.push_store_pop(slot);
             Some(slot)
         } else {
             None
@@ -6022,11 +6003,11 @@ impl Compiler {
                     Instruction::ADD
                 };
                 for i in 0..length {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push_load(t0);
+                    bytecode.push_const(i as i32);
                     bytecode.push(Byte::new(Instruction::Index));
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push_load(t1);
+                    bytecode.push_const(i as i32);
                     bytecode.push(Byte::new(Instruction::Index));
                     bytecode.push(Byte::new(mul));
                     if i > 0 {
@@ -6064,33 +6045,33 @@ impl Compiler {
                     (by, t1, 1),
                     (bz, t1, 2),
                 ] {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i));
+                    bytecode.push_load(src);
+                    bytecode.push_const(i);
                     bytecode.push(Byte::new(Instruction::Index));
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    bytecode.push_store_pop(slot);
                 }
                 // i = ay*bz - az*by
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push_load(ay);
+                bytecode.push_load(bz);
                 bytecode.push(Byte::new(mul));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push_load(az);
+                bytecode.push_load(by);
                 bytecode.push(Byte::new(mul));
                 bytecode.push(Byte::new(sub));
                 // j = az*bx - ax*bz
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push_load(az);
+                bytecode.push_load(bx);
                 bytecode.push(Byte::new(mul));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push_load(ax);
+                bytecode.push_load(bz);
                 bytecode.push(Byte::new(mul));
                 bytecode.push(Byte::new(sub));
                 // k = ax*by - ay*bx
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push_load(ax);
+                bytecode.push_load(by);
                 bytecode.push(Byte::new(mul));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push_load(ay);
+                bytecode.push_load(bx);
                 bytecode.push(Byte::new(mul));
                 bytecode.push(Byte::new(sub));
                 if left_is_tuple {
@@ -6122,16 +6103,16 @@ impl Compiler {
                     for j in 0..n {
                         for t in 0..k {
                             // A[i][t]
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                            bytecode.push_load(t0);
+                            bytecode.push_const(i as i32);
                             bytecode.push(Byte::new(Instruction::Index));
-                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push_const(t as i32);
                             bytecode.push(Byte::new(Instruction::Index));
                             // B[t][j]
-                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
-                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push_load(t1);
+                            bytecode.push_const(t as i32);
                             bytecode.push(Byte::new(Instruction::Index));
-                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                            bytecode.push_const(j as i32);
                             bytecode.push(Byte::new(Instruction::Index));
                             bytecode.push(Byte::new(mul));
                             if t > 0 {
@@ -6169,15 +6150,15 @@ impl Compiler {
                 };
                 for i in 0..m {
                     for j in 0..n {
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push_load(t0);
+                        bytecode.push_const(i as i32);
                         bytecode.push(Byte::new(Instruction::Index));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push_const(j as i32);
                         bytecode.push(Byte::new(Instruction::Index));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push_load(t1);
+                        bytecode.push_const(i as i32);
                         bytecode.push(Byte::new(Instruction::Index));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push_const(j as i32);
                         bytecode.push(Byte::new(Instruction::Index));
                         bytecode.push(Byte::new(cell_op));
                     }
@@ -6202,10 +6183,10 @@ impl Compiler {
             } => {
                 for i in 0..m {
                     for j in 0..n {
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push_load(t0);
+                        bytecode.push_const(i as i32);
                         bytecode.push(Byte::new(Instruction::Index));
-                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push_const(j as i32);
                         bytecode.push(Byte::new(Instruction::Index));
                         self.emit_neg_tos(bytecode, elem_is_float);
                     }
@@ -6422,7 +6403,7 @@ impl Compiler {
             Value::from(0i64).raw() as _,
         ));
         self.bytecode
-            .push(Byte::new(Instruction::StorePop).with_operand_u32(failed_slot));
+            .push_store_pop(failed_slot);
 
         let mut bb = BlockBuilder::new();
         for (desc, offset) in &cases {
@@ -6452,14 +6433,14 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::PRINT));
             // failed += 1
             self.bytecode
-                .push(Byte::new(Instruction::LOAD).with_operand_u32(failed_slot));
+                .push_load(failed_slot);
             self.bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
                 Value::from(1i64).raw() as _,
             ));
             self.bytecode.push(Byte::new(Instruction::ADD));
             self.bytecode
-                .push(Byte::new(Instruction::StorePop).with_operand_u32(failed_slot));
+                .push_store_pop(failed_slot);
             bb.bind_label(done, self.bytecode.il_mut());
         }
 
@@ -6467,7 +6448,7 @@ impl Compiler {
         let panic_lbl = bb.fresh_label(self.bytecode.il_mut());
         let end_lbl = bb.fresh_label(self.bytecode.il_mut());
         self.bytecode
-            .push(Byte::new(Instruction::LOAD).with_operand_u32(failed_slot));
+            .push_load(failed_slot);
         self.bytecode.push(Byte::new_with_value(
             Instruction::CONST,
             Value::from(0i64).raw() as _,
@@ -6583,14 +6564,13 @@ impl Compiler {
                     self.append_binding_rhs(&mut bytecode, rhs);
                 }
                 let tmp = self.alloc_temp_slot();
-                let store = Byte::new(Instruction::StorePop).with_operand_u32(tmp);
                 if rhs_is_match {
-                    self.bytecode.push(store);
+                    self.bytecode.push_store_pop(tmp);
                     let mut binds = Vec::new();
                     self.emit_let_pattern_binds(pattern, tmp, &mut binds);
                     self.bytecode.append(&mut binds);
                 } else {
-                    bytecode.push(store);
+                    bytecode.push_store_pop(tmp);
                     self.emit_let_pattern_binds(pattern, tmp, &mut bytecode);
                 }
             }
@@ -6656,23 +6636,19 @@ impl Compiler {
                             } else {
                                 let slot = self.alloc_binding_slot(&name);
                                 self.context.constants.insert(slot as usize, true);
-                                let store =
-                                    Byte::new(Instruction::StorePop).with_operand_u32(slot);
                                 if rhs_is_match {
-                                    self.bytecode.push(store);
+                                    self.bytecode.push_store_pop(slot);
                                 } else {
-                                    bytecode.push(store);
+                                    bytecode.push_store_pop(slot);
                                 }
                             }
                             is_binding = true;
                         } else {
                             let slot = self.alloc_binding_slot(&name);
-                            let store =
-                                Byte::new(Instruction::StorePop).with_operand_u32(slot);
                             if rhs_is_match {
-                                self.bytecode.push(store);
+                                self.bytecode.push_store_pop(slot);
                             } else {
-                                bytecode.push(store);
+                                bytecode.push_store_pop(slot);
                             }
                             is_binding = true;
                         }
@@ -6882,9 +6858,7 @@ impl Compiler {
 
                 for cap in captures {
                     if let Some(slot) = self.lookup_slot(cap) {
-                        bytecode.push(
-                            Byte::new(Instruction::LOAD).with_operand_u32(slot),
-                        );
+                        bytecode.push_load(slot);
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownValue,
@@ -6898,7 +6872,7 @@ impl Compiler {
                         self.messages.push(message);
                     }
                 }
-                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+                bytecode.push_const(0);
                 bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(entry));
                 bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
                     make_fn_operand(captures.len() as u32, 0, arity as u32, is_rest),
@@ -7006,10 +6980,7 @@ impl Compiler {
                 let mut end_bc = self.do_compile(end);
                 bytecode.append(&mut end_bc);
                 Self::emit_raw_string_literal(&mut bytecode, "end");
-                bytecode.push(
-                    Byte::new(Instruction::CONST)
-                        .with_const_inline(if *inclusive { 1 } else { 0 }),
-                );
+                bytecode.push_const(if *inclusive { 1 } else { 0 });
                 Self::emit_raw_string_literal(&mut bytecode, "inclusive");
                 bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(3));
             }
@@ -7206,11 +7177,11 @@ impl Compiler {
                 // so `MakeTuple`/`HostInvoke` would pick up the instance
                 // as the native id.
                 let tmp_inst = self.alloc_temp_slot();
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_inst));
+                bytecode.push_store_pop(tmp_inst);
                 if let Some(arg_list) = args {
                     for (arg, (fname, _)) in arg_list.iter().zip(fields.iter()) {
                         bytecode.append(&mut self.do_compile(arg));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
+                        bytecode.push_load(tmp_inst);
                         self.emit_field_name(&mut bytecode, fname);
                         bytecode.push(Byte::new(Instruction::SetField));
                         bytecode.push(Byte::new(Instruction::POP));
@@ -7595,12 +7566,9 @@ impl Compiler {
                     if let Some(dict_slot) = self.lookup_slot(&dict_name) {
                         // Hidden trailing dictionary argument for sibling/default
                         // dispatch inside the selected implementation.
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
-                        bytecode.push(
-                            Byte::new(Instruction::CONST)
-                                .with_const_inline(hint.method_slot as i32),
-                        );
+                        bytecode.push_load(dict_slot);
+                        bytecode.push_load(dict_slot);
+                        bytecode.push_const(hint.method_slot as i32);
                         bytecode.push(Byte::new(Instruction::Index));
                         bytecode.push(
                             Byte::new(Instruction::CallIndirect)
@@ -7870,9 +7838,9 @@ impl Compiler {
                         let variadic = self.checker.is_extern_variadic(&n);
                         let depth_on_entry = self.expr_depth;
                         self.bytecode
-                            .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
+                            .push_load(lib_slot);
                         self.bytecode
-                            .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
+                            .push_load(fn_id_slot);
                         self.expr_depth = depth_on_entry + 2;
                         if let Some(items) = args {
                             for arg in items {
@@ -7994,9 +7962,7 @@ impl Compiler {
                                 bytecode.append(&mut self.do_compile(value));
                             }
                             let n_filled = mask.count_ones();
-                            bytecode.push(
-                                Byte::new(Instruction::CONST).with_const_inline(mask as i32),
-                            );
+                            bytecode.push_const(mask as i32);
                             bytecode.push(
                                 Byte::new(Instruction::CodePtr)
                                     .with_operand_u32(target_offset as u32),
@@ -8055,9 +8021,7 @@ impl Compiler {
                                     if let Some(slot) =
                                         self.lookup_slot(&format!("__dict{}", dict_index))
                                     {
-                                        bytecode.push(
-                                            Byte::new(Instruction::LOAD).with_operand_u32(slot),
-                                        );
+                                        bytecode.push_load(slot);
                                         forwarded += 1;
                                     }
                                 }
@@ -8140,10 +8104,7 @@ impl Compiler {
                                     if let Some(dict_slot) =
                                         self.lookup_slot(&format!("__dict{}", dict_index))
                                     {
-                                        bytecode.push(
-                                            Byte::new(Instruction::LOAD)
-                                                .with_operand_u32(dict_slot),
-                                        );
+                                        bytecode.push_load(dict_slot);
                                         dict_count += 1;
                                     }
                                 }
@@ -8160,7 +8121,7 @@ impl Compiler {
                         }
                         // Pack value arity + application dict arity so the VM can
                         // merge captured evidence with apply-site dictionaries.
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                        bytecode.push_load(slot);
                         bytecode.push(
                             Byte::new(Instruction::CallIndirect)
                                 .with_operand_u32(value_arity | (dict_count << 16)),
@@ -8335,7 +8296,7 @@ impl Compiler {
                         Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot),
                     );
                 } else if let Some(slot) = self.lookup_slot(n) {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    bytecode.push_load(slot);
                 } else {
                     // Not a local variable — check if it's a generic function
                     // escaping into a non-call position (e.g. `let f = id;`).
@@ -8439,9 +8400,7 @@ impl Compiler {
                                 .copied()
                                 .map(|(a, r)| (a as usize, r))
                                 .unwrap_or((fa, is_rest));
-                            bytecode.push(
-                                Byte::new(Instruction::CONST).with_const_inline(0),
-                            );
+                            bytecode.push_const(0);
                             bytecode.push(
                                 Byte::new(Instruction::CodePtr)
                                     .with_operand_u32(entry_offset as u32),
@@ -9175,14 +9134,14 @@ impl Compiler {
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
                     self.append_binding_rhs(&mut bytecode, value);
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                    bytecode.push_store_pop(tmp_val);
                     bytecode.append(&mut self.do_compile(arr));
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                    bytecode.push_store_pop(tmp_arr);
                     bytecode.append(&mut self.do_compile(idx));
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                    bytecode.push_store_pop(tmp_idx);
+                    bytecode.push_load(tmp_arr);
+                    bytecode.push_load(tmp_idx);
+                    bytecode.push_load(tmp_val);
                     bytecode.push(Byte::new(Instruction::StoreIndex));
                 }
                 Expression::Identifier(name) => {
@@ -9237,7 +9196,7 @@ impl Compiler {
                         }
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode
-                            .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
+                            .push_store_pop(symbol as u32);
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownValue,
@@ -9290,7 +9249,7 @@ impl Compiler {
                     self.bytecode.push(Byte::new(Instruction::FfiLoad));
                     self.emit_result_unwrap_or_panic();
                     self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(lib_slot));
+                        .push_store_pop(lib_slot);
                 }
                 // 3. For each declared function, emit declare(lib,
                 //    name, (arg_tags...), ret) and store fn id.
@@ -9321,7 +9280,7 @@ impl Compiler {
                     let fn_id_slot = self.context.variables.intern(fn_id_slot_name) as u32;
                     // Push the library handle.
                     self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
+                        .push_load(lib_slot);
                     // Push the function name (string literal).
                     let span: SimpleSpan = (0..0).into();
                     let sym = decl.symbol.unwrap_or(decl.name);
@@ -9392,7 +9351,7 @@ impl Compiler {
                     self.emit_result_unwrap_or_panic();
                     // Store the function id.
                     self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(fn_id_slot));
+                        .push_store_pop(fn_id_slot);
                     self.extern_runtime_functions
                         .insert(table_name, (lib_slot, fn_id_slot));
                 }

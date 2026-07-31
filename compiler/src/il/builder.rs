@@ -149,6 +149,28 @@ impl IlBuilder {
         self.push_op(IlOp::Return { loc });
     }
 
+    pub fn push_load(&mut self, slot: u32) {
+        self.push_op(IlOp::Load {
+            slot,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_load_at(&mut self, slot: u32, loc: DebugLoc) {
+        self.push_op(IlOp::Load { slot, loc });
+    }
+
+    pub fn push_store_pop(&mut self, slot: u32) {
+        self.push_op(IlOp::StorePop {
+            slot,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_store_pop_at(&mut self, slot: u32, loc: DebugLoc) {
+        self.push_op(IlOp::StorePop { slot, loc });
+    }
+
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
         for b in bytes {
             self.push_byte(b);
