@@ -248,6 +248,13 @@ pub enum Instruction {
     /// `BinSlotSlot; JMPF t` — pool packs slot b (low 8) + target (high 32).
     /// Operands: [31:24] op, [23:16] a, [15:0] pool index (mirrors BinSlotImmJmpf).
     BinSlotSlotJmpf,
+
+    /// `BinSlotImm; STORE dest` — pool packs imm (low 32) + dest (high 32).
+    /// Operands: [31:24] op, [23:16] src, [15:0] pool index.
+    BinSlotImmStore,
+    /// `BinSlotSlot; STORE dest` — no pool.
+    /// Operands: [31:24] op, [23:16] a, [15:8] b, [7:0] dest.
+    BinSlotSlotStore,
 }
 
 impl From<u8> for Instruction {
@@ -494,6 +501,38 @@ impl Byte {
         )
     }
 
+    /// BinSlotImmStore: [31:24] op, [23:16] src, [15:0] pool index.
+    pub fn with_bin_slot_imm_store(mut self, op: u8, src: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | ((src as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotStore: [31:24] op, [23:16] a, [15:8] b, [7:0] dest.
+    pub fn with_bin_slot_slot_store(mut self, op: u8, a: u8, b: u8, dest: u8) -> Self {
+        self.operands =
+            ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_store_parts(&self) -> (u8, usize, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+            (o & 0xFF) as usize,
+        )
+    }
+
     /// INC/DEC: [31:3] slot, [2] prefix, [1] float.
     pub fn with_inc_dec(mut self, slot: u32, prefix: bool, is_float: bool) -> Self {
         self.operands = (slot << 3) | ((prefix as u32) << 2) | ((is_float as u32) << 1);
@@ -701,6 +740,38 @@ impl ArchivedByte {
         )
     }
 
+    pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    pub fn with_bin_slot_imm_store(mut self, op: u8, src: u8, pool_idx: u16) -> Self {
+        let packed = ((op as u32) << 24) | ((src as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn with_bin_slot_slot_store(mut self, op: u8, a: u8, b: u8, dest: u8) -> Self {
+        let packed =
+            ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_store_parts(&self) -> (u8, usize, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+            (o & 0xFF) as usize,
+        )
+    }
+
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
         let o: u32 = self.operands.into();
         ((o >> 3) as usize, (o & 0b100) != 0, (o & 0b010) != 0)
@@ -831,7 +902,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::BinSlotSlotJmpf as u8;
+        let last = Instruction::BinSlotSlotStore as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -855,6 +926,30 @@ mod tests {
         let n = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(9);
         assert!(n.log_not_jmpf_is_pool());
         assert_eq!(n.log_not_jmpf_target(), 9);
+    }
+
+    #[test]
+    fn bin_slot_imm_store_and_slot_store_pack() {
+        let imm = Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+            Instruction::ADD as u8,
+            2,
+            5,
+        );
+        assert_eq!(
+            imm.bin_slot_imm_store_parts(),
+            (Instruction::ADD as u8, 2, 5)
+        );
+
+        let ss = Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+            Instruction::BITAND as u8,
+            1,
+            3,
+            4,
+        );
+        assert_eq!(
+            ss.bin_slot_slot_store_parts(),
+            (Instruction::BITAND as u8, 1, 3, 4)
+        );
     }
 }
 

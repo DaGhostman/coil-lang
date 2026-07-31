@@ -1178,7 +1178,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinSlotSlotJmpf as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlotStore as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1669,6 +1669,87 @@ impl<const S: usize> Machine<S> {
                     };
                     if !taken {
                         ip = target;
+                    }
+                }
+                // Fused `LOAD src; CONST imm; <op>; STORE dest` — pool packs (dest<<32)|imm.
+                Instruction::BinSlotImmStore => {
+                    let (op, slot, pool_idx) = opcode.bin_slot_imm_store_parts();
+                    promise!(pool_idx < constants.len());
+                    let packed = unsafe { *constants.get_unchecked(pool_idx) };
+                    let imm = packed as u32 as i32 as i64;
+                    let dest = (packed >> 32) as usize;
+                    promise!(sp + slot < 8192);
+                    let lhs = self.stack[sp + slot];
+                    let rhs = Value::from(imm);
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(lhs.as_int() + imm),
+                        Instruction::SUB => Value::from(lhs.as_int() - imm),
+                        Instruction::MUL => Value::from(lhs.as_int() * imm),
+                        Instruction::DIV => Value::from(lhs.as_int() / imm),
+                        Instruction::MOD => Value::from(lhs.as_int() % imm),
+                        Instruction::LE => Value::from((lhs.raw() < rhs.raw()) as i64),
+                        Instruction::LEQ => Value::from((lhs.raw() <= rhs.raw()) as i64),
+                        Instruction::GT => Value::from((lhs.raw() > rhs.raw()) as i64),
+                        Instruction::GEQ => Value::from((lhs.raw() >= rhs.raw()) as i64),
+                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
+                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::Pow => {
+                            let exp = imm.max(0) as u32;
+                            Value::from(lhs.as_int().pow(exp))
+                        }
+                        Instruction::BITAND => Value::from(lhs.as_int() & imm),
+                        Instruction::BITOR => Value::from(lhs.as_int() | imm),
+                        Instruction::SHL => Value::from(lhs.as_int() << imm),
+                        Instruction::SHR => Value::from(lhs.as_int() >> imm),
+                        Instruction::XOR => Value::from(lhs.as_int() ^ imm),
+                        Instruction::AND => Value::from(lhs.as_bool() && rhs.as_bool()),
+                        Instruction::OR => Value::from(lhs.as_bool() || rhs.as_bool()),
+                        _ => Value::default(),
+                    };
+                    let dest_idx = sp + dest;
+                    self.stack[dest_idx] = result;
+                    let tell = self.stack.tell();
+                    if tell < dest_idx + 1 {
+                        self.stack.seek(dest_idx + 1);
+                    }
+                }
+                // Fused `LOAD a; LOAD b; <op>; STORE dest`.
+                Instruction::BinSlotSlotStore => {
+                    let (op, a, b, dest) = opcode.bin_slot_slot_store_parts();
+                    promise!(sp + a < 8192);
+                    promise!(sp + b < 8192);
+                    let va = self.stack[sp + a];
+                    let vb = self.stack[sp + b];
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(va.as_int() + vb.as_int()),
+                        Instruction::SUB => Value::from(va.as_int() - vb.as_int()),
+                        Instruction::MUL => Value::from(va.as_int() * vb.as_int()),
+                        Instruction::DIV => Value::from(va.as_int() / vb.as_int()),
+                        Instruction::MOD => Value::from(va.as_int() % vb.as_int()),
+                        Instruction::Pow => {
+                            let exp = vb.as_int().max(0) as u32;
+                            Value::from(va.as_int().pow(exp))
+                        }
+                        Instruction::BITAND => Value::from(va.as_int() & vb.as_int()),
+                        Instruction::BITOR => Value::from(va.as_int() | vb.as_int()),
+                        Instruction::SHL => Value::from(va.as_int() << vb.as_int()),
+                        Instruction::SHR => Value::from(va.as_int() >> vb.as_int()),
+                        Instruction::XOR => Value::from(va.as_int() ^ vb.as_int()),
+                        Instruction::AND => Value::from(va.as_bool() && vb.as_bool()),
+                        Instruction::OR => Value::from(va.as_bool() || vb.as_bool()),
+                        Instruction::LE => Value::from((va.raw() < vb.raw()) as i64),
+                        Instruction::LEQ => Value::from((va.raw() <= vb.raw()) as i64),
+                        Instruction::GT => Value::from((va.raw() > vb.raw()) as i64),
+                        Instruction::GEQ => Value::from((va.raw() >= vb.raw()) as i64),
+                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
+                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
+                        _ => Value::default(),
+                    };
+                    let dest_idx = sp + dest;
+                    self.stack[dest_idx] = result;
+                    let tell = self.stack.tell();
+                    if tell < dest_idx + 1 {
+                        self.stack.seek(dest_idx + 1);
                     }
                 }
                 Instruction::LoadReturnSlot => {
@@ -5425,6 +5506,49 @@ mod tests {
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// BinSlotImmStore: compute slot⊕imm and write dest without stack traffic.
+    #[test]
+    fn bin_slot_imm_store_writes_dest() {
+        let add = Instruction::ADD as u8;
+        // slot0=10; BinSlotImmStore ADD src=0 imm=1 dest=0 → slot0=11; return slot0
+        let packed = (0u64 << 32) | (1u16 as u64);
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(10),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(add, 0, 0),
+                load(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 11);
+    }
+
+    /// BinSlotSlotStore: AND two locals into dest.
+    #[test]
+    fn bin_slot_slot_store_and_writes_dest() {
+        let and = Instruction::AND as u8;
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(1),
+                const_int(1),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(and, 0, 1, 2),
+                load(2),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_bool(), true);
     }
 
     /// CmpJmpf / LogNotJmpf resolve large targets via the constant pool.

@@ -11543,6 +11543,69 @@ fn main() {
         );
     }
 
+    /// `i = i + 1` fuses to `BinSlotImmStore(ADD)`.
+    #[test]
+    fn assign_add_imm_fuses_bin_slot_imm_store() {
+        use common::Instruction;
+        let (bc, pool) = compile_src(
+            "fn bump(int i) -> int { \
+               i = i + 1; \
+               return i; \
+             }",
+        );
+        assert!(
+            bc.iter().any(|b| {
+                if *b.bytecode() != Instruction::BinSlotImmStore {
+                    return false;
+                }
+                let (op, _src, idx) = b.bin_slot_imm_store_parts();
+                op == Instruction::ADD as u8 && (pool[idx] as u16) == 1
+            }),
+            "expected BinSlotImmStore(ADD, imm=1); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `flags = flags & mask` fuses to `BinSlotSlotStore(BITAND)`.
+    #[test]
+    fn assign_bitand_fuses_bin_slot_slot_store() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn mask_bits(int flags, int mask) -> int { \
+               flags = flags & mask; \
+               return flags; \
+             }",
+        );
+        assert!(
+            bc.iter().any(|b| {
+                *b.bytecode() == Instruction::BinSlotSlotStore
+                    && b.bin_slot_slot_store_parts().0 == Instruction::BITAND as u8
+            }),
+            "expected BinSlotSlotStore(BITAND) for flags = flags & mask; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x = a && b` assignment fuses to `BinSlotSlotStore(AND)`.
+    #[test]
+    fn assign_logical_and_fuses_bin_slot_slot_store() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn both(bool a, bool b) -> bool { \
+               a = a && b; \
+               return a; \
+             }",
+        );
+        assert!(
+            bc.iter().any(|b| {
+                *b.bytecode() == Instruction::BinSlotSlotStore
+                    && b.bin_slot_slot_store_parts().0 == Instruction::AND as u8
+            }),
+            "expected BinSlotSlotStore(AND) for a = a && b; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Loop exit jump must land past the back-edge `JMP`, even after
     /// peephole fusion relocates jump targets. The condition may fuse
     /// to `CmpJmpf` (large limit) or `BinSlotImmJmpf` (inline limit).

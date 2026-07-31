@@ -26,7 +26,7 @@
 - Virtual `regex` (`use regex::*`): PCRE2 via HostInvoke; opaque `Regex`; flags `i`/`m`/`s`/`x`/`u`.
 - Cargo features `crypto`, `time`, `regex`, and `tls` (default-on) gate those virtual modules; embedders may use `default-features = false`.
 - `byte` is `Ty::Con("byte")` (0..=255); integer literals coerce under expected `byte` / `[byte]`. Array annotations `[T]` / `[T; N]` preserve element type in the AST.
-- `ARCHIVE_VERSION` is **32** (`common/src/archive.rs`); bump on incompatible bytecode, tag, or opcode changes.
+- `ARCHIVE_VERSION` is **33** (`common/src/archive.rs`); bump on incompatible bytecode, tag, or opcode changes.
 - Packed LA (`dot` / `matmul` / `Matrix` ops) lowers to HostInvoke natives in `machine/src/packed_la.rs` — no LA opcodes.
 - Primitive casts (`CastIntToFloat` … `CastBoolToInt`) are the last `Instruction` variants.
 - Static slots: `LoadStatic`/`StoreStatic`; `static_slot_count` is in the archive envelope. Archives also carry `source_files` + `debug_locs` (one per bytecode slot).
