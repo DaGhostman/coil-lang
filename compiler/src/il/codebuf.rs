@@ -131,6 +131,31 @@ impl CodeBuf {
         self.il.push_load_field(index);
     }
 
+    pub fn push_get_field(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_get_field();
+    }
+
+    pub fn push_set_field(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_set_field();
+    }
+
+    pub fn push_host_invoke(&mut self, arity: u32) {
+        self.invalidate_lowered();
+        self.il.push_host_invoke(arity);
+    }
+
+    pub fn push_print(&mut self) {
+        self.invalidate_lowered();
+        self.il.push_print();
+    }
+
+    pub fn push_const_pool(&mut self, idx: u32) {
+        self.invalidate_lowered();
+        self.il.push_const_pool(idx);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);

@@ -1072,13 +1072,13 @@ impl Compiler {
                 } else {
                     let bits = Value::from(*n).raw() as u64;
                     let idx = self.intern_constant(bits);
-                    bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                    bytecode.push_const_pool(idx);
                 }
             }
             ConstValue::Float(n) => {
                 let bits = Value::from(*n).raw() as u64;
                 let idx = self.intern_constant(bits);
-                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                bytecode.push_const_pool(idx);
             }
             ConstValue::Bool(b) => {
                 bytecode.push(Byte::new_with_value(Instruction::CONST, Value::from(*b).raw() as _));
@@ -2438,7 +2438,7 @@ impl Compiler {
         if is_float {
             let bits = Value::from(-1.0f64).raw() as u64;
             let idx = self.intern_constant(bits);
-            bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            bytecode.push_const_pool(idx);
             bytecode.push(Byte::new(Instruction::MULF));
         } else {
             bytecode.push(Byte::new(Instruction::NEG));
@@ -3389,7 +3389,7 @@ impl Compiler {
             self.bytecode
                 .push_load(record_slot);
             Self::emit_raw_string_literal(&mut self.bytecode, name);
-            self.bytecode.push(Byte::new(Instruction::GetField));
+            self.bytecode.push_get_field();
             self.emit_show_for_stack_value(field_ty);
             let slot = self.alloc_temp_slot();
             self.bytecode
@@ -3855,9 +3855,7 @@ impl Compiler {
         }
         self.bytecode
             .push_make_tuple(arity as u32);
-        self.bytecode.push(
-            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
-        );
+        self.bytecode.push_host_invoke(arity as u32);
         // Restore: caller owns counting the result value if it needs to.
         self.expr_depth = depth_on_entry;
     }
@@ -4013,8 +4011,7 @@ impl Compiler {
                 self.bytecode.push_unbox_value(ValueTag::String as u32);
                 self.bytecode
                     .push_make_tuple(1);
-                self.bytecode
-                    .push(Byte::new(Instruction::HostInvoke).with_operand_u32(1));
+                self.bytecode.push_host_invoke(1);
                 self.bytecode.push_return();
             }
         }
@@ -4044,8 +4041,7 @@ impl Compiler {
             self.bytecode.push_unbox_value(ValueTag::Array as u32);
             self.bytecode
                 .push_make_tuple(arity);
-            self.bytecode
-                .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+            self.bytecode.push_host_invoke(arity);
             self.bytecode.push_return();
         }
 
@@ -4766,14 +4762,14 @@ impl Compiler {
                         LetPattern::Binding { name } => {
                             bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
-                            bytecode.push(Byte::new(Instruction::GetField));
+                            bytecode.push_get_field();
                             let slot = self.alloc_binding_slot(name);
                             bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
                             bytecode.push_load(src_slot);
                             Self::emit_raw_string_literal(bytecode, pf.name);
-                            bytecode.push(Byte::new(Instruction::GetField));
+                            bytecode.push_get_field();
                             let nested_slot = self.alloc_temp_slot();
                             bytecode
                                 .push_store_pop(nested_slot);
@@ -4967,14 +4963,14 @@ impl Compiler {
                 self.bytecode
                     .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "start");
-                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode.push_get_field();
                 self.bytecode
                     .push_store_pop(cur_slot);
 
                 self.bytecode
                     .push_load(range_slot);
                 Self::emit_raw_string_literal(&mut self.bytecode, "end");
-                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode.push_get_field();
                 self.bytecode
                     .push_store_pop(end_slot);
             }
@@ -5033,7 +5029,7 @@ impl Compiler {
             let bits = Value::from(1.0_f64).raw() as u64;
             let idx = self.intern_constant(bits);
             self.bytecode
-                .push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                .push_const_pool(idx);
             self.bytecode.push(Byte::new(Instruction::ADDF));
         } else {
             self.bytecode
@@ -5386,7 +5382,7 @@ impl Compiler {
             Expression::Access(receiver, field) => {
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
-                bytecode.push(Byte::new(Instruction::GetField));
+                bytecode.push_get_field();
                 matches!(
                     self.receiver_type(receiver),
                     Some(crate::typechecking::Ty::Con(ref n))
@@ -5431,7 +5427,7 @@ impl Compiler {
                 }
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
-                bytecode.push(Byte::new(Instruction::SetField));
+                bytecode.push_set_field();
             }
             Expression::Index(arr, Some(idx)) => {
                 // Always stash the RHS — `StoreIndex` pops value/index/array.
@@ -6207,7 +6203,7 @@ impl Compiler {
         self.expr_depth += 1;
         let arity = value_args.len() + 1; // + meta
         bytecode.push_make_tuple(arity as u32);
-        bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        bytecode.push_host_invoke(arity as u32);
         self.expr_depth = depth_on_entry;
         true
     }
@@ -6298,7 +6294,7 @@ impl Compiler {
             self.bytecode.push_pop();
             let msg = format!("> Test \"{desc}\" failed\n");
             self.emit_string_literal(&msg);
-            self.bytecode.push(Byte::new(Instruction::PRINT));
+            self.bytecode.push_print();
             // failed += 1
             self.bytecode
                 .push_load(failed_slot);
@@ -7051,7 +7047,7 @@ impl Compiler {
                         bytecode.append(&mut self.do_compile(arg));
                         bytecode.push_load(tmp_inst);
                         self.emit_field_name(&mut bytecode, fname);
-                        bytecode.push(Byte::new(Instruction::SetField));
+                        bytecode.push_set_field();
                         bytecode.push_pop();
                     }
                 }
@@ -7762,9 +7758,7 @@ impl Compiler {
                         }
                         self.bytecode
                             .push_make_tuple(arity as u32);
-                        self.bytecode.push(
-                            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
-                        );
+                        self.bytecode.push_host_invoke(arity as u32);
                         self.expr_depth = depth_on_entry;
                     } else if let Some(offset) = self.functions.get(&n).copied() {
                         let mono_offset = self.mono_call_offset(&n, args.as_ref());
@@ -8889,7 +8883,7 @@ impl Compiler {
             Expression::Float(num) => {
                 let bits = Value::from(*num).raw() as u64;
                 let idx = self.intern_constant(bits);
-                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                bytecode.push_const_pool(idx);
             }
             Expression::String(str) => {
                 let escaped = unescape_coil_string(str);
@@ -8987,7 +8981,7 @@ impl Compiler {
                     self.append_binding_rhs(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
-                    bytecode.push(Byte::new(Instruction::SetField));
+                    bytecode.push_set_field();
                 }
                 Expression::Index(arr, None) => {
                     bytecode.append(&mut self.do_compile(arr));
@@ -10023,7 +10017,7 @@ impl Compiler {
                     bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     self.emit_field_name(&mut bytecode, field);
-                    bytecode.push(Byte::new(Instruction::GetField));
+                    bytecode.push_get_field();
                 } else {
                     // Unknown receiver — do not emit GetField (enum
                     // match bindings historically lacked side-table
@@ -10172,7 +10166,7 @@ impl Compiler {
                     self.bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
-                    self.bytecode.push(Byte::new(Instruction::GetField));
+                    self.bytecode.push_get_field();
                 } else {
                     self.bytecode.push_load_field(0);
                 }

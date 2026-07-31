@@ -50,13 +50,20 @@ impl SpInfo {
 pub fn stack_delta(op: &IlOp) -> Option<i32> {
     match op {
         IlOp::Label(_) => Some(0),
-        IlOp::Load { .. } | IlOp::Const { .. } | IlOp::Dup { .. } => Some(1),
+        IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Dup { .. } => {
+            Some(1)
+        }
         IlOp::StorePop { .. } | IlOp::Pop { .. } | IlOp::Index { .. } => Some(-1),
         IlOp::MakeTuple { arity, .. } | IlOp::MakeArray { arity, .. } => {
             Some(1 - *arity as i32)
         }
         IlOp::MakeEnum { arity, .. } => Some(1 - *arity as i32),
         IlOp::BoxValue { .. } | IlOp::UnboxValue { .. } | IlOp::LoadField { .. } => Some(0),
+        // GetField: pop target+name, push value. SetField: pop value+target+name, push value.
+        IlOp::GetField { .. } | IlOp::SetField { .. } => Some(-1),
+        // HostInvoke: pop fn_id + args tuple, push result.
+        IlOp::HostInvoke { .. } => Some(-1),
+        IlOp::Print { .. } => Some(-1),
         IlOp::Bin { .. } => Some(-1),
         // Slot forms push a computed value without consuming eval-stack args.
         IlOp::BinSlotImm { .. } | IlOp::BinSlotSlot { .. } => Some(1),
@@ -154,7 +161,9 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
             Some(1 - arity as i32)
         }
         Instruction::TailCall => None,
-        // Fail closed for the long tail (PRINT, FORMAT, MakeEnum, HostInvoke, …).
+        Instruction::HostInvoke => Some(-1),
+        Instruction::PRINT | Instruction::GetField | Instruction::SetField => Some(-1),
+        // Fail closed for the remaining long tail (FORMAT, FFI, …).
         _ => None,
     }
 }
@@ -352,9 +361,10 @@ mod tests {
 
     #[test]
     fn unknown_byte_poisons() {
+        // FORMAT remains residual with unknown stack delta.
         let ops = vec![
             IlOp::Const { imm: 1, loc: loc() },
-            IlOp::byte(common::Byte::new(Instruction::PRINT)),
+            IlOp::byte(common::Byte::new(Instruction::FORMAT)),
             IlOp::Return { loc: loc() },
         ];
         let info = analyze(&ops);
@@ -465,6 +475,23 @@ mod tests {
                 loc: loc(),
             }),
             Some(0)
+        );
+        assert_eq!(stack_delta(&IlOp::GetField { loc: loc() }), Some(-1));
+        assert_eq!(stack_delta(&IlOp::SetField { loc: loc() }), Some(-1));
+        assert_eq!(
+            stack_delta(&IlOp::HostInvoke {
+                arity: 3,
+                loc: loc(),
+            }),
+            Some(-1)
+        );
+        assert_eq!(stack_delta(&IlOp::Print { loc: loc() }), Some(-1));
+        assert_eq!(
+            stack_delta(&IlOp::ConstPool {
+                idx: 2,
+                loc: loc(),
+            }),
+            Some(1)
         );
     }
 

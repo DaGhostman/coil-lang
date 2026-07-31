@@ -222,6 +222,38 @@ impl IlBuilder {
         });
     }
 
+    pub fn push_get_field(&mut self) {
+        self.push_op(IlOp::GetField {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_set_field(&mut self) {
+        self.push_op(IlOp::SetField {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_host_invoke(&mut self, arity: u32) {
+        self.push_op(IlOp::HostInvoke {
+            arity,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_print(&mut self) {
+        self.push_op(IlOp::Print {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_const_pool(&mut self, idx: u32) {
+        self.push_op(IlOp::ConstPool {
+            idx,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
         for b in bytes {
             self.push_byte(b);

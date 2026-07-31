@@ -509,9 +509,9 @@ mod tests {
 
     #[test]
     fn join_cse_keeps_load_when_join_sp_unknown() {
-        // PRINT fail-closes SP; Known-SP Load join CSE must not fire.
+        // FORMAT fail-closes SP; Known-SP Load join CSE must not fire.
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(common::Instruction::PRINT)),
+            IlOp::byte(common::Byte::new(common::Instruction::FORMAT)),
             IlOp::Const {
                 imm: 0,
                 loc: loc(),
