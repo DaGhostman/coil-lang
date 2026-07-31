@@ -123,6 +123,32 @@ impl IlBuilder {
         self.ops.push(IlOp::byte_at(byte, loc));
     }
 
+    /// Append a typed IL op (prefer over [`Self::push_byte`] for hot-set ops).
+    pub fn push_op(&mut self, op: IlOp) {
+        self.ops.push(op);
+    }
+
+    pub fn push_const(&mut self, imm: i32) {
+        self.push_op(IlOp::Const {
+            imm,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_const_at(&mut self, imm: i32, loc: DebugLoc) {
+        self.push_op(IlOp::Const { imm, loc });
+    }
+
+    pub fn push_return(&mut self) {
+        self.push_op(IlOp::Return {
+            loc: DebugLoc::unknown(),
+        });
+    }
+
+    pub fn push_return_at(&mut self, loc: DebugLoc) {
+        self.push_op(IlOp::Return { loc });
+    }
+
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
         for b in bytes {
             self.push_byte(b);

@@ -1214,6 +1214,69 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
+/// Nested multi-field record patterns must not clobber sibling outer fields.
+/// Pre-fix, in-place `UnpackAt` at the outer field slot overwrote later
+/// siblings when the inner arity exceeded one.
+#[test]
+fn nested_multifield_record_pattern_preserves_sibling() {
+    let output = run_example_src(
+        r#"
+enum Inner {
+    I { x: int, y: int },
+}
+enum Wrap {
+    W { inner: Inner, name: int },
+}
+fn both(Wrap w) -> int {
+    return match w {
+        Wrap::W { inner: Inner::I { x, y }, name } => x + y + name,
+    };
+}
+fn main() {
+    let w = Wrap::W { inner: Inner::I { x: 10, y: 20 }, name: 3 };
+    print "%i", both(w);
+}
+"#,
+    );
+    assert_eq!(
+        output, "33",
+        "inner fields and outer sibling `name` must all bind correctly"
+    );
+}
+
+/// Two nested multifield records in one outer arm — each must unpack into
+/// distinct scratch regions so the second nested payload cannot overwrite
+/// the first nested bindings.
+#[test]
+fn nested_two_multifield_records_preserve_both() {
+    let output = run_example_src(
+        r#"
+enum Inner {
+    I { x: int, y: int },
+}
+enum Pair {
+    P { a: Inner, b: Inner },
+}
+fn sum(Pair p) -> int {
+    return match p {
+        Pair::P {
+            a: Inner::I { x: ax, y: ay },
+            b: Inner::I { x: bx, y: by },
+        } => ax + ay + bx + by,
+    };
+}
+fn main() {
+    let p = Pair::P {
+        a: Inner::I { x: 1, y: 2 },
+        b: Inner::I { x: 10, y: 20 },
+    };
+    print "%i", sum(p);
+}
+"#,
+    );
+    assert_eq!(output, "33", "both nested multifield bindings must survive");
+}
+
 fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -4190,4 +4253,207 @@ fn main() {
 "#,
     );
     assert_eq!(output, "true,true,true,true,true");
+}
+
+#[test]
+fn fallthrough_string_return_requires_explicit_return() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+fn bad() -> string {
+    // no return
+}
+
+fn main() {
+    print "%s", bad();
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "missing return for string should fail with E0111"
+    );
+    let msgs = pipeline.messages();
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch)),
+        "expected ReturnMismatch; got {} messages",
+        msgs.len()
+    );
+}
+
+#[test]
+fn fallthrough_unit_and_int_still_allow_zero() {
+    let output = run_example_src(
+        r#"
+fn unitish() {
+    let x = 1;
+}
+
+fn answer() -> int {
+    // implicit 0
+}
+
+fn main() {
+    unitish();
+    print "%i", answer();
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
+
+#[test]
+fn fallthrough_bool_byte_float_allow_zero() {
+    let output = run_example_src(
+        r#"
+fn flag() -> bool {}
+fn b() -> byte {}
+fn f() -> float {}
+
+fn main() {
+    print "%i,", flag() as int;
+    print "%i,", b() as int;
+    print "%i", f() as int;
+}
+"#,
+    );
+    assert_eq!(output, "0,0,0");
+}
+
+#[test]
+fn fallthrough_option_emits_none_at_runtime() {
+    // Option fall-through must emit MakeEnum None — bare CONST 0 is not None.
+    let output = run_example_src(
+        r#"
+fn opt() -> Option<int> {}
+
+fn main() {
+    print "%i", match opt() {
+        Option::None => 1,
+        Option::Some(_) => 0,
+    };
+}
+"#,
+    );
+    assert_eq!(output, "1", "empty Option body must fall through as None");
+}
+
+#[test]
+fn fallthrough_async_yield_only_does_not_e0111() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+async fn gen_three() {
+    yield 0;
+    yield 1;
+    yield 2;
+}
+async fn outer() {
+    yield from gen_three();
+}
+async fn parameterized(int base) {
+    yield base;
+    yield base + 1;
+    yield base + 2;
+}
+fn main() {
+    let _ = resume gen_three();
+}
+"#,
+    );
+    assert!(
+        result.is_ok(),
+        "yield-only async bodies must not E0111 on fall-through: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn fallthrough_result_zero_safe_ok_wraps_at_runtime() {
+    // Annotated Result enters result-mode; zero-safe Ok scalars Ok-wrap CONST 0.
+    let output = run_example_src(
+        r#"
+fn ok_int() -> Result<int, string> {}
+fn ok_unit() -> Result<(), string> {}
+
+fn main() {
+    print "%i,", match ok_int() {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    };
+    print "%i", match ok_unit() {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+"#,
+    );
+    assert_eq!(
+        output, "0,1",
+        "Result<int,_> / Result<(),_> fall-through must Ok-wrap"
+    );
+}
+
+#[test]
+fn fallthrough_result_string_and_adt_require_explicit_return() {
+    let mut pipeline = Pipeline::new();
+    let err = pipeline.compile_src(
+        r#"
+enum Color { Red, Blue }
+fn bad_res() -> Result<string, string> {}
+fn bad_adt() -> Color {}
+fn main() {
+    let _ = bad_res();
+    let _ = bad_adt();
+}
+"#,
+    );
+    assert!(
+        err.is_err(),
+        "Result<string,_>/ADT fall-through should fail with E0111"
+    );
+    let msgs = pipeline.messages();
+    let mismatches = msgs
+        .iter()
+        .filter(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch))
+        .count();
+    assert!(
+        mismatches >= 2,
+        "expected ReturnMismatch for both Result<string> and ADT; got {} messages: {:?}",
+        msgs.len(),
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+/// Nested multifield record that is not the first outer field must still
+/// relocate into scratch and preserve the preceding sibling binding.
+#[test]
+fn nested_multifield_record_after_sibling_preserves_bindings() {
+    let output = run_example_src(
+        r#"
+enum Inner {
+    I { x: int, y: int },
+}
+enum Wrap {
+    W { name: int, inner: Inner },
+}
+fn both(Wrap w) -> int {
+    return match w {
+        Wrap::W { name, inner: Inner::I { x, y } } => name + x + y,
+    };
+}
+fn main() {
+    let w = Wrap::W { name: 3, inner: Inner::I { x: 10, y: 20 } };
+    print "%i", both(w);
+}
+"#,
+    );
+    assert_eq!(
+        output, "33",
+        "preceding sibling `name` and nested `x`/`y` must all bind"
+    );
 }

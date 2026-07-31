@@ -1630,38 +1630,26 @@ fn emit_pattern_binding<'compiler>(
                 }
             }
             PatternPayload::Record(fields) => {
-                // Declaration-order walk; nested records use UnpackAt at non-top slots.
+                // Declaration-order walk. Nested records unpack into a
+                // scratch region past this record's field slots so
+                // multi-field inners cannot clobber sibling outers.
                 // `record_base` is the first payload slot for this record
                 // (normally 1; higher when trailing dict locals precede
                 // the match).
                 let record_base = *next_slot;
+                let n_fields = parent_decl_order.len() as u32;
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                     fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
                     let field_slot = record_base + i as u32;
                     if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {
-                        // If the sub-pattern is a nested
-                        // record, emit `UnpackAt` with the
-                        // slot position of the OUTER field
-                        // (= `field_slot`). The slot-based
-                        // UNPACK writes the inner record's
-                        // payload values to consecutive
-                        // positions starting at `field_slot`,
-                        // overwriting the nested record's
-                        // enum value.
+                        // Nested record + consume: copy the enum into a
+                        // scratch base (≥ end of this record's fields /
+                        // prior scratch), UnpackAt there, then bind from
+                        // scratch. Plain siblings after a nested unpack
+                        // relocate field_slot → next_slot before binding.
                         //
-                        // `is_outer` is captured by value
-                        // from the enclosing Record arm
-                        // call. When `is_outer = true`, we're
-                        // walking the OUTER record's fields
-                        // — nested records at this level need
-                        // `UnpackAt`. When `is_outer = false`
-                        // (we're recursing into a nested
-                        // record's fields), nested records
-                        // ALSO need `UnpackAt` (one level
-                        // deeper). Either way, emit it when
-                        // the sub-pattern is a nested record
-                        // AND `consume_values = true`.
+                        // UnpackAt operands: [31:16]=arity, [15:0]=slot.
                         if consume_values
                             && let Pattern::Constructor {
                                 enum_name: sub_enum,
@@ -1671,14 +1659,28 @@ fn emit_pattern_binding<'compiler>(
                         {
                             let inner_arity =
                                 checker.payload_tys_for(sub_enum, sub_variant).len() as u16;
+                            let scratch_base = (*next_slot).max(record_base + n_fields);
+                            if scratch_base != field_slot {
+                                bytecode.push(
+                                    Byte::new(Instruction::LOAD).with_operand_u32(field_slot),
+                                );
+                                bytecode.push(
+                                    Byte::new(Instruction::StorePop)
+                                        .with_operand_u32(scratch_base),
+                                );
+                            }
                             bytecode.push(
                                 Byte::new(Instruction::UnpackAt)
-                                    .with_operands_u16([field_slot as u16, inner_arity]),
+                                    .with_operands_u16([inner_arity, scratch_base as u16]),
+                            );
+                            *next_slot = scratch_base;
+                        } else if consume_values && field_slot != *next_slot {
+                            bytecode
+                                .push(Byte::new(Instruction::LOAD).with_operand_u32(field_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::StorePop).with_operand_u32(*next_slot),
                             );
                         }
-                        // Compute the sub-pattern's own
-                        // record decl_order if it's a record
-                        // constructor (for unbounded nesting).
                         let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
                             enum_name: sub_enum,
                             variant_name: sub_variant,
@@ -4014,9 +4016,8 @@ impl Compiler {
             let fqn = Generics::builtin_instance_fqn("Hash", "unit", "hash");
             if !self.functions.contains_key(&fqn) {
                 self.bind_function_entry(fqn);
-                self.bytecode
-                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
             }
         }
         if let Some(native_id) = self.native_id("hash_string") {
@@ -4124,6 +4125,198 @@ impl Compiler {
         }
     }
 
+    /// Peel `forall` / function arrows to the final return type.
+    fn peel_fn_return_ty(ty: &crate::typechecking::Ty) -> crate::typechecking::Ty {
+        use crate::typechecking::Ty;
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        while let Ty::Fun(_, ret) = t {
+            t = *ret;
+        }
+        t
+    }
+
+    /// Look up a function's scheme and peel to its return type.
+    fn fn_return_ty(&self, name: &str) -> Option<crate::typechecking::Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        let scheme = self
+            .checker
+            .env()
+            .lookup(name)
+            .or_else(|| {
+                self.current_function_qualified
+                    .as_deref()
+                    .and_then(|q| self.checker.env().lookup(q))
+            })
+            .or_else(|| {
+                self.current_function_table_key
+                    .as_deref()
+                    .and_then(|q| self.checker.env().lookup(q))
+            })?;
+        let applied = apply_ty_prune(self.checker.subst(), &scheme.ty);
+        Some(Self::peel_fn_return_ty(&applied))
+    }
+
+    /// True when `ty` is unit / `()` (safe Ok payload for Result fall-through).
+    fn ty_is_unit_like(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::{Ty, ty::UNIT};
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        match &t {
+            Ty::Con(name) => name == UNIT,
+            Ty::Tuple(items) if items.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    /// Ok payload that may be invented as `CONST 0` + Ok-wrap on fall-through.
+    ///
+    /// Unit, open vars (bodies that only use `?` / `assert`), and zero-safe
+    /// scalars (`int`/`bool`/…) are Ok; `string` / ADTs are not.
+    fn ty_allows_result_ok_fallthrough(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::Ty;
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        if Self::ty_is_unit_like(&t) {
+            return true;
+        }
+        if matches!(&t, Ty::Var(_)) || matches!(&t, Ty::Con(n) if n == "unknown") {
+            return true;
+        }
+        Self::ty_allows_zero_default(&t)
+    }
+
+    /// True when `Value::default()` (`0`) is a valid representation for `ty`.
+    ///
+    /// Safe for unit / int / byte / bool / float, open vars (statement bodies),
+    /// and empty tuples. `Option` / `Result` / `string` / ADTs need a real
+    /// constructor (or an explicit `return`).
+    fn ty_allows_zero_default(ty: &crate::typechecking::Ty) -> bool {
+        use crate::typechecking::{
+            Ty,
+            ty::{BOOL, BYTE, FLOAT, INT, UNIT},
+        };
+        let mut t = ty.clone();
+        while let Ty::Forall { body, .. } = t {
+            t = *body;
+        }
+        match &t {
+            Ty::Con(name) => {
+                matches!(name.as_str(), UNIT | INT | BYTE | BOOL | FLOAT)
+                    // Incomplete / placeholder types — do not spuriously E0111.
+                    || name == "unknown"
+            }
+            Ty::Var(_) => true,
+            // `()` / empty tuple is unit-like.
+            Ty::Tuple(items) if items.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    /// Whether an implicit fall-through is valid for `name`'s return.
+    fn fallthrough_allows_zero(&self, name: &str) -> bool {
+        use crate::typechecking::ty::{is_option_ty, result_ok_err};
+        // Async fn bodies complete with a sentinel; the `coroutine<…>` value
+        // is produced by MakeCoro at the call site.
+        if self.coroutine_fns.contains(name)
+            || self
+                .current_function_qualified
+                .as_ref()
+                .is_some_and(|q| self.coroutine_fns.contains(q))
+        {
+            return true;
+        }
+        let Some(ret) = self.fn_return_ty(name) else {
+            return true;
+        };
+        // `Option` fall-through emits `None` (not raw `0`) in
+        // [`Self::emit_fallthrough_return`].
+        if is_option_ty(&ret) {
+            return true;
+        }
+        if self.compiling_result_mode {
+            // Result-mode Ok-wraps unit / open Ok / zero-safe scalars.
+            // Refuse inventing Ok for `string` / ADT payloads.
+            if let Some((ok, _)) = result_ok_err(&ret) {
+                return Self::ty_allows_result_ok_fallthrough(&ok);
+            }
+            return true;
+        }
+        if let crate::typechecking::Ty::App(con, _) = &ret
+            && matches!(con.as_ref(), crate::typechecking::Ty::Con(n) if n == "coroutine")
+        {
+            return true;
+        }
+        Self::ty_allows_zero_default(&ret)
+    }
+
+    /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
+    fn emit_fallthrough_return(&mut self, name: &str, span: SimpleSpan) {
+        use crate::typechecking::ty::is_option_ty;
+        self.emit_run_defers();
+        if !self.fallthrough_allows_zero(name) {
+            let ret_s = self
+                .fn_return_ty(name)
+                .map(|t| format!("{t}"))
+                .unwrap_or_else(|| "unknown".into());
+            let mut message = Message::error(
+                ErrorCode::ReturnMismatch,
+                format!(
+                    "function `{name}` reaches the end without returning a value of type `{ret_s}`"
+                ),
+                span.into_range(),
+            );
+            message.push(DiagLabel::new(
+                "add an explicit `return` (implicit `0` is not valid for this type)".to_string(),
+                span.into_range(),
+            ));
+            self.messages.push(message);
+        }
+        let opt_none = self
+            .fn_return_ty(name)
+            .as_ref()
+            .is_some_and(is_option_ty);
+        if opt_none {
+            // `Option::None` = tag 0, arity 0.
+            self.bytecode
+                .push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+        } else {
+            self.bytecode.push_const(0);
+            if self.compiling_result_mode {
+                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+            }
+        }
+        self.bytecode.push_return();
+    }
+
+    /// True when IL ops in `[op_start, ops.len())` end with a return terminator
+    /// (labels skipped). `op_start` must be an index into [`CodeBuf::ops`], not
+    /// an emitting-code length from [`CodeBuf::len`].
+    fn region_ends_with_return(&self, op_start: usize) -> bool {
+        let ops = self.bytecode.ops();
+        let mut i = ops.len();
+        while i > op_start {
+            i -= 1;
+            match &ops[i] {
+                IlOp::Label(_) => continue,
+                IlOp::Return { .. }
+                | IlOp::LoadReturnSlot { .. }
+                | IlOp::ConstReturnImm { .. }
+                | IlOp::BinReturn { .. }
+                | IlOp::Halt { .. } => return true,
+                op if op.is_plain_return() => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Emit a `BoxValue` instruction for a concrete `Ty` at a generic
     /// call argument boundary (concrete→generic).  Does nothing when the
     /// type is already open (Ty::Var), or if a tag cannot be determined.
@@ -4201,22 +4394,12 @@ impl Compiler {
         for dict_idx in 0..dict_arity {
             self.context.variables.intern(format!("__dict{}", dict_idx));
         }
+        let body_op_start = self.bytecode.ops().len();
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
 
-        if !matches!(
-            self.bytecode.last_byte().map(|b| *b.bytecode()),
-            Some(Instruction::RETURN)
-        ) {
-            self.emit_run_defers();
-            self.bytecode.push(Byte::new_with_value(
-                Instruction::CONST,
-                Value::default().raw() as _,
-            ));
-            if self.compiling_result_mode {
-                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-            }
-            self.bytecode.push(Byte::new(Instruction::RETURN));
+        if !self.region_ends_with_return(body_op_start) {
+            self.emit_fallthrough_return(name, body.0);
         }
 
         self.fn_defers = prev_fn_defers;
@@ -4400,22 +4583,12 @@ impl Compiler {
             let prev_fn_defers = std::mem::take(&mut self.fn_defers);
             let mut a = self.do_compile(args);
             self.bytecode.append(&mut a);
+            let body_op_start = self.bytecode.ops().len();
             let mut c = self.do_compile(body);
             self.bytecode.append(&mut c);
 
-            if !matches!(
-                self.bytecode.last_byte().map(|b| *b.bytecode()),
-                Some(Instruction::RETURN)
-            ) {
-                self.emit_run_defers();
-                self.bytecode.push(Byte::new_with_value(
-                    Instruction::CONST,
-                    Value::default().raw() as _,
-                ));
-                if self.compiling_result_mode {
-                    Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                }
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+            if !self.region_ends_with_return(body_op_start) {
+                self.emit_fallthrough_return(source_name, body.0);
             }
 
             self.fn_defers = prev_fn_defers;
@@ -6307,11 +6480,8 @@ impl Compiler {
         self.emit_string_literal("tests failed");
         self.bytecode.push(Byte::new(Instruction::Panic));
         bb.bind_label(end_lbl, self.bytecode.il_mut());
-        self.bytecode.push(Byte::new_with_value(
-            Instruction::CONST,
-            Value::default().raw() as _,
-        ));
-        self.bytecode.push(Byte::new(Instruction::RETURN));
+        self.bytecode.push_const(0);
+        self.bytecode.push_return();
 
         bb.finalize()
             .expect("BlockBuilder::finalize: virtual test main labels bound");
@@ -6626,6 +6796,7 @@ impl Compiler {
                 self.bytecode.append(&mut a);
 
                 let body_start = self.bytecode.len();
+                let body_op_start = self.bytecode.ops().len();
                 let prev_active = self.active_fn_name.take();
                 let prev_fn_defers = std::mem::take(&mut self.fn_defers);
                 self.active_fn_name = Some(name.to_string());
@@ -6633,19 +6804,8 @@ impl Compiler {
                 self.active_fn_name = prev_active;
                 self.bytecode.append(&mut c);
 
-                if !matches!(
-                    self.bytecode.last_byte().map(|b| *b.bytecode()),
-                    Some(Instruction::RETURN)
-                ) {
-                    self.emit_run_defers();
-                    self.bytecode.push(Byte::new_with_value(
-                        Instruction::CONST,
-                        Value::default().raw() as _,
-                    ));
-                    if self.compiling_result_mode {
-                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                    }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                if !self.region_ends_with_return(body_op_start) {
+                    self.emit_fallthrough_return(name, body.0);
                 }
 
                 self.fn_defers = prev_fn_defers;
@@ -6711,12 +6871,9 @@ impl Compiler {
                         Expression::Block(items) if items.is_empty()
                     );
                     if body_empty {
-                        self.bytecode.push(Byte::new_with_value(
-                            Instruction::CONST,
-                            Value::default().raw() as _,
-                        ));
+                        self.bytecode.push_const(0);
                     }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                    self.bytecode.push_return();
                 }
                 self.context.variables = prev_fn_vars;
 
@@ -6905,7 +7062,7 @@ impl Compiler {
                 self.bytecode.append(&mut bytecode);
                 self.emit_run_defers();
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                    self.bytecode.push_return();
                 }
             }
             Expression::Yield(expr) => {
@@ -7304,11 +7461,8 @@ impl Compiler {
                 self.bytecode.append(&mut body_bc);
                 self.context.variables = prev_vars;
 
-                self.bytecode.push(Byte::new_with_value(
-                    Instruction::CONST,
-                    Value::from(0i64).raw() as _,
-                ));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
 
                 bb.bind_label(after, self.bytecode.il_mut());
                 bb.finalize()
@@ -9285,21 +9439,13 @@ impl Compiler {
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
 
+                let body_op_start = self.bytecode.ops().len();
                 let mut body_bc = self.do_compile(body);
                 self.bytecode.append(&mut body_bc);
 
-                if !matches!(
-                    self.bytecode.last_byte().map(|b| *b.bytecode()),
-                    Some(Instruction::RETURN)
-                ) {
-                    self.bytecode.push(Byte::new_with_value(
-                        Instruction::CONST,
-                        Value::default().raw() as _,
-                    ));
-                    if self.compiling_result_mode {
-                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
-                    }
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                if !self.region_ends_with_return(body_op_start) {
+                    // Test cases are typed as unit / Result<(), string> — zero is safe.
+                    self.emit_fallthrough_return(&fn_name, body.0);
                 }
 
                 self.compiling_result_mode = prev_result_mode;
@@ -10078,7 +10224,9 @@ impl Compiler {
                 self.emit_bytes(*span, &expr_bc);
                 Self::emit_result_err(&mut self.bytecode);
                 self.pad_debug_locs();
-                self.emit_byte(*span, Byte::new(Instruction::RETURN));
+                let loc = self.loc_for_span(*span);
+                self.bytecode.push_return_at(loc);
+                self.debug_locs.push(loc);
             }
             Expression::Panic(expr) => {
                 let expr_bc = self.do_compile(expr);
@@ -10104,7 +10252,7 @@ impl Compiler {
                     self.bytecode.il_mut(),
                 );
                 // Miss: failure value still on stack — propagate via RETURN.
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.bytecode.push_return();
                 bb.bind_label(success, self.bytecode.il_mut());
                 bb.finalize()
                     .expect("BlockBuilder::finalize: Try success label bound");
@@ -13426,6 +13574,75 @@ print \"%i\", len(a); \
         );
     }
 
+    /// Empty `Option` bodies emit `MakeEnum` None (tag 0, arity 0), not bare
+    /// `CONST 0` — raw zero is not a reliable `None` at runtime.
+    #[test]
+    fn fallthrough_option_emits_make_enum_none() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn opt() -> Option<int> {}\
+ fn main() { let _ = opt(); }",
+        );
+        let make_none = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MakeEnum)
+                && b.operand_u32() & 0xFFFF == 0
+                && (b.operand_u32() >> 16) & 0xFFFF == 0
+        });
+        assert!(
+            make_none,
+            "Option fall-through should emit MakeEnum None; got {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Nested multi-field records emit scratch relocate (LOAD+StorePop)
+    /// then UnpackAt with operands `[arity, scratch_slot]` — not in-place
+    /// at the outer field (which would clobber siblings).
+    #[test]
+    fn match_nested_multifield_record_emits_scratch_unpack_at() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "enum Inner { I { x: int, y: int } } \
+ enum Wrap { W { inner: Inner, name: int } } \
+ match Wrap::W { inner: Inner::I { x: 1, y: 2 }, name: 3 } { \
+ Wrap::W { inner: Inner::I { x, y }, name } => x + y + name, \
+ };",
+        );
+
+        let unpack_at: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::UnpackAt))
+            .collect();
+        assert!(
+            !unpack_at.is_empty(),
+            "expected UnpackAt for nested Inner::I"
+        );
+        for b in &unpack_at {
+            let ops = b.operand_u32();
+            let slot = ops & 0xFFFF;
+            let arity = ops >> 16;
+            assert_eq!(arity, 2, "inner record arity must be in [31:16]; got {ops:#x}");
+            // Outer has 2 fields; scratch starts at record_base + 2 (payload_base
+            // is 0 for bare expression matches, 1 inside functions).
+            assert!(
+                slot >= 2,
+                "scratch slot must be past outer field region; got slot={slot}"
+            );
+        }
+        let load_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LOAD))
+            .count();
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        assert!(
+            load_count >= 1 && store_pop_count >= 1,
+            "expected LOAD+StorePop to relocate nested enum into scratch; LOAD={load_count} StorePop={store_pop_count}"
+        );
+    }
+
     /// Codegen test 25 : depth-3 nested constructor
     /// patterns (`Foo::Bar(Baz::Qux { a: W::W { v } })`).
     /// The codegen recurses at unbounded depth — three levels
@@ -14837,4 +15054,26 @@ fn main() {
         );
     }
 
+}
+
+#[cfg(test)]
+mod fallthrough_probe {
+    use super::*;
+    #[test]
+    fn probe_string_fallthrough_diag() {
+        let mut p = crate::pipeline::Pipeline::new();
+        let src = "fn bad() -> string {}\nfn main() { let _ = bad(); }\n";
+        let r = p.compile_src(src);
+        let c = p.compiler_mut();
+        let ty = c.fn_return_ty("bad");
+        let allow = c.fallthrough_allows_zero("bad");
+        let scheme = c.checker.env().lookup("bad").map(|s| format!("{}", s.ty));
+        let msgs: Vec<_> = p
+            .messages()
+            .iter()
+            .map(|m| (m.code(), m.message().to_string()))
+            .collect();
+        eprintln!("result_ok={} ty={ty:?} allow={allow} scheme={scheme:?} msgs={msgs:?}", r.is_ok());
+        assert!(r.is_err(), "ty={ty:?} allow={allow} scheme={scheme:?}");
+    }
 }
