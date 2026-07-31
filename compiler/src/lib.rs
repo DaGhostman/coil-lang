@@ -4201,7 +4201,9 @@ impl Compiler {
 
     /// Whether an implicit fall-through `CONST 0` is valid for `name`'s return.
     fn fallthrough_allows_zero(&self, name: &str) -> bool {
-        use crate::typechecking::ty::{is_result_ty, result_ok_err};
+        use crate::typechecking::ty::result_ok_err;
+        // Async fn bodies complete with a sentinel; the `coroutine<…>` value
+        // is produced by MakeCoro at the call site.
         if self.coroutine_fns.contains(name)
             || self
                 .current_function_qualified
@@ -4213,29 +4215,18 @@ impl Compiler {
         let Some(ret) = self.fn_return_ty(name) else {
             return true;
         };
-        let allow = if self.compiling_result_mode {
+        if self.compiling_result_mode {
             if let Some((ok, _)) = result_ok_err(&ret) {
-                Self::ty_allows_zero_default(&ok)
-            } else {
-                true
+                return Self::ty_allows_zero_default(&ok);
             }
-        } else if let crate::typechecking::Ty::App(con, _) = &ret
+            return true;
+        }
+        if let crate::typechecking::Ty::App(con, _) = &ret
             && matches!(con.as_ref(), crate::typechecking::Ty::Con(n) if n == "coroutine")
         {
-            true
-        } else {
-            Self::ty_allows_zero_default(&ret)
-        };
-        if name == "main" {
-            eprintln!(
-                "FALLTHROUGH_DBG main result_mode={} is_result={} peel={:?} allow={} ret={ret:?}",
-                self.compiling_result_mode,
-                is_result_ty(&ret),
-                result_ok_err(&ret),
-                allow
-            );
+            return true;
         }
-        allow
+        Self::ty_allows_zero_default(&ret)
     }
 
     /// Emit defers + type-directed fall-through return (or E0111 when unsafe).
