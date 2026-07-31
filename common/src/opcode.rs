@@ -79,9 +79,8 @@ pub enum Instruction {
     Unpack,
     LoadField,
 
-    // StorePop: [31:0] slot_index — pop stack and write slot (let bindings).
-    // STORE is a no-op used by match-arm binding codegen.
-    // INC/DEC: [31:3] slot, [2] prefix (1=new value), [1] float, [0] reserved.
+    // StorePop: deprecated discriminant alias of STORE (same VM handler).
+    // Compiler emits STORE only. INC/DEC: [31:3] slot, [2] prefix, [1] float.
     StorePop,
 
     // UnpackAt: [31:16] arity, [15:0] slot offset — unpack enum at slot in place.

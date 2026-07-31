@@ -787,7 +787,7 @@ impl<const S: usize> Machine<S> {
 
         if push_send_for_receive
             && *ip < code.len()
-            && matches!(code[*ip].bytecode(), Instruction::StorePop)
+            && matches!(code[*ip].bytecode(), Instruction::STORE | Instruction::StorePop)
         {
             self.stack.push(send_val);
         }
@@ -1204,8 +1204,16 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(offset));
                 }
                 Instruction::STORE => {
-                    // No-op: stack and locals share memory; UNPACK/JUMP_IF_MATCH
-                    // already wrote match bindings into slot positions.
+                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
+                    // is newly allocated, but never shrink past higher locals —
+                    // locals and the operand stack share memory.
+                    let slot = sp + opcode.operand_u32() as usize;
+                    let val = self.stack.pop();
+                    self.stack[slot] = val;
+                    let tell = self.stack.tell();
+                    if tell < slot + 1 {
+                        self.stack.seek(slot + 1);
+                    }
                 }
                 Instruction::LOAD => {
                     let slot = opcode.operand_u32() as usize;
@@ -2358,12 +2366,9 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
+                // Deprecated discriminant alias of `STORE` (same handler).
+                // Compiler never emits StorePop; kept for archived bytecode.
                 Instruction::StorePop => {
-                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
-                    // is newly allocated, but NEVER shrink past higher locals —
-                    // locals and the operand stack share memory (Phase 18E).
-                    // Unconditional `seek(slot + 1)` orphans later slots and
-                    // makes early-loop flags appear not to stick.
                     let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack.pop();
                     self.stack[slot] = val;
@@ -3095,7 +3100,7 @@ mod tests {
     }
 
     fn store_pop(slot: u32) -> Byte {
-        Byte::new(Instruction::StorePop).with_operand_u32(slot)
+        Byte::new(Instruction::STORE).with_operand_u32(slot)
     }
 
     /// Build a `LOAD` byte that pushes `stack[frame.sp + slot]`

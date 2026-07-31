@@ -977,24 +977,14 @@ fn let_binding_emits_store_pop_in_bytecode() {
     let (bytecode, _constants) = pipeline.compile_test("", &mut ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
-    let binding_store_pop_count = bytecode
+    let binding_store_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::StorePop) && b.operand_u32() == 0)
+        .filter(|b| matches!(b.bytecode(), Instruction::STORE) && b.operand_u32() == 0)
         .count();
     assert_eq!(
-        binding_store_pop_count, 2,
-        "expected exactly 2 StorePop writes to binding slot 0 for one let + one re-assignment; got {}",
-        binding_store_pop_count
-    );
-
-    let store_count = bytecode
-        .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::STORE))
-        .count();
-    assert_eq!(
-        store_count, 0,
-        "expected zero STORE instructions for let/assignment; got {}",
-        store_count
+        binding_store_count, 2,
+        "expected exactly 2 STORE writes to binding slot 0 for one let + one re-assignment; got {}",
+        binding_store_count
     );
 }
 

@@ -16,9 +16,9 @@ pub trait EmitBuf {
         self.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(slot));
     }
 
-    /// Hot-path `StorePop`.
+    /// Hot-path `STORE` (pop TOS into slot).
     fn push_store_pop(&mut self, slot: u32) {
-        self.push_byte(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+        self.push_byte(Byte::new(Instruction::STORE).with_operand_u32(slot));
     }
 
     /// Inline `CONST` (pool-backed: [`Self::push_const_pool`]).
@@ -186,7 +186,7 @@ mod tests {
 
         assert_eq!(*buf[0].bytecode(), Instruction::LOAD);
         assert_eq!(buf[0].operand_u32(), 3);
-        assert_eq!(*buf[1].bytecode(), Instruction::StorePop);
+        assert_eq!(*buf[1].bytecode(), Instruction::STORE);
         assert_eq!(buf[1].operand_u32(), 4);
         assert_eq!(*buf[2].bytecode(), Instruction::CONST);
         assert_eq!(buf[2].operand_u32(), 7);

@@ -67,7 +67,8 @@ fn is_mem_barrier(op: &IlOp) -> bool {
         op.as_encode_byte(),
         Some(b) if matches!(
             *b.bytecode(),
-            Instruction::StorePop
+            Instruction::STORE
+                | Instruction::StorePop
                 | Instruction::SetField
                 | Instruction::HostInvoke
                 | Instruction::PRINT

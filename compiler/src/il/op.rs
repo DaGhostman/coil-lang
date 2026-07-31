@@ -160,7 +160,7 @@ impl IlOp {
                 slot: byte.operand_u32(),
                 loc,
             },
-            Instruction::StorePop => Self::StorePop {
+            Instruction::STORE | Instruction::StorePop => Self::StorePop {
                 slot: byte.operand_u32(),
                 loc,
             },
@@ -255,7 +255,7 @@ impl IlOp {
         Some(match self {
             IlOp::Byte { byte, .. } => *byte,
             IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_operand_u32(*slot),
-            IlOp::StorePop { slot, .. } => Byte::new(Instruction::StorePop).with_operand_u32(*slot),
+            IlOp::StorePop { slot, .. } => Byte::new(Instruction::STORE).with_operand_u32(*slot),
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
@@ -416,7 +416,7 @@ impl IlOp {
         match self {
             IlOp::Byte { byte, .. } => Some(*byte.bytecode()),
             IlOp::Load { .. } => Some(Instruction::LOAD),
-            IlOp::StorePop { .. } => Some(Instruction::StorePop),
+            IlOp::StorePop { .. } => Some(Instruction::STORE),
             IlOp::Const { .. } | IlOp::ConstPool { .. } => Some(Instruction::CONST),
             IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Some(Instruction::POP),

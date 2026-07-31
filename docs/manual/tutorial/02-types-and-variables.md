@@ -212,7 +212,7 @@ Only simple variables and certain l-values (e.g. field access on records) are va
 At run time, a `let x = expr;` binding:
 
 1. Evaluates `expr` and pushes the result on the operand stack.
-2. Writes that value into **slot** reserved for `x` (via the `StorePop` instruction).
+2. Writes that value into the **slot** reserved for `x` (via the `STORE` instruction).
 3. Advances the stack cursor so later expressions do not overwrite the slot accidentally.
 
 This matters when you bind several variables in sequence:

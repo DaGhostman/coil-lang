@@ -5,7 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::debug::{DebugLoc, ProgramDebug};
 
 /// Bump when bytecode encoding or `Byte` layout changes incompatibly.
-pub const ARCHIVE_VERSION: u32 = 30;
+pub const ARCHIVE_VERSION: u32 = 31;
 
 /// Serialized program with constant pool and bytecode.
 #[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]

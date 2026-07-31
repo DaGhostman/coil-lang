@@ -271,7 +271,7 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
         if i + 1 < ops.len()
             && let (Some(b0), Some(b1)) = (ops[i].as_encode_byte(), ops[i + 1].as_encode_byte())
             && *b0.bytecode() == Instruction::LOAD
-            && *b1.bytecode() == Instruction::StorePop
+            && (*b1.bytecode() == Instruction::STORE || *b1.bytecode() == Instruction::StorePop)
             && b0.operand_u32() == b1.operand_u32()
             && matches!(&ops[i], IlOp::Byte { .. })
             && matches!(&ops[i + 1], IlOp::Byte { .. })
