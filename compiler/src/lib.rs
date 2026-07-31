@@ -4196,6 +4196,16 @@ impl Compiler {
     /// Whether an implicit fall-through `CONST 0` is valid for `name`'s return.
     fn fallthrough_allows_zero(&self, name: &str) -> bool {
         use crate::typechecking::ty::result_ok_err;
+        // Async fn bodies complete with a sentinel; the `coroutine<…>` value
+        // is produced by MakeCoro at the call site.
+        if self.coroutine_fns.contains(name)
+            || self
+                .current_function_qualified
+                .as_ref()
+                .is_some_and(|q| self.coroutine_fns.contains(q))
+        {
+            return true;
+        }
         let Some(ret) = self.fn_return_ty(name) else {
             // No scheme (e.g. some inherent methods) — allow zero rather than
             // false-positive E0111; annotated unsafe returns are looked up.
@@ -4205,6 +4215,14 @@ impl Compiler {
             if let Some((ok, _)) = result_ok_err(&ret) {
                 return Self::ty_allows_zero_default(&ok);
             }
+            // Still emit Ok-wrap of zero when the Result peel fails.
+            return true;
+        }
+        // Bare `coroutine<…>` scheme (e.g. looked up without coroutine_fns).
+        if let crate::typechecking::Ty::App(con, _) = &ret
+            && matches!(con.as_ref(), crate::typechecking::Ty::Con(n) if n == "coroutine")
+        {
+            return true;
         }
         Self::ty_allows_zero_default(&ret)
     }
