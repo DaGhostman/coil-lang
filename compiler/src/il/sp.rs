@@ -59,8 +59,9 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
         }
         IlOp::MakeEnum { arity, .. } => Some(1 - *arity as i32),
         IlOp::BoxValue { .. } | IlOp::UnboxValue { .. } | IlOp::LoadField { .. } => Some(0),
-        // GetField: pop target+name, push value. SetField: pop value+target+name, push value.
-        IlOp::GetField { .. } | IlOp::SetField { .. } => Some(-1),
+        // GetField: pop target+name, push value (−1). SetField: pop value+target+name, push value (−2).
+        IlOp::GetField { .. } => Some(-1),
+        IlOp::SetField { .. } => Some(-2),
         // HostInvoke: pop fn_id + args tuple, push result.
         IlOp::HostInvoke { .. } => Some(-1),
         IlOp::Print { .. } => Some(-1),
@@ -173,6 +174,10 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::MakeTuple | Instruction::MakeArray => {
             Some(1 - byte.operand_u32() as i32)
         }
+        Instruction::MakeDict => {
+            let arity = (byte.operand_u32() & 0xFFFF) as i32;
+            Some(1 - 2 * arity)
+        }
         Instruction::MakeEnum => Some(1 - byte.operand_u16(1) as i32),
         Instruction::CALL | Instruction::MakeCoro => {
             let (arity, _) = byte.call_parts();
@@ -180,7 +185,10 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         }
         Instruction::TailCall => None,
         Instruction::HostInvoke => Some(-1),
-        Instruction::PRINT | Instruction::GetField | Instruction::SetField => Some(-1),
+        Instruction::PRINT | Instruction::GetField => Some(-1),
+        Instruction::SetField => Some(-2),
+        // STRING pushes the ObjString; subsequent DATA chars mutate it in place.
+        Instruction::DATA => Some(0),
         // Fail closed for the remaining long tail (FORMAT, FFI, …).
         _ => None,
     }
@@ -566,7 +574,7 @@ mod tests {
             Some(0)
         );
         assert_eq!(stack_delta(&IlOp::GetField { loc: loc() }), Some(-1));
-        assert_eq!(stack_delta(&IlOp::SetField { loc: loc() }), Some(-1));
+        assert_eq!(stack_delta(&IlOp::SetField { loc: loc() }), Some(-2));
         assert_eq!(
             stack_delta(&IlOp::HostInvoke {
                 arity: 3,
