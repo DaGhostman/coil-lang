@@ -12750,7 +12750,8 @@ fn main() {
         );
     }
 
-    /// `i = i + 1` fuses to `BinSlotImmStore(ADD)`.
+    /// `i = i + 1` fuses to `BinSlotImmStore(ADD)`, or elides the store when
+    /// `mem_fwd` + dead-store keep the value on stack for `return i`.
     #[test]
     fn assign_add_imm_fuses_bin_slot_imm_store() {
         use common::Instruction;
@@ -12760,20 +12761,26 @@ fn main() {
                return i; \
              }",
         );
+        let fused = bc.iter().any(|b| {
+            if *b.bytecode() != Instruction::BinSlotImmStore {
+                return false;
+            }
+            let (op, _src, idx) = b.bin_slot_imm_store_parts();
+            op == Instruction::ADD as u8 && (pool[idx] as u16) == 1
+        });
+        let stack_return = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::ADD as u8
+        });
         assert!(
-            bc.iter().any(|b| {
-                if *b.bytecode() != Instruction::BinSlotImmStore {
-                    return false;
-                }
-                let (op, _src, idx) = b.bin_slot_imm_store_parts();
-                op == Instruction::ADD as u8 && (pool[idx] as u16) == 1
-            }),
-            "expected BinSlotImmStore(ADD, imm=1); opcodes: {:?}",
+            fused || stack_return,
+            "expected BinSlotImmStore(ADD) or BinSlotImm(ADD) for return; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
-    /// `flags = flags & mask` fuses to `BinSlotSlotStore(BITAND)`.
+    /// `flags = flags & mask` fuses to `BinSlotSlotStore(BITAND)`, or keeps a
+    /// stack `BinSlotSlot(BITAND)` when the store is dead after `return`.
     #[test]
     fn assign_bitand_fuses_bin_slot_slot_store() {
         use common::Instruction;
@@ -12783,17 +12790,23 @@ fn main() {
                return flags; \
              }",
         );
+        let fused = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlotStore
+                && b.bin_slot_slot_store_parts().0 == Instruction::BITAND as u8
+        });
+        let stack_return = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::BITAND as u8
+        });
         assert!(
-            bc.iter().any(|b| {
-                *b.bytecode() == Instruction::BinSlotSlotStore
-                    && b.bin_slot_slot_store_parts().0 == Instruction::BITAND as u8
-            }),
-            "expected BinSlotSlotStore(BITAND) for flags = flags & mask; opcodes: {:?}",
+            fused || stack_return,
+            "expected BinSlotSlotStore/BinSlotSlot(BITAND); opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
-    /// `x = a && b` assignment fuses to `BinSlotSlotStore(AND)`.
+    /// `x = a && b` assignment fuses to `BinSlotSlotStore(AND)`, or keeps
+    /// `BinSlotSlot(AND)` when returning the computed value on stack.
     #[test]
     fn assign_logical_and_fuses_bin_slot_slot_store() {
         use common::Instruction;
@@ -12803,12 +12816,17 @@ fn main() {
                return a; \
              }",
         );
+        let fused = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlotStore
+                && b.bin_slot_slot_store_parts().0 == Instruction::AND as u8
+        });
+        let stack_return = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::AND as u8
+        });
         assert!(
-            bc.iter().any(|b| {
-                *b.bytecode() == Instruction::BinSlotSlotStore
-                    && b.bin_slot_slot_store_parts().0 == Instruction::AND as u8
-            }),
-            "expected BinSlotSlotStore(AND) for a = a && b; opcodes: {:?}",
+            fused || stack_return,
+            "expected BinSlotSlotStore/BinSlotSlot(AND); opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
