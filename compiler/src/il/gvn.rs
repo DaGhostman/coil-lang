@@ -980,6 +980,33 @@ mod tests {
     }
 
     #[test]
+    fn get_field_cse_refuses_when_set_field_intervening() {
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::SetField { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, IlOp::GetField { .. }))
+                .count(),
+            2,
+            "SetField must invalidate GetField CSE"
+        );
+    }
+
+    #[test]
     fn join_cse_drops_length_two_pure_tail() {
         let mut ops = vec![
             IlOp::Const {
