@@ -72,6 +72,27 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             continue;
         }
 
+        // Load s; Const 2; Pow → Load s; Dup; Mul (square).
+        if i + 2 < ops.len()
+            && info.sp_before(i + 1).is_known()
+            && info.sp_before(i + 2).is_known()
+            && let (IlOp::Load { slot, loc }, IlOp::Const { imm: 2, .. }, IlOp::Bin { op, .. }) =
+                (&ops[i], &ops[i + 1], &ops[i + 2])
+            && *op == Instruction::Pow
+        {
+            out.push(IlOp::Load {
+                slot: *slot,
+                loc: *loc,
+            });
+            out.push(IlOp::Dup { loc: *loc });
+            out.push(IlOp::Bin {
+                op: Instruction::MUL,
+                loc: *loc,
+            });
+            i += 3;
+            continue;
+        }
+
         out.push(ops[i].clone());
         i += 1;
     }
@@ -113,6 +134,10 @@ fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> O
     let keep = match insn {
         Instruction::ADD | Instruction::SUB if imm == 0 => true,
         Instruction::MUL | Instruction::DIV if imm == 1 => true,
+        Instruction::BITOR | Instruction::XOR | Instruction::SHL | Instruction::SHR if imm == 0 => {
+            true
+        }
+        Instruction::BITAND if imm == -1 => true,
         _ => false,
     };
     if keep {
@@ -122,6 +147,15 @@ fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> O
         })
     } else if matches!(insn, Instruction::MUL) && imm == 0 {
         Some(IlOp::Const { imm: 0, loc })
+    } else if matches!(insn, Instruction::BITAND) && imm == 0 {
+        Some(IlOp::Const { imm: 0, loc })
+    } else if matches!(insn, Instruction::Pow) && imm == 0 {
+        Some(IlOp::Const { imm: 1, loc })
+    } else if matches!(insn, Instruction::Pow) && imm == 1 {
+        Some(IlOp::Load {
+            slot: slot as u32,
+            loc,
+        })
     } else {
         None
     }
@@ -151,6 +185,28 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
                 None
             }
         }
+        // x | 0 / x ^ 0 / x << 0 / x >> 0 → x
+        (
+            Instruction::BITOR | Instruction::XOR | Instruction::SHL | Instruction::SHR,
+            x,
+            IlOp::Const { imm: 0, .. },
+        ) => {
+            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
+        // x & -1 → x; x & 0 → 0
+        (Instruction::BITAND, x, IlOp::Const { imm: -1, .. }) => {
+            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
+        (Instruction::BITAND, _, IlOp::Const { imm: 0, .. })
+        | (Instruction::BITAND, IlOp::Const { imm: 0, .. }, _) => Some(IlOp::Const { imm: 0, loc }),
         // x - x / x * 0 / 0 * x → Const 0 (same Load slot or same Const)
         (Instruction::SUB, IlOp::Load { slot: s0, .. }, IlOp::Load { slot: s1, .. })
             if s0 == s1 =>
@@ -162,6 +218,15 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         }
         (Instruction::MUL, _, IlOp::Const { imm: 0, .. })
         | (Instruction::MUL, IlOp::Const { imm: 0, .. }, _) => Some(IlOp::Const { imm: 0, loc }),
+        // x ** 0 → 1; x ** 1 → x
+        (Instruction::Pow, _, IlOp::Const { imm: 0, .. }) => Some(IlOp::Const { imm: 1, loc }),
+        (Instruction::Pow, x, IlOp::Const { imm: 1, .. }) => {
+            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -334,5 +399,53 @@ mod tests {
     fn analyze_known_gate_smoke() {
         let ops = vec![IlOp::Const { imm: 1, loc: loc() }];
         assert!(matches!(sp::analyze(&ops).sp_before(0), Sp::Known(0)));
+    }
+
+    #[test]
+    fn bitand_minus_one_folds_to_load() {
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Const { imm: -1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn pow_square_becomes_dup_mul() {
+        let mut ops = vec![
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::MUL, .. }));
+    }
+
+    #[test]
+    fn pow_zero_folds_to_one() {
+        let mut ops = vec![
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
     }
 }
