@@ -3223,8 +3223,13 @@ impl Compiler {
         false
     }
 
-    /// Pure call arg: literals, local loads, and pure arith/cmp/logic — no
-    /// Call / HostInvoke / IO / mutation / control side effects.
+    /// Pure call arg: literals and pure arith/cmp/logic — no Call / HostInvoke /
+    /// IO / mutation / control side effects.
+    ///
+    /// Bare [`Expression::Identifier`] is intentionally **not** pure here: copying
+    /// locals through temps on the shared operand/local stack (STORE extends
+    /// `tell`) before effectful args corrupted frames in large functions
+    /// (`parse_url` → Url field SEGV). Literals still reorder ahead of effects.
     fn call_arg_is_pure(expr: &Output<'_>) -> bool {
         match expr.1.as_ref() {
             Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
@@ -3234,8 +3239,8 @@ impl Compiler {
             | Expression::Float(_)
             | Expression::String(_)
             | Expression::Bool(_)
-            | Expression::Identifier(_)
             | Expression::Default(_) => true,
+            Expression::Identifier(_) => false,
             Expression::Negate(e)
             | Expression::Not(e)
             | Expression::LogicalNot(e)
