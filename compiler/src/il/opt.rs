@@ -1431,30 +1431,32 @@ mod tests {
         assert!(matches!(ops[2], IlOp::Load { slot: 3, .. }));
     }
 
-    /// Call return at height arity+1 then StorePop arity must not become Dup;Store
-    /// (TOS aliases the local on the shared stack).
+    /// Nested CALL resets height to 1; StorePop to a higher slot must not
+    /// become Dup;Store (arithmetic `1 - arity` would overestimate height).
     #[test]
     fn mem_fwd_refuses_post_call_store_that_aliases_tos() {
         let loc = common::DebugLoc::unknown();
         let mut ops = vec![
             IlOp::Load { slot: 0, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Load { slot: 2, loc },
             IlOp::Entry {
                 kind: crate::il::op::EntryKind::Call,
-                arity: 1,
+                arity: 0,
                 target: Label(0),
                 loc,
             },
-            IlOp::StorePop { slot: 2, loc },
-            IlOp::Load { slot: 2, loc },
+            IlOp::StorePop { slot: 4, loc },
+            IlOp::Load { slot: 4, loc },
             IlOp::Return { loc },
         ];
-        // Two args already on stack at body entry (probe-like).
-        mem_fwd(&mut ops, 2);
+        // Deep frame; nullary CALL must not leave modeled height 6.
+        mem_fwd(&mut ops, 5);
         assert!(
-            matches!(ops[2], IlOp::StorePop { slot: 2, .. }),
-            "must keep StorePop;Load when height aliases slot"
+            matches!(ops[4], IlOp::StorePop { slot: 4, .. }),
+            "must keep StorePop;Load when CALL resets height to 1"
         );
-        assert!(matches!(ops[3], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[5], IlOp::Load { slot: 4, .. }));
     }
 
     #[test]
@@ -2344,24 +2346,15 @@ mod tests {
 
     #[test]
     fn mem_fwd_store_pop_load_becomes_dup_store() {
+        // Need height before StorePop > slot+1 (cursor-safe Dup;Store).
+        let loc = common::DebugLoc::unknown();
         let mut ops = vec![
-            IlOp::Const {
-                imm: 7,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::StorePop {
-                slot: 3,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::Load {
-                slot: 3,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::Return {
-                loc: common::DebugLoc::unknown(),
-            },
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 3, loc },
+            IlOp::Load { slot: 3, loc },
+            IlOp::Return { loc },
         ];
-        mem_fwd(&mut ops, 0);
+        mem_fwd(&mut ops, 5);
         assert!(matches!(ops[1], IlOp::Dup { .. }));
         assert!(matches!(ops[2], IlOp::StorePop { slot: 3, .. }));
     }
@@ -2514,25 +2507,15 @@ mod tests {
 
     #[test]
     fn mem_fwd_then_dead_store_via_optimize() {
-        // StorePop;Load same slot → Dup;StorePop, then dead when unused.
+        // StorePop;Load same slot → Dup;StorePop (needs h > slot+1), then dead.
+        let loc = common::DebugLoc::unknown();
         let mut ops = vec![
-            IlOp::Const {
-                imm: 5,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::StorePop {
-                slot: 1,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::Load {
-                slot: 1,
-                loc: common::DebugLoc::unknown(),
-            },
-            IlOp::Return {
-                loc: common::DebugLoc::unknown(),
-            },
+            IlOp::Const { imm: 5, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
         ];
-        optimize(
+        optimize_at(
             &mut ops,
             &OptimizeOptions {
                 jump_thread: false,
@@ -2545,6 +2528,7 @@ mod tests {
                 bin_join_convoy: false,
                 multi_op_join_convoy: false,
             },
+            3,
         );
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Load { .. })));
