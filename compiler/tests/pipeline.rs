@@ -5153,7 +5153,7 @@ fn main() {
     assert_eq!(run_example_src(src), "7,30");
 }
 
-/// Repeated GetField of the same name materializes the key once and LOADs it.
+/// Repeated GetField of the same name materializes the key once and reuses the value.
 #[test]
 fn repeated_field_key_reuses_prologue_temp() {
     let src = r#"
@@ -5170,13 +5170,29 @@ fn main() {
 "#;
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
-    let string_ops = bytecode
-        .iter()
-        .filter(|b| matches!(b.bytecode(), common::Instruction::STRING))
-        .count();
-    assert_eq!(
-        string_ops, 1,
-        "twice(p.x + p.x) should emit STRING \"x\" once in the prologue"
+    // Prologue: STRING "x"; STORE temp (ctor also emits STRING "x" for SetField).
+    let has_string_x_store = bytecode.windows(3).any(|w| {
+        matches!(w[0].bytecode(), common::Instruction::STRING)
+            && w[0].operand_u32() == 1
+            && matches!(w[1].bytecode(), common::Instruction::DATA)
+            && w[1].operand_u32() == u32::from(b'x')
+            && matches!(
+                w[2].bytecode(),
+                common::Instruction::STORE | common::Instruction::StorePop
+            )
+    });
+    assert!(
+        has_string_x_store,
+        "p.x + p.x should materialize STRING \"x\" into a temp slot"
+    );
+    // Value reuse: GetField then DUPLICATE (not a second GetField of x).
+    let has_getfield_dup = bytecode.windows(2).any(|w| {
+        matches!(w[0].bytecode(), common::Instruction::GetField)
+            && matches!(w[1].bytecode(), common::Instruction::DUPLICATE)
+    });
+    assert!(
+        has_getfield_dup,
+        "p.x + p.x should GetField once then DUPLICATE"
     );
     assert_eq!(run_example_src(src), "6");
 }
