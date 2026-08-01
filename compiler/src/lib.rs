@@ -12472,7 +12472,6 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
-enum Option<T> { None, Some(T) }
 fn foo() -> int {
     return match Option::Some(1) {
         Option::None => 0,
@@ -12481,17 +12480,27 @@ fn foo() -> int {
 }
 "#,
         );
-        // IL: join Label is the fuse barrier (DUPLICATE;POP is stack_dce'd).
-        // Peephole safety = stacked arm value not dropped by ConstReturnImm.
+        // clone_shared_return may fuse the const arm to ConstReturnImm, but the
+        // payload arm must RETURN locally — never JMP into ConstReturnImm (that
+        // would ignore the stacked Unpack value).
+        let unpack = bc
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::Unpack))
+            .expect("expected Unpack on Some arm");
         assert!(
-            !bc.iter()
-                .any(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm)),
-            "return match join must not lower to ConstReturnImm"
+            matches!(*bc[unpack + 1].bytecode(), Instruction::RETURN),
+            "Some arm must RETURN immediately after Unpack; got {:?}",
+            bc[unpack + 1].bytecode()
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(*b.bytecode(), Instruction::JMP)),
+            "payload arm must not JMP into a fused const return"
         );
         assert!(
             bc.iter()
-                .any(|b| matches!(*b.bytecode(), Instruction::RETURN)),
-            "return match must still end in RETURN"
+                .any(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm))
+                || bc.iter().any(|b| matches!(*b.bytecode(), Instruction::RETURN)),
+            "None arm should ConstReturnImm or shared RETURN"
         );
     }
 
