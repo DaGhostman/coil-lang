@@ -5738,28 +5738,27 @@ mod tests {
     #[test]
     fn bin_slot_imm_store_extends_cursor_and_preserves_higher() {
         let add = Instruction::ADD as u8;
-        // dest=2, imm=1 — writes past arity-1 frame cursor
+        // dest=2, imm=1 — writes past the current cursor after a single local
         let packed = (2u64 << 32) | 1u64;
         let mut vm = Machine::<32>::default();
         vm.run_with_pool(
             &[
                 const_int(10),
-                Byte::new(Instruction::CALL).with_call_packed(1, 3),
-                Byte::new(Instruction::HALT),
+                store_pop(0),
                 // slot0=10; BinSlotImmStore ADD → slot2=11 (extends cursor)
                 Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(add, 0, 0),
                 // Reassign low slot; must not truncate past slot 2.
                 const_int(99),
                 store_pop(0),
-                load(2),
                 load(0),
-                Byte::new(Instruction::RETURN),
+                load(2),
+                Byte::new(Instruction::HALT),
             ],
             &[packed],
             0,
         );
-        assert_eq!(vm.pop().as_int(), 99);
-        assert_eq!(vm.pop().as_int(), 11);
+        assert_eq!(vm.pop().as_int(), 11, "dest slot must hold fused result");
+        assert_eq!(vm.pop().as_int(), 99, "low slot reassignment must stick");
     }
 
     /// BinSlotSlotStore BITAND matches the compiler's `flags = flags & mask` fuse.

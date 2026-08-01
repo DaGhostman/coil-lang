@@ -1753,10 +1753,17 @@ impl Compiler {
         // Compare+branch diamond: emit CFG into `self.bytecode`, stash the
         // result in a temp, and leave a LOAD in `bytecode` so parents that
         // accumulate into a local Vec keep program order.
+        //
+        // On emit failure, roll back and clear arg prep so peel/call can
+        // re-emit cleanly — a partial diamond leaves `JMP end_label` unbound
+        // (resolves to PC 0) and poisons later fallbacks.
         if Self::is_tiny_inline_diamond_il(&ops) {
             let raw = self.bytecode.code_slice_raw_ops(start, end);
+            let rollback = self.bytecode.len();
             self.bytecode.append(bytecode);
             if !self.emit_cfg_inline_body(&raw, &temps, /*allow_calls=*/ false) {
+                self.bytecode.truncate(rollback);
+                bytecode.clear();
                 return false;
             }
             let result = self.alloc_temp_slot();
@@ -1847,8 +1854,11 @@ impl Compiler {
             temps.push(tmp);
         }
         let raw = self.bytecode.code_slice_raw_ops(start, end);
+        let rollback = self.bytecode.len();
         self.bytecode.append(bytecode);
         if !self.emit_cfg_inline_body(&raw, &temps, /*allow_calls=*/ true) {
+            self.bytecode.truncate(rollback);
+            bytecode.clear();
             return false;
         }
         let result = self.alloc_temp_slot();
@@ -16493,4 +16503,32 @@ fn main() {
         );
     }
 
+
+    /// Failed diamond inline must not leave a JMP to PC 0 before peel/call fallback.
+    #[test]
+    fn diamond_inline_failure_does_not_emit_jmp_to_pc_zero() {
+        use common::Instruction;
+        // Helper call in the else arm refuses tiny-inline diamond emit; peel/call
+        // must still produce a sane program (no unbound join → JMP 0).
+        let (bc, _pool) = compile_src(
+            "fn other(int n) -> int { return n; } \
+             fn base(int n) -> int { \
+               if n <= 0 { return 1; } \
+               return other(n) + 1; \
+             } \
+             fn main() { print \"%i\", base(0); }",
+        );
+        let bad: Vec<_> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                matches!(b.bytecode(), Instruction::JMP) && b.operand_u32() == 0
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "unbound diamond/peel join must not resolve to PC 0; JMP at {bad:?}"
+        );
+    }
 }
