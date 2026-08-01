@@ -3463,13 +3463,13 @@ impl Compiler {
             Some(
                 Instruction::STORE
                     | Instruction::StorePop
-                    | Instruction::SetField
-                    | Instruction::StoreIndex
                     | Instruction::StoreStatic
+                    | Instruction::POP
             )
         ) {
-            // `x = expr;` / compound updates already consumed the
-            // RHS via StorePop/SetField/StoreIndex/StoreStatic — no trailing POP.
+            // Slot/static stores consume the RHS; a prior POP already discarded.
+            // SetField / StoreIndex push the value back — still need POP when
+            // they are last (handled by the final branch).
         } else if !matches!(
             bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
@@ -6797,6 +6797,8 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
                 bytecode.push_set_field();
+                // SetField leaves the value; caller uses leave_value_on_stack /
+                // discard_statement_value to keep or POP.
             }
             Expression::Index(arr, Some(idx)) => {
                 // Always stash the RHS — `StoreIndex` pops value/index/array.
@@ -10396,6 +10398,7 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push_set_field();
+                    // Value left on stack for expression result; ExprStatement POPs.
                 }
                 Expression::Index(arr, None) => {
                     bytecode.append(&mut self.do_compile(arr));
@@ -12387,6 +12390,41 @@ fn main() {
     }
 
     /// `x ** 0` folds to const 1.
+    
+    #[test]
+    fn dict_hot_loop_hoists_field_name_strings() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+            fn main() {
+                let d = { x: 0, y: 0 };
+                let i = 0;
+                while (i < 10) {
+                    d.x = d.x + 1;
+                    d.y = d.y + 2;
+                    i = i + 1;
+                }
+                print "%i", d.x + d.y;
+            }
+            "#,
+        );
+        // Count STRING ops after the loop header fuse (BinSlotImmJmpf).
+        let jmpf = bc.iter().position(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf));
+        let Some(j) = jmpf else {
+            panic!("no loop header");
+        };
+        let latch = bc.iter().rposition(|b| matches!(b.bytecode(), Instruction::JMP)).unwrap();
+        let strings_in_loop = bc[j..=latch]
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STRING))
+            .count();
+        assert_eq!(
+            strings_in_loop, 0,
+            "field-name STRING should be hoisted out of loop; slice={:?}",
+            bc[j..=latch].iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn pow_zero_emits_const_one() {
         use common::Instruction;
