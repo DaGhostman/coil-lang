@@ -197,6 +197,35 @@ pub fn strength_reduced_inner<'a>(
         Expression::Sub(lhs, rhs) if zero_int(rhs).is_some() => Some(lhs),
         Expression::Mul(lhs, rhs) => one_int(rhs).map(|_| lhs).or_else(|| one_int(lhs).map(|_| rhs)),
         Expression::Div(lhs, rhs) if one_int(rhs).is_some() => Some(lhs),
+        // `x ** 1` → `x` (exponent identity).
+        Expression::Pow(lhs, rhs) if one_int(rhs).is_some() => Some(lhs),
+        _ => None,
+    }
+}
+
+/// Integer `x ** k` strength-reduction kind for codegen / IL peeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrengthPow {
+    /// `x ** 0` → `1` (including `0 ** 0`, matching VM `i32::pow`).
+    ConstOne,
+    /// `x ** 2` → `x * x` (caller must ensure base is side-effect free / dup-safe).
+    Square,
+}
+
+/// If `expr` is `base ** k` with small constant `k`, return `(base, kind)`.
+pub fn strength_pow_int<'a>(
+    expr: &'a (SimpleSpan, Box<Expression<'a>>),
+    env: &HashMap<String, ConstValue>,
+) -> Option<(&'a Output<'a>, StrengthPow)> {
+    let Expression::Pow(lhs, rhs) = expr.1.as_ref() else {
+        return None;
+    };
+    let ConstValue::Int(k) = eval_expr(rhs, env)? else {
+        return None;
+    };
+    match k {
+        0 => Some((lhs, StrengthPow::ConstOne)),
+        2 => Some((lhs, StrengthPow::Square)),
         _ => None,
     }
 }
@@ -548,6 +577,36 @@ mod tests {
         ));
         assert!(matches!(
             strength_reduced_inner(&mul1).map(|e| e.1.as_ref()),
+            Some(Expression::Identifier("x"))
+        ));
+    }
+
+    #[test]
+    fn strength_pow_int_square_and_zero() {
+        let env = HashMap::new();
+        let sq = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Pow(id_expr("x"), int_expr(2))),
+        );
+        let z = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Pow(id_expr("x"), int_expr(0))),
+        );
+        let id = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Pow(id_expr("x"), int_expr(1))),
+        );
+        let (base, kind) = strength_pow_int(&sq, &env).expect("**2");
+        assert!(matches!(base.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(kind, StrengthPow::Square);
+        assert_eq!(
+            strength_pow_int(&z, &env).map(|(_, k)| k),
+            Some(StrengthPow::ConstOne)
+        );
+        // **1 is identity via strength_reduced_inner, not strength_pow_int.
+        assert_eq!(strength_pow_int(&id, &env), None);
+        assert!(matches!(
+            strength_reduced_inner(&id).map(|e| e.1.as_ref()),
             Some(Expression::Identifier("x"))
         ));
     }
