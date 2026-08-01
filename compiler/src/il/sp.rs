@@ -638,6 +638,51 @@ mod tests {
     }
 
     #[test]
+    fn make_dict_and_data_stack_deltas() {
+        use common::Byte;
+        // MakeDict arity=2: pop 4 (k,v,k,v), push dict → −3.
+        assert_eq!(
+            stack_delta(&IlOp::byte(
+                Byte::new(Instruction::MakeDict).with_operand_u32(2)
+            )),
+            Some(1 - 2 * 2)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::byte(
+                Byte::new(Instruction::MakeDict).with_operand_u32(0)
+            )),
+            Some(1)
+        );
+        // DATA mutates the STRING already on the stack (net 0).
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'a' as u32))),
+            Some(0)
+        );
+        let ops = vec![
+            IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
+            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(0), Sp::Known(0));
+        assert_eq!(info.sp_before(1), Sp::Known(1));
+        assert_eq!(info.sp_before(2), Sp::Known(1));
+    }
+
+    #[test]
+    fn set_field_byte_matches_typed_delta() {
+        use common::Byte;
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::SetField))),
+            Some(-2)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::GetField))),
+            Some(-1)
+        );
+    }
+
+    #[test]
     fn call_entry_resets_height_to_one() {
         // Nested CALL returns with tell = frame_base + 1 regardless of arity
         // / pre-call height (VM seeks then pushes the result).
