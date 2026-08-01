@@ -686,6 +686,14 @@ struct Context {
 /// fresh compile (safe to clear the shared constant pool).
 pub const PROLOGUE_BYTECODE_LEN: usize = 3;
 
+/// Matched base-case opening for caller-side predicate peel (2B).
+struct PredicatePeel {
+    cond: Vec<IlOp>,
+    then_value: IlOp,
+    /// One past the highest callee slot referenced by cond/then.
+    arity_hint: usize,
+}
+
 pub struct Compiler {
     namespace: String,
     /// Stack IL during emit; lowered `Vec<Byte>` after [`Self::finalize_bytecode`].
@@ -1849,6 +1857,432 @@ impl Compiler {
         true
     }
 
+    /// Caller-side predicate peel (2B): when callee opens with compare+JMPF and an
+    /// immediate/slot base return, evaluate that check before `CALL` so base cases
+    /// skip the frame. Nested/false path still `CALL`s.
+    fn try_emit_predicate_peel_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+        is_indirect: bool,
+    ) -> bool {
+        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+            return false;
+        };
+        let lookup = strip_overload_key(fqn).to_string();
+        if self.checker.fn_has_rest(&lookup) {
+            return false;
+        }
+        if self.coroutine_fns.contains(fqn) || self.coroutine_fns.contains(&lookup) {
+            return false;
+        }
+        if self.checker.is_generic_fn(&lookup) {
+            return false;
+        }
+        let ops = self.bytecode.code_slice_raw_ops(start, end);
+        let Some(peel) = Self::match_predicate_peel_shape(&ops) else {
+            return false;
+        };
+        drop(ops);
+        let arg_slice = args.unwrap_or(&[]);
+        let flat = self.flatten_call_args_for_emit(arg_slice);
+        if flat.len() < peel.arity_hint {
+            return false;
+        }
+        // Pre-check slot remapping against arity (temps will be 1:1 with flat).
+        let fake_temps: Vec<u32> = (0..flat.len() as u32).collect();
+        if !Self::remap_peel_ops_ok(&peel, &fake_temps) {
+            return false;
+        }
+        // Evaluate args into temps (reuse pure-first when mixed).
+        let mut temps = Vec::with_capacity(flat.len());
+        if Self::should_reorder_pure_call_args(&flat) {
+            let mut slots = vec![0u32; flat.len()];
+            for (i, arg) in flat.iter().enumerate() {
+                if !Self::call_arg_is_pure(arg) {
+                    continue;
+                }
+                let value = match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v,
+                    _ => arg,
+                };
+                bytecode.append(&mut self.do_compile(value));
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                slots[i] = tmp;
+            }
+            for (i, arg) in flat.iter().enumerate() {
+                if Self::call_arg_is_pure(arg) {
+                    continue;
+                }
+                let value = match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v,
+                    _ => arg,
+                };
+                bytecode.append(&mut self.do_compile(value));
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                slots[i] = tmp;
+            }
+            temps = slots;
+        } else {
+            for arg in &flat {
+                let value = match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v,
+                    _ => arg,
+                };
+                bytecode.append(&mut self.do_compile(value));
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                temps.push(tmp);
+            }
+        }
+
+        // Emit into self.bytecode then leave a LOAD of the result in `bytecode`
+        // so parents that accumulate into a local Vec keep program order.
+        self.bytecode.append(bytecode);
+        let do_call = self.bytecode.fresh_label();
+        let join = self.bytecode.fresh_label();
+
+        // Remapped condition; JMPF → do_call (false path continues into CALL).
+        for op in &peel.cond {
+            if !self.emit_peel_remapped_op(op, &temps) {
+                return false;
+            }
+        }
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: do_call,
+            loc: DebugLoc::unknown(),
+        });
+        // Base-case then-arm value.
+        if !self.emit_peel_remapped_op(&peel.then_value, &temps) {
+            return false;
+        }
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: join,
+            loc: DebugLoc::unknown(),
+        });
+        self.bytecode.bind_label(do_call);
+        for &tmp in &temps {
+            self.bytecode.push_load(tmp);
+        }
+        let arity = temps.len() as u32;
+        if is_indirect {
+            Self::emit_call_indirect(&mut self.bytecode, target_offset, arity);
+        } else {
+            self.bytecode.push(
+                Byte::new(Instruction::CALL).with_call_packed(arity, target_offset),
+            );
+        }
+        self.bytecode.bind_label(join);
+        let result = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(result);
+        bytecode.push_load(result);
+        true
+    }
+
+    /// Opening shape: `cond…; JumpIfFalse; (Const|Load) [; Return]; Label? …`
+    /// with an imm/slot base return. `arity_hint` is 1 + max slot referenced.
+    fn match_predicate_peel_shape(ops: &[IlOp]) -> Option<PredicatePeel> {
+        // Skip leading labels.
+        let mut i = 0usize;
+        while i < ops.len() && matches!(ops[i], IlOp::Label(_)) {
+            i += 1;
+        }
+        if i >= ops.len() {
+            return None;
+        }
+        let jump_idx = (i..ops.len()).find(|&j| {
+            matches!(
+                ops[j],
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    ..
+                }
+            )
+        })?;
+        if jump_idx == i {
+            return None;
+        }
+        let cond = &ops[i..jump_idx];
+        // Cond must be pure producers only (no control / calls / effects).
+        if cond.iter().any(|op| {
+            op.is_control()
+                || matches!(
+                    op,
+                    IlOp::HostInvoke { .. }
+                        | IlOp::Print { .. }
+                        | IlOp::Entry { .. }
+                        | IlOp::SetField { .. }
+                        | IlOp::GetField { .. }
+                )
+                || matches!(
+                    op.as_plain_byte(),
+                    Some(b) if matches!(
+                        *b.bytecode(),
+                        Instruction::CALL
+                            | Instruction::TailCall
+                            | Instruction::HostInvoke
+                            | Instruction::PRINT
+                            | Instruction::FfiInvoke
+                    )
+                )
+        }) {
+            return None;
+        }
+        // Pure cond ops: Load/Const/Bin/BinSlot*/Dup/ConstPool.
+        if !cond.iter().all(|op| {
+            matches!(
+                op,
+                IlOp::Load { .. }
+                    | IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::Dup { .. }
+                    | IlOp::Bin { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. }
+            ) || matches!(
+                op.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::LOAD
+                        | Instruction::CONST
+                        | Instruction::DUPLICATE
+                        | Instruction::ADD
+                        | Instruction::SUB
+                        | Instruction::MUL
+                        | Instruction::DIV
+                        | Instruction::MOD
+                        | Instruction::EQ
+                        | Instruction::NEQ
+                        | Instruction::LE
+                        | Instruction::LEQ
+                        | Instruction::GT
+                        | Instruction::GEQ
+                        | Instruction::AND
+                        | Instruction::OR
+                        | Instruction::BITAND
+                        | Instruction::BITOR
+                        | Instruction::SHL
+                        | Instruction::SHR
+                        | Instruction::XOR
+                        | Instruction::BinSlotImm
+                        | Instruction::BinSlotSlot
+                )
+            )
+        }) {
+            return None;
+        }
+        let then_start = jump_idx + 1;
+        if then_start >= ops.len() {
+            return None;
+        }
+        // Then: fused *Return, or Const/Load + Return, or sole Const/Load before label.
+        let (then_value, then_end) = if Self::inline_is_fused_return(&ops[then_start]) {
+            match &ops[then_start] {
+                IlOp::ConstReturnImm { imm, loc } => (
+                    IlOp::Const {
+                        imm: *imm as i32,
+                        loc: *loc,
+                    },
+                    then_start,
+                ),
+                IlOp::LoadReturnSlot { slot, loc } => (
+                    IlOp::Load {
+                        slot: *slot,
+                        loc: *loc,
+                    },
+                    then_start,
+                ),
+                _ => return None, // BinReturn not an imm/slot base
+            }
+        } else {
+            let v = match &ops[then_start] {
+                IlOp::Const { .. } | IlOp::Load { .. } => ops[then_start].clone(),
+                other => {
+                    if let Some(b) = other.as_plain_byte() {
+                        match *b.bytecode() {
+                            Instruction::CONST => IlOp::Const {
+                                imm: b.operand_u32() as i32,
+                                loc: DebugLoc::unknown(),
+                            },
+                            Instruction::LOAD => {
+                                let slot = b.load_store_single_slot()?;
+                                IlOp::Load {
+                                    slot,
+                                    loc: DebugLoc::unknown(),
+                                }
+                            }
+                            _ => return None,
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            let mut end = then_start;
+            if then_start + 1 < ops.len() && ops[then_start + 1].is_plain_return() {
+                end = then_start + 1;
+            } else if then_start + 1 < ops.len()
+                && matches!(ops[then_start + 1], IlOp::Label(_))
+            {
+                // fall through after value (unusual); still ok if JMPF target
+            } else if then_start + 1 < ops.len()
+                && !matches!(ops[then_start + 1], IlOp::Label(_))
+                && !ops[then_start + 1].is_plain_return()
+            {
+                return None;
+            }
+            (v, end)
+        };
+        // After then-arm there should be more body (otherwise tiny-inline diamond
+        // would have taken it). Require at least one emitting op past the peel.
+        let after = then_end + 1;
+        let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
+        if !has_rest {
+            return None;
+        }
+        let mut arity_hint = 0usize;
+        let bump_slot = |slot: u32, hint: &mut usize| {
+            *hint = (*hint).max(slot as usize + 1);
+        };
+        for op in cond {
+            match op {
+                IlOp::Load { slot, .. } => bump_slot(*slot, &mut arity_hint),
+                IlOp::BinSlotImm { slot, .. } => bump_slot(*slot as u32, &mut arity_hint),
+                IlOp::BinSlotSlot { a, b, .. } => {
+                    bump_slot(*a as u32, &mut arity_hint);
+                    bump_slot(*b as u32, &mut arity_hint);
+                }
+                _ => {}
+            }
+        }
+        if let IlOp::Load { slot, .. } = &then_value {
+            bump_slot(*slot, &mut arity_hint);
+        }
+        Some(PredicatePeel {
+            cond: cond.to_vec(),
+            then_value,
+            arity_hint,
+        })
+    }
+
+    fn remap_peel_ops_ok(peel: &PredicatePeel, temps: &[u32]) -> bool {
+        let ok_slot = |s: u32| (s as usize) < temps.len();
+        for op in &peel.cond {
+            match op {
+                IlOp::Load { slot, .. } if !ok_slot(*slot) => return false,
+                IlOp::BinSlotImm { slot, .. } if !ok_slot(*slot as u32) => return false,
+                IlOp::BinSlotSlot { a, b, .. }
+                    if !ok_slot(*a as u32) || !ok_slot(*b as u32) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        match &peel.then_value {
+            IlOp::Load { slot, .. } => ok_slot(*slot),
+            IlOp::Const { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn emit_peel_remapped_op(&mut self, op: &IlOp, temps: &[u32]) -> bool {
+        match op {
+            IlOp::Load { slot, loc } => {
+                let Some(&tmp) = temps.get(*slot as usize) else {
+                    return false;
+                };
+                self.bytecode.push_op(IlOp::Load {
+                    slot: tmp,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::Const { imm, loc } => {
+                self.bytecode.push_op(IlOp::Const {
+                    imm: *imm,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::ConstPool { idx, loc } => {
+                self.bytecode.push_op(IlOp::ConstPool {
+                    idx: *idx,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::Dup { loc } => {
+                self.bytecode.push_op(IlOp::Dup { loc: *loc });
+                true
+            }
+            IlOp::Bin { op: bin, loc } => {
+                self.bytecode.push_op(IlOp::Bin {
+                    op: *bin,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::BinSlotImm {
+                op: bin,
+                slot,
+                imm,
+                loc,
+            } => {
+                let Some(&tmp) = temps.get(*slot as usize) else {
+                    return false;
+                };
+                if tmp > u8::MAX as u32 {
+                    return false;
+                }
+                self.bytecode.push_op(IlOp::BinSlotImm {
+                    op: *bin,
+                    slot: tmp as u8,
+                    imm: *imm,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::BinSlotSlot {
+                op: bin,
+                a,
+                b,
+                loc,
+            } => {
+                let Some(&ta) = temps.get(*a as usize) else {
+                    return false;
+                };
+                let Some(&tb) = temps.get(*b as usize) else {
+                    return false;
+                };
+                if ta > u8::MAX as u32 || tb > u8::MAX as u32 {
+                    return false;
+                }
+                self.bytecode.push_op(IlOp::BinSlotSlot {
+                    op: *bin,
+                    a: ta as u8,
+                    b: tb as u8,
+                    loc: *loc,
+                });
+                true
+            }
+            other => {
+                if let Some(b) = other.as_plain_byte() {
+                    self.bytecode.push(b);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn body_uses_slot_past(ops: &[IlOp], arity: usize) -> bool {
         for op in ops {
             match op {
@@ -2714,6 +3148,10 @@ impl Compiler {
 
     /// Emit value args for a call, packing rest into `MakeArray` when needed.
     /// Returns the CALL arity (fixed + 1 if rest packed).
+    ///
+    /// When args mix pure and effectful expressions, evaluates pure args into
+    /// temps first, then effectful args, then restores original CALL order via
+    /// `LOAD`s (2A pure-arg reorder).
     fn emit_call_args_with_rest(
         &mut self,
         fn_name: &str,
@@ -2723,6 +3161,10 @@ impl Compiler {
     ) -> u32 {
         self.consume_spread_emit_ids(args);
         let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
+
+        if !pack_rest && Self::should_reorder_pure_call_args(&fixed) {
+            return self.emit_call_args_pure_first(&fixed, bytecode, box_generic);
+        }
 
         for arg in &fixed {
             self.append_with_existential_pack(bytecode, arg);
@@ -2749,6 +3191,112 @@ impl Compiler {
             return (fixed.len() + 1) as u32;
         }
         fixed.len() as u32
+    }
+
+    /// True when `args` has both a pure and an effectful argument.
+    fn should_reorder_pure_call_args(args: &[Output<'_>]) -> bool {
+        if args.len() < 2 {
+            return false;
+        }
+        let mut saw_pure = false;
+        let mut saw_effect = false;
+        for arg in args {
+            if Self::call_arg_is_pure(arg) {
+                saw_pure = true;
+            } else {
+                saw_effect = true;
+            }
+            if saw_pure && saw_effect {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Pure call arg: literals, local loads, and pure arith/cmp/logic — no
+    /// Call / HostInvoke / IO / mutation / control side effects.
+    fn call_arg_is_pure(expr: &Output<'_>) -> bool {
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
+                Self::call_arg_is_pure(v)
+            }
+            Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Bool(_)
+            | Expression::Identifier(_)
+            | Expression::Default(_) => true,
+            Expression::Negate(e)
+            | Expression::Not(e)
+            | Expression::LogicalNot(e)
+            | Expression::Positive(e)
+            | Expression::Cast(e, _) => Self::call_arg_is_pure(e),
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Pow(a, b)
+            | Expression::Shl(a, b)
+            | Expression::Shr(a, b)
+            | Expression::Xor(a, b)
+            | Expression::And(a, b)
+            | Expression::BitAnd(a, b)
+            | Expression::Or(a, b)
+            | Expression::BitOr(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Geq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Gt(a, b) => Self::call_arg_is_pure(a) && Self::call_arg_is_pure(b),
+            Expression::Array(items) | Expression::Tuple(items) | Expression::List(items) => {
+                items.iter().all(Self::call_arg_is_pure)
+            }
+            _ => false,
+        }
+    }
+
+    /// Evaluate pure args into temps, then effectful args, then `LOAD` in order.
+    fn emit_call_args_pure_first(
+        &mut self,
+        args: &[Output<'_>],
+        bytecode: &mut Vec<Byte>,
+        box_generic: bool,
+    ) -> u32 {
+        let mut temps = vec![0u32; args.len()];
+        for (i, arg) in args.iter().enumerate() {
+            if !Self::call_arg_is_pure(arg) {
+                continue;
+            }
+            self.append_with_existential_pack(bytecode, arg);
+            if box_generic {
+                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                }
+            }
+            let tmp = self.alloc_temp_slot();
+            bytecode.push_store_pop(tmp);
+            temps[i] = tmp;
+        }
+        for (i, arg) in args.iter().enumerate() {
+            if Self::call_arg_is_pure(arg) {
+                continue;
+            }
+            self.append_with_existential_pack(bytecode, arg);
+            if box_generic {
+                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                }
+            }
+            let tmp = self.alloc_temp_slot();
+            bytecode.push_store_pop(tmp);
+            temps[i] = tmp;
+        }
+        for &tmp in &temps {
+            bytecode.push_load(tmp);
+        }
+        args.len() as u32
     }
 
     fn next_emit_id(&mut self) -> Option<crate::typechecking::id::NodeId> {
@@ -8486,6 +9034,24 @@ impl Compiler {
                             return bytecode;
                         }
 
+                        // Caller-side base-case peel: cmp-jmp before CALL when
+                        // the callee opens with fused/unfused compare + imm/slot return.
+                        let peel_indirect =
+                            is_instance_method_fqn(&self.checker, &lookup_name);
+                        if !is_generic
+                            && !self.coroutine_fns.contains(&n)
+                            && !self.coroutine_fns.contains(&lookup_name)
+                            && self.try_emit_predicate_peel_call(
+                                &n,
+                                Some(arg_slice),
+                                &mut bytecode,
+                                target_offset as u32,
+                                peel_indirect,
+                            )
+                        {
+                            return bytecode;
+                        }
+
                         // Partial application → MakeFn (not CALL).
                         let (fa, is_rest) = self
                             .checker
@@ -13510,6 +14076,8 @@ fn main() {
     fn call_arg_prep_packs_three_loads() {
         use common::Instruction;
         // Two early-return guards → not a single tiny-inline diamond.
+        // Predicate peel (2B) still applies: args land in temps, then a packed
+        // LOAD of those temps feeds the CALL.
         let (bc, _pool) = compile_src(
             "fn add(int a, int b, int c) -> int { \
  if a < 0 { return 0; } \
@@ -13527,10 +14095,13 @@ fn main() {
             matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3
         });
         let packed = packed.expect("expected one LOAD with n=3 for add(x,y,z) arg prep");
+        let (n, s0, s1, s2) = packed.load_store_parts();
+        assert_eq!(n, 3, "packed LOAD must carry three slots");
+        // Locals x,y,z are 0,1,2; peel stores them into consecutive temps 3,4,5.
         assert_eq!(
-            packed.load_store_parts(),
-            (3, 0, 1, 2),
-            "arg prep should load locals x,y,z in order"
+            (s0, s1, s2),
+            (3, 4, 5),
+            "peel arg prep should LOAD temps in original order"
         );
     }
 
@@ -13991,6 +14562,95 @@ fn main() { print \"%i\", add(3, 4); }",
             )),
             "self-unroll should copy compare/branch into caller; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pure-arg reorder (2A): pure args are stored before effectful arg codegen.
+    #[test]
+    fn pure_arg_reorder_stores_pure_before_effectful() {
+        use common::Instruction;
+        // `sink` prints (not tiny-inlinable) so the CALL path runs reorder.
+        let (bc, _pool) = compile_src(
+            "fn effect() -> int { print \"%i\", 7; return 2; } \
+             fn sink(int a, int b) -> int { print \"%i\", a + b; return a + b; } \
+             fn main() { print \"%i\", sink(effect(), 10); }",
+        );
+        // Prologue CALL is index 0 (arity 0). The effect() CALL is the next arity-0 CALL.
+        let effect_call = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 0)
+            .nth(1)
+            .map(|(i, _)| i);
+        let pure_const = bc.iter().position(|b| {
+            matches!(b.bytecode(), Instruction::CONST)
+                && (b.operand_u32() & Byte::POOL_FLAG) == 0
+                && b.operand_u32() as i32 == 10
+        });
+        let Some(effect_i) = effect_call else {
+            panic!(
+                "expected arity-0 CALL to effect after prologue; opcodes: {:?}",
+                bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            );
+        };
+        let Some(pure_i) = pure_const else {
+            panic!(
+                "expected CONST 10 for pure arg; opcodes: {:?}",
+                bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            pure_i < effect_i,
+            "pure CONST 10 (at {pure_i}) must be emitted before effect CALL (at {effect_i}); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2
+            }),
+            "expected CALL sink with arity 2"
+        );
+    }
+
+    /// Predicate peel (2B): base-case cmp-jmp is duplicated at the call site.
+    #[test]
+    fn predicate_peel_emits_cmp_jmp_before_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn other(int n) -> int { return n; } \
+             fn base(int n) -> int { \
+               if n <= 0 { return 1; } \
+               return other(n) + 1; \
+             } \
+             fn main() { print \"%i\", base(5); }",
+        );
+        let cmp_jmps: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPF
+                        | Instruction::CmpJmpf
+                        | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            cmp_jmps.len() >= 2,
+            "peel + callee body should yield ≥2 cmp-jmps; got {} opcodes: {:?}",
+            cmp_jmps.len(),
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // At least one cmp-jmp must be followed (later) by a CALL — the peeled site.
+        let has_cmp_before_call = cmp_jmps.iter().any(|&ci| {
+            bc[ci + 1..].iter().any(|b| matches!(b.bytecode(), Instruction::CALL))
+        });
+        assert!(
+            has_cmp_before_call,
+            "predicate peel must place cmp-jmp before a CALL; cmp_jmps={cmp_jmps:?}"
         );
     }
 
