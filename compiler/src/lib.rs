@@ -16602,13 +16602,9 @@ fn main() {
                 continue;
             }
             saw = true;
-            let (op, a, idx) = b.bin_slot_slot_jmpf_parts();
+            let (_op, _a, idx) = b.bin_slot_slot_jmpf_parts();
             let packed = pool[idx];
             let tgt = (packed >> 32) as usize;
-            eprintln!(
-                "pc={i} BinSlotSlotJmpf op={op} a={a} idx={idx} tgt={tgt} b={} back={back}",
-                packed as u8
-            );
             assert!(
                 tgt > back,
                 "BinSlotSlotJmpf while-exit at {i}: target {tgt} must be past back-edge JMP {back}"
@@ -16616,7 +16612,4 @@ fn main() {
         }
         assert!(saw, "expected BinSlotSlotJmpf for while i < end");
     }
-
-
-
 }
