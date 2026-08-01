@@ -5666,6 +5666,190 @@ mod tests {
         assert!(vm.pop().as_bool());
     }
 
+    /// BinSlotSlotJmpf covers logical AND and BITAND (compiler fuses `a && b` / `a & b` conditions).
+    #[test]
+    fn bin_slot_slot_jmpf_and_and_bitand() {
+        let and = Instruction::AND as u8;
+        // pool: b=1, target=8
+        let packed = (8u64 << 32) | 1u64;
+        // true && true → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(1),
+                const_int(1),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(and, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+
+        // true && false → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(1),
+                const_int(0),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(and, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        let bitand = Instruction::BITAND as u8;
+        // 0b101 & 0b010 = 0 → false → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(0b101),
+                const_int(0b010),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(bitand, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// BinSlotImmStore to a dest past the live cursor must extend tell so higher locals survive.
+    #[test]
+    fn bin_slot_imm_store_extends_cursor_and_preserves_higher() {
+        let add = Instruction::ADD as u8;
+        // dest=2, imm=1 — writes past arity-1 frame cursor
+        let packed = (2u64 << 32) | 1u64;
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(10),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                // slot0=10; BinSlotImmStore ADD → slot2=11 (extends cursor)
+                Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(add, 0, 0),
+                // Reassign low slot; must not truncate past slot 2.
+                const_int(99),
+                store_pop(0),
+                load(2),
+                load(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 99);
+        assert_eq!(vm.pop().as_int(), 11);
+    }
+
+    /// BinSlotSlotStore BITAND matches the compiler's `flags = flags & mask` fuse.
+    #[test]
+    fn bin_slot_slot_store_bitand_writes_dest() {
+        let bitand = Instruction::BITAND as u8;
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(0b1111),
+                const_int(0b0101),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(bitand, 0, 1, 2),
+                load(2),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0b0101);
+    }
+
+    /// Wide LOAD/STORE (`n==0`, slot in low 24 bits) round-trips past the u8 packed range.
+    #[test]
+    fn wide_load_store_slot_past_255() {
+        let slot = 300u32;
+        let mut vm = Machine::<512>::default();
+        vm.run(&[
+            const_int(42),
+            Byte::new(Instruction::STORE).with_load_store_wide(slot),
+            Byte::new(Instruction::LOAD).with_load_store_wide(slot),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// CmpJmpf pool path falls through when the compare is true (not only the taken jump).
+    #[test]
+    fn cmp_jmpf_pool_falls_through_when_compare_true() {
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                const_int(2),
+                const_int(5),
+                // 2 < 5 → true → fall through → 1
+                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(Instruction::LE as u8, 0),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[5u64],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    /// Packed LOAD/STORE n=2 preserves push/pop order (n=3 is covered separately).
+    #[test]
+    fn packed_load_store_n2_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            store_pop(0),
+            const_int(20),
+            store_pop(1),
+            Byte::new(Instruction::LOAD).with_load_store_packed(2, 0, 1, 0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 20);
+        assert_eq!(vm.pop().as_int(), 10);
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(0),
+            store_pop(0),
+            const_int(0),
+            store_pop(1),
+            const_int(7),
+            const_int(8), // TOS
+            Byte::new(Instruction::STORE).with_load_store_packed(2, 0, 1, 0),
+            load(0),
+            load(1),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 7); // slot 1
+        assert_eq!(vm.pop().as_int(), 8); // slot 0 got TOS
+    }
+
     /// In-register BinSlotImm Pow avoids the old push/binary stack dance.
     #[test]
     fn bin_slot_imm_pow_computes_without_stack_roundtrip() {
