@@ -924,14 +924,46 @@ fn is_multi_op_join_pred_kind(kind: IlJumpKind) -> bool {
     )
 }
 
+/// Exclusive end index for a multi-op suffix before a join predecessor jump.
+///
+/// `JMP` consumes nothing → suffix may end at the jump. `JMPF` / `JMPT` /
+/// `JumpIfMatch` consume TOS (condition / scrutinee) → that producer stays
+/// immediately before the jump and is not part of the sunk suffix.
+fn multi_op_pred_suffix_end(jump_idx: usize, kind: IlJumpKind) -> Option<usize> {
+    match kind {
+        IlJumpKind::Unconditional => Some(jump_idx),
+        IlJumpKind::JumpIfFalse
+        | IlJumpKind::JumpIfTrue
+        | IlJumpKind::JumpIfMatch { .. } => {
+            if jump_idx == 0 {
+                None
+            } else {
+                Some(jump_idx - 1)
+            }
+        }
+    }
+}
+
+/// `JMPF`/`JMPT` condition must be a pure push (delta +1) so it does not
+/// consume values produced by the sunk suffix (e.g. `LOAD;CONST;EQ;JMPF`
+/// must not treat `EQ` as movable with its operands).
+fn multi_op_cond_is_independent_push(ops: &[IlOp], cond_idx: usize) -> bool {
+    matches!(
+        super::sp::stack_delta(&ops[cond_idx]),
+        Some(1)
+    )
+}
+
 /// Sink identical multi-op compute suffixes into a return or non-return join.
 ///
 /// Length cap is [`MULTI_OP_SUFFIX_MAX`]. Single-op tails stay with
 /// [`bin_join_convoy`] / [`return_convoy`] (return-only; no `len==1` for
 /// non-return). Requires agreeing SP at suffix starts and at the join
 /// (see [`super::sp::analyze`]). Accepts `JMP` / `JMPF` / `JMPT` /
-/// `JumpIfMatch` into the cluster. When fall-through has no suffix, the
-/// template comes from the first jump pred.
+/// `JumpIfMatch` into the cluster. Conditional / match preds keep the TOS
+/// producer (condition / scrutinee) in place — it must be an independent
+/// push (stack delta +1) so sunk suffix ops are not consumed by the branch.
+/// When fall-through has no suffix, the template comes from the first jump pred.
 pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
     let info = super::sp::analyze(ops);
     // (cluster_start, cluster_end, kind, suffix)
@@ -944,7 +976,7 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
         };
         let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
 
-        let mut jump_pred_ends: Vec<usize> = Vec::new();
+        let mut jump_preds: Vec<(usize, IlJumpKind)> = Vec::new();
         let mut ok_edges = true;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
@@ -962,9 +994,9 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
                 ok_edges = false;
                 break;
             }
-            jump_pred_ends.push(j);
+            jump_preds.push((j, *jk));
         }
-        if !ok_edges || jump_pred_ends.is_empty() {
+        if !ok_edges || jump_preds.is_empty() {
             i = cluster_end + 1;
             continue;
         }
@@ -975,15 +1007,47 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
             continue;
         }
 
+        // Reject when JMPF/JMPT condition or JumpIfMatch scrutinee consumes
+        // suffix outputs (must be a pure push left in place before the jump).
+        let mut cond_ok = true;
+        for &(j, jk) in &jump_preds {
+            if matches!(
+                jk,
+                IlJumpKind::JumpIfFalse
+                    | IlJumpKind::JumpIfTrue
+                    | IlJumpKind::JumpIfMatch { .. }
+            ) {
+                let Some(end) = multi_op_pred_suffix_end(j, jk) else {
+                    cond_ok = false;
+                    break;
+                };
+                // `end` is exclusive; TOS producer lives at `end` (== j-1).
+                if !multi_op_cond_is_independent_push(ops, end) {
+                    cond_ok = false;
+                    break;
+                }
+            }
+        }
+        if !cond_ok {
+            i = cluster_end + 1;
+            continue;
+        }
+
         let mut chosen: Option<Vec<IlOp>> = None;
         'len: for len in (2..=MULTI_OP_SUFFIX_MAX).rev() {
             let fall = suffix_before(ops, cluster_start, len);
             let (template, template_start) = if let Some(f) = fall {
                 (f, cluster_start - len)
-            } else if let Some(suf) = suffix_before(ops, jump_pred_ends[0], len) {
-                (suf, jump_pred_ends[0] - len)
             } else {
-                continue;
+                let (j0, k0) = jump_preds[0];
+                let Some(end0) = multi_op_pred_suffix_end(j0, k0) else {
+                    continue;
+                };
+                if let Some(suf) = suffix_before(ops, end0, len) {
+                    (suf, end0 - len)
+                } else {
+                    continue;
+                }
             };
             let Some(template_sp) = info.sp_before(template_start).known() else {
                 continue;
@@ -995,14 +1059,17 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
                 }
             }
 
-            for &j in &jump_pred_ends {
-                let Some(suf) = suffix_before(ops, j, len) else {
+            for &(j, jk) in &jump_preds {
+                let Some(end) = multi_op_pred_suffix_end(j, jk) else {
+                    continue 'len;
+                };
+                let Some(suf) = suffix_before(ops, end, len) else {
                     continue 'len;
                 };
                 if !suffixes_equal(template, suf) {
                     continue 'len;
                 }
-                let Some(jsp) = info.sp_before(j - len).known() else {
+                let Some(jsp) = info.sp_before(end - len).known() else {
                     continue 'len;
                 };
                 if jsp != template_sp {
@@ -1051,8 +1118,10 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
                 && is_multi_op_join_pred_kind(*jk)
                 && cluster.iter().any(|l| l == target)
             {
-                for i in (j - len)..j {
-                    remove_at.insert(i);
+                if let Some(end) = multi_op_pred_suffix_end(j, *jk) {
+                    for i in (end - len)..end {
+                        remove_at.insert(i);
+                    }
                 }
             }
         }
@@ -2690,16 +2759,26 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_sinks_identical_suffix_via_jmpf() {
-        // Two arms: S; JMPF Ljoin — both −1, join SP Known; no fall-through.
+        // Two arms: S; cond; JMPF Ljoin — cond is an independent push (not fed by S).
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        // Pop value left under cond so second arm matches join SP (return_convoy shape).
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
@@ -2738,17 +2817,58 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
     }
 
+    /// `STORE; LOAD; CONST; EQ; JMPF` must not sink — EQ consumes the compare
+    /// operands (parse_url `sep_at == 999999` hang).
+    #[test]
+    fn multi_op_join_convoy_refuses_eq_fed_jmpf_suffix() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::StorePop { slot: 3, loc },
+            IlOp::Load { slot: 3, loc },
+            IlOp::Const { imm: 999999, loc },
+            IlOp::Bin {
+                op: Instruction::EQ,
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Const { imm: 1, loc },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Load { slot: 0, loc },
+            IlOp::Return { loc },
+        ];
+        let before = ops.clone();
+        multi_op_join_convoy(&mut ops);
+        assert!(
+            ops == before,
+            "must not sink STORE/LOAD/CONST past EQ;JMPF"
+        );
+    }
+
     #[test]
     fn multi_op_join_convoy_sinks_identical_suffix_via_jmpt() {
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfTrue,
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfTrue,
             target: Label(0),
@@ -2873,14 +2993,23 @@ mod tests {
     #[test]
     fn multi_op_join_convoy_prefers_longest_suffix_via_jmpf() {
         let suf = load_not_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 0,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
@@ -2906,13 +3035,13 @@ mod tests {
                 )
             })
             .count();
-        let const_count = ops
+        let const1_count = ops
             .iter()
             .filter(|op| matches!(op, IlOp::Const { imm: 1, .. }))
             .count();
         assert_eq!(load_count, 1);
         assert_eq!(not_count, 1, "length-4 jump-pred template keeps NOT");
-        assert_eq!(const_count, 1);
+        assert_eq!(const1_count, 1);
         let jmpf_count = ops
             .iter()
             .filter(|op| {
@@ -2932,14 +3061,23 @@ mod tests {
     fn multi_op_join_convoy_jump_pred_template_keeps_pre_join_ops() {
         // All-jump diamond: ops between last pred and join are not the suffix.
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
@@ -2989,14 +3127,23 @@ mod tests {
     fn multi_op_join_convoy_sinks_jmpf_through_label_cluster() {
         // Jump-pred template into a multi-label return cluster.
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(54),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(54),
@@ -3032,16 +3179,25 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_sinks_identical_suffix_via_jump_if_match() {
-        // Two arms: S; JumpIfMatch Ljoin — both −1, join SP Known; no fall-through.
+        // Two arms: S; scrutinee; JumpIfMatch — scrutinee is an independent Load.
         let suf = load_const_add_suffix();
+        let scrut = IlOp::Load {
+            slot: 7,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(scrut.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(scrut);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
             target: Label(0),
@@ -3056,7 +3212,7 @@ mod tests {
 
         let load_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
             .count();
         let add_count = ops
             .iter()
@@ -3129,16 +3285,25 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_prefers_longest_suffix_via_jump_if_match() {
-        // Net-+1 len-4 suffix so sequential JumpIfMatch diamonds agree at join.
+        // Net-+1 len-4 suffix; independent scrutinee Load; POP balances fall-through.
         let suf = load_not_const_add_suffix();
+        let scrut = IlOp::Load {
+            slot: 7,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(scrut.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(scrut);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
             target: Label(0),
@@ -3151,9 +3316,9 @@ mod tests {
 
         multi_op_join_convoy(&mut ops);
 
-        let load_count = ops
+        let suf_loads = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
             .count();
         let not_count = ops
             .iter()
@@ -3164,7 +3329,7 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(load_count, 1);
+        assert_eq!(suf_loads, 1);
         assert_eq!(not_count, 1, "length-4 JumpIfMatch template keeps NOT");
         let jim_count = ops
             .iter()
@@ -3184,14 +3349,23 @@ mod tests {
     #[test]
     fn multi_op_join_convoy_sinks_jump_if_match_through_label_cluster() {
         let suf = load_const_add_suffix();
+        let scrut = IlOp::Load {
+            slot: 7,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(scrut.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             target: Label(54),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(scrut);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
             target: Label(54),
@@ -3205,11 +3379,11 @@ mod tests {
 
         multi_op_join_convoy(&mut ops);
 
-        let load_count = ops
+        let suf_loads = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
             .count();
-        assert_eq!(load_count, 1);
+        assert_eq!(suf_loads, 1);
         let lab54 = ops
             .iter()
             .position(|op| matches!(op, IlOp::Label(Label(54))))
@@ -3597,14 +3771,23 @@ mod tests {
     #[test]
     fn multi_op_join_convoy_sinks_identical_suffix_via_jump_if_match_non_return() {
         let suf = load_const_add_suffix();
+        let scrut = IlOp::Load {
+            slot: 7,
+            loc: common::DebugLoc::unknown(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(scrut.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             target: Label(0),
             loc: common::DebugLoc::unknown(),
         });
+        ops.push(IlOp::Pop {
+            loc: common::DebugLoc::unknown(),
+        });
         ops.extend(suf);
+        ops.push(scrut);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
             target: Label(0),
@@ -3618,11 +3801,11 @@ mod tests {
 
         multi_op_join_convoy(&mut ops);
 
-        let load_count = ops
+        let suf_loads = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Load { .. }))
+            .filter(|op| matches!(op, IlOp::Load { slot: 0, .. }))
             .count();
-        assert_eq!(load_count, 1);
+        assert_eq!(suf_loads, 1);
         let store_idx = ops
             .iter()
             .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
