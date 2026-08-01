@@ -20,13 +20,24 @@ if [[ ! -x "$BIN" ]]; then
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
+# GNU `timeout` is absent on stock macOS; prefer gtimeout (coreutils) then bare run.
+run_coil_test() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${TIMEOUT_SECS}s" "$BIN" test
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "${TIMEOUT_SECS}s" "$BIN" test
+  else
+    "$BIN" test
+  fi
+}
+
 failed=0
 for proj in 01-todo 02-adventure 03-echo 04-http; do
   echo "=== $proj tests ==="
   rm -f "$PROJECTS/$proj/out.hyc" "$ROOT/out.hyc"
   if (
     cd "$PROJECTS/$proj"
-    timeout "${TIMEOUT_SECS}s" "$BIN" test
+    run_coil_test
   ); then
     echo
   else
