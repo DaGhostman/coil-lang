@@ -892,7 +892,7 @@ const MULTI_OP_SUFFIX_MAX: usize = 4;
 /// Residual `STRING`/`DATA`/`FORMAT`/`PRINT`/… encode as bytes but must not
 /// sink — Known SP after FORMAT would otherwise splice format runs across joins.
 fn is_multi_op_suffix_op(op: &IlOp) -> bool {
-    matches!(
+    if matches!(
         op,
         IlOp::Load { .. }
             | IlOp::Const { .. }
@@ -906,6 +906,13 @@ fn is_multi_op_suffix_op(op: &IlOp) -> bool {
             | IlOp::BoxValue { .. }
             | IlOp::UnboxValue { .. }
             | IlOp::Pop { .. }
+    ) {
+        return true;
+    }
+    // Unary residual compute (NOT/NEG stay as Byte until typed lift).
+    matches!(
+        op.as_encode_byte().as_ref().map(|b| *b.bytecode()),
+        Some(Instruction::NOT | Instruction::NEG)
     )
 }
 
