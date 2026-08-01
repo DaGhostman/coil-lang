@@ -3299,6 +3299,112 @@ fn main() {
     assert_eq!(output, "-1,8");
 }
 
+/// Pure-arg reorder must keep CALL arg order while evaluating pure temps before
+/// effectful args (print from effect runs first; sink still sees a=2, b=10).
+#[test]
+fn pure_arg_reorder_preserves_order_and_effects() {
+    let output = run_example_src(
+        r#"
+fn effect() -> int {
+    print "%i,", 7;
+    return 2;
+}
+fn sink(int a, int b) -> int {
+    print "%i,", a + b;
+    return a + b;
+}
+fn main() {
+    print "%i", sink(effect(), 10);
+}
+"#,
+    );
+    assert_eq!(output, "7,12,12");
+}
+
+/// Predicate peel base path and recursive path must both return correct values.
+#[test]
+fn predicate_peel_base_and_recursive_paths() {
+    let output = run_example_src(
+        r#"
+fn other(int n) -> int {
+    return n;
+}
+fn base(int n) -> int {
+    if n <= 0 {
+        return 1;
+    }
+    return other(n) + 1;
+}
+fn main() {
+    print "%i,", base(0);
+    print "%i", base(5);
+}
+"#,
+    );
+    assert_eq!(output, "1,6");
+}
+
+/// One-level self-unroll must not change recursive fib results.
+#[test]
+fn self_unroll_fib_still_correct() {
+    let output = run_example_src(
+        r#"
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    print "%i", fib(10);
+}
+"#,
+    );
+    assert_eq!(output, "55");
+}
+
+/// Fused assign / two-local AND-if / packed three-arg call must evaluate correctly.
+#[test]
+fn fused_assign_and_packed_call_runtime() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int {
+    if a < 0 {
+        return 0;
+    }
+    if b < 0 {
+        return 0;
+    }
+    return a + b + c;
+}
+fn main() {
+    let i = 0;
+    i = i + 1;
+    i = i + 1;
+    let flags = 15;
+    let mask = 7;
+    flags = flags & mask;
+    let a = true;
+    let b = false;
+    let and_ok = 0;
+    if a && b {
+        and_ok = 1;
+    } else {
+        and_ok = 2;
+    }
+    let x = 1;
+    let y = 2;
+    let z = 3;
+    print "%i,", i;
+    print "%i,", flags;
+    print "%i,", and_ok;
+    print "%i", add3(x, y, z);
+}
+"#,
+    );
+    assert_eq!(output, "2,7,2,6");
+}
+
 #[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
