@@ -76,3 +76,29 @@ fn perf_fib_dispatch_regression() {
         "fib(10) dispatch count regressed: {dispatches}"
     );
 }
+
+#[test]
+fn perf_field_hot_reuses_repeated_string_keys() {
+    let (bc, _, _) = compile("examples/perf/field_hot.hy");
+    // Point::twice_x / hot loop reuses "x"/"y" — STRING count stays small vs
+    // naive per-access emit (200k iters × several fields would explode).
+    let strings = count_opcodes(&bc, Instruction::STRING);
+    assert!(
+        strings <= 8,
+        "field_hot should materialize field-name STRINGs once per key, got {strings}"
+    );
+    assert!(
+        count_opcodes(&bc, Instruction::GetField) >= 1,
+        "field_hot should emit GetField"
+    );
+}
+
+#[test]
+fn perf_for_in_array_uses_single_array_len() {
+    let (bc, _, _) = compile("examples/for_in_array.hy");
+    assert_eq!(
+        count_opcodes(&bc, Instruction::ArrayLen),
+        1,
+        "for_in_array should hoist ArrayLen out of the loop"
+    );
+}
