@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn refuses_when_header_sp_unknown() {
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(common::Instruction::FORMAT)),
+            IlOp::byte(common::Byte::new(common::Instruction::FfiInvoke)),
             IlOp::Label(Label(0)),
             IlOp::Const { imm: 9, loc: loc() },
             IlOp::Pop { loc: loc() },

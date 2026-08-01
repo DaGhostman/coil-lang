@@ -250,7 +250,9 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
         }
     }
     load_field_cse(ops, blocks);
-    get_field_cse(ops, blocks);
+    // load_field_cse may shrink `ops`; rebuild block bounds before GetField CSE.
+    let blocks = build_blocks(ops);
+    get_field_cse(ops, &blocks);
 }
 
 /// `Load obj; Load key; GetField` twice → drop second loads, replace second
@@ -865,9 +867,9 @@ mod tests {
 
     #[test]
     fn join_cse_keeps_load_when_join_sp_unknown() {
-        // FORMAT fail-closes SP; Known-SP Load join CSE must not fire.
+        // FfiInvoke fail-closes SP; Known-SP Load join CSE must not fire.
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(common::Instruction::FORMAT)),
+            IlOp::byte(common::Byte::new(common::Instruction::FfiInvoke)),
             IlOp::Const {
                 imm: 0,
                 loc: loc(),

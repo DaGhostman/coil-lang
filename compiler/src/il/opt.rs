@@ -2112,9 +2112,9 @@ mod tests {
 
     #[test]
     fn return_convoy_skips_jump_if_match_unknown_join_sp() {
-        // FORMAT poisons SP; JumpIfMatch diamond must refuse.
+        // FfiInvoke poisons SP; JumpIfMatch diamond must refuse.
         let mut ops = vec![
-            IlOp::byte(Byte::new(Instruction::FORMAT)),
+            IlOp::byte(Byte::new(Instruction::FfiInvoke)),
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },

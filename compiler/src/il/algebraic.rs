@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn refuses_when_sp_unknown() {
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(Instruction::FORMAT)),
+            IlOp::byte(common::Byte::new(Instruction::FfiInvoke)),
             IlOp::Load { slot: 1, loc: loc() },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
@@ -366,7 +366,7 @@ mod tests {
         ];
         let before = ops.clone();
         algebraic_simplify(&mut ops);
-        // Window starting at Load has Unknown SP-in after FORMAT.
+        // Window starting at Load has Unknown SP-in after FfiInvoke.
         assert_eq!(ops.len(), before.len());
     }
 
