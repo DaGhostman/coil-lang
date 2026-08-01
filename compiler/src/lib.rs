@@ -12482,25 +12482,38 @@ fn foo() -> int {
         );
         // clone_shared_return may fuse the const arm to ConstReturnImm, but the
         // payload arm must RETURN locally — never JMP into ConstReturnImm (that
-        // would ignore the stacked Unpack value).
-        let unpack = bc
+        // would ignore the stacked Unpack value). Scope to the match region so
+        // prologue / other fn JMPs do not trip the guard.
+        let make_enum = bc
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::MakeEnum))
+            .expect("expected MakeEnum for Option::Some(1)");
+        let jim = bc[make_enum..]
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::JumpIfMatch))
+            .map(|i| make_enum + i)
+            .expect("expected JumpIfMatch after MakeEnum");
+        let region_end = bc[jim..]
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm))
+            .map(|i| jim + i)
+            .expect("expected ConstReturnImm on None arm");
+        let region = &bc[jim..=region_end];
+        let unpack = region
             .iter()
             .position(|b| matches!(*b.bytecode(), Instruction::Unpack))
             .expect("expected Unpack on Some arm");
         assert!(
-            matches!(*bc[unpack + 1].bytecode(), Instruction::RETURN),
+            matches!(*region[unpack + 1].bytecode(), Instruction::RETURN),
             "Some arm must RETURN immediately after Unpack; got {:?}",
-            bc[unpack + 1].bytecode()
+            region[unpack + 1].bytecode()
         );
         assert!(
-            !bc.iter().any(|b| matches!(*b.bytecode(), Instruction::JMP)),
-            "payload arm must not JMP into a fused const return"
-        );
-        assert!(
-            bc.iter()
-                .any(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm))
-                || bc.iter().any(|b| matches!(*b.bytecode(), Instruction::RETURN)),
-            "None arm should ConstReturnImm or shared RETURN"
+            !region
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::JMP)),
+            "match return region must not JMP into a fused const return; slice={:?}",
+            region.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
