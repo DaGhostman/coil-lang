@@ -887,16 +887,26 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
 
 const MULTI_OP_SUFFIX_MAX: usize = 4;
 
+/// Compute-only ops eligible for multi-op join sinking.
+///
+/// Residual `STRING`/`DATA`/`FORMAT`/`PRINT`/… encode as bytes but must not
+/// sink — Known SP after FORMAT would otherwise splice format runs across joins.
 fn is_multi_op_suffix_op(op: &IlOp) -> bool {
-    if matches!(
+    matches!(
         op,
-        IlOp::Label(_) | IlOp::Jump { .. } | IlOp::Entry { .. } | IlOp::PrologueJmp { .. }
-    ) || op.is_plain_return()
-        || is_return_terminator(op)
-    {
-        return false;
-    }
-    op.as_encode_byte().is_some()
+        IlOp::Load { .. }
+            | IlOp::Const { .. }
+            | IlOp::ConstPool { .. }
+            | IlOp::Dup { .. }
+            | IlOp::Bin { .. }
+            | IlOp::BinSlotImm { .. }
+            | IlOp::BinSlotSlot { .. }
+            | IlOp::Index { .. }
+            | IlOp::LoadField { .. }
+            | IlOp::BoxValue { .. }
+            | IlOp::UnboxValue { .. }
+            | IlOp::Pop { .. }
+    )
 }
 
 fn suffix_before(ops: &[IlOp], end: usize, len: usize) -> Option<&[IlOp]> {
@@ -4155,6 +4165,59 @@ mod tests {
             .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
             .expect("StorePop");
         assert!(add_idx < store_idx);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_refuses_format_string_suffix() {
+        // STRING/DATA/FORMAT must not count as sinkable compute — Known SP after
+        // FORMAT would otherwise splice format runs across joins.
+        let fmt = vec![
+            IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
+            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
+            IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(0)),
+            IlOp::Print {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+        ];
+        ops.extend(fmt.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(2)));
+        ops.extend(fmt.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        let before = ops.len();
+        multi_op_join_convoy(&mut ops);
+        assert_eq!(ops.len(), before, "format suffixes must not sink");
+        let strings = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.as_encode_byte(),
+                    Some(b) if *b.bytecode() == Instruction::STRING
+                )
+            })
+            .count();
+        assert_eq!(strings, 2, "each arm keeps its STRING");
     }
 
     #[test]
