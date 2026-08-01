@@ -16557,4 +16557,61 @@ fn main() {
             "unbound diamond/peel join must not resolve to PC 0; JMP at {bad:?}"
         );
     }
+
+    /// `bytes_slice`-shaped loop: `while i < end` with nested `i < len(src)` and
+    /// `out[] = src[i]` must exit past the back-edge (BinSlotSlotJmpf pool target).
+    #[test]
+    fn bytes_slice_while_exit_targets_past_back_edge() {
+        use common::Instruction;
+        let (bc, pool) = compile_src(
+            r#"
+use io::*;
+fn bytes_slice([byte] src, int start, int end) -> [byte] {
+    let out: [byte] = [];
+    let i = start;
+    while i < end {
+        if i < len(src) {
+            out[] = src[i];
+        }
+        i = i + 1;
+    }
+    return out;
+}
+fn main() {
+    let b = to_bytes("abcd");
+    let s = bytes_slice(b, 0, 4);
+    print "%i", len(s);
+}
+"#,
+        );
+        let back = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::JMP))
+            .map(|(i, _)| i)
+            .max()
+            .expect("back-edge JMP");
+        let mut saw = false;
+        for (i, b) in bc.iter().enumerate() {
+            if *b.bytecode() != Instruction::BinSlotSlotJmpf {
+                continue;
+            }
+            saw = true;
+            let (op, a, idx) = b.bin_slot_slot_jmpf_parts();
+            let packed = pool[idx];
+            let tgt = (packed >> 32) as usize;
+            eprintln!(
+                "pc={i} BinSlotSlotJmpf op={op} a={a} idx={idx} tgt={tgt} b={} back={back}",
+                packed as u8
+            );
+            assert!(
+                tgt > back,
+                "BinSlotSlotJmpf while-exit at {i}: target {tgt} must be past back-edge JMP {back}"
+            );
+        }
+        assert!(saw, "expected BinSlotSlotJmpf for while i < end");
+    }
+
+
+
 }
