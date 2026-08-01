@@ -1,4 +1,5 @@
 mod block_builder;
+mod dissect;
 mod il;
 mod attrs;
 mod const_fold;
@@ -28,6 +29,10 @@ use parser::{
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
 };
 
+pub use dissect::{
+    DissectArtifacts, FnSym, IlSnapshot, filter_symbols, format_bytecode, format_bytecode_section,
+    format_il, format_symbol_index, matches_fn_pat,
+};
 pub use pipeline::*;
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
 pub use typechecking::{
@@ -834,6 +839,8 @@ pub struct Compiler {
     current_function_table_key: Option<String>,
     /// Bytecode span `(start, end)` per function for tiny inlining.
     fn_bytecode_spans: HashMap<String, (usize, usize)>,
+    /// Debug: FQN → user-facing local/param name → frame slot (last write wins).
+    fn_debug_locals: HashMap<String, HashMap<String, u32>>,
 
     /// When true, [`Expression::Match`] omits the trailing `DUPLICATE; POP`
     /// fusion barrier. Set while compiling a match whose value is consumed
@@ -900,6 +907,7 @@ impl Default for Compiler {
             current_function_qualified: None,
             current_function_table_key: None,
             fn_bytecode_spans: HashMap::new(),
+            fn_debug_locals: HashMap::new(),
             suppress_match_fusion_barrier: false,
         }
     }
@@ -2909,6 +2917,28 @@ impl Compiler {
         !self.extern_runtime_functions.is_empty()
     }
 
+    /// Record a user-visible local/param for `coil debug` / dissect.
+    ///
+    /// Skips synthetic `__pad*` / `__dict*` names. `__shadow_name_N` is stored
+    /// under the user-facing `name`.
+    fn record_debug_local(&mut self, name: &str, slot: u32) {
+        if name.starts_with("__pad") || name.starts_with("__dict") {
+            return;
+        }
+        let display = if let Some(rest) = name.strip_prefix("__shadow_") {
+            rest.rsplit_once('_').map(|(n, _)| n).unwrap_or(rest)
+        } else {
+            name
+        };
+        let Some(key) = self.current_function_table_key.clone() else {
+            return;
+        };
+        self.fn_debug_locals
+            .entry(key)
+            .or_default()
+            .insert(display.to_string(), slot);
+    }
+
     /// Look up the slot for a name used in an arm body. First
     /// checks the per-arm `match_bindings` map (where match-bound
     /// names live at slots 1, 2, 3, ... matching the VM's
@@ -2949,10 +2979,13 @@ impl Compiler {
         if let Some(map) = &self.context.block_bindings
             && let Some(&slot) = map.get(name)
         {
+            self.record_debug_local(name, slot);
             return slot;
         }
         if self.context.block_bindings.is_none() {
-            return self.context.variables.intern(name.to_string()) as u32;
+            let slot = self.context.variables.intern(name.to_string()) as u32;
+            self.record_debug_local(name, slot);
+            return slot;
         }
         let shadows_outer = {
             let in_vars = self
@@ -2982,9 +3015,12 @@ impl Compiler {
                 .as_mut()
                 .expect("block_bindings checked above")
                 .insert(name.to_string(), slot);
+            self.record_debug_local(name, slot);
             slot
         } else {
-            self.context.variables.intern(name.to_string()) as u32
+            let slot = self.context.variables.intern(name.to_string()) as u32;
+            self.record_debug_local(name, slot);
+            slot
         }
     }
 
@@ -5474,15 +5510,18 @@ impl Compiler {
 
         self.bind_function_entry(qualified.clone());
         if *is_coro {
-            self.coroutine_fns.insert(qualified);
+            self.coroutine_fns.insert(qualified.clone());
         }
 
         let prev_vars = std::mem::take(&mut self.context.variables);
         let prev_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
         let prev_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
+        let prev_fn_table_key = self.current_function_table_key.take();
+        self.current_function_table_key = Some(qualified.clone());
         self.context.variables = Interner::default();
         if self.compiling_method {
-            self.context.variables.intern("self".to_string());
+            let slot = self.context.variables.intern("self".to_string()) as u32;
+            self.record_debug_local("self", slot);
         }
 
         let prev_result_mode = self.compiling_result_mode;
@@ -5517,6 +5556,7 @@ impl Compiler {
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
         self.polyfn_sources = prev_polyfn_sources;
+        self.current_function_table_key = prev_fn_table_key;
     }
 
     fn instance_method_unbox_tys(
@@ -7872,7 +7912,8 @@ impl Compiler {
                 self.context.variables = Interner::default();
                 self.expr_depth = 0;
                 if self.compiling_method {
-                    self.context.variables.intern("self".to_string());
+                    let slot = self.context.variables.intern("self".to_string()) as u32;
+                    self.record_debug_local("self", slot);
                 }
 
                 let prev_result_mode = self.compiling_result_mode;
@@ -9303,7 +9344,8 @@ impl Compiler {
                 } // end non-method Call
             }
             Expression::Argument(ty, n, _is_rest) => {
-                let _ = self.context.variables.intern(n.to_string());
+                let slot = self.context.variables.intern(n.to_string()) as u32;
+                self.record_debug_local(n, slot);
                 if ty.as_ref().is_some_and(|t| matches!(t.1.as_ref(), Expression::Forall { .. })) {
                     self.polyfn_vars.insert(n.to_string());
                 }
@@ -11190,6 +11232,11 @@ impl Compiler {
                         // positions. Cleared after the body emits.
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
+                        if let Some(map) = self.context.match_bindings.clone() {
+                            for (name, slot) in map {
+                                self.record_debug_local(&name, slot);
+                            }
+                        }
 
                         // Per-arm binding types override the flat
                         // `codegen_var_types` side-table so Access on
@@ -11517,6 +11564,9 @@ impl Compiler {
         self.current_function_qualified = None;
         self.current_function_table_key = None;
         self.fn_bytecode_spans.clear();
+        if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
+            self.fn_debug_locals.clear();
+        }
         self.loop_stack.clear();
         self.loop_bbs.clear();
         // Constant pool is shared across multi-file `compile_module`
@@ -11570,6 +11620,19 @@ impl Compiler {
     /// Called once after multi-file linking by the pipeline, or at the end
     /// of single-file [`compile`] so unit tests observe fused output.
     pub fn finalize_bytecode(&mut self) {
+        let _ = self.finalize_bytecode_inner(false);
+    }
+
+    /// Like [`finalize_bytecode`], but also returns a pre-opt IL snapshot for dissect.
+    pub fn finalize_bytecode_capturing_il(&mut self) -> crate::dissect::IlSnapshot {
+        self.finalize_bytecode_inner(true)
+            .expect("capture_il requested")
+    }
+
+    fn finalize_bytecode_inner(
+        &mut self,
+        capture_il: bool,
+    ) -> Option<crate::dissect::IlSnapshot> {
         // Splice static initializers into the IL before lower — no absolute
         // target bumping required for symbolic jumps.
         let static_init_region = if !self.static_init_bytecode.is_empty() {
@@ -11633,6 +11696,15 @@ impl Compiler {
             }
         }
 
+        let il_snapshot = if capture_il {
+            Some(crate::dissect::IlSnapshot::new(
+                self.bytecode.ops().to_vec(),
+                self.bytecode.funcs().to_vec(),
+            ))
+        } else {
+            None
+        };
+
         let lowered = self.bytecode.lower_in_place(&mut self.constants);
         let map = |t: usize| -> usize {
             if let Some(&p) = lowered.pre_to_post.get(&t) {
@@ -11681,6 +11753,31 @@ impl Compiler {
             self.bytecode.len(),
             "debug_locs / bytecode length mismatch after finalize"
         );
+
+        il_snapshot
+    }
+
+    /// Post-lower function symbols sorted by entry PC (for dissect / debug).
+    pub fn function_symbols(&self) -> Vec<crate::dissect::FnSym> {
+        let mut syms: Vec<_> = self
+            .functions
+            .iter()
+            .map(|(name, &pc)| {
+                let mut locals: Vec<(String, u32)> = self
+                    .fn_debug_locals
+                    .get(name)
+                    .map(|m| m.iter().map(|(n, &s)| (n.clone(), s)).collect())
+                    .unwrap_or_default();
+                locals.sort_by_key(|(_, s)| *s);
+                crate::dissect::FnSym {
+                    name: name.clone(),
+                    entry_pc: pc as u32,
+                    locals,
+                }
+            })
+            .collect();
+        syms.sort_by_key(|s| s.entry_pc);
+        syms
     }
 
     pub fn compile<'compiler>(

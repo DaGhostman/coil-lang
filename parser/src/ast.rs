@@ -1413,6 +1413,16 @@ impl<'a> Display for Expression<'a> {
                 }
                 write!(f, ";")
             }
+            Self::Program(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                        writeln!(f)?;
+                    }
+                    write!(f, "{}", item.1)?;
+                }
+                Ok(())
+            }
             e => write!(f, "<unhandled: {:?}>", e),
         }
     }
