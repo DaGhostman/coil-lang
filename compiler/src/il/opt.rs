@@ -294,8 +294,10 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
 }
 
 /// `StorePop s; Load s` → `Dup; StorePop s` when the value stays on stack after
-/// store. Refused when SP-in is `s + 1` (TOS aliases the slot in the shared
-/// stack/locals frame — e.g. tuple `let` temps at slot 0).
+/// store. Refused when SP-in `h <= s + 1`: the store extends `tell` to `s + 1`,
+/// so a remaining Dup copy is no longer TOS and later pops (e.g. `CONST; CmpJmpf`)
+/// eat the local — classic shared-stack hazard after nested CALL returns
+/// (`tell == frame_base + 1`, store to a higher slot).
 fn mem_fwd(ops: &mut Vec<IlOp>, entry_sp: i32) {
     let sp = super::sp::analyze_at(ops, entry_sp);
     let mut i = 0;
@@ -310,7 +312,7 @@ fn mem_fwd(ops: &mut Vec<IlOp>, entry_sp: i32) {
         };
         if let Some((slot, loc)) = slot_loc {
             let refuse = match sp.sp_before(i) {
-                super::sp::Sp::Known(h) => h == slot as i32 + 1,
+                super::sp::Sp::Known(h) => h <= slot as i32 + 1,
                 super::sp::Sp::Unknown => true,
             } || mem_fwd_load_feeds_index(ops, i + 1);
             if !refuse {
@@ -1399,6 +1401,34 @@ mod tests {
         assert!(matches!(ops[3], IlOp::StorePop { slot: 0, .. }));
         assert!(matches!(ops[4], IlOp::Load { slot: 0, .. }));
         assert_eq!(ops.len(), before.len());
+    }
+
+    /// After nested CALL return (`tell == frame_base + 1`), StorePop to a higher
+    /// slot must not become Dup;Store — tell extension makes later operand pops
+    /// consume the local (e.g. `let x = f(); if x == k`).
+    #[test]
+    fn mem_fwd_refuses_store_above_tos_after_call_return_height() {
+        let loc = common::DebugLoc::unknown();
+        // Model post-return height 1 (return value only) then store to slot 3.
+        let mut ops = vec![
+            IlOp::Const { imm: 4, loc },
+            IlOp::StorePop { slot: 3, loc },
+            IlOp::Load { slot: 3, loc },
+            IlOp::Const { imm: 999999, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        mem_fwd(&mut ops, 0);
+        assert!(
+            matches!(ops[1], IlOp::StorePop { slot: 3, .. }),
+            "StorePop;Load at height 1 to slot 3 must not become Dup;StorePop"
+        );
+        assert!(matches!(ops[2], IlOp::Load { slot: 3, .. }));
     }
 
     /// Call return at height arity+1 then StorePop arity must not become Dup;Store
