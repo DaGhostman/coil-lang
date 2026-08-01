@@ -310,15 +310,22 @@ mod tests {
     #[test]
     fn multi_op_on_full_buffer_refuses_when_prologue_poisons_sp() {
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: loc(),
+        };
         let mut ops = vec![IlOp::byte(Byte::new(Instruction::PRINT))];
         let body_start = ops.len();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
             loc: loc(),
         });
+        ops.push(IlOp::Pop { loc: loc() });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
@@ -355,14 +362,21 @@ mod tests {
     #[test]
     fn multi_op_on_full_buffer_still_sinks_clean_body() {
         let suf = load_const_add_suffix();
+        let cond = IlOp::Const {
+            imm: 1,
+            loc: loc(),
+        };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
+        ops.push(cond.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
             loc: loc(),
         });
+        ops.push(IlOp::Pop { loc: loc() });
         ops.extend(suf);
+        ops.push(cond);
         ops.push(IlOp::Jump {
             kind: IlJumpKind::JumpIfFalse,
             target: Label(0),
