@@ -271,6 +271,130 @@ impl From<Instruction> for u8 {
     }
 }
 
+impl Instruction {
+    /// Stable mnemonic for disassembly / DX tooling (always available).
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            Self::HALT => "HALT",
+            Self::NOOP => "NOOP",
+            Self::DUPLICATE => "DUPLICATE",
+            Self::POP => "POP",
+            Self::CONST => "CONST",
+            Self::STORE => "STORE",
+            Self::LOAD => "LOAD",
+            Self::CALL => "CALL",
+            Self::RETURN => "RETURN",
+            Self::JMP => "JMP",
+            Self::JMPT => "JMPT",
+            Self::JMPF => "JMPF",
+            Self::STRING => "STRING",
+            Self::DATA => "DATA",
+            Self::INC => "INC",
+            Self::DEC => "DEC",
+            Self::ADD => "ADD",
+            Self::SUB => "SUB",
+            Self::MUL => "MUL",
+            Self::DIV => "DIV",
+            Self::MOD => "MOD",
+            Self::ADDF => "ADDF",
+            Self::SUBF => "SUBF",
+            Self::MULF => "MULF",
+            Self::DIVF => "DIVF",
+            Self::MODF => "MODF",
+            Self::NOT => "NOT",
+            Self::NEG => "NEG",
+            Self::AND => "AND",
+            Self::OR => "OR",
+            Self::SHL => "SHL",
+            Self::SHR => "SHR",
+            Self::XOR => "XOR",
+            Self::EQ => "EQ",
+            Self::NEQ => "NEQ",
+            Self::LE => "LE",
+            Self::LEQ => "LEQ",
+            Self::LEF => "LEF",
+            Self::LEQF => "LEQF",
+            Self::GT => "GT",
+            Self::GEQ => "GEQ",
+            Self::GTF => "GTF",
+            Self::GEQF => "GEQF",
+            Self::PRINT => "PRINT",
+            Self::FORMAT => "FORMAT",
+            Self::STRINGIFY => "STRINGIFY",
+            Self::NATIVE => "NATIVE",
+            Self::INIT => "INIT",
+            Self::SET => "SET",
+            Self::MakeEnum => "MakeEnum",
+            Self::JumpIfMatch => "JumpIfMatch",
+            Self::Unpack => "Unpack",
+            Self::LoadField => "LoadField",
+            Self::StorePop => "StorePop",
+            Self::UnpackAt => "UnpackAt",
+            Self::FfiLoad => "FfiLoad",
+            Self::FfiInvoke => "FfiInvoke",
+            Self::DeclareFFI => "DeclareFFI",
+            Self::MakeTuple => "MakeTuple",
+            Self::MakeArray => "MakeArray",
+            Self::Index => "Index",
+            Self::MakeDict => "MakeDict",
+            Self::GetField => "GetField",
+            Self::SetField => "SetField",
+            Self::HostInvoke => "HostInvoke",
+            Self::LoadReturnSlot => "LoadReturnSlot",
+            Self::ConstReturnImm => "ConstReturnImm",
+            Self::BinSlotImm => "BinSlotImm",
+            Self::CmpJmpf => "CmpJmpf",
+            Self::BinReturn => "BinReturn",
+            Self::BinSlotSlot => "BinSlotSlot",
+            Self::BinSlotImmJmpf => "BinSlotImmJmpf",
+            Self::LogNotJmpf => "LogNotJmpf",
+            Self::MakeCoro => "MakeCoro",
+            Self::ResumeCoro => "ResumeCoro",
+            Self::YieldCoro => "YieldCoro",
+            Self::YieldFromCoro => "YieldFromCoro",
+            Self::Pow => "Pow",
+            Self::PowF => "PowF",
+            Self::BITAND => "BITAND",
+            Self::BITOR => "BITOR",
+            Self::StoreIndex => "StoreIndex",
+            Self::LogNot => "LogNot",
+            Self::DoneCoro => "DoneCoro",
+            Self::ArrayPush => "ArrayPush",
+            Self::ArrayLen => "ArrayLen",
+            Self::CallIndirect => "CallIndirect",
+            Self::BoxValue => "BoxValue",
+            Self::UnboxValue => "UnboxValue",
+            Self::MakePolyFn => "MakePolyFn",
+            Self::DynAdd => "DynAdd",
+            Self::DynSub => "DynSub",
+            Self::DynMul => "DynMul",
+            Self::DynDiv => "DynDiv",
+            Self::DynMod => "DynMod",
+            Self::DynCmp => "DynCmp",
+            Self::DynEq => "DynEq",
+            Self::DynNe => "DynNe",
+            Self::DynPrint => "DynPrint",
+            Self::CodePtr => "CodePtr",
+            Self::MakePolyFnCapture => "MakePolyFnCapture",
+            Self::Panic => "Panic",
+            Self::DictEntries => "DictEntries",
+            Self::MakeFn => "MakeFn",
+            Self::LoadStatic => "LoadStatic",
+            Self::StoreStatic => "StoreStatic",
+            Self::TailCall => "TailCall",
+            Self::CastIntToFloat => "CastIntToFloat",
+            Self::CastFloatToInt => "CastFloatToInt",
+            Self::CastIntToByte => "CastIntToByte",
+            Self::CastByteToInt => "CastByteToInt",
+            Self::CastIntToBool => "CastIntToBool",
+            Self::CastBoolToInt => "CastBoolToInt",
+            Self::BinSlotSlotJmpf => "BinSlotSlotJmpf",
+            Self::BinSlotImmStore => "BinSlotImmStore",
+            Self::BinSlotSlotStore => "BinSlotSlotStore",
+        }
+    }
+}
+
 impl From<u8> for ArchivedInstruction {
     fn from(value: u8) -> Self {
         unsafe { std::mem::transmute(value) }
@@ -1041,6 +1165,17 @@ mod tests {
         let last = Instruction::BinSlotSlotStore as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
+    }
+
+    #[test]
+    fn mnemonic_covers_first_and_last_variants() {
+        assert_eq!(Instruction::HALT.mnemonic(), "HALT");
+        assert_eq!(
+            Instruction::BinSlotSlotStore.mnemonic(),
+            "BinSlotSlotStore"
+        );
+        assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
+        assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
     }
 
     #[test]

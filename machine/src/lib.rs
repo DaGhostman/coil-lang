@@ -5,6 +5,7 @@ mod ffi;
 pub mod crypto;
 #[cfg(feature = "crypto")]
 mod crypto_hasher_state;
+pub mod debug;
 pub mod env;
 pub mod fs;
 pub mod io;
@@ -25,6 +26,7 @@ mod vm;
 
 #[cfg(feature = "crypto")]
 pub use crypto::{CryptoErrorTag, CRYPTO_WIRING};
+pub use debug::{DebugController, StepMode, StopReason};
 pub use env::ENV_WIRING;
 pub use fs::FS_WIRING;
 #[cfg(feature = "regex")]

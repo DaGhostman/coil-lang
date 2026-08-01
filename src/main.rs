@@ -12,8 +12,12 @@ use rkyv::rancor::Error;
 const DEFAULT_OUT: &str = "out.hyc";
 const TESTS_DIR: &str = "tests";
 
+mod debug_cmd;
+mod dissect;
 mod package_app;
 
+use debug_cmd::{DebugArgs, cmd_debug};
+use dissect::{DissectArgs, cmd_dissect};
 use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +37,17 @@ enum Command {
         check_native: bool,
         strip_debug: bool,
     },
+    Dissect {
+        filename: String,
+        fn_pat: Option<String>,
+        show_il: bool,
+        show_ast: bool,
+    },
+    Debug {
+        filename: String,
+        script: Option<String>,
+        batch: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +66,8 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] run <file.hyc>\n\
          \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
+         \x20 coil [--log-json | --log-lsp] dissect <file.hy> [--fn <pat>] [--il] [--ast]\n\
+         \x20 coil [--log-json | --log-lsp] debug <file.hy> [-x <script>] [--batch]\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) to out.hyc and run it\n\
@@ -59,6 +76,8 @@ fn print_help() {
          \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
          \x20 test       Compile and run every .hy file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
+         \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no out.hyc)\n\
+         \x20 debug      GDB-style debugger (REPL; optional -x script / --batch)\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` or packaged binary for `package`\n\
@@ -67,6 +86,11 @@ fn print_help() {
          \x20 --strip-debug         With `package`, omit debug line table from embedded archive\n\
          \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
          \x20 --fail-fast          With `test`, stop after the first failed case\n\
+         \x20 --fn <pat>           With `dissect`, filter functions by FQN substring / trailing name\n\
+         \x20 --il                 With `dissect`, also print pre-opt stack IL\n\
+         \x20 --ast                With `dissect`, also print the entry-file AST\n\
+         \x20 -x <script>          With `debug`, run commands from a script file\n\
+         \x20 --batch              With `debug`, non-interactive (use -x or stdin); exit after script\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
@@ -83,6 +107,11 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut include_tests = false;
     let mut check_native = false;
     let mut strip_debug = false;
+    let mut show_il = false;
+    let mut show_ast = false;
+    let mut batch = false;
+    let mut fn_pat: Option<String> = None;
+    let mut script: Option<String> = None;
     let mut runner: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
@@ -97,6 +126,35 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--include-tests" => include_tests = true,
             "--check-native" => check_native = true,
             "--strip-debug" => strip_debug = true,
+            "--il" => show_il = true,
+            "--ast" => show_ast = true,
+            "--batch" => batch = true,
+            "--fn" => {
+                i += 1;
+                let Some(pat) = args.get(i) else {
+                    return Err("missing pattern after --fn");
+                };
+                if pat.starts_with('-') {
+                    return Err("missing pattern after --fn");
+                }
+                if fn_pat.is_some() {
+                    return Err("duplicate --fn flag");
+                }
+                fn_pat = Some(pat.clone());
+            }
+            "-x" => {
+                i += 1;
+                let Some(path) = args.get(i) else {
+                    return Err("missing path after -x");
+                };
+                if path.starts_with('-') {
+                    return Err("missing path after -x");
+                }
+                if script.is_some() {
+                    return Err("duplicate -x flag");
+                }
+                script = Some(path.clone());
+            }
             "--runner" => {
                 i += 1;
                 let Some(path) = args.get(i) else {
@@ -125,12 +183,15 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
         i += 1;
     }
+
+    let has_dissect_flags = fn_pat.is_some() || show_il || show_ast;
+    let has_debug_flags = script.is_some() || batch;
 
     let command = match positionals.as_slice() {
         [] => {
@@ -142,6 +203,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
             }
             // Resolved later from coil.toml `[entry].file`.
             Command::BuildAndRun {
@@ -158,6 +225,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
             Command::Test {
                 path: None,
                 fail_fast,
@@ -173,7 +246,19 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
-            if path == "compile" || path == "run" || path == "test" || path == "package" {
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
+            if path == "compile"
+                || path == "run"
+                || path == "test"
+                || path == "package"
+                || path == "dissect"
+                || path == "debug"
+            {
                 return Err("test path must be a directory");
             }
             Command::Test {
@@ -188,6 +273,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
             // Filename filled from `[entry].file` when empty.
             Command::Compile {
                 filename: String::new(),
@@ -196,8 +287,16 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         }
         [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
+        [cmd] if cmd == "dissect" => return Err("dissect requires an entry .hy file"),
+        [cmd] if cmd == "debug" => return Err("debug requires an entry .hy file"),
         [cmd, filename] if cmd == "package" => {
-            if filename == "package" || filename == "compile" || filename == "run" || filename == "test" {
+            if filename == "package"
+                || filename == "compile"
+                || filename == "run"
+                || filename == "test"
+                || filename == "dissect"
+                || filename == "debug"
+            {
                 return Err("package requires an entry file");
             }
             if fail_fast {
@@ -205,6 +304,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if include_tests {
                 return Err("--include-tests is not valid with `package`");
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
             }
             let out = output.unwrap_or_else(|| {
                 Path::new(filename)
@@ -221,8 +326,77 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 strip_debug,
             }
         }
+        [cmd, filename] if cmd == "debug" => {
+            if filename == "package"
+                || filename == "compile"
+                || filename == "run"
+                || filename == "test"
+                || filename == "dissect"
+                || filename == "debug"
+            {
+                return Err("debug requires an entry .hy file");
+            }
+            if output.is_some() {
+                return Err("-o/--output is not valid with `debug`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if include_tests {
+                return Err("--include-tests is not valid with `debug`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            Command::Debug {
+                filename: filename.clone(),
+                script,
+                batch,
+            }
+        }
+        [cmd, filename] if cmd == "dissect" => {
+            if filename == "package"
+                || filename == "compile"
+                || filename == "run"
+                || filename == "test"
+                || filename == "dissect"
+                || filename == "debug"
+            {
+                return Err("dissect requires an entry .hy file");
+            }
+            if output.is_some() {
+                return Err("-o/--output is not valid with `dissect`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if include_tests {
+                return Err("--include-tests is not valid with `dissect`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
+            Command::Dissect {
+                filename: filename.clone(),
+                fn_pat,
+                show_il,
+                show_ast,
+            }
+        }
         [cmd, filename] if cmd == "compile" => {
-            if filename == "compile" || filename == "run" || filename == "test" || filename == "package" {
+            if filename == "compile"
+                || filename == "run"
+                || filename == "test"
+                || filename == "package"
+                || filename == "dissect"
+                || filename == "debug"
+            {
                 return Err("compile requires an entry file");
             }
             if fail_fast {
@@ -230,6 +404,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
             }
             Command::Compile {
                 filename: filename.clone(),
@@ -246,6 +426,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
             Command::Run {
                 archive: archive.clone(),
             }
@@ -259,6 +445,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if check_native || strip_debug || runner.is_some() {
                 return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -897,6 +1089,32 @@ fn main() {
 
     match cli.command {
         Command::Test { path, fail_fast } => cmd_test(config, path, fail_fast),
+        Command::Dissect {
+            filename,
+            fn_pat,
+            show_il,
+            show_ast,
+        } => cmd_dissect(
+            config,
+            DissectArgs {
+                filename,
+                fn_pat,
+                show_il,
+                show_ast,
+            },
+        ),
+        Command::Debug {
+            filename,
+            script,
+            batch,
+        } => cmd_debug(
+            config,
+            DebugArgs {
+                filename,
+                script,
+                batch,
+            },
+        ),
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
@@ -927,7 +1145,9 @@ fn main() {
                     check_native,
                     strip_debug,
                 ),
-                Command::Test { .. } => unreachable!(),
+                Command::Test { .. } | Command::Dissect { .. } | Command::Debug { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
@@ -941,6 +1161,48 @@ mod tests {
         std::iter::once("coil".to_string())
             .chain(parts.iter().map(|s| (*s).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn parse_debug_with_script_batch() {
+        let cli = parse_args(&args(&[
+            "debug",
+            "examples/fib.hy",
+            "-x",
+            "cmds.txt",
+            "--batch",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Debug {
+                filename: "examples/fib.hy".into(),
+                script: Some("cmds.txt".into()),
+                batch: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dissect_with_fn_il_ast() {
+        let cli = parse_args(&args(&[
+            "dissect",
+            "examples/fib.hy",
+            "--fn",
+            "fib",
+            "--il",
+            "--ast",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Dissect {
+                filename: "examples/fib.hy".into(),
+                fn_pat: Some("fib".into()),
+                show_il: true,
+                show_ast: true,
+            }
+        );
     }
 
     #[test]

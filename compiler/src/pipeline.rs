@@ -1486,6 +1486,71 @@ impl Pipeline {
         ))
     }
 
+    /// Compile a source entry in-memory for `coil dissect` (never writes an archive).
+    ///
+    /// When `capture_il` is true, retains pre-opt stack IL after finalize splices.
+    pub fn compile_dissect(
+        &mut self,
+        file: &str,
+        capture_il: bool,
+    ) -> Result<crate::DissectArtifacts, ()> {
+        let entry = PathBuf::from(file);
+        let root = Self::find_project_root(&entry);
+        if root != self.project_root {
+            self.project_root = root.clone();
+            self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
+            machine::env::set_allow_exec(self.manifest.allow_exec);
+        }
+        self.entry_file = Some(entry.clone());
+        self.enqueue_file(entry);
+
+        self.discover_all();
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline] dissect compiling worklist ({} files, LIFO)",
+            self.worklist.len()
+        );
+        while let Some(item) = self.worklist.pop_back() {
+            let is_entry = self
+                .entry_file
+                .as_ref()
+                .map(|e| *e == item.file)
+                .unwrap_or(false);
+            self.compile_file(item, is_entry);
+        }
+
+        if self.failed || self.had_errors() {
+            return Err(());
+        }
+
+        let il = if capture_il {
+            Some(self.compiler.finalize_bytecode_capturing_il())
+        } else {
+            self.compiler.finalize_bytecode();
+            None
+        };
+        self.bytecode = self.compiler.bytecode_vec();
+
+        if let Some(byte) = self.bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.prologue_jmp_target());
+        }
+
+        if !self.compiler.get_messages().is_empty() {
+            return Err(());
+        }
+
+        let functions = self.compiler.function_symbols();
+        let debug = self.program_debug();
+        Ok(crate::DissectArtifacts {
+            bytecode: std::mem::take(&mut self.bytecode),
+            constants: self.compiler.constants.clone(),
+            functions,
+            il,
+            debug,
+        })
+    }
+
     /// Harness test cases from the last compile (`description`, bytecode offset).
     pub fn test_cases(&self) -> &[(String, u32)] {
         self.compiler.test_cases()
