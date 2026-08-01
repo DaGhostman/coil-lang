@@ -3278,10 +3278,10 @@ fn main() {
     assert_eq!(output, "40,28,48,9,42,-24");
 }
 
-/// Early-return callees must not be tiny-inlined (inliner truncates at first
-/// RETURN). Both arms must run correctly via a real CALL.
+/// Early-return diamond callees are tiny-inlined; both arms must still evaluate
+/// correctly at the call site.
 #[test]
-fn early_return_callee_both_arms_via_call() {
+fn early_return_callee_both_arms_correct() {
     let output = run_example_src(
         r#"
 fn early(int n, int is_neg) -> int {

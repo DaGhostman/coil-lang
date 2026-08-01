@@ -454,6 +454,32 @@ impl CodeBuf {
         out
     }
 
+    /// Ops in emitting range `[start, end)`, including [`IlOp::Label`] markers
+    /// that sit at those emitting positions (needed to copy jump diamonds).
+    pub fn code_slice_raw_ops(&self, start: usize, end: usize) -> Vec<super::IlOp> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        for op in self.il.ops() {
+            if matches!(op, super::IlOp::Label(_)) {
+                if i >= start && i < end {
+                    out.push(op.clone());
+                }
+                continue;
+            }
+            if !op.emits_code() {
+                continue;
+            }
+            if i >= end {
+                break;
+            }
+            if i >= start {
+                out.push(op.clone());
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// True if `[start, end)` contains a Jump/Entry (not safe to tiny-inline
     /// via [`Self::code_slice_bytes`], which drops those ops).
     pub fn span_has_control_ops(&self, start: usize, end: usize) -> bool {

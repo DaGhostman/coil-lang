@@ -20,7 +20,7 @@ use common::{
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
-use crate::il::{CodeBuf, EmitBuf, EntryKind, IlOp, Label as IlLabel};
+use crate::il::{CodeBuf, EmitBuf, EntryKind, IlJumpKind, IlOp, Label as IlLabel};
 use crate::const_fold::ConstValue;
 use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
@@ -1290,9 +1290,17 @@ impl Compiler {
         true
     }
 
+    /// Max emitting ops for a compare+branch tiny-inline diamond.
+    const TINY_INLINE_DIAMOND_MAX_OPS: usize = 24;
+    /// Max emitting ops for a one-level self-unroll peel.
+    const SELF_UNROLL_MAX_OPS: usize = 48;
+
     fn is_tiny_inline_il(ops: &[IlOp]) -> bool {
         if ops.is_empty() || ops.len() > 64 {
             return false;
+        }
+        if Self::is_tiny_inline_diamond_il(ops) {
+            return true;
         }
         if ops.iter().any(|op| op.is_control()) {
             return false;
@@ -1335,6 +1343,203 @@ impl Compiler {
             return false;
         }
         !ops.iter().any(|op| Self::inline_forbidden_op(op))
+    }
+
+    /// One compare+branch diamond: `if cond { return A; } return B;` (no calls).
+    ///
+    /// Emitting shape (labels omitted by [`CodeBuf::code_slice_ops`]):
+    /// `cond…; JumpIfFalse; then…; Return; else…; Return`.
+    fn is_tiny_inline_diamond_il(ops: &[IlOp]) -> bool {
+        if ops.is_empty() || ops.len() > Self::TINY_INLINE_DIAMOND_MAX_OPS {
+            return false;
+        }
+        if ops.iter().any(|op| matches!(op, IlOp::Entry { .. })) {
+            return false;
+        }
+        let jump_idxs: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, IlOp::Jump { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if jump_idxs.len() != 1 {
+            return false;
+        }
+        let j = jump_idxs[0];
+        let IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            ..
+        } = &ops[j]
+        else {
+            return false;
+        };
+        if j == 0 || j + 1 >= ops.len() {
+            return false;
+        }
+        // Cond / arms must not contain nested control or forbidden ops.
+        if ops[..j]
+            .iter()
+            .any(|op| op.is_control() || Self::inline_forbidden_op(op) || Self::inline_is_return(op))
+        {
+            return false;
+        }
+        let Some(then_end) = Self::diamond_arm_end(ops, j + 1) else {
+            return false;
+        };
+        if then_end + 1 >= ops.len() {
+            return false;
+        }
+        let else_start = then_end + 1;
+        let Some(else_end) = Self::diamond_arm_end(ops, else_start) else {
+            return false;
+        };
+        if else_end != ops.len() - 1 {
+            return false;
+        }
+        let then_arm = &ops[j + 1..=then_end];
+        let else_arm = &ops[else_start..=else_end];
+        Self::diamond_arm_ok(then_arm) && Self::diamond_arm_ok(else_arm)
+    }
+
+    fn inline_is_return(op: &IlOp) -> bool {
+        op.is_plain_return()
+            || matches!(
+                op,
+                IlOp::LoadReturnSlot { .. }
+                    | IlOp::ConstReturnImm { .. }
+                    | IlOp::BinReturn { .. }
+            )
+            || matches!(
+                op.as_plain_byte(),
+                Some(b) if matches!(
+                    *b.bytecode(),
+                    Instruction::RETURN
+                        | Instruction::LoadReturnSlot
+                        | Instruction::ConstReturnImm
+                        | Instruction::BinReturn
+                )
+            )
+    }
+
+    /// Index of the last op of an arm starting at `start` (inclusive).
+    fn diamond_arm_end(ops: &[IlOp], start: usize) -> Option<usize> {
+        if start >= ops.len() {
+            return None;
+        }
+        // Sole fused *Return arm.
+        if Self::inline_is_fused_return(&ops[start]) {
+            return Some(start);
+        }
+        for i in start..ops.len() {
+            if ops[i].is_control() {
+                return None;
+            }
+            if ops[i].is_plain_return() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn inline_is_fused_return(op: &IlOp) -> bool {
+        matches!(
+            op,
+            IlOp::LoadReturnSlot { .. }
+                | IlOp::ConstReturnImm { .. }
+                | IlOp::BinReturn { .. }
+        ) || matches!(
+            op.as_plain_byte(),
+            Some(b) if matches!(
+                *b.bytecode(),
+                Instruction::LoadReturnSlot
+                    | Instruction::ConstReturnImm
+                    | Instruction::BinReturn
+            )
+        )
+    }
+
+    fn diamond_arm_ok(arm: &[IlOp]) -> bool {
+        if arm.is_empty() {
+            return false;
+        }
+        if Self::inline_is_fused_return(&arm[0]) {
+            return arm.len() == 1;
+        }
+        if arm
+            .iter()
+            .any(|op| op.is_control() || Self::inline_forbidden_op(op))
+        {
+            return false;
+        }
+        arm.last().is_some_and(|op| op.is_plain_return())
+            && arm[..arm.len() - 1]
+                .iter()
+                .all(|op| !Self::inline_is_return(op))
+    }
+
+    /// Body eligible for one-level self-unroll at a call site to `self_entry`.
+    fn is_self_unroll_il(ops: &[IlOp], self_entry: Option<IlLabel>) -> bool {
+        if ops.is_empty() || ops.len() > Self::SELF_UNROLL_MAX_OPS {
+            return false;
+        }
+        let Some(self_entry) = self_entry else {
+            return false;
+        };
+        let mut saw_self_call = false;
+        for op in ops {
+            match op {
+                IlOp::Entry {
+                    kind: EntryKind::TailCall,
+                    ..
+                } => {
+                    // Tail-call bodies leave dead fallthrough and rely on
+                    // post-emit opts for arg order — unsafe to peel pre-opt.
+                    return false;
+                }
+                IlOp::Entry {
+                    kind: EntryKind::Call,
+                    target,
+                    ..
+                } => {
+                    if *target == self_entry {
+                        saw_self_call = true;
+                    }
+                }
+                IlOp::Entry { .. } | IlOp::PrologueJmp { .. } => return false,
+                IlOp::HostInvoke { .. } => return false,
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfMatch { .. },
+                    ..
+                } => return false,
+                _ => {
+                    if let Some(b) = op.as_plain_byte() {
+                        match *b.bytecode() {
+                            Instruction::TailCall => return false,
+                            Instruction::CALL => {}
+                            Instruction::MakeCoro
+                            | Instruction::YieldCoro
+                            | Instruction::YieldFromCoro
+                            | Instruction::HostInvoke
+                            | Instruction::FfiInvoke
+                            | Instruction::JumpIfMatch => return false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        saw_self_call
+            && !ops.iter().any(|op| {
+                matches!(
+                    op,
+                    IlOp::Print { .. }
+                        | IlOp::GetField { .. }
+                        | IlOp::SetField { .. }
+                        | IlOp::MakeTuple { .. }
+                        | IlOp::MakeArray { .. }
+                        | IlOp::MakeEnum { .. }
+                )
+            })
     }
 
     /// ≤3 pure producers + terminal Return / fused *Return (Load/Const/Bin/…).
@@ -1524,7 +1729,6 @@ impl Compiler {
         if !Self::is_tiny_inline_il(&ops) {
             return false;
         }
-        let slice = self.bytecode.code_slice_bytes(start, end);
         let arg_slice = args.unwrap_or(&[]);
         let mut temps = Vec::new();
         let flat = self.flatten_call_args_for_emit(arg_slice);
@@ -1538,6 +1742,21 @@ impl Compiler {
             bytecode.push_store_pop(tmp);
             temps.push(tmp);
         }
+        // Compare+branch diamond: emit CFG into `self.bytecode`, stash the
+        // result in a temp, and leave a LOAD in `bytecode` so parents that
+        // accumulate into a local Vec keep program order.
+        if Self::is_tiny_inline_diamond_il(&ops) {
+            let raw = self.bytecode.code_slice_raw_ops(start, end);
+            self.bytecode.append(bytecode);
+            if !self.emit_cfg_inline_body(&raw, &temps, /*allow_calls=*/ false) {
+                return false;
+            }
+            let result = self.alloc_temp_slot();
+            self.bytecode.push_store_pop(result);
+            bytecode.push_load(result);
+            return true;
+        }
+        let slice = self.bytecode.code_slice_bytes(start, end);
         if slice.len() == 1
             && let Some(expanded) = Self::expand_fused_return_for_inline(&slice[0], &temps)
         {
@@ -1572,6 +1791,398 @@ impl Compiler {
             }
         }
         true
+    }
+
+    /// One-level self-unroll: peel callee body once at a self-`CALL` site.
+    /// Nested self-calls remain `CALL`/`Entry`. Emits into `self.bytecode`.
+    fn try_emit_self_unroll_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+            return false;
+        };
+        let lookup = strip_overload_key(fqn).to_string();
+        if self.checker.fn_has_rest(&lookup) {
+            return false;
+        }
+        if self.coroutine_fns.contains(fqn) || self.coroutine_fns.contains(&lookup) {
+            return false;
+        }
+        // Skip callees that use defer (body would miss deferred side effects).
+        // `fn_defers` is only populated while compiling the callee; once its
+        // body is finished the stack is empty — refuse bodies that contain
+        // MakeCoro / Yield (already gated) and nested `fn` defs (not in span).
+        let ops = self.bytecode.code_slice_ops(start, end);
+        let self_entry = self.fn_entry_labels.get(fqn).copied();
+        if !Self::is_self_unroll_il(&ops, self_entry) {
+            return false;
+        }
+        // Refuse locals beyond arity (temps only cover args).
+        let arity = self.flatten_call_args_for_emit(args.unwrap_or(&[])).len();
+        if Self::body_uses_slot_past(&ops, arity) {
+            return false;
+        }
+        let arg_slice = args.unwrap_or(&[]);
+        let mut temps = Vec::new();
+        let flat = self.flatten_call_args_for_emit(arg_slice);
+        for arg in &flat {
+            let value = match arg.1.as_ref() {
+                Expression::NamedArg(_, v) => v,
+                _ => arg,
+            };
+            bytecode.append(&mut self.do_compile(value));
+            let tmp = self.alloc_temp_slot();
+            bytecode.push_store_pop(tmp);
+            temps.push(tmp);
+        }
+        let raw = self.bytecode.code_slice_raw_ops(start, end);
+        self.bytecode.append(bytecode);
+        if !self.emit_cfg_inline_body(&raw, &temps, /*allow_calls=*/ true) {
+            return false;
+        }
+        let result = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(result);
+        bytecode.push_load(result);
+        true
+    }
+
+    fn body_uses_slot_past(ops: &[IlOp], arity: usize) -> bool {
+        for op in ops {
+            match op {
+                IlOp::Load { slot, .. } | IlOp::StorePop { slot, .. } => {
+                    if *slot as usize >= arity {
+                        return true;
+                    }
+                }
+                IlOp::LoadReturnSlot { slot, .. } => {
+                    if *slot as usize >= arity {
+                        return true;
+                    }
+                }
+                IlOp::BinSlotImm { slot, .. } => {
+                    if *slot as usize >= arity {
+                        return true;
+                    }
+                }
+                IlOp::BinSlotSlot { a, b, .. } => {
+                    if *a as usize >= arity || *b as usize >= arity {
+                        return true;
+                    }
+                }
+                _ => {
+                    if let Some(b) = op.as_plain_byte() {
+                        match *b.bytecode() {
+                            Instruction::LOAD | Instruction::STORE => {
+                                if b.load_store_single_slot()
+                                    .is_some_and(|s| s as usize >= arity)
+                                {
+                                    return true;
+                                }
+                            }
+                            Instruction::LoadReturnSlot => {
+                                if b.operand_u32() as usize >= arity {
+                                    return true;
+                                }
+                            }
+                            Instruction::BinSlotImm => {
+                                if b.bin_slot_imm_parts().1 >= arity {
+                                    return true;
+                                }
+                            }
+                            Instruction::BinSlotSlot => {
+                                let (_, a, bslot) = b.bin_slot_slot_parts();
+                                if a >= arity || bslot >= arity {
+                                    return true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Copy a CFG-bearing callee body into `self.bytecode`, remapping slots to
+    /// `temps`. Strips `RETURN` / fused `*Return` so the value stays on stack.
+    /// When `allow_calls` is set, `Entry`/`CALL` are preserved (self-unroll).
+    fn emit_cfg_inline_body(
+        &mut self,
+        ops: &[IlOp],
+        temps: &[u32],
+        allow_calls: bool,
+    ) -> bool {
+        use std::collections::HashMap;
+        let mut label_map: HashMap<u32, IlLabel> = HashMap::new();
+        let mut ensure_label = |id: u32, bc: &mut CodeBuf| -> IlLabel {
+            *label_map
+                .entry(id)
+                .or_insert_with(|| bc.fresh_label())
+        };
+        // Pre-allocate labels referenced by jumps.
+        for op in ops {
+            if let IlOp::Jump { target, .. } = op {
+                let _ = ensure_label(target.0, &mut self.bytecode);
+            }
+            if let IlOp::Label(l) = op {
+                let _ = ensure_label(l.0, &mut self.bytecode);
+            }
+        }
+        let end_label = self.bytecode.fresh_label();
+        let mut saw_value = false;
+        for op in ops {
+            match op {
+                IlOp::Label(l) => {
+                    let mapped = ensure_label(l.0, &mut self.bytecode);
+                    self.bytecode.bind_label(mapped);
+                }
+                IlOp::Jump { kind, target, loc } => {
+                    let mapped = ensure_label(target.0, &mut self.bytecode);
+                    self.bytecode.push_op(IlOp::Jump {
+                        kind: *kind,
+                        target: mapped,
+                        loc: *loc,
+                    });
+                }
+                IlOp::Entry {
+                    kind,
+                    arity,
+                    target,
+                    loc,
+                } => {
+                    if !allow_calls {
+                        return false;
+                    }
+                    // Peel is an expression context: TailCall would replace the
+                    // caller's frame and never yield a value back. Demote to Call.
+                    let kind = match kind {
+                        EntryKind::TailCall => EntryKind::Call,
+                        other => *other,
+                    };
+                    self.bytecode.push_op(IlOp::Entry {
+                        kind,
+                        arity: *arity,
+                        target: *target,
+                        loc: *loc,
+                    });
+                    saw_value = true;
+                }
+                IlOp::Return { .. } => {
+                    // Arm/function return → jump to join with value on stack.
+                    self.bytecode.push_op(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: end_label,
+                        loc: DebugLoc::unknown(),
+                    });
+                    saw_value = true;
+                }
+                IlOp::ConstReturnImm { imm, loc } => {
+                    self.bytecode.push_op(IlOp::Const {
+                        imm: *imm as i32,
+                        loc: *loc,
+                    });
+                    self.bytecode.push_op(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: end_label,
+                        loc: DebugLoc::unknown(),
+                    });
+                    saw_value = true;
+                }
+                IlOp::LoadReturnSlot { slot, loc } => {
+                    let Some(&tmp) = temps.get(*slot as usize) else {
+                        return false;
+                    };
+                    self.bytecode.push_op(IlOp::Load {
+                        slot: tmp,
+                        loc: *loc,
+                    });
+                    self.bytecode.push_op(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: end_label,
+                        loc: DebugLoc::unknown(),
+                    });
+                    saw_value = true;
+                }
+                IlOp::BinReturn { op: bin_op, loc } => {
+                    for &tmp in temps {
+                        self.bytecode.push_op(IlOp::Load {
+                            slot: tmp,
+                            loc: *loc,
+                        });
+                    }
+                    self.bytecode.push_op(IlOp::Bin {
+                        op: *bin_op,
+                        loc: *loc,
+                    });
+                    self.bytecode.push_op(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: end_label,
+                        loc: DebugLoc::unknown(),
+                    });
+                    saw_value = true;
+                }
+                IlOp::Load { slot, loc } => {
+                    let Some(&tmp) = temps.get(*slot as usize) else {
+                        return false;
+                    };
+                    self.bytecode.push_op(IlOp::Load {
+                        slot: tmp,
+                        loc: *loc,
+                    });
+                }
+                IlOp::StorePop { slot, loc } => {
+                    let Some(&tmp) = temps.get(*slot as usize) else {
+                        return false;
+                    };
+                    self.bytecode.push_op(IlOp::StorePop {
+                        slot: tmp,
+                        loc: *loc,
+                    });
+                }
+                IlOp::BinSlotImm {
+                    op: bin_op,
+                    slot,
+                    imm,
+                    loc,
+                } => {
+                    let Some(&tmp) = temps.get(*slot as usize) else {
+                        return false;
+                    };
+                    if tmp > u8::MAX as u32 {
+                        return false;
+                    }
+                    self.bytecode.push_op(IlOp::BinSlotImm {
+                        op: *bin_op,
+                        slot: tmp as u8,
+                        imm: *imm,
+                        loc: *loc,
+                    });
+                }
+                IlOp::BinSlotSlot {
+                    op: bin_op,
+                    a,
+                    b,
+                    loc,
+                } => {
+                    let Some(&ta) = temps.get(*a as usize) else {
+                        return false;
+                    };
+                    let Some(&tb) = temps.get(*b as usize) else {
+                        return false;
+                    };
+                    if ta > u8::MAX as u32 || tb > u8::MAX as u32 {
+                        return false;
+                    }
+                    self.bytecode.push_op(IlOp::BinSlotSlot {
+                        op: *bin_op,
+                        a: ta as u8,
+                        b: tb as u8,
+                        loc: *loc,
+                    });
+                }
+                other => {
+                    // Plain producers / residual bytes — remap LOAD/STORE/BinSlot*.
+                    if let Some(b) = other.as_plain_byte() {
+                        match *b.bytecode() {
+                            Instruction::RETURN => {
+                                self.bytecode.push_op(IlOp::Jump {
+                                    kind: IlJumpKind::Unconditional,
+                                    target: end_label,
+                                    loc: DebugLoc::unknown(),
+                                });
+                                saw_value = true;
+                            }
+                            Instruction::ConstReturnImm => {
+                                self.bytecode.push_const(b.operand_u32() as i32);
+                                self.bytecode.push_op(IlOp::Jump {
+                                    kind: IlJumpKind::Unconditional,
+                                    target: end_label,
+                                    loc: DebugLoc::unknown(),
+                                });
+                                saw_value = true;
+                            }
+                            Instruction::LoadReturnSlot => {
+                                let Some(&tmp) = temps.get(b.operand_u32() as usize) else {
+                                    return false;
+                                };
+                                self.bytecode.push_load(tmp);
+                                self.bytecode.push_op(IlOp::Jump {
+                                    kind: IlJumpKind::Unconditional,
+                                    target: end_label,
+                                    loc: DebugLoc::unknown(),
+                                });
+                                saw_value = true;
+                            }
+                            Instruction::BinReturn => {
+                                let op: Instruction = b.bin_return_op().into();
+                                for &tmp in temps {
+                                    self.bytecode.push_load(tmp);
+                                }
+                                self.bytecode.push(Byte::new(op));
+                                self.bytecode.push_op(IlOp::Jump {
+                                    kind: IlJumpKind::Unconditional,
+                                    target: end_label,
+                                    loc: DebugLoc::unknown(),
+                                });
+                                saw_value = true;
+                            }
+                            Instruction::LOAD => {
+                                let Some(slot) = b.load_store_single_slot() else {
+                                    return false;
+                                };
+                                let Some(&tmp) = temps.get(slot as usize) else {
+                                    return false;
+                                };
+                                self.bytecode.push_load(tmp);
+                            }
+                            Instruction::STORE => {
+                                let Some(slot) = b.load_store_single_slot() else {
+                                    return false;
+                                };
+                                let Some(&tmp) = temps.get(slot as usize) else {
+                                    return false;
+                                };
+                                self.bytecode.push_store_pop(tmp);
+                            }
+                            Instruction::BinSlotImm | Instruction::BinSlotSlot => {
+                                let Some(remapped) =
+                                    Self::remap_bin_slot_for_inline(&b, temps)
+                                else {
+                                    return false;
+                                };
+                                self.bytecode.push(remapped);
+                            }
+                            Instruction::CALL | Instruction::TailCall => {
+                                if !allow_calls {
+                                    return false;
+                                }
+                                // Expression peel: TailCall → CALL so the value returns.
+                                let (arity, target) = b.call_parts();
+                                self.bytecode.push(
+                                    Byte::new(Instruction::CALL)
+                                        .with_call_packed(arity as u32, target as u32),
+                                );
+                                saw_value = true;
+                            }
+                            _ => {
+                                if Self::inline_forbidden_op(other) && !allow_calls {
+                                    return false;
+                                }
+                                self.bytecode.push_op(other.clone());
+                            }
+                        }
+                    } else {
+                        self.bytecode.push_op(other.clone());
+                    }
+                }
+            }
+        }
+        self.bytecode.bind_label(end_label);
+        saw_value
     }
 }
 
@@ -7865,6 +8476,16 @@ impl Compiler {
                             return bytecode;
                         }
 
+                        // One-level self-unroll: peel recursive callee body once;
+                        // nested self-calls remain CALL/Entry.
+                        if !is_generic
+                            && !self.coroutine_fns.contains(&n)
+                            && !self.coroutine_fns.contains(&lookup_name)
+                            && self.try_emit_self_unroll_call(&n, Some(arg_slice), &mut bytecode)
+                        {
+                            return bytecode;
+                        }
+
                         // Partial application → MakeFn (not CALL).
                         let (fa, is_rest) = self
                             .checker
@@ -12888,10 +13509,11 @@ fn main() {
     #[test]
     fn call_arg_prep_packs_three_loads() {
         use common::Instruction;
-        // Keep `add` large enough that tiny-inline will not absorb the call.
+        // Two early-return guards → not a single tiny-inline diamond.
         let (bc, _pool) = compile_src(
             "fn add(int a, int b, int c) -> int { \
  if a < 0 { return 0; } \
+ if b < 0 { return 0; } \
  return a + b + c; \
  } \
  fn main() { \
@@ -13249,10 +13871,12 @@ fn main() { print \"%i\", add(3, 4); }",
         );
     }
 
-    /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
-    /// first `RETURN`, which would drop the else arm (`return n * 2`).
+
+
+    /// Early-return diamond bodies ARE tiny-inlined (Phase 4a): one compare+branch
+    /// + base return + fall-through return, with no CALL left at the call site.
     #[test]
-    fn early_return_callee_is_not_tiny_inlined() {
+    fn early_return_callee_is_tiny_inlined() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn early(int n, int is_neg) -> int { \
@@ -13261,9 +13885,111 @@ fn main() { print \"%i\", add(3, 4); }",
              } \
              fn main() { print \"%i\", early(4, 0); }",
         );
+        // Prologue may contain one CALL to main; the early() call site must not.
+        let calls = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL | Instruction::TailCall))
+            .count();
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CALL)),
-            "early-return callee must remain a CALL (not truncated inline); opcodes: {:?}",
+            calls <= 1,
+            "early-return diamond must be tiny-inlined (only prologue CALL); call_count={calls}; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Inlined body still has a conditional branch.
+        assert!(
+            bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::JMPF
+                    | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
+            )),
+            "inlined diamond must keep a compare+branch; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn is_tiny_inline_il_accepts_compare_branch_diamond() {
+        use crate::il::{IlJumpKind, IlOp, Label};
+        use common::{DebugLoc, Instruction};
+        let ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::LEQ,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Const {
+                imm: 1,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ];
+        assert!(Compiler::is_tiny_inline_diamond_il(&ops));
+        assert!(Compiler::is_tiny_inline_il(&ops));
+    }
+
+    /// Self-recursive call from `main` peels one level; nested recursion remains CALL.
+    #[test]
+    fn self_unroll_peels_one_level_at_call_site() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn fib(int n) -> int { \
+               if n <= 2 { return 1; } \
+               return fib(n - 1) + fib(n - 2); \
+             } \
+             fn main() { print \"%i\", fib(5); }",
+        );
+        let calls = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL | Instruction::TailCall))
+            .count();
+        assert!(
+            calls >= 2,
+            "peeled fib must retain nested CALLs; call_count={calls}; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Peel copies the base-case compare into main's stream.
+        assert!(
+            bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::JMPF
+                    | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
+                    | Instruction::LEQ
+                    | Instruction::LE
+            )),
+            "self-unroll should copy compare/branch into caller; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
