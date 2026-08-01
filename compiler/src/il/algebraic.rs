@@ -493,4 +493,74 @@ mod tests {
         assert!(matches!(ops[1], IlOp::Const { imm: 1, .. }));
         assert!(matches!(ops[2], IlOp::Return { .. }));
     }
+
+    #[test]
+    fn const_const_div_mod_zero_and_wide_shift_refused() {
+        let mut div0 = vec![
+            IlOp::Const { imm: 8, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::DIV,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = div0.clone();
+        algebraic_simplify(&mut div0);
+        assert_eq!(div0.len(), before.len(), "DIV by 0 must not fold");
+
+        let mut mod0 = vec![
+            IlOp::Const { imm: 8, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MOD,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = mod0.clone();
+        algebraic_simplify(&mut mod0);
+        assert_eq!(mod0.len(), before.len(), "MOD by 0 must not fold");
+
+        let mut shl = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Const { imm: 32, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::SHL,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = shl.clone();
+        algebraic_simplify(&mut shl);
+        assert_eq!(shl.len(), before.len(), "SHL amount ≥ 32 must not fold");
+    }
+
+    #[test]
+    fn pow_one_identity_and_bitand_zero() {
+        let mut pow1 = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut pow1);
+        assert!(matches!(pow1[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(pow1[1], IlOp::Return { .. }));
+
+        let mut and0 = vec![
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut and0);
+        assert!(matches!(and0[0], IlOp::Const { imm: 0, .. }));
+    }
 }
