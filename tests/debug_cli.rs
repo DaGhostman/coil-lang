@@ -85,7 +85,7 @@ fn debug_batch_bad_command_exits_nonzero() {
 #[test]
 fn debug_batch_stepi_bt_and_disassemble() {
     let (out, cwd) = run_debug_script(
-        "break fib\nrun\nbt\nstepi\ndisassemble fib\ncontinue\nquit\n",
+        "break fib\nrun\nbt\nstepi\ndisassemble fib\ndelete\ncontinue\nquit\n",
         "stepi",
     );
     assert!(
