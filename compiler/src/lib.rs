@@ -1160,6 +1160,43 @@ impl Compiler {
             bytecode.push_const(shift as i32);
             bytecode.push(Byte::new(Instruction::SHL));
             true
+        } else if let Some((base, kind)) =
+            const_fold::strength_pow_int(ast, self.const_env())
+        {
+            use crate::typechecking::subst::apply_ty_prune;
+            use crate::typechecking::ty::{BYTE, INT};
+            let base_is_int_like = self.codegen_expr_ty(base).is_some_and(|ty| {
+                matches!(
+                    apply_ty_prune(self.checker.subst(), &ty),
+                    Ty::Con(ref n) if n == INT || n == BYTE
+                )
+            });
+            if !base_is_int_like {
+                return false;
+            }
+            match kind {
+                const_fold::StrengthPow::ConstOne => {
+                    // Still walk `base` for NodeId alignment, then push 1.
+                    self.discard_compile(base);
+                    bytecode.push_const(1);
+                    true
+                }
+                const_fold::StrengthPow::Square => {
+                    // Dup-safe bases only: Identifier or pure (no Call / IO).
+                    if !(matches!(
+                        unwrap_expr_output(base).1.as_ref(),
+                        Expression::Identifier(_)
+                    ) || Self::call_arg_is_pure(base))
+                    {
+                        return false;
+                    }
+                    let mut base_bc = self.do_compile(base);
+                    bytecode.append(&mut base_bc);
+                    bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    bytecode.push(Byte::new(Instruction::MUL));
+                    true
+                }
+            }
         } else {
             false
         }
@@ -1182,6 +1219,38 @@ impl Compiler {
             }
             self.discard_compile(body);
         }
+    }
+
+    /// Rewrite `if (!c) { A } else { B }` as `if (c) { B } else { A }` so the
+    /// condition can fuse into `BinSlot*Jmpf` / `CmpJmpf` without `LogNotJmpf`.
+    fn try_invert_not_if_else<'a>(branches: &'a [Output<'a>]) -> Option<Vec<Output<'a>>> {
+        if branches.len() != 2 {
+            return None;
+        }
+        let Expression::Branch(Some(cond), then_body) = branches[0].1.as_ref() else {
+            return None;
+        };
+        let Expression::Branch(else_cond, else_body) = branches[1].1.as_ref() else {
+            return None;
+        };
+        if else_cond.is_some() {
+            return None;
+        }
+        let cond = unwrap_expr_output(cond);
+        let Expression::LogicalNot(inner) = cond.1.as_ref() else {
+            return None;
+        };
+        let inner = unwrap_expr_output(inner).clone();
+        Some(vec![
+            (
+                branches[0].0,
+                Box::new(Expression::Branch(Some(inner), else_body.clone())),
+            ),
+            (
+                branches[1].0,
+                Box::new(Expression::Branch(None, then_body.clone())),
+            ),
+        ])
     }
 
     /// Constant-folded `if` / `else if` / `else`. Returns true when handled.
@@ -4230,6 +4299,9 @@ impl Compiler {
         if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
             let rewritten = Self::rewrite_format_v_to_s(fmt);
             let specs = Self::format_consuming_specs(fmt);
+            // Evaluate args into temps first. Emitting the format string
+            // before args leaves it under CALL/STORE frames (self-unroll /
+            // nested calls) and corrupts the shared stack.
             let mut arg_slots = Vec::with_capacity(params.len());
             let mut emitted = 0usize;
             for (param, spec) in params.iter().zip(specs.iter()) {
@@ -4240,24 +4312,20 @@ impl Compiler {
                     self.bytecode.extend(bc);
                 }
                 let slot = self.alloc_temp_slot();
-                self.bytecode
-                    .push_store_pop(slot);
+                self.bytecode.push_store_pop(slot);
                 arg_slots.push(slot);
                 emitted += 1;
             }
-            // Extra args beyond specifiers — still push them (VM pops by count).
             for param in params.iter().skip(emitted) {
                 let bc = self.do_compile(param);
                 self.bytecode.extend(bc);
                 let slot = self.alloc_temp_slot();
-                self.bytecode
-                    .push_store_pop(slot);
+                self.bytecode.push_store_pop(slot);
                 arg_slots.push(slot);
             }
             self.emit_string_literal(&rewritten);
             for slot in arg_slots {
-                self.bytecode
-                    .push_load(slot);
+                self.bytecode.push_load(slot);
             }
             self.bytecode
                 .push(Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32));
@@ -9632,6 +9700,11 @@ impl Compiler {
                 if self.try_compile_const_if(branches) {
                     return bytecode;
                 }
+                // `if (!c) { A } else { B }` ≡ `if (c) { B } else { A }` — exposes
+                // BinSlot*/Cmp JMPF fusion (avoids LogNotJmpf after fused cond).
+                let inverted = Self::try_invert_not_if_else(branches);
+                let branches: &[Output<'_>] = inverted.as_deref().unwrap_or(branches);
+
                 let mut bb = BlockBuilder::new();
                 let end_label = bb.fresh_label(self.bytecode.il_mut());
                 let mut branch_start_labels: Vec<Option<crate::block_builder::Label>> =
@@ -10141,7 +10214,9 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(lhs));
             }
             Expression::Pow(lhs, rhs) => {
-                if self.try_emit_aggregate_arith(
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                    // **0 / **1 / **2 strength-reduced or const-folded.
+                } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
                     span.start,
@@ -11819,6 +11894,8 @@ fn unwrap_expr_output<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
         | Expression::Group(inner)
         | Expression::Statement(inner)
         | Expression::ExprStatement(inner) => unwrap_expr_output(inner),
+        // Parenthesized conditions often parse as a one-element Fragment.
+        Expression::Fragment(items) if items.len() == 1 => unwrap_expr_output(&items[0]),
         _ => expr,
     }
 }
@@ -12282,6 +12359,75 @@ fn main() {
         assert!(
             bytecode_has_shl_by(&bc, 3),
             "expected LOAD/CONST/SHL (shift 3) or fused BinSlotImm(SHL, 3) for x*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x ** 2` strength-reduces to `x; DUP; MUL` (not `Pow`).
+    #[test]
+    fn pow_two_emits_dup_mul_not_pow() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn sq(int x) -> int { return x ** 2; }");
+        let has_pow = bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow));
+        let has_mul = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MUL)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::MUL as u8)
+                || (*b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::MUL as u8)
+        });
+        let has_dup = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
+        assert!(
+            !has_pow && has_mul && has_dup,
+            "expected DUP+MUL for x**2; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x ** 0` folds to const 1.
+    #[test]
+    fn pow_zero_emits_const_one() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn one(int x) -> int { return x ** 0; }");
+        let has_pow = bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow));
+        let has_one = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() == 1
+                || matches!(b.bytecode(), Instruction::ConstReturnImm) && b.operand_u32() == 1
+        });
+        assert!(
+            !has_pow && has_one,
+            "expected const 1 for x**0; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `if (!cond) { A } else { B }` inverts so fused JMPF sees `cond` (no LogNotJmpf).
+    #[test]
+    fn not_if_else_inverts_away_log_not_jmpf() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+            fn f(int i) -> int {
+                if (!(i & 1)) {
+                    return 10;
+                } else {
+                    return 20;
+                }
+            }
+            "#,
+        );
+        let has_log_not_jmpf = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::LogNotJmpf));
+        let has_bin_slot_jmpf = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::BinSlotImmJmpf)
+                && b.bin_slot_imm_jmpf_parts().0 == Instruction::BITAND as u8
+        });
+        assert!(
+            !has_log_not_jmpf && has_bin_slot_jmpf,
+            "expected BinSlotImmJmpf(BITAND) without LogNotJmpf; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
