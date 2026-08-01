@@ -20,15 +20,14 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        // Const a; Const b; CMP → Const 0/1 when both inline.
+        // Const a; Const b; Bin → Const result for scalar int ops.
         if i + 2 < ops.len()
             && let (IlOp::Const { imm: a, loc }, IlOp::Const { imm: b, .. }, IlOp::Bin { op, .. }) =
                 (&ops[i], &ops[i + 1], &ops[i + 2])
-            && is_int_cmp(*op)
             && info.sp_before(i + 1).is_known()
             && info.sp_before(i + 2).is_known()
+            && let Some(r) = eval_const_bin(*op, *a, *b)
         {
-            let r = eval_cmp(*op, *a, *b);
             out.push(IlOp::Const {
                 imm: r,
                 loc: *loc,
@@ -127,6 +126,29 @@ fn eval_cmp(op: Instruction, a: i32, b: i32) -> i32 {
         _ => return 0,
     };
     i32::from(t)
+}
+
+/// Fold `Const a; Const b; Bin` when both immediates are inline ints.
+fn eval_const_bin(op: Instruction, a: i32, b: i32) -> Option<i32> {
+    if is_int_cmp(op) {
+        return Some(eval_cmp(op, a, b));
+    }
+    match op {
+        Instruction::ADD => Some(a.wrapping_add(b)),
+        Instruction::SUB => Some(a.wrapping_sub(b)),
+        Instruction::MUL => Some(a.wrapping_mul(b)),
+        Instruction::DIV if b != 0 => Some(a / b),
+        Instruction::MOD if b != 0 => Some(a % b),
+        Instruction::BITAND => Some(a & b),
+        Instruction::BITOR => Some(a | b),
+        Instruction::XOR => Some(a ^ b),
+        Instruction::SHL if (0..32).contains(&b) => Some(a.wrapping_shl(b as u32)),
+        Instruction::SHR if (0..32).contains(&b) => Some(a.wrapping_shr(b as u32)),
+        Instruction::AND => Some(i32::from(a != 0 && b != 0)),
+        Instruction::OR => Some(i32::from(a != 0 || b != 0)),
+        Instruction::Pow if (0..32).contains(&b) => Some(a.wrapping_pow(b as u32)),
+        _ => None,
+    }
 }
 
 fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> Option<IlOp> {
@@ -447,5 +469,28 @@ mod tests {
         ];
         algebraic_simplify(&mut ops);
         assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
+    }
+
+    #[test]
+    fn const_const_binop_folds() {
+        let mut ops = vec![
+            IlOp::Const { imm: 6, loc: loc() },
+            IlOp::Const { imm: 7, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 1, .. }));
+        assert!(matches!(ops[2], IlOp::Return { .. }));
     }
 }
