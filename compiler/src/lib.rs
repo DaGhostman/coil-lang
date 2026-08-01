@@ -7889,6 +7889,9 @@ impl Compiler {
                     self.context.variables.intern(format!("__dict{}", dict_idx));
                 }
 
+                // Args + self + dicts occupy the shared stack at body entry.
+                let entry_sp = self.context.variables.len() as u32;
+
                 self.bytecode.append(&mut a);
 
                 let body_start = self.bytecode.len();
@@ -7913,8 +7916,13 @@ impl Compiler {
                 self.fn_bytecode_spans
                     .insert(table_key.clone(), (body_start, body_end));
                 let entry = self.fn_entry_labels.get(&table_key).copied();
-                self.bytecode
-                    .record_func(table_key, entry, body_start, body_end);
+                self.bytecode.record_func_with_sp(
+                    table_key,
+                    entry,
+                    body_start,
+                    body_end,
+                    entry_sp,
+                );
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;

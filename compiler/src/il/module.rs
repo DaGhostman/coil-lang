@@ -128,7 +128,7 @@ impl IlModule {
         }
 
         for body in &mut self.funcs {
-            opt::optimize(&mut body.ops, &per);
+            opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32);
             super::gvn::cfg_gvn(&mut body.ops);
         }
 

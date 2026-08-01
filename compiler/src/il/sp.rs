@@ -214,12 +214,21 @@ fn is_terminator(op: &IlOp) -> bool {
 
 /// Compute SP-in for each op. Entry SP is 0 at index 0; unknown effects poison.
 pub fn analyze(ops: &[IlOp]) -> SpInfo {
+    analyze_at(ops, 0)
+}
+
+/// Like [`analyze`], but seed height at `entry_sp` (function arity / frame base).
+///
+/// Per-function bodies begin with args already on the shared locals/operand
+/// stack; starting at 0 understates height and lets `mem_fwd` emit `Dup;Store`
+/// that aliases a local with TOS.
+pub fn analyze_at(ops: &[IlOp], entry_sp: i32) -> SpInfo {
     let n = ops.len();
     let mut sp_in: Vec<Option<Sp>> = vec![None; n];
     if n == 0 {
         return SpInfo { sp_in: Vec::new() };
     }
-    sp_in[0] = Some(Sp::Known(0));
+    sp_in[0] = Some(Sp::Known(entry_sp));
 
     let mut label_at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (i, op) in ops.iter().enumerate() {
@@ -248,7 +257,7 @@ pub fn analyze(ops: &[IlOp]) -> SpInfo {
     for _ in 0..n.saturating_mul(2).max(8) {
         let mut changed = false;
         // `None` = no fall-through edge into the next index.
-        let mut fall_sp: Option<Sp> = Some(Sp::Known(0));
+        let mut fall_sp: Option<Sp> = Some(Sp::Known(entry_sp));
         for i in 0..n {
             if i > 0
                 && let Some(edge) = fall_sp

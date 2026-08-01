@@ -45,6 +45,11 @@ impl Default for OptimizeOptions {
 
 /// Run IL opts in place. Safe to call before [`super::lower`].
 pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
+    optimize_at(ops, opts, 0);
+}
+
+/// Like [`optimize`], seeding SP analysis at `entry_sp` for the op buffer.
+pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
     if opts.jump_thread {
         jump_thread(ops);
     }
@@ -55,13 +60,15 @@ pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
         stack_dce(ops);
     }
     if opts.mem_fwd {
-        mem_fwd(ops);
+        mem_fwd(ops, entry_sp);
         dead_store(ops);
     }
     if opts.algebraic {
         super::algebraic::algebraic_simplify(ops);
     }
     if opts.licm {
+        // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
+        let _ = entry_sp;
         super::licm::licm(ops);
     }
     if opts.return_convoy {
@@ -289,8 +296,8 @@ fn stack_dce(ops: &mut Vec<IlOp>) {
 /// `StorePop s; Load s` → `Dup; StorePop s` when the value stays on stack after
 /// store. Refused when SP-in is `s + 1` (TOS aliases the slot in the shared
 /// stack/locals frame — e.g. tuple `let` temps at slot 0).
-fn mem_fwd(ops: &mut Vec<IlOp>) {
-    let sp = super::sp::analyze(ops);
+fn mem_fwd(ops: &mut Vec<IlOp>, entry_sp: i32) {
+    let sp = super::sp::analyze_at(ops, entry_sp);
     let mut i = 0;
     while i + 1 < ops.len() {
         let slot_loc = {
@@ -1348,7 +1355,7 @@ mod tests {
                 loc: common::DebugLoc::unknown(),
             },
         ];
-        mem_fwd(&mut ops);
+        mem_fwd(&mut ops, 0);
         assert!(matches!(ops[0], IlOp::StorePop { slot: 5, .. }));
         assert!(matches!(ops[1], IlOp::Load { slot: 5, .. }));
     }
@@ -1388,10 +1395,36 @@ mod tests {
             },
         ];
         let before = ops.clone();
-        mem_fwd(&mut ops);
+        mem_fwd(&mut ops, 0);
         assert!(matches!(ops[3], IlOp::StorePop { slot: 0, .. }));
         assert!(matches!(ops[4], IlOp::Load { slot: 0, .. }));
         assert_eq!(ops.len(), before.len());
+    }
+
+    /// Call return at height arity+1 then StorePop arity must not become Dup;Store
+    /// (TOS aliases the local on the shared stack).
+    #[test]
+    fn mem_fwd_refuses_post_call_store_that_aliases_tos() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 1,
+                target: Label(0),
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+        // Two args already on stack at body entry (probe-like).
+        mem_fwd(&mut ops, 2);
+        assert!(
+            matches!(ops[2], IlOp::StorePop { slot: 2, .. }),
+            "must keep StorePop;Load when height aliases slot"
+        );
+        assert!(matches!(ops[3], IlOp::Load { slot: 2, .. }));
     }
 
     #[test]
@@ -2298,7 +2331,7 @@ mod tests {
                 loc: common::DebugLoc::unknown(),
             },
         ];
-        mem_fwd(&mut ops);
+        mem_fwd(&mut ops, 0);
         assert!(matches!(ops[1], IlOp::Dup { .. }));
         assert!(matches!(ops[2], IlOp::StorePop { slot: 3, .. }));
     }
@@ -2366,7 +2399,7 @@ mod tests {
             },
         ];
         let before = ops.clone();
-        mem_fwd(&mut ops);
+        mem_fwd(&mut ops, 0);
         assert!(ops == before);
     }
 

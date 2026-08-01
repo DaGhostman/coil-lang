@@ -16,15 +16,29 @@ pub struct IlFunc {
     /// Inclusive-exclusive emitting-op indices in [`super::CodeBuf`].
     pub code_start: usize,
     pub code_end: usize,
+    /// Stack height at body entry (args + `self` + dict slots). SP analysis for
+    /// per-func opts must start here — locals and the operand stack share memory.
+    pub entry_sp: u32,
 }
 
 impl IlFunc {
     pub fn new(name: impl Into<String>, entry: Option<Label>, code_start: usize, code_end: usize) -> Self {
+        Self::with_entry_sp(name, entry, code_start, code_end, 0)
+    }
+
+    pub fn with_entry_sp(
+        name: impl Into<String>,
+        entry: Option<Label>,
+        code_start: usize,
+        code_end: usize,
+        entry_sp: u32,
+    ) -> Self {
         Self {
             name: name.into(),
             entry,
             code_start,
             code_end,
+            entry_sp,
         }
     }
 }

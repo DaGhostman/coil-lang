@@ -217,7 +217,7 @@ impl CodeBuf {
         self.funcs.clear();
     }
 
-    /// Record a function's emitting span and optional entry label.
+    /// Record a function's emitting span, optional entry label, and entry SP.
     pub fn record_func(
         &mut self,
         name: impl Into<String>,
@@ -225,8 +225,20 @@ impl CodeBuf {
         code_start: usize,
         code_end: usize,
     ) {
-        self.funcs
-            .push(IlFunc::new(name, entry, code_start, code_end));
+        self.record_func_with_sp(name, entry, code_start, code_end, 0);
+    }
+
+    pub fn record_func_with_sp(
+        &mut self,
+        name: impl Into<String>,
+        entry: Option<Label>,
+        code_start: usize,
+        code_end: usize,
+        entry_sp: u32,
+    ) {
+        self.funcs.push(IlFunc::with_entry_sp(
+            name, entry, code_start, code_end, entry_sp,
+        ));
     }
 
     pub fn funcs(&self) -> &[IlFunc] {
