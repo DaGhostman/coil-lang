@@ -409,6 +409,46 @@ mod tests {
         assert_eq!(stack_delta(&slot), Some(1));
     }
 
+    /// Packed LOAD/STORE and fused assign/jmpf forms must report accurate net deltas
+    /// so convoy/LICM SP analysis does not poison on the new encodings.
+    #[test]
+    fn stack_delta_packed_load_store_and_fused_stores() {
+        use common::Byte;
+        let load3 = IlOp::byte(
+            Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2),
+        );
+        let store2 = IlOp::byte(
+            Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0),
+        );
+        let imm_store = IlOp::byte(
+            Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+                Instruction::ADD as u8,
+                0,
+                1,
+            ),
+        );
+        let slot_store = IlOp::byte(
+            Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+                Instruction::BITAND as u8,
+                0,
+                1,
+                2,
+            ),
+        );
+        let slot_jmpf = IlOp::byte(
+            Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+                Instruction::AND as u8,
+                0,
+                3,
+            ),
+        );
+        assert_eq!(stack_delta(&load3), Some(3));
+        assert_eq!(stack_delta(&store2), Some(-2));
+        assert_eq!(stack_delta(&imm_store), Some(0));
+        assert_eq!(stack_delta(&slot_store), Some(0));
+        assert_eq!(stack_delta(&slot_jmpf), Some(0));
+    }
+
     #[test]
     fn stack_delta_call_uses_arity_tail_call_unknown() {
         let call = IlOp::Entry {
