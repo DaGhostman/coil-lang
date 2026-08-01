@@ -5,7 +5,7 @@
 - Run tests with a 64MB memory limit to catch leaks; exceeding it likely indicates a memory leak.
 - Use `poop` for CPU performance baselines: `./scripts/poop_baseline.sh` (or `cargo build --release && poop -d 6000 "./target/release/coil examples/fib_bench.hy" && rm out.hyc`). Soft check before/after opt changes — not a hard CI fail.
 - Use sub-agents for large tasks (scoped to disjoint files/modules); avoid over-parallelizing — give specific, scoped instructions so each agent can finish independently.
-- For VM/runtime performance work, prefer alloc reduction, hot-loop tuning, bounds-check elimination, and `promise!` over adding opcodes or compile-time IL optimizations.
+- For VM/runtime performance work, prefer alloc reduction, hot-loop tuning, bounds-check elimination, and `promise!` over adding opcodes or compile-time IL optimizations; reject benchmark-shaped opcodes (e.g. dropped `BinSlotImmCall`) unless the pattern is clearly universal.
 - Draft implementation plans before large language-feature work; do not edit attached plan files during implementation.
 - New language features require full HM typechecker integration and updated user-facing docs in `docs/`.
 - Include minimal runnable examples with clear expected output before committing feature work.
@@ -28,9 +28,9 @@
 - `byte` is `Ty::Con("byte")` (0..=255); integer literals coerce under expected `byte` / `[byte]`. Array annotations `[T]` / `[T; N]` preserve element type in the AST.
 - `ARCHIVE_VERSION` is **34** (`common/src/archive.rs`); bump on incompatible bytecode, tag, or opcode changes.
 - Packed LA (`dot` / `matmul` / `Matrix` ops) lowers to HostInvoke natives in `machine/src/packed_la.rs` — no LA opcodes.
-- Primitive casts (`CastIntToFloat` … `CastBoolToInt`) are the last `Instruction` variants.
+- After primitive casts, last `Instruction` variants are `BinSlotSlotJmpf`, `BinSlotImmStore`, `BinSlotSlotStore`; BinSlot* / jmpf / store fusions also cover bitwise and logical AND/OR.
 - Static slots: `LoadStatic`/`StoreStatic`; `static_slot_count` is in the archive envelope. Archives also carry `source_files` + `debug_locs` (one per bytecode slot).
-- Codegen: scalar const folding (`ConstEnv`), constant branch/loop elimination, loop unroll (≤8 trips, no `break`/`continue`), optional tiny direct-call inlining, `TailCall` for eligible self-recursive returns.
+- Codegen: scalar const folding (`ConstEnv`), constant branch/loop elimination, loop unroll (≤8 trips, no `break`/`continue`), optional tiny direct-call inlining (incl. one compare+branch return diamond), one-level self-`CALL` unroll (peel once; nested self-calls remain), `TailCall` for eligible self-recursive returns.
 - `prelude::test::assert` is auto-imported (`Result<(), string>`); `panic` aborts the VM (CLI/`coil test` treat it as failure).
 - `examples/fib.hy` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.hy` is the primary `poop` / `vm_bench.sh` / `perf_metrics` entry.
 - CLI caches bytecode in `out.hyc`; delete it before re-running after source edits.
