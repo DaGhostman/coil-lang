@@ -38,11 +38,21 @@ fn perf_numeric_uses_bin_slot_imm_jmpf_for_loop() {
 }
 
 #[test]
-fn perf_operators_loop_uses_log_not_jmpf() {
+fn perf_operators_loop_inverts_not_into_bin_slot_jmpf() {
     let (bc, _, _) = compile("examples/perf/operators_loop.hy");
+    // `if (!(i & 1))` inverts so the fused header is BinSlotImmJmpf(BITAND),
+    // not LogNotJmpf.
+    assert_eq!(
+        count_opcodes(&bc, Instruction::LogNotJmpf),
+        0,
+        "operators loop should not emit LogNotJmpf after if(!c) invert"
+    );
     assert!(
-        count_opcodes(&bc, Instruction::LogNotJmpf) >= 1,
-        "operators loop should fuse LogNot; JMPF"
+        bc.iter().any(|b| {
+            matches!(*b.bytecode(), Instruction::BinSlotImmJmpf)
+                && b.bin_slot_imm_jmpf_parts().0 == Instruction::BITAND as u8
+        }),
+        "operators loop should fuse BITAND into BinSlotImmJmpf"
     );
 }
 
