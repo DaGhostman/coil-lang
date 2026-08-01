@@ -111,6 +111,8 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 | `coil run <file.hyc>` | Execute a previously compiled archive |
 | `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`); always requires an explicit `.hy` path (does not read `[entry].file`) |
 | `coil test [path] [--fail-fast]` | Compile and run every `.hy` under `[path]` (default `./tests`) |
+| `coil dissect <file.hy> [--fn pat] [--il] [--ast]` | In-memory compile and dump filtered bytecode (optional pre-opt IL / entry AST); never writes `out.hyc` |
+| `coil debug <file.hy> [-x script] [--batch]` | GDB-style debugger (REPL; optional script / batch mode); never writes `out.hyc` |
 
 Examples:
 
@@ -120,6 +122,14 @@ cargo run -- compile examples/fib.hy -o /tmp/fib.hyc
 
 # Run that archive
 cargo run -- run /tmp/fib.hyc
+
+# Inspect final bytecode for `fib` (and optionally pre-opt IL)
+cargo run -- dissect examples/fib.hy --fn fib
+cargo run -- dissect examples/fib.hy --fn fib --il
+
+# Debug interactively, or with a script
+cargo run -- debug examples/fib.hy
+cargo run -- debug examples/fib.hy -x /tmp/cmds.txt --batch
 
 # Single-file app for this machine (no separate .hyc or coil install needed to run)
 cargo run --release -- package examples/fib.hy -o ./fib-app

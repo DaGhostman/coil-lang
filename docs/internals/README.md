@@ -7,6 +7,8 @@ How coil is structured for contributors and embedders. End-user language docs li
 | [Pipeline](pipeline.md) | Parse → typecheck → codegen → archive → execute |
 | [Debug line table](debug-info.md) | `source_files` / `debug_locs` in `.hyc` |
 | [Opcodes](opcodes.md) | Selected bytecode ops behind builtins |
+| [Dissect](dissect.md) | `coil dissect` — in-memory bytecode / IL / AST dump |
+| [Debugger](debugger.md) | `coil debug` — GDB-style REPL / batch debugger |
 | [Test health report](test-health-report.md) | Historical flaky/broken-test notes |
 | [Grammar](grammar/) | tree-sitter grammar sources |
 
