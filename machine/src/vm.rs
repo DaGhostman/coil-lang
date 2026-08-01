@@ -16,8 +16,9 @@ use common::{
 };
 
 use crate::{
-    CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjBoxed, ObjCoroutine, ObjEnum,
-    ObjInstance, ObjFn, ObjPolyFn, ObjString, ObjTuple, Object, RefCoroutine, Stack,
+    CStructLayout, CoroState, DebugController, Frame, Heap, Member, ObjArray, ObjBoxed,
+    ObjCoroutine, ObjEnum, ObjInstance, ObjFn, ObjPolyFn, ObjString, ObjTuple, Object,
+    RefCoroutine, Stack, StopReason,
 };
 use common::ValueTag;
 
@@ -161,6 +162,12 @@ pub struct Machine<const S: usize> {
     statics: Vec<Value>,
     /// Debug line table (parallel to archived bytecode indices).
     program_debug: ProgramDebug,
+    /// Cached `(file_index, line)` per PC for debug stepping (built from `program_debug`).
+    pc_lines: Vec<Option<(u32, u32)>>,
+    /// Optional debug controller; when set, `execute` may pause at stops.
+    debug: Option<Box<DebugController>>,
+    /// Set when `execute` pauses for the debugger (alongside `pending_ffi`).
+    pending_debug_stop: Option<StopReason>,
     /// Shared program image for OS thread workers (`spawn`).
     thread_program: Option<std::sync::Arc<crate::thread::ThreadProgram>>,
     /// Optional shared stdout capture for worker threads.
@@ -196,6 +203,9 @@ impl<const S: usize> Default for Machine<S> {
             panicked: false,
             statics: Vec::new(),
             program_debug: ProgramDebug::default(),
+            pc_lines: Vec::new(),
+            debug: None,
+            pending_debug_stop: None,
             thread_program: None,
             shared_print: None,
             live_threads: crate::thread::new_live_thread_registry(),
@@ -211,6 +221,201 @@ impl<const S: usize> Machine<S> {
 
     pub fn set_program_debug(&mut self, debug: ProgramDebug) {
         self.program_debug = debug;
+        self.rebuild_pc_line_cache();
+    }
+
+    /// Attach a debug controller (enables stop checks in `execute`).
+    pub fn attach_debug(&mut self, controller: DebugController) {
+        self.debug = Some(Box::new(controller));
+        self.pending_debug_stop = None;
+        if self.pc_lines.is_empty() {
+            self.rebuild_pc_line_cache();
+        }
+    }
+
+    /// Borrow the attached debug controller, if any.
+    pub fn debug_controller_mut(&mut self) -> Option<&mut DebugController> {
+        self.debug.as_deref_mut()
+    }
+
+    pub fn debug_controller(&self) -> Option<&DebugController> {
+        self.debug.as_deref()
+    }
+
+    fn rebuild_pc_line_cache(&mut self) {
+        use std::collections::HashMap;
+        let mut texts: HashMap<u32, String> = HashMap::new();
+        self.pc_lines.clear();
+        self.pc_lines
+            .reserve(self.program_debug.debug_locs.len());
+        for loc in &self.program_debug.debug_locs {
+            if !loc.is_known() {
+                self.pc_lines.push(None);
+                continue;
+            }
+            let text = texts.entry(loc.file).or_insert_with(|| {
+                let path = self
+                    .program_debug
+                    .source_files
+                    .get(loc.file as usize)
+                    .map(|p| self.resolve_source_path(p))
+                    .unwrap_or_default();
+                std::fs::read_to_string(path).unwrap_or_default()
+            });
+            if text.is_empty() {
+                self.pc_lines.push(None);
+                continue;
+            }
+            let pos = byte_to_position(text, loc.start_byte as usize);
+            self.pc_lines.push(Some((loc.file, pos.line)));
+        }
+    }
+
+    /// Resolve PC → `(path, line, column)` when debug locs are known.
+    pub fn resolve_pc_location(&self, pc: usize) -> Option<(String, u32, u32)> {
+        let loc = self.program_debug.debug_locs.get(pc)?;
+        if !loc.is_known() {
+            return None;
+        }
+        let path = self.program_debug.source_files.get(loc.file as usize)?;
+        let resolved = self.resolve_source_path(path);
+        let text = std::fs::read_to_string(&resolved).ok()?;
+        let pos = byte_to_position(&text, loc.start_byte as usize);
+        Some((resolved.display().to_string(), pos.line, pos.column))
+    }
+
+    pub fn debug_ip(&self) -> usize {
+        if self.frames.is_empty() {
+            return 0;
+        }
+        self.frames.get().tell()
+    }
+
+    pub fn debug_frame_depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn debug_frame_sp(&self, frame_idx: usize) -> Option<usize> {
+        if frame_idx >= self.frames.len() {
+            return None;
+        }
+        Some(self.frames[frame_idx].get())
+    }
+
+    pub fn debug_frame_ip(&self, frame_idx: usize) -> Option<usize> {
+        if frame_idx >= self.frames.len() {
+            return None;
+        }
+        Some(self.frames[frame_idx].tell())
+    }
+
+    /// Read local/operand slot `slot` relative to frame base (`frame.sp + slot`).
+    pub fn debug_slot(&self, frame_idx: usize, slot: usize) -> Option<Value> {
+        let base = self.debug_frame_sp(frame_idx)?;
+        let idx = base + slot;
+        if idx >= self.stack.tell() && idx >= 8192 {
+            return None;
+        }
+        // Allow reading within the stack buffer even past cursor for allocated locals.
+        if idx >= 8192 {
+            return None;
+        }
+        Some(self.stack[idx])
+    }
+
+    pub fn debug_format_value(&self, v: Value) -> String {
+        Self::stringify_value(&self.heap, v)
+    }
+
+    pub fn program_debug(&self) -> &ProgramDebug {
+        &self.program_debug
+    }
+
+    /// Cached `(file_index, line)` for a PC, if known.
+    pub fn debug_pc_line(&self, pc: usize) -> Option<(u32, u32)> {
+        self.pc_lines.get(pc).copied().flatten()
+    }
+
+    /// Reset execution state for a fresh `run` (keeps natives / debug / program_debug).
+    pub fn debug_reset(&mut self) {
+        self.stack = Stack::new();
+        self.frames = ArrayVec::default();
+        self.frames.consume();
+        self.panicked = false;
+        self.pending_ffi = None;
+        self.pending_debug_stop = None;
+        self.nested_depth = 0;
+        self.nested_frame_depths.clear();
+        self.nested_return = None;
+        self.resume_stack.clear();
+        self.statics.clear();
+        self.alloc_counter = 0;
+        if let Some(dbg) = self.debug.as_mut() {
+            dbg.clear_step();
+            dbg.clear_skip_bp();
+        }
+    }
+
+    fn debug_check_stop_at(&mut self, ip: usize) -> Option<StopReason> {
+        let depth = self.frames.len();
+        let loc = self.pc_lines.get(ip).copied().flatten();
+        self.debug.as_mut()?.check_stop(ip, depth, loc)
+    }
+
+    /// Run until the next debug stop, halt, or panic. Auto-resumes FFI pauses.
+    pub fn debug_run_until(
+        &mut self,
+        code: &[Byte],
+        constants: &[u64],
+        static_slots: u32,
+        start_ip: usize,
+    ) -> StopReason {
+        if code.is_empty() {
+            return StopReason::Halt;
+        }
+        if self.statics.len() != static_slots as usize {
+            self.statics = vec![Value::default(); static_slots as usize];
+        }
+        if self.program_code.is_empty() {
+            self.program_code = unsafe {
+                std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
+            };
+            self.program_constants = constants.to_vec();
+            self.sync_thread_program_from_current();
+        }
+        let mut ip = start_ip;
+        loop {
+            self.pending_debug_stop = None;
+            let paused = self.execute(code, constants, ip);
+            if let Some(pending) = self.pending_ffi.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if let Some(reason) = self.pending_debug_stop.take() {
+                return reason;
+            }
+            if self.panicked {
+                return StopReason::Panic;
+            }
+            if !paused {
+                return StopReason::Halt;
+            }
+            return StopReason::Halt;
+        }
+    }
+
+    /// Like [`debug_run_until`] for compiler-owned [`RawByte`] buffers.
+    pub fn debug_run_until_raw(
+        &mut self,
+        code: &[RawByte],
+        constants: &[u64],
+        static_slots: u32,
+        start_ip: usize,
+    ) -> StopReason {
+        let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
+        self.debug_run_until(code, constants, static_slots, start_ip)
     }
 
     fn resolve_source_path(&self, path: &str) -> PathBuf {
@@ -1152,6 +1357,15 @@ impl<const S: usize> Machine<S> {
         let mut sp = self.frames.get_mut().get();
 
         while ip < code.len() {
+            if unlikely(self.debug.is_some())
+                && let Some(reason) = self.debug_check_stop_at(ip)
+            {
+                self.frames.get_mut().seek(ip);
+                self.frames.get_mut().set(sp);
+                self.pending_debug_stop = Some(reason);
+                return true;
+            }
+
             #[cfg(any(test, feature = "vm_profile"))]
             VM_DISPATCH_COUNT.with(|c| c.fetch_add(1, Ordering::Relaxed));
 
@@ -5895,5 +6109,64 @@ mod tests {
             Byte::new(Instruction::HALT),
         ]);
         assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    #[test]
+    fn debug_breakpoint_stops_before_target() {
+        use crate::DebugController;
+        use crate::StopReason;
+        use common::Instruction as OwnedInsn;
+        use common::Byte as OwnedByte;
+
+        // Build owned bytes then transmute like run_raw.
+        let owned = vec![
+            OwnedByte::new(OwnedInsn::CONST).with_const_inline(1),
+            OwnedByte::new(OwnedInsn::CONST).with_const_inline(2),
+            OwnedByte::new(OwnedInsn::ADD),
+            OwnedByte::new(OwnedInsn::HALT),
+        ];
+        let code: &[Byte] =
+            unsafe { std::slice::from_raw_parts(owned.as_ptr().cast(), owned.len()) };
+
+        let mut vm = Machine::<16>::default();
+        let mut dbg = DebugController::new();
+        dbg.add_breakpoint(2); // stop at ADD
+        vm.attach_debug(dbg);
+
+        let reason = vm.debug_run_until(code, &[], 0, 0);
+        assert_eq!(reason, StopReason::Breakpoint { pc: 2 });
+        assert_eq!(vm.debug_ip(), 2);
+
+        // Continue past the breakpoint to HALT.
+        if let Some(d) = vm.debug_controller_mut() {
+            d.skip_breakpoint_once(2);
+        }
+        let reason = vm.debug_run_until(code, &[], 0, 2);
+        assert_eq!(reason, StopReason::Halt);
+    }
+
+    #[test]
+    fn debug_stepi_advances_one_insn() {
+        use crate::DebugController;
+        use crate::StopReason;
+        use common::Instruction as OwnedInsn;
+        use common::Byte as OwnedByte;
+
+        let owned = vec![
+            OwnedByte::new(OwnedInsn::CONST).with_const_inline(7),
+            OwnedByte::new(OwnedInsn::CONST).with_const_inline(8),
+            OwnedByte::new(OwnedInsn::HALT),
+        ];
+        let code: &[Byte] =
+            unsafe { std::slice::from_raw_parts(owned.as_ptr().cast(), owned.len()) };
+
+        let mut vm = Machine::<16>::default();
+        vm.attach_debug(DebugController::new());
+        if let Some(d) = vm.debug_controller_mut() {
+            d.set_stepi();
+        }
+        let reason = vm.debug_run_until(code, &[], 0, 0);
+        assert_eq!(reason, StopReason::Step);
+        assert_eq!(vm.debug_ip(), 1);
     }
 }
