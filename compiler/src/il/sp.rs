@@ -189,7 +189,24 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::SetField => Some(-2),
         // STRING pushes the ObjString; subsequent DATA chars mutate it in place.
         Instruction::DATA => Some(0),
-        // Fail closed for the remaining long tail (FORMAT, FFI, …).
+        // FORMAT n: pop n args + format string, push result (−n). n==0 is a no-op.
+        Instruction::FORMAT => {
+            let n = byte.operand_u32() as i32;
+            if n == 0 {
+                Some(0)
+            } else {
+                Some(-n)
+            }
+        }
+        // STRINGIFY: pop value, push string (net 0).
+        Instruction::STRINGIFY => Some(0),
+        // ArrayLen: pop array, push length (net 0).
+        Instruction::ArrayLen => Some(0),
+        // StoreIndex: pop value+index+target, push value (−2).
+        Instruction::StoreIndex => Some(-2),
+        // ArrayPush: pop value+array, push array (−1).
+        Instruction::ArrayPush => Some(-1),
+        // Fail closed for the remaining long tail (FFI, …).
         _ => None,
     }
 }
@@ -417,17 +434,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_byte_poisons() {
-        // FORMAT remains residual with unknown stack delta.
+    fn format_and_stringify_stack_deltas() {
+        use common::Byte;
+        let format1 = IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(1));
+        let format0 = IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(0));
+        let stringify = IlOp::byte(Byte::new(Instruction::STRINGIFY));
+        assert_eq!(stack_delta(&format1), Some(-1));
+        assert_eq!(stack_delta(&format0), Some(0));
+        assert_eq!(stack_delta(&stringify), Some(0));
+
+        // FORMAT 1: args+fmt on stack → result; SP stays Known through PRINT.
         let ops = vec![
             IlOp::Const { imm: 1, loc: loc() },
-            IlOp::byte(common::Byte::new(Instruction::FORMAT)),
+            IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(0)),
+            IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(1)),
+            IlOp::Print { loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         let info = analyze(&ops);
         assert_eq!(info.sp_before(0), Sp::Known(0));
-        assert_eq!(info.sp_before(1), Sp::Known(1));
-        assert_eq!(info.sp_before(2), Sp::Unknown);
+        assert_eq!(info.sp_before(2), Sp::Known(2));
+        assert_eq!(info.sp_before(3), Sp::Known(1));
+        assert_eq!(info.sp_before(4), Sp::Known(0));
+    }
+
+    #[test]
+    fn array_len_and_store_index_stack_deltas() {
+        use common::Byte;
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::ArrayLen))),
+            Some(0)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::StoreIndex))),
+            Some(-2)
+        );
+        assert_eq!(
+            stack_delta(&IlOp::byte(Byte::new(Instruction::ArrayPush))),
+            Some(-1)
+        );
     }
 
     #[test]
