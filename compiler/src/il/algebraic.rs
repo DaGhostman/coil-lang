@@ -21,12 +21,15 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
         }
 
         // Const a; Const b; Bin → Const result for scalar int ops.
+        // Refuse results that cannot be encoded as inline CONST (bit 31 is
+        // POOL_FLAG — negatives would be misread as pool indices).
         if i + 2 < ops.len()
             && let (IlOp::Const { imm: a, loc }, IlOp::Const { imm: b, .. }, IlOp::Bin { op, .. }) =
                 (&ops[i], &ops[i + 1], &ops[i + 2])
             && info.sp_before(i + 1).is_known()
             && info.sp_before(i + 2).is_known()
             && let Some(r) = eval_const_bin(*op, *a, *b)
+            && r >= 0
         {
             out.push(IlOp::Const {
                 imm: r,
@@ -183,6 +186,14 @@ fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> O
     }
 }
 
+/// Ops that can stand alone as a binop stack operand in a 3-op window.
+fn is_scalar_producer(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }
+    )
+}
+
 fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
     let IlOp::Bin { op, loc } = bin else {
         return None;
@@ -192,7 +203,7 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         // x + 0 / x - 0 / x * 1 / x / 1 → x
         (Instruction::ADD | Instruction::SUB, x, IlOp::Const { imm: 0, .. })
         | (Instruction::MUL | Instruction::DIV, x, IlOp::Const { imm: 1, .. }) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
@@ -201,7 +212,7 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         // 0 + x / 1 * x → x
         (Instruction::ADD, IlOp::Const { imm: 0, .. }, x)
         | (Instruction::MUL, IlOp::Const { imm: 1, .. }, x) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
@@ -213,7 +224,7 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
             x,
             IlOp::Const { imm: 0, .. },
         ) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
@@ -221,14 +232,20 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         }
         // x & -1 → x; x & 0 → 0
         (Instruction::BITAND, x, IlOp::Const { imm: -1, .. }) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
             }
         }
-        (Instruction::BITAND, _, IlOp::Const { imm: 0, .. })
-        | (Instruction::BITAND, IlOp::Const { imm: 0, .. }, _) => Some(IlOp::Const { imm: 0, loc }),
+        // Zeroing folds require both window ops to be scalar producers. A bare
+        // `_` would match `Const 0; Index; MUL` (index literal, not MUL operand).
+        (Instruction::BITAND, x, IlOp::Const { imm: 0, .. })
+        | (Instruction::BITAND, IlOp::Const { imm: 0, .. }, x)
+            if is_scalar_producer(x) =>
+        {
+            Some(IlOp::Const { imm: 0, loc })
+        }
         // x - x / x * 0 / 0 * x → Const 0 (same Load slot or same Const)
         (Instruction::SUB, IlOp::Load { slot: s0, .. }, IlOp::Load { slot: s1, .. })
             if s0 == s1 =>
@@ -238,12 +255,18 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         (Instruction::SUB, IlOp::Const { imm: a, .. }, IlOp::Const { imm: b, .. }) if a == b => {
             Some(IlOp::Const { imm: 0, loc })
         }
-        (Instruction::MUL, _, IlOp::Const { imm: 0, .. })
-        | (Instruction::MUL, IlOp::Const { imm: 0, .. }, _) => Some(IlOp::Const { imm: 0, loc }),
+        (Instruction::MUL, x, IlOp::Const { imm: 0, .. })
+        | (Instruction::MUL, IlOp::Const { imm: 0, .. }, x)
+            if is_scalar_producer(x) =>
+        {
+            Some(IlOp::Const { imm: 0, loc })
+        }
         // x ** 0 → 1; x ** 1 → x
-        (Instruction::Pow, _, IlOp::Const { imm: 0, .. }) => Some(IlOp::Const { imm: 1, loc }),
+        (Instruction::Pow, x, IlOp::Const { imm: 0, .. }) if is_scalar_producer(x) => {
+            Some(IlOp::Const { imm: 1, loc })
+        }
         (Instruction::Pow, x, IlOp::Const { imm: 1, .. }) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
@@ -562,5 +585,52 @@ mod tests {
         ];
         algebraic_simplify(&mut and0);
         assert!(matches!(and0[0], IlOp::Const { imm: 0, .. }));
+    }
+
+    #[test]
+    fn refuses_fold_to_negative_inline_const() {
+        // 0 - 1 → -1 cannot be IlOp::Const (POOL_FLAG bit collision).
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::SUB,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_len = ops.len();
+        algebraic_simplify(&mut ops);
+        assert_eq!(
+            ops.len(),
+            before_len,
+            "negative fold result must stay Const;Const;SUB"
+        );
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::SUB, .. }));
+    }
+
+    #[test]
+    fn refuses_mul_zero_fold_through_index() {
+        // `2 * t[0]` is Load; Load; Const 0; Index; MUL — Const 0 indexes, not multiplies.
+        let mut ops = vec![
+            IlOp::Load { slot: 11, loc: loc() },
+            IlOp::Load { slot: 10, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Index { loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(
+            matches!(ops[3], IlOp::Index { .. }),
+            "Index must survive Const 0; Index; MUL"
+        );
+        assert!(
+            matches!(ops[4], IlOp::Bin { op: Instruction::MUL, .. }),
+            "MUL must survive Const 0; Index; MUL"
+        );
     }
 }
