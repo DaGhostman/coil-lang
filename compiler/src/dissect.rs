@@ -495,7 +495,7 @@ pub fn format_il(snapshot: &IlSnapshot, pat: Option<&str>) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::Byte;
+    use common::{Byte, ProgramDebug};
 
     #[test]
     fn mnemonic_load_and_call_line() {
@@ -521,5 +521,66 @@ mod tests {
         assert!(matches_fn_pat("fib#2", "fib"));
         assert!(matches_fn_pat("Show__int__show", "show"));
         assert!(!matches_fn_pat("main", "fib"));
+        assert!(matches_fn_pat("anything", ""));
+        assert!(matches_fn_pat("FIB", "fib"));
+    }
+
+    #[test]
+    fn format_bytecode_miss_and_function_ranges() {
+        let arts = DissectArtifacts {
+            bytecode: vec![
+                Byte::new(Instruction::LOAD).with_load_store_slot(0),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::CONST).with_const_inline(1),
+                Byte::new(Instruction::RETURN),
+            ],
+            constants: vec![],
+            functions: vec![
+                FnSym {
+                    name: "a".into(),
+                    entry_pc: 0,
+                    locals: vec![("x".into(), 0)],
+                },
+                FnSym {
+                    name: "b".into(),
+                    entry_pc: 2,
+                    locals: vec![],
+                },
+            ],
+            il: None,
+            debug: ProgramDebug::default(),
+        };
+        let ranges = arts.function_ranges();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!((ranges[0].1, ranges[0].2), (0, 2));
+        assert_eq!((ranges[1].1, ranges[1].2), (2, 4));
+
+        let miss = format_bytecode(&arts, Some("nope"));
+        assert!(miss.unwrap_err().contains("no functions matching"));
+
+        let out = format_bytecode(&arts, Some("a")).unwrap();
+        assert!(out.contains(";; fn a"));
+        assert!(out.contains("LOAD"));
+        assert!(!out.contains(";; fn b"));
+    }
+
+    #[test]
+    fn format_packed_load_and_bin_slot_imm() {
+        let packed = Byte::new(Instruction::LOAD).with_load_store_packed(3, 1, 2, 3);
+        let empty = HashMap::new();
+        let line = format_byte_line(0, &packed, &[], &empty);
+        assert!(line.contains("s0=1"));
+        assert!(line.contains("s1=2"));
+        assert!(line.contains("s2=3"));
+
+        let bin = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::SUB as u8,
+            4,
+            -1,
+        );
+        let line = format_byte_line(9, &bin, &[], &empty);
+        assert!(line.contains("BinSlotImm"));
+        assert!(line.contains("slot=4"));
+        assert!(line.contains("imm=-1"));
     }
 }

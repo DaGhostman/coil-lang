@@ -219,4 +219,45 @@ mod tests {
         assert_eq!(c.check_stop(2, 3, Some((0, 99))), None); // inside callee
         assert_eq!(c.check_stop(3, 2, Some((0, 4))), Some(StopReason::Next));
     }
+
+    #[test]
+    fn next_stops_when_returning_below_start_depth() {
+        let mut c = DebugController::new();
+        c.set_next(0, 3, 2);
+        assert_eq!(c.check_stop(1, 1, Some((0, 3))), Some(StopReason::Next));
+    }
+
+    #[test]
+    fn step_line_stops_on_line_or_file_change() {
+        let mut c = DebugController::new();
+        c.set_step_line(0, 3, 1);
+        assert_eq!(c.check_stop(1, 1, Some((0, 3))), None);
+        assert_eq!(c.check_stop(2, 2, Some((0, 3))), None); // into callee, same line
+        assert_eq!(c.check_stop(3, 2, Some((0, 4))), Some(StopReason::Step));
+
+        c.set_step_line(0, 3, 1);
+        assert_eq!(c.check_stop(4, 1, Some((1, 3))), Some(StopReason::Step));
+    }
+
+    #[test]
+    fn finish_stops_at_or_below_target_depth() {
+        let mut c = DebugController::new();
+        c.set_finish(1);
+        assert_eq!(c.check_stop(10, 2, None), None);
+        assert_eq!(c.check_stop(11, 1, None), Some(StopReason::Finish));
+
+        c.set_finish(1);
+        assert_eq!(c.check_stop(12, 0, None), Some(StopReason::Finish));
+    }
+
+    #[test]
+    fn stepi_from_breakpoint_skip_then_step() {
+        let mut c = DebugController::new();
+        c.add_breakpoint(5);
+        c.set_stepi();
+        c.skip_breakpoint_once(5);
+        // First visit: arm stepi and consume skip; do not stop.
+        assert_eq!(c.check_stop(5, 1, None), None);
+        assert_eq!(c.check_stop(6, 1, None), Some(StopReason::Step));
+    }
 }

@@ -1168,6 +1168,17 @@ mod tests {
     }
 
     #[test]
+    fn mnemonic_covers_first_and_last_variants() {
+        assert_eq!(Instruction::HALT.mnemonic(), "HALT");
+        assert_eq!(
+            Instruction::BinSlotSlotStore.mnemonic(),
+            "BinSlotSlotStore"
+        );
+        assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
+        assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
+    }
+
+    #[test]
     fn bin_slot_slot_jmpf_and_pool_cmp_log_not_pack() {
         let j = Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
             Instruction::LE as u8,
