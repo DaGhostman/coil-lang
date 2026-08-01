@@ -3363,6 +3363,60 @@ fn main() {
     assert_eq!(output, "55");
 }
 
+/// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not
+/// turn StorePop;Load into Dup;Store when the store extends tell past TOS
+/// (shared-stack CmpJmpf would eat the local — broke http `parse_url`).
+#[test]
+fn mem_fwd_post_call_store_compare_does_not_hang() {
+    let output = run_example_src(
+        r#"
+use io::*;
+fn find_bytes([byte] hay, [byte] needle) -> int {
+    let hn = len(hay);
+    let nn = len(needle);
+    if nn == 0 { return 0; }
+    if nn > hn { return 999999; }
+    let i = 0;
+    while i + nn <= hn {
+        let ok = 1;
+        let j = 0;
+        while j < nn {
+            if hay[i + j] != needle[j] { ok = 0; }
+            j = j + 1;
+        }
+        if ok == 1 { return i; }
+        i = i + 1;
+    }
+    return 999999;
+}
+fn bytes_slice([byte] src, int start, int end) -> [byte] {
+    let out: [byte] = [];
+    let i = start;
+    while i < end {
+        if i < len(src) { out[] = src[i]; }
+        i = i + 1;
+    }
+    return out;
+}
+fn parse_url(string s) -> int {
+    let b = to_bytes(s);
+    let sep: [byte] = [58, 47, 47];
+    let sep_at = find_bytes(b, sep);
+    if sep_at == 999999 { return -1; }
+    let scheme_b = bytes_slice(b, 0, sep_at);
+    let rest_start = sep_at + 3;
+    let host_end = len(b);
+    let host_b = bytes_slice(b, rest_start, host_end);
+    return len(scheme_b) + len(host_b);
+}
+fn main() {
+    print "%i", parse_url("http://example.com/hi");
+}
+"#,
+    );
+    assert_eq!(output, "18");
+}
+
 /// Fused assign / two-local AND-if / packed three-arg call must evaluate correctly.
 #[test]
 fn fused_assign_and_packed_call_runtime() {
