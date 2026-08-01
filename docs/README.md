@@ -25,7 +25,7 @@ See [Getting Started](manual/getting-started.md) for prerequisites, project layo
 
 ## How programs run
 
-Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned `.hyc` archive (`ARCHIVE_VERSION` **30**) → VM executes `main`. Cached `out.hyc` is reused until sources/version/entry change; delete it to force a rebuild. Full stage notes: [Internals — Pipeline](internals/pipeline.md).
+Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned `.hyc` archive (`ARCHIVE_VERSION` **34**) → VM executes `main`. Cached `out.hyc` is reused until sources/version/entry change; delete it to force a rebuild. Full stage notes: [Internals — Pipeline](internals/pipeline.md).
 
 ## Language at a glance
 

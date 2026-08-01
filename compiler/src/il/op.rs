@@ -156,13 +156,13 @@ impl IlOp {
     /// Lift a packed `Byte` into a typed hot-set variant when possible.
     pub fn from_plain_byte(byte: Byte, loc: DebugLoc) -> Self {
         match *byte.bytecode() {
-            Instruction::LOAD => Self::Load {
-                slot: byte.operand_u32(),
-                loc,
+            Instruction::LOAD => match byte.load_store_single_slot() {
+                Some(slot) => Self::Load { slot, loc },
+                None => Self::Byte { byte, loc },
             },
-            Instruction::StorePop => Self::StorePop {
-                slot: byte.operand_u32(),
-                loc,
+            Instruction::STORE | Instruction::StorePop => match byte.load_store_single_slot() {
+                Some(slot) => Self::StorePop { slot, loc },
+                None => Self::Byte { byte, loc },
             },
             Instruction::CONST => {
                 let op = byte.operand_u32();
@@ -254,8 +254,10 @@ impl IlOp {
     pub fn as_encode_byte(&self) -> Option<Byte> {
         Some(match self {
             IlOp::Byte { byte, .. } => *byte,
-            IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_operand_u32(*slot),
-            IlOp::StorePop { slot, .. } => Byte::new(Instruction::StorePop).with_operand_u32(*slot),
+            IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_load_store_slot(*slot),
+            IlOp::StorePop { slot, .. } => {
+                Byte::new(Instruction::STORE).with_load_store_slot(*slot)
+            },
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
@@ -416,7 +418,7 @@ impl IlOp {
         match self {
             IlOp::Byte { byte, .. } => Some(*byte.bytecode()),
             IlOp::Load { .. } => Some(Instruction::LOAD),
-            IlOp::StorePop { .. } => Some(Instruction::StorePop),
+            IlOp::StorePop { .. } => Some(Instruction::STORE),
             IlOp::Const { .. } | IlOp::ConstPool { .. } => Some(Instruction::CONST),
             IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Some(Instruction::POP),
@@ -536,6 +538,14 @@ mod tests {
     fn from_plain_byte_lifts_store_dup_pop_return_halt() {
         assert!(matches!(
             IlOp::from_plain_byte(
+                Byte::new(Instruction::STORE).with_load_store_slot(5),
+                DebugLoc::unknown(),
+            ),
+            IlOp::StorePop { slot: 5, .. }
+        ));
+        // Deprecated StorePop discriminant with legacy wide operand still lifts.
+        assert!(matches!(
+            IlOp::from_plain_byte(
                 Byte::new(Instruction::StorePop).with_operand_u32(5),
                 DebugLoc::unknown(),
             ),
@@ -556,6 +566,40 @@ mod tests {
         assert!(matches!(
             IlOp::from_plain_byte(Byte::new(Instruction::HALT), DebugLoc::unknown()),
             IlOp::Halt { .. }
+        ));
+    }
+
+    /// Multi-slot packed LOAD/STORE must stay residual `Byte` (no single-slot typed lift).
+    #[test]
+    fn from_plain_byte_keeps_packed_multi_slot_load_store_as_byte() {
+        let load3 = Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2);
+        assert!(matches!(
+            IlOp::from_plain_byte(load3, DebugLoc::unknown()),
+            IlOp::Byte { .. }
+        ));
+        let store2 = Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0);
+        assert!(matches!(
+            IlOp::from_plain_byte(store2, DebugLoc::unknown()),
+            IlOp::Byte { .. }
+        ));
+        // New fuse opcodes also remain residual until typed lift is added.
+        let jmpf = Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+            Instruction::LE as u8,
+            0,
+            1,
+        );
+        assert!(matches!(
+            IlOp::from_plain_byte(jmpf, DebugLoc::unknown()),
+            IlOp::Byte { .. }
+        ));
+        let imm_store = Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+            Instruction::ADD as u8,
+            0,
+            2,
+        );
+        assert!(matches!(
+            IlOp::from_plain_byte(imm_store, DebugLoc::unknown()),
+            IlOp::Byte { .. }
         ));
     }
 

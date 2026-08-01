@@ -1403,9 +1403,13 @@ mod tests {
         let port = local_elems[1].as_int();
         assert!(port > 0);
 
+        // Hold the peer socket open until after shutdown — a sleep+drop races
+        // on macOS and makes `shutdown(Both)` return Other.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let client = thread::spawn(move || {
-            let _ = TcpStream::connect(("127.0.0.1", port as u16));
-            thread::sleep(Duration::from_millis(200));
+            let stream = TcpStream::connect(("127.0.0.1", port as u16)).ok();
+            let _ = release_rx.recv();
+            drop(stream);
         });
         let conn = tcp_accept_wait_timeout(&mut heap, listener, 2000).expect("accept");
         tcp_set_nodelay(&mut heap, conn, true).expect("nodelay");
@@ -1413,6 +1417,7 @@ mod tests {
         let peer_elems = tuple_elems(&heap, peer);
         assert!(peer_elems[1].as_int() > 0);
         tcp_shutdown(&mut heap, conn, 2).expect("shutdown both");
+        let _ = release_tx.send(());
         stream_close(&mut heap, conn).ok();
         stream_close(&mut heap, listener).ok();
         let _ = client.join();

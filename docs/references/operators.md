@@ -178,7 +178,7 @@ identifier += expr    // and other compound forms
 | Undeclared | Error — use `let` first |
 | Value | Assignment and compound-assignment expressions evaluate to the assigned value |
 
-`let` bindings use `StorePop`; match arms use no-op `STORE` for pattern slots.
+`let` bindings use `STORE` (pop TOS into the slot); match arms need no store opcode for pattern slots (value already placed by unpack/match).
 
 ---
 

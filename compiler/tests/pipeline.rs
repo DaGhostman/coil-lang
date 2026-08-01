@@ -977,24 +977,17 @@ fn let_binding_emits_store_pop_in_bytecode() {
     let (bytecode, _constants) = pipeline.compile_test("", &mut ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
-    let binding_store_pop_count = bytecode
+    let binding_store_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::StorePop) && b.operand_u32() == 0)
+        .filter(|b| {
+            matches!(b.bytecode(), Instruction::STORE)
+                && b.load_store_single_slot() == Some(0)
+        })
         .count();
     assert_eq!(
-        binding_store_pop_count, 2,
-        "expected exactly 2 StorePop writes to binding slot 0 for one let + one re-assignment; got {}",
-        binding_store_pop_count
-    );
-
-    let store_count = bytecode
-        .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::STORE))
-        .count();
-    assert_eq!(
-        store_count, 0,
-        "expected zero STORE instructions for let/assignment; got {}",
-        store_count
+        binding_store_count, 2,
+        "expected exactly 2 STORE writes to binding slot 0 for one let + one re-assignment; got {}",
+        binding_store_count
     );
 }
 
@@ -3285,10 +3278,10 @@ fn main() {
     assert_eq!(output, "40,28,48,9,42,-24");
 }
 
-/// Early-return callees must not be tiny-inlined (inliner truncates at first
-/// RETURN). Both arms must run correctly via a real CALL.
+/// Early-return diamond callees are tiny-inlined; both arms must still evaluate
+/// correctly at the call site.
 #[test]
-fn early_return_callee_both_arms_via_call() {
+fn early_return_callee_both_arms_correct() {
     let output = run_example_src(
         r#"
 fn early(int n, int is_neg) -> int {
@@ -3304,6 +3297,166 @@ fn main() {
 "#,
     );
     assert_eq!(output, "-1,8");
+}
+
+/// Pure-arg reorder must keep CALL arg order while evaluating pure temps before
+/// effectful args (print from effect runs first; sink still sees a=2, b=10).
+#[test]
+fn pure_arg_reorder_preserves_order_and_effects() {
+    let output = run_example_src(
+        r#"
+fn effect() -> int {
+    print "%i,", 7;
+    return 2;
+}
+fn sink(int a, int b) -> int {
+    print "%i,", a + b;
+    return a + b;
+}
+fn main() {
+    print "%i", sink(effect(), 10);
+}
+"#,
+    );
+    assert_eq!(output, "7,12,12");
+}
+
+/// Predicate peel base path and recursive path must both return correct values.
+#[test]
+fn predicate_peel_base_and_recursive_paths() {
+    let output = run_example_src(
+        r#"
+fn other(int n) -> int {
+    return n;
+}
+fn base(int n) -> int {
+    if n <= 0 {
+        return 1;
+    }
+    return other(n) + 1;
+}
+fn main() {
+    print "%i,", base(0);
+    print "%i", base(5);
+}
+"#,
+    );
+    assert_eq!(output, "1,6");
+}
+
+/// One-level self-unroll must not change recursive fib results.
+#[test]
+fn self_unroll_fib_still_correct() {
+    let output = run_example_src(
+        r#"
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    print "%i", fib(10);
+}
+"#,
+    );
+    assert_eq!(output, "55");
+}
+
+/// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not
+/// turn StorePop;Load into Dup;Store when the store extends tell past TOS
+/// (shared-stack CmpJmpf would eat the local — broke http `parse_url`).
+#[test]
+fn mem_fwd_post_call_store_compare_does_not_hang() {
+    let output = run_example_src(
+        r#"
+use io::*;
+fn find_bytes([byte] hay, [byte] needle) -> int {
+    let hn = len(hay);
+    let nn = len(needle);
+    if nn == 0 { return 0; }
+    if nn > hn { return 999999; }
+    let i = 0;
+    while i + nn <= hn {
+        let ok = 1;
+        let j = 0;
+        while j < nn {
+            if hay[i + j] != needle[j] { ok = 0; }
+            j = j + 1;
+        }
+        if ok == 1 { return i; }
+        i = i + 1;
+    }
+    return 999999;
+}
+fn bytes_slice([byte] src, int start, int end) -> [byte] {
+    let out: [byte] = [];
+    let i = start;
+    while i < end {
+        if i < len(src) { out[] = src[i]; }
+        i = i + 1;
+    }
+    return out;
+}
+fn parse_url(string s) -> int {
+    let b = to_bytes(s);
+    let sep: [byte] = [58, 47, 47];
+    let sep_at = find_bytes(b, sep);
+    if sep_at == 999999 { return -1; }
+    let scheme_b = bytes_slice(b, 0, sep_at);
+    let rest_start = sep_at + 3;
+    let host_end = len(b);
+    let host_b = bytes_slice(b, rest_start, host_end);
+    return len(scheme_b) + len(host_b);
+}
+fn main() {
+    print "%i", parse_url("http://example.com/hi");
+}
+"#,
+    );
+    assert_eq!(output, "18");
+}
+
+/// Fused assign / two-local AND-if / packed three-arg call must evaluate correctly.
+#[test]
+fn fused_assign_and_packed_call_runtime() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int {
+    if a < 0 {
+        return 0;
+    }
+    if b < 0 {
+        return 0;
+    }
+    return a + b + c;
+}
+fn main() {
+    let i = 0;
+    i = i + 1;
+    i = i + 1;
+    let flags = 15;
+    let mask = 7;
+    flags = flags & mask;
+    let a = true;
+    let b = false;
+    let and_ok = 0;
+    if a && b {
+        and_ok = 1;
+    } else {
+        and_ok = 2;
+    }
+    let x = 1;
+    let y = 2;
+    let z = 3;
+    print "%i,", i;
+    print "%i,", flags;
+    print "%i,", and_ok;
+    print "%i", add3(x, y, z);
+}
+"#,
+    );
+    assert_eq!(output, "2,7,2,6");
 }
 
 #[test]

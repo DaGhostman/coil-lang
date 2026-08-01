@@ -19,6 +19,8 @@ pub enum Instruction {
     DUPLICATE,
     POP,
     CONST,
+    // STORE/LOAD: [31:24]=n (1..=3), [23:16]=s2, [15:8]=s1, [7:0]=s0;
+    // n==0 → wide single slot in [23:0]. See `with_load_store_*`.
     STORE,
     LOAD,
     CALL,
@@ -79,9 +81,8 @@ pub enum Instruction {
     Unpack,
     LoadField,
 
-    // StorePop: [31:0] slot_index — pop stack and write slot (let bindings).
-    // STORE is a no-op used by match-arm binding codegen.
-    // INC/DEC: [31:3] slot, [2] prefix (1=new value), [1] float, [0] reserved.
+    // StorePop: deprecated discriminant alias of STORE (same VM handler).
+    // Compiler emits STORE only. INC/DEC: [31:3] slot, [2] prefix, [1] float.
     StorePop,
 
     // UnpackAt: [31:16] arity, [15:0] slot offset — unpack enum at slot in place.
@@ -245,6 +246,17 @@ pub enum Instruction {
     CastByteToInt,
     CastIntToBool,
     CastBoolToInt,
+
+    /// `BinSlotSlot; JMPF t` — pool packs slot b (low 8) + target (high 32).
+    /// Operands: [31:24] op, [23:16] a, [15:0] pool index (mirrors BinSlotImmJmpf).
+    BinSlotSlotJmpf,
+
+    /// `BinSlotImm; STORE dest` — pool packs imm (low 32) + dest (high 32).
+    /// Operands: [31:24] op, [23:16] src, [15:0] pool index.
+    BinSlotImmStore,
+    /// `BinSlotSlot; STORE dest` — no pool.
+    /// Operands: [31:24] op, [23:16] a, [15:8] b, [7:0] dest.
+    BinSlotSlotStore,
 }
 
 impl From<u8> for Instruction {
@@ -395,8 +407,15 @@ impl Byte {
         )
     }
 
+    /// CmpJmpf direct target: [31:24] op, [15:0] PC (bit 16 clear).
     pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
         self.operands = ((op as u32) << 24) | (target as u32);
+        self
+    }
+
+    /// CmpJmpf pool target: [31:24] op, bit 16 set, [15:0] pool index → absolute PC.
+    pub fn with_cmp_jmpf_pool(mut self, op: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | (1u32 << 16) | (pool_idx as u32);
         self
     }
 
@@ -405,6 +424,10 @@ impl Byte {
             (self.operands >> 24) as u8,
             (self.operands & 0xFFFF) as usize,
         )
+    }
+
+    pub fn cmp_jmpf_is_pool(&self) -> bool {
+        (self.operands & (1u32 << 16)) != 0
     }
 
     pub fn with_bin_return(mut self, op: u8) -> Self {
@@ -436,14 +459,24 @@ impl Byte {
         )
     }
 
-    /// LogNotJmpf: [15:0] false-branch target.
+    /// LogNotJmpf direct target: [15:0] PC (bit 16 clear).
     pub fn with_log_not_jmpf(mut self, target: u16) -> Self {
         self.operands = target as u32;
         self
     }
 
+    /// LogNotJmpf pool target: bit 16 set, [15:0] pool index → absolute PC.
+    pub fn with_log_not_jmpf_pool(mut self, pool_idx: u16) -> Self {
+        self.operands = (1u32 << 16) | (pool_idx as u32);
+        self
+    }
+
     pub fn log_not_jmpf_target(&self) -> usize {
         (self.operands & 0xFFFF) as usize
+    }
+
+    pub fn log_not_jmpf_is_pool(&self) -> bool {
+        (self.operands & (1u32 << 16)) != 0
     }
 
     pub fn bin_slot_slot_parts(&self) -> (u8, usize, usize) {
@@ -452,6 +485,53 @@ impl Byte {
             (o >> 24) as u8,
             ((o >> 16) & 0xFF) as usize,
             ((o >> 8) & 0xFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotJmpf: [31:24] op, [23:16] a, [15:0] pool index.
+    pub fn with_bin_slot_slot_jmpf(mut self, op: u8, a: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// BinSlotImmStore: [31:24] op, [23:16] src, [15:0] pool index.
+    pub fn with_bin_slot_imm_store(mut self, op: u8, src: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | ((src as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotStore: [31:24] op, [23:16] a, [15:8] b, [7:0] dest.
+    pub fn with_bin_slot_slot_store(mut self, op: u8, a: u8, b: u8, dest: u8) -> Self {
+        self.operands =
+            ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_store_parts(&self) -> (u8, usize, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+            (o & 0xFF) as usize,
         )
     }
 
@@ -464,6 +544,77 @@ impl Byte {
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
         let o = self.operands;
         ((o >> 3) as usize, (o & 0b100) != 0, (o & 0b010) != 0)
+    }
+
+    /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
+    pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
+        debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
+        self.operands =
+            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        self
+    }
+
+    /// Wide single-slot LOAD/STORE escape: `n==0`, slot in low 24 bits.
+    pub fn with_load_store_wide(mut self, slot: u32) -> Self {
+        debug_assert!(slot <= 0x00FF_FFFF, "LOAD/STORE wide slot exceeds 24 bits");
+        self.operands = slot & 0x00FF_FFFF;
+        self
+    }
+
+    /// Single-slot LOAD/STORE: `n=1` when `slot <= 255`, else wide (`n=0`).
+    pub fn with_load_store_slot(self, slot: u32) -> Self {
+        if slot > 255 {
+            self.with_load_store_wide(slot)
+        } else {
+            self.with_load_store_packed(1, slot as u8, 0, 0)
+        }
+    }
+
+    /// Slot count for packed LOAD/STORE (`n==0` → 1).
+    pub fn load_store_count(&self) -> usize {
+        let n = (self.operands >> 24) as u8;
+        if n == 0 {
+            1
+        } else {
+            n as usize
+        }
+    }
+
+    /// Slot at index `i` within a packed LOAD/STORE (`i < load_store_count()`).
+    pub fn load_store_slot_at(&self, i: usize) -> u32 {
+        let n = (self.operands >> 24) as u8;
+        if n == 0 {
+            debug_assert!(i == 0);
+            return self.operands & 0x00FF_FFFF;
+        }
+        match i {
+            0 => self.operands & 0xFF,
+            1 => (self.operands >> 8) & 0xFF,
+            2 => (self.operands >> 16) & 0xFF,
+            _ => unreachable!("LOAD/STORE slot index out of range"),
+        }
+    }
+
+    /// Single-slot LOAD/STORE (`n==0` or `n==1`); `None` when `n > 1`.
+    pub fn load_store_single_slot(&self) -> Option<u32> {
+        let n = (self.operands >> 24) as u8;
+        match n {
+            0 => Some(self.operands & 0x00FF_FFFF),
+            1 => Some(self.operands & 0xFF),
+            _ => None,
+        }
+    }
+
+    /// Packed parts `(n, s0, s1, s2)`. For `n==0`, returns `(0, low24 as u8 truncated, 0, 0)` —
+    /// prefer [`load_store_single_slot`] / [`load_store_slot_at`] for wide slots.
+    pub fn load_store_parts(&self) -> (u8, u8, u8, u8) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            (o & 0xFF) as u8,
+            ((o >> 8) & 0xFF) as u8,
+            ((o >> 16) & 0xFF) as u8,
+        )
     }
 }
 
@@ -577,8 +728,17 @@ impl ArchivedByte {
         ((o >> 24) as u8, (o & 0xFFFF) as usize)
     }
 
+    pub fn cmp_jmpf_is_pool(&self) -> bool {
+        (u32::from(self.operands) & (1u32 << 16)) != 0
+    }
+
     pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
         self.operands = (((op as u32) << 24) | (target as u32)).into();
+        self
+    }
+
+    pub fn with_cmp_jmpf_pool(mut self, op: u8, pool_idx: u16) -> Self {
+        self.operands = (((op as u32) << 24) | (1u32 << 16) | (pool_idx as u32)).into();
         self
     }
 
@@ -625,8 +785,64 @@ impl ArchivedByte {
         self
     }
 
+    pub fn with_log_not_jmpf_pool(mut self, pool_idx: u16) -> Self {
+        self.operands = ((1u32 << 16) | (pool_idx as u32)).into();
+        self
+    }
+
     pub fn log_not_jmpf_target(&self) -> usize {
         (u32::from(self.operands) & 0xFFFF) as usize
+    }
+
+    pub fn log_not_jmpf_is_pool(&self) -> bool {
+        (u32::from(self.operands) & (1u32 << 16)) != 0
+    }
+
+    pub fn with_bin_slot_slot_jmpf(mut self, op: u8, a: u8, pool_idx: u16) -> Self {
+        let packed = ((op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    pub fn with_bin_slot_imm_store(mut self, op: u8, src: u8, pool_idx: u16) -> Self {
+        let packed = ((op as u32) << 24) | ((src as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn with_bin_slot_slot_store(mut self, op: u8, a: u8, b: u8, dest: u8) -> Self {
+        let packed =
+            ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_store_parts(&self) -> (u8, usize, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+            (o & 0xFF) as usize,
+        )
     }
 
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
@@ -637,6 +853,69 @@ impl ArchivedByte {
     pub fn with_inc_dec(mut self, slot: u32, prefix: bool, is_float: bool) -> Self {
         self.operands = ((slot << 3) | ((prefix as u32) << 2) | ((is_float as u32) << 1)).into();
         self
+    }
+
+    /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
+    pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
+        debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
+        let packed =
+            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    /// Wide single-slot LOAD/STORE escape: `n==0`, slot in low 24 bits.
+    pub fn with_load_store_wide(mut self, slot: u32) -> Self {
+        debug_assert!(slot <= 0x00FF_FFFF, "LOAD/STORE wide slot exceeds 24 bits");
+        self.operands = (slot & 0x00FF_FFFF).into();
+        self
+    }
+
+    /// Single-slot LOAD/STORE: `n=1` when `slot <= 255`, else wide (`n=0`).
+    pub fn with_load_store_slot(self, slot: u32) -> Self {
+        if slot > 255 {
+            self.with_load_store_wide(slot)
+        } else {
+            self.with_load_store_packed(1, slot as u8, 0, 0)
+        }
+    }
+
+    /// Slot count for packed LOAD/STORE (`n==0` → 1).
+    pub fn load_store_count(&self) -> usize {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        if n == 0 {
+            1
+        } else {
+            n as usize
+        }
+    }
+
+    /// Slot at index `i` within a packed LOAD/STORE.
+    pub fn load_store_slot_at(&self, i: usize) -> u32 {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        if n == 0 {
+            debug_assert!(i == 0);
+            return o & 0x00FF_FFFF;
+        }
+        match i {
+            0 => o & 0xFF,
+            1 => (o >> 8) & 0xFF,
+            2 => (o >> 16) & 0xFF,
+            _ => unreachable!("LOAD/STORE slot index out of range"),
+        }
+    }
+
+    /// Single-slot LOAD/STORE (`n==0` or `n==1`); `None` when `n > 1`.
+    pub fn load_store_single_slot(&self) -> Option<u32> {
+        let o: u32 = self.operands.into();
+        let n = (o >> 24) as u8;
+        match n {
+            0 => Some(o & 0x00FF_FFFF),
+            1 => Some(o & 0xFF),
+            _ => None,
+        }
     }
 }
 
@@ -759,9 +1038,81 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::CastBoolToInt as u8;
+        let last = Instruction::BinSlotSlotStore as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
+    }
+
+    #[test]
+    fn bin_slot_slot_jmpf_and_pool_cmp_log_not_pack() {
+        let j = Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+            Instruction::LE as u8,
+            1,
+            7,
+        );
+        assert_eq!(
+            j.bin_slot_slot_jmpf_parts(),
+            (Instruction::LE as u8, 1, 7)
+        );
+
+        let cmp = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(Instruction::EQ as u8, 3);
+        assert!(cmp.cmp_jmpf_is_pool());
+        assert_eq!(cmp.cmp_jmpf_parts(), (Instruction::EQ as u8, 3));
+
+        let n = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(9);
+        assert!(n.log_not_jmpf_is_pool());
+        assert_eq!(n.log_not_jmpf_target(), 9);
+    }
+
+    #[test]
+    fn bin_slot_imm_store_and_slot_store_pack() {
+        let imm = Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+            Instruction::ADD as u8,
+            2,
+            5,
+        );
+        assert_eq!(
+            imm.bin_slot_imm_store_parts(),
+            (Instruction::ADD as u8, 2, 5)
+        );
+
+        let ss = Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+            Instruction::BITAND as u8,
+            1,
+            3,
+            4,
+        );
+        assert_eq!(
+            ss.bin_slot_slot_store_parts(),
+            (Instruction::BITAND as u8, 1, 3, 4)
+        );
+    }
+
+    #[test]
+    fn load_store_packed_round_trip() {
+        let load3 = Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2);
+        assert_eq!(load3.load_store_count(), 3);
+        assert_eq!(load3.load_store_slot_at(0), 0);
+        assert_eq!(load3.load_store_slot_at(1), 1);
+        assert_eq!(load3.load_store_slot_at(2), 2);
+        assert_eq!(load3.load_store_parts(), (3, 0, 1, 2));
+        assert!(load3.load_store_single_slot().is_none());
+
+        let store2 = Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0);
+        assert_eq!(store2.load_store_count(), 2);
+        assert_eq!(store2.load_store_slot_at(0), 4);
+        assert_eq!(store2.load_store_slot_at(1), 5);
+        assert_eq!(store2.load_store_parts(), (2, 4, 5, 0));
+
+        let single = Byte::new(Instruction::LOAD).with_load_store_slot(7);
+        assert_eq!(single.load_store_single_slot(), Some(7));
+        assert_eq!(single.load_store_count(), 1);
+        assert_eq!(single.load_store_parts().0, 1);
+
+        let wide = Byte::new(Instruction::STORE).with_load_store_slot(300);
+        assert_eq!(wide.load_store_single_slot(), Some(300));
+        assert_eq!(wide.load_store_parts().0, 0);
+        assert_eq!(wide.operand_u32() & 0x00FF_FFFF, 300);
     }
 }
 

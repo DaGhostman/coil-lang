@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet};
 use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
 
-/// Hoist loop-invariant `Const` / `Load` out of natural loops when header
-/// SP-in is Known. Inserts a preheader label and redirects external entries.
+/// Hoist loop-invariant `Const` / `Load` / `BinSlotImm` / `BinSlotSlot` out of
+/// natural loops when header SP-in is Known. Inserts a preheader label and
+/// redirects external entries.
 pub fn licm(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
         return;
@@ -34,6 +35,14 @@ pub fn licm(ops: &mut Vec<IlOp>) {
                 IlOp::Load { slot, .. } if !stored.contains(slot) => {
                     hoist.push((i, ops[i].clone()));
                 }
+                IlOp::BinSlotImm { slot, .. } if !stored.contains(&(*slot as u32)) => {
+                    hoist.push((i, ops[i].clone()));
+                }
+                IlOp::BinSlotSlot { a, b, .. }
+                    if !stored.contains(&(*a as u32)) && !stored.contains(&(*b as u32)) =>
+                {
+                    hoist.push((i, ops[i].clone()));
+                }
                 _ => {}
             }
         }
@@ -43,7 +52,7 @@ pub fn licm(ops: &mut Vec<IlOp>) {
         // Only hoist when net stack effect of hoisted ops is applied once at
         // preheader — v1: require each candidate is immediately used by a pure
         // consumer inside the loop (skip orphan Const that changes SP freely).
-        // Simpler gate: hoist at most a single Const or Load per loop when it
+        // Simpler gate: hoist at most a single invariant op per loop when it
         // appears as the first emitting op after the header label.
         let first_emit = (lp.body_start()..lp.latch).find(|&i| !matches!(ops[i], IlOp::Label(_)));
         let Some(fi) = first_emit else {
@@ -54,7 +63,11 @@ pub fn licm(ops: &mut Vec<IlOp>) {
         };
         if !matches!(
             cand,
-            IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+            IlOp::Const { .. }
+                | IlOp::ConstPool { .. }
+                | IlOp::Load { .. }
+                | IlOp::BinSlotImm { .. }
+                | IlOp::BinSlotSlot { .. }
         ) {
             continue;
         }
@@ -146,8 +159,22 @@ fn loop_has_barrier(ops: &[IlOp], lp: &NaturalLoop) -> bool {
 fn slots_stored_in_loop(ops: &[IlOp], lp: &NaturalLoop) -> HashSet<u32> {
     let mut s = HashSet::new();
     for i in lp.header..=lp.latch {
-        if let IlOp::StorePop { slot, .. } = &ops[i] {
-            s.insert(*slot);
+        match &ops[i] {
+            IlOp::StorePop { slot, .. } => {
+                s.insert(*slot);
+            }
+            IlOp::Byte { byte, .. }
+                if matches!(
+                    *byte.bytecode(),
+                    common::Instruction::STORE | common::Instruction::StorePop
+                ) =>
+            {
+                let n = byte.load_store_count();
+                for i in 0..n {
+                    s.insert(byte.load_store_slot_at(i));
+                }
+            }
+            _ => {}
         }
     }
     s
@@ -404,5 +431,112 @@ mod tests {
         let before = ops.clone();
         licm(&mut ops);
         assert!(ops == before, "Unknown header SP must refuse hoist");
+    }
+
+    #[test]
+    fn hoists_bin_slot_imm_when_slot_not_stored() {
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotImm {
+                op: common::Instruction::ADD as u8,
+                slot: 2,
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header].iter().any(|op| matches!(
+                op,
+                IlOp::BinSlotImm {
+                    slot: 2,
+                    imm: 1,
+                    ..
+                }
+            )),
+            "invariant BinSlotImm should hoist before header"
+        );
+        assert!(
+            !ops[header + 1..]
+                .iter()
+                .take_while(|op| !matches!(op, IlOp::Jump { .. }))
+                .any(|op| matches!(op, IlOp::BinSlotImm { .. })),
+            "BinSlotImm should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn refuses_bin_slot_imm_when_slot_stored_in_loop() {
+        let mut ops = vec![
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotImm {
+                op: common::Instruction::ADD as u8,
+                slot: 1,
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 1, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        licm(&mut ops);
+        assert_eq!(ops.len(), before.len(), "stored dep must refuse BinSlotImm hoist");
+    }
+
+    #[test]
+    fn hoists_bin_slot_slot_when_deps_not_stored() {
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotSlot {
+                op: common::Instruction::ADD as u8,
+                a: 1,
+                b: 2,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header].iter().any(|op| matches!(
+                op,
+                IlOp::BinSlotSlot { a: 1, b: 2, .. }
+            )),
+            "invariant BinSlotSlot should hoist before header"
+        );
     }
 }

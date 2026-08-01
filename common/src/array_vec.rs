@@ -85,6 +85,18 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         self.consume();
     }
 
+    /// Hot CALL helper: rewrite the active frame, then push a fresh one.
+    #[inline]
+    pub fn rewrite_top_and_push<F, G>(&mut self, rewrite_top: F, setup_new: G)
+    where
+        F: FnOnce(&mut T),
+        G: FnOnce(&mut T),
+    {
+        rewrite_top(self.get_mut());
+        setup_new(self.current_mut());
+        self.consume();
+    }
+
     #[inline]
     pub fn seek(&mut self, value: usize) {
         self.current = value;

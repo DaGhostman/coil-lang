@@ -36,6 +36,13 @@ enum Slot {
         target: Label,
         loc: DebugLoc,
     },
+    BinSlotSlotJmpf {
+        op: u8,
+        a: u8,
+        b: u8,
+        target: Label,
+        loc: DebugLoc,
+    },
 }
 
 impl Slot {
@@ -47,7 +54,8 @@ impl Slot {
             | Slot::PrologueJmp(l)
             | Slot::CmpJmpf(_, _, l)
             | Slot::LogNotJmpf(_, l)
-            | Slot::BinSlotImmJmpf { loc: l, .. } => *l,
+            | Slot::BinSlotImmJmpf { loc: l, .. }
+            | Slot::BinSlotSlotJmpf { loc: l, .. } => *l,
         }
     }
 }
@@ -263,6 +271,15 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
     if let Some(s) = try_fuse_load_const_cmp_jmpf_slot(window) {
         return Some((s, 4));
     }
+    if let Some(s) = try_fuse_load_load_op_jmpf_slot(window) {
+        return Some((s, 4));
+    }
+    if let Some(s) = try_fuse_load_const_op_store(window, pool) {
+        return Some((s, 4));
+    }
+    if let Some(s) = try_fuse_load_load_op_store(window) {
+        return Some((s, 4));
+    }
     if window.len() >= 3
         && let (Some(a), Some(b), Some(c)) = (
             slot_as_byte(&window[0]),
@@ -287,7 +304,7 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
     {
         if *b0.bytecode() == Instruction::BinSlotImm {
             let (op, slot, imm) = b0.bin_slot_imm_parts();
-            if is_cmp_op(Instruction::from(op)) {
+            if is_jmpf_cond_op(Instruction::from(op)) {
                 return Some((
                     Slot::BinSlotImmJmpf {
                         op,
@@ -300,10 +317,25 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
                 ));
             }
         }
+        if *b0.bytecode() == Instruction::BinSlotSlot {
+            let (op, a, b) = b0.bin_slot_slot_parts();
+            if is_jmpf_cond_op(Instruction::from(op)) {
+                return Some((
+                    Slot::BinSlotSlotJmpf {
+                        op,
+                        a: a as u8,
+                        b: b as u8,
+                        target: *tgt,
+                        loc: window[0].loc(),
+                    },
+                    2,
+                ));
+            }
+        }
         if *b0.bytecode() == Instruction::LogNot {
             return Some((Slot::LogNotJmpf(*tgt, window[0].loc()), 2));
         }
-        if is_cmp_op(*b0.bytecode()) {
+        if is_jmpf_cond_op(*b0.bytecode()) {
             return Some((
                 Slot::CmpJmpf(*b0.bytecode() as u8, *tgt, window[0].loc()),
                 2,
@@ -313,6 +345,12 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
     if window.len() >= 2
         && let (Some(a), Some(b)) = (slot_as_byte(&window[0]), slot_as_byte(&window[1]))
     {
+        if let Some(fused) = try_fuse_bin_slot_imm_store_local(&a, &b, pool) {
+            return Some((Slot::Byte(fused, window[0].loc()), 2));
+        }
+        if let Some(fused) = try_fuse_bin_slot_slot_store_local(&a, &b) {
+            return Some((Slot::Byte(fused, window[0].loc()), 2));
+        }
         let w = [a, b];
         if let Some(fused) = try_fuse_load_return_local(&w) {
             return Some((Slot::Byte(fused, window[0].loc()), 2));
@@ -323,6 +361,13 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
         if let Some(fused) = try_fuse_bin_return_local(&w) {
             return Some((Slot::Byte(fused, window[0].loc()), 2));
         }
+    }
+    // After patterns that consume individual LOAD/STORE: pack adjacent runs.
+    if let Some((fused, n)) = try_fuse_packed_loads(window) {
+        return Some((fused, n));
+    }
+    if let Some((fused, n)) = try_fuse_packed_stores(window) {
+        return Some((fused, n));
     }
     None
 }
@@ -339,7 +384,7 @@ fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
     };
     let slot = load_slot(&b0)?;
     let imm = i16::try_from(const_inline_value(&b1)?).ok()?;
-    if !is_cmp_op(*b2.bytecode()) {
+    if !is_jmpf_cond_op(*b2.bytecode()) {
         return None;
     }
     Some(Slot::BinSlotImmJmpf {
@@ -349,6 +394,83 @@ fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
         target: *tgt,
         loc: window[0].loc(),
     })
+}
+
+fn try_fuse_load_load_op_jmpf_slot(window: &[Slot]) -> Option<Slot> {
+    if window.len() < 4 {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    let b1 = slot_as_byte(&window[1])?;
+    let b2 = slot_as_byte(&window[2])?;
+    let Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _) = &window[3] else {
+        return None;
+    };
+    let a = load_slot(&b0)?;
+    let b = load_slot(&b1)?;
+    if !is_jmpf_cond_op(*b2.bytecode()) {
+        return None;
+    }
+    Some(Slot::BinSlotSlotJmpf {
+        op: *b2.bytecode() as u8,
+        a,
+        b,
+        target: *tgt,
+        loc: window[0].loc(),
+    })
+}
+
+/// `LOAD src; CONST imm; <int-bin>; STORE dest` → `BinSlotImmStore`.
+fn try_fuse_load_const_op_store(window: &[Slot], pool: &mut Vec<u64>) -> Option<Slot> {
+    if window.len() < 4 {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    let b1 = slot_as_byte(&window[1])?;
+    let b2 = slot_as_byte(&window[2])?;
+    let b3 = slot_as_byte(&window[3])?;
+    let src = load_slot(&b0)?;
+    let imm = i16::try_from(const_inline_value(&b1)?).ok()?;
+    if !is_int_bin_op(*b2.bytecode()) {
+        return None;
+    }
+    let dest = store_slot_u32(&b3)?;
+    let idx = pool.len();
+    pool.push(((dest as u64) << 32) | (imm as u16 as u32 as u64));
+    Some(Slot::Byte(
+        Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+            *b2.bytecode() as u8,
+            src,
+            idx as u16,
+        ),
+        window[0].loc(),
+    ))
+}
+
+/// `LOAD a; LOAD b; <int-bin>; STORE dest` → `BinSlotSlotStore`.
+fn try_fuse_load_load_op_store(window: &[Slot]) -> Option<Slot> {
+    if window.len() < 4 {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    let b1 = slot_as_byte(&window[1])?;
+    let b2 = slot_as_byte(&window[2])?;
+    let b3 = slot_as_byte(&window[3])?;
+    let a = load_slot(&b0)?;
+    let b = load_slot(&b1)?;
+    if !is_int_bin_op(*b2.bytecode()) {
+        return None;
+    }
+    let dest = store_slot_u8(&b3)?;
+    Some(Slot::Byte(
+        Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+            *b2.bytecode() as u8,
+            a,
+            b,
+            dest,
+        ),
+        window[0].loc(),
+    ))
 }
 
 fn slot_as_byte(s: &Slot) -> Option<Byte> {
@@ -406,7 +528,9 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             if pc <= u16::MAX as u32 {
                 Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(*op, pc as u16)
             } else {
-                Byte::new(Instruction::JMPF).with_operand_u32(pc)
+                let idx = pool.len();
+                pool.push(pc as u64);
+                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(*op, idx as u16)
             }
         }
         Slot::LogNotJmpf(target, _) => {
@@ -414,7 +538,9 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             if pc <= u16::MAX as u32 {
                 Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(pc as u16)
             } else {
-                Byte::new(Instruction::JMPF).with_operand_u32(pc)
+                let idx = pool.len();
+                pool.push(pc as u64);
+                Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(idx as u16)
             }
         }
         Slot::BinSlotImmJmpf {
@@ -428,6 +554,18 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             let idx = pool.len();
             pool.push(((pc as u64) << 32) | (*imm as u16 as u32 as u64));
             Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(*op, *slot, idx as u16)
+        }
+        Slot::BinSlotSlotJmpf {
+            op,
+            a,
+            b,
+            target,
+            ..
+        } => {
+            let pc = resolve(labels, *target);
+            let idx = pool.len();
+            pool.push(((pc as u64) << 32) | (*b as u64));
+            Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(*op, *a, idx as u16)
         }
     }
 }
@@ -469,6 +607,11 @@ fn is_int_bin_op(i: Instruction) -> bool {
             | Instruction::Pow
             | Instruction::BITAND
             | Instruction::BITOR
+            | Instruction::SHL
+            | Instruction::SHR
+            | Instruction::XOR
+            | Instruction::AND
+            | Instruction::OR
     )
 }
 
@@ -488,6 +631,19 @@ fn is_cmp_op(i: Instruction) -> bool {
     )
 }
 
+/// Ops whose result is a JMPF condition (cmp, logical, or bitwise mask).
+fn is_jmpf_cond_op(i: Instruction) -> bool {
+    is_cmp_op(i)
+        || matches!(
+            i,
+            Instruction::AND
+                | Instruction::OR
+                | Instruction::BITAND
+                | Instruction::BITOR
+                | Instruction::XOR
+        )
+}
+
 fn is_bin_op(i: Instruction) -> bool {
     is_int_bin_op(i)
         || matches!(
@@ -501,9 +657,7 @@ fn is_bin_op(i: Instruction) -> bool {
                 | Instruction::LEQF
                 | Instruction::GTF
                 | Instruction::GEQF
-                | Instruction::Pow
-                | Instruction::BITAND
-                | Instruction::BITOR
+                | Instruction::PowF
         )
 }
 
@@ -522,11 +676,109 @@ fn load_slot(byte: &Byte) -> Option<u8> {
     if *byte.bytecode() != Instruction::LOAD {
         return None;
     }
-    let slot = byte.operand_u32();
+    let slot = byte.load_store_single_slot()?;
     if slot > 255 {
         return None;
     }
     Some(slot as u8)
+}
+
+fn store_slot_u8(byte: &Byte) -> Option<u8> {
+    if !matches!(
+        *byte.bytecode(),
+        Instruction::STORE | Instruction::StorePop
+    ) {
+        return None;
+    }
+    let slot = byte.load_store_single_slot()?;
+    if slot > 255 {
+        return None;
+    }
+    Some(slot as u8)
+}
+
+fn store_slot_u32(byte: &Byte) -> Option<u32> {
+    if !matches!(
+        *byte.bytecode(),
+        Instruction::STORE | Instruction::StorePop
+    ) {
+        return None;
+    }
+    byte.load_store_single_slot()
+}
+
+/// Adjacent `LOAD`×2/3 → one packed `LOAD` (`n` in `[31:24]`).
+fn try_fuse_packed_loads(window: &[Slot]) -> Option<(Slot, usize)> {
+    for n in [3usize, 2] {
+        if window.len() < n {
+            continue;
+        }
+        let mut slots = [0u8; 3];
+        let mut ok = true;
+        for i in 0..n {
+            let Some(b) = slot_as_byte(&window[i]) else {
+                ok = false;
+                break;
+            };
+            let Some(s) = load_slot(&b) else {
+                ok = false;
+                break;
+            };
+            slots[i] = s;
+        }
+        if ok {
+            return Some((
+                Slot::Byte(
+                    Byte::new(Instruction::LOAD).with_load_store_packed(
+                        n as u8,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                    ),
+                    window[0].loc(),
+                ),
+                n,
+            ));
+        }
+    }
+    None
+}
+
+/// Adjacent `STORE`×2/3 → one packed `STORE` (TOS → first listed slot).
+fn try_fuse_packed_stores(window: &[Slot]) -> Option<(Slot, usize)> {
+    for n in [3usize, 2] {
+        if window.len() < n {
+            continue;
+        }
+        let mut slots = [0u8; 3];
+        let mut ok = true;
+        for i in 0..n {
+            let Some(b) = slot_as_byte(&window[i]) else {
+                ok = false;
+                break;
+            };
+            let Some(s) = store_slot_u8(&b) else {
+                ok = false;
+                break;
+            };
+            slots[i] = s;
+        }
+        if ok {
+            return Some((
+                Slot::Byte(
+                    Byte::new(Instruction::STORE).with_load_store_packed(
+                        n as u8,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                    ),
+                    window[0].loc(),
+                ),
+                n,
+            ));
+        }
+    }
+    None
 }
 
 fn try_fuse_bin_slot_imm_local(window: &[Byte; 3]) -> Option<Byte> {
@@ -547,6 +799,39 @@ fn try_fuse_bin_slot_slot_local(window: &[Byte; 3]) -> Option<Byte> {
         return None;
     }
     Some(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(op as u8, a, b))
+}
+
+/// `BinSlotImm; STORE dest` → `BinSlotImmStore`.
+fn try_fuse_bin_slot_imm_store_local(b0: &Byte, b1: &Byte, pool: &mut Vec<u64>) -> Option<Byte> {
+    if *b0.bytecode() != Instruction::BinSlotImm {
+        return None;
+    }
+    let (op, src, imm) = b0.bin_slot_imm_parts();
+    if !is_int_bin_op(Instruction::from(op)) {
+        return None;
+    }
+    let dest = store_slot_u32(b1)?;
+    let idx = pool.len();
+    pool.push(((dest as u64) << 32) | (imm as i16 as u16 as u32 as u64));
+    Some(
+        Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(op, src as u8, idx as u16),
+    )
+}
+
+/// `BinSlotSlot; STORE dest` → `BinSlotSlotStore`.
+fn try_fuse_bin_slot_slot_store_local(b0: &Byte, b1: &Byte) -> Option<Byte> {
+    if *b0.bytecode() != Instruction::BinSlotSlot {
+        return None;
+    }
+    let (op, a, b) = b0.bin_slot_slot_parts();
+    if !is_int_bin_op(Instruction::from(op)) {
+        return None;
+    }
+    let dest = store_slot_u8(b1)?;
+    Some(
+        Byte::new(Instruction::BinSlotSlotStore)
+            .with_bin_slot_slot_store(op, a as u8, b as u8, dest),
+    )
 }
 
 fn try_fold_const_bin_local(window: &[Byte; 3], pool: &mut Vec<u64>) -> Option<Byte> {
@@ -770,6 +1055,204 @@ mod tests {
         let packed = pool[idx];
         assert_eq!(packed >> 32, 2);
         assert_eq!(packed as u16, 2);
+    }
+
+    #[test]
+    fn lower_fuses_load_load_cmp_jmpf_to_bin_slot_slot_jmpf() {
+        let mut il = IlBuilder::new();
+        let exit = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        il.push_byte(Byte::new(Instruction::LE));
+        il.emit_jump(IlJumpKind::JumpIfFalse, exit);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.bind_label(exit);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotSlotJmpf
+        ));
+        let (op, a, idx) = lowered.bytecode[0].bin_slot_slot_jmpf_parts();
+        assert_eq!(op, Instruction::LE as u8);
+        assert_eq!(a, 0);
+        let packed = pool[idx];
+        assert_eq!(packed >> 32, 2);
+        assert_eq!(packed as u8, 1); // slot b
+    }
+
+    #[test]
+    fn lower_fuses_bin_slot_slot_and_jmpf() {
+        let mut il = IlBuilder::new();
+        let exit = il.fresh_label();
+        il.push_byte(
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::AND as u8, 0, 1),
+        );
+        il.emit_jump(IlJumpKind::JumpIfFalse, exit);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.bind_label(exit);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotSlotJmpf
+        ));
+        let (op, a, idx) = lowered.bytecode[0].bin_slot_slot_jmpf_parts();
+        assert_eq!(op, Instruction::AND as u8);
+        assert_eq!(a, 0);
+        assert_eq!(pool[idx] as u8, 1);
+    }
+
+    #[test]
+    fn lower_fuses_load_const_bitand_jmpf() {
+        let mut il = IlBuilder::new();
+        let exit = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.push_byte(Byte::new(Instruction::BITAND));
+        il.emit_jump(IlJumpKind::JumpIfFalse, exit);
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.bind_label(exit);
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotImmJmpf
+        ));
+        assert_eq!(
+            lowered.bytecode[0].bin_slot_imm_jmpf_parts().0,
+            Instruction::BITAND as u8
+        );
+    }
+
+    #[test]
+    fn lower_fuses_load_const_add_store_to_bin_slot_imm_store() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
+        il.push_byte(Byte::new(Instruction::ADD));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotImmStore
+        ));
+        let (op, src, idx) = lowered.bytecode[0].bin_slot_imm_store_parts();
+        assert_eq!(op, Instruction::ADD as u8);
+        assert_eq!(src, 0);
+        let packed = pool[idx];
+        assert_eq!(packed >> 32, 0); // dest
+        assert_eq!(packed as u16, 1); // imm
+    }
+
+    #[test]
+    fn lower_fuses_load_load_and_store_to_bin_slot_slot_store() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        il.push_byte(Byte::new(Instruction::AND));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(2));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotSlotStore
+        ));
+        assert_eq!(
+            lowered.bytecode[0].bin_slot_slot_store_parts(),
+            (Instruction::AND as u8, 0, 1, 2)
+        );
+    }
+
+    #[test]
+    fn lower_fuses_bin_slot_imm_then_store() {
+        let mut il = IlBuilder::new();
+        il.push_byte(
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::BITAND as u8, 0, 7),
+        );
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(1));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::BinSlotImmStore
+        ));
+        let (op, src, idx) = lowered.bytecode[0].bin_slot_imm_store_parts();
+        assert_eq!(op, Instruction::BITAND as u8);
+        assert_eq!(src, 0);
+        assert_eq!(pool[idx] >> 32, 1);
+        assert_eq!(pool[idx] as u16, 7);
+    }
+
+    #[test]
+    fn lower_packs_three_adjacent_loads() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(2));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::LOAD
+        ));
+        assert_eq!(lowered.bytecode[0].load_store_parts(), (3, 0, 1, 2));
+        assert_eq!(lowered.bytecode[0].load_store_count(), 3);
+    }
+
+    #[test]
+    fn lower_packs_two_adjacent_stores_ordering() {
+        // Consecutive STORE s0; STORE s1 pops TOS→s0 then next→s1.
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        il.push_byte(Byte::new(Instruction::STORE).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 2);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::STORE
+        ));
+        assert_eq!(lowered.bytecode[0].load_store_parts(), (2, 0, 1, 0));
+        assert_eq!(lowered.bytecode[0].load_store_slot_at(0), 0);
+        assert_eq!(lowered.bytecode[0].load_store_slot_at(1), 1);
+    }
+
+    #[test]
+    fn lower_refuses_packed_loads_when_label_mid_window() {
+        let mut il = IlBuilder::new();
+        let mid = il.fresh_label();
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        il.bind_label(mid);
+        il.push_byte(Byte::new(Instruction::LOAD).with_load_store_slot(1));
+        il.push_byte(Byte::new(Instruction::HALT));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 3);
+        assert_eq!(lowered.bytecode[0].load_store_single_slot(), Some(0));
+        assert_eq!(lowered.bytecode[1].load_store_single_slot(), Some(1));
+        assert_eq!(lowered.label_pcs.get(&mid.0).copied(), Some(1));
     }
 
     /// JMP-to-join must not land on ConstReturnImm: stacked arm value is ignored.

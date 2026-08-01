@@ -110,8 +110,20 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
 fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
     match insn {
         Instruction::LOAD | Instruction::CONST | Instruction::DUPLICATE | Instruction::STRING
-        | Instruction::CodePtr | Instruction::MakePolyFn => Some(1),
-        Instruction::POP | Instruction::StorePop | Instruction::STORE => Some(-1),
+        | Instruction::CodePtr | Instruction::MakePolyFn => {
+            if insn == Instruction::LOAD {
+                Some(byte.load_store_count() as i32)
+            } else {
+                Some(1)
+            }
+        }
+        Instruction::POP | Instruction::StorePop | Instruction::STORE => {
+            if matches!(insn, Instruction::STORE | Instruction::StorePop) {
+                Some(-(byte.load_store_count() as i32))
+            } else {
+                Some(-1)
+            }
+        }
         Instruction::ADD
         | Instruction::SUB
         | Instruction::MUL
@@ -143,6 +155,12 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         | Instruction::OR => Some(-1),
         Instruction::NOT | Instruction::NEG => Some(0),
         Instruction::BinSlotImm | Instruction::BinSlotSlot => Some(1),
+        Instruction::BinSlotImmJmpf
+        | Instruction::BinSlotSlotJmpf
+        | Instruction::BinSlotImmStore
+        | Instruction::BinSlotSlotStore => Some(0),
+        Instruction::CmpJmpf => Some(-2),
+        Instruction::LogNotJmpf => Some(-1),
         Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => {
             Some(-1)
         }
@@ -194,14 +212,38 @@ fn is_terminator(op: &IlOp) -> bool {
     )
 }
 
+/// True when `op` is a nested direct call whose VM return resets tell to
+/// `frame_base + 1` (return value only).
+fn is_nested_call_return(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Entry {
+            kind: EntryKind::Call | EntryKind::MakeCoro,
+            ..
+        }
+    ) || matches!(
+        op.as_plain_byte(),
+        Some(b) if matches!(*b.bytecode(), Instruction::CALL | Instruction::MakeCoro)
+    )
+}
+
 /// Compute SP-in for each op. Entry SP is 0 at index 0; unknown effects poison.
 pub fn analyze(ops: &[IlOp]) -> SpInfo {
+    analyze_at(ops, 0)
+}
+
+/// Like [`analyze`], but seed height at `entry_sp` (function arity / frame base).
+///
+/// Per-function bodies begin with args already on the shared locals/operand
+/// stack; starting at 0 understates height and lets `mem_fwd` emit `Dup;Store`
+/// that aliases a local with TOS.
+pub fn analyze_at(ops: &[IlOp], entry_sp: i32) -> SpInfo {
     let n = ops.len();
     let mut sp_in: Vec<Option<Sp>> = vec![None; n];
     if n == 0 {
         return SpInfo { sp_in: Vec::new() };
     }
-    sp_in[0] = Some(Sp::Known(0));
+    sp_in[0] = Some(Sp::Known(entry_sp));
 
     let mut label_at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (i, op) in ops.iter().enumerate() {
@@ -230,7 +272,7 @@ pub fn analyze(ops: &[IlOp]) -> SpInfo {
     for _ in 0..n.saturating_mul(2).max(8) {
         let mut changed = false;
         // `None` = no fall-through edge into the next index.
-        let mut fall_sp: Option<Sp> = Some(Sp::Known(0));
+        let mut fall_sp: Option<Sp> = Some(Sp::Known(entry_sp));
         for i in 0..n {
             if i > 0
                 && let Some(edge) = fall_sp
@@ -240,8 +282,15 @@ pub fn analyze(ops: &[IlOp]) -> SpInfo {
 
             let op = &ops[i];
             let before = sp_in[i].unwrap_or(Sp::Unknown);
-            let delta = stack_delta(op);
-            let after = before.apply(delta);
+            // Nested CALL/MakeCoro return seeks to frame_base and pushes one
+            // result → relative height is always 1, not `before + (1 - arity)`.
+            // Modeling the arithmetic delta lets mem_fwd emit Dup;Store that
+            // later operand pops destroy (http parse_url / bytes_slice hang).
+            let after = if is_nested_call_return(op) {
+                Sp::Known(1)
+            } else {
+                before.apply(stack_delta(op))
+            };
 
             if let IlOp::Jump { kind, target, .. } = op {
                 if let Some(&t) = label_at.get(&target.0) {
@@ -391,6 +440,46 @@ mod tests {
         assert_eq!(stack_delta(&slot), Some(1));
     }
 
+    /// Packed LOAD/STORE and fused assign/jmpf forms must report accurate net deltas
+    /// so convoy/LICM SP analysis does not poison on the new encodings.
+    #[test]
+    fn stack_delta_packed_load_store_and_fused_stores() {
+        use common::Byte;
+        let load3 = IlOp::byte(
+            Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2),
+        );
+        let store2 = IlOp::byte(
+            Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0),
+        );
+        let imm_store = IlOp::byte(
+            Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+                Instruction::ADD as u8,
+                0,
+                1,
+            ),
+        );
+        let slot_store = IlOp::byte(
+            Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+                Instruction::BITAND as u8,
+                0,
+                1,
+                2,
+            ),
+        );
+        let slot_jmpf = IlOp::byte(
+            Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+                Instruction::AND as u8,
+                0,
+                3,
+            ),
+        );
+        assert_eq!(stack_delta(&load3), Some(3));
+        assert_eq!(stack_delta(&store2), Some(-2));
+        assert_eq!(stack_delta(&imm_store), Some(0));
+        assert_eq!(stack_delta(&slot_store), Some(0));
+        assert_eq!(stack_delta(&slot_jmpf), Some(0));
+    }
+
     #[test]
     fn stack_delta_call_uses_arity_tail_call_unknown() {
         let call = IlOp::Entry {
@@ -496,8 +585,9 @@ mod tests {
     }
 
     #[test]
-    fn call_entry_adjusts_height_by_arity() {
-        // Two args on stack, CALL arity 2 → net −1 (consume args, push result).
+    fn call_entry_resets_height_to_one() {
+        // Nested CALL returns with tell = frame_base + 1 regardless of arity
+        // / pre-call height (VM seeks then pushes the result).
         let ops = vec![
             IlOp::Const { imm: 1, loc: loc() },
             IlOp::Const { imm: 2, loc: loc() },
@@ -512,6 +602,26 @@ mod tests {
         let info = analyze(&ops);
         assert_eq!(info.sp_before(2), Sp::Known(2));
         assert_eq!(info.sp_before(3), Sp::Known(1));
+    }
+
+    #[test]
+    fn call_with_high_pre_height_still_returns_at_one() {
+        // Arithmetic delta would be 1 - 0 = pre_height; absolute reset to 1.
+        let ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(3), Sp::Known(3));
+        assert_eq!(info.sp_before(4), Sp::Known(1));
     }
 
     #[test]
