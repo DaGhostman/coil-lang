@@ -5,6 +5,10 @@
 use parser::Pratt;
 use proptest::prelude::*;
 
+fn with_io_string_imports(body: String) -> String {
+    format!("use io::{{stdout, write_all}};\nuse string::{{format, to_bytes}};\n{body}")
+}
+
 /// Build a small well-formed-ish source string from constrained components.
 fn program_from_parts(a: i32, b: i32, use_if: bool, use_let: bool, ident_idx: u8) -> String {
     let names = ["x", "y", "n", "tmp", "acc"];
@@ -13,39 +17,63 @@ fn program_from_parts(a: i32, b: i32, use_if: bool, use_let: bool, ident_idx: u8
     if use_let {
         body.push_str(&format!("    let {name} = {a};\n"));
         body.push_str(&format!("    {name} = {name} + {b};\n"));
-        body.push_str(&format!("    print \"%i\", {name};\n"));
+        body.push_str(&format!(
+            "    write_all(stdout(), to_bytes(format(\"%i\", {name})));\n"
+        ));
     } else {
-        body.push_str(&format!("    print \"%i\", {a} + {b};\n"));
+        body.push_str(&format!(
+            "    write_all(stdout(), to_bytes(format(\"%i\", {a} + {b})));\n"
+        ));
     }
     if use_if {
         body.push_str(&format!(
-            "    if {a} < {b} {{ print \"%i\", 1; }} else {{ print \"%i\", 0; }}\n"
+            "    if {a} < {b} {{ write_all(stdout(), to_bytes(format(\"%i\", 1))); }} else {{ write_all(stdout(), to_bytes(format(\"%i\", 0))); }}\n"
         ));
     }
-    format!("fn main() {{\n{body}}}\n")
+    with_io_string_imports(format!("fn main() {{\n{body}}}\n"))
 }
 
 /// Broader syntax shapes for positive fuzzing (still intended to parse).
 fn syntax_shape(kind: u8, a: i32, b: i32) -> String {
-    match kind % 12 {
-        0 => format!("fn main() {{ print \"%i\", {a} + {b}; }}\n"),
-        1 => format!("fn main() {{ let x = {a}; x = x + {b}; print \"%i\", x; }}\n"),
-        2 => format!(
-            "fn main() {{ if {a} < {b} {{ print \"%i\", 1; }} else {{ print \"%i\", 0; }} }}\n"
+    with_io_string_imports(match kind % 12 {
+        0 => format!(
+            "fn main() {{ write_all(stdout(), to_bytes(format(\"%i\", {a} + {b}))); }}\n"
         ),
-        3 => format!("fn main() {{ let a = [{a}, {b}]; print \"%i\", a[0] + a[1]; }}\n"),
-        4 => format!("fn main() {{ let t = ({a}, {b}); print \"%i\", t[0] + t[1]; }}\n"),
-        5 => format!("fn main() {{ let d = {{ v: {a} }}; print \"%i\", d.v + {b}; }}\n"),
-        6 => format!("enum C {{ A, B }}\nfn main() {{ let c = C::A; print \"%z\", c == C::A; }}\n"),
-        7 => format!("fn main() {{ let i = 0; while i < 3 {{ i = i + 1; }} print \"%i\", i; }}\n"),
-        8 => format!("fn main() {{ for (let i = 0; i < 3; i = i + 1) {{ print \"%i\", i; }} }}\n"),
-        9 => format!("fn main() {{ print \"%s\", \"a\" + \"b\"; print \"%i\", {a}; }}\n"),
-        10 => format!("fn main() {{ let s = format \"%i-%i\", {a}, {b}; print \"%s\", s; }}\n"),
+        1 => format!(
+            "fn main() {{ let x = {a}; x = x + {b}; write_all(stdout(), to_bytes(format(\"%i\", x))); }}\n"
+        ),
+        2 => format!(
+            "fn main() {{ if {a} < {b} {{ write_all(stdout(), to_bytes(format(\"%i\", 1))); }} else {{ write_all(stdout(), to_bytes(format(\"%i\", 0))); }} }}\n"
+        ),
+        3 => format!(
+            "fn main() {{ let a = [{a}, {b}]; write_all(stdout(), to_bytes(format(\"%i\", a[0] + a[1]))); }}\n"
+        ),
+        4 => format!(
+            "fn main() {{ let t = ({a}, {b}); write_all(stdout(), to_bytes(format(\"%i\", t[0] + t[1]))); }}\n"
+        ),
+        5 => format!(
+            "fn main() {{ let d = {{ v: {a} }}; write_all(stdout(), to_bytes(format(\"%i\", d.v + {b}))); }}\n"
+        ),
+        6 => format!(
+            "enum C {{ A, B }}\nfn main() {{ let c = C::A; write_all(stdout(), to_bytes(format(\"%z\", c == C::A))); }}\n"
+        ),
+        7 => format!(
+            "fn main() {{ let i = 0; while i < 3 {{ i = i + 1; }} write_all(stdout(), to_bytes(format(\"%i\", i))); }}\n"
+        ),
+        8 => format!(
+            "fn main() {{ for (let i = 0; i < 3; i = i + 1) {{ write_all(stdout(), to_bytes(format(\"%i\", i))); }} }}\n"
+        ),
+        9 => format!(
+            "fn main() {{ write_all(stdout(), to_bytes(format(\"%s\", \"a\" + \"b\"))); write_all(stdout(), to_bytes(format(\"%i\", {a}))); }}\n"
+        ),
+        10 => format!(
+            "fn main() {{ let s = format(\"%i-%i\", {a}, {b}); write_all(stdout(), to_bytes(format(\"%s\", s))); }}\n"
+        ),
         _ => format!(
             "fn add(int x, int y) -> int {{ return x + y; }}\n\
-             fn main() {{ print \"%i\", add({a}, {b}); }}\n"
+             fn main() {{ write_all(stdout(), to_bytes(format(\"%i\", add({a}, {b})))); }}\n"
         ),
-    }
+    })
 }
 
 /// Intentionally broken / partial sources — must not panic the parser.
@@ -59,7 +87,7 @@ fn broken_shape(kind: u8, a: i32) -> String {
         5 => "fn main() { if { } }".to_string(),
         6 => "fn main() { match { } }".to_string(),
         7 => "enum { }".to_string(),
-        8 => format!("fn main() {{ print \"%i\", {a} + ; }}\n"),
+        8 => format!("fn main() {{ write_all(stdout(), to_bytes(format(\"%i\", {a} + ))); }}\n"),
         9 => "fn main() { let = 1; }".to_string(),
         10 => "fn main() { ;;;; }".to_string(),
         11 => "use ;;;".to_string(),
