@@ -3446,7 +3446,7 @@ mod tests {
     };
 
     use super::{dispatch_count, reset_dispatch_count};
-    use crate::{Heap, Machine, ObjEnum};
+    use crate::{Heap, Machine, ObjArray, ObjEnum, Object};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -4163,6 +4163,7 @@ mod tests {
         assert_eq!(s, "panic: boom");
     }
 
+    #[test]
     fn with_output_captures_print() {
         let mut vm = Machine::<16>::default();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -4187,6 +4188,28 @@ mod tests {
         let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn with_output_captures_io_stdout_write_all() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let heap = vm.heap_mut();
+        let stdout = crate::io::stream_stdout(heap).expect("stdout stream");
+        let elements = b"hello via io"
+            .iter()
+            .map(|&b| Value::from(b as i64))
+            .collect();
+        let (arr, _) = heap.alloc(ObjArray { elements }, Object::Array);
+        let data = Value::from(arr.addr());
+        crate::io::stream_write_all(heap, stdout, data).expect("write_all stdout");
+
+        let _ = vm.restore_output();
+        let bytes = take_test_output(buf);
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "hello via io");
     }
 
     /// GetField must return heap-object field values (strings,

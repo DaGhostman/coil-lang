@@ -4,6 +4,7 @@
 //! (`read_exact`, `read_to_end`, `write_all`, …) may block in Rust
 //! via `poll`, but never busy-spin on `WouldBlock`.
 
+use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -14,6 +15,23 @@ use common::{
 };
 
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
+
+type OutputRedirect = *mut (dyn Write + Send);
+
+thread_local! {
+    static OUTPUT_REDIRECT: RefCell<Option<OutputRedirect>> = RefCell::new(None);
+}
+
+pub fn set_output_redirect(sink: Option<OutputRedirect>) -> Option<OutputRedirect> {
+    OUTPUT_REDIRECT.with(|cell| cell.replace(sink))
+}
+
+fn with_output_redirect<T>(f: impl FnOnce(&mut (dyn Write + Send)) -> T) -> Option<T> {
+    OUTPUT_REDIRECT.with(|cell| {
+        let ptr = (*cell.borrow())?;
+        Some(f(unsafe { &mut *ptr }))
+    })
+}
 
 /// Tag indices for [`IoError`](common::BUILTIN_IO_ERROR_ENUM).
 ///
@@ -358,6 +376,14 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
     with_stream_mut(heap, stream, |s| -> Result<usize, IoErrorTag> {
         if s.closed || s.fd.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
+        }
+        if matches!(s.kind, StreamKind::Stdout | StreamKind::Stderr)
+            && let Some(result) = with_output_redirect(|out| match out.write(&bytes) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+            })
+        {
+            return result;
         }
         let fd = s.fd.as_ref().unwrap().as_raw_fd();
         #[cfg(feature = "tls")]

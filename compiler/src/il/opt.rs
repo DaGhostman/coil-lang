@@ -4176,11 +4176,10 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_refuses_format_string_suffix() {
-        // STRING/DATA/FORMAT must not count as sinkable compute — Known SP after
+        // STRING/FORMAT must not count as sinkable compute — Known SP after
         // FORMAT would otherwise splice format runs across joins.
         let fmt = vec![
             IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
-            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
             IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(0)),
             IlOp::Print {
                 loc: common::DebugLoc::unknown(),

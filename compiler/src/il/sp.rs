@@ -187,7 +187,7 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::HostInvoke => Some(-1),
         Instruction::PRINT | Instruction::GetField => Some(-1),
         Instruction::SetField => Some(-2),
-        // STRING pushes the ObjString; subsequent DATA chars mutate it in place.
+        // STRING pushes the ObjString; DATA is a stack-neutral archive tombstone.
         Instruction::DATA => Some(0),
         // FORMAT n: pop n args + format string, push result (−n). n==0 is a no-op.
         Instruction::FORMAT => {
@@ -653,20 +653,18 @@ mod tests {
             )),
             Some(1)
         );
-        // DATA mutates the STRING already on the stack (net 0).
+        // DATA is a legacy archive tombstone (net 0).
         assert_eq!(
             stack_delta(&IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'a' as u32))),
             Some(0)
         );
         let ops = vec![
             IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
-            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
             IlOp::Return { loc: loc() },
         ];
         let info = analyze(&ops);
         assert_eq!(info.sp_before(0), Sp::Known(0));
         assert_eq!(info.sp_before(1), Sp::Known(1));
-        assert_eq!(info.sp_before(2), Sp::Known(1));
     }
 
     #[test]

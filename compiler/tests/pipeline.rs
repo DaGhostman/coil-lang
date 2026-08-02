@@ -5224,14 +5224,17 @@ fn main() {
 "#;
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
-    // Prologue: STRING "x"; STORE temp (ctor also emits STRING "x" for SetField).
-    let has_string_x_store = bytecode.windows(3).any(|w| {
+    // Prologue: STRING table["x"]; STORE temp (ctor also emits STRING "x" for SetField).
+    let x_idx = pipeline
+        .strings()
+        .iter()
+        .position(|s| s == "x")
+        .expect("string table should contain field key x") as u32;
+    let has_string_x_store = bytecode.windows(2).any(|w| {
         matches!(w[0].bytecode(), common::Instruction::STRING)
-            && w[0].operand_u32() == 1
-            && matches!(w[1].bytecode(), common::Instruction::DATA)
-            && w[1].operand_u32() == u32::from(b'x')
+            && w[0].operand_u32() == x_idx
             && matches!(
-                w[2].bytecode(),
+                w[1].bytecode(),
                 common::Instruction::STORE | common::Instruction::StorePop
             )
     });

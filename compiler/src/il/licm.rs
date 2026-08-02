@@ -8,7 +8,7 @@ use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
 
 /// Hoist loop-invariant `Const` / `Load` / `BinSlotImm` / `BinSlotSlot` out of
-/// natural loops when header SP-in is Known. Also sinks repeated `STRING`/`DATA`
+/// natural loops when header SP-in is Known. Also sinks repeated `STRING`
 /// field-key literals into preheader temps (GetField/SetField loops).
 pub fn licm(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
@@ -86,7 +86,7 @@ fn licm_stack_producers(ops: &mut Vec<IlOp>) {
     }
 }
 
-/// Hoist repeated `STRING`/`DATA` key literals out of GetField/SetField loops
+/// Hoist repeated table-indexed `STRING` key literals out of GetField/SetField loops
 /// into preheader temps. Returns true when a transform was applied.
 fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
     let info = sp::analyze(ops);
@@ -107,15 +107,15 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
         if runs.is_empty() {
             continue;
         }
-        // Group identical literals; only rewrite keys that appear ≥2 times.
-        let mut by_chars: HashMap<Vec<u32>, Vec<(usize, usize)>> = HashMap::new();
-        for (start, end, chars) in &runs {
-            by_chars
-                .entry(chars.clone())
+        // Group identical string-table indices; only rewrite keys that appear ≥2 times.
+        let mut by_string: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+        for (start, end, string_idx) in &runs {
+            by_string
+                .entry(*string_idx)
                 .or_default()
                 .push((*start, *end));
         }
-        let mut rewrite: Vec<(Vec<u32>, Vec<(usize, usize)>)> = by_chars
+        let mut rewrite: Vec<(u32, Vec<(usize, usize)>)> = by_string
             .into_iter()
             .filter(|(_, sites)| sites.len() >= 2)
             .collect();
@@ -124,7 +124,7 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
             // require at least one string run (field access loops).
             rewrite = runs
                 .into_iter()
-                .map(|(s, e, c)| (c, vec![(s, e)]))
+                .map(|(s, e, idx)| (idx, vec![(s, e)]))
                 .collect();
         }
         rewrite.sort_by_key(|(_, sites)| sites[0].0);
@@ -137,9 +137,9 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
         // Materialize unique strings in one preheader (first rewrite only this loop).
         let loc = ops[lp.header].loc();
         let mut materialize: Vec<IlOp> = Vec::new();
-        let mut slot_for: HashMap<Vec<u32>, u32> = HashMap::new();
-        for (chars, _) in &rewrite {
-            if slot_for.contains_key(chars) {
+        let mut slot_for: HashMap<u32, u32> = HashMap::new();
+        for (string_idx, _) in &rewrite {
+            if slot_for.contains_key(string_idx) {
                 continue;
             }
             let slot = next_slot;
@@ -147,22 +147,17 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
             if next_slot > 255 {
                 return false;
             }
-            slot_for.insert(chars.clone(), slot);
+            slot_for.insert(*string_idx, slot);
             materialize.push(IlOp::byte(
-                Byte::new(Instruction::STRING).with_operand_u32(chars.len() as u32),
+                Byte::new(Instruction::STRING).with_operand_u32(*string_idx),
             ));
-            for &ch in chars {
-                materialize.push(IlOp::byte(
-                    Byte::new(Instruction::DATA).with_operand_u32(ch),
-                ));
-            }
             materialize.push(IlOp::StorePop { slot, loc });
         }
 
         // Replace in-loop runs with LOAD (highest index first so offsets stay valid).
         let mut replacements: Vec<(usize, usize, u32)> = Vec::new();
-        for (chars, sites) in &rewrite {
-            let slot = slot_for[chars];
+        for (string_idx, sites) in &rewrite {
+            let slot = slot_for[string_idx];
             for &(start, end) in sites {
                 replacements.push((start, end, slot));
             }
@@ -188,51 +183,23 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
     false
 }
 
-fn find_string_runs(ops: &[IlOp], start: usize, end: usize) -> Vec<(usize, usize, Vec<u32>)> {
+fn find_string_runs(ops: &[IlOp], start: usize, end: usize) -> Vec<(usize, usize, u32)> {
     let mut out = Vec::new();
     let mut i = start;
     while i < end {
-        let Some(nchars) = string_op_len(&ops[i]) else {
+        let Some(string_idx) = string_op_index(&ops[i]) else {
             i += 1;
             continue;
         };
-        let mut chars = Vec::with_capacity(nchars);
-        let mut j = i + 1;
-        let mut ok = true;
-        for _ in 0..nchars {
-            if j >= end {
-                ok = false;
-                break;
-            }
-            let Some(ch) = data_op_char(&ops[j]) else {
-                ok = false;
-                break;
-            };
-            chars.push(ch);
-            j += 1;
-        }
-        if ok && chars.len() == nchars {
-            out.push((i, j, chars));
-            i = j;
-        } else {
-            i += 1;
-        }
+        out.push((i, i + 1, string_idx));
+        i += 1;
     }
     out
 }
 
-fn string_op_len(op: &IlOp) -> Option<usize> {
+fn string_op_index(op: &IlOp) -> Option<u32> {
     match op {
         IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::STRING => {
-            Some(byte.operand_u32() as usize)
-        }
-        _ => None,
-    }
-}
-
-fn data_op_char(op: &IlOp) -> Option<u32> {
-    match op {
-        IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::DATA => {
             Some(byte.operand_u32())
         }
         _ => None,
@@ -804,9 +771,6 @@ mod tests {
         let str_x = |ops: &mut Vec<IlOp>| {
             ops.push(IlOp::byte(
                 Byte::new(Instruction::STRING).with_operand_u32(1),
-            ));
-            ops.push(IlOp::byte(
-                Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32),
             ));
         };
         let mut ops = vec![

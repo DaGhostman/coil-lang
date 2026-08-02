@@ -753,7 +753,7 @@ pub struct Compiler {
     temp_counter: u32,
 
     /// Function-local cache of field-name string keys used ≥2 times
-    /// (`STRING`/`DATA` materialized once at entry, then `LOAD`).
+    /// (`STRING` materialized once at entry, then `LOAD`).
     field_key_slots: HashMap<String, u32>,
 
     /// Count of expression values currently live on the operand stack
