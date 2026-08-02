@@ -37,13 +37,15 @@ An `extern` block names a shared library and lists function signatures. Calls to
 From `examples/strlen.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 extern "c" {
     fn strlen(string s) -> int;
 }
 
 fn main() {
     let n = strlen("hello");
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -56,12 +58,14 @@ fn main() {
 A single libc function can be declared without an `extern` block:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
 
 fn main() {
     let n = strlen("hello");
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -180,6 +184,8 @@ clang -shared -o examples/sum.dll examples/sum.c
 ```coil
 use ffi::*;
 use ffi::types::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let lib = match dload("sum") {
@@ -194,7 +200,7 @@ fn main() {
         Result::Ok(v) => v,
         Result::Err(e) => panic e.message,
     };
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -400,6 +406,6 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 ## Next steps
 
-- [Built-ins reference](../../references/README.md) — full `print` / FFI builtin details
+- [Built-ins reference](../../references/README.md) — virtual module and FFI builtin details
 - [Types reference](../../references/types.md) — what can and cannot cross the FFI boundary
 - [Getting Started](../getting-started.md) — build and cache (`out.hyc`) workflow

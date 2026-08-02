@@ -23,8 +23,6 @@ All reserved words in the coil parser. Keywords cannot be used as identifiers.
 | `return` | Statement | Exit function with value | [Syntax — Statements](syntax.md#statements) |
 | `raise` | Expression / stmt | Early-return `Err(e)` (result mode) | [Tutorial: Error handling](../manual/tutorial/09-error-handling.md) |
 | `panic` | Expression / stmt | Abort with a string message | [Built-ins](panic.md) |
-| `print` | Statement / I/O | Print to stdout | [Built-ins](print.md) |
-| `format` | Expression / I/O | Build a formatted string | [Built-ins](format.md) |
 | `enum` | Declaration | Sum type definition | [Types — Sum types](types.md#sum-types--enums-tysum) |
 | `match` | Expression | Pattern match | [Syntax — Patterns](syntax.md#patterns-match) |
 | `default` | Pattern | Wildcard arm (same as `_`) | [Syntax — Patterns](syntax.md#patterns-match) |
@@ -66,7 +64,7 @@ Registered in the top-level `declaration()` parser before generic statements so 
 ## Statement keywords
 
 ```
-let | const | if | else | while | for | break | continue | return | raise | panic | print
+let | const | if | else | while | for | break | continue | return | raise | panic
 ```
 
 Appear inside `{ ... }` blocks via `statement()`.
@@ -76,7 +74,7 @@ Appear inside `{ ... }` blocks via `statement()`.
 ## Expression / literal keywords
 
 ```
-match | new | true | false | format | yield | resume | done | raise | panic
+match | new | true | false | yield | resume | done | raise | panic
 ```
 
 Parsed as **atoms** before the generic `ident()` rule so they are never treated as variable names.
@@ -119,8 +117,8 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 
 | Kind | Examples | Callable as `name(...)`? |
 |------|----------|------------------------|
-| Statement keyword | `print` | No — statement form only: `print "...";` |
-| Virtual-module export | `dload`, `declare`, `invoke` (via `use ffi::*`) | Yes as identifiers — not reserved keywords |
+| Statement keyword | `return` | No — statement form only |
+| Virtual-module export | `format` (via `use string::format`), `dload`, `declare`, `invoke` (via `use ffi::*`) | Yes as identifiers — not reserved keywords |
 | Declaration keyword | `fn`, `enum` | No |
 
 ---
@@ -130,5 +128,5 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | Document | Contents |
 |----------|----------|
 | [Syntax](syntax.md) | Grammar using these keywords |
-| [Built-ins](README.md) | `print`, FFI functions |
+| [Built-ins](README.md) | virtual modules and builtin functions |
 | [Operators](operators.md) | Non-keyword operators |

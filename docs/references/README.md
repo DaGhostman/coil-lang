@@ -2,7 +2,7 @@
 
 Lookup docs for language constructs and compiler-provided APIs. For a guided introduction, start with the [manual](../manual/getting-started.md).
 
-Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `thread`, `time`, `env`, `crypto`, and `regex` require an explicit `use`.
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, and `regex` require an explicit `use`.
 
 ## Language
 
@@ -21,8 +21,9 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | Document | Kind | Purpose |
 |----------|------|---------|
 | [Option / Result](option-result.md) | Prelude enums | Built-in sum types |
-| [print](print.md) | Statement | Write to stdout |
-| [format](format.md) | Expression | Build a formatted string |
+| [print](print.md) | Migration note | Removed statement; use `io` + `string` |
+| [format](format.md) | Intrinsic | `string::format(...)` builds a formatted string |
+| [string](string.md) | Virtual module | `format` / UTF-8 byte conversions |
 | [arrays](arrays.md) | Expression | `arr[] =` append and `len` |
 | [math](math.md) | Prelude | `dot` / `matmul` / `cross` / `Matrix` |
 | [FFI](ffi.md) | Virtual module | `dload` / `declare` / `invoke` / `extern` |

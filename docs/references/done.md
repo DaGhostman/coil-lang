@@ -19,11 +19,13 @@ done(handle_expr)
 ### Example
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let h = counter();
-print "%z", done(h); // false
+write_all(stdout(), to_bytes(format("%z", done(h)))); // false
 resume h;
 resume h;            // completes
-print "%z", done(h); // true
+write_all(stdout(), to_bytes(format("%z", done(h)))); // true
 ```
 
 ---

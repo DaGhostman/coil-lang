@@ -132,6 +132,8 @@ Because `match` is an expression, it can appear anywhere a value is expected —
 From `examples/option.hy` (`Option` is a compiler builtin — no local `enum` declaration):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -140,7 +142,7 @@ fn unwrap(Option o) -> int {
 }
 
 fn main() {
-    print "%i", unwrap(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", unwrap(Option::Some(42)))));
 }
 ```
 
@@ -202,6 +204,8 @@ This matches a `Result::Ok` whose inner `Option` is `Some`, binding `v` to the i
 When **multiple arms share the same outer variant** but differ on the inner pattern, the runtime dispatches on the inner tag at match time. From `examples/result.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -211,9 +215,9 @@ fn unwrap_result(Result r) -> int {
 }
 
 fn main() {
-    print "%i", unwrap_result(Result::Ok(Option::Some(42)));
-    print "%i", unwrap_result(Result::Ok(Option::None));
-    print "%i", unwrap_result(Result::Err("oops"));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::Some(42))))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::None)))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Err("oops")))));
 }
 ```
 
@@ -236,6 +240,8 @@ The two `Result::Ok` arms share the outer tag but differ on the inner `Option` t
 Variants can reference their own enum type, enabling tree-like structures. From `examples/tree.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Tree {
     Leaf,
     Node(int, Tree, Tree),
@@ -249,9 +255,9 @@ fn sum_tree(Tree t) -> int {
 }
 
 fn main() {
-    print "%i", sum_tree(Tree::Node(1,
+    write_all(stdout(), to_bytes(format("%i", sum_tree(Tree::Node(1,
                 Tree::Node(2, Tree::Leaf(), Tree::Leaf()),
-                Tree::Node(3, Tree::Leaf(), Tree::Leaf())));
+                Tree::Node(3, Tree::Leaf(), Tree::Leaf()))))));
 }
 ```
 
@@ -266,6 +272,8 @@ The tree has value `1` at the root, `2` on the left subtree, and `3` on the righ
 A single enum can combine unit, tuple, and record variants. From `examples/mixed.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Shape {
     Empty,
     CircleR(int),
@@ -283,10 +291,10 @@ fn area(Shape s) -> int {
 }
 
 fn main() {
-    print "%i", area(Shape::Empty);
-    print "%i", area(Shape::CircleR(5));
-    print "%i", area(Shape::Rect { width: 3, height: 4 });
-    print "%i", area(Shape::Tri { a: 1, b: 2, c: 3 });
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Empty))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::CircleR(5)))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Rect { width: 3, height: 4 }))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Tri { a: 1, b: 2, c: 3 }))));
 }
 ```
 

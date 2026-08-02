@@ -83,6 +83,8 @@ Point::Point { x, y } => x * x + y * y
 Patterns can nest constructors inside record fields. From `examples/nested_records.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Inner {
     I { v: int },
 }
@@ -99,7 +101,7 @@ fn get_v(Wrap w) -> int {
 
 fn main() {
     let w = Wrap::W { inner: Inner::I { v: 99 }, name: "x" };
-    print "%i", get_v(w);
+    write_all(stdout(), to_bytes(format("%i", get_v(w))));
 }
 ```
 
@@ -128,6 +130,8 @@ Dot access works on values whose type is a record-shaped enum variant. The compi
 From `examples/record.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Point {
     Origin,
     Point { x: int, y: int },
@@ -149,9 +153,9 @@ fn y_coord(Point p) -> int {
 }
 
 fn main() {
-    print "%i", distance_squared(Point::Point { x: 5, y: 12 });
-    print "%i", x_coord(Point::Point { x: 5, y: 12 });
-    print "%i", y_coord(Point::Point { x: 5, y: 12 });
+    write_all(stdout(), to_bytes(format("%i", distance_squared(Point::Point { x: 5, y: 12 }))));
+    write_all(stdout(), to_bytes(format("%i", x_coord(Point::Point { x: 5, y: 12 }))));
+    write_all(stdout(), to_bytes(format("%i", y_coord(Point::Point { x: 5, y: 12 }))));
 }
 ```
 
@@ -172,6 +176,8 @@ Use `match` when you need to branch on the variant tag (e.g. `Origin` vs `Point`
 When a field's type is itself a record-shaped enum, chain dots to read through nested records. From `examples/chained.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Inner {
     Inner { v: int },
 }
@@ -190,8 +196,8 @@ fn read_y(Outer o) -> int {
 
 fn main() {
     let p = Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 };
-    print "%i", read_x_v(p);
-    print "%i", read_y(p);
+    write_all(stdout(), to_bytes(format("%i", read_x_v(p))));
+    write_all(stdout(), to_bytes(format("%i", read_y(p))));
 }
 ```
 

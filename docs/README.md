@@ -7,8 +7,10 @@ The language targets embeddable scripting: you get real type checking and infere
 ## Quick start
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "Hello, world!";
+    write_all(stdout(), to_bytes("Hello, world!"));
 }
 ```
 
@@ -54,7 +56,7 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
 | Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` steps `int`/`byte`/`float`; no auto array materialize ([syntax](references/syntax.md#ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
-| `format` keyword | Supported (returns `string`; same specifiers as `print`) |
+| `string::format(...)` | Supported compiler intrinsic (returns `string`; literal specifiers are checked) |
 
 Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo, HTTP client) live under [`examples/projects/`](../examples/projects/README.md). See also [HTTP/1.1 client](manual/http-client.md).
 

@@ -38,12 +38,14 @@ Each parameter requires a type name before the parameter name: `Type param`.
 ### On return types
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
 }
 
 fn greet() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -52,6 +54,8 @@ The `-> RetType` clause is optional. Functions with no meaningful return value m
 From `examples/aliases.hy`, annotations on both parameter and `let`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Point = (int, int);
 
 fn distance(Point p) -> int {
@@ -62,7 +66,7 @@ fn distance(Point p) -> int {
 
 fn main() {
     let p: Point = (3, 4);
-    print "%i", distance(p);
+    write_all(stdout(), to_bytes(format("%i", distance(p))));
 }
 ```
 
@@ -86,8 +90,10 @@ Built-in primitive names are matched **case-insensitively** at typecheck time: `
 `void` appears primarily in foreign-function signatures:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() -> void {
-    print "Hello, World!";
+    write_all(stdout(), to_bytes("Hello, World!"));
 }
 ```
 
@@ -146,8 +152,10 @@ The typechecker emits diagnostics anchored to your source. Common messages:
 You referenced a name that was never bound, or it is out of scope (e.g. a `let` inside an inner block):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "%i", x;   // error: x not declared
+    write_all(stdout(), to_bytes(format("%i", x)));   // error: x not declared
 }
 ```
 
@@ -178,13 +186,15 @@ return "text";          // inside fn f() -> int { ... }
 
 ### Format specifier errors
 
-`print` and `format` validate each `%` specifier against the corresponding argument:
+`string::format` validates each `%` specifier against the corresponding argument:
 
 ```coil
-print "%i", "hello";   // %i requires int
-print "%s", 42;        // %s requires string
-print "%f", 1;         // %f requires float — use 1.0
-print "%z", 1;         // %z requires bool
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%i", "hello")));   // %i requires int
+write_all(stdout(), to_bytes(format("%s", 42)));        // %s requires string
+write_all(stdout(), to_bytes(format("%f", 1)));         // %f requires float — use 1.0
+write_all(stdout(), to_bytes(format("%z", 1)));         // %z requires bool
 ```
 
 **Fix:** Use the correct specifier or convert/coerce the value to the expected type.
@@ -218,9 +228,11 @@ At run time, a `let x = expr;` binding:
 This matters when you bind several variables in sequence:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let x = 5;
 let y = 10;
-print "%i", x + y;   // 15 — x's slot is preserved
+write_all(stdout(), to_bytes(format("%i", x + y)));   // 15 — x's slot is preserved
 ```
 
 **Reassignment** (`x = expr;`) uses the same slot-write path: the old value is replaced.
@@ -275,6 +287,8 @@ Implications for you as a programmer:
 coil supports class declarations and `impl` blocks for methods. From `examples/classes.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Foo {
     name: String,
 }
@@ -287,7 +301,7 @@ impl Foo {
 
 fn main() {
     let x = new Foo();
-    print "%i", (2 * 2 + 3);
+    write_all(stdout(), to_bytes(format("%i", (2 * 2 + 3))));
 }
 ```
 
@@ -332,6 +346,8 @@ Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — 
 A small program that combines annotations, inference, and checked output:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn clamp(int lo, int hi, int v) -> int {
     if v < lo {
         return lo;
@@ -344,8 +360,8 @@ fn clamp(int lo, int hi, int v) -> int {
 
 fn main() {
     let x = clamp(0, 100, 150);   // inferred int
-    print "%i", x;                 // 100
-    print "%z", x == 100;          // true
+    write_all(stdout(), to_bytes(format("%i", x)));                 // 100
+    write_all(stdout(), to_bytes(format("%z", x == 100)));          // true
 }
 ```
 
@@ -357,11 +373,11 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 
 1. Add explicit types to every binding in `examples/let_test.hy` without changing behavior.
 
-2. Write a function `max(int a, int b) -> int` and a `main` that prints the result. Remove the return type and confirm inference still accepts the program.
+2. Write a function `max(int a, int b) -> int` and a `main` that writes the result. Remove the return type and confirm inference still accepts the program.
 
 3. Introduce deliberate errors (one at a time) and record the diagnostic text:
    - unknown variable
-   - wrong `print` specifier
+   - wrong `format` specifier
    - assignment without `let`
 
 4. Declare `type UserId = int;` and write `fn fetch(UserId id) -> int` that returns `id * 2`. Call it from `main`.
@@ -372,7 +388,7 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 
 ## See also
 
-- [Chapter 1 — Basics](01-basics.md) — syntax, control flow, and `print`
+- [Chapter 1 — Basics](01-basics.md) — syntax, control flow, and stdout
 - [Chapter 5 — Aggregates](05-aggregates.md) — tuples, arrays, records, and aliases in depth
 - [Operator reference](../../references/operators.md) — operators and operand types
 - `examples/let_test.hy` — binding and reassignment

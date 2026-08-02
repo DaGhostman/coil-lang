@@ -5,8 +5,10 @@ This chapter introduces the core syntax of coil: literals, variables, functions,
 Every coil program is a `.hy` file. The runtime looks for a top-level `main` function as the entry point:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -43,11 +45,13 @@ coil has four primitive literal forms.
 | `bool` | `true`, `false`       | Boolean literals                           |
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "%i", 42;
-    print "%f", 3.14;
-    print "%s", "hello";
-    print "%z", true;
+    write_all(stdout(), to_bytes(format("%i", 42)));
+    write_all(stdout(), to_bytes(format("%f", 3.14)));
+    write_all(stdout(), to_bytes(format("%s", "hello")));
+    write_all(stdout(), to_bytes(format("%z", true)));
 }
 ```
 
@@ -87,13 +91,15 @@ x = 20;
 From `examples/let_test.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 5;
-    print "%i", x;   // 5
+    write_all(stdout(), to_bytes(format("%i", x)));   // 5
     let y = 10;
-    print "%i", y;   // 10
+    write_all(stdout(), to_bytes(format("%i", y)));   // 10
     x = 20;
-    print "%i", x;   // 20
+    write_all(stdout(), to_bytes(format("%i", x)));   // 20
 }
 ```
 
@@ -104,19 +110,23 @@ Assignment requires an existing binding. Assigning to an undeclared name is a co
 Compound assignment (`+=`, `-=`, `*=`, and the other arithmetic/bitwise forms) updates a binding in place and evaluates to the new value:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let x = 5;
 x += 3;
-print "%i", x;   // 8
+write_all(stdout(), to_bytes(format("%i", x)));   // 8
 ```
 
 Increment and decrement follow C-like rules: prefix forms (`++x`, `--x`) evaluate to the new value; postfix forms (`x++`, `x--`) evaluate to the old value. They work on variables, dict fields, and array elements.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let y = 0;
-print "%i", y++;   // 0
-print "%i", y;     // 1
+write_all(stdout(), to_bytes(format("%i", y++)));   // 0
+write_all(stdout(), to_bytes(format("%i", y)));     // 1
 let z = 0;
-print "%i", ++z;   // 1
+write_all(stdout(), to_bytes(format("%i", ++z)));   // 1
 ```
 
 See `examples/operators.hy` for a broader operator demo.
@@ -146,13 +156,15 @@ add(3, 4);
 From `examples/call_test.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
     add(3, 4);      // result discarded
-    print "done";
+    write_all(stdout(), to_bytes("done"));
 }
 ```
 
@@ -184,16 +196,18 @@ If execution reaches the end of a function body without hitting `return`, the fu
 Conditions must be boolean expressions:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 if n <= 2 {
     return 1;
 }
 
 if (n % 3) == 0 {
-    print "FIZ";
+    write_all(stdout(), to_bytes("FIZ"));
 } else if (n % 5) == 0 {
-    print "BUZ";
+    write_all(stdout(), to_bytes("BUZ"));
 } else {
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -238,11 +252,13 @@ For this example, `sum` becomes `18` (`0 + 1 + 2 + 4 + 5 + 6`).
 A block `{ ... }` groups zero or more statements. Blocks create scope for `let` bindings declared inside them:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 1;
     {
         let y = 2;
-        print "%i", x + y;
+        write_all(stdout(), to_bytes(format("%i", x + y)));
     }
     // y is not visible here
 }
@@ -257,11 +273,13 @@ Function bodies, `if` branches, `while` bodies, and `defer` bodies are all block
 Schedule cleanup (or other exit work) with `defer`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn example() {
     defer {
-        print "cleanup";
+        write_all(stdout(), to_bytes("cleanup"));
     }
-    print "work";
+    write_all(stdout(), to_bytes("work"));
 }
 ```
 
@@ -270,9 +288,11 @@ A `defer` block runs when the **enclosing function** exits — via `return` / `r
 Outer locals are **not** visible inside a defer unless you list them in an explicit `use (…)` capture list (same rule as lambdas):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn log_on_exit(int n) {
     defer use (n) {
-        print "%i", n;
+        write_all(stdout(), to_bytes(format("%i", n)));
     }
 }
 ```
@@ -283,24 +303,28 @@ Use `defer` for resource teardown, logging, or paired setup/teardown logic witho
 
 ---
 
-## `print` and format specifiers
+## Stdout and format specifiers
 
 ### Literal output
 
-Print a string with no formatting:
+Write a string to stdout with `io::write_all` and `string::to_bytes`:
 
 ```coil
-print "hello";
-print "FIZ";
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes("hello"));
+write_all(stdout(), to_bytes("FIZ"));
 ```
 
 ### Formatted output
 
-When the format string contains conversion specifiers, pass matching arguments after a comma:
+When the format string contains conversion specifiers, call `string::format` first:
 
 ```coil
-print "%i", 42;
-print "%i", x + y;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%i", 42)));
+write_all(stdout(), to_bytes(format("%i", x + y)));
 ```
 
 The compiler **type-checks** every specifier against its argument. A mismatch is a compile error, not a silent runtime bug.
@@ -320,22 +344,26 @@ The compiler **type-checks** every specifier against its argument. A mismatch is
 Example mixing integers from `examples/const.hy`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sum(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
-    print "%u", 2 + 2 + sum(2 + 2);
-    print "%u", 2 + 2 + 2 + 2;
+    write_all(stdout(), to_bytes(format("%u", 2 + 2 + sum(2 + 2))));
+    write_all(stdout(), to_bytes(format("%u", 2 + 2 + 2 + 2)));
 }
 ```
 
 Common type errors:
 
 ```coil
-print "%i", "hello";  // error: %i requires int
-print "%s", 42;       // error: %s requires string
-print "%f", 1;        // error: %f requires float (use 1.0)
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%i", "hello")));  // error: %i requires int
+write_all(stdout(), to_bytes(format("%s", 42)));       // error: %s requires string
+write_all(stdout(), to_bytes(format("%f", 1)));        // error: %f requires float (use 1.0)
 ```
 
 ---
@@ -347,7 +375,7 @@ Understanding the distinction keeps programs predictable.
 | Concept      | Ends with `;`? | Produces a value? | Example                    |
 |--------------|----------------|-------------------|----------------------------|
 | Expression   | Optional       | Yes               | `2 + 2`, `fib(10)`, `x`    |
-| Statement    | Usually yes    | Often no          | `let x = 5;`, `print "%i", x;` |
+| Statement    | Usually yes    | Often no          | `let x = 5;`, `write_all(...);` |
 
 - **Expression statement**: an expression followed by `;`. The value is evaluated and discarded — e.g. `add(3, 4);`.
 - **`let` binding**: a statement that introduces a name; not an expression (you cannot write `let y = let x = 5;`).
@@ -357,8 +385,10 @@ Understanding the distinction keeps programs predictable.
 Function calls, arithmetic, and comparisons are expressions and can nest:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 return fib(n - 1) + fib(n - 2);
-print "%u", 2 + 2 + sum(2 + 2);
+write_all(stdout(), to_bytes(format("%u", 2 + 2 + sum(2 + 2))));
 ```
 
 ---
@@ -397,6 +427,8 @@ The following examples build on each other. Read them in order, then run them lo
 Recursive functions, `if`, and formatted integer output:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -406,7 +438,7 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(10);
+    write_all(stdout(), to_bytes(format("%i", fib(10))));
 }
 ```
 
@@ -421,13 +453,15 @@ Running this prints `55` (the 10th Fibonacci number). Notice:
 Multiple bindings and reassignment:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 5;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
     let y = 10;
-    print "%i", y;
+    write_all(stdout(), to_bytes(format("%i", y)));
     x = 20;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 }
 ```
 
@@ -438,40 +472,46 @@ Output: `51020`.
 Combine function calls with expression statements and `%u` formatting:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
     add(3, 4);
-    print "done";
+    write_all(stdout(), to_bytes("done"));
 }
 ```
 
 And nested arithmetic with a helper:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sum(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
-    print "%u", 2 + 2 + sum(2 + 2);
-    print "%u", 2 + 2 + 2 + 2;
+    write_all(stdout(), to_bytes(format("%u", 2 + 2 + sum(2 + 2))));
+    write_all(stdout(), to_bytes(format("%u", 2 + 2 + 2 + 2)));
 }
 ```
 
 ### Step 4 — FizzBuzz-style output (`examples/fizbuz.hy`)
 
-Independent `if` checks (not `else if`) so multiples of both 3 and 5 print both fragments:
+Independent `if` checks (not `else if`) so multiples of both 3 and 5 write both fragments:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fizbuz(int n) {
     if (n % 3) == 0 {
-        print "FIZ";
+        write_all(stdout(), to_bytes("FIZ"));
     }
     if (n % 5) == 0 {
-        print "BUZ";
+        write_all(stdout(), to_bytes("BUZ"));
     }
 }
 
@@ -502,7 +542,7 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 ## Common pitfalls
 
-1. **Forgetting semicolons** — Statements like `let`, `return`, and `print` need a trailing `;`.
+1. **Forgetting semicolons** — Statements like `let`, `return`, and expression statements such as `write_all(...);` need a trailing `;`.
 
 2. **Using `let` on reassignment** — Write `x = 10;`, not `let x = 10;` again (that would shadow or error depending on scope).
 
@@ -512,7 +552,7 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 5. **Float vs int literals** — `1.0` is a float; `1` is an int. Mixing them in arithmetic may require an explicit cast or a float literal where `%f` is used.
 
-6. **Discarding return values accidentally** — `add(3, 4);` computes `7` and throws it away. Assign or print the result when you need it: `let r = add(3, 4);` or `print "%i", add(3, 4);`.
+6. **Discarding return values accidentally** — `add(3, 4);` computes `7` and throws it away. Assign or write the result when you need it: `let r = add(3, 4);` or `write_all(stdout(), to_bytes(format("%i", add(3, 4))));`.
 
 7. **`else if` vs separate `if`s** — Chained `else if` runs at most one branch. Separate `if` statements can each run (as in FizzBuzz when a number is divisible by both 3 and 5).
 
@@ -524,21 +564,23 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 ## Exercises
 
-1. Write `fn double(int n) -> int` and print `double(21)` from `main`.
+1. Write `fn double(int n) -> int` and write `double(21)` from `main`.
 
-2. Extend the Fibonacci example to print `fib(0)` through `fib(10)` on one line using a `while` loop.
+2. Extend the Fibonacci example to write `fib(0)` through `fib(10)` on one line using a `while` loop.
 
 3. Write a function `abs(int n) -> int` using `if`/`else` (no built-in `abs` assumed).
 
-4. Use `defer` in a function that prints `"enter"`, does work, and relies on defer to print `"leave"`. Confirm LIFO order with two defers.
+4. Use `defer` in a function that writes `"enter"`, does work, and relies on defer to write `"leave"`. Confirm LIFO order with two defers.
 
 5. Fix the type errors in this snippet (there are three):
    ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
    fn main() {
-       print "%f", 3;
-       print "%s", 100;
+       write_all(stdout(), to_bytes(format("%f", 3)));
+       write_all(stdout(), to_bytes(format("%s", 100)));
        if 1 {
-           print "always";
+           write_all(stdout(), to_bytes("always"));
        }
    }
    ```

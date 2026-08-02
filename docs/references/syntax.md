@@ -33,6 +33,8 @@ literal     ::= string | int | float | 'true' | 'false'
 Examples:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 #[derive(Show, Eq, Ord)]
 enum Color { Red, Blue }
 
@@ -45,7 +47,7 @@ fn add_works() {
 fn strlen(string s) -> int;
 
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
-    print "%s", message;
+    write_all(stdout(), to_bytes(format("%s", message)));
     return target(...args);
 }
 
@@ -169,10 +171,12 @@ attr wrap<T>(fn(...args) -> T target, ...args) -> T {
 ```
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
-fn greet() { print "hi"; }
+fn greet() { write_all(stdout(), to_bytes("hi")); }
 fn sum(int... xs) -> int { return len(xs); }
 sum(1, 2, 3);   // xs == [1, 2, 3]
 sum();          // xs == []
@@ -401,7 +405,6 @@ statement ::= while_stmt
             | const_stmt
             | defer_stmt
             | expr_stmt
-            | print_stmt
             | return_stmt
             | comment
 ```
@@ -413,7 +416,6 @@ statement ::= while_stmt
 | `static` | `static let IDENT …` / `static const IDENT …` (top-level only) |
 | `defer` | `defer [use (ident,*)] { statement* }` (runs on enclosing function exit, LIFO; outer locals require `use`) |
 | Expression | `expr ';'` |
-| `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return [expr] ';'` (`return;` returns unit) |
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
@@ -501,9 +503,11 @@ binding_yield ::= 'let' IDENT '=' yield_expr
 Examples:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn ping() {
     let msg = yield "ready";
-    print "%s", msg;
+    write_all(stdout(), to_bytes(format("%s", msg)));
 }
 
 fn main() {
@@ -636,10 +640,12 @@ Construction needs only `Ord`. **`for` iteration** steps with `+1` /
 range value but are not iterable yet).
 
 ```coil
-for x in 0..5 { print "%i", x; }   // 01234
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+for x in 0..5 { write_all(stdout(), to_bytes(format("%i", x))); }   // 01234
 let r = 0..=3;
-for x in r { print "%i", x; }      // 0123
-for x in 1.0..4.0 { print "%f", x; } // 1.02.03.0
+for x in r { write_all(stdout(), to_bytes(format("%i", x))); }      // 0123
+for x in 1.0..4.0 { write_all(stdout(), to_bytes(format("%f", x))); } // 1.02.03.0
 ```
 
 See `examples/range.hy`.
@@ -661,5 +667,5 @@ See [README](../README.md) language-at-a-glance table for the live feature matri
 | [Types](types.md) | Type forms and inference |
 | [Operators](operators.md) | Precedence and semantics |
 | [Keywords](keywords.md) | Reserved words |
-| [Built-ins](README.md) | `print`, FFI builtins |
+| [Built-ins](README.md) | virtual modules and FFI builtins |
 | [Modules](modules.md) | `use` / `mod` resolution |

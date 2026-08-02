@@ -11,8 +11,6 @@ Bare `Option::Some(…)` works because of the implicit prelude. To redefine a pr
 
 Use constructors / `match` as usual, plus `raise`, `?`, `??`, and `?.` — see [Tutorial: Error handling](../manual/tutorial/09-error-handling.md).
 
-Internal: the `FORMAT` opcode powers both `print` and the `format` expression.
-
 ---
 
 ## Related

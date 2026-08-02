@@ -19,7 +19,7 @@ Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `in
 
 Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`). `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
-Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print` (`%i` accepts `byte`).
+Strings support `+` / `+=` with other strings. `string::format(...)` returns `string` and validates literal format specifiers (`%i` accepts `byte`).
 
 Opaque **`Stream`** (`Ty::Con("Stream")`) is the handle type for the virtual [`io`](io.md) module — not constructible in userland.
 
@@ -155,9 +155,11 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed, and `len(arr)` returns its current runtime length as `int`.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let xs = [1, 2];   // starts as [int; 2]
 xs[] = 3;          // xs is treated as dynamic [int] afterwards
-print "%i", len(xs);
+write_all(stdout(), to_bytes(format("%i", len(xs))));
 ```
 
 ### Indexing
@@ -314,7 +316,7 @@ IDENT                    // int, MyEnum, Foo
 | Let-polymorphism | `let`-bound names generalize free type variables at binding site |
 | Function recursion | Monomorphic recursion — `fn` body sees monomorphic self type |
 | `match` exhaustiveness | Checked post-inference; non-exhaustive match → diagnostic |
-| Format strings | `print "%i", x` validates specifier vs argument type |
+| Format strings | `string::format("%i", x)` validates specifier vs argument type |
 | `impl` methods | `self` is implicit first parameter of owner class type |
 
 ---
@@ -408,11 +410,13 @@ a stale value.
 Generic functions use an optional type-parameter list and trait bounds on parameters:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 
 fn main() {
-    print "%i", add(3, 4);   // int
-    print "%f", add(1.5, 2.5); // float
+    write_all(stdout(), to_bytes(format("%i", add(3, 4))));   // int
+    write_all(stdout(), to_bytes(format("%f", add(1.5, 2.5)))); // float
 }
 ```
 
@@ -505,8 +509,10 @@ fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 A unary trait name in a value type position denotes an existential value:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn print_any(Show x) {
-    print "%s", show(x);
+    write_all(stdout(), to_bytes(format("%s", show(x))));
 }
 
 fn main() {
@@ -796,11 +802,13 @@ When a concrete value crosses into a generic function body, the compiler wraps i
 This means **most generic calls to primitive-returning functions are transparent** — the caller receives a plain `int`, `float`, `bool`, or `string`, not a boxed wrapper:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn id<T>(T x) -> T { return x; }
 
 fn main() {
     let n = id(42);   // n is a raw int — unboxed automatically
-    print "%i", n;    // prints: 42
+    write_all(stdout(), to_bytes(format("%i", n)));    // prints: 42
 }
 ```
 
@@ -809,15 +817,17 @@ fn main() {
 Concrete format specifiers (`%i`, `%f`, `%s`, `%z`, …) require a resolved concrete type. An open type parameter is a type error; use `%v`, which requires `T: Show` and lowers through the `show` method to a string before formatting:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn show_it<T: Show>(T x) {
-    print "%v", x;   // ok — dictionary Show
+    write_all(stdout(), to_bytes(format("%v", x)));   // ok — dictionary Show
 }
 
 fn main() {
     show_it(42);
     show_it("hi");
-    let s = format "%v", 99;  // same lowering; leaves a string
-    print "%s", s;
+    let s = format("%v", 99);  // same lowering; leaves a string
+    write_all(stdout(), to_bytes(format("%s", s)));
 }
 ```
 

@@ -1,18 +1,30 @@
-# `print`
+# `print` removal
 
-### Syntax
+The `print` statement has been removed. Write to stdout through the virtual `io` module and convert strings to bytes through the virtual `string` module.
 
+Old:
+
+```coil
+print "%i", x;
 ```
-print_stmt ::= 'print' STRING (',' expr)* ';'
+
+New:
+
+```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+write_all(stdout(), to_bytes(format("%i", x)));
 ```
 
-### Forms
+Literal-only output does not need `format`:
 
-| Form | Example | Behavior |
-|------|---------|----------|
-| Literal only | `print "hello";` | Writes `hello` |
-| Format + args | `print "%i", x;` | Interpolates specifiers |
-| Multiple args | `print "%i %s", n, name;` | One specifier per arg, left to right |
+```coil
+use io::{stdout, write_all};
+use string::to_bytes;
+
+write_all(stdout(), to_bytes("hello"));
+```
 
 ### Format specifiers
 
@@ -35,27 +47,13 @@ The typechecker validates specifiers against arguments when the format string is
 
 `%v` works for open type parameters when the enclosing function has a `Show` bound. Concrete `%i`/`%f`/`%s`/`%z` on an unresolved type variable are rejected (help text recommends `%v`).
 
-### Examples
-
-```coil
-print "plain text";
-print "%i", 42;
-print "%s %z", "ok", true;
-print "100%% complete";   // literal percent via %%
-```
-
-### Runtime pipeline
-
-1. If specifiers present: `FORMAT` builds a new string on the heap.
-2. `PRINT` pops the string and writes to stdout (or a redirected writer in tests).
-
-See [Tutorial 01](../manual/tutorial/01-basics.md) for introductory usage.
-
 ---
 
-Internal: the `FORMAT` opcode powers both `print` and the `format` expression.
+`FORMAT` still builds formatted strings for `string::format`. Stdout writes are ordinary `io::write_all(stdout(), bytes)` calls.
 
 ## Related
 
 - [format](format.md)
+- [string](string.md)
+- [io](io.md)
 - [Tutorial 01](../manual/tutorial/01-basics.md)

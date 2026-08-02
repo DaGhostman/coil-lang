@@ -102,11 +102,13 @@ invoke(lib, fn_id, (args...))
 Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = declare(...)?` (or match) so the side table can refine later `invoke` calls.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let n = match invoke(lib, sum_id, (40, 2)) {
     Result::Ok(v) => v,
     Result::Err(e) => panic e.message,
 };
-print "%i", n;
+write_all(stdout(), to_bytes(format("%i", n)));
 ```
 
 ### `Error` / `ErrorKind`
@@ -127,13 +129,15 @@ Match on `e.kind` for recovery; use `e.message` for logging / `panic`.
 Not separate builtins — the compiler lowers extern declarations to `dload` / `declare` / `invoke` sequences. User code calls look like normal functions:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 extern "c" {
     fn strlen(string s) -> int;
     fn printf(string fmt, ...) -> int;   // C varargs — bare `...`
 }
 
 fn main() {
-    print "%i", strlen("hello");
+    write_all(stdout(), to_bytes(format("%i", strlen("hello"))));
 }
 ```
 

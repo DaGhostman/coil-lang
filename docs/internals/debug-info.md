@@ -44,6 +44,6 @@ If the location is unknown or the file cannot be read, only
 ## Limitations (MVP)
 
 - Many codegen sites still emit **unknown** locations; coverage grows
-  incrementally (`panic`, `print`, `raise`, and padded slots elsewhere).
+  incrementally (`panic`, `raise`, formatting/stdout calls, and padded slots elsewhere).
 - Fused super-instructions keep the **first** slot’s span only.
 - No call-stack walk on panic yet (planned follow-up).

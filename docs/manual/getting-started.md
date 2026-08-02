@@ -79,6 +79,8 @@ The canonical starter example computes the 10th Fibonacci number recursively
 workload in `examples/fib_bench.hy`):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -88,7 +90,7 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(10);
+    write_all(stdout(), to_bytes(format("%i", fib(10))));
 }
 ```
 
@@ -198,8 +200,10 @@ cargo run -- examples/print_literal.hy
 Source:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -292,8 +296,7 @@ The language includes:
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
 - **Classes** (partial — see `examples/classes.hy`)
 - **Coroutines** — `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` (see [tutorial/08-coroutines.md](tutorial/08-coroutines.md))
-
-Not yet available: string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
+- **String helpers** — `string::format(...)` and UTF-8 byte conversions via `string::{from_bytes, to_bytes}`
 
 ## Next steps
 
@@ -306,7 +309,7 @@ Not yet available: string concatenation with `+`, and a user-facing `format` key
 
 | Step | Example | Teaches |
 |------|---------|---------|
-| 1 | `print_literal.hy` | `print`, `main` |
+| 1 | `print_literal.hy` | stdout via `io`, `main` |
 | 2 | `let_test.hy` | `let`, reassignment |
 | 3 | `fizbuz.hy` | `if`, modulo, multiple prints |
 | 4 | `option.hy` | enums, `match` |

@@ -211,8 +211,10 @@ The FQN shape depends on **which file** path resolution loaded (see [Path resolu
 Example — `src/foo.hy`:
 
 ```coil
-fn sadge() { print "%i", 100; }
-fn greet() { print "%i", 200; }
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn sadge() { write_all(stdout(), to_bytes(format("%i", 100))); }
+fn greet() { write_all(stdout(), to_bytes(format("%i", 200))); }
 ```
 
 After `use foo::*;` in another file, both `sadge()` and `greet()` are callable directly.

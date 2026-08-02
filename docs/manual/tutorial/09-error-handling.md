@@ -98,10 +98,12 @@ Prefer `?` or `match` when failure must be observed. Coalesce on a non-Option/no
 - `Some(x)` → `Some(x.field)`
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let some = Option::Some({ v: 42 });
 let none = Option::None;
-print "%i,", show(some?.v);   // Some(42) → unwrap in helper
-print "%i", none?.v ?? 0;     // None → 0
+write_all(stdout(), to_bytes(format("%i,", show(some?.v))));   // Some(42) → unwrap in helper
+write_all(stdout(), to_bytes(format("%i", none?.v ?? 0)));     // None → 0
 ```
 
 `?.` on `Result` or a non-Option is a type error (E0116). Use `?` then `.`, or `match`.
