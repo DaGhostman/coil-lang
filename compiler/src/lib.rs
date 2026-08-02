@@ -15009,6 +15009,16 @@ fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
                 loc: DebugLoc::unknown(),
             },
         ]));
+        // Typed STRING (literal `return "…"`) is a pure micro-body producer.
+        assert!(Compiler::is_tiny_inline_il(&[
+            IlOp::String {
+                idx: 0,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+        ]));
         assert!(!Compiler::is_tiny_inline_il(&[
             IlOp::HostInvoke {
                 arity: 1,
