@@ -608,6 +608,10 @@ mod tests {
             stack_delta(&IlOp::ConstPool { idx: 2, loc: loc() }),
             Some(1)
         );
+        assert_eq!(
+            stack_delta(&IlOp::String { idx: 4, loc: loc() }),
+            Some(1)
+        );
     }
 
     #[test]

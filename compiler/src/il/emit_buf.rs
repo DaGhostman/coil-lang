@@ -256,22 +256,25 @@ mod tests {
     fn codebuf_emit_buf_trait_lifts_residual_typed() {
         let mut buf = CodeBuf::new();
         EmitBuf::push_const_pool(&mut buf, 4);
+        EmitBuf::push_string(&mut buf, 11);
         EmitBuf::push_get_field(&mut buf);
         EmitBuf::push_set_field(&mut buf);
         EmitBuf::push_host_invoke(&mut buf, 2);
         EmitBuf::push_print(&mut buf);
         let ops = buf.ops();
         assert!(matches!(ops[0], IlOp::ConstPool { idx: 4, .. }));
-        assert!(matches!(ops[1], IlOp::GetField { .. }));
-        assert!(matches!(ops[2], IlOp::SetField { .. }));
-        assert!(matches!(ops[3], IlOp::HostInvoke { arity: 2, .. }));
-        assert!(matches!(ops[4], IlOp::Print { .. }));
+        assert!(matches!(ops[1], IlOp::String { idx: 11, .. }));
+        assert!(matches!(ops[2], IlOp::GetField { .. }));
+        assert!(matches!(ops[3], IlOp::SetField { .. }));
+        assert!(matches!(ops[4], IlOp::HostInvoke { arity: 2, .. }));
+        assert!(matches!(ops[5], IlOp::Print { .. }));
     }
 
     #[test]
     fn vec_emit_buf_packs_residual_typed() {
         let mut buf: Vec<Byte> = Vec::new();
         EmitBuf::push_const_pool(&mut buf, 4);
+        EmitBuf::push_string(&mut buf, 11);
         EmitBuf::push_get_field(&mut buf);
         EmitBuf::push_set_field(&mut buf);
         EmitBuf::push_host_invoke(&mut buf, 2);
@@ -279,24 +282,28 @@ mod tests {
         assert_eq!(*buf[0].bytecode(), Instruction::CONST);
         assert_eq!(buf[0].operand_u32() & Byte::POOL_FLAG, Byte::POOL_FLAG);
         assert_eq!(buf[0].operand_u32() & !Byte::POOL_FLAG, 4);
-        assert_eq!(*buf[1].bytecode(), Instruction::GetField);
-        assert_eq!(*buf[2].bytecode(), Instruction::SetField);
-        assert_eq!(*buf[3].bytecode(), Instruction::HostInvoke);
-        assert_eq!(buf[3].operand_u32(), 2);
-        assert_eq!(*buf[4].bytecode(), Instruction::PRINT);
+        assert_eq!(*buf[1].bytecode(), Instruction::STRING);
+        assert_eq!(buf[1].operand_u32(), 11);
+        assert_eq!(*buf[2].bytecode(), Instruction::GetField);
+        assert_eq!(*buf[3].bytecode(), Instruction::SetField);
+        assert_eq!(*buf[4].bytecode(), Instruction::HostInvoke);
+        assert_eq!(buf[4].operand_u32(), 2);
+        assert_eq!(*buf[5].bytecode(), Instruction::PRINT);
     }
 
     #[test]
     fn codebuf_push_byte_absorbs_residual_typed() {
         let mut buf = CodeBuf::new();
         buf.push(Byte::new(Instruction::CONST).with_const_pool(1));
+        buf.push(Byte::new(Instruction::STRING).with_operand_u32(3));
         buf.push(Byte::new(Instruction::GetField));
         buf.push(Byte::new(Instruction::PRINT));
         buf.push(Byte::new(Instruction::HostInvoke).with_operand_u32(0));
         let ops = buf.ops();
         assert!(matches!(ops[0], IlOp::ConstPool { idx: 1, .. }));
-        assert!(matches!(ops[1], IlOp::GetField { .. }));
-        assert!(matches!(ops[2], IlOp::Print { .. }));
-        assert!(matches!(ops[3], IlOp::HostInvoke { arity: 0, .. }));
+        assert!(matches!(ops[1], IlOp::String { idx: 3, .. }));
+        assert!(matches!(ops[2], IlOp::GetField { .. }));
+        assert!(matches!(ops[3], IlOp::Print { .. }));
+        assert!(matches!(ops[4], IlOp::HostInvoke { arity: 0, .. }));
     }
 }
