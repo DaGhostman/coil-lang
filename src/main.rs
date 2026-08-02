@@ -1,7 +1,6 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::time::SystemTime;
 
 use common::{ARCHIVE_VERSION, ArchivedProgram, Byte, ProgramDebug};
 use compiler::Pipeline;
@@ -22,7 +21,7 @@ use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
-    /// Legacy: compile entry → out.hyc (cached) → run.
+    /// Default: compile entry in memory and run (no out.hyc).
     BuildAndRun {
         filename: String,
     },
@@ -77,13 +76,13 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] debug <file.hy> [-x <script>] [--batch]\n\
          \n\
          Commands:\n\
-         \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) to out.hyc and run it\n\
+         \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) in memory and run it\n\
          \x20 compile    Compile an entry file (must define main) to a .hyc archive\n\
          \x20 run        Execute a previously compiled .hyc archive\n\
          \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
          \x20 test       Compile and run every .hy file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
-         \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no out.hyc)\n\
+         \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no archive file)\n\
          \x20 debug      GDB-style debugger (REPL; optional -x script / --batch)\n\
          \n\
          Options:\n\
@@ -577,123 +576,114 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
     }
 }
 
-fn archive_mtime(path: &str) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
+#[cfg(test)]
+mod archive_staleness {
+    use std::path::Path;
+    use std::time::SystemTime;
 
-/// Like [`archive_mtime`], but also tries project-root-relative paths.
-///
-/// Archives record `source_files` relative to the directory containing
-/// `coil.toml`. When the CLI cwd is that root, `path` works as-is; when the
-/// recorded path is relative and the cwd is nested (or absolute forms fail),
-/// walk parents until `coil.toml` and retry `root.join(path)`.
-fn archive_source_mtime(path: &str) -> Option<SystemTime> {
-    if let Some(m) = archive_mtime(path) {
-        return Some(m);
+    use common::ProgramDebug;
+
+    pub(super) fn archive_mtime(path: &str) -> Option<SystemTime> {
+        std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
     }
-    let p = Path::new(path);
-    if p.is_absolute() {
-        return None;
-    }
-    let Ok(mut dir) = std::env::current_dir() else {
-        return None;
-    };
-    loop {
-        let candidate = dir.join(p);
-        if let Some(s) = candidate.to_str()
-            && let Some(m) = archive_mtime(s)
-        {
+
+    /// Like [`archive_mtime`], but also tries project-root-relative paths.
+    pub(super) fn archive_source_mtime(path: &str) -> Option<SystemTime> {
+        if let Some(m) = archive_mtime(path) {
             return Some(m);
         }
-        if dir.join("coil.toml").is_file() {
-            break;
+        let p = Path::new(path);
+        if p.is_absolute() {
+            return None;
         }
-        if !dir.pop() {
-            break;
+        let Ok(mut dir) = std::env::current_dir() else {
+            return None;
+        };
+        loop {
+            let candidate = dir.join(p);
+            if let Some(s) = candidate.to_str()
+                && let Some(m) = archive_mtime(s)
+            {
+                return Some(m);
+            }
+            if dir.join("coil.toml").is_file() {
+                break;
+            }
+            if !dir.pop() {
+                break;
+            }
         }
+        None
     }
-    None
-}
 
-/// True when `path` refers to the same file as `other` (best-effort).
-fn same_source_path(path: &str, other: &str) -> bool {
-    if path == other {
-        return true;
-    }
-    let a = Path::new(path);
-    let b = Path::new(other);
-    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
-        return ca == cb;
-    }
-    let norm = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
-    let a_s = norm(path);
-    let b_s = norm(other);
-    if a_s == b_s {
-        return true;
-    }
-    // Proper path-suffix only (requires a `/` in the shorter side) so bare
-    // `main.hy` is not equated with `vendor/pkg/main.hy`.
-    fn proper_path_suffix(full: &str, suffix: &str) -> bool {
-        if suffix.is_empty() || !suffix.contains('/') {
-            return false;
+    /// True when `path` refers to the same file as `other` (best-effort).
+    pub(super) fn same_source_path(path: &str, other: &str) -> bool {
+        if path == other {
+            return true;
         }
-        full.len() > suffix.len()
-            && full.ends_with(suffix)
-            && full.as_bytes()[full.len() - suffix.len() - 1] == b'/'
+        let a = Path::new(path);
+        let b = Path::new(other);
+        if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+            return ca == cb;
+        }
+        let norm = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
+        let a_s = norm(path);
+        let b_s = norm(other);
+        if a_s == b_s {
+            return true;
+        }
+        fn proper_path_suffix(full: &str, suffix: &str) -> bool {
+            if suffix.is_empty() || !suffix.contains('/') {
+                return false;
+            }
+            full.len() > suffix.len()
+                && full.ends_with(suffix)
+                && full.as_bytes()[full.len() - suffix.len() - 1] == b'/'
+        }
+        proper_path_suffix(&a_s, &b_s) || proper_path_suffix(&b_s, &a_s)
     }
-    proper_path_suffix(&a_s, &b_s) || proper_path_suffix(&b_s, &a_s)
-}
 
-/// Whether the cached `out.hyc` must be rebuilt for `entry`.
-///
-/// Invalidates when:
-/// - the entry file is newer than the archive
-/// - **any** source recorded in the archive is newer (multi-file modules)
-/// - the entry is not among the archive's `source_files` (different program
-///   was compiled into the shared `out.hyc` path — e.g. ran `A.hy` then `B.hy`)
-/// - a recorded source file is missing
-fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
-    let Some(arch_mtime) = archive_mtime(archive) else {
-        return true;
-    };
+    /// Whether a cached archive must be rebuilt for `entry`.
+    pub(super) fn archive_is_stale(entry: &str, archive: &str, debug: &ProgramDebug) -> bool {
+        let Some(arch_mtime) = archive_mtime(archive) else {
+            return true;
+        };
 
-    if debug.source_files.is_empty() {
-        return match archive_source_mtime(entry) {
+        if debug.source_files.is_empty() {
+            return match archive_source_mtime(entry) {
+                Some(src) => src > arch_mtime,
+                None => true,
+            };
+        }
+
+        let entry_known = debug
+            .source_files
+            .iter()
+            .any(|s| same_source_path(s, entry));
+        if !entry_known {
+            return true;
+        }
+
+        for src in &debug.source_files {
+            match archive_source_mtime(src) {
+                Some(m) if m > arch_mtime => return true,
+                None => return true,
+                _ => {}
+            }
+        }
+
+        match archive_source_mtime(entry) {
             Some(src) => src > arch_mtime,
             None => true,
-        };
-    }
-
-    let entry_known = debug
-        .source_files
-        .iter()
-        .any(|s| same_source_path(s, entry));
-    if !entry_known {
-        return true;
-    }
-
-    for src in &debug.source_files {
-        match archive_source_mtime(src) {
-            Some(m) if m > arch_mtime => return true,
-            None => return true,
-            _ => {}
         }
     }
 
-    match archive_source_mtime(entry) {
-        Some(src) => src > arch_mtime,
-        // Entry was listed in `source_files` but cannot be resolved now —
-        // treat as stale (same as a missing dependency path above).
-        None => true,
-    }
-}
-
-/// Legacy helper kept for unit tests: entry-only mtime compare.
-#[cfg(test)]
-fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
-    match (archive_mtime(archive), archive_mtime(filename)) {
-        (Some(arch), Some(src)) => src > arch,
-        _ => false,
+    /// Entry-only mtime compare.
+    pub(super) fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
+        match (archive_mtime(archive), archive_mtime(filename)) {
+            (Some(arch), Some(src)) => src > arch,
+            _ => false,
+        }
     }
 }
 
@@ -733,39 +723,17 @@ pub(crate) fn execute_archive(
 }
 
 fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
-    let cached = try_load_archive(DEFAULT_OUT);
-    let recompile = match &cached {
-        Err(LoadErr::Missing) => true,
-        Err(LoadErr::Corrupt) => true,
-        Err(LoadErr::Version(v)) => {
-            pipeline.emit_spanless_error(
-                ErrorCode::ArchiveVersionMismatch,
-                format!(
-                    "Bytecode archive version {v} does not match compiler version {ARCHIVE_VERSION}. Recompiling."
-                ),
-            );
-            true
+    let (bytecode, constants) = match pipeline.compile_src_from_file(filename) {
+        Ok(ok) => ok,
+        Err(()) => {
+            let _ = pipeline.finish_reporting();
+            exit(1);
         }
-        Ok((_, _, _, _, debug)) => archive_is_stale(filename, DEFAULT_OUT, debug),
     };
 
-    if recompile {
-        let _ = std::fs::remove_file(DEFAULT_OUT);
-        compile_to_archive(pipeline, filename, DEFAULT_OUT);
-    }
-
-    let (bytecode, constants, strings, static_slots, debug) = if recompile {
-        match try_load_archive(DEFAULT_OUT) {
-            Ok(ok) => ok,
-            Err(_) => fail_and_exit(
-                pipeline,
-                ErrorCode::IoError,
-                "Unable to load freshly compiled archive",
-            ),
-        }
-    } else {
-        cached.expect("archive checked above")
-    };
+    let strings = pipeline.strings().to_vec();
+    let static_slots = pipeline.static_slot_count();
+    let debug = pipeline.program_debug();
 
     if let Err(e) = pipeline.finish_reporting() {
         pipeline.emit_spanless_warning(
@@ -1198,6 +1166,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::archive_staleness::{
+        archive_is_stale, archive_mtime, archive_source_mtime, same_source_path,
+        source_newer_than_archive,
+    };
 
     fn args(parts: &[&str]) -> Vec<String> {
         std::iter::once("coil".to_string())

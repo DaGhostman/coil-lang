@@ -1,0 +1,70 @@
+# coil contributor reference
+
+## Key files
+
+| File | Role |
+|------|------|
+| `common/src/opcode.rs` | `Instruction` enum — append-only |
+| `common/src/archive.rs` | `ARCHIVE_VERSION`, archive envelope |
+| `machine/src/vm.rs` | Main dispatch loop, `promise!` opcode ceiling |
+| `compiler/src/lib.rs` | Codegen driver, `finalize_bytecode` |
+| `compiler/src/il/` | IL ops, lower, fuse-select, opts |
+| `compiler/src/typechecking/` | HM Algorithm W |
+| `parser/src/` | Pratt parser |
+| `machine/src/packed_la.rs` | LA ops via HostInvoke (no LA opcodes) |
+
+## Codegen / VM invariants
+
+- **`STORE`**: pops TOS into slot(s); `cursor = max(cursor, slot + 1)`. Match bindings skip store (`UNPACK` / `JUMP_IF_MATCH`). `StorePop` is deprecated alias — compiler never emits. Packed multi-slot `LOAD`/`STORE`: `[31:24]=n` (1..=3), three slot bytes; `n==0` → wide single slot in low 24 bits.
+- **Stack IL**: symbolic labels until `finalize_bytecode` → per-body opts + **single** `il::lower` after concat. Nested fused returns must `capture_nested_return`.
+- **Type aliases**: scoped; same-frame duplicates are errors; inner may shadow outer.
+- Packed LA (`dot`/`matmul`/`Matrix`) → `HostInvoke` in `machine/src/packed_la.rs` (no LA opcodes).
+
+## Codegen notes
+
+- `BlockBuilder`: thin wrapper over `IlBuilder` labels; no absolute PC patching in emitters.
+- `ConstEnv`: scalar const folding; constant branch/loop elimination; loop unroll ≤8.
+- Tiny direct-call inlining; one-level self-`CALL` peel; `TailCall` for eligible recursion.
+- Match: threaded layout, `JumpIfMatch`, nested records use `UnpackAt` (slot-based).
+- Enum fields: `LoadField` (index); dict/class fields: `GetField`/`SetField` (string keys).
+
+## VM / values
+
+- Static slots: `LoadStatic`/`StoreStatic`; count in archive envelope.
+- Coroutines: `MakeCoro`, `ResumeCoro`, `YieldCoro`, `YieldFromCoro`, `DoneCoro`.
+- `panic` aborts VM; test harness treats as failure.
+- GC: addr index O(1) lookup; mark walks intrusive list.
+
+## Typechecker limitations (known)
+
+- `codegen_var_types` side table still used for some Identifier paths.
+- Path completeness (`E0111`) for concrete non-unit returns on named fns.
+- Unreachable code `E0118`; defer in infinite loop `E0123`.
+- Unit/open-var fall-through may emit `CONST 0; RETURN` (Result-mode Ok-wraps unit only).
+
+## ARCHIVE_VERSION bump triggers
+
+- New or reordered opcode discriminants
+- Incompatible bytecode encoding
+- Tag layout changes
+- Archive envelope field changes
+
+Current version: check `common/src/archive.rs`.
+
+## Perf philosophy
+
+Prefer over new opcodes / IL opts:
+- Allocation reduction in hot paths
+- Bounds-check elimination
+- Hot-loop tuning in VM
+- `promise!` for release assertions
+
+Soft baseline: `./scripts/poop_baseline.sh` on `examples/fib_bench.hy`. See AGENTS.md user preferences.
+
+| Tree | When to update |
+|------|----------------|
+| `docs/manual/` | Tutorials, getting started, examples catalog |
+| `docs/references/` | Syntax, per-API builtin pages, error codes |
+| `docs/internals/` | Pipeline, opcodes, debugger (contributor-facing) |
+
+New stable diagnostics: add to `docs/references/error-codes.md`.
