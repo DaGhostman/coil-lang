@@ -2,14 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use common::{Byte, Instruction};
+use common::Instruction;
 
 use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
 
 /// Hoist loop-invariant `Const` / `Load` / `BinSlotImm` / `BinSlotSlot` out of
-/// natural loops when header SP-in is Known. Also sinks repeated `STRING`
-/// field-key literals into preheader temps (GetField/SetField loops).
+/// natural loops when header SP-in is Known. Also sinks repeated table-indexed
+/// `STRING` field-key literals into preheader temps (GetField/SetField loops).
 pub fn licm(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
         return;
@@ -38,7 +38,7 @@ fn licm_stack_producers(ops: &mut Vec<IlOp>) {
         let mut hoist: Vec<(usize, IlOp)> = Vec::new();
         for i in lp.body_start()..lp.latch {
             match &ops[i] {
-                IlOp::Const { .. } | IlOp::ConstPool { .. } => {
+                IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } => {
                     hoist.push((i, ops[i].clone()));
                 }
                 IlOp::Load { slot, .. } if !stored.contains(slot) => {
@@ -74,6 +74,7 @@ fn licm_stack_producers(ops: &mut Vec<IlOp>) {
             cand,
             IlOp::Const { .. }
                 | IlOp::ConstPool { .. }
+                | IlOp::String { .. }
                 | IlOp::Load { .. }
                 | IlOp::BinSlotImm { .. }
                 | IlOp::BinSlotSlot { .. }
@@ -148,9 +149,10 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
                 return false;
             }
             slot_for.insert(*string_idx, slot);
-            materialize.push(IlOp::byte(
-                Byte::new(Instruction::STRING).with_operand_u32(*string_idx),
-            ));
+            materialize.push(IlOp::String {
+                idx: *string_idx,
+                loc,
+            });
             materialize.push(IlOp::StorePop { slot, loc });
         }
 
@@ -196,6 +198,7 @@ fn find_string_runs(ops: &[IlOp], start: usize, end: usize) -> Vec<(usize, usize
 
 fn string_op_index(op: &IlOp) -> Option<u32> {
     match op {
+        IlOp::String { idx, .. } => Some(*idx),
         IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::STRING => {
             Some(byte.operand_u32())
         }
@@ -784,6 +787,103 @@ mod tests {
 
     #[test]
     fn hoists_repeated_string_keys_with_get_field() {
+        let str_x = |ops: &mut Vec<IlOp>| {
+            ops.push(IlOp::String {
+                idx: 1,
+                loc: loc(),
+            });
+        };
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+        ];
+        str_x(&mut ops);
+        ops.push(IlOp::GetField { loc: loc() });
+        ops.push(IlOp::Pop { loc: loc() });
+        ops.push(IlOp::Load {
+            slot: 0,
+            loc: loc(),
+        });
+        str_x(&mut ops);
+        ops.push(IlOp::GetField { loc: loc() });
+        ops.push(IlOp::Pop { loc: loc() });
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.push(IlOp::Halt { loc: loc() });
+
+        licm(&mut ops);
+
+        let string_ops = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::String { .. }))
+            .count();
+        assert_eq!(string_ops, 1, "STRING should materialize once in preheader");
+        let loads_of_temp = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { slot: 1, .. }))
+            .count();
+        assert!(
+            loads_of_temp >= 2,
+            "in-loop key uses should LOAD the hoisted temp"
+        );
+    }
+
+    #[test]
+    fn hoists_typed_string_stack_producer_out_of_loop() {
+        // Plain String;Pop loop (no GetField) — stack LICM should hoist.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::String {
+                idx: 9,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header]
+                .iter()
+                .any(|op| matches!(op, IlOp::String { idx: 9, .. })),
+            "invariant String should hoist before header"
+        );
+        assert!(
+            !ops[header + 1..]
+                .iter()
+                .take_while(|op| !matches!(op, IlOp::Jump { .. }))
+                .any(|op| matches!(op, IlOp::String { idx: 9, .. })),
+            "String should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn hoists_residual_byte_string_keys_with_get_field() {
+        // Residual IlOp::Byte STRING runs must still feed field-key LICM.
         use common::{Byte, Instruction};
         let str_x = |ops: &mut Vec<IlOp>| {
             ops.push(IlOp::byte(
@@ -823,9 +923,13 @@ mod tests {
 
         let string_ops = ops
             .iter()
-            .filter(
-                |op| matches!(op.as_encode_byte(), Some(b) if *b.bytecode() == Instruction::STRING),
-            )
+            .filter(|op| {
+                matches!(op, IlOp::String { idx: 1, .. })
+                    || matches!(
+                        op.as_encode_byte(),
+                        Some(b) if *b.bytecode() == Instruction::STRING && b.operand_u32() == 1
+                    )
+            })
             .count();
         assert_eq!(string_ops, 1, "STRING should materialize once in preheader");
         let loads_of_temp = ops

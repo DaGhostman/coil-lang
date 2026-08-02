@@ -67,6 +67,11 @@ pub enum IlOp {
         idx: u32,
         loc: DebugLoc,
     },
+    /// Table-indexed `STRING` (archive `strings[idx]`); pure stack push.
+    String {
+        idx: u32,
+        loc: DebugLoc,
+    },
     Dup {
         loc: DebugLoc,
     },
@@ -248,6 +253,10 @@ impl IlOp {
                     }
                 }
             }
+            Instruction::STRING => Self::String {
+                idx: byte.operand_u32(),
+                loc,
+            },
             Instruction::DUPLICATE => Self::Dup { loc },
             Instruction::POP => Self::Pop { loc },
             Instruction::Index => Self::Index { loc },
@@ -330,6 +339,7 @@ impl IlOp {
             }
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
+            IlOp::String { idx, .. } => Byte::new(Instruction::STRING).with_operand_u32(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Byte::new(Instruction::POP),
             IlOp::Index { .. } => Byte::new(Instruction::Index),
@@ -411,6 +421,7 @@ impl IlOp {
             | IlOp::StorePop { loc, .. }
             | IlOp::Const { loc, .. }
             | IlOp::ConstPool { loc, .. }
+            | IlOp::String { loc, .. }
             | IlOp::Dup { loc }
             | IlOp::Pop { loc }
             | IlOp::Index { loc }
@@ -447,6 +458,7 @@ impl IlOp {
             | IlOp::StorePop { loc: l, .. }
             | IlOp::Const { loc: l, .. }
             | IlOp::ConstPool { loc: l, .. }
+            | IlOp::String { loc: l, .. }
             | IlOp::Dup { loc: l }
             | IlOp::Pop { loc: l }
             | IlOp::Index { loc: l }
@@ -487,6 +499,7 @@ impl IlOp {
             IlOp::Load { .. } => Some(Instruction::LOAD),
             IlOp::StorePop { .. } => Some(Instruction::STORE),
             IlOp::Const { .. } | IlOp::ConstPool { .. } => Some(Instruction::CONST),
+            IlOp::String { .. } => Some(Instruction::STRING),
             IlOp::Dup { .. } => Some(Instruction::DUPLICATE),
             IlOp::Pop { .. } => Some(Instruction::POP),
             IlOp::Index { .. } => Some(Instruction::Index),
@@ -765,6 +778,13 @@ mod tests {
             IlOp::Print { .. }
         ));
         assert!(matches!(
+            IlOp::from_plain_byte(
+                Byte::new(Instruction::STRING).with_operand_u32(9),
+                DebugLoc::unknown(),
+            ),
+            IlOp::String { idx: 9, .. }
+        ));
+        assert!(matches!(
             IlOp::from_plain_byte(Byte::new(Instruction::GetField), DebugLoc::unknown()),
             IlOp::GetField { .. }
         ));
@@ -819,6 +839,10 @@ mod tests {
             },
             IlOp::Const {
                 imm: 42,
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::String {
+                idx: 5,
                 loc: DebugLoc::unknown(),
             },
             IlOp::Dup {

@@ -412,6 +412,7 @@ fn format_il_op(op: &IlOp) -> String {
         IlOp::StorePop { slot, .. } => format!("STORE slot={slot}"),
         IlOp::Const { imm, .. } => format!("CONST imm={imm}"),
         IlOp::ConstPool { idx, .. } => format!("CONST pool[{idx}]"),
+        IlOp::String { idx, .. } => format!("STRING table[{idx}]"),
         IlOp::Dup { .. } => "DUPLICATE".to_string(),
         IlOp::Pop { .. } => "POP".to_string(),
         IlOp::Index { .. } => "Index".to_string(),

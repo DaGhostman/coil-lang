@@ -156,6 +156,11 @@ impl CodeBuf {
         self.il.push_const_pool(idx);
     }
 
+    pub fn push_string(&mut self, idx: u32) {
+        self.invalidate_lowered();
+        self.il.push_string(idx);
+    }
+
     pub fn extend<I: IntoIterator<Item = Byte>>(&mut self, iter: I) {
         for b in iter {
             self.push(b);
