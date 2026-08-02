@@ -921,8 +921,36 @@ mod tests {
         (Arc::new(config), "localhost".into())
     }
 
+    fn io_transient(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
+        )
+    }
+
+    fn drain_app_data(conn: &mut ServerConnection, acc: &mut Vec<u8>) -> bool {
+        let mut got = false;
+        let mut tmp = [0u8; 4096];
+        loop {
+            match conn.reader().read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&tmp[..n]);
+                    got = true;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
     /// Echo server: read app data, echo it back, then close_notify.
-    /// Socket IO is time-bounded so aborted clients cannot hang the suite.
+    ///
+    /// Uses non-blocking sockets and retries transient IO. The previous
+    /// SO_RCVTIMEO + `Err(_) => return` handshake treated macOS `TimedOut`
+    /// mid-handshake as fatal, so the server quit before echoing and the
+    /// client saw `read_to_end == []` (CI flake).
     fn spawn_tls_echo_server() -> (u16, thread::JoinHandle<()>) {
         let (cfg, _name) = test_server_config();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -933,40 +961,68 @@ mod tests {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
-            let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-            let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = sock.set_nonblocking(true);
             let Ok(mut conn) = ServerConnection::new(cfg) else {
                 return;
             };
-            // Handshake (best-effort; client may abort mid-way).
-            while conn.is_handshaking() {
-                if conn.wants_write() && conn.write_tls(&mut sock).is_err() {
-                    return;
-                }
-                if conn.is_handshaking() {
-                    match conn.read_tls(&mut sock) {
-                        Ok(0) => return,
-                        Ok(_) => {
-                            if conn.process_new_packets().is_err() {
-                                return;
-                            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+            while conn.is_handshaking() && std::time::Instant::now() < deadline {
+                while conn.wants_write() {
+                    match conn.write_tls(&mut sock) {
+                        // rustls may return Ok(0) when the socket is not ready.
+                        Ok(0) => {
+                            thread::sleep(Duration::from_millis(1));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if io_transient(&e) => {
+                            thread::sleep(Duration::from_millis(1));
+                            break;
                         }
                         Err(_) => return,
                     }
                 }
-            }
-            while conn.wants_write() {
-                if conn.write_tls(&mut sock).is_err() {
-                    return;
+                if !conn.is_handshaking() {
+                    break;
+                }
+                match conn.read_tls(&mut sock) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        if conn.process_new_packets().is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if io_transient(&e) => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => return,
                 }
             }
+            if conn.is_handshaking() {
+                return;
+            }
+            while conn.wants_write() && std::time::Instant::now() < deadline {
+                match conn.write_tls(&mut sock) {
+                    Ok(0) => thread::sleep(Duration::from_millis(1)),
+                    Ok(_) => {}
+                    Err(e) if io_transient(&e) => thread::sleep(Duration::from_millis(1)),
+                    Err(_) => return,
+                }
+            }
+
             let mut acc = Vec::new();
-            let hard_deadline = std::time::Instant::now() + Duration::from_secs(2);
-            let mut last_data = std::time::Instant::now();
-            // Accumulate until peer goes idle after first byte (or EOF / hard deadline).
-            // A single-shot read is not enough for multi-record client writes.
-            while std::time::Instant::now() < hard_deadline {
-                if !acc.is_empty() && last_data.elapsed() > Duration::from_millis(50) {
+            // Plaintext may already be buffered from the finishing handshake records.
+            let mut last_data = if drain_app_data(&mut conn, &mut acc) {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            // Accumulate until peer goes idle after first byte (or EOF / deadline).
+            while std::time::Instant::now() < deadline {
+                if let Some(t) = last_data
+                    && t.elapsed() > Duration::from_millis(100)
+                {
                     break;
                 }
                 match conn.read_tls(&mut sock) {
@@ -975,23 +1031,16 @@ mod tests {
                         if conn.process_new_packets().is_err() {
                             return;
                         }
-                        let mut tmp = [0u8; 4096];
-                        loop {
-                            match conn.reader().read(&mut tmp) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    acc.extend_from_slice(&tmp[..n]);
-                                    last_data = std::time::Instant::now();
-                                }
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                                Err(_) => break,
-                            }
+                        if drain_app_data(&mut conn, &mut acc) {
+                            last_data = Some(std::time::Instant::now());
                         }
                     }
-                    Err(e)
-                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                    {
-                        thread::sleep(Duration::from_millis(5));
+                    Err(e) if io_transient(&e) => {
+                        if drain_app_data(&mut conn, &mut acc) {
+                            last_data = Some(std::time::Instant::now());
+                        } else {
+                            thread::sleep(Duration::from_millis(2));
+                        }
                     }
                     Err(_) => return,
                 }
@@ -1003,9 +1052,12 @@ mod tests {
                 return;
             }
             conn.send_close_notify();
-            while conn.wants_write() {
-                if conn.write_tls(&mut sock).is_err() {
-                    break;
+            while conn.wants_write() && std::time::Instant::now() < deadline {
+                match conn.write_tls(&mut sock) {
+                    Ok(0) => thread::sleep(Duration::from_millis(1)),
+                    Ok(_) => {}
+                    Err(e) if io_transient(&e) => thread::sleep(Duration::from_millis(1)),
+                    Err(_) => break,
                 }
             }
         });
