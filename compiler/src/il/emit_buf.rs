@@ -87,6 +87,10 @@ pub trait EmitBuf {
     fn push_const_pool(&mut self, idx: u32) {
         self.push_byte(Byte::new(Instruction::CONST).with_const_pool(idx));
     }
+
+    fn push_string(&mut self, idx: u32) {
+        self.push_byte(Byte::new(Instruction::STRING).with_operand_u32(idx));
+    }
 }
 
 impl EmitBuf for Vec<Byte> {
@@ -167,6 +171,10 @@ impl EmitBuf for CodeBuf {
 
     fn push_const_pool(&mut self, idx: u32) {
         CodeBuf::push_const_pool(self, idx);
+    }
+
+    fn push_string(&mut self, idx: u32) {
+        CodeBuf::push_string(self, idx);
     }
 }
 

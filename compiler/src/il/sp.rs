@@ -50,9 +50,11 @@ impl SpInfo {
 pub fn stack_delta(op: &IlOp) -> Option<i32> {
     match op {
         IlOp::Label(_) => Some(0),
-        IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Dup { .. } => {
-            Some(1)
-        }
+        IlOp::Load { .. }
+            | IlOp::Const { .. }
+            | IlOp::ConstPool { .. }
+            | IlOp::String { .. }
+            | IlOp::Dup { .. } => Some(1),
         IlOp::StorePop { .. } | IlOp::Pop { .. } | IlOp::Index { .. } => Some(-1),
         IlOp::MakeTuple { arity, .. } | IlOp::MakeArray { arity, .. } => Some(1 - *arity as i32),
         IlOp::MakeEnum { arity, .. } => Some(1 - *arity as i32),

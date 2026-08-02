@@ -254,6 +254,13 @@ impl IlBuilder {
         });
     }
 
+    pub fn push_string(&mut self, idx: u32) {
+        self.push_op(IlOp::String {
+            idx,
+            loc: DebugLoc::unknown(),
+        });
+    }
+
     pub fn extend_bytes<I: IntoIterator<Item = Byte>>(&mut self, bytes: I) {
         for b in bytes {
             self.push_byte(b);
