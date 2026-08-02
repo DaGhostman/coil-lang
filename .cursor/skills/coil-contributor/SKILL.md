@@ -11,7 +11,7 @@ description: >-
 
 coil is a Rust workspace: parse → HM typecheck → stack IL codegen → IL opts → lower → `.hyc` archive → VM.
 
-Read [AGENTS.md](AGENTS.md) for durable invariants and user preferences — this skill focuses on **where to change code** and **verification**.
+Read [AGENTS.md](AGENTS.md) for user preferences and global invariants — this skill covers **where to change code** and **verification**.
 
 ## Workspace map
 
@@ -50,12 +50,12 @@ Single compilation path: stack codegen in `compiler/src/lib.rs` — no register 
    - `promise!` ceiling in `machine/src/vm.rs`
    - `instruction_from_u8_covers_last_appended_variant` test
 2. **Virtual module natives** — use `HostInvoke`, not new opcodes for `io`/`thread`/etc.
-3. **Reject benchmark-shaped opcodes** unless pattern is universal (see AGENTS.md).
+3. **Reject benchmark-shaped opcodes** unless pattern is universal (see AGENTS.md user preferences).
 4. **New language features** — full HM integration + `docs/` updates + minimal runnable example.
 
 `STORE` vs deprecated `StorePop`: compiler emits `STORE` only. Match bindings skip store (value already in slot via `UNPACK`/`JUMP_IF_MATCH`).
 
-Stack IL: symbolic labels until `finalize_bytecode` → single `il::lower` after concat (not per-function lower). See AGENTS.md "Stack IL / lower" section.
+Stack IL: symbolic labels until `finalize_bytecode` → single `il::lower` after concat (not per-function lower). See [reference.md](reference.md) and `docs/internals/pipeline.md`.
 
 ## Verification checklist
 

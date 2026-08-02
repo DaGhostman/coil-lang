@@ -13,6 +13,13 @@
 | `parser/src/` | Pratt parser |
 | `machine/src/packed_la.rs` | LA ops via HostInvoke (no LA opcodes) |
 
+## Codegen / VM invariants
+
+- **`STORE`**: pops TOS into slot(s); `cursor = max(cursor, slot + 1)`. Match bindings skip store (`UNPACK` / `JUMP_IF_MATCH`). `StorePop` is deprecated alias — compiler never emits. Packed multi-slot `LOAD`/`STORE`: `[31:24]=n` (1..=3), three slot bytes; `n==0` → wide single slot in low 24 bits.
+- **Stack IL**: symbolic labels until `finalize_bytecode` → per-body opts + **single** `il::lower` after concat. Nested fused returns must `capture_nested_return`.
+- **Type aliases**: scoped; same-frame duplicates are errors; inner may shadow outer.
+- Packed LA (`dot`/`matmul`/`Matrix`) → `HostInvoke` in `machine/src/packed_la.rs` (no LA opcodes).
+
 ## Codegen notes
 
 - `BlockBuilder`: thin wrapper over `IlBuilder` labels; no absolute PC patching in emitters.
@@ -33,6 +40,7 @@
 - `codegen_var_types` side table still used for some Identifier paths.
 - Path completeness (`E0111`) for concrete non-unit returns on named fns.
 - Unreachable code `E0118`; defer in infinite loop `E0123`.
+- Unit/open-var fall-through may emit `CONST 0; RETURN` (Result-mode Ok-wraps unit only).
 
 ## ARCHIVE_VERSION bump triggers
 
@@ -41,7 +49,7 @@
 - Tag layout changes
 - Archive envelope field changes
 
-Current version: check `common/src/archive.rs` (documented in AGENTS.md).
+Current version: check `common/src/archive.rs`.
 
 ## Perf philosophy
 
@@ -51,13 +59,7 @@ Prefer over new opcodes / IL opts:
 - Hot-loop tuning in VM
 - `promise!` for release assertions
 
-Soft baseline: `./scripts/poop_baseline.sh` on `examples/fib_bench.hy`.
-
-## Sub-agent guidance
-
-For large tasks, scope sub-agents to disjoint files/modules with explicit boundaries. Avoid over-parallelizing conflicting edits.
-
-## Docs trees
+Soft baseline: `./scripts/poop_baseline.sh` on `examples/fib_bench.hy`. See AGENTS.md user preferences.
 
 | Tree | When to update |
 |------|----------------|
