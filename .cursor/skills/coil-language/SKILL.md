@@ -1,0 +1,137 @@
+---
+name: coil-language
+description: >-
+  Write and reason about coil programs (.hy): syntax, HM types, modules, virtual
+  builtins, coroutines, FFI, and tests. Use when authoring or editing coil source,
+  explaining coil syntax, debugging type errors, or when the user mentions .hy files,
+  coil.toml, or coil language features.
+---
+
+# coil language
+
+coil is a **statically typed** scripting language with Hindley–Milner inference. Sources are `.hy`; the CLI compiles to versioned `.hyc` archives and runs them on a custom stack VM.
+
+**Do not invent stdlib APIs** — check [docs/references/not-builtins.md](docs/references/not-builtins.md). Compiler builtins live in virtual modules, not user `.hy` files.
+
+## Quick workflow
+
+```bash
+cargo build --workspace
+cargo run -- examples/fib.hy          # compile (cached out.hyc) + run
+rm -f out.hyc                         # force recompile after edits
+cargo run -- test                     # discover **/*.hy under ./tests
+ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
+```
+
+| Goal | Command |
+|------|---------|
+| Run one file | `cargo run -- path/to/file.hy` |
+| Compile only | `cargo run -- compile file.hy -o out.hyc` |
+| Run archive | `cargo run -- run out.hyc` |
+| Project tests | `cargo run -- test [path] [--fail-fast]` |
+
+Delete `out.hyc` when switching examples or after source edits — stale bytecode is a common agent mistake.
+
+## File shape
+
+Every runnable program needs `fn main()` **unless** the file only has `test("…")` cases (harness injects virtual `main` for `coil test`; do not mix `main` and `test()` in one file).
+
+Implicit imports (no `use` needed): `prelude::*`, `prelude::ops::*`, `prelude::test::*`, `prelude::math::*`.
+
+Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`.
+
+```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    write_all(stdout(), to_bytes(format("%i", 42)));
+}
+```
+
+There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
+
+## Syntax essentials
+
+| Topic | Rule |
+|-------|------|
+| Functions | `fn name(T arg) -> R { … }`; `async fn` for coroutines |
+| Variables | `let x = e;` / `const x = e;`; destructuring `let (a,b) = …`, `let { x } = …` |
+| Control | `if`/`else`, `while`, `for x in iter`, `break`/`continue` |
+| Types | Primitives `int` `float` `string` `bool` `byte`; arrays `[T]` / `[T; N]`; tuples; dicts as anonymous records |
+| Enums | `enum E { A, B(T) }`; `match e { … }` with record/nested patterns |
+| Errors | Built-in `Option`/`Result`; `raise`, `?`, `??`, `?.` |
+| Classes | `class C { … }`, `impl C { … }`, `new C(…)` |
+| Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
+| FFI | `extern { … }` blocks or `use ffi::*` + `dload`/`declare`/`invoke` |
+| Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
+
+Named call-site args: positional prefix then `f(name: v)`. Rest: trailing `T... xs`. Spread: `f(...pack)`.
+
+Ranges `a..b` / `a..=b` are **lazy** `Range<T: Ord>` — no auto array materialize.
+
+Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
+
+## Virtual modules (explicit `use`)
+
+| Module | Typical import | Notes |
+|--------|----------------|-------|
+| `io` | `use io::*;` | `Stream`, `[byte]`, files, TCP/UDP; non-blocking L0 |
+| `string` | `use string::*;` | `format`, `to_bytes` / `from_bytes` |
+| `ffi` | `use ffi::*;` | Dynamic loading; tags in `ffi::types` |
+| `thread` | `use thread::*;` | `spawn`/`join`, channels, mutex |
+| `time` / `env` / `crypto` / `regex` | `use …::*;` | Cargo-feature gated (default on) |
+
+`byte` is 0..=255; integer literals coerce under `byte` / `[byte]` expectations.
+
+## Coroutines
+
+`async fn`, `yield`, `resume h`, `resume h with v`, `let x = yield e`, `yield from`, `done(h)`. Types: `coroutine<Y, S>`. Resume after done → default value.
+
+Tutorial: [docs/manual/tutorial/08-coroutines.md](docs/manual/tutorial/08-coroutines.md).
+
+## Tests
+
+```coil
+test("addition") {
+    assert(1 + 1 == 2)?;
+}
+```
+
+Or `#[test("desc")] fn … { … }`. Body is Result mode. `panic` aborts VM; `coil test` treats as failure.
+
+## Multi-file projects
+
+`coil.toml` at project root; entry file has empty namespace. See [docs/references/project-config.md](docs/references/project-config.md).
+
+## Learn by example
+
+| Topic | File |
+|-------|------|
+| Fibonacci smoke | `examples/fib.hy` |
+| Option/Result | `examples/option.hy`, `examples/result.hy` |
+| Modules | `examples/modules.hy` |
+| Coroutines | `examples/coro.hy` |
+| FFI | `examples/strlen.hy` |
+| Full catalog | [docs/manual/examples.md](docs/manual/examples.md) |
+
+Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) → chapters 01–11.
+
+## Common pitfalls
+
+1. **Stale `out.hyc`** — delete before re-run after edits.
+2. **`main` + `test()`** — do not combine in one file.
+3. **Assuming stdlib** — no `sort`, `sqrt`, HTTP in VM; use `io` TCP + userland or FFI.
+4. **Missing `use`** — `io`/`string` are not auto-imported.
+5. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
+6. **Type errors** — read diagnostic `E####`; index in [docs/references/error-codes.md](docs/references/error-codes.md).
+
+## Debugging programs
+
+For hangs, wrong values, panics, breakpoints: use the **coil-debug** skill (`coil debug`, `coil dissect`).
+
+## Additional resources
+
+- Syntax cheat sheet + patterns: [reference.md](reference.md)
+- API lookup: [docs/references/README.md](docs/references/README.md)
+- Internals (contributors): **coil-contributor** skill
