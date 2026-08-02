@@ -1,4 +1,6 @@
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn producer(Sender tx) {
     send(tx, "hello")?;
@@ -9,6 +11,6 @@ fn main() {
     let tx = pair[0];
     let rx = pair[1];
     let t = spawn(producer, tx)?;
-    print "%s", recv(rx)?;
+    write_all(stdout(), to_bytes(format("%s", recv(rx)?)));
     join(t)?;
 }

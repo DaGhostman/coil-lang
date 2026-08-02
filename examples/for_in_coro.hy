@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter() {
     yield 0;
     yield 1;
@@ -13,12 +15,12 @@ async fn early() {
 
 fn main() {
     for x in counter() {
-        print "%i", x;
+        write_all(stdout(), to_bytes(format("%i", x)));
     }
     for y in early() {
         if y == 20 {
             break;
         }
-        print "%i", y;
+        write_all(stdout(), to_bytes(format("%i", y)));
     }
 }

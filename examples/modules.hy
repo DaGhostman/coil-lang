@@ -12,8 +12,10 @@
 //   "45"     (69 in hex, from the inline print)
 
 use foo::sadge;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     sadge();
-    print "%x\n", 69;
+    write_all(stdout(), to_bytes(format("%x\n", 69)));
 }

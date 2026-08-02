@@ -6,6 +6,8 @@
 //   5  — p.x after set_x(5)
 //   8  — p.sum() after mutation
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -22,12 +24,12 @@ impl Point {
 }
 
 fn main() {
-    print "%i", (2 * 2 + 3);
+    write_all(stdout(), to_bytes(format("%i", (2 * 2 + 3))));
 
     let p = new Point(1, 3);
-    print "%i", p.sum();
+    write_all(stdout(), to_bytes(format("%i", p.sum())));
 
     p.set_x(5);
-    print "%i", p.x;
-    print "%i", p.sum();
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.sum())));
 }

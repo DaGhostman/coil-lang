@@ -5,6 +5,8 @@
 // flattened (Ordered methods, then Equal methods). A generic with only
 // `T: Ordered` can call `eq_val` via the implied Equal bound.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Equal<T> {
     fn eq_val(T a, T b) -> bool;
 }
@@ -34,7 +36,7 @@ fn cmp_lt<T: Ordered>(T a, T b) -> bool {
 }
 
 fn main() {
-    print "%z", cmp_eq(3, 3);
-    print "%z", cmp_lt(1, 2);
-    print "%z", cmp_eq(1, 2);
+    write_all(stdout(), to_bytes(format("%z", cmp_eq(3, 3))));
+    write_all(stdout(), to_bytes(format("%z", cmp_lt(1, 2))));
+    write_all(stdout(), to_bytes(format("%z", cmp_eq(1, 2))));
 }

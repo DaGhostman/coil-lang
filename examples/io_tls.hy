@@ -18,6 +18,7 @@
 // Smoke: client enable on a non-TCP stream → Err (InvalidInput).
 use io::*;
 use io::net::tls::client::*;
+use string::*;
 
 fn main() {
     let path = "/tmp/coil_tls_smoke.bin";
@@ -27,5 +28,5 @@ fn main() {
         Result::Err(_) => "tls-ok",
     };
     close(s)?;
-    print "%s", msg;
+    write_all(stdout(), to_bytes(format("%s", msg)));
 }

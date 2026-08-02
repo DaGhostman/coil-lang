@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -11,9 +13,9 @@ impl Point {
 
 fn main() {
     let xs = readonly [1, 2, 3];
-    print "%i", len(xs);
+    write_all(stdout(), to_bytes(format("%i", len(xs))));
     let p = readonly new Point(1, 2);
     p.shift();
-    print "%i", p.x;
-    print "%i", p.y;
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.y)));
 }

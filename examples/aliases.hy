@@ -10,6 +10,8 @@
 //   4
 //   7
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Point = (int, int);
 
 fn distance(Point p) -> int {
@@ -20,7 +22,7 @@ fn distance(Point p) -> int {
 
 fn main() {
     let p: Point = (3, 4);
-    print "%i", p[0];
-    print "%i", p[1];
-    print "%i", distance(p);
+    write_all(stdout(), to_bytes(format("%i", p[0])));
+    write_all(stdout(), to_bytes(format("%i", p[1])));
+    write_all(stdout(), to_bytes(format("%i", distance(p))));
 }

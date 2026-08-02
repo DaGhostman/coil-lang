@@ -2,16 +2,18 @@
 //
 // Irrefutable let destructuring: tuple and record patterns.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let (a, b) = (1, 2);
-    print "%i", a;
-    print "%i", b;
+    write_all(stdout(), to_bytes(format("%i", a)));
+    write_all(stdout(), to_bytes(format("%i", b)));
 
     let { x, y } = { x: 3, y: 4 };
-    print "%i", x;
-    print "%i", y;
+    write_all(stdout(), to_bytes(format("%i", x)));
+    write_all(stdout(), to_bytes(format("%i", y)));
     // Nested tuple inside a record field.
     let { pair } = { pair: (2, 0) };
     let (p, _) = pair;
-    print "%i", p;
+    write_all(stdout(), to_bytes(format("%i", p)));
 }

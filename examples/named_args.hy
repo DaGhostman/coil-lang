@@ -1,6 +1,8 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn greet(string name, int age) {
-    print "%s", name;
-    print "%i", age;
+    write_all(stdout(), to_bytes(format("%s", name)));
+    write_all(stdout(), to_bytes(format("%i", age)));
 }
 
 fn main() {

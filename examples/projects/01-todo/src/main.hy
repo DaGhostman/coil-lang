@@ -4,9 +4,11 @@
 //   board:3 done:1 | 1:write tests [Doing] | 2:ship demo [Todo] | 3:nap [Done] |
 
 use board::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn print_task(Task t) {
-    print "%i:%s [%s] | ", t.id, t.title, status_name(t.status);
+    write_all(stdout(), to_bytes(format("%i:%s [%s] | ", t.id, t.title, status_name(t.status))));
 }
 
 fn main() {
@@ -19,7 +21,7 @@ fn main() {
     advance_task(board, 3);
     advance_task(board, 3);
 
-    print "board:%i done:%i | ", board_len(board), count_done(board);
+    write_all(stdout(), to_bytes(format("board:%i done:%i | ", board_len(board), count_done(board))));
 
     let i = 1;
     while i <= board_len(board) {

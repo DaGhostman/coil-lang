@@ -1,9 +1,11 @@
 // Generic type aliases expand at typecheck time.
 // Expected output: `7`
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Pair<T> = (T, T);
 
 fn main() {
     let p: Pair<int> = (3, 4);
-    print "%i", p[0] + p[1];
+    write_all(stdout(), to_bytes(format("%i", p[0] + p[1])));
 }

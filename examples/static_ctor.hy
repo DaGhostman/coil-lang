@@ -9,6 +9,8 @@
 //   1  — Counter::fresh().id (count was bumped to 1)
 //   1  — Counter::count after one fresh()
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -38,9 +40,9 @@ impl Counter {
 
 fn main() {
     let p = Point::new(40, 2);
-    print "%i,", p.sum();
+    write_all(stdout(), to_bytes(format("%i,", p.sum())));
 
     let c = Counter::fresh();
-    print "%i,", c.id;
-    print "%i", Counter::count;
+    write_all(stdout(), to_bytes(format("%i,", c.id)));
+    write_all(stdout(), to_bytes(format("%i", Counter::count)));
 }

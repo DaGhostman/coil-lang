@@ -1,4 +1,6 @@
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn bump(Mutex m) {
     with_lock(m, fn (int n) => (n + 1, 0))?;
@@ -11,5 +13,5 @@ fn main() {
     join(t1)?;
     join(t2)?;
     let n = with_lock(m, fn (int x) => (x, x))?;
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }

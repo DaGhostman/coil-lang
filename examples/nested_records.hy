@@ -13,6 +13,8 @@
 // recursing at unbounded depth.
 //
 // Output: `99` (the value of `v`).
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Inner {
     I { v: int },
 }
@@ -29,5 +31,5 @@ fn get_v(Wrap w) -> int {
 
 fn main() {
     let w = Wrap::W { inner: Inner::I { v: 99 }, name: "x" };
-    print "%i", get_v(w);
+    write_all(stdout(), to_bytes(format("%i", get_v(w))));
 }

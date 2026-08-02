@@ -8,6 +8,8 @@
 // its own slot via the Interner.
 //
 // Expected output: 0, 25, 12, 2 (one line per shape).
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Shape {
     Empty,
     CircleR(int),
@@ -25,8 +27,8 @@ fn area(Shape s) -> int {
 }
 
 fn main() {
-    print "%i", area(Shape::Empty);
-    print "%i", area(Shape::CircleR(5));
-    print "%i", area(Shape::Rect { width: 3, height: 4 });
-    print "%i", area(Shape::Tri { a: 1, b: 2, c: 3 });
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Empty))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::CircleR(5)))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Rect { width: 3, height: 4 }))));
+    write_all(stdout(), to_bytes(format("%i", area(Shape::Tri { a: 1, b: 2, c: 3 }))));
 }

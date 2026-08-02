@@ -6,6 +6,8 @@
 // - Calling `lt_val` binds `c` to Ordered.
 // - Calling `eq_val` then uses Ordered's Equal superclass slot.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Equal<T> {
     fn eq_val(T a, T b) -> bool;
 }
@@ -37,5 +39,5 @@ fn choose<c: * -> Constraint, T: c>(T a, T b) -> int {
 }
 
 fn main() {
-    print "%i", choose(7, 7);
+    write_all(stdout(), to_bytes(format("%i", choose(7, 7))));
 }

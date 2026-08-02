@@ -1,4 +1,6 @@
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
     while true {
@@ -6,7 +8,7 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
         if job == "stop" {
             break;
         }
-        print "%s,", job;
+        write_all(stdout(), to_bytes(format("%s,", job)));
     }
     return 0;
 }

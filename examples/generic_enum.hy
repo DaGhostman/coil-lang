@@ -1,4 +1,6 @@
 // User generic enum — same construct/match machinery as builtin Option.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Box<T> {
     Empty,
     Full(T),
@@ -12,5 +14,5 @@ fn unwrap(Box<int> b) -> int {
 }
 
 fn main() {
-    print "%i", unwrap(Box::Full(7));
+    write_all(stdout(), to_bytes(format("%i", unwrap(Box::Full(7)))));
 }

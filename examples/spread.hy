@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn pair_sum(int a, int b) -> int {
     return a + b;
 }
@@ -7,6 +9,6 @@ fn triple_sum(int a, int b, int c) -> int {
 }
 
 fn main() {
-    print "%i", pair_sum(...(1, 2));
-    print "%i", triple_sum(...[10, 20, 30]);
+    write_all(stdout(), to_bytes(format("%i", pair_sum(...(1, 2)))));
+    write_all(stdout(), to_bytes(format("%i", triple_sum(...[10, 20, 30]))));
 }

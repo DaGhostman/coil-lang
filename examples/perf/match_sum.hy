@@ -1,5 +1,7 @@
 // CPU: enum construction + match dispatch in a loop.
 // Variant names must not collide with builtin Option::None / Option::Some.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Opt {
     Empty,
     Value(int),
@@ -19,5 +21,5 @@ fn main() {
         acc = acc + payload(Opt::Value((i % 7) + 1));
         i = i + 1;
     }
-    print "%i", acc;
+    write_all(stdout(), to_bytes(format("%i", acc)));
 }

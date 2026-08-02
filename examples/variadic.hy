@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sum(int... xs) -> int {
     let n = len(xs);
     let total = 0;
@@ -21,7 +23,7 @@ fn greet(string name, string... extras) -> string {
 }
 
 fn main() {
-    print "%i", sum(1, 2, 3);
-    print "%i", sum();
-    print "%s", greet(name: "Hi", "!", "?");
+    write_all(stdout(), to_bytes(format("%i", sum(1, 2, 3))));
+    write_all(stdout(), to_bytes(format("%i", sum())));
+    write_all(stdout(), to_bytes(format("%s", greet(name: "Hi", "!", "?"))));
 }

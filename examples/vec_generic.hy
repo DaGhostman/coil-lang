@@ -3,6 +3,8 @@
 // monomorphizes to zip when called with ground tuples.
 // Expected output: 24,55
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn scale<T: Num>((T, T) v, T s) -> (T, T) {
     return v * s;
 }
@@ -13,7 +15,7 @@ fn add<T: Num>(T a, T b) -> T {
 
 fn main() {
     let s = scale((1, 2), 2);
-    print "%i%i,", s[0], s[1];
+    write_all(stdout(), to_bytes(format("%i%i,", s[0], s[1])));
     let t = add((2, 3), (3, 2));
-    print "%i%i", t[0], t[1];
+    write_all(stdout(), to_bytes(format("%i%i", t[0], t[1])));
 }

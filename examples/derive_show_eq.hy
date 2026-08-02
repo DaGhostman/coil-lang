@@ -2,6 +2,8 @@
 //
 // Output: Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 #[derive(Show, Eq, Ord)]
 enum Color {
     Red,
@@ -20,18 +22,18 @@ class Cell {
 }
 
 fn main() {
-    print "%v,", Color::Red;
-    print "%z,", Color::Red == Color::Red;
-    print "%z,", Color::Red == Color::Blue;
-    print "%z,", Color::Red < Color::Blue;
+    write_all(stdout(), to_bytes(format("%v,", Color::Red)));
+    write_all(stdout(), to_bytes(format("%z,", Color::Red == Color::Red)));
+    write_all(stdout(), to_bytes(format("%z,", Color::Red == Color::Blue)));
+    write_all(stdout(), to_bytes(format("%z,", Color::Red < Color::Blue)));
 
     let p = Point::Point { x: 5, y: 12 };
-    print "%v,", p;
-    print "%z,", p == Point::Point { x: 5, y: 12 };
-    print "%z,", p == Point::Origin;
+    write_all(stdout(), to_bytes(format("%v,", p)));
+    write_all(stdout(), to_bytes(format("%z,", p == Point::Point { x: 5, y: 12 })));
+    write_all(stdout(), to_bytes(format("%z,", p == Point::Origin)));
 
     let c = new Cell(42);
-    print "%v,", c;
-    print "%z,", c == new Cell(42);
-    print "%z", c == new Cell(7);
+    write_all(stdout(), to_bytes(format("%v,", c)));
+    write_all(stdout(), to_bytes(format("%z,", c == new Cell(42))));
+    write_all(stdout(), to_bytes(format("%z", c == new Cell(7))));
 }

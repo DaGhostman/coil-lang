@@ -1,5 +1,7 @@
 // Expected: compile failure — tuple index out of bounds.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let t = (1, 2);
-    print "%i", t[5];
+    write_all(stdout(), to_bytes(format("%i", t[5])));
 }

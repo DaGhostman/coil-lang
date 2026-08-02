@@ -6,6 +6,8 @@
 // Open projection `C::Elem` under `C: Collect` is pinned to `int` when
 // `take_head` is applied at a ground `Option<int>` call site.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
@@ -26,5 +28,5 @@ fn take_head<C: Collect>(C xs) -> C::Elem {
 }
 
 fn main() {
-    print "%i", take_head(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", take_head(Option::Some(42)))));
 }

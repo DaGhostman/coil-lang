@@ -1,11 +1,13 @@
 // ?? coalesce on Option and Result (Result Err is swallowed).
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = Option::None ?? "bar";
-    print "%s,", a;
+    write_all(stdout(), to_bytes(format("%s,", a)));
     let b = Option::Some("hi") ?? "bar";
-    print "%s,", b;
+    write_all(stdout(), to_bytes(format("%s,", b)));
     let c = Result::Err("boom") ?? 7;
-    print "%i,", c;
+    write_all(stdout(), to_bytes(format("%i,", c)));
     let d = Result::Ok(9) ?? 7;
-    print "%i", d;
+    write_all(stdout(), to_bytes(format("%i", d)));
 }

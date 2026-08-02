@@ -1,4 +1,6 @@
 // Built-in Option — unwrap via match.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -7,5 +9,5 @@ fn unwrap(Option o) -> int {
 }
 
 fn main() {
-    print "%i", unwrap(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", unwrap(Option::Some(42)))));
 }

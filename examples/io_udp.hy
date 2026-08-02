@@ -2,6 +2,7 @@
 // Server binds ephemeral port; client send_to; server recv_from_wait.
 use io::*;
 use io::net::udp::*;
+use string::*;
 
 fn echo_once() {
     let server = bind("127.0.0.1", 0)?;
@@ -13,12 +14,12 @@ fn echo_once() {
     let t = recv_from_wait(server, buf)?;
     close(server)?;
     close(client)?;
-    return format "%i", t[0];
+    return format("%i", t[0]);
 }
 
 fn main() {
-    print "%s", match echo_once() {
+    write_all(stdout(), to_bytes(format("%s", match echo_once() {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
-    };
+    })));
 }
