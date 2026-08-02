@@ -5746,3 +5746,93 @@ test("add") {
     let output = run_harness_src(src);
     assert_eq!(output, "GET/hi");
 }
+
+/// Nested `+` emits consecutive `"%s%s"` STRING ops. Dup-CSE of those ops
+/// broke http `request_build` / multi-piece header lines.
+#[test]
+fn nested_string_concat_chain_prints_full_content() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::to_bytes;
+
+fn main() {
+    let method = "GET";
+    let path = "/hi";
+    let host = "example.com";
+    let line = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n";
+    write_all(stdout(), to_bytes(line));
+}
+"#,
+    );
+    assert_eq!(output, "GET /hi HTTP/1.1\r\nHost: example.com\r\n");
+}
+
+/// Same nested-concat shape under loop `+=` (format_extra_headers_str style).
+#[test]
+fn string_plus_equal_loop_builds_header_block() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::to_bytes;
+
+fn main() {
+    let names = ["X-Trace", "Accept"];
+    let values = ["abc", "text/plain"];
+    let acc = names[0] + ": " + values[0] + "\r\n";
+    let i = 1;
+    while i < 2 {
+        acc = acc + names[i] + ": " + values[i] + "\r\n";
+        i = i + 1;
+    }
+    write_all(stdout(), to_bytes(acc));
+}
+"#,
+    );
+    assert_eq!(output, "X-Trace: abc\r\nAccept: text/plain\r\n");
+}
+
+/// Bytecode shape: chained concat must keep multiple STRING `"%s%s"` hits
+/// (not collapse them via Dup-CSE).
+#[test]
+fn nested_string_concat_keeps_multiple_pct_s_string_ops() {
+    let src = r#"
+use io::{stdout, write_all};
+use string::to_bytes;
+
+fn main() {
+    let a = "a";
+    let b = "b";
+    let c = "c";
+    write_all(stdout(), to_bytes(a + b + c));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    let pct_idx = pipeline
+        .strings()
+        .iter()
+        .position(|s| s == "%s%s")
+        .expect("concat should intern %s%s") as u32;
+    let pct_string_ops = bytecode
+        .iter()
+        .filter(|b| {
+            matches!(b.bytecode(), common::Instruction::STRING) && b.operand_u32() == pct_idx
+        })
+        .count();
+    assert!(
+        pct_string_ops >= 2,
+        "a + b + c should emit ≥2 STRING \"%s%s\" (got {pct_string_ops}); Dup-CSE would under-count"
+    );
+    // No STRING \"%s%s\" immediately rewritten to DUPLICATE in the final stream.
+    let string_then_dup = bytecode.windows(2).any(|w| {
+        matches!(w[0].bytecode(), common::Instruction::STRING)
+            && w[0].operand_u32() == pct_idx
+            && matches!(w[1].bytecode(), common::Instruction::DUPLICATE)
+    });
+    assert!(
+        !string_then_dup,
+        "STRING \"%s%s\" must not be followed by DUPLICATE (within-block Dup-CSE)"
+    );
+    assert_eq!(run_example_src(src), "abc");
+}

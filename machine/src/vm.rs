@@ -709,6 +709,26 @@ impl<const S: usize> Machine<S> {
             child.mark(gray);
         }
     }
+
+    /// Intern `data`, push the GC pointer, then maybe collect.
+    ///
+    /// The intern table is a cache, not a GC root — unmarked interned strings
+    /// are swept. The new object must be on the operand stack before
+    /// [`Self::gc_collect`] so it survives the cycle.
+    fn push_interned_string(&mut self, data: String) {
+        let gc_string = self.heap.intern(data);
+        self.stack
+            .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+        self.alloc_counter += 1;
+        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
+            Self::gc_collect(
+                &mut self.heap,
+                &self.stack,
+                &self.resume_stack,
+                &mut self.alloc_counter,
+            );
+        }
+    }
 }
 
 impl<const S: usize> Machine<S> {
@@ -1622,20 +1642,7 @@ impl<const S: usize> Machine<S> {
                             }
                         }
 
-                        let gc_string = self.heap.intern(message);
-
-                        self.alloc_counter += 1;
-                        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                            Self::gc_collect(
-                                &mut self.heap,
-                                &self.stack,
-                                &self.resume_stack,
-                                &mut self.alloc_counter,
-                            );
-                        }
-
-                        self.stack
-                            .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+                        self.push_interned_string(message);
                     }
                 }
                 Instruction::STRINGIFY => {
@@ -1644,18 +1651,7 @@ impl<const S: usize> Machine<S> {
                     // raw immediate (treated as int).
                     let v = self.stack.pop();
                     let text = Self::stringify_value(&self.heap, v);
-                    let gc_string = self.heap.intern(text);
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
-                    self.stack
-                        .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+                    self.push_interned_string(text);
                 }
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
@@ -2329,20 +2325,7 @@ impl<const S: usize> Machine<S> {
                     let idx = opcode.operand_u32() as usize;
                     promise!(idx < self.program_strings.len());
                     let value = unsafe { self.program_strings.get_unchecked(idx) }.clone();
-                    let gc_string = self.heap.intern(value);
-
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
-
-                    self.stack
-                        .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+                    self.push_interned_string(value);
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
@@ -3327,18 +3310,9 @@ impl<const S: usize> Machine<S> {
                         {
                             let sa = Self::object_string_value(&self.heap, &a_inner);
                             let sb = Self::object_string_value(&self.heap, &b_inner);
-                            let concat = sa + &sb;
-                            let gc_string = self.heap.intern(concat);
-                            self.alloc_counter += 1;
-                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                                Self::gc_collect(
-                                    &mut self.heap,
-                                    &self.stack,
-                                    &self.resume_stack,
-                                    &mut self.alloc_counter,
-                                );
-                            }
-                            Value::from(gc_string.as_ptr() as *mut u8 as u64)
+                            // Root before any GC (same as FORMAT/STRING).
+                            self.push_interned_string(sa + &sb);
+                            continue;
                         }
                         _ => {
                             let ai = a_inner.as_int();
@@ -4187,6 +4161,141 @@ mod tests {
         let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hello");
+    }
+
+    /// Regression: `STRING` / `FORMAT` used to `intern` then maybe
+    /// `gc_collect` *before* pushing. The intern table is not a GC
+    /// root, so the fresh object could be swept and the pushed
+    /// pointer dangling — exposed by heavy `"%s%s"` concat (HTTP
+    /// showcase / string-table era).
+    #[test]
+    fn string_literal_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let strings: Vec<String> = (0..n).map(|i| format!("lit-{i}")).collect();
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 2);
+        for i in 0..n {
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(i as u32));
+            // Drop earlier literals so only the newest is live — maximizes
+            // chance the just-interned object is unmarked during GC.
+            if i + 1 < n {
+                bytecode.push(Byte::new(Instruction::POP));
+            }
+        }
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, format!("lit-{}", n - 1));
+    }
+
+    #[test]
+    fn format_concat_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        // FORMAT "%s%s" past the GC interval with unique RHS pieces.
+        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let mut strings = vec!["%s%s".to_string(), "x".to_string()];
+        for i in 0..n {
+            strings.push(format!("p{i}"));
+        }
+        let mut bytecode: Vec<Byte> = Vec::new();
+        // seed acc in slot 0
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        for i in 0..n {
+            // format("%s%s", acc, p_i) — FORMAT pops args then format string.
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+            bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32((2 + i) as u32));
+            bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
+            bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        }
+        bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        let mut expect = String::from("x");
+        for i in 0..n {
+            expect.push_str(&format!("p{i}"));
+        }
+        assert_eq!(s, expect);
+    }
+
+    /// DynAdd string concat also goes through `push_interned_string` (and
+    /// `continue`s the dispatch loop). Root-after-intern is required here too.
+    #[test]
+    fn dyn_add_strings_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let mut strings = vec!["x".to_string()];
+        for i in 0..n {
+            strings.push(format!("p{i}"));
+        }
+        let mut bytecode: Vec<Byte> = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        for i in 0..n {
+            bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32((1 + i) as u32));
+            bytecode.push(Byte::new(Instruction::DynAdd));
+            bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        }
+        bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        let mut expect = String::from("x");
+        for i in 0..n {
+            expect.push_str(&format!("p{i}"));
+        }
+        assert_eq!(s, expect);
+    }
+
+    /// STRINGIFY shares `push_interned_string` — GC at intern must not sweep
+    /// the fresh display string before it is stacked.
+    #[test]
+    fn stringify_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 3 + 2);
+        for i in 0..n {
+            bytecode.push(const_int(i as i64));
+            bytecode.push(Byte::new(Instruction::STRINGIFY));
+            if i + 1 < n {
+                bytecode.push(Byte::new(Instruction::POP));
+            }
+        }
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, format!("{}", n - 1));
     }
 
     #[test]
