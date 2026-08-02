@@ -1083,7 +1083,7 @@ impl Compiler {
 
     fn push_string_literal(&mut self, bytecode: &mut impl EmitBuf, value: impl AsRef<str>) {
         let idx = self.intern_string(value);
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+        bytecode.push_string(idx);
     }
 
     fn const_env(&self) -> &HashMap<String, ConstValue> {
@@ -1670,6 +1670,7 @@ impl Compiler {
                 IlOp::Load { .. }
                     | IlOp::Const { .. }
                     | IlOp::ConstPool { .. }
+                    | IlOp::String { .. }
                     | IlOp::Dup { .. }
                     | IlOp::Bin { .. }
                     | IlOp::BinSlotImm { .. }
@@ -1680,6 +1681,7 @@ impl Compiler {
                     *b.bytecode(),
                     Instruction::LOAD
                         | Instruction::CONST
+                        | Instruction::STRING
                         | Instruction::DUPLICATE
                         | Instruction::ADD
                         | Instruction::SUB
@@ -2309,6 +2311,13 @@ impl Compiler {
             }
             IlOp::ConstPool { idx, loc } => {
                 self.bytecode.push_op(IlOp::ConstPool {
+                    idx: *idx,
+                    loc: *loc,
+                });
+                true
+            }
+            IlOp::String { idx, loc } => {
+                self.bytecode.push_op(IlOp::String {
                     idx: *idx,
                     loc: *loc,
                 });
@@ -4301,8 +4310,7 @@ impl Compiler {
     fn emit_string_literal(&mut self, s: &str) {
         let escaped = unescape_coil_string(s);
         let idx = self.intern_string(&escaped);
-        self.bytecode
-            .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+        self.bytecode.push_string(idx);
     }
 
     /// Rewrite `%v` → `%s` in a format literal (leave `%%` alone).
@@ -4808,8 +4816,7 @@ impl Compiler {
         for (name, field_ty) in fields {
             self.bytecode.push_load(record_slot);
             let idx = self.intern_string(name);
-            self.bytecode
-                .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+            self.bytecode.push_string(idx);
             self.bytecode.push_get_field();
             self.emit_show_for_stack_value(field_ty);
             let slot = self.alloc_temp_slot();
@@ -6388,15 +6395,13 @@ impl Compiler {
 
                 self.bytecode.push_load(range_slot);
                 let start_idx = self.intern_string("start");
-                self.bytecode
-                    .push(Byte::new(Instruction::STRING).with_operand_u32(start_idx));
+                self.bytecode.push_string(start_idx);
                 self.bytecode.push_get_field();
                 self.bytecode.push_store_pop(cur_slot);
 
                 self.bytecode.push_load(range_slot);
                 let end_idx = self.intern_string("end");
-                self.bytecode
-                    .push(Byte::new(Instruction::STRING).with_operand_u32(end_idx));
+                self.bytecode.push_string(end_idx);
                 self.bytecode.push_get_field();
                 self.bytecode.push_store_pop(end_slot);
             }
@@ -6763,8 +6768,7 @@ impl Compiler {
         for key in keys {
             let slot = self.alloc_temp_slot();
             let idx = self.intern_string(&key);
-            self.bytecode
-                .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+            self.bytecode.push_string(idx);
             self.bytecode.push_store_pop(slot);
             self.field_key_slots.insert(key, slot);
         }
@@ -11746,8 +11750,7 @@ impl Compiler {
                         self.bytecode.push_load(slot);
                     } else {
                         let idx = self.intern_string(field);
-                        self.bytecode
-                            .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+                        self.bytecode.push_string(idx);
                     }
                     self.bytecode.push_get_field();
                 } else {
