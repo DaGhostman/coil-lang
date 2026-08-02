@@ -820,6 +820,36 @@ mod tests {
     }
 
     #[test]
+    fn join_cse_drops_redundant_string_on_jmpf_diamond() {
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::String { idx: 7, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::String { idx: 7, loc: loc() },
+            IlOp::Label(Label(2)),
+            IlOp::String { idx: 7, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        let strings = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::String { idx: 7, .. }))
+            .count();
+        assert_eq!(strings, 2, "pred strings kept; join copy dropped when SP Known");
+        assert!(ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
+    }
+
+    #[test]
     fn join_cse_keeps_disagreeing_const() {
         let mut ops = vec![
             IlOp::Const { imm: 0, loc: loc() },
