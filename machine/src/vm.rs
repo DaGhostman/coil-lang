@@ -1622,9 +1622,7 @@ impl<const S: usize> Machine<S> {
                             }
                         }
 
-                        let (obj, _) = self
-                            .heap
-                            .alloc(ObjString::from(message.as_str()), Object::String);
+                        let gc_string = self.heap.intern(message);
 
                         self.alloc_counter += 1;
                         if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
@@ -1636,7 +1634,8 @@ impl<const S: usize> Machine<S> {
                             );
                         }
 
-                        self.stack.push(Value::from(obj.addr()));
+                        self.stack
+                            .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                     }
                 }
                 Instruction::STRINGIFY => {
@@ -1645,9 +1644,7 @@ impl<const S: usize> Machine<S> {
                     // raw immediate (treated as int).
                     let v = self.stack.pop();
                     let text = Self::stringify_value(&self.heap, v);
-                    let (obj, _) = self
-                        .heap
-                        .alloc(ObjString::from(text.as_str()), Object::String);
+                    let gc_string = self.heap.intern(text);
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -1657,7 +1654,8 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(obj.addr()));
+                    self.stack
+                        .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                 }
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
@@ -3330,9 +3328,7 @@ impl<const S: usize> Machine<S> {
                             let sa = Self::object_string_value(&self.heap, &a_inner);
                             let sb = Self::object_string_value(&self.heap, &b_inner);
                             let concat = sa + &sb;
-                            let (obj, _) = self
-                                .heap
-                                .alloc(ObjString::from(concat.as_str()), Object::String);
+                            let gc_string = self.heap.intern(concat);
                             self.alloc_counter += 1;
                             if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                                 Self::gc_collect(
@@ -3342,7 +3338,7 @@ impl<const S: usize> Machine<S> {
                                     &mut self.alloc_counter,
                                 );
                             }
-                            Value::from(obj.addr())
+                            Value::from(gc_string.as_ptr() as *mut u8 as u64)
                         }
                         _ => {
                             let ai = a_inner.as_int();
