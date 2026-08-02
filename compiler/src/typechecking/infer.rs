@@ -4456,8 +4456,32 @@ impl Checker {
                     uncaptured.remove(n);
                 }
 
+                // File-level virtual-module imports are global names, not
+                // closure captures. Rebind their callable schemes after
+                // isolating the value environment, just as `defer` does.
+                let virtual_callables: Vec<(String, BuiltinExport)> = self
+                    .scope_bindings
+                    .iter()
+                    .filter(|(_, e)| {
+                        matches!(
+                            e,
+                            BuiltinExport::FfiFn { .. }
+                                | BuiltinExport::IoFn { .. }
+                                | BuiltinExport::StringFn { .. }
+                                | BuiltinExport::ThreadFn { .. }
+                                | BuiltinExport::HostFn { .. }
+                        )
+                    })
+                    .map(|(k, e)| (k.clone(), e.clone()))
+                    .collect();
+
                 let saved_frames = self.env.take_and_isolate();
                 let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+                for (local, export) in virtual_callables {
+                    if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                        self.env.insert_top(local, scheme);
+                    }
+                }
                 for (n, ty) in &cap_bindings {
                     self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
