@@ -10853,14 +10853,6 @@ impl Compiler {
                     let mut bb = BlockBuilder::new();
                     let end_label = bb.fresh_label(self.bytecode.il_mut());
 
-                    // First payload slot after existing locals. Function
-                    // args occupy 0..n-1; trailing `__dictN` slots (for
-                    // constrained generics / HKT methods) push this above
-                    // 1. JumpIfMatch/Unpack push payloads onto the stack
-                    // above those locals, so bindings must start here —
-                    // not at the historical hardcoded slot 1.
-                    let payload_base = self.context.variables.len() as u32;
-
                     let tag_groups = group_arms_by_outer_tag(arms, &self.checker);
                     // Forward pass emits JUMP_IF_MATCH for every non-last
                     // group, and also for the last group when any group is
@@ -10880,8 +10872,19 @@ impl Compiler {
                         }
                     }
 
+                    // Compile scrutinee before choosing payload_base —
+                    // HostInvoke arg staging (`alloc_temp_slot`) grows
+                    // `variables`, and bindings must start *after* those
+                    // temps or Unpack/JumpIfMatch collide with them
+                    // (e.g. `match try_recv(rx)` after print→write_all).
                     let scrutinee_bc = self.do_compile(scrutinee);
                     self.bytecode.extend(scrutinee_bc);
+
+                    // First payload slot after locals + scrutinee temps.
+                    // JumpIfMatch/Unpack push payloads onto the stack
+                    // above those locals, so bindings must start here —
+                    // not at the historical hardcoded slot 1.
+                    let payload_base = self.context.variables.len() as u32;
 
                     // Forward pass: outer-tag dispatch + last-arm scrutinee consumer.
                     for (g_idx, group) in tag_groups.iter().enumerate() {

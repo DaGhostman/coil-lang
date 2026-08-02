@@ -24,7 +24,6 @@ fn main() {
     show_it("hi");
     show_it(1.5);
     show_it(true);
-    write_all(stdout(), to_bytes(format("%v", Point::Point { x: 3, y: 4 })));
-    let s = format("%v", 99);
-    write_all(stdout(), to_bytes(format("%s", s)));
+    show_it(Point::Point { x: 3, y: 4 });
+    show_it(99);
 }

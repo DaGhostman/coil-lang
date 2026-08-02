@@ -973,6 +973,7 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared.clone());
     pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
+    pipeline.wire_host_natives(&mut machine);
     machine.run_raw(
         &bytecode,
         &constants,
@@ -1003,6 +1004,7 @@ fn fizbuz_runs_to_completion() {
     let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
+    pipeline.wire_host_natives(&mut machine);
     machine.run_raw(
         &bytecode,
         &constants,
@@ -1217,6 +1219,7 @@ use string::{format, to_bytes};
     let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared.clone());
+    pipeline.wire_host_natives(&mut machine);
     machine.run_raw(
         &bytecode,
         &constants,

@@ -3216,7 +3216,9 @@ impl<const S: usize> Machine<S> {
                             Value::default()
                         }
                     } else {
-                        Value::default()
+                        // Already unboxed (e.g. raw enum passed to a Show
+                        // thunk that still emits UnboxValue). Pass through.
+                        v
                     };
                     self.stack.push(result);
                 }
