@@ -23,9 +23,16 @@ use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     /// Legacy: compile entry → out.hyc (cached) → run.
-    BuildAndRun { filename: String },
-    Compile { filename: String, output: String },
-    Run { archive: String },
+    BuildAndRun {
+        filename: String,
+    },
+    Compile {
+        filename: String,
+        output: String,
+    },
+    Run {
+        archive: String,
+    },
     Test {
         path: Option<String>,
         fail_fast: bool,
@@ -183,7 +190,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, -o/--output, or a command/file)");
+                return Err(
+                    "unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, -o/--output, or a command/file)",
+                );
             }
             _ => positionals.push(arg.clone()),
         }
@@ -202,7 +211,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--fail-fast is only valid with `test`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -223,7 +234,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--include-tests is only valid with `compile` or the default run mode");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -244,7 +257,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--include-tests is only valid with `compile` or the default run mode");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -271,7 +286,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--fail-fast is only valid with `test`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -346,7 +363,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--include-tests is not valid with `debug`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -377,7 +396,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--include-tests is not valid with `dissect`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
@@ -403,7 +424,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--fail-fast is only valid with `test`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -424,7 +447,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--fail-fast is only valid with `test`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -444,7 +469,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 return Err("--fail-fast is only valid with `test`");
             }
             if check_native || strip_debug || runner.is_some() {
-                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
             }
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
@@ -474,7 +501,11 @@ fn writer_for(format: ReportFormat) -> Box<dyn Write + Send> {
     }
 }
 
-pub(crate) fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: impl Into<String>) -> ! {
+pub(crate) fn fail_and_exit(
+    pipeline: &mut Pipeline,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> ! {
     pipeline.emit_spanless_error(code, message);
     let _ = pipeline.finish_reporting();
     exit(1);
@@ -522,6 +553,7 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
         version: ARCHIVE_VERSION,
         static_slot_count: pipeline.static_slot_count(),
         constants,
+        strings: pipeline.strings().to_vec(),
         bytecode,
         source_files: debug.source_files,
         debug_locs: debug.debug_locs,
@@ -593,11 +625,7 @@ fn same_source_path(path: &str, other: &str) -> bool {
     if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
         return ca == cb;
     }
-    let norm = |s: &str| {
-        s.replace('\\', "/")
-            .trim_start_matches("./")
-            .to_string()
-    };
+    let norm = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
     let a_s = norm(path);
     let b_s = norm(other);
     if a_s == b_s {
@@ -669,7 +697,9 @@ fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
     }
 }
 
-fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), LoadErr> {
+fn try_load_archive(
+    path: &str,
+) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
     let mut f = std::fs::File::open(path).map_err(|_| LoadErr::Missing)?;
     let mut buffer = Vec::with_capacity(1024);
     f.read_to_end(&mut buffer).map_err(|_| LoadErr::Corrupt)?;
@@ -688,6 +718,7 @@ pub(crate) fn execute_archive(
     pipeline: &Pipeline,
     bytecode: &[Byte],
     constants: &[u64],
+    strings: &[String],
     static_slots: u32,
     debug: ProgramDebug,
     entry: Option<&Path>,
@@ -695,9 +726,9 @@ pub(crate) fn execute_archive(
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
-    pipeline.wire_thread_program(&mut machine, bytecode, constants);
+    pipeline.wire_thread_program(&mut machine, bytecode, constants, strings);
     machine.set_program_debug(debug);
-    machine.run_raw(bytecode, constants, static_slots);
+    machine.run_raw(bytecode, constants, strings, static_slots);
     machine.panicked()
 }
 
@@ -715,7 +746,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
             );
             true
         }
-        Ok((_, _, _, debug)) => archive_is_stale(filename, DEFAULT_OUT, debug),
+        Ok((_, _, _, _, debug)) => archive_is_stale(filename, DEFAULT_OUT, debug),
     };
 
     if recompile {
@@ -723,7 +754,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         compile_to_archive(pipeline, filename, DEFAULT_OUT);
     }
 
-    let (bytecode, constants, static_slots, debug) = if recompile {
+    let (bytecode, constants, strings, static_slots, debug) = if recompile {
         match try_load_archive(DEFAULT_OUT) {
             Ok(ok) => ok,
             Err(_) => fail_and_exit(
@@ -748,6 +779,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         pipeline,
         &bytecode,
         &constants,
+        &strings,
         static_slots,
         debug,
         Some(Path::new(filename)),
@@ -768,7 +800,7 @@ fn cmd_compile(pipeline: &mut Pipeline, filename: &str, output: &str) {
 }
 
 fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
-    let (bytecode, constants, static_slots, debug) = match try_load_archive(archive) {
+    let (bytecode, constants, strings, static_slots, debug) = match try_load_archive(archive) {
         Ok(ok) => ok,
         Err(LoadErr::Missing) => fail_and_exit(
             pipeline,
@@ -804,6 +836,7 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
         pipeline,
         &bytecode,
         &constants,
+        &strings,
         static_slots,
         debug,
         Some(entry),
@@ -846,8 +879,7 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// Negative syntax / type tests live under any path segment named `compile_fail`.
 /// Those files must fail to compile; a successful compile is a harness failure.
 fn is_compile_fail(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == "compile_fail")
+    path.components().any(|c| c.as_os_str() == "compile_fail")
 }
 
 /// Classify a `catch_unwind` compile result for a `compile_fail/` file.
@@ -861,6 +893,7 @@ fn run_test_case(
     pipeline: &Pipeline,
     bytecode: &[Byte],
     constants: &[u64],
+    strings: &[String],
     entry: Option<&Path>,
     name: &str,
     offset: u32,
@@ -870,7 +903,7 @@ fn run_test_case(
         pipeline.wire_vm_ffi(&mut machine, entry);
         pipeline.wire_host_natives(&mut machine);
         machine.set_program_debug(pipeline.program_debug());
-        machine.load_program(bytecode, constants);
+        machine.load_program(bytecode, constants, strings);
         let ret = machine.call_function(offset, &[]);
         !machine.panicked() && machine.result_is_ok(ret)
     }));
@@ -891,7 +924,11 @@ fn run_test_case(
 /// Run the test harness over `root` and return `(passed, failed)` without exiting.
 /// Extracted from `cmd_test` so unit tests can assert compile_fail inversion and
 /// fail-fast behavior without terminating the process.
-fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<(usize, usize), String> {
+fn run_test_suite(
+    config: ReportConfig,
+    root: &Path,
+    fail_fast: bool,
+) -> Result<(usize, usize), String> {
     let files = collect_test_files(root)?;
 
     let mut passed = 0usize;
@@ -964,6 +1001,7 @@ fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<
                     false
                 }
                 Ok(Ok((bytecode, constants))) => {
+                    let strings = pipeline.strings().to_vec();
                     let static_slots = pipeline.static_slot_count();
                     let entry = path.as_path();
                     if cases.is_empty() {
@@ -974,6 +1012,7 @@ fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<
                                 &pipeline,
                                 &bytecode,
                                 &constants,
+                                &strings,
                                 static_slots,
                                 debug,
                                 Some(entry),
@@ -1000,6 +1039,7 @@ fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<
                                 &pipeline,
                                 &bytecode,
                                 &constants,
+                                &strings,
                                 Some(entry),
                                 name,
                                 *offset,
@@ -1066,7 +1106,9 @@ fn main() {
         Err(msg) => {
             let config = ReportConfig::default();
             let mut pipeline = Pipeline::with_reporter(config, Box::new(std::io::stderr()));
-            let code = if msg.contains("mutually") || msg.contains("unrecognized") || msg.contains("only valid")
+            let code = if msg.contains("mutually")
+                || msg.contains("unrecognized")
+                || msg.contains("only valid")
                 || msg.contains("duplicate")
                 || msg.contains("missing path")
             {
@@ -1467,6 +1509,7 @@ mod tests {
             version: stale_version,
             static_slot_count: 0,
             constants: vec![],
+            strings: vec![],
             bytecode: vec![Byte::new(common::Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![common::DebugLoc::unknown()],
@@ -1485,14 +1528,17 @@ mod tests {
             version: ARCHIVE_VERSION,
             static_slot_count: 0,
             constants: vec![42],
+            strings: vec![],
             bytecode: vec![Byte::new(common::Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![common::DebugLoc::unknown()],
         };
         let ok_bytes = rkyv::to_bytes::<Error>(&ok_prog).unwrap();
         std::fs::write(&ok_path, ok_bytes.as_slice()).unwrap();
-        let (bc, constants, _, _) = try_load_archive(ok_path.to_str().unwrap()).expect("ok archive");
+        let (bc, constants, strings, _, _) =
+            try_load_archive(ok_path.to_str().unwrap()).expect("ok archive");
         assert_eq!(constants, vec![42]);
+        assert!(strings.is_empty());
         assert_eq!(bc.len(), 1);
         let _ = std::fs::remove_file(&ok_path);
     }
@@ -1655,7 +1701,9 @@ mod tests {
     fn is_compile_fail_detects_path_segment() {
         assert!(is_compile_fail(Path::new("tests/compile_fail/bad.hy")));
         assert!(is_compile_fail(Path::new("/tmp/compile_fail/x.hy")));
-        assert!(is_compile_fail(Path::new("suite/nested/compile_fail/deep/x.hy")));
+        assert!(is_compile_fail(Path::new(
+            "suite/nested/compile_fail/deep/x.hy"
+        )));
         assert!(!is_compile_fail(Path::new("tests/arithmetic.hy")));
         assert!(!is_compile_fail(Path::new("tests/compile_fail_not/x.hy")));
         assert!(!is_compile_fail(Path::new("tests/my_compile_fail/x.hy")));
@@ -1695,11 +1743,7 @@ mod tests {
         )
         .unwrap();
         // Normal positive case still runs.
-        std::fs::write(
-            pos.join("ok.hy"),
-            "test(\"ok\") {\n  assert(true)?;\n}\n",
-        )
-        .unwrap();
+        std::fs::write(pos.join("ok.hy"), "test(\"ok\") {\n  assert(true)?;\n}\n").unwrap();
 
         let (passed, failed) =
             run_test_suite(ReportConfig::default(), &root, false).expect("suite runs");
@@ -1716,11 +1760,7 @@ mod tests {
         std::fs::create_dir_all(&cf).unwrap();
 
         // Lexicographic order: a_ok before z_bad — fail-fast must stop after a_ok.
-        std::fs::write(
-            cf.join("a_ok.hy"),
-            "fn main() {\n  print \"%i\", 1;\n}\n",
-        )
-        .unwrap();
+        std::fs::write(cf.join("a_ok.hy"), "fn main() {\n  print \"%i\", 1;\n}\n").unwrap();
         std::fs::write(
             cf.join("z_bad.hy"),
             "fn main() {\n  let x: int = \"no\";\n}\n",
@@ -1745,10 +1785,7 @@ mod tests {
         assert!(!same_source_path("examples/foo.hy", "vendor/pkg/foo.hy"));
         assert!(!same_source_path("main.hy", "vendor/pkg/main.hy"));
         assert!(same_source_path("examples/foo.hy", "./examples/foo.hy"));
-        assert!(same_source_path(
-            "src/lib/io.hy",
-            "project/src/lib/io.hy"
-        ));
+        assert!(same_source_path("src/lib/io.hy", "project/src/lib/io.hy"));
     }
 
     #[test]
@@ -1801,13 +1838,24 @@ test("still runs") {
         let mut passed = 0usize;
         let mut failed = 0usize;
         for (name, offset) in &cases {
-            if run_test_case(&pipeline, &bytecode, &constants, None, name, *offset) {
+            if run_test_case(
+                &pipeline,
+                &bytecode,
+                &constants,
+                pipeline.strings(),
+                None,
+                name,
+                *offset,
+            ) {
                 passed += 1;
             } else {
                 failed += 1;
             }
         }
         assert_eq!(failed, 2, "soft-fail + panic should each count as failures");
-        assert_eq!(passed, 1, "later case must still run after earlier failures");
+        assert_eq!(
+            passed, 1,
+            "later case must still run after earlier failures"
+        );
     }
 }

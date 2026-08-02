@@ -37,6 +37,7 @@ impl IlSnapshot {
 pub struct DissectArtifacts {
     pub bytecode: Vec<Byte>,
     pub constants: Vec<u64>,
+    pub strings: Vec<String>,
     pub functions: Vec<FnSym>,
     pub il: Option<IlSnapshot>,
     pub debug: ProgramDebug,
@@ -204,10 +205,7 @@ fn format_operands(
         }
         Instruction::BinSlotImmJmpf => {
             let (bop, slot, pool_idx) = byte.bin_slot_imm_jmpf_parts();
-            format!(
-                "op={} slot={slot} pool_idx={pool_idx}",
-                bin_op_name(bop)
-            )
+            format!("op={} slot={slot} pool_idx={pool_idx}", bin_op_name(bop))
         }
         Instruction::BinSlotSlotJmpf => {
             let (bop, a, pool_idx) = byte.bin_slot_slot_jmpf_parts();
@@ -215,10 +213,7 @@ fn format_operands(
         }
         Instruction::BinSlotImmStore => {
             let (bop, src, pool_idx) = byte.bin_slot_imm_store_parts();
-            format!(
-                "op={} src={src} pool_idx={pool_idx}",
-                bin_op_name(bop)
-            )
+            format!("op={} src={src} pool_idx={pool_idx}", bin_op_name(bop))
         }
         Instruction::BinSlotSlotStore => {
             let (bop, a, b, dest) = byte.bin_slot_slot_store_parts();
@@ -242,11 +237,7 @@ fn format_operands(
         }
         Instruction::Unpack => format!("arity={}", byte.operand_u32()),
         Instruction::UnpackAt => {
-            format!(
-                "arity={} slot={}",
-                byte.operand_u16(0),
-                byte.operand_u16(1)
-            )
+            format!("arity={} slot={}", byte.operand_u16(0), byte.operand_u16(1))
         }
         Instruction::LoadField => format!("index={}", byte.operand_u32()),
         Instruction::MakeTuple | Instruction::MakeArray | Instruction::MakeDict => {
@@ -402,7 +393,10 @@ fn format_il_op(op: &IlOp) -> String {
             format!("{k} -> L{}", target.0)
         }
         IlOp::Entry {
-            kind, arity, target, ..
+            kind,
+            arity,
+            target,
+            ..
         } => {
             let k = match kind {
                 EntryKind::Call => "CALL",
@@ -435,10 +429,7 @@ fn format_il_op(op: &IlOp) -> String {
         IlOp::Halt { .. } => "HALT".to_string(),
         IlOp::Bin { op, .. } => op.mnemonic().to_string(),
         IlOp::BinSlotImm { op, slot, imm, .. } => {
-            format!(
-                "BinSlotImm op={} slot={slot} imm={imm}",
-                bin_op_name(*op)
-            )
+            format!("BinSlotImm op={} slot={slot} imm={imm}", bin_op_name(*op))
         }
         IlOp::BinSlotSlot { op, a, b, .. } => {
             format!("BinSlotSlot op={} a={a} b={b}", bin_op_name(*op))
@@ -535,6 +526,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             constants: vec![],
+            strings: vec![],
             functions: vec![
                 FnSym {
                     name: "a".into(),
@@ -573,11 +565,8 @@ mod tests {
         assert!(line.contains("s1=2"));
         assert!(line.contains("s2=3"));
 
-        let bin = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
-            Instruction::SUB as u8,
-            4,
-            -1,
-        );
+        let bin =
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::SUB as u8, 4, -1);
         let line = format_byte_line(9, &bin, &[], &empty);
         assert!(line.contains("BinSlotImm"));
         assert!(line.contains("slot=4"));

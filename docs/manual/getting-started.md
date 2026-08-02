@@ -260,7 +260,7 @@ coil uses **AST → stack IL (symbolic labels) → lower/fuse → bytecode**. Th
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
 3. **Codegen (IL)** — walks the AST into a stack IL (`compiler/src/il`) with symbolic jump labels. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`**; tiny callees may be inlined at call sites.
 4. **Lower** — after link, `finalize_bytecode` runs IL opts then fuse-select (`BinSlotImm`, `CmpJmpf`, …), assigns PCs once, and emits `Vec<Byte>`. Label binds act as fusion barriers.
-5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **34**) must match at load time.
+5. **Archive** — bytecode, constant pool, and string table are wrapped in `ArchivedProgram { version, bytecode, constants, strings }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **35**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention

@@ -1,8 +1,8 @@
+mod attrs;
 mod block_builder;
+mod const_fold;
 mod dissect;
 mod il;
-mod attrs;
-mod const_fold;
 mod manifest;
 mod monomorphize;
 mod pipeline;
@@ -15,14 +15,14 @@ use std::{
 };
 
 use common::{
-    Byte, DebugLoc, Instruction, Interner, Value, ValueTag, DEBUG_FILE_UNKNOWN,
-    encode_tag_operand, likely, tag, unlikely,
+    Byte, DEBUG_FILE_UNKNOWN, DebugLoc, Instruction, Interner, Value, ValueTag, encode_tag_operand,
+    likely, tag, unlikely,
 };
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
-use crate::il::{CodeBuf, EmitBuf, EntryKind, IlJumpKind, IlOp, Label as IlLabel};
 use crate::const_fold::ConstValue;
+use crate::il::{CodeBuf, EmitBuf, EntryKind, IlJumpKind, IlOp, Label as IlLabel};
 use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
     SimpleSpan,
@@ -537,10 +537,8 @@ fn collect_pattern_binding_types(
                     }
                 }
                 PatternPayload::Record(fields) => {
-                    let by_name: HashMap<&str, &Ty> = decl
-                        .iter()
-                        .map(|(n, ty)| (n.as_str(), ty))
-                        .collect();
+                    let by_name: HashMap<&str, &Ty> =
+                        decl.iter().map(|(n, ty)| (n.as_str(), ty)).collect();
                     for pf in fields {
                         let expected = by_name.get(pf.name).copied();
                         collect_pattern_binding_types_with_expected(
@@ -645,9 +643,9 @@ fn make_fn_operand(n_cap: u32, n_filled: u32, arity: u32, is_rest: bool) -> u32 
 fn fn_arity_from_args(args: &Output<'_>) -> (usize, bool) {
     match args.1.as_ref() {
         Expression::Fragment(children) => {
-            let has_rest = children.last().is_some_and(|c| {
-                matches!(c.1.as_ref(), Expression::Argument(_, _, true))
-            });
+            let has_rest = children
+                .last()
+                .is_some_and(|c| matches!(c.1.as_ref(), Expression::Argument(_, _, true)));
             let n = children
                 .iter()
                 .filter(|c| matches!(c.1.as_ref(), Expression::Argument(..)))
@@ -744,6 +742,9 @@ pub struct Compiler {
     /// Wide immediates referenced from compact 8-byte `Byte`
     /// operands (floats, `JumpIfMatch` targets, etc.).
     constants: Vec<u64>,
+    /// Program string literals referenced by `Instruction::STRING`.
+    strings: Vec<String>,
+    string_indices: HashMap<String, u32>,
 
     /// Qualified names of `async fn` declarations (emit `MakeCoro` at call sites).
     coroutine_fns: std::collections::HashSet<String>,
@@ -884,6 +885,8 @@ impl Default for Compiler {
             program_start_offset,
             setup_entry_offset: program_start_offset,
             constants: Vec::default(),
+            strings: Vec::default(),
+            string_indices: HashMap::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
             field_key_slots: HashMap::new(),
@@ -923,6 +926,10 @@ impl Compiler {
         &self.constants
     }
 
+    pub fn strings(&self) -> &[String] {
+        &self.strings
+    }
+
     pub fn set_source_file(&mut self, path: impl Into<std::path::PathBuf>) {
         self.current_source_file = Some(path.into());
     }
@@ -956,8 +963,7 @@ impl Compiler {
         for (label, captures) in defers.iter().rev() {
             for cap in captures {
                 if let Some(slot) = self.lookup_slot(cap) {
-                    self.bytecode
-                        .push_load(slot);
+                    self.bytecode.push_load(slot);
                 } else {
                     // Typecheck should have rejected unknown captures; emit a
                     // zero so the CALL arity still matches.
@@ -1064,6 +1070,22 @@ impl Compiler {
         idx
     }
 
+    pub fn intern_string(&mut self, value: impl AsRef<str>) -> u32 {
+        let value = value.as_ref();
+        if let Some(&idx) = self.string_indices.get(value) {
+            return idx;
+        }
+        let idx = self.strings.len() as u32;
+        self.strings.push(value.to_string());
+        self.string_indices.insert(value.to_string(), idx);
+        idx
+    }
+
+    fn push_string_literal(&mut self, bytecode: &mut impl EmitBuf, value: impl AsRef<str>) {
+        let idx = self.intern_string(value);
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(idx));
+    }
+
     fn const_env(&self) -> &HashMap<String, ConstValue> {
         self.const_env_stack
             .last()
@@ -1102,25 +1124,15 @@ impl Compiler {
                 bytecode.push_const_pool(idx);
             }
             ConstValue::Bool(b) => {
-                bytecode.push(Byte::new_with_value(Instruction::CONST, Value::from(*b).raw() as _));
+                bytecode.push(Byte::new_with_value(
+                    Instruction::CONST,
+                    Value::from(*b).raw() as _,
+                ));
             }
             ConstValue::Str(s) => {
-                Self::emit_string_const(bytecode, s);
+                self.push_string_literal(bytecode, s);
             }
         }
-    }
-
-    fn emit_string_const(bytecode: &mut Vec<Byte>, escaped: &str) {
-        let idx = bytecode.len();
-        let mut count = 0usize;
-        for ch in escaped.chars() {
-            count += 1;
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-        }
-        bytecode.insert(
-            idx,
-            Byte::new(Instruction::STRING).with_operand_u32(count as u32),
-        );
     }
 
     /// If `ast` folds to a scalar, emit it and return true.
@@ -1165,9 +1177,7 @@ impl Compiler {
             bytecode.push_const(shift as i32);
             bytecode.push(Byte::new(Instruction::SHL));
             true
-        } else if let Some((base, kind)) =
-            const_fold::strength_pow_int(ast, self.const_env())
-        {
+        } else if let Some((base, kind)) = const_fold::strength_pow_int(ast, self.const_env()) {
             use crate::typechecking::subst::apply_ty_prune;
             use crate::typechecking::ty::{BYTE, INT};
             let base_is_int_like = self.codegen_expr_ty(base).is_some_and(|ty| {
@@ -1306,11 +1316,7 @@ impl Compiler {
     }
 
     /// `return self(...)` tail-call when eligible.
-    fn try_emit_tail_call_expr(
-        &mut self,
-        expr: &Output<'_>,
-        bytecode: &mut Vec<Byte>,
-    ) -> bool {
+    fn try_emit_tail_call_expr(&mut self, expr: &Output<'_>, bytecode: &mut Vec<Byte>) -> bool {
         if !self.fn_defers.is_empty() {
             return false;
         }
@@ -1347,7 +1353,11 @@ impl Compiler {
             if self.functions.contains_key(&keyed) {
                 call_key = keyed;
             } else {
-                let simple = call_key.rsplit("::").next().unwrap_or(&call_key).to_string();
+                let simple = call_key
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&call_key)
+                    .to_string();
                 let keyed_simple = overload_fn_key(&simple, fa, is_rest);
                 if self.functions.contains_key(&keyed_simple) {
                     call_key = keyed_simple;
@@ -1374,9 +1384,8 @@ impl Compiler {
             return false;
         };
         // Packed abs PC; CodeBuf::push rewrites to IlOp::Entry via entry_at_offset.
-        bytecode.push(
-            Byte::new(Instruction::TailCall).with_call_packed(arity as u32, target as u32),
-        );
+        bytecode
+            .push(Byte::new(Instruction::TailCall).with_call_packed(arity as u32, target as u32));
         true
     }
 
@@ -1467,10 +1476,9 @@ impl Compiler {
             return false;
         }
         // Cond / arms must not contain nested control or forbidden ops.
-        if ops[..j]
-            .iter()
-            .any(|op| op.is_control() || Self::inline_forbidden_op(op) || Self::inline_is_return(op))
-        {
+        if ops[..j].iter().any(|op| {
+            op.is_control() || Self::inline_forbidden_op(op) || Self::inline_is_return(op)
+        }) {
             return false;
         }
         let Some(then_end) = Self::diamond_arm_end(ops, j + 1) else {
@@ -1495,9 +1503,7 @@ impl Compiler {
         op.is_plain_return()
             || matches!(
                 op,
-                IlOp::LoadReturnSlot { .. }
-                    | IlOp::ConstReturnImm { .. }
-                    | IlOp::BinReturn { .. }
+                IlOp::LoadReturnSlot { .. } | IlOp::ConstReturnImm { .. } | IlOp::BinReturn { .. }
             )
             || matches!(
                 op.as_plain_byte(),
@@ -1534,9 +1540,7 @@ impl Compiler {
     fn inline_is_fused_return(op: &IlOp) -> bool {
         matches!(
             op,
-            IlOp::LoadReturnSlot { .. }
-                | IlOp::ConstReturnImm { .. }
-                | IlOp::BinReturn { .. }
+            IlOp::LoadReturnSlot { .. } | IlOp::ConstReturnImm { .. } | IlOp::BinReturn { .. }
         ) || matches!(
             op.as_plain_byte(),
             Some(b) if matches!(
@@ -1641,9 +1645,7 @@ impl Compiler {
         let terminal_ok = last.is_plain_return()
             || matches!(
                 last,
-                IlOp::LoadReturnSlot { .. }
-                    | IlOp::ConstReturnImm { .. }
-                    | IlOp::BinReturn { .. }
+                IlOp::LoadReturnSlot { .. } | IlOp::ConstReturnImm { .. } | IlOp::BinReturn { .. }
             )
             || matches!(
                 last.as_plain_byte(),
@@ -1745,9 +1747,9 @@ impl Compiler {
     /// Expand a fused `*Return` byte into the producer left on the caller's stack.
     fn expand_fused_return_for_inline(byte: &Byte, temps: &[u32]) -> Option<Byte> {
         match *byte.bytecode() {
-            Instruction::ConstReturnImm => Some(
-                Byte::new(Instruction::CONST).with_const_inline(byte.operand_u32() as i32),
-            ),
+            Instruction::ConstReturnImm => {
+                Some(Byte::new(Instruction::CONST).with_const_inline(byte.operand_u32() as i32))
+            }
             Instruction::LoadReturnSlot => {
                 let slot = byte.operand_u32() as usize;
                 let &tmp = temps.get(slot)?;
@@ -1793,10 +1795,7 @@ impl Compiler {
                 if ta > u8::MAX as u32 || tb > u8::MAX as u32 {
                     return None;
                 }
-                Some(
-                    Byte::new(Instruction::BinSlotSlot)
-                        .with_bin_slot_slot(op, ta as u8, tb as u8),
-                )
+                Some(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(op, ta as u8, tb as u8))
             }
             _ => None,
         }
@@ -2066,9 +2065,8 @@ impl Compiler {
         if is_indirect {
             Self::emit_call_indirect(&mut self.bytecode, target_offset, arity);
         } else {
-            self.bytecode.push(
-                Byte::new(Instruction::CALL).with_call_packed(arity, target_offset),
-            );
+            self.bytecode
+                .push(Byte::new(Instruction::CALL).with_call_packed(arity, target_offset));
         }
         self.bytecode.bind_label(join);
         let result = self.alloc_temp_slot();
@@ -2219,9 +2217,7 @@ impl Compiler {
             let mut end = then_start;
             if then_start + 1 < ops.len() && ops[then_start + 1].is_plain_return() {
                 end = then_start + 1;
-            } else if then_start + 1 < ops.len()
-                && matches!(ops[then_start + 1], IlOp::Label(_))
-            {
+            } else if then_start + 1 < ops.len() && matches!(ops[then_start + 1], IlOp::Label(_)) {
                 // fall through after value (unusual); still ok if JMPF target
             } else if then_start + 1 < ops.len()
                 && !matches!(ops[then_start + 1], IlOp::Label(_))
@@ -2269,9 +2265,7 @@ impl Compiler {
             match op {
                 IlOp::Load { slot, .. } if !ok_slot(*slot) => return false,
                 IlOp::BinSlotImm { slot, .. } if !ok_slot(*slot as u32) => return false,
-                IlOp::BinSlotSlot { a, b, .. }
-                    if !ok_slot(*a as u32) || !ok_slot(*b as u32) =>
-                {
+                IlOp::BinSlotSlot { a, b, .. } if !ok_slot(*a as u32) || !ok_slot(*b as u32) => {
                     return false;
                 }
                 _ => {}
@@ -2341,12 +2335,7 @@ impl Compiler {
                 });
                 true
             }
-            IlOp::BinSlotSlot {
-                op: bin,
-                a,
-                b,
-                loc,
-            } => {
+            IlOp::BinSlotSlot { op: bin, a, b, loc } => {
                 let Some(&ta) = temps.get(*a as usize) else {
                     return false;
                 };
@@ -2436,18 +2425,11 @@ impl Compiler {
     /// Copy a CFG-bearing callee body into `self.bytecode`, remapping slots to
     /// `temps`. Strips `RETURN` / fused `*Return` so the value stays on stack.
     /// When `allow_calls` is set, `Entry`/`CALL` are preserved (self-unroll).
-    fn emit_cfg_inline_body(
-        &mut self,
-        ops: &[IlOp],
-        temps: &[u32],
-        allow_calls: bool,
-    ) -> bool {
+    fn emit_cfg_inline_body(&mut self, ops: &[IlOp], temps: &[u32], allow_calls: bool) -> bool {
         use std::collections::HashMap;
         let mut label_map: HashMap<u32, IlLabel> = HashMap::new();
         let mut ensure_label = |id: u32, bc: &mut CodeBuf| -> IlLabel {
-            *label_map
-                .entry(id)
-                .or_insert_with(|| bc.fresh_label())
+            *label_map.entry(id).or_insert_with(|| bc.fresh_label())
         };
         // Pre-allocate labels referenced by jumps.
         for op in ops {
@@ -2675,8 +2657,7 @@ impl Compiler {
                                 self.bytecode.push_store_pop(tmp);
                             }
                             Instruction::BinSlotImm | Instruction::BinSlotSlot => {
-                                let Some(remapped) =
-                                    Self::remap_bin_slot_for_inline(&b, temps)
+                                let Some(remapped) = Self::remap_bin_slot_for_inline(&b, temps)
                                 else {
                                     return false;
                                 };
@@ -2893,8 +2874,7 @@ fn emit_pattern_binding<'compiler>(
                             );
                             *next_slot = scratch_base;
                         } else if consume_values && field_slot != *next_slot {
-                            bytecode
-                                .push_load(field_slot);
+                            bytecode.push_load(field_slot);
                             bytecode.push_store_pop(*next_slot);
                         }
                         let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
@@ -3062,11 +3042,7 @@ impl Compiler {
             return slot;
         }
         let shadows_outer = {
-            let in_vars = self
-                .context
-                .variables
-                .key(&name.to_string())
-                .is_some();
+            let in_vars = self.context.variables.key(&name.to_string()).is_some();
             let mut in_ancestor = false;
             let mut ctx = self.context.prev.as_deref();
             while let Some(c) = ctx {
@@ -3131,13 +3107,11 @@ impl Compiler {
                     }
                     continue;
                 }
-                let ty = self
-                    .codegen_expr_ty(inner)
-                    .or_else(|| {
-                        self.checker
-                            .lookup_for_codegen_span(inner.0.start, inner.0.end)
-                            .map(|t| apply_ty_prune(self.checker.subst(), &t))
-                    });
+                let ty = self.codegen_expr_ty(inner).or_else(|| {
+                    self.checker
+                        .lookup_for_codegen_span(inner.0.start, inner.0.end)
+                        .map(|t| apply_ty_prune(self.checker.subst(), &t))
+                });
                 let Some(ty) = ty else {
                     out.push(arg.clone());
                     continue;
@@ -3221,10 +3195,7 @@ impl Compiler {
                         rest.push(value.clone());
                         continue;
                     }
-                    if let Some(idx) = param_names[..fixed_count]
-                        .iter()
-                        .position(|p| p == *name)
-                    {
+                    if let Some(idx) = param_names[..fixed_count].iter().position(|p| p == *name) {
                         slots[idx] = Some(value.clone());
                     }
                 }
@@ -3840,38 +3811,27 @@ impl Compiler {
         let len_slot = self.alloc_temp_slot();
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
-        self.bytecode
-            .push_load(src);
+        self.bytecode.push_load(src);
         self.bytecode.push(Byte::new(Instruction::ArrayLen));
-        self.bytecode
-            .push_store_pop(len_slot);
-        self.bytecode
-            .push_make_array(0);
-        self.bytecode
-            .push_store_pop(out);
-        self.bytecode
-            .push_const(0);
-        self.bytecode
-            .push_store_pop(idx);
+        self.bytecode.push_store_pop(len_slot);
+        self.bytecode.push_make_array(0);
+        self.bytecode.push_store_pop(out);
+        self.bytecode.push_const(0);
+        self.bytecode.push_store_pop(idx);
 
         let mut bb = BlockBuilder::new();
         let loop_top = bb.fresh_label(self.bytecode.il_mut());
         let end = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(loop_top, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(idx);
-        self.bytecode
-            .push_load(len_slot);
+        self.bytecode.push_load(idx);
+        self.bytecode.push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(end, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(out);
-        self.bytecode
-            .push_load(src);
-        self.bytecode
-            .push_load(idx);
+        self.bytecode.push_load(out);
+        self.bytecode.push_load(src);
+        self.bytecode.push_load(idx);
         self.bytecode.push_index();
         {
             let mut neg_bc = Vec::new();
@@ -3879,20 +3839,15 @@ impl Compiler {
             self.bytecode.extend(neg_bc);
         }
         self.bytecode.push(Byte::new(Instruction::ArrayPush));
-        self.bytecode
-            .push_store_pop(out);
-        self.bytecode
-            .push_load(idx);
-        self.bytecode
-            .push_const(1);
+        self.bytecode.push_store_pop(out);
+        self.bytecode.push_load(idx);
+        self.bytecode.push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
-        self.bytecode
-            .push_store_pop(idx);
+        self.bytecode.push_store_pop(idx);
 
         bb.emit_jump_to(loop_top, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(end, self.bytecode.il_mut());
-        self.bytecode
-            .push_load(out);
+        self.bytecode.push_load(out);
         bb.finalize()
             .expect("BlockBuilder::finalize: dynamic unary array labels bound");
     }
@@ -3924,70 +3879,50 @@ impl Compiler {
         let len_slot = self.alloc_temp_slot();
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
-        self.bytecode
-            .push_load(t_vec);
+        self.bytecode.push_load(t_vec);
         self.bytecode.push(Byte::new(Instruction::ArrayLen));
-        self.bytecode
-            .push_store_pop(len_slot);
-        self.bytecode
-            .push_make_array(0);
-        self.bytecode
-            .push_store_pop(out);
-        self.bytecode
-            .push_const(0);
-        self.bytecode
-            .push_store_pop(idx);
+        self.bytecode.push_store_pop(len_slot);
+        self.bytecode.push_make_array(0);
+        self.bytecode.push_store_pop(out);
+        self.bytecode.push_const(0);
+        self.bytecode.push_store_pop(idx);
 
         let mut bb = BlockBuilder::new();
         let loop_top = bb.fresh_label(self.bytecode.il_mut());
         let end = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(loop_top, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(idx);
-        self.bytecode
-            .push_load(len_slot);
+        self.bytecode.push_load(idx);
+        self.bytecode.push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(end, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(out);
+        self.bytecode.push_load(out);
         match scalar_on {
             ScalarSide::Right => {
-                self.bytecode
-                    .push_load(t_vec);
-                self.bytecode
-                    .push_load(idx);
+                self.bytecode.push_load(t_vec);
+                self.bytecode.push_load(idx);
                 self.bytecode.push_index();
-                self.bytecode
-                    .push_load(t_sc);
+                self.bytecode.push_load(t_sc);
             }
             ScalarSide::Left => {
-                self.bytecode
-                    .push_load(t_sc);
-                self.bytecode
-                    .push_load(t_vec);
-                self.bytecode
-                    .push_load(idx);
+                self.bytecode.push_load(t_sc);
+                self.bytecode.push_load(t_vec);
+                self.bytecode.push_load(idx);
                 self.bytecode.push_index();
             }
         }
         self.bytecode.push(Byte::new(scalar_instr));
         self.bytecode.push(Byte::new(Instruction::ArrayPush));
-        self.bytecode
-            .push_store_pop(out);
-        self.bytecode
-            .push_load(idx);
-        self.bytecode
-            .push_const(1);
+        self.bytecode.push_store_pop(out);
+        self.bytecode.push_load(idx);
+        self.bytecode.push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
-        self.bytecode
-            .push_store_pop(idx);
+        self.bytecode.push_store_pop(idx);
 
         bb.emit_jump_to(loop_top, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(end, self.bytecode.il_mut());
-        self.bytecode
-            .push_load(out);
+        self.bytecode.push_load(out);
         bb.finalize()
             .expect("BlockBuilder::finalize: dynamic broadcast array labels bound");
     }
@@ -4236,17 +4171,13 @@ impl Compiler {
         true
     }
 
-    /// Emit a string literal as `STRING` + `DATA` bytes into `self.bytecode`.
+    /// Emit a string literal as a table-indexed `STRING` byte into `self.bytecode`.
     /// Applies the same escape processing as `Expression::String` codegen.
     fn emit_string_literal(&mut self, s: &str) {
         let escaped = unescape_coil_string(s);
-        let count = escaped.chars().count() as u32;
+        let idx = self.intern_string(&escaped);
         self.bytecode
-            .push(Byte::new(Instruction::STRING).with_operand_u32(count));
-        for ch in escaped.chars() {
-            self.bytecode
-                .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-        }
+            .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
     }
 
     /// Rewrite `%v` → `%s` in a format literal (leave `%%` alone).
@@ -4439,8 +4370,7 @@ impl Compiler {
             }
         }
         let arity = tuple_elements.len() as u32;
-        self.bytecode
-            .push_make_tuple(arity);
+        self.bytecode.push_make_tuple(arity);
 
         if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, ret_type) {
             emit_ffi_type_const(&mut self.bytecode, tag, aux);
@@ -4520,8 +4450,7 @@ impl Compiler {
             self.bytecode.extend(bc);
         }
         let arity = tuple_elements.len() as u32;
-        self.bytecode
-            .push_make_tuple(arity);
+        self.bytecode.push_make_tuple(arity);
 
         let mut operand = arity & 0xFFFF;
         if variadic {
@@ -4561,8 +4490,7 @@ impl Compiler {
         // message (field index 1: kind=0, message=1) and Panic.
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
-        self.bytecode
-            .push_load_field(1);
+        self.bytecode.push_load_field(1);
         self.bytecode.push(Byte::new(Instruction::Panic));
         bb.bind_label(success, self.bytecode.il_mut());
         bb.finalize()
@@ -4591,9 +4519,7 @@ impl Compiler {
             match pattern {
                 Pattern::Binding { name } => Some(name),
                 Pattern::Constructor { payload, .. } => match payload {
-                    PatternPayload::Tuple(items) if items.len() == 1 => {
-                        sole_binding(&items[0])
-                    }
+                    PatternPayload::Tuple(items) if items.len() == 1 => sole_binding(&items[0]),
                     _ => None,
                 },
                 _ => None,
@@ -4615,12 +4541,9 @@ impl Compiler {
             if let Some(dict_slot) = self.lookup_slot(&dict_name) {
                 let mut arg_bc = self.do_compile(arg);
                 self.bytecode.append(&mut arg_bc);
-                self.bytecode
-                    .push_load(dict_slot);
-                self.bytecode
-                    .push_load(dict_slot);
-                self.bytecode
-                    .push_const(method_slot as i32);
+                self.bytecode.push_load(dict_slot);
+                self.bytecode.push_load(dict_slot);
+                self.bytecode.push_const(method_slot as i32);
                 self.bytecode.push_index();
                 self.bytecode
                     .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
@@ -4723,27 +4646,22 @@ impl Compiler {
 
     fn emit_tuple_show_for_stack_value(&mut self, items: &[Ty]) {
         let tuple_slot = self.alloc_temp_slot();
-        self.bytecode
-            .push_store_pop(tuple_slot);
+        self.bytecode.push_store_pop(tuple_slot);
 
         let mut element_slots = Vec::with_capacity(items.len());
         for (idx, item_ty) in items.iter().enumerate() {
-            self.bytecode
-                .push_load(tuple_slot);
-            self.bytecode
-                .push_const(idx as i32);
+            self.bytecode.push_load(tuple_slot);
+            self.bytecode.push_const(idx as i32);
             self.bytecode.push_index();
             self.emit_show_for_stack_value(item_ty);
             let slot = self.alloc_temp_slot();
-            self.bytecode
-                .push_store_pop(slot);
+            self.bytecode.push_store_pop(slot);
             element_slots.push(slot);
         }
 
         self.emit_string_literal(&Self::tuple_show_format(items.len()));
         for slot in element_slots {
-            self.bytecode
-                .push_load(slot);
+            self.bytecode.push_load(slot);
         }
         self.bytecode
             .push(Byte::new(Instruction::FORMAT).with_operand_u32(items.len() as u32));
@@ -4751,26 +4669,24 @@ impl Compiler {
 
     fn emit_record_show_for_stack_value(&mut self, fields: &[(String, Ty)]) {
         let record_slot = self.alloc_temp_slot();
-        self.bytecode
-            .push_store_pop(record_slot);
+        self.bytecode.push_store_pop(record_slot);
 
         let mut field_slots = Vec::with_capacity(fields.len());
         for (name, field_ty) in fields {
+            self.bytecode.push_load(record_slot);
+            let idx = self.intern_string(name);
             self.bytecode
-                .push_load(record_slot);
-            Self::emit_raw_string_literal(&mut self.bytecode, name);
+                .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
             self.bytecode.push_get_field();
             self.emit_show_for_stack_value(field_ty);
             let slot = self.alloc_temp_slot();
-            self.bytecode
-                .push_store_pop(slot);
+            self.bytecode.push_store_pop(slot);
             field_slots.push(slot);
         }
 
         self.emit_string_literal(&Self::record_show_format(fields));
         for slot in field_slots {
-            self.bytecode
-                .push_load(slot);
+            self.bytecode.push_load(slot);
         }
         self.bytecode
             .push(Byte::new(Instruction::FORMAT).with_operand_u32(fields.len() as u32));
@@ -4837,16 +4753,7 @@ impl Compiler {
                 }
             }
             // Rest packs are `[T]` / `[T; N]` — bind `T` from the element.
-            (
-                Ty::Array {
-                    element: e1,
-                    ..
-                },
-                Ty::Array {
-                    element: e2,
-                    ..
-                },
-            ) => {
+            (Ty::Array { element: e1, .. }, Ty::Array { element: e2, .. }) => {
                 Self::bind_scheme_vars(e1, e2, map);
             }
             _ => {}
@@ -4934,12 +4841,7 @@ impl Compiler {
         self.bytecode.append(&mut expr_bc);
         if let Some(pack) = pack {
             let mut pack_bc = Vec::new();
-            Self::emit_existential_pack_recipe(
-                &mut pack_bc,
-                &pack,
-                &self.checker,
-                &self.functions,
-            );
+            Self::emit_existential_pack_recipe(&mut pack_bc, &pack, &self.checker, &self.functions);
             self.bytecode.append(&mut pack_bc);
         }
         self.suppress_match_fusion_barrier = prev;
@@ -5178,17 +5080,18 @@ impl Compiler {
         self.emit_host_native_invoke(kind.native_name(), args);
     }
 
-    fn emit_thread_host_invoke(&mut self, kind: crate::typechecking::ThreadBuiltin, args: &[Output]) {
+    fn emit_thread_host_invoke(
+        &mut self,
+        kind: crate::typechecking::ThreadBuiltin,
+        args: &[Output],
+    ) {
         self.emit_host_native_invoke(kind.native_name(), args);
     }
 
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
     fn emit_host_native_invoke(&mut self, native_name: &str, args: &[Output]) {
         let Some(native_id) = self.native_id(native_name) else {
-            let range = args
-                .first()
-                .map(|a| a.0.into_range())
-                .unwrap_or(0..0);
+            let range = args.first().map(|a| a.0.into_range()).unwrap_or(0..0);
             let mut message = Message::error(
                 ErrorCode::UnknownFunction,
                 format!("Host native `{native_name}` is not registered with the pipeline"),
@@ -5223,8 +5126,7 @@ impl Compiler {
             self.bytecode.append(&mut arg_bc);
             self.expr_depth += 1;
         }
-        self.bytecode
-            .push_make_tuple(arity as u32);
+        self.bytecode.push_make_tuple(arity as u32);
         self.bytecode.push_host_invoke(arity as u32);
         // Restore: caller owns counting the result value if it needs to.
         self.expr_depth = depth_on_entry;
@@ -5257,18 +5159,12 @@ impl Compiler {
             }
             compiler.bind_function_entry(fqn);
             for slot in 0..2 {
-                compiler
-                    .bytecode
-                    .push_load(slot);
-                compiler
-                    .bytecode
-                    .push_unbox_value(tag as u32);
+                compiler.bytecode.push_load(slot);
+                compiler.bytecode.push_unbox_value(tag as u32);
             }
             compiler.bytecode.push(Byte::new(op));
             if boxes_result {
-                compiler
-                    .bytecode
-                    .push_box_value(tag as u32);
+                compiler.bytecode.push_box_value(tag as u32);
             }
             compiler.bytecode.push_return();
         };
@@ -5335,8 +5231,7 @@ impl Compiler {
                 continue;
             }
             self.bind_function_entry(fqn);
-            self.bytecode
-                .push_load(0);
+            self.bytecode.push_load(0);
             self.bytecode.push(Byte::new(Instruction::STRINGIFY));
             self.bytecode.push_return();
         }
@@ -5356,10 +5251,8 @@ impl Compiler {
                 continue;
             }
             self.bind_function_entry(fqn);
-            self.bytecode
-                .push_load(0);
-            self.bytecode
-                .push_unbox_value(tag as u32);
+            self.bytecode.push_load(0);
+            self.bytecode.push_unbox_value(tag as u32);
             self.bytecode.push_return();
         }
         {
@@ -5376,11 +5269,9 @@ impl Compiler {
                 self.bind_function_entry(fqn);
                 self.bytecode
                     .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-                self.bytecode
-                    .push_load(0);
+                self.bytecode.push_load(0);
                 self.bytecode.push_unbox_value(ValueTag::String as u32);
-                self.bytecode
-                    .push_make_tuple(1);
+                self.bytecode.push_make_tuple(1);
                 self.bytecode.push_host_invoke(1);
                 self.bytecode.push_return();
             }
@@ -5403,25 +5294,58 @@ impl Compiler {
             self.bind_function_entry(fqn);
             self.bytecode
                 .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-            self.bytecode
-                .push_load(0);
+            self.bytecode.push_load(0);
             self.bytecode.push_unbox_value(ValueTag::Instance as u32);
-            self.bytecode
-                .push_load(1);
+            self.bytecode.push_load(1);
             self.bytecode.push_unbox_value(ValueTag::Array as u32);
-            self.bytecode
-                .push_make_tuple(arity);
+            self.bytecode.push_make_tuple(arity);
             self.bytecode.push_host_invoke(arity);
             self.bytecode.push_return();
         }
 
         let into_pairs = [
-            ("int", "float", Instruction::CastIntToFloat, ValueTag::Int, ValueTag::Float),
-            ("float", "int", Instruction::CastFloatToInt, ValueTag::Float, ValueTag::Int),
-            ("int", "byte", Instruction::CastIntToByte, ValueTag::Int, ValueTag::Int),
-            ("byte", "int", Instruction::CastByteToInt, ValueTag::Int, ValueTag::Int),
-            ("int", "bool", Instruction::CastIntToBool, ValueTag::Int, ValueTag::Bool),
-            ("bool", "int", Instruction::CastBoolToInt, ValueTag::Bool, ValueTag::Int),
+            (
+                "int",
+                "float",
+                Instruction::CastIntToFloat,
+                ValueTag::Int,
+                ValueTag::Float,
+            ),
+            (
+                "float",
+                "int",
+                Instruction::CastFloatToInt,
+                ValueTag::Float,
+                ValueTag::Int,
+            ),
+            (
+                "int",
+                "byte",
+                Instruction::CastIntToByte,
+                ValueTag::Int,
+                ValueTag::Int,
+            ),
+            (
+                "byte",
+                "int",
+                Instruction::CastByteToInt,
+                ValueTag::Int,
+                ValueTag::Int,
+            ),
+            (
+                "int",
+                "bool",
+                Instruction::CastIntToBool,
+                ValueTag::Int,
+                ValueTag::Bool,
+            ),
+            (
+                "bool",
+                "int",
+                Instruction::CastBoolToInt,
+                ValueTag::Bool,
+                ValueTag::Int,
+            ),
         ];
         for (from, to, cast_op, from_tag, to_tag) in into_pairs {
             let fqn = into_primitive_fqn(from, to);
@@ -5429,8 +5353,7 @@ impl Compiler {
                 continue;
             }
             self.bind_function_entry(fqn);
-            self.bytecode
-                .push_load(0);
+            self.bytecode.push_load(0);
             self.bytecode.push_unbox_value(from_tag as u32);
             self.bytecode.push(Byte::new(cast_op));
             if from_tag != to_tag {
@@ -5443,7 +5366,9 @@ impl Compiler {
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
     /// emission at generic call boundaries.
     fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
-        use crate::typechecking::{Ty, ty::BOOL, ty::BYTE, ty::FLOAT, ty::INT, ty::STRING, ty::UNIT};
+        use crate::typechecking::{
+            Ty, ty::BOOL, ty::BYTE, ty::FLOAT, ty::INT, ty::STRING, ty::UNIT,
+        };
         match ty {
             Ty::Con(name) => match name.as_str() {
                 INT | BYTE => Some(ValueTag::Int),
@@ -5605,12 +5530,9 @@ impl Compiler {
         self.bytecode.append(&mut a);
         for (slot, ty) in argument_unbox_tys.iter().enumerate() {
             if let Some(tag) = ty.as_ref().and_then(Self::ty_to_value_tag) {
-                self.bytecode
-                    .push_load(slot as u32);
-                self.bytecode
-                    .push_unbox_value(tag as u32);
-                self.bytecode
-                    .push_store_pop(slot as u32);
+                self.bytecode.push_load(slot as u32);
+                self.bytecode.push_unbox_value(tag as u32);
+                self.bytecode.push_store_pop(slot as u32);
             }
         }
         for dict_idx in 0..dict_arity {
@@ -6125,8 +6047,7 @@ impl Compiler {
                             bytecode.push_const(idx as i32);
                             bytecode.push_index();
                             let nested_slot = self.alloc_temp_slot();
-                            bytecode
-                                .push_store_pop(nested_slot);
+                            bytecode.push_store_pop(nested_slot);
                             self.emit_let_pattern_binds(nested, nested_slot, bytecode);
                         }
                     }
@@ -6138,18 +6059,17 @@ impl Compiler {
                         LetPattern::Wildcard => {}
                         LetPattern::Binding { name } => {
                             bytecode.push_load(src_slot);
-                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            self.emit_raw_string_literal(bytecode, pf.name);
                             bytecode.push_get_field();
                             let slot = self.alloc_binding_slot(name);
                             bytecode.push_store_pop(slot);
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
                             bytecode.push_load(src_slot);
-                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            self.emit_raw_string_literal(bytecode, pf.name);
                             bytecode.push_get_field();
                             let nested_slot = self.alloc_temp_slot();
-                            bytecode
-                                .push_store_pop(nested_slot);
+                            bytecode.push_store_pop(nested_slot);
                             self.emit_let_pattern_binds(nested, nested_slot, bytecode);
                         }
                     }
@@ -6176,12 +6096,9 @@ impl Compiler {
             let iter_bc = self.do_compile(iterable.expect("iterable required when not on stack"));
             self.bytecode.extend(iter_bc);
         }
-        self.bytecode
-            .push_store_pop(arr_slot);
-        self.bytecode
-            .push_const(0);
-        self.bytecode
-            .push_store_pop(idx_slot);
+        self.bytecode.push_store_pop(arr_slot);
+        self.bytecode.push_const(0);
+        self.bytecode.push_store_pop(idx_slot);
 
         // Hoist ArrayLen once — the array slot is not mutated by for-in.
         let len_slot = self.alloc_temp_slot();
@@ -6200,21 +6117,16 @@ impl Compiler {
         bb.bind_label(top_label, self.bytecode.il_mut());
 
         // cond: idx < len  (LE is `<`)
-        self.bytecode
-            .push_load(idx_slot);
-        self.bytecode
-            .push_load(len_slot);
+        self.bytecode.push_load(idx_slot);
+        self.bytecode.push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
         // x = arr[idx]
-        self.bytecode
-            .push_load(arr_slot);
-        self.bytecode
-            .push_load(idx_slot);
+        self.bytecode.push_load(arr_slot);
+        self.bytecode.push_load(idx_slot);
         self.bytecode.push_index();
-        self.bytecode
-            .push_store_pop(binding_slot);
+        self.bytecode.push_store_pop(binding_slot);
 
         self.loop_stack.push((continue_label, exit_label));
         self.loop_bbs.push(bb);
@@ -6229,13 +6141,10 @@ impl Compiler {
             .expect("loop label stack balanced for for-in array");
         bb.bind_label(continue_label, self.bytecode.il_mut());
         // idx = idx + 1
-        self.bytecode
-            .push_load(idx_slot);
-        self.bytecode
-            .push_const(1);
+        self.bytecode.push_load(idx_slot);
+        self.bytecode.push_const(1);
         self.bytecode.push(Byte::new(Instruction::ADD));
-        self.bytecode
-            .push_store_pop(idx_slot);
+        self.bytecode.push_store_pop(idx_slot);
 
         bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(exit_label, self.bytecode.il_mut());
@@ -6254,17 +6163,13 @@ impl Compiler {
         let tup_slot = self.alloc_temp_slot();
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
-        self.bytecode
-            .push_store_pop(tup_slot);
+        self.bytecode.push_store_pop(tup_slot);
         for i in 0..arity {
-            self.bytecode
-                .push_load(tup_slot);
-            self.bytecode
-                .push_const(i as i32);
+            self.bytecode.push_load(tup_slot);
+            self.bytecode.push_const(i as i32);
             self.bytecode.push_index();
         }
-        self.bytecode
-            .push_make_array(arity as u32);
+        self.bytecode.push_make_array(arity as u32);
         self.emit_for_in_array_loop(body, binding_name, true, None);
     }
 
@@ -6301,8 +6206,7 @@ impl Compiler {
                     let _ = self.next_emit_id();
                     let binding_slot = self.alloc_binding_slot(binding_name);
                     let _ = self.next_emit_id();
-                    if let Some(ConstValue::Int(s)) =
-                        const_fold::eval_expr(start, self.const_env())
+                    if let Some(ConstValue::Int(s)) = const_fold::eval_expr(start, self.const_env())
                     {
                         for k in 0..trips {
                             let val = s + k as i64;
@@ -6328,33 +6232,30 @@ impl Compiler {
                 let _ = self.next_emit_id();
                 let start_bc = self.do_compile(start);
                 self.bytecode.extend(start_bc);
-                self.bytecode
-                    .push_store_pop(cur_slot);
+                self.bytecode.push_store_pop(cur_slot);
                 let end_bc = self.do_compile(end);
                 self.bytecode.extend(end_bc);
-                self.bytecode
-                    .push_store_pop(end_slot);
+                self.bytecode.push_store_pop(end_slot);
             }
             _ => {
                 let range_slot = self.alloc_temp_slot();
                 let iter_bc = self.do_compile(iterable);
                 self.bytecode.extend(iter_bc);
-                self.bytecode
-                    .push_store_pop(range_slot);
+                self.bytecode.push_store_pop(range_slot);
 
+                self.bytecode.push_load(range_slot);
+                let start_idx = self.intern_string("start");
                 self.bytecode
-                    .push_load(range_slot);
-                Self::emit_raw_string_literal(&mut self.bytecode, "start");
+                    .push(Byte::new(Instruction::STRING).with_operand_u32(start_idx));
                 self.bytecode.push_get_field();
-                self.bytecode
-                    .push_store_pop(cur_slot);
+                self.bytecode.push_store_pop(cur_slot);
 
+                self.bytecode.push_load(range_slot);
+                let end_idx = self.intern_string("end");
                 self.bytecode
-                    .push_load(range_slot);
-                Self::emit_raw_string_literal(&mut self.bytecode, "end");
+                    .push(Byte::new(Instruction::STRING).with_operand_u32(end_idx));
                 self.bytecode.push_get_field();
-                self.bytecode
-                    .push_store_pop(end_slot);
+                self.bytecode.push_store_pop(end_slot);
             }
         }
 
@@ -6369,10 +6270,8 @@ impl Compiler {
         bb.bind_label(top_label, self.bytecode.il_mut());
 
         // cond: cur < end  (half-open) or cur <= end (inclusive)
-        self.bytecode
-            .push_load(cur_slot);
-        self.bytecode
-            .push_load(end_slot);
+        self.bytecode.push_load(cur_slot);
+        self.bytecode.push_load(end_slot);
         self.bytecode.push(Byte::new(if float {
             if inclusive {
                 Instruction::LEQF
@@ -6387,10 +6286,8 @@ impl Compiler {
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
         // x = cur
-        self.bytecode
-            .push_load(cur_slot);
-        self.bytecode
-            .push_store_pop(binding_slot);
+        self.bytecode.push_load(cur_slot);
+        self.bytecode.push_store_pop(binding_slot);
 
         self.loop_stack.push((continue_label, exit_label));
         self.loop_bbs.push(bb);
@@ -6405,21 +6302,17 @@ impl Compiler {
             .expect("loop label stack balanced for for-in range");
         bb.bind_label(continue_label, self.bytecode.il_mut());
         // cur = cur + 1  (or + 1.0 for float)
-        self.bytecode
-            .push_load(cur_slot);
+        self.bytecode.push_load(cur_slot);
         if float {
             let bits = Value::from(1.0_f64).raw() as u64;
             let idx = self.intern_constant(bits);
-            self.bytecode
-                .push_const_pool(idx);
+            self.bytecode.push_const_pool(idx);
             self.bytecode.push(Byte::new(Instruction::ADDF));
         } else {
-            self.bytecode
-                .push_const(1);
+            self.bytecode.push_const(1);
             self.bytecode.push(Byte::new(Instruction::ADD));
         }
-        self.bytecode
-            .push_store_pop(cur_slot);
+        self.bytecode.push_store_pop(cur_slot);
 
         bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(exit_label, self.bytecode.il_mut());
@@ -6433,8 +6326,7 @@ impl Compiler {
         let handle_slot = self.alloc_temp_slot();
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
-        self.bytecode
-            .push_store_pop(handle_slot);
+        self.bytecode.push_store_pop(handle_slot);
 
         let _ = self.next_emit_id();
         let binding_slot = self.alloc_binding_slot(binding_name);
@@ -6444,15 +6336,12 @@ impl Compiler {
         let exit_label = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(top_label, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(handle_slot);
+        self.bytecode.push_load(handle_slot);
         self.bytecode
             .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
-        self.bytecode
-            .push_store_pop(binding_slot);
+        self.bytecode.push_store_pop(binding_slot);
 
-        self.bytecode
-            .push_load(handle_slot);
+        self.bytecode.push_load(handle_slot);
         self.bytecode.push(Byte::new(Instruction::DoneCoro));
         self.bytecode.push(Byte::new(Instruction::LogNot));
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
@@ -6499,11 +6388,9 @@ impl Compiler {
         let it_slot = self.alloc_temp_slot();
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
-        self.bytecode
-            .push_box_value(carrier_tag);
+        self.bytecode.push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
-        self.bytecode
-            .push_store_pop(it_slot);
+        self.bytecode.push_store_pop(it_slot);
 
         let _ = self.next_emit_id();
         let binding_slot = self.alloc_binding_slot(binding_name);
@@ -6513,10 +6400,8 @@ impl Compiler {
         let exit_label = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(top_label, self.bytecode.il_mut());
 
-        self.bytecode
-            .push_load(it_slot);
-        self.bytecode
-            .push_box_value(carrier_tag);
+        self.bytecode.push_load(it_slot);
+        self.bytecode.push_box_value(carrier_tag);
         Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
 
         // `Option::None` → exit (JumpIfMatch pops unit None).
@@ -6531,8 +6416,7 @@ impl Compiler {
         // Fall-through: Some(v) — unpack payload into binding.
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
-        self.bytecode
-            .push_store_pop(binding_slot);
+        self.bytecode.push_store_pop(binding_slot);
 
         self.loop_stack.push((top_label, exit_label));
         self.loop_bbs.push(bb);
@@ -6552,12 +6436,12 @@ impl Compiler {
             .expect("BlockBuilder::finalize: for-in custom labels bound");
     }
 
-    fn emit_field_name(&self, bytecode: &mut impl EmitBuf, field: &str) {
+    fn emit_field_name(&mut self, bytecode: &mut impl EmitBuf, field: &str) {
         if let Some(&slot) = self.field_key_slots.get(field) {
             bytecode.push_load(slot);
             return;
         }
-        Self::emit_raw_string_literal(bytecode, field);
+        self.emit_raw_string_literal(bytecode, field);
     }
 
     /// Count GetField/SetField string-key uses in `node` (Access / OptionalAccess).
@@ -6639,15 +6523,8 @@ impl Compiler {
                     }
                 }
             }
-            List(v)
-            | Array(v)
-            | Fragment(v)
-            | Block(v)
-            | Program(v)
-            | Tuple(v)
-            | If(v)
-            | Declare(v)
-            | Invoke(v) => {
+            List(v) | Array(v) | Fragment(v) | Block(v) | Program(v) | Tuple(v) | If(v)
+            | Declare(v) | Invoke(v) => {
                 for c in v {
                     Self::count_field_key_uses(c, counts);
                 }
@@ -6750,18 +6627,16 @@ impl Compiler {
         self.field_key_slots.clear();
         for key in keys {
             let slot = self.alloc_temp_slot();
-            Self::emit_raw_string_literal(&mut self.bytecode, &key);
+            let idx = self.intern_string(&key);
+            self.bytecode
+                .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
             self.bytecode.push_store_pop(slot);
             self.field_key_slots.insert(key, slot);
         }
     }
 
-    fn emit_raw_string_literal(bytecode: &mut impl EmitBuf, value: &str) {
-        bytecode
-            .push(Byte::new(Instruction::STRING).with_operand_u32(value.chars().count() as u32));
-        for ch in value.chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-        }
+    fn emit_raw_string_literal(&mut self, bytecode: &mut impl EmitBuf, value: &str) {
+        self.push_string_literal(bytecode, value);
     }
 
     fn variable_slot(&mut self, name: &str) -> Option<u32> {
@@ -7056,7 +6931,7 @@ impl Compiler {
             && self.is_string_expr(target)
             && self.is_string_expr(rhs)
         {
-            Self::emit_raw_string_literal(bytecode, "%s%s");
+            self.emit_raw_string_literal(bytecode, "%s%s");
             let _ = self.emit_read_lvalue(bytecode, target);
             bytecode.append(&mut self.do_compile(rhs));
             bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
@@ -7075,14 +6950,7 @@ impl Compiler {
         };
         if let Some(agg_op) = agg_op {
             let mut tmp = Vec::new();
-            if self.try_emit_matrix_op(
-                &mut tmp,
-                self_id,
-                span_start,
-                span_end,
-                target,
-                Some(rhs),
-            ) {
+            if self.try_emit_matrix_op(&mut tmp, self_id, span_start, span_end, target, Some(rhs)) {
                 bytecode.append(&mut tmp);
                 self.emit_write_lvalue(bytecode, target, false);
                 return;
@@ -7240,9 +7108,8 @@ impl Compiler {
         }
         let mut init_bc = self.do_compile(init);
         self.static_init_bytecode.append(&mut init_bc);
-        self.static_init_bytecode.push(
-            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
-        );
+        self.static_init_bytecode
+            .push(Byte::new(Instruction::StoreStatic).with_operand_u32(slot));
     }
 
     /// Resolve enum name for field access via the codegen side-table.
@@ -7848,8 +7715,7 @@ impl Compiler {
             Instruction::CONST,
             Value::from(0i64).raw() as _,
         ));
-        self.bytecode
-            .push_store_pop(failed_slot);
+        self.bytecode.push_store_pop(failed_slot);
 
         let mut bb = BlockBuilder::new();
         for (desc, offset) in &cases {
@@ -7858,9 +7724,8 @@ impl Compiler {
             } else {
                 // Fallback for cases without a bound entry label (should be rare
                 // after `bind_function_entry`); packed CALL(0, pc) keeps harness green.
-                self.bytecode.push(
-                    Byte::new(Instruction::CALL).with_call_packed(0, *offset),
-                );
+                self.bytecode
+                    .push(Byte::new(Instruction::CALL).with_call_packed(0, *offset));
             }
             // Jump if Result::Err (tag 1) — on match, payload (message) is pushed.
             let fail = bb.fresh_label(self.bytecode.il_mut());
@@ -7880,23 +7745,20 @@ impl Compiler {
             self.emit_string_literal(&msg);
             self.bytecode.push_print();
             // failed += 1
-            self.bytecode
-                .push_load(failed_slot);
+            self.bytecode.push_load(failed_slot);
             self.bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
                 Value::from(1i64).raw() as _,
             ));
             self.bytecode.push(Byte::new(Instruction::ADD));
-            self.bytecode
-                .push_store_pop(failed_slot);
+            self.bytecode.push_store_pop(failed_slot);
             bb.bind_label(done, self.bytecode.il_mut());
         }
 
         // if failed != 0 { panic "tests failed" }
         let panic_lbl = bb.fresh_label(self.bytecode.il_mut());
         let end_lbl = bb.fresh_label(self.bytecode.il_mut());
-        self.bytecode
-            .push_load(failed_slot);
+        self.bytecode.push_load(failed_slot);
         self.bytecode.push(Byte::new_with_value(
             Instruction::CONST,
             Value::from(0i64).raw() as _,
@@ -8077,8 +7939,7 @@ impl Compiler {
                             self.append_binding_rhs(&mut bytecode, &children[1]);
                         }
                         if is_const {
-                            if let Some(val) =
-                                const_fold::eval_expr(&children[1], self.const_env())
+                            if let Some(val) = const_fold::eval_expr(&children[1], self.const_env())
                             {
                                 self.const_env_mut().insert(name.clone(), val);
                             } else {
@@ -8156,13 +8017,12 @@ impl Compiler {
                     .or_default()
                     .push(name.to_string());
                 let (fixed_arity, has_rest) = fn_arity_from_args(args);
-                let table_key = if self.checker.is_overloaded(name)
-                    || self.checker.is_overloaded(&qualified)
-                {
-                    overload_fn_key(&qualified, fixed_arity, has_rest)
-                } else {
-                    qualified.clone()
-                };
+                let table_key =
+                    if self.checker.is_overloaded(name) || self.checker.is_overloaded(&qualified) {
+                        overload_fn_key(&qualified, fixed_arity, has_rest)
+                    } else {
+                        qualified.clone()
+                    };
                 let (fn_offset, _) = self.bind_function_entry(table_key.clone());
                 let fn_offset = fn_offset as u32;
                 self.fn_arities
@@ -8248,13 +8108,8 @@ impl Compiler {
                 self.fn_bytecode_spans
                     .insert(table_key.clone(), (body_start, body_end));
                 let entry = self.fn_entry_labels.get(&table_key).copied();
-                self.bytecode.record_func_with_sp(
-                    table_key,
-                    entry,
-                    body_start,
-                    body_end,
-                    entry_sp,
-                );
+                self.bytecode
+                    .record_func_with_sp(table_key, entry, body_start, body_end, entry_sp);
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
@@ -8337,9 +8192,14 @@ impl Compiler {
                 }
                 bytecode.push_const(0);
                 bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(entry));
-                bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
-                    make_fn_operand(captures.len() as u32, 0, arity as u32, is_rest),
-                ));
+                bytecode.push(
+                    Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
+                        captures.len() as u32,
+                        0,
+                        arity as u32,
+                        is_rest,
+                    )),
+                );
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -8416,15 +8276,7 @@ impl Compiler {
                     // runtime's pair Vec.
                     let mut bc = self.do_compile(&f.value);
                     bytecode.append(&mut bc);
-                    // field-name string — emits STRING then
-                    // DATA bytes (the runtime's standard
-                    // string-literal encoding — see
-                    // `Expression::String` arm).
-                    bytecode
-                        .push(Byte::new(Instruction::STRING).with_operand_u32(name.len() as u32));
-                    for ch in name.chars() {
-                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                    }
+                    self.emit_raw_string_literal(&mut bytecode, name);
                 }
                 let arity = items.len() as u32;
                 bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(arity));
@@ -8439,12 +8291,12 @@ impl Compiler {
             } => {
                 let mut start_bc = self.do_compile(start);
                 bytecode.append(&mut start_bc);
-                Self::emit_raw_string_literal(&mut bytecode, "start");
+                self.emit_raw_string_literal(&mut bytecode, "start");
                 let mut end_bc = self.do_compile(end);
                 bytecode.append(&mut end_bc);
-                Self::emit_raw_string_literal(&mut bytecode, "end");
+                self.emit_raw_string_literal(&mut bytecode, "end");
                 bytecode.push_const(if *inclusive { 1 } else { 0 });
-                Self::emit_raw_string_literal(&mut bytecode, "inclusive");
+                self.emit_raw_string_literal(&mut bytecode, "inclusive");
                 bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(3));
             }
             // `t[i]` — pop the index (top), pop the target,
@@ -8542,12 +8394,14 @@ impl Compiler {
                                 idx += 1;
                             }
                         }
-                        _ => unreachable!(
-                            "There should be only fields inside of a class definition"
-                        ),
+                        _ => {
+                            unreachable!("There should be only fields inside of a class definition")
+                        }
                     }
                 }
-                self.context.classes.insert(name.to_string(), instance_fields);
+                self.context
+                    .classes
+                    .insert(name.to_string(), instance_fields);
                 self.context.symbols.intern(name.to_string());
             }
             Expression::Implementation { owner, methods, .. } => {
@@ -8592,7 +8446,10 @@ impl Compiler {
             Expression::Method(_vis, body) => {
                 let is_static = matches!(
                     body.1.borrow(),
-                    Expression::Function { is_static: true, .. }
+                    Expression::Function {
+                        is_static: true,
+                        ..
+                    }
                 );
                 self.compiling_method = !is_static;
                 bytecode.append(&mut self.do_compile(body));
@@ -8611,8 +8468,7 @@ impl Compiler {
                         let arity =
                             self.emit_call_args_with_rest(&ctor, arg_slice, &mut bytecode, false);
                         bytecode.push(
-                            Byte::new(Instruction::CALL)
-                                .with_call_packed(arity, offset as u32),
+                            Byte::new(Instruction::CALL).with_call_packed(arity, offset as u32),
                         );
                     } else {
                         self.messages.push(Message::error(
@@ -8624,32 +8480,33 @@ impl Compiler {
                         ));
                     }
                 } else {
-                let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
-                bytecode.push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
-                // SetField stack order is value, target, name (same as
-                // Assignment to Access). Stash the instance, then for
-                // each ctor arg emit that sequence and discard the
-                // value SetField pushes back.
-                //
-                // `StorePop` keeps the instance at `tmp` with the cursor
-                // past that slot — so the stashed value is already TOS
-                // for the expression result. Do **not** emit a final
-                // `LOAD tmp`: that would push a second copy and leave
-                // the stash sitting between any live values below
-                // (e.g. a HostInvoke native-id CONST) and the result,
-                // so `MakeTuple`/`HostInvoke` would pick up the instance
-                // as the native id.
-                let tmp_inst = self.alloc_temp_slot();
-                bytecode.push_store_pop(tmp_inst);
-                if let Some(arg_list) = args {
-                    for (arg, (fname, _)) in arg_list.iter().zip(fields.iter()) {
-                        bytecode.append(&mut self.do_compile(arg));
-                        bytecode.push_load(tmp_inst);
-                        self.emit_field_name(&mut bytecode, fname);
-                        bytecode.push_set_field();
-                        bytecode.push_pop();
+                    let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
+                    bytecode
+                        .push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
+                    // SetField stack order is value, target, name (same as
+                    // Assignment to Access). Stash the instance, then for
+                    // each ctor arg emit that sequence and discard the
+                    // value SetField pushes back.
+                    //
+                    // `StorePop` keeps the instance at `tmp` with the cursor
+                    // past that slot — so the stashed value is already TOS
+                    // for the expression result. Do **not** emit a final
+                    // `LOAD tmp`: that would push a second copy and leave
+                    // the stash sitting between any live values below
+                    // (e.g. a HostInvoke native-id CONST) and the result,
+                    // so `MakeTuple`/`HostInvoke` would pick up the instance
+                    // as the native id.
+                    let tmp_inst = self.alloc_temp_slot();
+                    bytecode.push_store_pop(tmp_inst);
+                    if let Some(arg_list) = args {
+                        for (arg, (fname, _)) in arg_list.iter().zip(fields.iter()) {
+                            bytecode.append(&mut self.do_compile(arg));
+                            bytecode.push_load(tmp_inst);
+                            self.emit_field_name(&mut bytecode, fname);
+                            bytecode.push_set_field();
+                            bytecode.push_pop();
+                        }
                     }
-                }
                 }
             }
             Expression::Adjust { op, prefix, target } => {
@@ -8683,9 +8540,7 @@ impl Compiler {
                         .and_then(|id| self.checker.for_in_info_at(id))
                         .or_else(|| self.checker.for_in_info_for_span(span.start, span.end))
                         .cloned();
-                    let kind = info
-                        .map(|i| i.kind)
-                        .unwrap_or(ForInKind::Coroutine);
+                    let kind = info.map(|i| i.kind).unwrap_or(ForInKind::Coroutine);
                     match kind {
                         ForInKind::Array => {
                             self.emit_for_in_array_loop(body, &binding_name, false, Some(iterable));
@@ -8700,13 +8555,7 @@ impl Compiler {
                             self.emit_for_in_coro(iterable, body, &binding_name);
                         }
                         ForInKind::Range { inclusive, float } => {
-                            self.emit_for_in_range(
-                                iterable,
-                                body,
-                                &binding_name,
-                                inclusive,
-                                float,
-                            );
+                            self.emit_for_in_range(iterable, body, &binding_name, inclusive, float);
                         }
                         ForInKind::Custom {
                             into_iter_fqn,
@@ -8766,11 +8615,9 @@ impl Compiler {
                 step,
                 body,
             } => {
-                if let Some(trips) = const_fold::for_loop_trip_count(
-                    init.as_ref(),
-                    cond,
-                    step.as_ref(),
-                ) && !const_fold::body_has_loop_control(body)
+                if let Some(trips) =
+                    const_fold::for_loop_trip_count(init.as_ref(), cond, step.as_ref())
+                    && !const_fold::body_has_loop_control(body)
                 {
                     // Pre-walk order is init → cond → body → step. Emit init,
                     // discard cond (IDs only), then for each trip restore the
@@ -8795,8 +8642,7 @@ impl Compiler {
                     }
                     return bytecode;
                 }
-                if let Some(ConstValue::Bool(false)) =
-                    const_fold::eval_expr(cond, self.const_env())
+                if let Some(ConstValue::Bool(false)) = const_fold::eval_expr(cond, self.const_env())
                 {
                     if let Some(init) = init {
                         let mut init_bc = self.do_compile(init);
@@ -8881,8 +8727,7 @@ impl Compiler {
                 bb.emit_jump_to(after, BbJumpKind::Unconditional, self.bytecode.il_mut());
 
                 bb.bind_label(thunk, self.bytecode.il_mut());
-                let cap_names: Vec<String> =
-                    captures.iter().map(|c| (*c).to_string()).collect();
+                let cap_names: Vec<String> = captures.iter().map(|c| (*c).to_string()).collect();
                 self.fn_defers.push((thunk, cap_names));
 
                 // Remap locals so capture names occupy slots 0..N-1 inside the
@@ -8984,8 +8829,7 @@ impl Compiler {
                     } else if registry == "env_exit" {
                         self.messages.push(Message::warn(
                             ErrorCode::GenericTypeError,
-                            "env::exit terminates the process with the given exit code"
-                                .to_string(),
+                            "env::exit terminates the process with the given exit code".to_string(),
                             span.into_range(),
                         ));
                     }
@@ -9060,10 +8904,7 @@ impl Compiler {
                     // the instance method (dict ABI, `dict_arity = 1`).
                     let ground_trait = self_id
                         .and_then(|id| self.checker.call_dicts_at(id))
-                        .or_else(|| {
-                            self.checker
-                                .call_dicts_for_span(span.start, span.end)
-                        })
+                        .or_else(|| self.checker.call_dicts_for_span(span.start, span.end))
                         .and_then(|dicts| dicts.first())
                         .and_then(|instance| {
                             let fqn = instance.method_fqns.get(*method)?.clone();
@@ -9144,9 +8985,7 @@ impl Compiler {
                             // selection (set had size 1 at infer time).
                             self.checker
                                 .select_overload(&fqn_base, nargs)
-                                .map(|c| {
-                                    overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest)
-                                })
+                                .map(|c| overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest))
                                 .filter(|k| self.functions.contains_key(k))
                                 .unwrap_or(fqn_base)
                         } else {
@@ -9157,12 +8996,7 @@ impl Compiler {
                             // (reordered when any arg is named; rest packed).
                             bytecode.append(&mut self.do_compile(recv));
                             let nargs = if let Some(items) = args {
-                                self.emit_call_args_with_rest(
-                                    &fqn,
-                                    items,
-                                    &mut bytecode,
-                                    false,
-                                )
+                                self.emit_call_args_with_rest(&fqn, items, &mut bytecode, false)
                             } else {
                                 0
                             };
@@ -9265,9 +9099,8 @@ impl Compiler {
                     };
 
                     // Arity-overload table key (when the typechecker selected one).
-                    let n = if let Some((fa, is_rest)) = self
-                        .checker
-                        .selected_overload_at(span.start, span.end)
+                    let n = if let Some((fa, is_rest)) =
+                        self.checker.selected_overload_at(span.start, span.end)
                     {
                         let keyed = overload_fn_key(&n, fa, is_rest);
                         if self.functions.contains_key(&keyed) {
@@ -9300,10 +9133,8 @@ impl Compiler {
                         };
                         let variadic = self.checker.is_extern_variadic(&n);
                         let depth_on_entry = self.expr_depth;
-                        self.bytecode
-                            .push_load(lib_slot);
-                        self.bytecode
-                            .push_load(fn_id_slot);
+                        self.bytecode.push_load(lib_slot);
+                        self.bytecode.push_load(fn_id_slot);
                         self.expr_depth = depth_on_entry + 2;
                         if let Some(items) = args {
                             for arg in items {
@@ -9312,13 +9143,14 @@ impl Compiler {
                                 self.expr_depth += 1;
                             }
                         }
-                        self.bytecode
-                            .push_make_tuple(arity as u32);
+                        self.bytecode.push_make_tuple(arity as u32);
                         let mut operand = arity as u32 & 0xFFFF;
                         if variadic {
                             let call_span = (span.start, span.end);
-                            let arg_refs: Vec<_> =
-                                args.as_ref().map(|items| items.iter().collect()).unwrap_or_default();
+                            let arg_refs: Vec<_> = args
+                                .as_ref()
+                                .map(|items| items.iter().collect())
+                                .unwrap_or_default();
                             if let Some(tags) = resolve_variadic_ffi_tags(
                                 &self.checker,
                                 call_span,
@@ -9355,8 +9187,7 @@ impl Compiler {
                                 self.expr_depth += 1;
                             }
                         }
-                        self.bytecode
-                            .push_make_tuple(arity as u32);
+                        self.bytecode.push_make_tuple(arity as u32);
                         self.bytecode.push_host_invoke(arity as u32);
                         self.expr_depth = depth_on_entry;
                     } else if let Some(offset) = self.functions.get(&n).copied() {
@@ -9389,8 +9220,7 @@ impl Compiler {
 
                         // Caller-side base-case peel: cmp-jmp before CALL when
                         // the callee opens with fused/unfused compare + imm/slot return.
-                        let peel_indirect =
-                            is_instance_method_fqn(&self.checker, &lookup_name);
+                        let peel_indirect = is_instance_method_fqn(&self.checker, &lookup_name);
                         if !is_generic
                             && !self.coroutine_fns.contains(&n)
                             && !self.coroutine_fns.contains(&lookup_name)
@@ -9426,17 +9256,18 @@ impl Compiler {
                                     .map(|(a, r)| (*a as usize, *r))
                             })
                             .unwrap_or((0, false));
-                        let fill_mask = self.checker.partial_fill_at(span.start, span.end).or_else(
-                            || {
-                                // Spread args count as their expanded arity, not one slot.
-                                let argc = flat_arg_slice.len();
-                                if !is_rest && fa > 0 && argc < fa {
-                                    Some((1u32 << argc).wrapping_sub(1))
-                                } else {
-                                    None
-                                }
-                            },
-                        );
+                        let fill_mask =
+                            self.checker
+                                .partial_fill_at(span.start, span.end)
+                                .or_else(|| {
+                                    // Spread args count as their expanded arity, not one slot.
+                                    let argc = flat_arg_slice.len();
+                                    if !is_rest && fa > 0 && argc < fa {
+                                        Some((1u32 << argc).wrapping_sub(1))
+                                    } else {
+                                        None
+                                    }
+                                });
                         if let Some(mask) = fill_mask {
                             // Emit filled values in declaration order (already
                             // the order of `flat_arg_slice` after named reorder at TC).
@@ -9453,14 +9284,9 @@ impl Compiler {
                                 Byte::new(Instruction::CodePtr)
                                     .with_operand_u32(target_offset as u32),
                             );
-                            bytecode.push(
-                                Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
-                                    0,
-                                    n_filled,
-                                    fa as u32,
-                                    is_rest,
-                                )),
-                            );
+                            bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
+                                make_fn_operand(0, n_filled, fa as u32, is_rest),
+                            ));
                             return bytecode;
                         }
 
@@ -9635,12 +9461,17 @@ impl Compiler {
             Expression::Argument(ty, n, _is_rest) => {
                 let slot = self.context.variables.intern(n.to_string()) as u32;
                 self.record_debug_local(n, slot);
-                if ty.as_ref().is_some_and(|t| matches!(t.1.as_ref(), Expression::Forall { .. })) {
+                if ty
+                    .as_ref()
+                    .is_some_and(|t| matches!(t.1.as_ref(), Expression::Forall { .. }))
+                {
                     self.polyfn_vars.insert(n.to_string());
                 }
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
-            Expression::Type(_) | Expression::TypeFun(_, _) | Expression::TypeFnSig { .. }
+            Expression::Type(_)
+            | Expression::TypeFun(_, _)
+            | Expression::TypeFnSig { .. }
             | Expression::Forall { .. } => {
                 // Type names appear as metadata inside enum
                 // declarations (e.g. `Some(int)` wraps `int` as
@@ -9770,7 +9601,10 @@ impl Compiler {
                 } else if let Some(v) = self
                     .static_const_values
                     .get(&self.qualify_static_fqn(n))
-                    .filter(|_| self.checker.is_static_const_fqn(&self.qualify_static_fqn(n)))
+                    .filter(|_| {
+                        self.checker
+                            .is_static_const_fqn(&self.qualify_static_fqn(n))
+                    })
                     .cloned()
                 {
                     self.emit_const_value(&v, &mut bytecode);
@@ -9779,9 +9613,7 @@ impl Compiler {
                     .static_slot_index(&resolved)
                     .or_else(|| self.checker.static_slot_for_module_name(n))
                 {
-                    bytecode.push(
-                        Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot),
-                    );
+                    bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot));
                 } else if let Some(slot) = self.lookup_slot(n) {
                     bytecode.push_load(slot);
                 } else {
@@ -9851,7 +9683,10 @@ impl Compiler {
                                 span.into_range(),
                             );
                             message.push(DiagLabel::new(
-                                format!("Cannot reify overloaded `{}` without a type annotation", n),
+                                format!(
+                                    "Cannot reify overloaded `{}` without a type annotation",
+                                    n
+                                ),
                                 span.into_range(),
                             ));
                             self.messages.push(message);
@@ -9893,12 +9728,8 @@ impl Compiler {
                                     .with_operand_u32(entry_offset as u32),
                             );
                             bytecode.push(
-                                Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
-                                    0,
-                                    0,
-                                    fa as u32,
-                                    is_rest,
-                                )),
+                                Byte::new(Instruction::MakeFn)
+                                    .with_operand_u32(make_fn_operand(0, 0, fa as u32, is_rest)),
                             );
                         } else {
                             let mut message = Message::error(
@@ -9961,7 +9792,11 @@ impl Compiler {
                         let cond_bc = self.do_compile(cond);
                         self.bytecode.extend(cond_bc);
                         let jmpf_target = branch_start_labels[i].unwrap_or(end_label);
-                        bb.emit_jump_to(jmpf_target, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+                        bb.emit_jump_to(
+                            jmpf_target,
+                            BbJumpKind::JumpIfFalse,
+                            self.bytecode.il_mut(),
+                        );
                     }
 
                     // Body after cond+JMPF so Print/nested control-flow offsets stay correct.
@@ -9972,7 +9807,11 @@ impl Compiler {
                     // branch except the last. The last branch falls
                     // through to `end_pos`.
                     if i + 1 < branches.len() {
-                        bb.emit_jump_to(end_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                        bb.emit_jump_to(
+                            end_label,
+                            BbJumpKind::Unconditional,
+                            self.bytecode.il_mut(),
+                        );
                     }
                 }
 
@@ -10006,13 +9845,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Lt",
-                    "lt",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Lt", "lt") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10043,13 +9876,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Gt",
-                    "gt",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Gt", "gt") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10080,13 +9907,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Le",
-                    "le",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Le", "le") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10117,13 +9938,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Ge",
-                    "ge",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Ge", "ge") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10154,13 +9969,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Eq",
-                    "eq",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Eq", "eq") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10174,14 +9983,8 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::LogNot));
             }
             Expression::Negate(lhs) => {
-                if self.try_emit_matrix_op(
-                    &mut bytecode,
-                    self_id,
-                    span.start,
-                    span.end,
-                    lhs,
-                    None,
-                ) {
+                if self.try_emit_matrix_op(&mut bytecode, self_id, span.start, span.end, lhs, None)
+                {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else if self.try_emit_aggregate_arith(
@@ -10227,7 +10030,7 @@ impl Compiler {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
-                    Self::emit_raw_string_literal(&mut bytecode, "%s%s");
+                    self.emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
                     bytecode.append(&mut self.do_compile(rhs));
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
@@ -10330,40 +10133,41 @@ impl Compiler {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
-                // Prefer trait/`Mul` dictionary dispatch over primitive
-                // `x * 2^n` → SHL when the checker recorded a bound operator
-                // (non-primitive `T * 2^n` must not emit int SHL).
-                // `try_emit_folded_expr` also const-folds literal×literal and
-                // identity-reduces `* 1` before bound/primitive fallback.
-                let bound_mul = self_id
-                    .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| {
-                        self.checker
-                            .bound_operator_call_for_span(span.start, span.end)
-                    })
-                    .cloned();
-                if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
-                    // Intentional empty body: the emit/try_emit call in the
-                    // condition already wrote bytecode as a side effect.
-                } else if let Some(hint) = bound_mul
-                    && self.emit_bound_operator_call(
-                        &mut bytecode,
-                        lhs,
-                        rhs,
-                        hint.dict_index,
-                        hint.method_slot,
-                    )
-                {
-                    // Intentional empty body: the emit/try_emit call in the
-                    // condition already wrote bytecode as a side effect.
-                } else {
-                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                    bytecode.push(Byte::new(if is_float {
-                        Instruction::MULF
+                    // Prefer trait/`Mul` dictionary dispatch over primitive
+                    // `x * 2^n` → SHL when the checker recorded a bound operator
+                    // (non-primitive `T * 2^n` must not emit int SHL).
+                    // `try_emit_folded_expr` also const-folds literal×literal and
+                    // identity-reduces `* 1` before bound/primitive fallback.
+                    let bound_mul = self_id
+                        .and_then(|id| self.checker.bound_operator_call_at(id))
+                        .or_else(|| {
+                            self.checker
+                                .bound_operator_call_for_span(span.start, span.end)
+                        })
+                        .cloned();
+                    if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
+                        // Intentional empty body: the emit/try_emit call in the
+                        // condition already wrote bytecode as a side effect.
+                    } else if let Some(hint) = bound_mul
+                        && self.emit_bound_operator_call(
+                            &mut bytecode,
+                            lhs,
+                            rhs,
+                            hint.dict_index,
+                            hint.method_slot,
+                        )
+                    {
+                        // Intentional empty body: the emit/try_emit call in the
+                        // condition already wrote bytecode as a side effect.
                     } else {
-                        Instruction::MUL
-                    }));
-                }
+                        let is_float =
+                            likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                        bytecode.push(Byte::new(if is_float {
+                            Instruction::MULF
+                        } else {
+                            Instruction::MUL
+                        }));
+                    }
                 }
             }
             Expression::Mod(lhs, rhs) => {
@@ -10494,13 +10298,7 @@ impl Compiler {
                 {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if self.emit_concrete_operator_call(
-                    &mut bytecode,
-                    lhs,
-                    rhs,
-                    "Eq",
-                    "ne",
-                ) {
+                } else if self.emit_concrete_operator_call(&mut bytecode, lhs, rhs, "Eq", "ne") {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
                 } else {
@@ -10541,18 +10339,7 @@ impl Compiler {
                 //         )
                 //     }
                 // }
-                let idx = bytecode.len();
-
-                let mut count = 0;
-
-                escaped.chars().inspect(|_| count += 1).for_each(|ch| {
-                    bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                });
-
-                bytecode.insert(
-                    idx,
-                    Byte::new(Instruction::STRING).with_operand_u32(count as u32),
-                );
+                self.emit_raw_string_literal(&mut bytecode, &escaped);
             }
             Expression::Variable(name, _ty) => {
                 if unlikely(self.context.variables.contains(&name.to_string())) {
@@ -10594,9 +10381,7 @@ impl Compiler {
                     let fqn = format!("{}::{}", owner, member);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
                         self.append_binding_rhs(&mut bytecode, value);
-                        bytecode.push(
-                            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
-                        );
+                        bytecode.push(Byte::new(Instruction::StoreStatic).with_operand_u32(slot));
                     }
                 }
                 Expression::Construct {
@@ -10607,9 +10392,7 @@ impl Compiler {
                     let fqn = format!("{}::{}", enum_name, variant_name);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
                         self.append_binding_rhs(&mut bytecode, value);
-                        bytecode.push(
-                            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
-                        );
+                        bytecode.push(Byte::new(Instruction::StoreStatic).with_operand_u32(slot));
                     }
                 }
                 Expression::Access(target_expr, field) => {
@@ -10655,58 +10438,58 @@ impl Compiler {
                             Byte::new(Instruction::StoreStatic).with_operand_u32(static_slot),
                         );
                     } else {
-                    self.context.assignments.insert(name.to_string(), true);
-                    let symbol_opt = if let Some(map) = &self.context.match_bindings {
-                        if let Some(&slot) = map.get(*name) {
-                            Some(slot as usize)
+                        self.context.assignments.insert(name.to_string(), true);
+                        let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                            if let Some(&slot) = map.get(*name) {
+                                Some(slot as usize)
+                            } else {
+                                self.context.variables.key(&name.to_string())
+                            }
                         } else {
                             self.context.variables.key(&name.to_string())
-                        }
-                    } else {
-                        self.context.variables.key(&name.to_string())
-                    };
+                        };
 
-                    if let Some(symbol) = symbol_opt {
-                        if unlikely(self.context.constants.contains_key(&symbol)) {
-                            let assigned = likely(*self.context.constants.get(&symbol).unwrap());
-                            if !assigned {
-                                self.context.constants.entry(symbol).and_modify(|state| {
-                                    *state = true;
-                                });
-                            } else {
-                                let mut message = Message::error(
-                                    ErrorCode::InvalidAssignment,
-                                    "Assignment error".to_string(),
-                                    span.into_range(),
-                                );
-                                message.push(DiagLabel::new(
-                                    format!(
-                                        "Unable to assign to an already assigned constant '{}'",
-                                        name
-                                    ),
-                                    span.into_range(),
-                                ));
-                                self.messages.push(message);
+                        if let Some(symbol) = symbol_opt {
+                            if unlikely(self.context.constants.contains_key(&symbol)) {
+                                let assigned =
+                                    likely(*self.context.constants.get(&symbol).unwrap());
+                                if !assigned {
+                                    self.context.constants.entry(symbol).and_modify(|state| {
+                                        *state = true;
+                                    });
+                                } else {
+                                    let mut message = Message::error(
+                                        ErrorCode::InvalidAssignment,
+                                        "Assignment error".to_string(),
+                                        span.into_range(),
+                                    );
+                                    message.push(DiagLabel::new(
+                                        format!(
+                                            "Unable to assign to an already assigned constant '{}'",
+                                            name
+                                        ),
+                                        span.into_range(),
+                                    ));
+                                    self.messages.push(message);
+                                }
                             }
+                            self.append_binding_rhs(&mut bytecode, value);
+                            bytecode.push_store_pop(symbol as u32);
+                        } else {
+                            let mut message = Message::error(
+                                ErrorCode::UnknownValue,
+                                "Undefined variable".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!(
+                                    "Unable to assign to a non-existing variable/constant '{}'",
+                                    name
+                                ),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
                         }
-                        self.append_binding_rhs(&mut bytecode, value);
-                        bytecode
-                            .push_store_pop(symbol as u32);
-                    } else {
-                        let mut message = Message::error(
-                            ErrorCode::UnknownValue,
-                            "Undefined variable".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(DiagLabel::new(
-                            format!(
-                                "Unable to assign to a non-existing variable/constant '{}'",
-                                name
-                            ),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
-                    }
                     }
                 }
                 _ => {
@@ -10743,8 +10526,7 @@ impl Compiler {
                     self.bytecode.append(&mut bc);
                     self.bytecode.push(Byte::new(Instruction::FfiLoad));
                     self.emit_result_unwrap_or_panic();
-                    self.bytecode
-                        .push_store_pop(lib_slot);
+                    self.bytecode.push_store_pop(lib_slot);
                 }
                 // 3. For each declared function, emit declare(lib,
                 //    name, (arg_tags...), ret) and store fn id.
@@ -10760,9 +10542,7 @@ impl Compiler {
                     };
                     // Key fixed-arity overloads; keep bare name for
                     // single decls and for C-varargs (not overload members).
-                    let table_name = if !decl.variadic
-                        && self.checker.is_overloaded(decl.name)
-                    {
+                    let table_name = if !decl.variadic && self.checker.is_overloaded(decl.name) {
                         overload_fn_key(&fn_name, nfixed, false)
                     } else {
                         fn_name.clone()
@@ -10774,8 +10554,7 @@ impl Compiler {
                     let fn_id_slot_name = format!("__ext_fn_{}", table_name);
                     let fn_id_slot = self.context.variables.intern(fn_id_slot_name) as u32;
                     // Push the library handle.
-                    self.bytecode
-                        .push_load(lib_slot);
+                    self.bytecode.push_load(lib_slot);
                     // Push the function name (string literal).
                     let span: SimpleSpan = (0..0).into();
                     let sym = decl.symbol.unwrap_or(decl.name);
@@ -10827,8 +10606,7 @@ impl Compiler {
                         }
                     }
                     let arity = arg_type_tags.len() as u32;
-                    self.bytecode
-                        .push_make_tuple(arity);
+                    self.bytecode.push_make_tuple(arity);
                     // Push the ret type tag (top of stack for DeclareFFI).
                     let (ret_tag, ret_aux) = decl
                         .returns
@@ -10845,8 +10623,7 @@ impl Compiler {
                         .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
                     self.emit_result_unwrap_or_panic();
                     // Store the function id.
-                    self.bytecode
-                        .push_store_pop(fn_id_slot);
+                    self.bytecode.push_store_pop(fn_id_slot);
                     self.extern_runtime_functions
                         .insert(table_name, (lib_slot, fn_id_slot));
                 }
@@ -10956,9 +10733,7 @@ impl Compiler {
                     if matches!(fields, EnumConstructPayload::Unit)
                         && let Some(slot) = self.checker.static_slot_index(&fqn)
                     {
-                        bytecode.push(
-                            Byte::new(Instruction::LoadStatic).with_operand_u32(slot),
-                        );
+                        bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(slot));
                         return bytecode;
                     }
                     // `Class::static_method(...)` — same surface as enum
@@ -10974,10 +10749,8 @@ impl Compiler {
                                 // Record form is a type error for static
                                 // methods; still emit a CALL for recovery.
                                 bytecode.push(
-                                    Byte::new(Instruction::CALL).with_call_packed(
-                                        parts.len() as u32,
-                                        offset as u32,
-                                    ),
+                                    Byte::new(Instruction::CALL)
+                                        .with_call_packed(parts.len() as u32, offset as u32),
                                 );
                                 return bytecode;
                             }
@@ -10985,8 +10758,7 @@ impl Compiler {
                         let arity =
                             self.emit_call_args_with_rest(&fqn, arg_slice, &mut bytecode, false);
                         bytecode.push(
-                            Byte::new(Instruction::CALL)
-                                .with_call_packed(arity, offset as u32),
+                            Byte::new(Instruction::CALL).with_call_packed(arity, offset as u32),
                         );
                         return bytecode;
                     }
@@ -11005,10 +10777,7 @@ impl Compiler {
                     }
                     return bytecode;
                 };
-                let arity = self
-                    .checker
-                    .arity_for(enum_name, variant_name)
-                    .unwrap_or(0);
+                let arity = self.checker.arity_for(enum_name, variant_name).unwrap_or(0);
 
                 // Emit args in reverse declaration order for MAKE_ENUM stack discipline.
                 match fields {
@@ -11073,7 +10842,8 @@ impl Compiler {
                         let is_last_group = g_idx == tag_groups.len() - 1;
                         if !is_last_group || any_multi_arm_group {
                             let first_arm_idx = group.arm_indices[0];
-                            arm_labels[first_arm_idx] = Some(bb.fresh_label(self.bytecode.il_mut()));
+                            arm_labels[first_arm_idx] =
+                                Some(bb.fresh_label(self.bytecode.il_mut()));
                         }
                     }
 
@@ -11578,7 +11348,11 @@ impl Compiler {
                         // `end_label`. This is patched when we
                         // bind `end_label` below.
                         if !is_first {
-                            bb.emit_jump_to(end_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                            bb.emit_jump_to(
+                                end_label,
+                                BbJumpKind::Unconditional,
+                                self.bytecode.il_mut(),
+                            );
                         }
                     }
 
@@ -11713,10 +11487,9 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(expr));
                 let src_ty = self.codegen_expr_ty(expr);
                 let dst_name = primitive_name_from_type_ann(ty_ann);
-                if let (Some(from), Some(to)) = (
-                    src_ty.as_ref().and_then(primitive_type_name),
-                    dst_name,
-                ) {
+                if let (Some(from), Some(to)) =
+                    (src_ty.as_ref().and_then(primitive_type_name), dst_name)
+                {
                     if from != to {
                         if let Some(op) = primitive_cast_opcode(from, to) {
                             bytecode.push(Byte::new(op));
@@ -11788,14 +11561,17 @@ impl Compiler {
                     .as_ref()
                     .is_some_and(|ty| self.checker.ty_is_class(ty));
                 let enum_field_index = if !is_record && !is_class {
-                    inner_ty.as_ref().and_then(extract_enum_name).and_then(|name| {
-                        if self.checker.is_class(&name) {
-                            return None;
-                        }
-                        self.checker
-                            .field_index_for(&name, field)
-                            .map(|(_variant, idx)| idx)
-                    })
+                    inner_ty
+                        .as_ref()
+                        .and_then(extract_enum_name)
+                        .and_then(|name| {
+                            if self.checker.is_class(&name) {
+                                return None;
+                            }
+                            self.checker
+                                .field_index_for(&name, field)
+                                .map(|(_variant, idx)| idx)
+                        })
                 } else {
                     None
                 };
@@ -11805,7 +11581,9 @@ impl Compiler {
                     if let Some(&slot) = self.field_key_slots.get(*field) {
                         self.bytecode.push_load(slot);
                     } else {
-                        Self::emit_raw_string_literal(&mut self.bytecode, field);
+                        let idx = self.intern_string(field);
+                        self.bytecode
+                            .push(Byte::new(Instruction::STRING).with_operand_u32(idx));
                     }
                     self.bytecode.push_get_field();
                 } else {
@@ -11882,6 +11660,8 @@ impl Compiler {
         // (still just the CALL/JMP/HALT prologue).
         if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
             self.constants.clear();
+            self.strings.clear();
+            self.string_indices.clear();
         }
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
@@ -11895,7 +11675,8 @@ impl Compiler {
         // ID pre-walk / typecheck (see `attrs::expand_program`).
         let expand = attrs::expand_program(ast);
         self.messages.extend(expand.messages);
-        self.decorated_class_ctors.extend(expand.decorated_class_ctors);
+        self.decorated_class_ctors
+            .extend(expand.decorated_class_ctors);
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the
@@ -11933,10 +11714,7 @@ impl Compiler {
             .expect("capture_il requested")
     }
 
-    fn finalize_bytecode_inner(
-        &mut self,
-        capture_il: bool,
-    ) -> Option<crate::dissect::IlSnapshot> {
+    fn finalize_bytecode_inner(&mut self, capture_il: bool) -> Option<crate::dissect::IlSnapshot> {
         // Splice static initializers into the IL before lower — no absolute
         // target bumping required for symbolic jumps.
         let static_init_region = if !self.static_init_bytecode.is_empty() {
@@ -12216,12 +11994,17 @@ mod tests {
         let mut machine = machine::Machine::<256>::default();
         pipeline.wire_host_natives(&mut machine);
         machine.set_program_debug(pipeline.program_debug());
-        machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+        machine.run_raw(
+            &bytecode,
+            &constants,
+            pipeline.strings(),
+            pipeline.static_slot_count(),
+        );
     }
 
     #[test]
     fn two_module_and_class_static_assignments_run() {
-        use common::{ArchivedProgram, ARCHIVE_VERSION};
+        use common::{ARCHIVE_VERSION, ArchivedProgram};
         use rkyv::rancor::Error;
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12238,23 +12021,26 @@ mod tests {
             version: ARCHIVE_VERSION,
             static_slot_count: pipeline.static_slot_count(),
             constants: constants.clone(),
+            strings: pipeline.strings().to_vec(),
             bytecode: bytecode.clone(),
             source_files: pipeline.program_debug().source_files,
             debug_locs: pipeline.program_debug().debug_locs,
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
-        let archived =
-            rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice()).expect("access");
+        let archived = rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice())
+            .expect("access");
         let loaded_bc: Vec<Byte> =
             rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode).expect("bc");
         let loaded_constants: Vec<u64> =
             rkyv::deserialize::<Vec<u64>, Error>(&archived.constants).expect("consts");
+        let loaded_strings: Vec<String> =
+            rkyv::deserialize::<Vec<String>, Error>(&archived.strings).expect("strings");
         let static_slots = u32::from(archived.static_slot_count);
 
         let mut machine = machine::Machine::<256>::default();
         pipeline.wire_vm_ffi(&mut machine, Some(path.as_path()));
         pipeline.wire_host_natives(&mut machine);
-        machine.run_raw(&loaded_bc, &loaded_constants, static_slots);
+        machine.run_raw(&loaded_bc, &loaded_constants, &loaded_strings, static_slots);
     }
 
     /// `test("…")` cases become `__zs_test_N` functions; standalone runs get a virtual `main`.
@@ -12288,11 +12074,13 @@ test("two") { assert(true)?; }
 
         // Peephole relocates test_cases offsets to match fused function entries.
         assert_eq!(
-            compiler.test_cases()[0].1, syn0 as u32,
+            compiler.test_cases()[0].1,
+            syn0 as u32,
             "test_cases[0] must track peephole relocation of __zs_test_0"
         );
         assert_eq!(
-            compiler.test_cases()[1].1, syn1 as u32,
+            compiler.test_cases()[1].1,
+            syn1 as u32,
             "test_cases[1] must track peephole relocation of __zs_test_1"
         );
 
@@ -12638,7 +12426,7 @@ fn main() {
     }
 
     /// `x ** 0` folds to const 1.
-    
+
     #[test]
     fn dict_hot_loop_hoists_field_name_strings() {
         use common::Instruction;
@@ -12657,19 +12445,28 @@ fn main() {
             "#,
         );
         // Count STRING ops after the loop header fuse (BinSlotImmJmpf).
-        let jmpf = bc.iter().position(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf));
+        let jmpf = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf));
         let Some(j) = jmpf else {
             panic!("no loop header");
         };
-        let latch = bc.iter().rposition(|b| matches!(b.bytecode(), Instruction::JMP)).unwrap();
+        let latch = bc
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::JMP))
+            .unwrap();
         let strings_in_loop = bc[j..=latch]
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STRING))
             .count();
         assert_eq!(
-            strings_in_loop, 0,
+            strings_in_loop,
+            0,
             "field-name STRING should be hoisted out of loop; slice={:?}",
-            bc[j..=latch].iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            bc[j..=latch]
+                .iter()
+                .map(|b| b.bytecode())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -12711,9 +12508,7 @@ fn main() {
     #[test]
     fn for_in_array_hoists_array_len_out_of_loop() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { for x in [1, 2, 3] { print \"%i\", x; } }",
-        );
+        let (bc, _pool) = compile_src("fn main() { for x in [1, 2, 3] { print \"%i\", x; } }");
         let len_at = bc
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::ArrayLen))
@@ -12805,9 +12600,7 @@ fn main() {
     /// `const K = 16; x * K` must consult `const_env` and emit `<< 4`.
     #[test]
     fn mul_by_const_power_of_two_emits_shl() {
-        let (bc, _pool) = compile_src(
-            "fn scale(int x) -> int { const K = 16; return x * K; }",
-        );
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { const K = 16; return x * K; }");
         assert!(
             bytecode_has_shl_by(&bc, 4),
             "expected SHL (shift 4) for x*const(16); opcodes: {:?}",
@@ -12871,9 +12664,7 @@ fn main() {
     /// Type aliases to `int` expand at check time, so `I * 8` still SHLs.
     #[test]
     fn aliased_int_mul_by_power_of_two_emits_shl() {
-        let (bc, _pool) = compile_src(
-            "type I = int; fn scale(I x) -> I { return x * 8; }",
-        );
+        let (bc, _pool) = compile_src("type I = int; fn scale(I x) -> I { return x * 8; }");
         assert!(
             bytecode_has_shl_by(&bc, 3),
             "expected SHL for aliased int*8; opcodes: {:?}",
@@ -12909,8 +12700,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src("\"a\" + \"b\";");
 
-        let folded_string = bc.iter().any(|b| matches!(b.bytecode(), Instruction::STRING));
-        let via_format = bc.iter().any(|b| matches!(b.bytecode(), Instruction::FORMAT));
+        let folded_string = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::STRING));
+        let via_format = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::FORMAT));
         assert!(
             folded_string || via_format,
             "expected folded STRING or FORMAT for string concat; opcodes: {:?}",
@@ -13030,9 +12825,6 @@ fn main() {
         assert_eq!(tag, 1, "expected tag=1 (Some)");
         assert_eq!(arity, 1, "expected arity=1 for Some(int)");
     }
-
-
-
 
     /// Codegen test 2: a `match` with multiple constructor arms
     /// emits a cascade of `JUMP_IF_MATCH` instructions
@@ -13179,8 +12971,11 @@ fn main() {
             .filter(|b| {
                 matches!(
                     b.bytecode(),
-                    Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
-                        | Instruction::BinSlotSlotJmpf | Instruction::LogNotJmpf
+                    Instruction::JMPF
+                        | Instruction::CmpJmpf
+                        | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf
+                        | Instruction::LogNotJmpf
                 )
             })
             .count()
@@ -13220,7 +13015,6 @@ fn main() {
         }
         None
     }
-
 
     #[test]
     fn fib_compiles_with_fused_superinstructions() {
@@ -13494,8 +13288,11 @@ fn main() {
             .position(|b| {
                 matches!(
                     b.bytecode(),
-                    Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
-                        | Instruction::BinSlotSlotJmpf | Instruction::LogNotJmpf
+                    Instruction::JMPF
+                        | Instruction::CmpJmpf
+                        | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf
+                        | Instruction::LogNotJmpf
                 )
             })
             .expect("loop should emit an exit branch");
@@ -13578,9 +13375,7 @@ sum = sum + i; \
     #[test]
     fn for_in_array_emits_array_len_index_and_back_edge() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { for x in [1, 2, 3] { print \"%i\", x; } }",
-        );
+        let (bc, _pool) = compile_src("fn main() { for x in [1, 2, 3] { print \"%i\", x; } }");
         let has_len = bc
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::ArrayLen));
@@ -13593,15 +13388,17 @@ sum = sum + i; \
             .count();
         assert!(has_len, "array for-in should emit ArrayLen");
         assert!(has_index, "array for-in should emit Index");
-        assert!(jmp >= 1, "array for-in should emit back-edge JMP; got {jmp}");
+        assert!(
+            jmp >= 1,
+            "array for-in should emit back-edge JMP; got {jmp}"
+        );
     }
 
     #[test]
     fn for_in_dict_emits_dict_entries() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { let d = { a: 1, b: 2 }; for p in d { print \"%i\", p[1]; } }",
-        );
+        let (bc, _pool) =
+            compile_src("fn main() { let d = { a: 1, b: 2 }; for p in d { print \"%i\", p[1]; } }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::DictEntries)),
@@ -13668,12 +13465,7 @@ fn main() { for x in counter() { print \"%i\", x; } }",
             .count();
         let jmpf = bc
             .iter()
-            .filter(|b| {
-                matches!(
-                    b.bytecode(),
-                    Instruction::JMPF | Instruction::LogNotJmpf
-                )
-            })
+            .filter(|b| matches!(b.bytecode(), Instruction::JMPF | Instruction::LogNotJmpf))
             .count();
         let jmp = bc
             .iter()
@@ -14734,9 +14526,9 @@ fn main() {
  print \"%i\", add(x, y, z); \
  }",
         );
-        let packed = bc.iter().find(|b| {
-            matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3
-        });
+        let packed = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3);
         let packed = packed.expect("expected one LOAD with n=3 for add(x,y,z) arg prep");
         let (n, s0, s1, s2) = packed.load_store_parts();
         assert_eq!(n, 3, "packed LOAD must carry three slots");
@@ -14809,24 +14601,20 @@ fn main() {
             "expected at least 1 STORE_POP for `x = 10;` re-assignment; got {}",
             store_pop_count
         );
-
     }
 
     /// Scalar `const` at use sites folds through codegen (no LOAD of binding).
     #[test]
     fn const_scalar_folds_add_to_single_const() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { const x = 5; print \"%i\", x + 5; }",
-        );
+        let (bc, _pool) = compile_src("fn main() { const x = 5; print \"%i\", x + 5; }");
         let const_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::CONST))
             .count();
         assert!(
             bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CONST)
-                    && b.operand_u32() as i32 == 10
+                matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 10
             }),
             "expected folded CONST 10 for `const x = 5; x + 5`"
         );
@@ -14837,9 +14625,8 @@ fn main() {
     #[test]
     fn const_if_strict_lt_does_not_take_then_branch() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
-        );
+        let (bc, _pool) =
+            compile_src("fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "both branches constant-folded; expected only else body"
@@ -14850,9 +14637,8 @@ fn main() {
     #[test]
     fn const_if_emits_only_taken_branch() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { if 4 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
-        );
+        let (bc, _pool) =
+            compile_src("fn main() { if 4 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `if 4 < 5` should not emit JMPF; opcodes: {:?}",
@@ -14872,7 +14658,8 @@ return sum_to(n - 1, acc + n); \
 fn main() { print \"%i\", sum_to(5, 0); }",
         );
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::TailCall)),
             "expected TailCall in tail-recursive sum_to"
         );
     }
@@ -15044,13 +14831,11 @@ fn main() { print \"%i\", add(3, 4); }",
         use crate::il::IlOp;
         use common::{Byte, Instruction};
         let ops = vec![
-            IlOp::byte(
-                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
-                    Instruction::ADD as u8,
-                    0,
-                    1,
-                ),
-            ),
+            IlOp::byte(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::ADD as u8,
+                0,
+                1,
+            )),
             IlOp::byte(Byte::new(Instruction::RETURN)),
         ];
         assert!(Compiler::is_tiny_inline_il(&ops));
@@ -15059,19 +14844,16 @@ fn main() { print \"%i\", add(3, 4); }",
     #[test]
     fn remap_bin_slot_for_inline_rewrites_slots() {
         use common::{Byte, Instruction};
-        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 0, 3);
-        let remapped =
-            Compiler::remap_bin_slot_for_inline(&imm, &[10]).expect("remap BinSlotImm");
+        let imm =
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 0, 3);
+        let remapped = Compiler::remap_bin_slot_for_inline(&imm, &[10]).expect("remap BinSlotImm");
         let (op, slot, val) = remapped.bin_slot_imm_parts();
         assert_eq!(op, Instruction::ADD as u8);
         assert_eq!(slot, 10);
         assert_eq!(val, 3);
 
-        let slot_slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
-            Instruction::SUB as u8,
-            0,
-            1,
-        );
+        let slot_slot =
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::SUB as u8, 0, 1);
         let remapped =
             Compiler::remap_bin_slot_for_inline(&slot_slot, &[7, 9]).expect("remap BinSlotSlot");
         let (op, a, b) = remapped.bin_slot_slot_parts();
@@ -15084,8 +14866,6 @@ fn main() { print \"%i\", add(3, 4); }",
             "slot past arity must fail closed"
         );
     }
-
-
 
     /// Early-return diamond bodies ARE tiny-inlined (Phase 4a): one compare+branch
     /// + base return + fall-through return, with no CALL left at the call site.
@@ -15248,9 +15028,8 @@ fn main() { print \"%i\", add(3, 4); }",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
-            bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2
-            }),
+            bc.iter()
+                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2 }),
             "expected CALL sink with arity 2"
         );
     }
@@ -15289,7 +15068,9 @@ fn main() { print \"%i\", add(3, 4); }",
         );
         // At least one cmp-jmp must be followed (later) by a CALL — the peeled site.
         let has_cmp_before_call = cmp_jmps.iter().any(|&ci| {
-            bc[ci + 1..].iter().any(|b| matches!(b.bytecode(), Instruction::CALL))
+            bc[ci + 1..]
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL))
         });
         assert!(
             has_cmp_before_call,
@@ -15322,17 +15103,16 @@ print \"%i\", s; \
     #[test]
     fn const_if_strict_lt_equality_takes_else() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
-        );
+        let (bc, _pool) =
+            compile_src("fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `if 5 < 5` should not emit JMPF"
         );
         // Taken else prints 0 — must see CONST 0 (or ConstReturnImm), not only CONST 1.
-        let has_zero = bc.iter().any(|b| {
-            matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 0
-        });
+        let has_zero = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 0);
         assert!(
             has_zero,
             "else branch for `5 < 5` should emit CONST 0; opcodes: {:?}",
@@ -15344,9 +15124,8 @@ print \"%i\", s; \
     #[test]
     fn const_while_false_eliminates_loop() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn main() { while false { print \"%i\", 1; } print \"%i\", 2; }",
-        );
+        let (bc, _pool) =
+            compile_src("fn main() { while false { print \"%i\", 1; } print \"%i\", 2; }");
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `while false` should not emit JMPF; opcodes: {:?}",
@@ -15399,7 +15178,8 @@ return tick(n - 1); \
 fn main() { let h = tick(2); print \"%i\", resume h; }",
         );
         assert!(
-            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::TailCall)),
             "coroutines must not use TailCall"
         );
     }
@@ -15661,12 +15441,7 @@ print \"%i\", len(a); \
         // Pre-18B replaced the inner record with a single POP.
         let unpack_count = bc
             .iter()
-            .filter(|b| {
-                matches!(
-                    b.bytecode(),
-                    Instruction::Unpack | Instruction::UnpackAt
-                )
-            })
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack | Instruction::UnpackAt))
             .count();
         assert!(
             unpack_count >= 1,
@@ -15700,7 +15475,10 @@ print \"%i\", len(a); \
             let ops = b.operand_u32();
             let slot = ops & 0xFFFF;
             let arity = ops >> 16;
-            assert_eq!(arity, 2, "inner record arity must be in [31:16]; got {ops:#x}");
+            assert_eq!(
+                arity, 2,
+                "inner record arity must be in [31:16]; got {ops:#x}"
+            );
             // Outer has 2 fields; scratch starts at record_base + 2 (payload_base
             // is 0 for bare expression matches, 1 inside functions).
             assert!(
@@ -15745,12 +15523,7 @@ print \"%i\", len(a); \
         // so the depth-3 walk still reaches the record fields.
         let unpack_count = bc
             .iter()
-            .filter(|b| {
-                matches!(
-                    b.bytecode(),
-                    Instruction::Unpack | Instruction::UnpackAt
-                )
-            })
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack | Instruction::UnpackAt))
             .count();
         assert!(
             unpack_count >= 1,
@@ -16360,9 +16133,7 @@ fn main() { \
         // include the inner HostInvoke).
         let outer_const = bc[..outer_host]
             .iter()
-            .rposition(|b| {
-                matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 2
-            })
+            .rposition(|b| matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 2)
             .expect("outer read_to_end CONST(id=2) before outer HostInvoke");
         let inner_host = host_idxs
             .iter()
@@ -16512,8 +16283,8 @@ fn main() { \
     /// *inner* `HostInvoke` (not merely the first one).
     #[test]
     fn nested_generic_host_invoke_emits_outer_id_before_inner_invoke() {
-        use common::Instruction;
         use crate::typechecking::ty::int;
+        use common::Instruction;
 
         let mut ast = Pratt::default()
             .parse(
@@ -16545,9 +16316,7 @@ fn main() {
         let outer_host = *host_idxs.last().expect("outer HostInvoke");
         let outer_const = bc[..outer_host]
             .iter()
-            .rposition(|b| {
-                matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == outer_id
-            })
+            .rposition(|b| matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == outer_id)
             .expect("outer id CONST before outer HostInvoke");
         let inner_host = host_idxs
             .iter()
@@ -16582,9 +16351,7 @@ fn main() {
         // call_parts() = (arity, target).
         let call_idx = bc
             .iter()
-            .rposition(|b| {
-                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2
-            })
+            .rposition(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2)
             .expect("expected CALL arity 2 for greet");
         // Walk backward from CALL over the two arg pushes: STRING then CONST.
         let mut saw_string = false;
@@ -17136,7 +16903,6 @@ fn main() {
         );
     }
 
-
     /// Failed diamond inline must not leave a JMP to PC 0 before peel/call fallback.
     #[test]
     fn diamond_inline_failure_does_not_emit_jmp_to_pc_zero() {
@@ -17154,9 +16920,7 @@ fn main() {
         let bad: Vec<_> = bc
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
-                matches!(b.bytecode(), Instruction::JMP) && b.operand_u32() == 0
-            })
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::JMP) && b.operand_u32() == 0)
             .map(|(i, _)| i)
             .collect();
         assert!(

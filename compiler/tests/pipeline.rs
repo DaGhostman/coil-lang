@@ -129,9 +129,14 @@ fn run_bytecode(
     machine.with_output(shared.clone());
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
     machine.set_program_debug(pipeline.program_debug());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     let _ = machine.restore_output();
     shared.into_utf8()
 }
@@ -210,7 +215,12 @@ fn main() {
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     assert!(machine.panicked(), "expected language-level panic");
     let _ = machine.restore_output();
     let s = shared.into_utf8();
@@ -853,10 +863,7 @@ fn polyfn_with_fib_keeps_fused_superinstructions() {
                 | Instruction::BinReturn
         )
     });
-    assert!(
-        has_arith,
-        "expected fib arithmetic with PolyFn present"
-    );
+    assert!(has_arith, "expected fib arithmetic with PolyFn present");
     let output = run_bytecode(bytecode, constants, &pipeline, None);
     // fib(6) = 8
     assert_eq!(output, "8");
@@ -929,8 +936,13 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared.clone());
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
 
     let _ = machine.restore_output();
     let output = shared.into_utf8();
@@ -955,7 +967,12 @@ fn fizbuz_runs_to_completion() {
     let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
 
     let _ = shared;
 }
@@ -980,8 +997,7 @@ fn let_binding_emits_store_pop_in_bytecode() {
     let binding_store_count = bytecode
         .iter()
         .filter(|b| {
-            matches!(b.bytecode(), Instruction::STORE)
-                && b.load_store_single_slot() == Some(0)
+            matches!(b.bytecode(), Instruction::STORE) && b.load_store_single_slot() == Some(0)
         })
         .count();
     assert_eq!(
@@ -1149,7 +1165,12 @@ fn example_let_chained_bindings_works() {
     let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared.clone());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
 
     let _ = machine.restore_output();
     let output = shared.into_utf8();
@@ -1302,12 +1323,7 @@ fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     {
         cmd.arg("-shared");
     }
-    let status = cmd
-        .arg("-O2")
-        .arg("-o")
-        .arg(&libsum)
-        .arg(&sum_c)
-        .status();
+    let status = cmd.arg("-O2").arg("-o").arg(&libsum).arg(&sum_c).status();
     match status {
         Ok(s) if s.success() => {
             if let Ok(meta) = std::fs::metadata(&libsum)
@@ -1347,9 +1363,7 @@ fn example_ffi_sum_via_dlopen_prints_42() {
 
     // Absolute dload path avoids cwd races in parallel tests.
     let full = workspace_root.join("examples/ffi_sum.hy");
-    let lib_abs = libsum
-        .canonicalize()
-        .unwrap_or_else(|_| libsum.clone());
+    let lib_abs = libsum.canonicalize().unwrap_or_else(|_| libsum.clone());
     let mut src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
     src = src.replace(
@@ -1548,7 +1562,12 @@ fn main() {
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
     machine.set_program_debug(pipeline.program_debug());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     assert!(
         machine.panicked(),
         "missing library should panic, not segfault"
@@ -2093,7 +2112,7 @@ fn attr_test_fn_discovered_by_harness() {
     for (_name, offset) in &cases {
         let mut machine = Machine::<128>::default();
         pipeline.wire_host_natives(&mut machine);
-        machine.load_program(&bytecode, &constants);
+        machine.load_program(&bytecode, &constants, pipeline.strings());
         let ret = machine.call_function(*offset, &[]);
         assert!(
             !machine.panicked() && machine.result_is_ok(ret),
@@ -2352,7 +2371,12 @@ fn main() {
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     assert!(machine.panicked(), "expected language-level panic on Err");
     let _ = machine.restore_output();
     let s = shared.into_utf8();
@@ -2414,7 +2438,12 @@ test("broken") {
     machine.with_output(shared.clone());
     pipeline.wire_host_natives(&mut machine);
     machine.set_program_debug(pipeline.program_debug());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     let _ = machine.restore_output();
     assert!(
         machine.panicked(),
@@ -2453,7 +2482,7 @@ test("c") { assert(1 + 1 == 2)?; }
     for (name, offset) in &cases {
         let mut machine = Machine::<128>::default();
         pipeline.wire_host_natives(&mut machine);
-        machine.load_program(&bytecode, &constants);
+        machine.load_program(&bytecode, &constants, pipeline.strings());
         let ret = machine.call_function(*offset, &[]);
         let ok = !machine.panicked() && machine.result_is_ok(ret);
         results.push((name.as_str(), ok));
@@ -2486,7 +2515,7 @@ test("after") { assert(true)?; }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut machine = Machine::<128>::default();
             pipeline.wire_host_natives(&mut machine);
-            machine.load_program(&bytecode, &constants);
+            machine.load_program(&bytecode, &constants, pipeline.strings());
             let ret = machine.call_function(*offset, &[]);
             !machine.panicked() && machine.result_is_ok(ret)
         }));
@@ -2752,7 +2781,6 @@ fn main() {
     // Pre-fix: e.code → LoadField(0) → kind (1), not code (42).
     assert_eq!(output, "421");
 }
-
 
 #[test]
 fn example_overload_prints_15() {
@@ -3781,7 +3809,11 @@ fn example_time_epoch_ok() {
 #[test]
 fn example_ansi_color_prints_red() {
     let output = run_example("examples/ansi_color.hy");
-    assert!(output.contains("red"), "expected visible 'red', got {:?}", output);
+    assert!(
+        output.contains("red"),
+        "expected visible 'red', got {:?}",
+        output
+    );
 }
 
 /// HostInvoke + virtual `crypto` wiring: empty SHA-256 digest length is 32.
@@ -3952,7 +3984,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "2-arg enable should fail to typecheck as Result");
+    assert!(
+        err.is_err(),
+        "2-arg enable should fail to typecheck as Result"
+    );
 }
 
 /// Third arg to client `enable` must be a record with `verify: bool`.
@@ -4143,7 +4178,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "server::encrypt must not resolve after rename");
+    assert!(
+        err.is_err(),
+        "server::encrypt must not resolve after rename"
+    );
 
     let err = pipeline.compile_src(
         r#"
@@ -4157,7 +4195,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "server::decrypt must not resolve after rename");
+    assert!(
+        err.is_err(),
+        "server::decrypt must not resolve after rename"
+    );
 }
 
 /// Same surface name `enable`, different opts records — cross-namespace misuse fails.
@@ -4310,7 +4351,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "unknown client opts key should fail to typecheck");
+    assert!(
+        err.is_err(),
+        "unknown client opts key should fail to typecheck"
+    );
 }
 
 #[cfg(feature = "tls")]
@@ -4445,7 +4489,8 @@ fn main() {
     );
     let msgs = pipeline.messages();
     assert!(
-        msgs.iter().any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch)),
+        msgs.iter()
+            .any(|m| m.code() == Some(compiler::ErrorCode::ReturnMismatch)),
         "expected ReturnMismatch; got {} messages",
         msgs.len()
     );
@@ -4743,7 +4788,11 @@ fn main() {
 }
 "#,
     );
-    assert!(result.is_ok(), "E0123 is a warning: {:?}", pipeline.messages());
+    assert!(
+        result.is_ok(),
+        "E0123 is a warning: {:?}",
+        pipeline.messages()
+    );
     assert!(
         pipeline
             .messages()
@@ -4770,7 +4819,11 @@ fn main() {
 }
 "#,
     );
-    assert!(result.is_ok(), "E0123 is a warning: {:?}", pipeline.messages());
+    assert!(
+        result.is_ok(),
+        "E0123 is a warning: {:?}",
+        pipeline.messages()
+    );
     assert!(
         pipeline
             .messages()
@@ -5098,9 +5151,10 @@ fn main() {
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
     assert!(
-        !bytecode
-            .iter()
-            .any(|b| matches!(b.bytecode(), common::Instruction::LogNot | common::Instruction::LogNotJmpf)),
+        !bytecode.iter().any(|b| matches!(
+            b.bytecode(),
+            common::Instruction::LogNot | common::Instruction::LogNotJmpf
+        )),
         "inverted if(!c) else should drop LogNot / LogNotJmpf"
     );
     assert_eq!(run_example_src(src), "10,20");

@@ -45,10 +45,7 @@ fn build_project(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "coil_ns_test_{}_{}_{}",
-        test_name, pid, nanos
-    ));
+    let tmp = std::env::temp_dir().join(format!("coil_ns_test_{}_{}_{}", test_name, pid, nanos));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp project dir");
 
@@ -86,11 +83,7 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     })
 }
 
-fn run_bytecode(
-    bytecode: Vec<common::Byte>,
-    constants: Vec<u64>,
-    pipeline: &Pipeline,
-) -> String {
+fn run_bytecode(bytecode: Vec<common::Byte>, constants: Vec<u64>, pipeline: &Pipeline) -> String {
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
@@ -98,9 +91,14 @@ fn run_bytecode(
     machine.set_shared_print(shared.inner.clone());
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
     machine.set_program_debug(pipeline.program_debug());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     let _ = machine.restore_output();
     let bytes = shared
         .inner
@@ -310,10 +308,7 @@ roots = ["./src"]
              impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
              fn main() { }\n",
         ),
-        (
-            "src/iface.hy",
-            "trait Foreign<T> { fn id(T x) -> int; }\n",
-        ),
+        ("src/iface.hy", "trait Foreign<T> { fn id(T x) -> int; }\n"),
     ];
     let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.hy");
     let msgs = compile_project_errors(&root, &entry);
@@ -401,10 +396,7 @@ roots = ["./src"]
     assert!(
         has_fused,
         "final-link fusion should leave fused ops; opcodes: {:?}",
-        bytecode
-            .iter()
-            .map(|b| b.bytecode())
-            .collect::<Vec<_>>()
+        bytecode.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
     );
 
     let output = run_bytecode(bytecode, constants, &pipeline);
@@ -561,10 +553,12 @@ roots = ["./src"]
     let _guard = CwdGuard(original_cwd);
 
     let capture = Capture::default();
-    let mut pipeline =
-        Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
+    let mut pipeline = Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
     let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
-    assert!(result.is_err(), "expected compile to fail on bad dependency");
+    assert!(
+        result.is_err(),
+        "expected compile to fail on bad dependency"
+    );
     let _ = pipeline.finish_reporting();
     let out = String::from_utf8_lossy(&capture.inner.lock().unwrap()).into_owned();
     assert!(
@@ -592,10 +586,7 @@ roots = ["./src"]
 [entry]
 file = "./src/main.hy"
 "#;
-    let files = &[(
-        "src/main.hy",
-        "fn main() { print \"%i\", 42; }\n",
-    )];
+    let files = &[("src/main.hy", "fn main() { print \"%i\", 42; }\n")];
     let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
 
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));

@@ -28,7 +28,10 @@ pub enum Instruction {
     JMP,
     JMPT,
     JMPF,
+    /// Index into [`crate::archive::ArchivedProgram::strings`] (v35+).
+    /// Pre-v35 archives used `STRING` + trailing `DATA` char words.
     STRING,
+    /// Tombstone: pre-v35 char payload after `STRING`. Never emitted by the compiler.
     DATA,
     INC,
     DEC,
@@ -673,8 +676,7 @@ impl Byte {
     /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
     pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
         debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
-        self.operands =
-            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        self.operands = ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
         self
     }
 
@@ -697,11 +699,7 @@ impl Byte {
     /// Slot count for packed LOAD/STORE (`n==0` → 1).
     pub fn load_store_count(&self) -> usize {
         let n = (self.operands >> 24) as u8;
-        if n == 0 {
-            1
-        } else {
-            n as usize
-        }
+        if n == 0 { 1 } else { n as usize }
     }
 
     /// Slot at index `i` within a packed LOAD/STORE (`i < load_store_count()`).
@@ -953,8 +951,7 @@ impl ArchivedByte {
     }
 
     pub fn with_bin_slot_slot_store(mut self, op: u8, a: u8, b: u8, dest: u8) -> Self {
-        let packed =
-            ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
+        let packed = ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8) | (dest as u32);
         self.operands = packed.into();
         self
     }
@@ -982,8 +979,7 @@ impl ArchivedByte {
     /// Packed LOAD/STORE: `[31:24]=n` (`1..=3`), `[23:16]=s2`, `[15:8]=s1`, `[7:0]=s0`.
     pub fn with_load_store_packed(mut self, n: u8, s0: u8, s1: u8, s2: u8) -> Self {
         debug_assert!((1..=3).contains(&n), "packed LOAD/STORE n must be 1..=3");
-        let packed =
-            ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
+        let packed = ((n as u32) << 24) | ((s2 as u32) << 16) | ((s1 as u32) << 8) | (s0 as u32);
         self.operands = packed.into();
         self
     }
@@ -1008,11 +1004,7 @@ impl ArchivedByte {
     pub fn load_store_count(&self) -> usize {
         let o: u32 = self.operands.into();
         let n = (o >> 24) as u8;
-        if n == 0 {
-            1
-        } else {
-            n as usize
-        }
+        if n == 0 { 1 } else { n as usize }
     }
 
     /// Slot at index `i` within a packed LOAD/STORE.
@@ -1107,11 +1099,7 @@ mod tests {
 
     #[test]
     fn bin_slot_imm_sign_extends_immediate() {
-        let b = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
-            Instruction::ADD as u8,
-            3,
-            -7,
-        );
+        let b = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 3, -7);
         let (op, slot, imm) = b.bin_slot_imm_parts();
         assert_eq!(op, Instruction::ADD as u8);
         assert_eq!(slot, 3);
@@ -1120,15 +1108,9 @@ mod tests {
 
     #[test]
     fn bin_slot_slot_and_cmp_jmpf_and_bin_return_pack() {
-        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
-            Instruction::MUL as u8,
-            1,
-            2,
-        );
-        assert_eq!(
-            slot.bin_slot_slot_parts(),
-            (Instruction::MUL as u8, 1, 2)
-        );
+        let slot =
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::MUL as u8, 1, 2);
+        assert_eq!(slot.bin_slot_slot_parts(), (Instruction::MUL as u8, 1, 2));
 
         let cmp = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(Instruction::EQ as u8, 99);
         assert_eq!(cmp.cmp_jmpf_parts(), (Instruction::EQ as u8, 99));
@@ -1144,10 +1126,7 @@ mod tests {
             0,
             4,
         );
-        assert_eq!(
-            j.bin_slot_imm_jmpf_parts(),
-            (Instruction::LEQ as u8, 0, 4)
-        );
+        assert_eq!(j.bin_slot_imm_jmpf_parts(), (Instruction::LEQ as u8, 0, 4));
 
         let n = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(12);
         assert_eq!(n.log_not_jmpf_target(), 12);
@@ -1170,10 +1149,7 @@ mod tests {
     #[test]
     fn mnemonic_covers_first_and_last_variants() {
         assert_eq!(Instruction::HALT.mnemonic(), "HALT");
-        assert_eq!(
-            Instruction::BinSlotSlotStore.mnemonic(),
-            "BinSlotSlotStore"
-        );
+        assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
     }
@@ -1185,10 +1161,7 @@ mod tests {
             1,
             7,
         );
-        assert_eq!(
-            j.bin_slot_slot_jmpf_parts(),
-            (Instruction::LE as u8, 1, 7)
-        );
+        assert_eq!(j.bin_slot_slot_jmpf_parts(), (Instruction::LE as u8, 1, 7));
 
         let cmp = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(Instruction::EQ as u8, 3);
         assert!(cmp.cmp_jmpf_is_pool());
@@ -1250,4 +1223,3 @@ mod tests {
         assert_eq!(wide.operand_u32() & 0x00FF_FFFF, 300);
     }
 }
-

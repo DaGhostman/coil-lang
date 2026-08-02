@@ -13,8 +13,7 @@ use common::{
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use reporting::{
-    Diagnostic, DiagnosticSink, ErrorCode, Message, ReportConfig, SourceId, SourceMap,
-    create_sink,
+    Diagnostic, DiagnosticSink, ErrorCode, Message, ReportConfig, SourceId, SourceMap, create_sink,
 };
 use rkyv::rancor::Error;
 
@@ -205,195 +204,203 @@ impl Pipeline {
             self.compiler.register_native_id(&name, id);
             let kind = *kind;
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    let v = match kind {
-                        // Stdio handles are `() -> Stream` (not Result).
-                        IoBuiltin::Stdin => stream_stdin(heap).unwrap_or_default(),
-                        IoBuiltin::Stdout => stream_stdout(heap).unwrap_or_default(),
-                        IoBuiltin::Stderr => stream_stderr(heap).unwrap_or_default(),
-                        IoBuiltin::Open => {
-                            let path = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let mode = match value_as_string(heap, args[1]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = stream_open(heap, &path, &mode);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::Close => {
-                            let r = stream_close(heap, args[0]);
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::Read => {
-                            let r = stream_read(heap, args[0], args[1]);
-                            as_result_option_int(heap, r)
-                        }
-                        IoBuiltin::Write => {
-                            let r = stream_write(heap, args[0], args[1]);
-                            as_result_int(heap, r)
-                        }
-                        IoBuiltin::ReadExact => {
-                            let r = stream_read_exact(heap, args[0], args[1]);
-                            as_result_option_int(heap, r)
-                        }
-                        IoBuiltin::ReadToEnd => {
-                            let r = stream_read_to_end(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::WriteAll => {
-                            let r = stream_write_all(heap, args[0], args[1]);
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::SetReadTimeout => {
-                            let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::SetWriteTimeout => {
-                            let r = stream_set_write_timeout(heap, args[0], args[1].as_int());
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::FromBytes => {
-                            let r = from_bytes(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::ToBytes => to_bytes(heap, args[0]),
-                        IoBuiltin::TcpConnect => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = tcp_connect(heap, &host, args[1].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpConnectTimeout => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r =
-                                tcp_connect_timeout(heap, &host, args[1].as_int(), args[2].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpListen => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = tcp_listen(heap, &host, args[1].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpAccept => {
-                            let r = tcp_accept(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpAcceptWait => {
-                            let r = tcp_accept_wait(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpAcceptWaitTimeout => {
-                            let r = tcp_accept_wait_timeout(heap, args[0], args[1].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpPeerAddr => {
-                            let r = tcp_peer_addr(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpLocalAddr => {
-                            let r = tcp_local_addr(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::TcpSetNodelay => {
-                            let r = tcp_set_nodelay(heap, args[0], args[1].as_bool());
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::TcpShutdown => {
-                            let r = tcp_shutdown(heap, args[0], args[1].as_int());
-                            as_result_unit(heap, r)
-                        }
-                        IoBuiltin::UdpBind => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = udp_bind(heap, &host, args[1].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::UdpConnect => {
-                            let host = match value_as_string(heap, args[0]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = udp_connect(heap, &host, args[1].as_int());
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::UdpSendTo => {
-                            let host = match value_as_string(heap, args[2]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = udp_send_to(heap, args[0], args[1], &host, args[3].as_int());
-                            as_result_int(heap, r)
-                        }
-                        IoBuiltin::UdpRecvFrom => {
-                            let r = udp_recv_from(heap, args[0], args[1]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::UdpRecvFromWait => {
-                            let r = udp_recv_from_wait(heap, args[0], args[1]);
-                            as_result_value(heap, r)
-                        }
-                        IoBuiltin::UdpLocalPort => {
-                            let r = udp_local_port(heap, args[0]).map(Value::from);
-                            as_result_value(heap, r)
-                        }
-                        #[cfg(feature = "tls")]
-                        IoBuiltin::TlsClientEnable => {
-                            let host = match value_as_string(heap, args[1]) {
-                                Ok(s) => s,
-                                Err(tag) => {
-                                    return Ok(Some(as_result_value(heap, Err(tag))));
-                                }
-                            };
-                            let r = tls_client_enable(heap, args[0], &host, args[2]);
-                            as_result_value(heap, r)
-                        }
-                        #[cfg(feature = "tls")]
-                        IoBuiltin::TlsClientDisable => {
-                            let r = tls_client_disable(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                        #[cfg(feature = "tls")]
-                        IoBuiltin::TlsServerEnable => {
-                            let r = tls_server_enable(heap, args[0], args[1]);
-                            as_result_value(heap, r)
-                        }
-                        #[cfg(feature = "tls")]
-                        IoBuiltin::TlsServerDisable => {
-                            let r = tls_server_disable(heap, args[0]);
-                            as_result_value(heap, r)
-                        }
-                    };
-                    Ok(Some(v))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| {
+                        let v = match kind {
+                            // Stdio handles are `() -> Stream` (not Result).
+                            IoBuiltin::Stdin => stream_stdin(heap).unwrap_or_default(),
+                            IoBuiltin::Stdout => stream_stdout(heap).unwrap_or_default(),
+                            IoBuiltin::Stderr => stream_stderr(heap).unwrap_or_default(),
+                            IoBuiltin::Open => {
+                                let path = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let mode = match value_as_string(heap, args[1]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = stream_open(heap, &path, &mode);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::Close => {
+                                let r = stream_close(heap, args[0]);
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::Read => {
+                                let r = stream_read(heap, args[0], args[1]);
+                                as_result_option_int(heap, r)
+                            }
+                            IoBuiltin::Write => {
+                                let r = stream_write(heap, args[0], args[1]);
+                                as_result_int(heap, r)
+                            }
+                            IoBuiltin::ReadExact => {
+                                let r = stream_read_exact(heap, args[0], args[1]);
+                                as_result_option_int(heap, r)
+                            }
+                            IoBuiltin::ReadToEnd => {
+                                let r = stream_read_to_end(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::WriteAll => {
+                                let r = stream_write_all(heap, args[0], args[1]);
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::SetReadTimeout => {
+                                let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::SetWriteTimeout => {
+                                let r = stream_set_write_timeout(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::FromBytes => {
+                                let r = from_bytes(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::ToBytes => to_bytes(heap, args[0]),
+                            IoBuiltin::TcpConnect => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_connect(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpConnectTimeout => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_connect_timeout(
+                                    heap,
+                                    &host,
+                                    args[1].as_int(),
+                                    args[2].as_int(),
+                                );
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpListen => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_listen(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpAccept => {
+                                let r = tcp_accept(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpAcceptWait => {
+                                let r = tcp_accept_wait(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpAcceptWaitTimeout => {
+                                let r = tcp_accept_wait_timeout(heap, args[0], args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpPeerAddr => {
+                                let r = tcp_peer_addr(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpLocalAddr => {
+                                let r = tcp_local_addr(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::TcpSetNodelay => {
+                                let r = tcp_set_nodelay(heap, args[0], args[1].as_bool());
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::TcpShutdown => {
+                                let r = tcp_shutdown(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoBuiltin::UdpBind => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = udp_bind(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::UdpConnect => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = udp_connect(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::UdpSendTo => {
+                                let host = match value_as_string(heap, args[2]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r =
+                                    udp_send_to(heap, args[0], args[1], &host, args[3].as_int());
+                                as_result_int(heap, r)
+                            }
+                            IoBuiltin::UdpRecvFrom => {
+                                let r = udp_recv_from(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::UdpRecvFromWait => {
+                                let r = udp_recv_from_wait(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            IoBuiltin::UdpLocalPort => {
+                                let r = udp_local_port(heap, args[0]).map(Value::from);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoBuiltin::TlsClientEnable => {
+                                let host = match value_as_string(heap, args[1]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tls_client_enable(heap, args[0], &host, args[2]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoBuiltin::TlsClientDisable => {
+                                let r = tls_client_disable(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoBuiltin::TlsServerEnable => {
+                                let r = tls_server_enable(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoBuiltin::TlsServerDisable => {
+                                let r = tls_server_disable(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                        };
+                        Ok(Some(v))
+                    },
+                )));
         }
     }
 
@@ -454,11 +461,11 @@ impl Pipeline {
                 Ok(Some(v))
             };
             let native = if kind == ThreadBuiltin::Spawn {
-                std::sync::Arc::new(HostClosureFn::new_with_arity_range(
-                    sig, 1, 2, closure,
-                )) as std::sync::Arc<dyn NativeFn>
+                std::sync::Arc::new(HostClosureFn::new_with_arity_range(sig, 1, 2, closure))
+                    as std::sync::Arc<dyn NativeFn>
             } else {
-                std::sync::Arc::new(HostClosureFn::new(sig, closure)) as std::sync::Arc<dyn NativeFn>
+                std::sync::Arc::new(HostClosureFn::new(sig, closure))
+                    as std::sync::Arc<dyn NativeFn>
             };
             self.host_natives.push(native);
         }
@@ -475,9 +482,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(host(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(host(heap, args))),
+                )));
         }
     }
 
@@ -493,9 +501,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(host(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(host(heap, args))),
+                )));
         }
     }
 
@@ -510,9 +519,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(host(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(host(heap, args))),
+                )));
         }
     }
 
@@ -528,9 +538,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(host(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(host(heap, args))),
+                )));
         }
     }
 
@@ -546,9 +557,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(host(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(host(heap, args))),
+                )));
         }
     }
 
@@ -558,12 +570,14 @@ impl Pipeline {
         machine: &mut machine::Machine<N>,
         bytecode: &[Byte],
         constants: &[u64],
+        strings: &[String],
     ) {
         use machine::thread::ThreadProgram;
         use std::sync::Arc;
         machine.set_thread_program(Arc::new(ThreadProgram {
             code: Arc::from(bytecode.to_vec()),
             constants: Arc::from(constants.to_vec()),
+            strings: Arc::from(strings.to_vec()),
             static_slot_count: self.static_slot_count(),
             debug: self.program_debug(),
         }));
@@ -579,15 +593,15 @@ impl Pipeline {
         use machine::char_ord::{prelude_char, prelude_hash_string, prelude_ord};
         use machine::{FfiSignature, FfiType, HostClosureFn};
 
-        let ord_sig =
-            FfiSignature::from_parts("ord".to_string(), vec![FfiType::Int], FfiType::Int)
-                .expect("ord signature");
+        let ord_sig = FfiSignature::from_parts("ord".to_string(), vec![FfiType::Int], FfiType::Int)
+            .expect("ord signature");
         let ord_id = self.host_natives.len();
         self.compiler.register_native_id("ord", ord_id);
         self.host_natives
-            .push(std::sync::Arc::new(HostClosureFn::new(ord_sig, |heap, args| {
-                Ok(Some(prelude_ord(heap, args)))
-            })));
+            .push(std::sync::Arc::new(HostClosureFn::new(
+                ord_sig,
+                |heap, args| Ok(Some(prelude_ord(heap, args))),
+            )));
 
         let char_sig =
             FfiSignature::from_parts("char".to_string(), vec![FfiType::Int], FfiType::Int)
@@ -595,20 +609,25 @@ impl Pipeline {
         let char_id = self.host_natives.len();
         self.compiler.register_native_id("char", char_id);
         self.host_natives
-            .push(std::sync::Arc::new(HostClosureFn::new(char_sig, |heap, args| {
-                Ok(Some(prelude_char(heap, args)))
-            })));
+            .push(std::sync::Arc::new(HostClosureFn::new(
+                char_sig,
+                |heap, args| Ok(Some(prelude_char(heap, args))),
+            )));
 
         // Internal: `Hash__string__hash` thunk — not a userland free function.
-        let hash_sig =
-            FfiSignature::from_parts("hash_string".to_string(), vec![FfiType::String], FfiType::Int)
-                .expect("hash_string signature");
+        let hash_sig = FfiSignature::from_parts(
+            "hash_string".to_string(),
+            vec![FfiType::String],
+            FfiType::Int,
+        )
+        .expect("hash_string signature");
         let hash_id = self.host_natives.len();
         self.compiler.register_native_id("hash_string", hash_id);
         self.host_natives
-            .push(std::sync::Arc::new(HostClosureFn::new(hash_sig, |heap, args| {
-                Ok(Some(prelude_hash_string(heap, args)))
-            })));
+            .push(std::sync::Arc::new(HostClosureFn::new(
+                hash_sig,
+                |heap, args| Ok(Some(prelude_hash_string(heap, args))),
+            )));
     }
 
     /// Approach A packed LA kernels via existing `HostInvoke` (no new opcodes —
@@ -619,7 +638,11 @@ impl Pipeline {
             packed_matmul, packed_matrix_neg, packed_matrix_zip,
         };
 
-        let specs: &[(&str, usize, fn(&mut machine::Heap, &[common::Value]) -> common::Value)] = &[
+        let specs: &[(
+            &str,
+            usize,
+            fn(&mut machine::Heap, &[common::Value]) -> common::Value,
+        )] = &[
             (PACKED_DOT, 3, packed_dot),
             (PACKED_MATMUL, 3, packed_matmul),
             (PACKED_MATRIX_ZIP, 3, packed_matrix_zip),
@@ -632,9 +655,10 @@ impl Pipeline {
             let id = self.host_natives.len();
             self.compiler.register_native_id(name, id);
             self.host_natives
-                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
-                    Ok(Some(kernel(heap, args)))
-                })));
+                .push(std::sync::Arc::new(HostClosureFn::new(
+                    sig,
+                    move |heap, args| Ok(Some(kernel(heap, args))),
+                )));
         }
     }
 
@@ -839,7 +863,11 @@ impl Pipeline {
             .emit(Diagnostic::warning(message.into()).with_code(code));
     }
 
-    fn emit_manifest_load_error(&mut self, project_root: &Path, err: crate::manifest::ManifestError) {
+    fn emit_manifest_load_error(
+        &mut self,
+        project_root: &Path,
+        err: crate::manifest::ManifestError,
+    ) {
         let path = project_root.join("coil.toml");
         match err {
             crate::manifest::ManifestError::Parse { line, message } => {
@@ -854,7 +882,10 @@ impl Pipeline {
                 } else {
                     self.emit_spanless_error(
                         ErrorCode::IoError,
-                        format!("`{}`: parse error at line {line}: {message}", path.display()),
+                        format!(
+                            "`{}`: parse error at line {line}: {message}",
+                            path.display()
+                        ),
                     );
                 }
             }
@@ -967,15 +998,9 @@ impl Pipeline {
                     } else if let Some(file) = self.manifest.resolve_mod(&self.project_root, "*") {
                         self.enqueue_file(file);
                     } else {
-                        self.emit_module_not_found(
-                            parent_file,
-                            parent_src,
-                            use_range,
-                            "`use *`",
-                        );
+                        self.emit_module_not_found(parent_file, parent_src, use_range, "`use *`");
                     }
-                } else if let Some(file) =
-                    self.manifest.resolve_use(&self.project_root, path, name)
+                } else if let Some(file) = self.manifest.resolve_use(&self.project_root, path, name)
                 {
                     self.enqueue_file(file);
                 } else {
@@ -1348,8 +1373,8 @@ impl Pipeline {
         // jump to `program_start_offset` so setup runs
         // before `main`. Otherwise jump straight to `main`.
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte =
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         // Wrap the bytecode in the versioned `ArchivedProgram` envelope
@@ -1359,6 +1384,7 @@ impl Pipeline {
             version: ARCHIVE_VERSION,
             static_slot_count: self.compiler.static_slot_count(),
             constants: self.compiler.constants.clone(),
+            strings: self.compiler.strings().to_vec(),
             bytecode: self.bytecode,
             source_files: self.compiler.source_files_list(),
             debug_locs: self.compiler.debug_locs().to_vec(),
@@ -1390,8 +1416,8 @@ impl Pipeline {
         // Patch the JMP at offset 1 (the second prologue
         // instruction).
         if let Some(byte) = bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte =
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         (bytecode, self.compiler.constants.clone())
@@ -1419,8 +1445,8 @@ impl Pipeline {
         }
 
         if let Some(byte) = bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte =
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         Ok((bytecode, self.compiler.constants.clone()))
@@ -1471,8 +1497,8 @@ impl Pipeline {
 
         // Patch the JMP at offset 1.
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte =
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         // In-memory API: any diagnostic (error or warning) is a failure.
@@ -1532,8 +1558,8 @@ impl Pipeline {
         self.bytecode = self.compiler.bytecode_vec();
 
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte =
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         if !self.compiler.get_messages().is_empty() {
@@ -1545,6 +1571,7 @@ impl Pipeline {
         Ok(crate::DissectArtifacts {
             bytecode: std::mem::take(&mut self.bytecode),
             constants: self.compiler.constants.clone(),
+            strings: self.compiler.strings().to_vec(),
             functions,
             il,
             debug,
@@ -1576,6 +1603,10 @@ impl Pipeline {
         self.compiler.constants()
     }
 
+    pub fn strings(&self) -> &[String] {
+        self.compiler.strings()
+    }
+
     pub fn static_slot_count(&self) -> u32 {
         self.compiler.static_slot_count()
     }
@@ -1587,7 +1618,10 @@ impl Pipeline {
         }
     }
 
-    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), ()> {
+    pub fn run(
+        self,
+        filename: String,
+    ) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
@@ -1618,6 +1652,8 @@ impl Pipeline {
             .expect("Unable to deserialize bytecode");
         let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
             .expect("Unable to deserialize constant pool");
+        let strings = rkyv::deserialize::<Vec<String>, Error>(&archived.strings)
+            .expect("Unable to deserialize string table");
         let static_slot_count = u32::from(archived.static_slot_count);
         let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
             .expect("Unable to deserialize source_files");
@@ -1627,6 +1663,7 @@ impl Pipeline {
         Ok((
             bytecode,
             constants,
+            strings,
             static_slot_count,
             ProgramDebug {
                 source_files,
