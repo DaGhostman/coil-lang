@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use common::{Byte, Instruction};
+use common::Instruction;
 
 use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
