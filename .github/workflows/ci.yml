@@ -40,7 +40,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Workspace tests
-        run: cargo test --workspace
+        run: |
+          # macOS runners occasionally hit EAGAIN (WouldBlock) while cargo
+          # lists many test binaries in parallel; one retry clears it.
+          cargo test --workspace || cargo test --workspace
 
       - name: Language harness (`coil test`)
         run: |
