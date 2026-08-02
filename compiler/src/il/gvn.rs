@@ -737,6 +737,61 @@ mod tests {
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
     }
 
+    /// Nested `a + b + c` emits consecutive `"%s%s"` STRING ops (outer then
+    /// inner). Dup-CSE would rewrite the second to DUP and poison FORMAT.
+    #[test]
+    fn within_block_nested_format_concat_keeps_pct_s_strings() {
+        let mut ops = vec![
+            IlOp::String { idx: 0, loc: loc() }, // outer "%s%s"
+            IlOp::String { idx: 0, loc: loc() }, // inner "%s%s"
+            IlOp::String { idx: 1, loc: loc() }, // a
+            IlOp::String { idx: 2, loc: loc() }, // b
+            IlOp::byte(common::Byte::new(Instruction::FORMAT).with_operand_u32(2)),
+            IlOp::String { idx: 3, loc: loc() }, // c
+            IlOp::byte(common::Byte::new(Instruction::FORMAT).with_operand_u32(2)),
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        let pct_s = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::String { idx: 0, .. }))
+            .count();
+        assert_eq!(
+            pct_s, 2,
+            "both \"%s%s\" STRINGs must remain for nested FORMAT concat"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Dup { .. })),
+            "nested FORMAT concat must not Dup-CSE STRING"
+        );
+    }
+
+    /// Triple nest `((a+b)+c)+d` — Dup chain would rewrite all but the first
+    /// `"%s%s"` if STRING were still in the within-block allowlist.
+    #[test]
+    fn within_block_triple_nested_format_keeps_all_pct_s_strings() {
+        let mut ops = vec![
+            IlOp::String { idx: 0, loc: loc() },
+            IlOp::String { idx: 0, loc: loc() },
+            IlOp::String { idx: 0, loc: loc() },
+            IlOp::String { idx: 1, loc: loc() },
+            IlOp::String { idx: 2, loc: loc() },
+            IlOp::byte(common::Byte::new(Instruction::FORMAT).with_operand_u32(2)),
+            IlOp::String { idx: 3, loc: loc() },
+            IlOp::byte(common::Byte::new(Instruction::FORMAT).with_operand_u32(2)),
+            IlOp::String { idx: 4, loc: loc() },
+            IlOp::byte(common::Byte::new(Instruction::FORMAT).with_operand_u32(2)),
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        let pct_s = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::String { idx: 0, .. }))
+            .count();
+        assert_eq!(pct_s, 3, "all three \"%s%s\" STRINGs must remain");
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+    }
+
     #[test]
     fn within_block_string_refuses_mismatched_idx() {
         let mut ops = vec![

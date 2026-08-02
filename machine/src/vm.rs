@@ -4234,6 +4234,70 @@ mod tests {
         assert_eq!(s, expect);
     }
 
+    /// DynAdd string concat also goes through `push_interned_string` (and
+    /// `continue`s the dispatch loop). Root-after-intern is required here too.
+    #[test]
+    fn dyn_add_strings_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let mut strings = vec!["x".to_string()];
+        for i in 0..n {
+            strings.push(format!("p{i}"));
+        }
+        let mut bytecode: Vec<Byte> = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        for i in 0..n {
+            bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32((1 + i) as u32));
+            bytecode.push(Byte::new(Instruction::DynAdd));
+            bytecode.push(Byte::new(Instruction::STORE).with_load_store_slot(0));
+        }
+        bytecode.push(Byte::new(Instruction::LOAD).with_load_store_slot(0));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        let mut expect = String::from("x");
+        for i in 0..n {
+            expect.push_str(&format!("p{i}"));
+        }
+        assert_eq!(s, expect);
+    }
+
+    /// STRINGIFY shares `push_interned_string` — GC at intern must not sweep
+    /// the fresh display string before it is stacked.
+    #[test]
+    fn stringify_survives_gc_triggered_at_intern() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 3 + 2);
+        for i in 0..n {
+            bytecode.push(const_int(i as i64));
+            bytecode.push(Byte::new(Instruction::STRINGIFY));
+            if i + 1 < n {
+                bytecode.push(Byte::new(Instruction::POP));
+            }
+        }
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+        assert!(!vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, format!("{}", n - 1));
+    }
+
     #[test]
     fn with_output_captures_io_stdout_write_all() {
         let mut vm = Machine::<16>::default();
