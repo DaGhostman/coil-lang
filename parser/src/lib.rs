@@ -2657,12 +2657,18 @@ impl<'pratt> Pratt<'pratt> {
                     let joined = segments.join("::");
                     Box::leak(joined.into_boxed_str()) as &str
                 };
-                // Lowercase owner → `module::fn(...)` (e.g. `string::format`).
-                // PascalCase owner stays Construct (`Point::new`, `Option::Some`).
+                // `module::fn(...)` when both sides look like module/fn paths
+                // (`string::format`). PascalCase owners stay Construct
+                // (`Point::new`); PascalCase members stay Construct
+                // (`ffi::types::Int`, `Option::Some`).
                 if enum_name
                     .chars()
                     .next()
                     .is_some_and(|ch| ch.is_ascii_lowercase())
+                    && variant_name
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_lowercase())
                 {
                     let name = (
                         e.span(),
