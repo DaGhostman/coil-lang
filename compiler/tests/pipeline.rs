@@ -5564,3 +5564,119 @@ fn main() {
     );
     assert_eq!(output, "42,0");
 }
+
+/// v35 string table: serialize → load → run must keep STRING indexes valid,
+/// and the compiler must not emit legacy trailing DATA payloads.
+#[test]
+fn string_table_archive_round_trip_preserves_literals() {
+    use common::{ARCHIVE_VERSION, ArchivedProgram, Instruction};
+    use rkyv::rancor::Error;
+
+    let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn main() {
+    write_all(stdout(), to_bytes(format("%s-%i", "archive", 35)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        !pipeline.strings().is_empty(),
+        "expected program string table entries"
+    );
+    assert!(
+        pipeline.strings().iter().any(|s| s == "archive"),
+        "string table should contain literal `archive`: {:?}",
+        pipeline.strings()
+    );
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::STRING)),
+        "expected STRING opcodes indexing the table"
+    );
+    assert!(
+        bytecode
+            .iter()
+            .all(|b| !matches!(b.bytecode(), Instruction::DATA)),
+        "compiler must not emit DATA tombstones after STRING"
+    );
+
+    let program = ArchivedProgram {
+        version: ARCHIVE_VERSION,
+        static_slot_count: pipeline.static_slot_count(),
+        constants: constants.clone(),
+        strings: pipeline.strings().to_vec(),
+        bytecode: bytecode.clone(),
+        source_files: pipeline.program_debug().source_files,
+        debug_locs: pipeline.program_debug().debug_locs,
+    };
+    let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
+    let archived =
+        rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice()).expect("access");
+    assert_eq!(u32::from(archived.version), ARCHIVE_VERSION);
+    let loaded_bc: Vec<common::Byte> =
+        rkyv::deserialize::<Vec<common::Byte>, Error>(&archived.bytecode).expect("bc");
+    let loaded_constants: Vec<u64> =
+        rkyv::deserialize::<Vec<u64>, Error>(&archived.constants).expect("consts");
+    let loaded_strings: Vec<String> =
+        rkyv::deserialize::<Vec<String>, Error>(&archived.strings).expect("strings");
+    let static_slots = u32::from(archived.static_slot_count);
+    assert!(
+        loaded_strings.iter().any(|s| s == "archive"),
+        "deserialized string table lost literals: {loaded_strings:?}"
+    );
+
+    let shared = SharedBuf::new();
+    let mut machine = Machine::<128>::default();
+    machine.set_shared_print(shared.inner.clone());
+    machine.with_output(shared.clone());
+    pipeline.wire_host_natives(&mut machine);
+    machine.run_raw(&loaded_bc, &loaded_constants, &loaded_strings, static_slots);
+    let _ = machine.restore_output();
+    assert_eq!(shared.into_utf8(), "archive-35");
+}
+
+/// Worker `write_all(stdout(), …)` in a multi-iteration loop must keep HostInvoke
+/// results on the stack and honor shared-print capture TLS.
+#[test]
+fn worker_write_all_loop_captures_via_shared_print() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+fn worker() -> int {
+    let i = 0;
+    while i < 3 {
+        write_all(stdout(), to_bytes(format("%i", i)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() {
+    let t = spawn(worker)?;
+    join(t)?;
+}
+"#,
+    );
+    assert_eq!(output, "012");
+}
+
+/// Qualified `string::format` / `string::to_bytes` resolve without a glob import.
+#[test]
+fn qualified_string_helpers_without_glob_import() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+
+fn main() {
+    write_all(stdout(), string::to_bytes(string::format("%s", "ok")));
+}
+"#,
+    );
+    assert_eq!(output, "ok");
+}

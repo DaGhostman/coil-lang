@@ -3171,6 +3171,69 @@ mod tests {
         }
     }
 
+    /// Lowercase::lowercase paths are module calls (`string::format`), not Construct.
+    #[test]
+    fn string_format_parses_as_qualified_module_call() {
+        let ast = expr_ast!("string::format(\"%i\", 1)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Call {
+                name,
+                args: Some(params),
+            } => {
+                match name.1.as_ref() {
+                    Expression::QualifiedAccess { owner, member } => {
+                        assert_eq!(*owner, "string");
+                        assert_eq!(*member, "format");
+                    }
+                    other => panic!("expected QualifiedAccess callee, got {:?}", other),
+                }
+                assert_eq!(params.len(), 2);
+            }
+            other => panic!("expected Call(string::format), got {:?}", other),
+        }
+    }
+
+    /// PascalCase owners stay Construct even when the member is lowercase (`Point::new`).
+    #[test]
+    fn pascal_case_method_call_stays_construct() {
+        let ast = expr_ast!("Point::new(40, 2)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                fields: EnumConstructPayload::Tuple(args),
+            } => {
+                assert_eq!(enum_name, "Point");
+                assert_eq!(variant_name, "new");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Construct(Point::new), got {:?}", other),
+        }
+    }
+
+    /// `Statement(ExprStatement)` must not append a second `;` (Display regression).
+    #[test]
+    fn statement_wrapping_expr_statement_display_has_one_semicolon() {
+        let ast = decl_ast!("write_all(stdout(), to_bytes(\"x\"));");
+        let rendered = format!("{}", ast);
+        assert!(
+            !rendered.contains(";;"),
+            "ExprStatement already emits `;`; got {rendered:?}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(';'),
+            "expected a single trailing semicolon, got {rendered:?}"
+        );
+    }
+
     #[test]
     fn break_and_continue_parse_as_statements() {
         let break_ast = decl_ast!("break;");
