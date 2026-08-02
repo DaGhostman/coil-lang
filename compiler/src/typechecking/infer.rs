@@ -3328,6 +3328,33 @@ impl Checker {
                                 ),
                             );
                         }
+                        // Parser may emit Call(QualifiedAccess) for module paths;
+                        // Class::static_method stays Construct, but accept Call too.
+                        if let Some(ty) = self.try_infer_static_method_call(
+                            owner,
+                            member,
+                            &parser::ast::EnumConstructPayload::Tuple(
+                                args.as_deref().unwrap_or(&[]).to_vec(),
+                            ),
+                            range.clone(),
+                            id,
+                        ) {
+                            return ty;
+                        }
+                        if self.has_method(owner, member) {
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
+                                    fqn, member
+                                ),
+                                range,
+                                Some(format!(
+                                    "or declare `static fn {}` to call it as `{}`",
+                                    member, fqn
+                                )),
+                            );
+                        }
                         fqn
                     }
                     _ => {

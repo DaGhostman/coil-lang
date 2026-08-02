@@ -2657,7 +2657,9 @@ impl<'pratt> Pratt<'pratt> {
                     let joined = segments.join("::");
                     Box::leak(joined.into_boxed_str()) as &str
                 };
-                if variant_name
+                // Lowercase owner → `module::fn(...)` (e.g. `string::format`).
+                // PascalCase owner stays Construct (`Point::new`, `Option::Some`).
+                if enum_name
                     .chars()
                     .next()
                     .is_some_and(|ch| ch.is_ascii_lowercase())

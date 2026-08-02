@@ -615,7 +615,10 @@ fn constructor_wrong_arity_errors() {
 #[test]
 fn format_string_type_mismatch_errors() {
     // %s requires a string; passing int is a type error.
-    let (_ty, msgs) = check("write_all(stdout(), to_bytes(format(\"%s\", 42)));");
+    let (_ty, msgs) = check(
+        r#"use string::format;
+format("%s", 42);"#,
+    );
     assert!(
         msgs.iter().any(|m| m.contains("requires string")),
         "expected format-string type error, got: {:?}",
@@ -628,9 +631,8 @@ fn format_string_percent_z_accepts_bool() {
     // `%z` is the bool specifier. `string::format("%z", true)` should
     // type-check with no diagnostics.
     let (_ty, msgs) = check(
-        r#"use io::{stdout, write_all};
-use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%z", true)));"#,
+        r#"use string::format;
+format("%z", true);"#,
     );
     assert!(
         msgs.is_empty(),
@@ -642,7 +644,10 @@ write_all(stdout(), to_bytes(format("%z", true)));"#,
 #[test]
 fn format_string_percent_z_rejects_int() {
     // `%z` requires a bool; passing an int is a type error.
-    let (_ty, msgs) = check("write_all(stdout(), to_bytes(format(\"%z\", 42)));");
+    let (_ty, msgs) = check(
+        r#"use string::format;
+format("%z", 42);"#,
+    );
     assert!(
         msgs.iter().any(|m| m.contains("requires bool")),
         "expected 'requires bool' error for `%z` with int, got: {:?}",
@@ -653,8 +658,9 @@ fn format_string_percent_z_rejects_int() {
 #[test]
 fn format_percent_i_rejects_open_type_suggests_percent_v() {
     let msgs = check_messages(
-        "fn bad<T>(T x) { write_all(stdout(), to_bytes(format(\"%i\", x))); } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%i", x); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter().any(|m| {
@@ -668,8 +674,9 @@ fn format_percent_i_rejects_open_type_suggests_percent_v() {
 #[test]
 fn format_percent_v_requires_show_bound() {
     let (_ty, msgs) = check(
-        "fn bad<T>(T x) { write_all(stdout(), to_bytes(format(\"%v\", x))); } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%v", x); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter()
@@ -682,8 +689,9 @@ fn format_percent_v_requires_show_bound() {
 #[test]
 fn format_percent_v_requires_show_bound_inside_structural_tuple() {
     let (_ty, msgs) = check(
-        "fn bad<T>(T x) { write_all(stdout(), to_bytes(format(\"%v\", (x, 1)))); } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%v", (x, 1)); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter()
@@ -696,8 +704,9 @@ fn format_percent_v_requires_show_bound_inside_structural_tuple() {
 #[test]
 fn format_percent_v_accepts_show_bound() {
     let (_ty, msgs) = check(
-        "fn ok<T: Show>(T x) { write_all(stdout(), to_bytes(format(\"%v\", x))); } \
-         fn main() { ok(1); }",
+        r#"use string::format;
+fn ok<T: Show>(T x) { format("%v", x); }
+fn main() { ok(1); }"#,
     );
     assert!(
         msgs.is_empty(),

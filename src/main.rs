@@ -1739,7 +1739,7 @@ mod tests {
         // Well-typed under compile_fail/ ⇒ harness failure (inverted).
         std::fs::write(
             cf.join("unexpected_ok.hy"),
-            "fn main() {\n  print \"%i\", 1;\n}\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn main() {\n  write_all(stdout(), to_bytes(format(\"%i\", 1)));\n}\n",
         )
         .unwrap();
         // Normal positive case still runs.
@@ -1760,7 +1760,11 @@ mod tests {
         std::fs::create_dir_all(&cf).unwrap();
 
         // Lexicographic order: a_ok before z_bad — fail-fast must stop after a_ok.
-        std::fs::write(cf.join("a_ok.hy"), "fn main() {\n  print \"%i\", 1;\n}\n").unwrap();
+        std::fs::write(
+            cf.join("a_ok.hy"),
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn main() {\n  write_all(stdout(), to_bytes(format(\"%i\", 1)));\n}\n",
+        )
+        .unwrap();
         std::fs::write(
             cf.join("z_bad.hy"),
             "fn main() {\n  let x: int = \"no\";\n}\n",
