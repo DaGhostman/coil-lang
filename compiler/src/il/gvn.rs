@@ -234,11 +234,13 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 && k == pk
                 && matches!(
                     &ops[pi],
-                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Load { .. }
+                    // STRING stays: Dup-CSE of identical table hits breaks
+                    // nested `"%s%s"` FORMAT concat (04-http request_build).
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
                 )
                 && matches!(
                     &ops[i],
-                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Load { .. }
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
                 )
             {
                 ops[i] = IlOp::Dup { loc: ops[i].loc() };
@@ -720,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn within_block_string_dup_cse() {
+    fn within_block_string_not_dup_cse() {
         let mut ops = vec![
             IlOp::String { idx: 4, loc: loc() },
             IlOp::String { idx: 4, loc: loc() },
@@ -728,7 +730,11 @@ mod tests {
         ];
         cfg_gvn(&mut ops);
         assert!(matches!(ops[0], IlOp::String { idx: 4, .. }));
-        assert!(matches!(ops[1], IlOp::Dup { .. }));
+        assert!(
+            matches!(ops[1], IlOp::String { idx: 4, .. }),
+            "STRING must not Dup-CSE (FORMAT concat / http showcase)"
+        );
+        assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
     }
 
     #[test]
