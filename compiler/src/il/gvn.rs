@@ -23,6 +23,7 @@ fn is_pure_producer(op: &IlOp) -> bool {
         op,
         IlOp::Const { .. }
             | IlOp::ConstPool { .. }
+            | IlOp::String { .. }
             | IlOp::Load { .. }
             | IlOp::Bin { .. }
             | IlOp::BinSlotImm { .. }
@@ -35,6 +36,7 @@ fn is_pure_producer(op: &IlOp) -> bool {
         Some(b) if matches!(
             *b.bytecode(),
             Instruction::CONST
+                | Instruction::STRING
                 | Instruction::LOAD
                 | Instruction::ADD
                 | Instruction::SUB
@@ -232,11 +234,11 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 && k == pk
                 && matches!(
                     &ops[pi],
-                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Load { .. }
                 )
                 && matches!(
                     &ops[i],
-                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Load { .. }
                 )
             {
                 ops[i] = IlOp::Dup { loc: ops[i].loc() };
@@ -479,7 +481,10 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
             if is_pure_producer(&ops[i])
                 && matches!(
                     &ops[i],
-                    IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                    IlOp::Const { .. }
+                        | IlOp::ConstPool { .. }
+                        | IlOp::String { .. }
+                        | IlOp::Load { .. }
                 )
             {
                 join_prod = Some(i);
@@ -505,7 +510,10 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
             }
             if !matches!(
                 &ops[pi],
-                IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
+                IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::String { .. }
+                    | IlOp::Load { .. }
             ) {
                 ok = false;
                 break;
@@ -709,6 +717,18 @@ mod tests {
         cfg_gvn(&mut ops);
         assert!(matches!(ops[2], IlOp::Const { imm: 3, .. }));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
+    }
+
+    #[test]
+    fn within_block_string_dup_cse() {
+        let mut ops = vec![
+            IlOp::String { idx: 4, loc: loc() },
+            IlOp::String { idx: 4, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[0], IlOp::String { idx: 4, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
     }
 
     #[test]

@@ -871,14 +871,16 @@ const MULTI_OP_SUFFIX_MAX: usize = 4;
 
 /// Compute-only ops eligible for multi-op join sinking.
 ///
-/// Residual `STRING`/`DATA`/`FORMAT`/`PRINT`/… encode as bytes but must not
-/// sink — Known SP after FORMAT would otherwise splice format runs across joins.
+/// Typed [`IlOp::String`] is a pure push (table index) and may sink. Residual
+/// `FORMAT` / `PRINT` / `DATA` must not — Known SP after FORMAT would otherwise
+/// splice format runs across joins.
 fn is_multi_op_suffix_op(op: &IlOp) -> bool {
     if matches!(
         op,
         IlOp::Load { .. }
             | IlOp::Const { .. }
             | IlOp::ConstPool { .. }
+            | IlOp::String { .. }
             | IlOp::Dup { .. }
             | IlOp::Bin { .. }
             | IlOp::BinSlotImm { .. }
@@ -4254,20 +4256,20 @@ mod tests {
 
     #[test]
     fn multi_op_join_convoy_refuses_format_string_suffix() {
-        // STRING/FORMAT must not count as sinkable compute — Known SP after
-        // FORMAT would otherwise splice format runs across joins.
+        // FORMAT (+ PRINT) must not count as sinkable compute — Known SP after
+        // FORMAT would otherwise splice format runs across joins. Typed STRING
+        // alone is eligible; keep FORMAT out of the allowlist.
+        let loc = common::DebugLoc::unknown();
         let fmt = vec![
-            IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
+            IlOp::String { idx: 1, loc },
             IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(0)),
-            IlOp::Print {
-                loc: common::DebugLoc::unknown(),
-            },
+            IlOp::Print { loc },
         ];
         let mut ops = vec![
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(0),
-                loc: common::DebugLoc::unknown(),
+                loc,
             },
             IlOp::Label(Label(1)),
         ];
@@ -4275,33 +4277,65 @@ mod tests {
         ops.push(IlOp::Jump {
             kind: IlJumpKind::Unconditional,
             target: Label(0),
-            loc: common::DebugLoc::unknown(),
+            loc,
         });
         ops.push(IlOp::Label(Label(2)));
         ops.extend(fmt.clone());
         ops.push(IlOp::Jump {
             kind: IlJumpKind::Unconditional,
             target: Label(0),
-            loc: common::DebugLoc::unknown(),
+            loc,
         });
         ops.push(IlOp::Label(Label(0)));
-        ops.push(IlOp::Return {
-            loc: common::DebugLoc::unknown(),
-        });
+        ops.push(IlOp::Return { loc });
 
         let before = ops.len();
         multi_op_join_convoy(&mut ops);
         assert_eq!(ops.len(), before, "format suffixes must not sink");
         let strings = ops
             .iter()
-            .filter(|op| {
-                matches!(
-                    op.as_encode_byte(),
-                    Some(b) if *b.bytecode() == Instruction::STRING
-                )
-            })
+            .filter(|op| matches!(op, IlOp::String { .. }))
             .count();
         assert_eq!(strings, 2, "each arm keeps its STRING");
+    }
+
+    #[test]
+    fn multi_op_join_convoy_sinks_typed_string_suffix() {
+        // Diamond: both arms end with String;Load then join+RETURN.
+        let loc = common::DebugLoc::unknown();
+        let suf = vec![IlOp::String { idx: 3, loc }, IlOp::Load { slot: 1, loc }];
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc,
+            },
+        ];
+        ops.extend(suf.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc,
+        });
+        ops.push(IlOp::Label(Label(1)));
+        ops.extend(suf);
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return { loc });
+
+        multi_op_join_convoy(&mut ops);
+        let strings = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::String { idx: 3, .. }))
+            .count();
+        assert_eq!(strings, 1, "identical STRING tails should sink once");
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, IlOp::Load { slot: 1, .. }))
+                .count(),
+            1,
+            "LOAD should remain once after sink"
+        );
     }
 
     #[test]
