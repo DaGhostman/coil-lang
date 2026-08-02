@@ -862,7 +862,11 @@ impl<'a> Display for Expression<'a> {
                     .join(" ")
             ),
             Self::Group(g) => write!(f, "({})", g.1),
-            Self::Statement(s) => writeln!(f, "{};", s.1),
+            // `ExprStatement` already renders its trailing `;`; avoid `;;`.
+            Self::Statement(s) => match s.1.as_ref() {
+                Self::ExprStatement(_) => writeln!(f, "{}", s.1),
+                _ => writeln!(f, "{};", s.1),
+            },
             Self::String(s) => write!(f, "\"{}\"", s),
             Self::Dload(path) => write!(f, "dload({})", path.1),
             Self::Done(handle) => write!(f, "done({})", handle.1),
