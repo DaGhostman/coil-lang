@@ -838,4 +838,107 @@ mod tests {
             "in-loop key uses should LOAD the hoisted temp"
         );
     }
+
+    #[test]
+    fn hoists_typed_string_stack_producer_out_of_loop() {
+        // Plain String;Pop loop (no GetField) — stack LICM should hoist.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::String {
+                idx: 9,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header]
+                .iter()
+                .any(|op| matches!(op, IlOp::String { idx: 9, .. })),
+            "invariant String should hoist before header"
+        );
+        assert!(
+            !ops[header + 1..]
+                .iter()
+                .take_while(|op| !matches!(op, IlOp::Jump { .. }))
+                .any(|op| matches!(op, IlOp::String { idx: 9, .. })),
+            "String should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn hoists_residual_byte_string_keys_with_get_field() {
+        // Residual IlOp::Byte STRING runs must still feed field-key LICM.
+        use common::{Byte, Instruction};
+        let str_x = |ops: &mut Vec<IlOp>| {
+            ops.push(IlOp::byte(
+                Byte::new(Instruction::STRING).with_operand_u32(1),
+            ));
+        };
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+        ];
+        str_x(&mut ops);
+        ops.push(IlOp::GetField { loc: loc() });
+        ops.push(IlOp::Pop { loc: loc() });
+        ops.push(IlOp::Load {
+            slot: 0,
+            loc: loc(),
+        });
+        str_x(&mut ops);
+        ops.push(IlOp::GetField { loc: loc() });
+        ops.push(IlOp::Pop { loc: loc() });
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: loc(),
+        });
+        ops.push(IlOp::Halt { loc: loc() });
+
+        licm(&mut ops);
+
+        let string_ops = ops
+            .iter()
+            .filter(|op| {
+                matches!(op, IlOp::String { idx: 1, .. })
+                    || matches!(
+                        op.as_encode_byte(),
+                        Some(b) if *b.bytecode() == Instruction::STRING && b.operand_u32() == 1
+                    )
+            })
+            .count();
+        assert_eq!(string_ops, 1, "STRING should materialize once in preheader");
+        let loads_of_temp = ops
+            .iter()
+            .filter(|op| matches!(op, IlOp::Load { slot: 1, .. }))
+            .count();
+        assert!(
+            loads_of_temp >= 2,
+            "in-loop key uses should LOAD the hoisted temp"
+        );
+    }
 }
