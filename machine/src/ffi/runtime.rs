@@ -14,12 +14,7 @@ fn libffi_probe_names() -> &'static [&'static str] {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        &[
-            "libffi.so.8",
-            "libffi.so.7",
-            "libffi.so.6",
-            "libffi.so",
-        ]
+        &["libffi.so.8", "libffi.so.7", "libffi.so.6", "libffi.so"]
     }
     #[cfg(target_os = "windows")]
     {
@@ -55,10 +50,7 @@ pub fn probe_system_libffi() -> Result<(), String> {
 }
 
 /// Verify that each named library can be resolved (for `coil package --check-native`).
-pub fn check_native_libraries(
-    names: &[String],
-    base_dir: Option<&Path>,
-) -> Result<(), String> {
+pub fn check_native_libraries(names: &[String], base_dir: Option<&Path>) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }

@@ -21,7 +21,9 @@ pub enum StopReason {
 pub enum StepMode {
     None,
     /// Run one insn then stop before the next (`armed` flips after the first check).
-    Stepi { armed: bool },
+    Stepi {
+        armed: bool,
+    },
     /// Stop when source line changes (step into).
     StepLine {
         file: u32,
@@ -35,7 +37,9 @@ pub enum StepMode {
         start_depth: usize,
     },
     /// Stop when frame depth drops to `target_depth` or below.
-    Finish { target_depth: usize },
+    Finish {
+        target_depth: usize,
+    },
 }
 
 /// Attached to a [`crate::Machine`] for interactive / scripted debugging.

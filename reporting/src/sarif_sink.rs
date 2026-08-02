@@ -83,16 +83,15 @@ impl DiagnosticSink for SarifSink {
             })
             .collect();
 
-        let properties = diag.help.as_ref().map(|help| SarifResultProperties {
-            help: help.clone(),
-        });
+        let properties = diag
+            .help
+            .as_ref()
+            .map(|help| SarifResultProperties { help: help.clone() });
 
         self.results.push(SarifResult {
             rule_id: diag.code.map(|c| c.as_str().to_string()),
             level: level.to_string(),
-            message: SarifMessage {
-                text: diag.message,
-            },
+            message: SarifMessage { text: diag.message },
             locations,
             related_locations,
             properties,
@@ -256,10 +255,10 @@ mod tests {
 
     use super::*;
     use crate::codes::ErrorCode;
+    use crate::config::ReportConfig;
     use crate::diagnostic::Diagnostic;
     use crate::message::{Label as MsgLabel, Message};
-    use crate::sink::{create_sink, DiagnosticSink};
-    use crate::config::ReportConfig;
+    use crate::sink::{DiagnosticSink, create_sink};
 
     #[derive(Clone, Default)]
     struct SharedBuf {

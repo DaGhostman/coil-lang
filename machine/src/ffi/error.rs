@@ -1,8 +1,6 @@
 //! Runtime tags and allocation for virtual `ffi::Error` / `ffi::ErrorKind`.
 
-use common::{
-    BUILTIN_FFI_ERROR_KIND_VARIANTS, BUILTIN_FFI_ERROR_VARIANT, Value,
-};
+use common::{BUILTIN_FFI_ERROR_KIND_VARIANTS, BUILTIN_FFI_ERROR_VARIANT, Value};
 
 use crate::memory::{Heap, Member, ObjEnum, Object};
 
@@ -107,7 +105,10 @@ mod tests {
         assert_eq!(e.payload.len(), 2);
         match &e.payload[0] {
             Member::Object(Object::Enum(kind_gc)) => {
-                assert_eq!(kind_gc.as_ref().tag, FfiErrorKindTag::LibraryNotFound as u32);
+                assert_eq!(
+                    kind_gc.as_ref().tag,
+                    FfiErrorKindTag::LibraryNotFound as u32
+                );
             }
             _ => panic!("kind should be ErrorKind unit enum"),
         }
@@ -122,9 +123,7 @@ mod tests {
     #[test]
     fn from_ffi_error_maps_variants() {
         assert_eq!(
-            FfiErrorKindTag::from_ffi_error(&FfiError::SymbolNotFound {
-                name: "foo".into()
-            }),
+            FfiErrorKindTag::from_ffi_error(&FfiError::SymbolNotFound { name: "foo".into() }),
             FfiErrorKindTag::SymbolNotFound
         );
         assert_eq!(

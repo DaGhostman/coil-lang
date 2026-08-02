@@ -194,8 +194,6 @@ pub enum Expression<'expr> {
     /// Function type annotation `A -> B`.
     TypeFun(Output<'expr>, Output<'expr>),
     Comment(&'expr str),
-    Print(Output<'expr>, Option<Vec<Output<'expr>>>),
-    Format(Output<'expr>, Option<Vec<Output<'expr>>>),
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
     /// `raise expr` — early-return `Err(expr)` from a Result-mode function.
@@ -578,9 +576,7 @@ pub struct MatchArm<'expr> {
 #[derive(Clone, PartialEq, Debug)]
 pub enum LetPattern<'expr> {
     Wildcard,
-    Binding {
-        name: &'expr str,
-    },
+    Binding { name: &'expr str },
     Tuple(Vec<LetPattern<'expr>>),
     Record(Vec<LetFieldPattern<'expr>>),
 }
@@ -868,34 +864,6 @@ impl<'a> Display for Expression<'a> {
             Self::Group(g) => write!(f, "({})", g.1),
             Self::Statement(s) => writeln!(f, "{};", s.1),
             Self::String(s) => write!(f, "\"{}\"", s),
-            Self::Print(fmt, params) => write!(
-                f,
-                "print {}{}",
-                fmt.borrow().1,
-                params
-                    .clone()
-                    .map_or(String::default(), |p: Vec<Output<'a>>| format!(
-                        ", {}",
-                        p.iter()
-                            .map(|p| p.1.to_string())
-                            .collect::<Vec<String>>()
-                            .join(", ")
-                    ))
-            ),
-            Self::Format(fmt, params) => write!(
-                f,
-                "format {}{}",
-                fmt.borrow().1,
-                params
-                    .clone()
-                    .map_or(String::default(), |p: Vec<Output<'a>>| format!(
-                        ", {}",
-                        p.iter()
-                            .map(|p| p.1.to_string())
-                            .collect::<Vec<String>>()
-                            .join(", ")
-                    ))
-            ),
             Self::Dload(path) => write!(f, "dload({})", path.1),
             Self::Done(handle) => write!(f, "done({})", handle.1),
             Self::Tuple(items) => write!(
@@ -932,7 +900,11 @@ impl<'a> Display for Expression<'a> {
                     .as_ref()
                     .map(|t| format!(": {}", t.1))
                     .unwrap_or_default();
-                let kw = if *is_const { "static const" } else { "static let" };
+                let kw = if *is_const {
+                    "static const"
+                } else {
+                    "static let"
+                };
                 write!(f, "{}{} {} = {};", kw, ty_str, name, init.1)
             }
             Self::Declare(args) | Self::Invoke(args) => {
@@ -1075,16 +1047,10 @@ impl<'a> Display for Expression<'a> {
                 identifier,
                 iterable,
                 body,
-            } => {
-                match identifier {
-                    Some(ident) => write!(
-                        f,
-                        "for {} in {} {{\n{}}}",
-                        ident.1, iterable.1, body.1
-                    ),
-                    None => write!(f, "while {} {{\n{}}}", iterable.1, body.1),
-                }
-            }
+            } => match identifier {
+                Some(ident) => write!(f, "for {} in {} {{\n{}}}", ident.1, iterable.1, body.1),
+                None => write!(f, "while {} {{\n{}}}", iterable.1, body.1),
+            },
             Self::Break => write!(f, "break"),
             Self::Continue => write!(f, "continue"),
             Self::For {
@@ -1280,7 +1246,13 @@ impl<'a> Display for Expression<'a> {
                 name,
                 type_params,
                 ty,
-            } => write!(f, "type {}{} = {};", name, fmt_type_params(type_params), ty.1),
+            } => write!(
+                f,
+                "type {}{} = {};",
+                name,
+                fmt_type_params(type_params),
+                ty.1
+            ),
             Self::Class {
                 attrs,
                 name,
@@ -1294,7 +1266,14 @@ impl<'a> Display for Expression<'a> {
                 };
                 let attr_prefix = fmt_attrs(attrs);
                 let fs: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
-                write!(f, "{}class {}{} {{ {} }}", attr_prefix, name, tp, fs.join(", "))
+                write!(
+                    f,
+                    "{}class {}{} {{ {} }}",
+                    attr_prefix,
+                    name,
+                    tp,
+                    fs.join(", ")
+                )
             }
             Self::Implementation {
                 what,

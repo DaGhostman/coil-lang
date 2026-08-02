@@ -88,12 +88,14 @@ pub struct ForInInfo {
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
-    result_ok_err, result_ty, schemaize_payload, schemaize_ty, string, subst_payload_params,
-    subst_ty_params, unit as unit_ty, readonly_ty, strip_readonly,
+    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
+    result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
+    strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
-use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, ThreadBuiltin, VirtualModules};
+use super::virtual_modules::{
+    BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,
+};
 
 /// One candidate in a compile-time arity overload set.
 ///
@@ -670,6 +672,9 @@ impl Checker {
             BuiltinExport::Enum {
                 name: common::BUILTIN_IO_ERROR_ENUM
             } | BuiltinExport::IoFn { .. }
+                | BuiltinExport::StringFn {
+                    kind: StringBuiltin::FromBytes,
+                }
         ) || host_registry.is_some_and(|r| r.starts_with("fs_"));
         if needs_io_error && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM) {
             self.register_builtin_io_error();
@@ -795,6 +800,14 @@ impl Checker {
         }
     }
 
+    /// Resolve an in-scope name to a string helper (`format`, `to_bytes`, …).
+    pub fn string_fn_in_scope(&self, name: &str) -> Option<StringBuiltin> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::StringFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
     /// Resolve an in-scope name to a thread host native (`spawn`, `send`, …).
     pub fn thread_fn_in_scope(&self, name: &str) -> Option<ThreadBuiltin> {
         match self.scope_bindings.get(name)? {
@@ -822,12 +835,7 @@ impl Checker {
 
     /// Apply a `use` against virtual modules. Returns `true` when handled
     /// (caller should not treat it as a disk-module function import).
-    pub fn apply_virtual_use(
-        &mut self,
-        path: &[String],
-        name: &str,
-        alias: Option<&str>,
-    ) -> bool {
+    pub fn apply_virtual_use(&mut self, path: &[String], name: &str, alias: Option<&str>) -> bool {
         if name == "*" {
             let Some(exports) = self.virtual_modules.resolve_glob(path) else {
                 return false;
@@ -1041,14 +1049,13 @@ impl Checker {
     /// Pre-register `ffi::Error` as a single record variant
     /// `Error { kind: ErrorKind, message: string }`.
     fn register_builtin_ffi_error(&mut self) {
-        use common::{BUILTIN_FFI_ERROR_ENUM, BUILTIN_FFI_ERROR_KIND_ENUM, BUILTIN_FFI_ERROR_VARIANT};
+        use common::{
+            BUILTIN_FFI_ERROR_ENUM, BUILTIN_FFI_ERROR_KIND_ENUM, BUILTIN_FFI_ERROR_VARIANT,
+        };
         let name = BUILTIN_FFI_ERROR_ENUM.to_string();
         let variant_names = vec![BUILTIN_FFI_ERROR_VARIANT.to_string()];
         let payloads = vec![EnumVariantPayloadTy::Record(vec![
-            (
-                "kind".into(),
-                Ty::Con(BUILTIN_FFI_ERROR_KIND_ENUM.into()),
-            ),
+            ("kind".into(), Ty::Con(BUILTIN_FFI_ERROR_KIND_ENUM.into())),
             ("message".into(), string()),
         ])];
         let arities = vec![2];
@@ -1062,9 +1069,9 @@ impl Checker {
 
     /// Scheme for a virtual `io` host native (inserted on `use io::*`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
-        use crate::typechecking::ty::{array, boolean, byte, stream_ty, tuple};
         #[cfg(feature = "tls")]
         use crate::typechecking::ty::record;
+        use crate::typechecking::ty::{array, boolean, byte, stream_ty, tuple};
         let stream = stream_ty();
         let bytes = array(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
@@ -1081,9 +1088,10 @@ impl Checker {
         let recv_from_ty = tuple(vec![int(), string(), int()]);
         let res_recv_from = result_app_ty(recv_from_ty, io_err);
         let fun = |params: &[Ty], ret: Ty| {
-            params.iter().rev().fold(ret, |acc, p| {
-                Ty::Fun(Box::new(p.clone()), Box::new(acc))
-            })
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
         };
         let ty = match kind {
             IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => stream,
@@ -1098,9 +1106,7 @@ impl Checker {
             }
             IoBuiltin::FromBytes => fun(&[bytes], res_string),
             IoBuiltin::ToBytes => fun(&[string()], bytes),
-            IoBuiltin::TcpConnect | IoBuiltin::TcpListen => {
-                fun(&[string(), int()], res_stream)
-            }
+            IoBuiltin::TcpConnect | IoBuiltin::TcpListen => fun(&[string(), int()], res_stream),
             IoBuiltin::TcpConnectTimeout => fun(&[string(), int(), int()], res_stream),
             IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
             IoBuiltin::TcpAcceptWaitTimeout => fun(&[stream, int()], res_stream),
@@ -1132,9 +1138,7 @@ impl Checker {
             }
             #[cfg(feature = "tls")]
             IoBuiltin::TlsServerDisable => fun(&[stream], res_stream),
-            IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
-                fun(&[string(), int()], res_stream)
-            }
+            IoBuiltin::UdpBind | IoBuiltin::UdpConnect => fun(&[string(), int()], res_stream),
             IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
             IoBuiltin::UdpRecvFrom | IoBuiltin::UdpRecvFromWait => {
                 fun(&[stream, bytes], res_recv_from)
@@ -1142,6 +1146,43 @@ impl Checker {
             IoBuiltin::UdpLocalPort => fun(&[stream], res_int),
         };
         Scheme::mono(ty)
+    }
+
+    /// Scheme for virtual `string` helpers.
+    ///
+    /// `format` is checked by the call-special path because its arity and
+    /// argument types are determined by the literal specifiers.
+    pub fn string_fn_scheme(kind: StringBuiltin) -> Scheme {
+        use crate::typechecking::ty::{array, byte};
+        let bytes = array(byte());
+        let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
+        let fun = |params: &[Ty], ret: Ty| {
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
+        };
+        let ty = match kind {
+            StringBuiltin::Format => fun(&[string()], string()),
+            StringBuiltin::FromBytes => fun(&[bytes], result_app_ty(string(), io_err)),
+            StringBuiltin::ToBytes => fun(&[string()], bytes),
+        };
+        Scheme::mono(ty)
+    }
+
+    fn virtual_callable_scheme(
+        &mut self,
+        export: BuiltinExport,
+        range: Range<usize>,
+    ) -> Option<Scheme> {
+        match export {
+            BuiltinExport::IoFn { kind } => Some(Self::io_fn_scheme(kind)),
+            BuiltinExport::StringFn { kind } => Some(Self::string_fn_scheme(kind)),
+            BuiltinExport::ThreadFn { kind } => Some(self.thread_fn_scheme(kind)),
+            BuiltinExport::HostFn { registry, .. } => Some(self.host_fn_scheme(registry, range)),
+            BuiltinExport::FfiFn { .. } => Some(Scheme::mono(Ty::Var(self.counter.fresh()))),
+            _ => None,
+        }
     }
 
     /// Scheme for a virtual `thread` host native (inserted on `use thread::*`).
@@ -1153,9 +1194,10 @@ impl Checker {
         let res_thread = result_app_ty(thread_ty(), thread_err.clone());
         let res_unit = result_app_ty(unit_ty(), thread_err.clone());
         let fun = |params: &[Ty], ret: Ty| {
-            params.iter().rev().fold(ret, |acc, p| {
-                Ty::Fun(Box::new(p.clone()), Box::new(acc))
-            })
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
         };
         let fn_ty = |param: Ty, ret: Ty| Ty::Fun(Box::new(param), Box::new(ret));
         match kind {
@@ -1163,11 +1205,7 @@ impl Checker {
                 let t = self.counter.fresh();
                 let a = self.counter.fresh();
                 let fn_a_t = fn_ty(Ty::Var(a), Ty::Var(t));
-                Scheme::poly(
-                    vec![t, a],
-                    vec![],
-                    fun(&[fn_a_t, Ty::Var(a)], res_thread),
-                )
+                Scheme::poly(vec![t, a], vec![], fun(&[fn_a_t, Ty::Var(a)], res_thread))
             }
             ThreadBuiltin::Join => {
                 let t = self.counter.fresh();
@@ -1217,10 +1255,7 @@ impl Checker {
                 Scheme::poly(
                     vec![t],
                     vec![],
-                    fun(
-                        &[Ty::Var(t)],
-                        result_app_ty(mutex_ty(), thread_err.clone()),
-                    ),
+                    fun(&[Ty::Var(t)], result_app_ty(mutex_ty(), thread_err.clone())),
                 )
             }
             ThreadBuiltin::Rwlock => {
@@ -1237,10 +1272,7 @@ impl Checker {
             ThreadBuiltin::WithLock => {
                 let t = self.counter.fresh();
                 let r = self.counter.fresh();
-                let callback = fn_ty(
-                    Ty::Var(t),
-                    tuple(vec![Ty::Var(t), Ty::Var(r)]),
-                );
+                let callback = fn_ty(Ty::Var(t), tuple(vec![Ty::Var(t), Ty::Var(r)]));
                 Scheme::poly(
                     vec![t, r],
                     vec![],
@@ -1253,10 +1285,7 @@ impl Checker {
             ThreadBuiltin::WithWrite | ThreadBuiltin::TryWrite => {
                 let t = self.counter.fresh();
                 let r = self.counter.fresh();
-                let callback = fn_ty(
-                    Ty::Var(t),
-                    tuple(vec![Ty::Var(t), Ty::Var(r)]),
-                );
+                let callback = fn_ty(Ty::Var(t), tuple(vec![Ty::Var(t), Ty::Var(r)]));
                 Scheme::poly(
                     vec![t, r],
                     vec![],
@@ -1287,25 +1316,26 @@ impl Checker {
 
     /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
     pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
-        use crate::typechecking::ty::{array, boolean, record};
         #[cfg(feature = "crypto")]
         use crate::typechecking::ty::byte;
-        #[cfg(any(feature = "crypto", feature = "regex"))]
-        use crate::typechecking::ty::tuple;
         #[cfg(feature = "regex")]
         use crate::typechecking::ty::regex_ty;
-        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
-        #[cfg(feature = "regex")]
-        use common::BUILTIN_REGEX_ERROR_ENUM;
+        #[cfg(any(feature = "crypto", feature = "regex"))]
+        use crate::typechecking::ty::tuple;
+        use crate::typechecking::ty::{array, boolean, record};
         #[cfg(feature = "crypto")]
         use common::BUILTIN_CRYPTO_ERROR_ENUM;
+        #[cfg(feature = "regex")]
+        use common::BUILTIN_REGEX_ERROR_ENUM;
         #[cfg(feature = "time")]
         use common::BUILTIN_TIME_ERROR_ENUM;
+        use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
 
         let fun = |params: &[Ty], ret: Ty| {
-            params.iter().rev().fold(ret, |acc, p| {
-                Ty::Fun(Box::new(p.clone()), Box::new(acc))
-            })
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
         };
         let io_err = Ty::Con(BUILTIN_IO_ERROR_ENUM.into());
         #[cfg(feature = "time")]
@@ -1395,10 +1425,10 @@ impl Checker {
             #[cfg(feature = "time")]
             "time_sleep_ms" => fun(&[int()], res_unit_time),
             #[cfg(feature = "time")]
-            "time_elapsed_nanos" | "time_elapsed_millis"
-            | "time_date_from_period" | "time_date_from_epoch_period" => {
-                fun(&[int()], res_int_time.clone())
-            }
+            "time_elapsed_nanos"
+            | "time_elapsed_millis"
+            | "time_date_from_period"
+            | "time_date_from_epoch_period" => fun(&[int()], res_int_time.clone()),
             #[cfg(feature = "time")]
             "time_add" | "time_sub" | "time_period_add" | "time_period_sub" => {
                 fun(&[int(), int()], res_int_time.clone())
@@ -1438,42 +1468,35 @@ impl Checker {
                 fun(&[bytes.clone(), bytes.clone()], res_bytes_crypto.clone())
             }
             #[cfg(feature = "crypto")]
-            "crypto_hmac_verify_sha256" => {
-                fun(
-                    &[bytes.clone(), bytes.clone(), bytes.clone()],
-                    res_bool_crypto.clone(),
-                )
-            }
+            "crypto_hmac_verify_sha256" => fun(
+                &[bytes.clone(), bytes.clone(), bytes.clone()],
+                res_bool_crypto.clone(),
+            ),
             #[cfg(feature = "crypto")]
             "crypto_random_bytes" => fun(&[int()], res_bytes_crypto.clone()),
             #[cfg(feature = "crypto")]
             "crypto_random_u64" => fun(&[], res_int_crypto),
             #[cfg(feature = "crypto")]
-            "crypto_chacha20_poly1305_encrypt" | "crypto_chacha20_poly1305_decrypt"
-            | "crypto_aes_256_gcm_encrypt" | "crypto_aes_256_gcm_decrypt" => {
-                fun(
-                    &[bytes.clone(), bytes.clone(), bytes.clone(), bytes.clone()],
-                    res_bytes_crypto.clone(),
-                )
-            }
+            "crypto_chacha20_poly1305_encrypt"
+            | "crypto_chacha20_poly1305_decrypt"
+            | "crypto_aes_256_gcm_encrypt"
+            | "crypto_aes_256_gcm_decrypt" => fun(
+                &[bytes.clone(), bytes.clone(), bytes.clone(), bytes.clone()],
+                res_bytes_crypto.clone(),
+            ),
             #[cfg(feature = "crypto")]
             "crypto_ed25519_generate" | "crypto_x25519_generate" => {
                 fun(&[], result_app_ty(keypair.clone(), crypto_err.clone()))
             }
             #[cfg(feature = "crypto")]
             "crypto_ed25519_sign" | "crypto_x25519_shared_secret" => {
-                fun(
-                    &[bytes.clone(), bytes.clone()],
-                    res_bytes_crypto.clone(),
-                )
+                fun(&[bytes.clone(), bytes.clone()], res_bytes_crypto.clone())
             }
             #[cfg(feature = "crypto")]
-            "crypto_ed25519_verify" => {
-                fun(
-                    &[bytes.clone(), bytes.clone(), bytes.clone()],
-                    res_bool_crypto.clone(),
-                )
-            }
+            "crypto_ed25519_verify" => fun(
+                &[bytes.clone(), bytes.clone(), bytes.clone()],
+                res_bool_crypto.clone(),
+            ),
             #[cfg(feature = "crypto")]
             "crypto_argon2id_hash" | "crypto_argon2id_verify" => {
                 fun(&[bytes.clone(), bytes.clone()], res_unit_crypto)
@@ -1592,9 +1615,7 @@ impl Checker {
             }
             n => self.error_with_help(
                 ErrorCode::GenericTypeError,
-                format!(
-                    "spawn was called with too many arguments (expected 1 or 2, got {n})"
-                ),
+                format!("spawn was called with too many arguments (expected 1 or 2, got {n})"),
                 range,
                 None,
             ),
@@ -1656,16 +1677,16 @@ impl Checker {
             Ty::List(inner) => self.is_thread_sendable_ty(inner),
             Ty::Readonly(inner) => self.is_thread_sendable_ty(inner),
             Ty::Tuple(elems) => elems.iter().all(|t| self.is_thread_sendable_ty(t)),
-            Ty::Record { fields } => fields
-                .iter()
-                .all(|(_, t)| self.is_thread_sendable_ty(t)),
+            Ty::Record { fields } => fields.iter().all(|(_, t)| self.is_thread_sendable_ty(t)),
             Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
                 payload
                     .field_types()
                     .iter()
                     .all(|t| self.is_thread_sendable_ty(t))
             }),
-            Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } | Ty::Never => false,
+            Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } | Ty::Never => {
+                false
+            }
         }
     }
 
@@ -1805,9 +1826,7 @@ impl Checker {
                 "test files with `test(...)` cases must not define `main`".into(),
                 span,
             );
-            msg.with_help(
-                "remove `fn main`; the test harness provides a virtual main".into(),
-            );
+            msg.with_help("remove `fn main`; the test harness provides a virtual main".into());
             self.messages.push(msg);
         }
 
@@ -1931,9 +1950,7 @@ impl Checker {
         match ty {
             Ty::Var(_) => true,
             Ty::Forall { body, .. } => Self::ty_contains_open_var(body),
-            Ty::Fun(arg, ret) => {
-                Self::ty_contains_open_var(arg) || Self::ty_contains_open_var(ret)
-            }
+            Ty::Fun(arg, ret) => Self::ty_contains_open_var(arg) || Self::ty_contains_open_var(ret),
             Ty::App(ctor, args) => {
                 Self::ty_contains_open_var(ctor) || args.iter().any(Self::ty_contains_open_var)
             }
@@ -2460,11 +2477,8 @@ impl Checker {
                 // When `name` has multiple overload candidates and appears in
                 // value position, try to narrow using `current_expected`.
                 if self.is_overloaded(name) {
-                    let candidates: Vec<OverloadCandidate> = self
-                        .overload_sets
-                        .get(*name)
-                        .cloned()
-                        .unwrap_or_default();
+                    let candidates: Vec<OverloadCandidate> =
+                        self.overload_sets.get(*name).cloned().unwrap_or_default();
                     // If exactly one candidate matches current_expected, pick it.
                     let expected = self.current_expected.clone();
                     let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
@@ -2476,10 +2490,8 @@ impl Checker {
                             .iter()
                             .filter(|c| {
                                 let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
-                                crate::typechecking::unify::unify_with(
-                                    &self.subst, &fun_ty, &exp,
-                                )
-                                .is_ok()
+                                crate::typechecking::unify::unify_with(&self.subst, &fun_ty, &exp)
+                                    .is_ok()
                             })
                             .collect()
                     } else {
@@ -2547,10 +2559,7 @@ impl Checker {
                             name, expected_pretty
                         ),
                         range,
-                        Some(format!(
-                            "available overloads: {}",
-                            arities.join(", ")
-                        )),
+                        Some(format!("available overloads: {}", arities.join(", "))),
                     );
                 }
 
@@ -2599,11 +2608,7 @@ impl Checker {
             // Named call-site arg wrapper — type is the value's type.
             Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
-            Expression::Use {
-                path,
-                name,
-                alias,
-            } => {
+            Expression::Use { path, name, alias } => {
                 if self.apply_virtual_use(path, name, alias.as_deref()) {
                     // Bind FFI callables into the value env so Call sites
                     // resolve; enums/traits/tags are scope-only.
@@ -2615,6 +2620,7 @@ impl Checker {
                                 e,
                                 BuiltinExport::FfiFn { .. }
                                     | BuiltinExport::IoFn { .. }
+                                    | BuiltinExport::StringFn { .. }
                                     | BuiltinExport::ThreadFn { .. }
                                     | BuiltinExport::HostFn { .. }
                             )
@@ -2625,25 +2631,8 @@ impl Checker {
                         if self.env.lookup(&local).is_some() {
                             continue;
                         }
-                        match export {
-                            BuiltinExport::IoFn { kind } => {
-                                self.env.insert_top(local, Self::io_fn_scheme(kind));
-                            }
-                            BuiltinExport::ThreadFn { kind } => {
-                                let scheme = self.thread_fn_scheme(kind);
-                                self.env.insert_top(local, scheme);
-                            }
-                            BuiltinExport::HostFn { registry, .. } => {
-                                let scheme = self.host_fn_scheme(registry, range.clone());
-                                self.env.insert_top(local, scheme);
-                            }
-                            BuiltinExport::FfiFn { .. } => {
-                                self.env.insert_top(
-                                    local,
-                                    Scheme::mono(Ty::Var(self.counter.fresh())),
-                                );
-                            }
-                            _ => {}
+                        if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                            self.env.insert_top(local, scheme);
                         }
                     }
                     return unit_ty();
@@ -2979,12 +2968,9 @@ impl Checker {
                                 if self.next_id_idx < self.ids.ids().len() {
                                     self.next_id_idx += 1;
                                 }
-                                if let Some(ty) = self.try_infer_spread_call_target(
-                                    callee,
-                                    pack,
-                                    &range,
-                                    id,
-                                ) {
+                                if let Some(ty) =
+                                    self.try_infer_spread_call_target(callee, pack, &range, id)
+                                {
                                     return ty;
                                 }
                             }
@@ -3005,7 +2991,11 @@ impl Checker {
                     if method_has_named {
                         let class_owner = self.class_owner_from_ty(&resolved);
                         if let Some(owner) = class_owner.as_ref()
-                            && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
+                            && self
+                                .methods
+                                .get(owner)
+                                .and_then(|m| m.get(*method))
+                                .is_some()
                         {
                             let fqn = format!("{}::{}", owner, method);
                             let user_argc = method_args.len();
@@ -3101,7 +3091,10 @@ impl Checker {
                         if let Some((dict_index, dict_class, class, method_slot, scheme)) =
                             self.select_bound_method(candidates, method, &range)
                         {
-                            self.bind_matching_abstract_constraints(Some(receiver_var), &dict_class);
+                            self.bind_matching_abstract_constraints(
+                                Some(receiver_var),
+                                &dict_class,
+                            );
                             let (fun_ty, constraints, mapping) =
                                 self.instantiate_scheme_mapped(&scheme);
                             let mut arg_tys = vec![recv_ty];
@@ -3157,7 +3150,11 @@ impl Checker {
                     // exists for Point.
                     let class_owner = self.class_owner_from_ty(&resolved);
                     if let Some(owner) = class_owner.as_ref()
-                        && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
+                        && self
+                            .methods
+                            .get(owner)
+                            .and_then(|m| m.get(*method))
+                            .is_some()
                     {
                         if self.is_static_method(owner, method) {
                             let fqn = format!("{}::{}", owner, method);
@@ -3168,9 +3165,7 @@ impl Checker {
                                     method, fqn
                                 ),
                                 range,
-                                Some(
-                                    "static methods have no `self` receiver".to_string(),
-                                ),
+                                Some("static methods have no `self` receiver".to_string()),
                             );
                         }
                         let fqn = format!("{}::{}", owner, method);
@@ -3229,25 +3224,15 @@ impl Checker {
                         let fun_ty = self.instantiate_ty(&scheme);
                         let mut arg_tys = vec![recv_ty];
                         if self.fn_has_rest(&fqn) {
-                            let (tys, _) = self.infer_and_reorder_call_args(
-                                &fqn,
-                                method_args,
-                                &range,
-                            );
+                            let (tys, _) =
+                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
                             arg_tys.extend(tys);
                         } else if let Some(a) = args {
                             for arg in a {
                                 arg_tys.push(self.infer(arg));
                             }
                         }
-                        return self.apply_function(
-                            Some(&fqn),
-                            &fun_ty,
-                            &arg_tys,
-                            None,
-                            id,
-                            range,
-                        );
+                        return self.apply_function(Some(&fqn), &fun_ty, &arg_tys, None, id, range);
                     }
 
                     // Ground trait method: `recv.into()` / `recv.show()` via a
@@ -3370,6 +3355,45 @@ impl Checker {
                     }
                     return self.infer_array_len(args.as_deref(), range);
                 }
+                if let Some(kind) = self.string_fn_for_call(&ident) {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("Named arguments are not supported on `{}`", ident),
+                            range,
+                            Some("string helpers take positional arguments only".to_string()),
+                        );
+                    }
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    return match kind {
+                        StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
+                        StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                            if kind == StringBuiltin::FromBytes
+                                && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                            {
+                                self.register_builtin_io_error();
+                            }
+                            let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                            let flat_args = self.flatten_spread_call_args(arg_slice);
+                            let arg_tys: Vec<Ty> = flat_args
+                                .iter()
+                                .map(|arg| self.infer_call_arg(arg))
+                                .collect();
+                            self.apply_function(
+                                Some(&ident),
+                                &fun_ty,
+                                &arg_tys,
+                                if flat_args.is_empty() {
+                                    None
+                                } else {
+                                    Some(&flat_args)
+                                },
+                                id,
+                                range,
+                            )
+                        }
+                    };
+                }
                 // `assert` from `prelude::test` (auto-imported or via `use`).
                 if let Some(kind) = self.prelude_fn_in_scope(&ident) {
                     if has_named {
@@ -3471,10 +3495,7 @@ impl Checker {
                             };
                             let (arg_tys, ordered_args) = self
                                 .infer_and_reorder_call_args_with_candidate(
-                                    &ident,
-                                    &candidate,
-                                    raw_args,
-                                    &range,
+                                    &ident, &candidate, raw_args, &range,
                                 );
                             let result = self.apply_function(
                                 Some(&ident),
@@ -3509,21 +3530,19 @@ impl Checker {
                 // function (partial application is allowed — residual Fun is OK).
                 if has_named {
                     let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
-                        match scheme {
-                            Some(s) => {
-                                let (fun_ty, constraints, mapping) =
-                                    self.instantiate_scheme_mapped(&s);
-                                (fun_ty, constraints, mapping, Some(s))
-                            }
-                            None => {
-                                return self.error(
-                                    ErrorCode::UnknownFunction,
-                                    format!("Cannot find function `{}`", ident),
-                                    range,
-                                );
-                            }
-                        };
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                        Some(s) => {
+                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                            (fun_ty, constraints, mapping, Some(s))
+                        }
+                        None => {
+                            return self.error(
+                                ErrorCode::UnknownFunction,
+                                format!("Cannot find function `{}`", ident),
+                                range,
+                            );
+                        }
+                    };
                     let (arg_tys, ordered_args) =
                         self.infer_and_reorder_call_args(&ident, raw_args, &range);
                     let result = if let Some(filled) = self
@@ -3589,21 +3608,19 @@ impl Checker {
                 // resolution so we don't double-infer (NodeId alignment).
                 if self.fn_has_rest(&ident) {
                     let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
-                        match scheme {
-                            Some(s) => {
-                                let (fun_ty, constraints, mapping) =
-                                    self.instantiate_scheme_mapped(&s);
-                                (fun_ty, constraints, mapping, Some(s))
-                            }
-                            None => {
-                                return self.error(
-                                    ErrorCode::UnknownFunction,
-                                    format!("Cannot find function `{}`", ident),
-                                    range,
-                                );
-                            }
-                        };
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                        Some(s) => {
+                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                            (fun_ty, constraints, mapping, Some(s))
+                        }
+                        None => {
+                            return self.error(
+                                ErrorCode::UnknownFunction,
+                                format!("Cannot find function `{}`", ident),
+                                range,
+                            );
+                        }
+                    };
                     let (call_arg_tys, ordered_args) =
                         self.infer_and_reorder_call_args(&ident, raw_args, &range);
                     let result = self.apply_function(
@@ -3637,7 +3654,10 @@ impl Checker {
                 // Resolve it before ordinary environment lookup because class
                 // methods are selected by the active bound, not by a global FQN.
                 let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
-                let arg_tys: Vec<Ty> = flat_args.iter().map(|arg| self.infer_call_arg(arg)).collect();
+                let arg_tys: Vec<Ty> = flat_args
+                    .iter()
+                    .map(|arg| self.infer_call_arg(arg))
+                    .collect();
                 if let Some(Ty::Existential { class }) =
                     arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
                     && let Some((owner, method_slot, scheme)) =
@@ -3877,12 +3897,7 @@ impl Checker {
 
             Expression::Panic(e) => {
                 let msg_ty = self.infer(e);
-                self.unify(
-                    &msg_ty,
-                    &string(),
-                    &e.0.into_range(),
-                    "panic message",
-                );
+                self.unify(&msg_ty, &string(), &e.0.into_range(), "panic message");
                 never()
             }
 
@@ -4022,16 +4037,6 @@ impl Checker {
                 self.resolve_type_projection(owner, name, &arg_tys, &range)
             }
 
-            // ---- I/O ----
-            Expression::Print(fmt, params) => {
-                self.infer_print(fmt, params, range, "print");
-                unit_ty()
-            }
-            Expression::Format(fmt, params) => {
-                self.infer_print(fmt, params, range, "format");
-                string()
-            }
-
             // ---- Userland FFI builtins ----
             //
             // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::*`.
@@ -4105,13 +4110,12 @@ impl Checker {
                 let _ = unify_with(&self.subst, &index_ty_pruned, &int());
                 let resolved = apply_ty_prune(&self.subst, &target_ty);
                 // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
-                let resolved = if let Some(data) =
-                    super::aggregate_arith::unwrap_matrix_ty(&resolved)
-                {
-                    data.clone()
-                } else {
-                    resolved
-                };
+                let resolved =
+                    if let Some(data) = super::aggregate_arith::unwrap_matrix_ty(&resolved) {
+                        data.clone()
+                    } else {
+                        resolved
+                    };
                 match &resolved {
                     Ty::Array { element, length } => {
                         // Out-of-bounds check: only fires when the
@@ -4240,11 +4244,31 @@ impl Checker {
                     uncaptured.remove(n);
                 }
 
+                let virtual_callables: Vec<(String, BuiltinExport)> = self
+                    .scope_bindings
+                    .iter()
+                    .filter(|(_, e)| {
+                        matches!(
+                            e,
+                            BuiltinExport::FfiFn { .. }
+                                | BuiltinExport::IoFn { .. }
+                                | BuiltinExport::StringFn { .. }
+                                | BuiltinExport::ThreadFn { .. }
+                                | BuiltinExport::HostFn { .. }
+                        )
+                    })
+                    .map(|(k, e)| (k.clone(), e.clone()))
+                    .collect();
+
                 let saved_frames = self.env.take_and_isolate();
                 let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+                for (local, export) in virtual_callables {
+                    if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                        self.env.insert_top(local, scheme);
+                    }
+                }
                 for (n, ty) in &cap_bindings {
-                    self.env
-                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
                 }
                 let _ = self.infer(body);
@@ -4329,7 +4353,9 @@ impl Checker {
                         ErrorCode::GenericTypeError,
                         "`static fn` is only allowed inside an `impl` block".to_string(),
                         range,
-                        Some("declare static methods as `impl Class { static fn ... }`".to_string()),
+                        Some(
+                            "declare static methods as `impl Class { static fn ... }`".to_string(),
+                        ),
                     );
                 }
                 if *name == "main" {
@@ -4406,13 +4432,11 @@ impl Checker {
                 let saved_frames = self.env.take_and_isolate();
                 let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
                 for (n, ty) in &cap_bindings {
-                    self.env
-                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
                 }
                 for (n, ty) in &arg_tys {
-                    self.env
-                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
                 }
                 // Match codegen: consume Fragment + Argument IDs before body.
@@ -4435,9 +4459,7 @@ impl Checker {
             }
 
             // ---- `test("…") { … }` harness cases ----
-            Expression::TestCase { name, body } => {
-                self.infer_test_case(name, body, &range)
-            }
+            Expression::TestCase { name, body } => self.infer_test_case(name, body, &range),
             Expression::Implementation {
                 owner,
                 methods,
@@ -4778,9 +4800,9 @@ impl Checker {
                         Expression::Function {
                             name: mname, body, ..
                         } => {
-                            let has_default = body.as_ref().is_some_and(|b| {
-                                !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty())
-                            });
+                            let has_default = body.as_ref().is_some_and(
+                                |b| !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty()),
+                            );
                             Some(TypeClassMethodDef {
                                 name: mname.to_string(),
                                 has_default,
@@ -5436,13 +5458,7 @@ impl Checker {
                 let declared = ty.as_ref().map(|t| self.parse_type_name(t));
                 let init_ty = self.infer(init);
                 let slot_ty = if let Some(d) = declared {
-                    self.coerce_or_unify(
-                        &d,
-                        &init_ty,
-                        Some(init),
-                        &range,
-                        "static initializer",
-                    );
+                    self.coerce_or_unify(&d, &init_ty, Some(init), &range, "static initializer");
                     apply_ty_prune(&self.subst, &d)
                 } else {
                     apply_ty_prune(&self.subst, &init_ty)
@@ -5648,7 +5664,10 @@ impl Checker {
                             {
                                 let _ = self.infer(next);
                                 self.env.insert_top(name.to_string(), source_scheme.clone());
-                                self.record_codegen_var_type(name.to_string(), source_scheme.ty.clone());
+                                self.record_codegen_var_type(
+                                    name.to_string(),
+                                    source_scheme.ty.clone(),
+                                );
                                 self.maybe_record_polyfn_binding(
                                     (child.0.start, child.0.end),
                                     &source_scheme.ty,
@@ -5883,7 +5902,12 @@ impl Checker {
         let ep = apply_ty_prune(&self.subst, &et);
         // Coerce int literals under a `byte` peer (same as annotated `byte` lets).
         if Self::is_byte_ty(&sp) && Self::byte_literal_coercion(end).is_ok() {
-            let _ = self.unify(&et, &crate::typechecking::ty::byte(), &end.0.into_range(), "range end");
+            let _ = self.unify(
+                &et,
+                &crate::typechecking::ty::byte(),
+                &end.0.into_range(),
+                "range end",
+            );
         } else if Self::is_byte_ty(&ep) && Self::byte_literal_coercion(start).is_ok() {
             let _ = self.unify(
                 &st,
@@ -5987,8 +6011,7 @@ impl Checker {
         // Nominal `Matrix` — `*` is matmul (Mul), `+`/`-` are element-wise.
         // Must run before aggregate zip so nested-array data inside Matrix
         // is not treated as Hadamard product.
-        if super::aggregate_arith::is_matrix_ty(&lp) || super::aggregate_arith::is_matrix_ty(&rp)
-        {
+        if super::aggregate_arith::is_matrix_ty(&lp) || super::aggregate_arith::is_matrix_ty(&rp) {
             return self.infer_matrix_arith(lp, rp, id, range, op);
         }
         if matches!(&lp, Ty::Tuple(_) | Ty::Array { .. })
@@ -6089,7 +6112,16 @@ impl Checker {
 
         // Resolve shapes.
         let resolved: Result<(ArithShape, ZipMode), String> = match (&left, &right) {
-            (ArithShape::Tuple { elem: e1, arity: n1 }, ArithShape::Tuple { elem: e2, arity: n2 }) => {
+            (
+                ArithShape::Tuple {
+                    elem: e1,
+                    arity: n1,
+                },
+                ArithShape::Tuple {
+                    elem: e2,
+                    arity: n2,
+                },
+            ) => {
                 if n1 != n2 {
                     Err(format!(
                         "cannot zip tuples of length {} and {} with `{}`",
@@ -6098,13 +6130,7 @@ impl Checker {
                 } else {
                     let _ = self.unify(e1, e2, &range, &format!("element types of `{}`", op));
                     let elem = apply_ty_prune(&self.subst, e1);
-                    Ok((
-                        ArithShape::Tuple {
-                            elem,
-                            arity: *n1,
-                        },
-                        ZipMode::Zip,
-                    ))
+                    Ok((ArithShape::Tuple { elem, arity: *n1 }, ZipMode::Zip))
                 }
             }
             (
@@ -6263,12 +6289,16 @@ impl Checker {
                 arity: *arity,
                 elem_is_float: float,
             },
-            (ArithShape::Array { length: ArrayLength::Static(n), .. }, ZipMode::Zip) => {
-                AggregateArithKind::ZipArray {
-                    length: *n,
-                    elem_is_float: float,
-                }
-            }
+            (
+                ArithShape::Array {
+                    length: ArrayLength::Static(n),
+                    ..
+                },
+                ZipMode::Zip,
+            ) => AggregateArithKind::ZipArray {
+                length: *n,
+                elem_is_float: float,
+            },
             (ArithShape::Tuple { arity, .. }, ZipMode::BroadcastRight) => {
                 AggregateArithKind::BroadcastTuple {
                     arity: *arity,
@@ -6323,12 +6353,7 @@ impl Checker {
         result_ty_for(&result_shape)
     }
 
-    fn infer_aggregate_neg(
-        &mut self,
-        inner: Ty,
-        id: Option<NodeId>,
-        range: Range<usize>,
-    ) -> Ty {
+    fn infer_aggregate_neg(&mut self, inner: Ty, id: Option<NodeId>, range: Range<usize>) -> Ty {
         use super::aggregate_arith::*;
 
         let pruned = apply_ty_prune(&self.subst, &inner);
@@ -6401,7 +6426,10 @@ impl Checker {
         pruned
     }
 
-    pub fn aggregate_arith_at(&self, id: NodeId) -> Option<&super::aggregate_arith::AggregateArithInfo> {
+    pub fn aggregate_arith_at(
+        &self,
+        id: NodeId,
+    ) -> Option<&super::aggregate_arith::AggregateArithInfo> {
         self.aggregate_arith.get(&id)
     }
 
@@ -6452,11 +6480,9 @@ impl Checker {
     ) {
         use super::aggregate_arith::LinearAlgebraKind;
         let (what, limit, dims): (&str, usize, String) = match kind {
-            LinearAlgebraKind::Dot { length, .. } if *length > u16::MAX as usize => (
-                "dot length",
-                u16::MAX as usize,
-                format!("{length}"),
-            ),
+            LinearAlgebraKind::Dot { length, .. } if *length > u16::MAX as usize => {
+                ("dot length", u16::MAX as usize, format!("{length}"))
+            }
             LinearAlgebraKind::MatMul { m, k, n, .. }
                 if *m > u8::MAX as usize || *k > u8::MAX as usize || *n > u8::MAX as usize =>
             {
@@ -6469,28 +6495,18 @@ impl Checker {
             LinearAlgebraKind::MatrixZip { m, n, .. }
                 if *m > u8::MAX as usize || *n > u8::MAX as usize =>
             {
-                (
-                    "matrix dimensions",
-                    u8::MAX as usize,
-                    format!("{m}×{n}"),
-                )
+                ("matrix dimensions", u8::MAX as usize, format!("{m}×{n}"))
             }
             LinearAlgebraKind::MatrixNeg { m, n, .. }
                 if *m > u8::MAX as usize || *n > u8::MAX as usize =>
             {
-                (
-                    "matrix dimensions",
-                    u8::MAX as usize,
-                    format!("{m}×{n}"),
-                )
+                ("matrix dimensions", u8::MAX as usize, format!("{m}×{n}"))
             }
             _ => return,
         };
         let mut msg = Message::warn(
             ErrorCode::GenericTypeError,
-            format!(
-                "{what} `{dims}` exceed the packed kernel meta limit ({limit})",
-            ),
+            format!("{what} `{dims}` exceed the packed kernel meta limit ({limit})",),
             range.clone(),
         );
         msg.with_help(
@@ -6530,7 +6546,8 @@ impl Checker {
                             range,
                         );
                         msg.with_help(
-                            "`static const` bindings are immutable after initialization".to_string(),
+                            "`static const` bindings are immutable after initialization"
+                                .to_string(),
                         );
                         self.messages.push(msg);
                     }
@@ -6628,7 +6645,10 @@ impl Checker {
                             ErrorCode::InvalidAssignment,
                             format!("Cannot assign to constant `{}`", fqn),
                             range,
-                            Some("`static const` bindings are immutable after initialization".to_string()),
+                            Some(
+                                "`static const` bindings are immutable after initialization"
+                                    .to_string(),
+                            ),
                         );
                     }
                     return ty;
@@ -6652,7 +6672,10 @@ impl Checker {
                             ErrorCode::InvalidAssignment,
                             format!("Cannot assign to constant `{}`", fqn),
                             range,
-                            Some("`static const` bindings are immutable after initialization".to_string()),
+                            Some(
+                                "`static const` bindings are immutable after initialization"
+                                    .to_string(),
+                            ),
                         );
                     }
                     return ty;
@@ -6818,12 +6841,7 @@ impl Checker {
         );
         if let Some(msg) = args.get(1) {
             let msg_ty = self.infer(msg);
-            self.unify(
-                &msg_ty,
-                &string(),
-                &msg.0.into_range(),
-                "assert message",
-            );
+            self.unify(&msg_ty, &string(), &msg.0.into_range(), "assert message");
         }
         result_app_ty(unit_ty(), string())
     }
@@ -6869,12 +6887,7 @@ impl Checker {
             );
         }
         let s_ty = self.infer(&args[0]);
-        self.unify(
-            &s_ty,
-            &string(),
-            &args[0].0.into_range(),
-            "ord argument",
-        );
+        self.unify(&s_ty, &string(), &args[0].0.into_range(), "ord argument");
         result_app_ty(byte(), string())
     }
 
@@ -6893,24 +6906,14 @@ impl Checker {
             );
         }
         let b_ty = self.infer(&args[0]);
-        self.unify(
-            &b_ty,
-            &byte(),
-            &args[0].0.into_range(),
-            "char argument",
-        );
+        self.unify(&b_ty, &byte(), &args[0].0.into_range(), "char argument");
         result_app_ty(string(), string())
     }
 
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
-    fn infer_dot(
-        &mut self,
-        args: &[Output],
-        id: Option<NodeId>,
-        range: Range<usize>,
-    ) -> Ty {
+    fn infer_dot(&mut self, args: &[Output], id: Option<NodeId>, range: Range<usize>) -> Ty {
         use super::aggregate_arith::{
-            classify_vector, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+            LinearAlgebraInfo, LinearAlgebraKind, classify_vector, elem_is_float, is_numeric_elem,
         };
 
         if args.len() != 2 {
@@ -6951,7 +6954,9 @@ impl Checker {
                 ErrorCode::GenericTypeError,
                 "cannot mix tuple and array operands in `dot`".to_string(),
                 range,
-                Some("both arguments must be tuples or both must be fixed-length arrays".to_string()),
+                Some(
+                    "both arguments must be tuples or both must be fixed-length arrays".to_string(),
+                ),
             );
         }
         if ln != rn {
@@ -6988,14 +6993,9 @@ impl Checker {
     }
 
     /// `cross(a, b)` — length-3 vectors → length-3 vector.
-    fn infer_cross(
-        &mut self,
-        args: &[Output],
-        id: Option<NodeId>,
-        range: Range<usize>,
-    ) -> Ty {
+    fn infer_cross(&mut self, args: &[Output], id: Option<NodeId>, range: Range<usize>) -> Ty {
         use super::aggregate_arith::{
-            classify_vector, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+            LinearAlgebraInfo, LinearAlgebraKind, classify_vector, elem_is_float, is_numeric_elem,
         };
 
         if args.len() != 2 {
@@ -7082,14 +7082,9 @@ impl Checker {
     }
 
     /// `matmul(A, B)` — nested static matrices `(m×k) × (k×n) → (m×n)`.
-    fn infer_matmul(
-        &mut self,
-        args: &[Output],
-        id: Option<NodeId>,
-        range: Range<usize>,
-    ) -> Ty {
+    fn infer_matmul(&mut self, args: &[Output], id: Option<NodeId>, range: Range<usize>) -> Ty {
         use super::aggregate_arith::{
-            classify_matrix, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+            LinearAlgebraInfo, LinearAlgebraKind, classify_matrix, elem_is_float, is_numeric_elem,
         };
 
         if args.len() != 2 {
@@ -7120,7 +7115,9 @@ impl Checker {
                     lp
                 ),
                 args[0].0.into_range(),
-                Some("use `[[T; K]; M]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+                Some(
+                    "use `[[T; K]; M]` (or a tuple of equal-length row tuples/arrays)".to_string(),
+                ),
             );
         };
         let Some((re, k2, n, right_outer_tuple, right_row_tuple)) = classify_matrix(&rp) else {
@@ -7131,7 +7128,9 @@ impl Checker {
                     rp
                 ),
                 args[1].0.into_range(),
-                Some("use `[[T; N]; K]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+                Some(
+                    "use `[[T; N]; K]` (or a tuple of equal-length row tuples/arrays)".to_string(),
+                ),
             );
         };
         if outer_is_tuple != right_outer_tuple || row_is_tuple != right_row_tuple {
@@ -7228,7 +7227,9 @@ impl Checker {
                     pruned
                 ),
                 args[0].0.into_range(),
-                Some("use `[[T; N]; M]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+                Some(
+                    "use `[[T; N]; M]` (or a tuple of equal-length row tuples/arrays)".to_string(),
+                ),
             );
         };
         if !is_numeric_elem(&elem) {
@@ -7257,8 +7258,8 @@ impl Checker {
         op: &str,
     ) -> Ty {
         use super::aggregate_arith::{
-            classify_matrix, elem_is_float, is_numeric_elem, unwrap_matrix_ty, wrap_matrix_ty,
-            LinearAlgebraInfo, LinearAlgebraKind,
+            LinearAlgebraInfo, LinearAlgebraKind, classify_matrix, elem_is_float, is_numeric_elem,
+            unwrap_matrix_ty, wrap_matrix_ty,
         };
 
         let Some(ld) = unwrap_matrix_ty(&lp) else {
@@ -7440,15 +7441,10 @@ impl Checker {
     }
 
     /// Unary `-` on a `Matrix` — element-wise negate of every cell.
-    fn infer_matrix_neg(
-        &mut self,
-        matrix_ty: Ty,
-        id: Option<NodeId>,
-        range: Range<usize>,
-    ) -> Ty {
+    fn infer_matrix_neg(&mut self, matrix_ty: Ty, id: Option<NodeId>, range: Range<usize>) -> Ty {
         use super::aggregate_arith::{
-            classify_matrix, elem_is_float, is_numeric_elem, unwrap_matrix_ty, wrap_matrix_ty,
-            LinearAlgebraInfo, LinearAlgebraKind,
+            LinearAlgebraInfo, LinearAlgebraKind, classify_matrix, elem_is_float, is_numeric_elem,
+            unwrap_matrix_ty, wrap_matrix_ty,
         };
 
         let Some(data) = unwrap_matrix_ty(&matrix_ty) else {
@@ -8206,10 +8202,8 @@ impl Checker {
             }
             Err(UnifyError::Occurs { var, ty }) => {
                 let ty_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ty);
-                let var_s = crate::typechecking::pretty::format_ty_for_diag(
-                    &self.subst,
-                    &Ty::Var(var),
-                );
+                let var_s =
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, &Ty::Var(var));
                 self.error_with_help(
                     ErrorCode::InfiniteType,
                     format!("Cannot construct infinite type `{}`", ty_s),
@@ -8418,7 +8412,9 @@ impl Checker {
         // `(int,int)` lifts if `int` has the instance.
         match self.find_unique_instance(class, std::slice::from_ref(&elem), range) {
             Ok(Some(_)) => true,
-            Ok(None) => self.try_lift_aggregate_constraint(class, std::slice::from_ref(&elem), range),
+            Ok(None) => {
+                self.try_lift_aggregate_constraint(class, std::slice::from_ref(&elem), range)
+            }
             Err(()) => false,
         }
     }
@@ -8636,7 +8632,8 @@ impl Checker {
                 let ac_class = self
                     .abstract_constraint_binding(&ac.class)
                     .unwrap_or(ac.class.as_str());
-                ac_class == needed.class && ac.args.len() == needed_args.len()
+                ac_class == needed.class
+                    && ac.args.len() == needed_args.len()
                     && ac
                         .args
                         .iter()
@@ -8784,8 +8781,7 @@ impl Checker {
         for (class, scheme) in schemes {
             // Freshen to probe the first parameter; trial unify does not
             // commit into `self.subst`.
-            let (fun_ty, _constraints, _kinds) =
-                instantiate_with_kinds(&scheme, &mut self.counter);
+            let (fun_ty, _constraints, _kinds) = instantiate_with_kinds(&scheme, &mut self.counter);
             let Some(first_param) = Self::first_fun_param(&fun_ty) else {
                 continue;
             };
@@ -9231,9 +9227,7 @@ impl Checker {
                 Box::new(self.parse_type_name(arg)),
                 Box::new(self.parse_type_name(ret)),
             ),
-            Expression::TypeFnSig { params, ret } => {
-                self.parse_fn_sig_type(params, ret)
-            }
+            Expression::TypeFnSig { params, ret } => self.parse_fn_sig_type(params, ret),
             Expression::Forall { params, ty } => {
                 self.forall_type(params, |checker| checker.parse_type_name(ty))
             }
@@ -9846,7 +9840,8 @@ impl Checker {
                     for item in items {
                         let ty = self.infer(item);
                         tags.push(Self::ffi_tag_from_ty_static(&apply_ty_prune(
-                            &self.subst, &ty,
+                            &self.subst,
+                            &ty,
                         )));
                     }
                     if variadic {
@@ -9933,7 +9928,10 @@ impl Checker {
                 }
                 // Bare lowercase primitives (`int`, `void`, …) stay
                 // available without importing `ffi::types`.
-                if name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+                if name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                {
                     return tag_from_type_name(name).map(|t| (t, 0));
                 }
                 None
@@ -10095,18 +10093,16 @@ impl Checker {
                     if init.is_none() {
                         self.messages.push(Message::error(
                             ErrorCode::GenericTypeError,
-                            format!("Static field `{}` in class `{}` requires an initializer", fname_str, name),
+                            format!(
+                                "Static field `{}` in class `{}` requires an initializer",
+                                fname_str, name
+                            ),
                             field.0.into_range(),
                         ));
                         continue;
                     }
                     let fqn = format!("{}::{}", name, fname_str);
-                    self.register_static_slot(
-                        fqn,
-                        false,
-                        ty.clone(),
-                        field.0.into_range(),
-                    );
+                    self.register_static_slot(fqn, false, ty.clone(), field.0.into_range());
                     if let Some(init_expr) = init {
                         let init_ty = self.infer(init_expr);
                         self.coerce_or_unify(
@@ -10259,11 +10255,7 @@ impl Checker {
                     // Arity overloads keyed by FQN — user-arg count only
                     // (`self` is packed separately at CALL sites).
                     let has_rest = self.fn_has_rest.get(*name).copied().unwrap_or(false);
-                    let param_names = self
-                        .fn_param_names
-                        .get(*name)
-                        .cloned()
-                        .unwrap_or_default();
+                    let param_names = self.fn_param_names.get(*name).cloned().unwrap_or_default();
                     let fixed_arity = if has_rest {
                         param_names.len().saturating_sub(1)
                     } else {
@@ -10449,9 +10441,7 @@ impl Checker {
             // Binder bounds `T: Num` desugar to unary constraints. Bounds
             // may also name an earlier constraint parameter: `T: c`.
             for bound in &tp.bounds {
-                if let Some(constraint) =
-                    self.constraint_from_bound(bound, Ty::Var(*var), range)
-                {
+                if let Some(constraint) = self.constraint_from_bound(bound, Ty::Var(*var), range) {
                     param_constraints.push(constraint);
                 }
             }
@@ -10486,13 +10476,13 @@ impl Checker {
             arg_tys.iter().map(|(n, _)| n.clone()).collect(),
         );
         let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
-            if children.last().is_some_and(|c| {
-                matches!(c.1.as_ref(), Expression::Argument(_, _, true))
-            }));
+        if children.last().is_some_and(|c| {
+            matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+        }));
         let has_tuple_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
-            if children.last().is_some_and(|c| {
-                matches!(c.1.as_ref(), Expression::Argument(None, _, true))
-            }));
+        if children.last().is_some_and(|c| {
+            matches!(c.1.as_ref(), Expression::Argument(None, _, true))
+        }));
         self.fn_has_rest.insert(name.to_string(), has_rest);
         self.fn_tuple_rest.insert(name.to_string(), has_tuple_rest);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
@@ -10583,20 +10573,14 @@ impl Checker {
 
         if let Some(owner) = method_owner {
             let fqn = format!("{}::{}", owner, name);
-            self.env
-                .insert_top(fqn, Scheme::mono(Ty::Var(alpha)));
+            self.env.insert_top(fqn, Scheme::mono(Ty::Var(alpha)));
             // Stub so `self.name(...)` / `Owner::name(...)` resolve while
             // the body is inferred (real scheme is written by infer_impl).
             self.methods
                 .entry(owner.to_string())
                 .or_default()
                 .entry(name.to_string())
-                .or_insert_with(|| {
-                    (
-                        Visibility::Private,
-                        Scheme::mono(Ty::Var(alpha)),
-                    )
-                });
+                .or_insert_with(|| (Visibility::Private, Scheme::mono(Ty::Var(alpha))));
             if is_static_method {
                 self.static_methods
                     .entry(owner.to_string())
@@ -10661,8 +10645,7 @@ impl Checker {
                             })
                             .unwrap_or(false));
                 if !allow_fallthrough {
-                    let ret_s =
-                        crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ret);
+                    let ret_s = crate::typechecking::pretty::format_ty_for_diag(&self.subst, &ret);
                     let mut message = Message::error(
                         ErrorCode::ReturnMismatch,
                         format!(
@@ -10808,11 +10791,8 @@ impl Checker {
         // Trait / typeclass bodies suppress via `registering_overloadable_fn`.
         // Inherent `impl` methods register under `Owner::method` in `infer_impl`.
         if self.registering_overloadable_fn {
-            let param_names_for_overload = self
-                .fn_param_names
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
+            let param_names_for_overload =
+                self.fn_param_names.get(name).cloned().unwrap_or_default();
             let fixed_arity_for_overload = if has_rest {
                 param_names_for_overload.len().saturating_sub(1)
             } else {
@@ -10918,9 +10898,10 @@ impl Checker {
 
     fn tuple_pack_ty_for_args(args: &Output, counter: &mut TyVarCounter) -> Option<Ty> {
         if let Expression::Fragment(children) = args.1.as_ref() {
-            if children.last().is_some_and(|c| {
-                matches!(c.1.as_ref(), Expression::Argument(None, _, true))
-            }) {
+            if children
+                .last()
+                .is_some_and(|c| matches!(c.1.as_ref(), Expression::Argument(None, _, true)))
+            {
                 return Some(Ty::Var(counter.fresh()));
             }
         }
@@ -10935,8 +10916,7 @@ impl Checker {
         id: Option<NodeId>,
     ) -> Option<Ty> {
         let scheme = self.env.lookup(callee)?.clone();
-        let (fun_ty, fresh_constraints, fresh_mapping) =
-            self.instantiate_scheme_mapped(&scheme);
+        let (fun_ty, fresh_constraints, fresh_mapping) = self.instantiate_scheme_mapped(&scheme);
         let pack_ty = self.infer(pack);
         let resolved_pack = apply_ty_prune(&self.subst, &pack_ty);
         let elems = match resolved_pack {
@@ -11050,10 +11030,7 @@ impl Checker {
                         if i + 1 != n {
                             let mut msg = Message::error(
                                 ErrorCode::GenericTypeError,
-                                format!(
-                                    "Rest parameter `{}` must be the last parameter",
-                                    name
-                                ),
+                                format!("Rest parameter `{}` must be the last parameter", name),
                                 child.0.into_range(),
                             );
                             msg.with_help(
@@ -11120,11 +11097,16 @@ impl Checker {
     pub fn select_overload(&self, fn_name: &str, argc: usize) -> Option<&OverloadCandidate> {
         let candidates = self.overload_sets.get(fn_name)?;
         // Prefer exact fixed match.
-        if let Some(c) = candidates.iter().find(|c| !c.is_rest && c.fixed_arity == argc) {
+        if let Some(c) = candidates
+            .iter()
+            .find(|c| !c.is_rest && c.fixed_arity == argc)
+        {
             return Some(c);
         }
         // Fall back to rest candidate that can accept `argc`.
-        candidates.iter().find(|c| c.is_rest && c.fixed_arity <= argc)
+        candidates
+            .iter()
+            .find(|c| c.is_rest && c.fixed_arity <= argc)
     }
 
     /// The call-site selection result for the call spanning `(start, end)`.
@@ -11228,7 +11210,10 @@ impl Checker {
                 .get(idx as usize)
                 .cloned()
                 .unwrap_or_else(|| Ty::Var(self.counter.fresh())),
-            Ty::Array { element, length: ArrayLength::Static(n) } => {
+            Ty::Array {
+                element,
+                length: ArrayLength::Static(n),
+            } => {
                 if (idx as usize) < n {
                     element.as_ref().clone()
                 } else {
@@ -11384,10 +11369,7 @@ impl Checker {
                                 arg.0.into_range(),
                             );
                             if fixed_names.is_empty() {
-                                msg.with_help(format!(
-                                    "`{}` has no named parameters",
-                                    fn_name
-                                ));
+                                msg.with_help(format!("`{}` has no named parameters", fn_name));
                             } else {
                                 msg.with_help(format!(
                                     "expected one of: {}",
@@ -11438,17 +11420,13 @@ impl Checker {
                             arg.0.into_range(),
                         );
                         msg.with_help(
-                            "all positional arguments must come before named arguments"
-                                .to_string(),
+                            "all positional arguments must come before named arguments".to_string(),
                         );
                         self.messages.push(msg);
                     } else {
                         self.messages.push(Message::error(
                             ErrorCode::TooManyArguments,
-                            format!(
-                                "Function `{}` was called with too many arguments",
-                                fn_name
-                            ),
+                            format!("Function `{}` was called with too many arguments", fn_name),
                             arg.0.into_range(),
                         ));
                     }
@@ -11554,15 +11532,15 @@ impl Checker {
                 };
                 tys.push(rest_ty);
             } else {
-            let mut elem_ty: Option<Ty> = None;
-            for (t, _) in &rest_elems {
-                let t_pruned = apply_ty_prune(&self.subst, t);
-                match &elem_ty {
-                    None => elem_ty = Some(t_pruned),
-                    Some(prev) => {
-                        let prev_pruned = apply_ty_prune(&self.subst, prev);
-                        if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
-                            let _ = self.error_with_help(
+                let mut elem_ty: Option<Ty> = None;
+                for (t, _) in &rest_elems {
+                    let t_pruned = apply_ty_prune(&self.subst, t);
+                    match &elem_ty {
+                        None => elem_ty = Some(t_pruned),
+                        Some(prev) => {
+                            let prev_pruned = apply_ty_prune(&self.subst, prev);
+                            if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
+                                let _ = self.error_with_help(
                                 ErrorCode::TypeMismatch,
                                 format!(
                                     "rest argument type mismatch: expected `{}`, found `{}`",
@@ -11574,17 +11552,17 @@ impl Checker {
                                         .to_string(),
                                 ),
                             );
+                            }
                         }
                     }
                 }
-            }
-            let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-            let rest_ty = if rest_elems.is_empty() {
-                array(element)
-            } else {
-                array_fixed(element, rest_elems.len())
-            };
-            tys.push(rest_ty);
+                let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                let rest_ty = if rest_elems.is_empty() {
+                    array(element)
+                } else {
+                    array_fixed(element, rest_elems.len())
+                };
+                tys.push(rest_ty);
             }
             // Stand-in for apply_function's expression hooks (array packing
             // is a codegen concern). Prefer the first rest elem if any.
@@ -11929,15 +11907,6 @@ impl Checker {
                 self.pre_register_enums_walk(end, errors);
             }
 
-            Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-                self.pre_register_enums_walk(fmt, errors);
-                if let Some(p) = params {
-                    for param in p {
-                        self.pre_register_enums_walk(param, errors);
-                    }
-                }
-            }
-
             Expression::Resume(target, arg) => {
                 self.pre_register_enums_walk(target, errors);
                 if let Some(a) = arg {
@@ -12120,7 +12089,12 @@ impl Checker {
                 self.pre_register_enums_walk(params, errors);
                 self.pre_register_enums_walk(ret, errors);
             }
-            Expression::AttrDecl { args, returns, body, .. } => {
+            Expression::AttrDecl {
+                args,
+                returns,
+                body,
+                ..
+            } => {
                 self.pre_register_enums_walk(args, errors);
                 if let Some(returns) = returns {
                     self.pre_register_enums_walk(returns, errors);
@@ -12306,9 +12280,13 @@ impl Checker {
                         return apply_ty_prune(&self.subst, &ty);
                     }
                 }
-                if let Some(ty) =
-                    self.try_infer_static_method_call(enum_name, variant_name, fields, range.clone(), call_id)
-                {
+                if let Some(ty) = self.try_infer_static_method_call(
+                    enum_name,
+                    variant_name,
+                    fields,
+                    range.clone(),
+                    call_id,
+                ) {
                     return ty;
                 }
                 if self.has_method(enum_name, variant_name) {
@@ -12865,8 +12843,12 @@ impl Checker {
                 result_ty = body_ty;
                 first = false;
             } else {
-                result_ty =
-                    self.join_ty(&result_ty, &body_ty, &arm.body.0.into_range(), "match arm body");
+                result_ty = self.join_ty(
+                    &result_ty,
+                    &body_ty,
+                    &arm.body.0.into_range(),
+                    "match arm body",
+                );
             }
 
             // Step 6: pop the per-arm env frame.
@@ -13213,10 +13195,7 @@ impl Checker {
                     other => {
                         return self.error_with_help(
                             ErrorCode::GenericTypeError,
-                            format!(
-                                "cannot destructure type `{}` with a tuple pattern",
-                                other,
-                            ),
+                            format!("cannot destructure type `{}` with a tuple pattern", other,),
                             pattern_range.clone(),
                             Some("RHS must be a tuple".to_string()),
                         );
@@ -13238,10 +13217,7 @@ impl Checker {
                             if !seen.insert(pf.name) {
                                 return self.error_with_help(
                                     ErrorCode::DuplicateField,
-                                    format!(
-                                        "Duplicate field `{}` in record pattern",
-                                        pf.name
-                                    ),
+                                    format!("Duplicate field `{}` in record pattern", pf.name),
                                     pattern_range.clone(),
                                     Some("each field must appear exactly once".to_string()),
                                 );
@@ -13258,10 +13234,7 @@ impl Checker {
                     other => {
                         return self.error_with_help(
                             ErrorCode::GenericTypeError,
-                            format!(
-                                "cannot destructure type `{}` with a record pattern",
-                                other,
-                            ),
+                            format!("cannot destructure type `{}` with a record pattern", other,),
                             pattern_range.clone(),
                             Some("RHS must be a record (dict)".to_string()),
                         );
@@ -13283,10 +13256,7 @@ impl Checker {
                     let Some((_, fty)) = decl_fields.iter().find(|(n, _)| n == pf.name) else {
                         return self.error_with_help(
                             ErrorCode::UnknownField,
-                            format!(
-                                "Cannot find field `{}` on record `{}`",
-                                pf.name, expected,
-                            ),
+                            format!("Cannot find field `{}` on record `{}`", pf.name, expected,),
                             pattern_range.clone(),
                             Some(format!(
                                 "the record has fields: {}",
@@ -13525,9 +13495,44 @@ impl Checker {
         }
     }
 
-    /// Type-check a `print` (or `format`) expression: the format
-    /// string must be a string literal, and each `%X` specifier's
-    /// corresponding argument must have a matching type.
+    fn string_fn_for_call(&self, ident: &str) -> Option<StringBuiltin> {
+        self.string_fn_in_scope(ident).or_else(|| {
+            ident
+                .strip_prefix("string::")
+                .and_then(StringBuiltin::from_name)
+        })
+    }
+
+    fn infer_string_format_call(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        let Some((fmt, rest)) = args.split_first() else {
+            return self.error(
+                ErrorCode::WrongArity,
+                "`string::format` expects at least 1 argument".to_string(),
+                range,
+            );
+        };
+        let params = Some(rest.to_vec());
+        if !matches!(fmt.1.as_ref(), Expression::String(_)) {
+            let _ = self.infer(fmt);
+            for arg in rest {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "`string::format` requires a string literal as its first argument".to_string(),
+                fmt.0.into_range(),
+                Some(
+                    "literal format strings allow the compiler to check `%` specifiers".to_string(),
+                ),
+            );
+        }
+        self.infer_print(fmt, &params, range, "string::format");
+        string()
+    }
+
+    /// Type-check a `string::format` call: the format string must be a
+    /// literal, and each `%X` specifier's corresponding argument must have a
+    /// matching type.
     fn infer_print(
         &mut self,
         fmt: &Output,
@@ -14249,7 +14254,10 @@ impl Checker {
                 ErrorCode::InvalidAssignment,
                 "append assignment requires an array".to_string(),
                 range,
-                Some(format!("found `{}`; use `arr[] = value` on a `[T]` binding", other)),
+                Some(format!(
+                    "found `{}`; use `arr[] = value` on a `[T]` binding",
+                    other
+                )),
             ),
         }
     }
@@ -14295,11 +14303,8 @@ impl Checker {
                     .map(|v| v.ty.clone())
                     .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                 let into_fqn = into_inst.method_fqns.get("into_iter").cloned();
-                match self.find_unique_instance(
-                    "Iterator",
-                    &[into_iter_ty.clone()],
-                    iterable_range,
-                ) {
+                match self.find_unique_instance("Iterator", &[into_iter_ty.clone()], iterable_range)
+                {
                     Ok(Some(iter_inst)) => {
                         if let Some(iter_item) = iter_inst.assoc_tys.get("Item") {
                             self.unify(
@@ -14389,15 +14394,9 @@ impl Checker {
     /// Builtin iterable shapes → `(Item, ForInKind)`. Returns `None` when
     /// the type is not a recognised builtin iterable (caller falls through
     /// to trait instance lookup). Emits diagnostics for hetero tuple/dict.
-    fn builtin_for_in_kind(
-        &mut self,
-        te: &Ty,
-        range: &Range<usize>,
-    ) -> Option<(Ty, ForInKind)> {
+    fn builtin_for_in_kind(&mut self, te: &Ty, range: &Range<usize>) -> Option<(Ty, ForInKind)> {
         match te {
-            Ty::Array { element, .. } => {
-                Some((element.as_ref().clone(), ForInKind::Array))
-            }
+            Ty::Array { element, .. } => Some((element.as_ref().clone(), ForInKind::Array)),
             Ty::Tuple(elems) => {
                 if elems.is_empty() {
                     let _ = self.error_with_help(
@@ -14409,12 +14408,7 @@ impl Checker {
                     return None;
                 }
                 match self.homogeneous_types(elems, range, "tuple") {
-                    Some(item) => Some((
-                        item,
-                        ForInKind::Tuple {
-                            arity: elems.len(),
-                        },
-                    )),
+                    Some(item) => Some((item, ForInKind::Tuple { arity: elems.len() })),
                     None => None,
                 }
             }
@@ -14437,8 +14431,7 @@ impl Checker {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], false, range);
                 }
-                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1
-                {
+                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], true, range);
                 }
                 None
@@ -14481,19 +14474,11 @@ impl Checker {
                 ));
             }
         };
-        Some((
-            elem,
-            ForInKind::Range { inclusive, float },
-        ))
+        Some((elem, ForInKind::Range { inclusive, float }))
     }
 
     /// All types unify to one element type, or diagnose heterogeneity.
-    fn homogeneous_types(
-        &mut self,
-        tys: &[Ty],
-        range: &Range<usize>,
-        kind: &str,
-    ) -> Option<Ty> {
+    fn homogeneous_types(&mut self, tys: &[Ty], range: &Range<usize>, kind: &str) -> Option<Ty> {
         let first = apply_ty_prune(&self.subst, &tys[0]);
         for other in tys.iter().skip(1) {
             let other = apply_ty_prune(&self.subst, other);
@@ -14627,19 +14612,15 @@ impl Checker {
                         fqn
                     ),
                     range,
-                    Some(format!("write `{}(...)` with positional or named arguments", fqn)),
+                    Some(format!(
+                        "write `{}(...)` with positional or named arguments",
+                        fqn
+                    )),
                 ));
             }
         };
 
-        Some(self.apply_function(
-            Some(&fqn),
-            &fun_ty,
-            &arg_tys,
-            None,
-            call_id,
-            range,
-        ))
+        Some(self.apply_function(Some(&fqn), &fun_ty, &arg_tys, None, call_id, range))
     }
 
     /// True if `name` was declared as `async fn`.
@@ -15291,12 +15272,9 @@ mod tests {
     }
 
     #[test]
-    fn call_to_unregistered_print_does_not_error() {
-        // The parser turns `print` into a `Print` AST node (not a Call),
-        // so it doesn't go through the unknown-call path.
-        let (mut c, ty) = check("print \"hello\";");
-        assert!(c.take_messages().is_empty());
-        assert_eq!(ty, unit_ty());
+    fn call_to_unregistered_print_errors() {
+        let msgs = assert_messages("print(\"hello\");");
+        assert!(!msgs.is_empty());
     }
 
     // ---- If ----
@@ -15349,11 +15327,14 @@ mod tests {
         assert_ok("{ 1; 2; 3; }", int());
     }
 
-    // ---- Print / Format ----
+    // ---- String formatting ----
 
     #[test]
-    fn print_with_string_format_ok() {
-        assert_ok("print \"hello\";", unit_ty());
+    fn write_all_with_string_bytes_ok() {
+        assert_ok(
+            r#"use io::{stdout, write_all}; use string::to_bytes; write_all(stdout(), to_bytes("hello"));"#,
+            result_app_ty(unit_ty(), Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into())),
+        );
     }
 
     // ---- Defer ----
@@ -15370,7 +15351,7 @@ mod tests {
             r#"
 fn main() {
     let y = 10;
-    defer { print "%i", y; }
+    defer { y; }
 }
 "#,
         );
@@ -15388,7 +15369,7 @@ fn main() {
         let msgs = assert_messages(
             r#"
 fn main() {
-    defer { print "%i", totally_undefined_var; }
+    defer { totally_undefined_var; }
 }
 "#,
         );
@@ -15409,7 +15390,7 @@ fn main() {
             r#"
 fn main() {
     let y = 10;
-    defer use (y) { print "%i", y; }
+    defer use (y) { y; }
 }
 "#,
         );
@@ -15425,7 +15406,7 @@ fn main() {
         let msgs = assert_messages(
             r#"
 fn main() {
-    defer use (nope) { print "%i", nope; }
+    defer use (nope) { nope; }
 }
 "#,
         );
@@ -15509,9 +15490,11 @@ fn main() {
     #[test]
     fn rank_n_param_accepts_polymorphic_id() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
             fn id<T>(T x) -> T { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { print "%i", app(id, 1); }
+            fn main() { write_all(stdout(), to_bytes(format("%i", app(id, 1)))); }
         "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
@@ -15521,9 +15504,11 @@ fn main() {
     #[test]
     fn rank_n_rejects_escaping_skolem() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
             fn inc(int x) -> int { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { print "%i", app(inc, 1); }
+            fn main() { write_all(stdout(), to_bytes(format("%i", app(inc, 1)))); }
         "#;
         let msgs = assert_messages(src);
         assert!(
@@ -15885,7 +15870,7 @@ fn main() {
         // against the registered signature and produce the right type.
         let mut c = Checker::new();
         c.register_native("print", &[string()], &unit_ty());
-        let ast = Pratt::default().parse("print \"hi\";").expect("parse");
+        let ast = Pratt::default().parse("print(\"hi\");").expect("parse");
         let ty = c.check_program(&ast);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -15923,7 +15908,7 @@ fn main() {
         // nested scope.
         let mut c = Checker::new();
         c.register_native("print", &[string()], &unit_ty());
-        let ast = Pratt::default().parse("{ print \"a\"; }").expect("parse");
+        let ast = Pratt::default().parse("{ print(\"a\"); }").expect("parse");
         let _ = c.check_program(&ast);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -16185,7 +16170,8 @@ fn main() {
         let (c, _) = check(src);
         assert!(c.messages().is_empty(), "{:?}", c.messages());
         assert_eq!(
-            c.codegen_var_type("x").map(|t| apply_ty_prune(c.subst(), t)),
+            c.codegen_var_type("x")
+                .map(|t| apply_ty_prune(c.subst(), t)),
             Some(int())
         );
     }
@@ -16743,7 +16729,11 @@ fn main() {
 
     #[test]
     fn format_string_percent_i_requires_int() {
-        let msgs = assert_messages(r#"print "%i", "hello";"#);
+        let msgs = assert_messages(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%i", "hello")));"#,
+        );
         assert!(
             msgs.iter().any(|m| m.message().contains("requires int")),
             "expected '%i requires int' error, got: {:?}",
@@ -16753,7 +16743,7 @@ fn main() {
 
     #[test]
     fn format_string_percent_s_requires_string() {
-        let msgs = assert_messages("print \"%s\", 42;");
+        let msgs = assert_messages(r#"string::format("%s", 42);"#);
         assert!(
             msgs.iter().any(|m| m.message().contains("requires string")),
             "expected '%s requires string' error, got: {:?}",
@@ -16763,7 +16753,7 @@ fn main() {
 
     #[test]
     fn format_string_percent_f_requires_float() {
-        let msgs = assert_messages("print \"%f\", 1;");
+        let msgs = assert_messages(r#"string::format("%f", 1);"#);
         assert!(
             msgs.iter().any(|m| m.message().contains("requires float")),
             "expected '%f requires float' error, got: {:?}",
@@ -16775,7 +16765,7 @@ fn main() {
     fn format_string_with_constructor_value_errors_on_percent_s() {
         // Red-team critical: passing a `Constructor` (a sum) where
         // a string is expected must be flagged.
-        let src = "print \"%s\", Option::Some(1)";
+        let src = r#"string::format("%s", Option::Some(1));"#;
         let msgs = assert_messages(src);
         assert!(
             msgs.iter().any(|m| m.message().contains("requires string")),
@@ -16787,8 +16777,8 @@ fn main() {
     #[test]
     fn format_string_with_constructor_via_match_works() {
         // The match arm's body must be inferable as a string, and
-        // print "%s", s should accept it.
-        let src = "let s = match Option::Some(1) { Option::None() => \"none\", Option::Some(_) => \"some\" }; print \"%s\", s";
+        // string::format("%s", s) should accept it.
+        let src = r#"let s = match Option::Some(1) { Option::None() => "none", Option::Some(_) => "some" }; string::format("%s", s);"#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -16810,27 +16800,39 @@ fn main() {
     }
 
     #[test]
-    fn format_expression_returns_string() {
-        assert_ok("format \"%i-%s\", 42, \"x\"", string());
+    fn string_format_call_returns_string() {
+        assert_ok(r#"string::format("%i-%s", 42, "x")"#, string());
     }
 
     #[test]
     fn format_percent_v_accepts_int() {
-        let (mut c, _) = check(r#"print "%v", 42;"#);
+        let (mut c, _) = check(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%v", 42)));"#,
+        );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
     }
 
     #[test]
     fn format_percent_v_accepts_structural_tuple_and_record() {
-        let (mut c, _) = check(r#"print "%v%v", (1, true), { a: 3, b: "x" };"#);
+        let (mut c, _) = check(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
+        );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
     }
 
     #[test]
     fn format_percent_i_on_open_type_errors() {
-        let msgs = assert_messages(r#"fn bad<T>(T x) { print "%i", x; } fn main() { bad(1); }"#);
+        let msgs = assert_messages(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%i", x))); } fn main() { bad(1); }"#,
+        );
         assert!(
             msgs.iter().any(|m| {
                 m.message().contains("open type")
@@ -16843,7 +16845,11 @@ fn main() {
 
     #[test]
     fn format_percent_v_without_show_errors() {
-        let msgs = assert_messages(r#"fn bad<T>(T x) { print "%v", x; } fn main() { bad(1); }"#);
+        let msgs = assert_messages(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", x))); } fn main() { bad(1); }"#,
+        );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
             "expected Show requirement for `%v`, got: {:?}",
@@ -16853,8 +16859,11 @@ fn main() {
 
     #[test]
     fn format_percent_v_rejects_structural_tuple_with_open_type() {
-        let msgs =
-            assert_messages(r#"fn bad<T>(T x) { print "%v", (x, 1); } fn main() { bad(1); }"#);
+        let msgs = assert_messages(
+            r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", (x, 1)))); } fn main() { bad(1); }"#,
+        );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
             "expected Show requirement for structural `%v` with open T, got: {:?}",
@@ -16868,6 +16877,8 @@ fn main() {
     fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
         // Two Result::Ok arms with different inner patterns are both reachable.
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
         fn unwrap(Result r) -> int {
             return match r {
                 Result::Ok(Option::Some(v)) => v,
@@ -16876,7 +16887,7 @@ fn main() {
             };
         }
         fn main() {
-            print "%i", unwrap(Result::Ok(Option::Some(42)));
+            write_all(stdout(), to_bytes(format("%i", unwrap(Result::Ok(Option::Some(42))))));
         }
         "#;
         let (mut c, _) = check(src);
@@ -17003,11 +17014,13 @@ fn main() {
         // variants share index `"0"`; match refinement must make this
         // typecheck (and `%v` must resolve Show).
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 #[derive(Show, Eq)]
 enum Box { S(string), B(bool) }
 fn main() {
-    print "%v,", Box::S("x");
-    print "%z", Box::S("x") == Box::S("x");
+    write_all(stdout(), to_bytes(format("%v,", Box::S("x"))));
+    write_all(stdout(), to_bytes(format("%z", Box::S("x") == Box::S("x"))));
 }
 "#;
         let mut ast = Pratt::default().parse(src).expect("parse");
@@ -17929,7 +17942,7 @@ fn main() {
                            Point::Point { x, y } => x, \
                        }; \
                    } \
-                   fn main() { print \"%i\", distance_squared(Point::Point { x: 5, y: 12 }); }";
+                   fn main() { let _ = distance_squared(Point::Point { x: 5, y: 12 }); }";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "expected no diagnostics, got: {:?}", msgs);
@@ -18039,11 +18052,7 @@ fn main() {
         let (c, _) = check(src);
         assert_eq!(c.field_type_for("T", "0"), Some(int()));
         assert_eq!(c.field_type_for("T", "1"), Some(string()));
-        assert_eq!(
-            c.field_type_for("T", "2"),
-            None,
-            "out-of-range tuple index"
-        );
+        assert_eq!(c.field_type_for("T", "2"), None, "out-of-range tuple index");
     }
 
     /// Chained access: field type can be another enum (`Outer.x` → `Inner`).
@@ -18237,9 +18246,7 @@ fn main() {
     fn range_rejects_string_bounds_without_ord() {
         let (c, _) = check(r#"fn main() { let r = "a".."z"; }"#);
         assert!(
-            c.messages()
-                .iter()
-                .any(|m| m.message().contains("Ord")),
+            c.messages().iter().any(|m| m.message().contains("Ord")),
             "expected Ord requirement diagnostic, got {:?}",
             c.messages()
         );
@@ -18273,9 +18280,7 @@ fn span<T>(T a, T b) -> Range<T> {
 "#;
         let (c, _) = check(src);
         assert!(
-            c.messages()
-                .iter()
-                .any(|m| m.message().contains("Ord")),
+            c.messages().iter().any(|m| m.message().contains("Ord")),
             "expected Ord bound diagnostic, got {:?}",
             c.messages()
         );
@@ -18453,6 +18458,8 @@ fn main() {
     #[test]
     fn declare_struct_ret_recorded_for_invoke_typing() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 extern struct Point {
     x: int32,
     y: int32,
@@ -18470,8 +18477,8 @@ fn main() -> Result<(), Error> {
         Point,
     )?;
     let p = invoke(lib, make_id, (3, 4))?;
-    print "%i", p.x;
-    print "%i", p.y;
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.y)));
 }
 "#;
         let (c, _) = check(src);
@@ -18585,11 +18592,13 @@ fn c() {
     #[test]
     fn coalesce_option_and_result_typecheck() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = Option::None ?? "bar";
     let b = Result::Err("boom") ?? 7;
-    print "%s", a;
-    print "%i", b;
+    write_all(stdout(), to_bytes(format("%s", a)));
+    write_all(stdout(), to_bytes(format("%i", b)));
 }
 "#;
         let (c, _) = check(src);
@@ -18616,10 +18625,12 @@ fn main() {
     #[test]
     fn optional_access_on_option_ok() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let o = Option::Some({ v: 1 });
     let n = o?.v;
-    print "%i", n ?? 0;
+    write_all(stdout(), to_bytes(format("%i", n ?? 0)));
 }
 "#;
         let (c, _) = check(src);
@@ -18648,9 +18659,11 @@ fn main() {
     #[test]
     fn prelude_injects_option_without_import() {
         let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let o = Option::Some(1);
-    print "%i", match o { Option::Some(v) => v, Option::None => 0 };
+    write_all(stdout(), to_bytes(format("%i", match o { Option::Some(v) => v, Option::None => 0 })));
 }
 "#;
         let (c, _) = check(src);
@@ -18750,8 +18763,7 @@ fn main() {
         let msgs = assert_messages(r#"fn main() { let lib = dload("x.so"); }"#);
         assert!(
             msgs.iter().any(|m| {
-                m.code() == Some(ErrorCode::UnknownValue)
-                    && m.message().contains("dload")
+                m.code() == Some(ErrorCode::UnknownValue) && m.message().contains("dload")
             }),
             "expected UnknownValue for bare dload, got: {:?}",
             msgs.iter()
@@ -19145,8 +19157,8 @@ fn main() {
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(
-            msgs.iter().all(|m| !m.message().contains("No instance")
-                && !m.message().contains("Show")),
+            msgs.iter()
+                .all(|m| !m.message().contains("No instance") && !m.message().contains("Show")),
             "inherent show must not require Show instance, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19187,10 +19199,9 @@ fn main() {
         );
         let dicts = c.all_call_site_dicts();
         let has_f = dicts.values().any(|instances| {
-            instances.iter().any(|i| {
-                i.class == "Into"
-                    && matches!(&i.args[1], Ty::Con(n) if n == "Fahrenheit")
-            })
+            instances
+                .iter()
+                .any(|i| i.class == "Into" && matches!(&i.args[1], Ty::Con(n) if n == "Fahrenheit"))
         });
         assert!(
             has_f,
@@ -19487,8 +19498,10 @@ trait Pointer<P: * -> *> {
     fn byte_return_accepts_in_range_literal_arithmetic() {
         let (mut c, _) = check(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn f() -> byte { return 1 + 1; }
-fn main() { print "%i", f(); }
+fn main() { write_all(stdout(), to_bytes(format("%i", f()))); }
 "#,
         );
         let msgs = c.take_messages();
@@ -19520,10 +19533,9 @@ fn f() -> byte {
 "#,
         );
         assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("Type mismatch")
-                    && m.message().contains("byte")
-                    && m.message().contains("int")),
+            msgs.iter().any(|m| m.message().contains("Type mismatch")
+                && m.message().contains("byte")
+                && m.message().contains("int")),
             "got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19607,9 +19619,8 @@ fn main() {
 "#,
         );
         assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("expected `byte`")
-                    || m.message().contains("Type mismatch")),
+            msgs.iter().any(|m| m.message().contains("expected `byte`")
+                || m.message().contains("Type mismatch")),
             "got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19638,8 +19649,10 @@ test("ok") {
     fn test_case_rejects_main_alongside_cases() {
         let msgs = assert_messages(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 test("a") { assert(true)?; }
-fn main() { print "x"; }
+fn main() { write_all(stdout(), to_bytes("x")); }
 "#,
         );
         assert!(
@@ -19659,8 +19672,7 @@ test(name) { assert(true)?; }
 "#,
         );
         assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("string literal")),
+            msgs.iter().any(|m| m.message().contains("string literal")),
             "got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19699,8 +19711,8 @@ test("bad") {
 "#,
         );
         assert!(
-            msgs.iter().any(|m| m.message().contains("Type mismatch")
-                || m.message().contains("mismatch")),
+            msgs.iter()
+                .any(|m| m.message().contains("Type mismatch") || m.message().contains("mismatch")),
             "got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19863,7 +19875,6 @@ fn main() {
         );
     }
 
-
     /// Fixed N=1 vs rest with K=1 fixed prefix (N >= K) — overlap error.
     #[test]
     fn overload_fixed_vs_rest_overlap_when_n_ge_k() {
@@ -19935,8 +19946,7 @@ fn main() { let a = f(1, 2, 3); }
 "#,
         );
         assert!(
-            msgs.iter()
-                .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+            msgs.iter().any(|m| m.code() == Some(ErrorCode::WrongArity)),
             "expected WrongArity, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -19955,9 +19965,7 @@ fn main() { let partial = add(a: 1); }
         let msgs = c.take_messages();
         // The old "under-applied" error must not appear.
         assert!(
-            !msgs
-                .iter()
-                .any(|m| m.message().contains("under-applied")),
+            !msgs.iter().any(|m| m.message().contains("under-applied")),
             "unexpected under-apply error: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -20076,10 +20084,7 @@ fn main() { let g = add(a: 1); }
         let c = Checker::new();
         assert!(!c.is_thread_sendable_ty(&stream_ty()));
         assert!(!c.is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
-        assert!(!c.is_thread_sendable_ty(&Ty::Fun(
-            Box::new(unit_ty()),
-            Box::new(int())
-        )));
+        assert!(!c.is_thread_sendable_ty(&Ty::Fun(Box::new(unit_ty()), Box::new(int()))));
         assert!(!c.is_thread_sendable_ty(&Ty::App(
             Box::new(Ty::Con("coroutine".into())),
             vec![int(), unit_ty()]
@@ -20204,12 +20209,11 @@ fn main() {
         let msgs = c.take_messages();
         assert_eq!(msgs.len(), 1);
         assert!(
-            msgs[0].message().contains("unknown host native `no_such_native`"),
+            msgs[0]
+                .message()
+                .contains("unknown host native `no_such_native`"),
             "got: {}",
             msgs[0].message()
         );
     }
 }
-
-
-

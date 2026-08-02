@@ -239,9 +239,7 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                     IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
                 )
             {
-                ops[i] = IlOp::Dup {
-                    loc: ops[i].loc(),
-                };
+                ops[i] = IlOp::Dup { loc: ops[i].loc() };
                 // Keep the original producer key so Const;Const;Const → Const;Dup;Dup.
                 continue;
             }
@@ -462,9 +460,9 @@ fn gvn_at_joins(ops: &mut Vec<IlOp>, blocks: &[Block]) {
         if let Some(tail) = join_pure_tail(ops, b.start, b.end, 2) {
             let keys: Vec<u64> = tail.iter().filter_map(|&i| producer_key(&ops[i])).collect();
             if keys.len() == 2
-                && preds[bi].iter().all(|&p| {
-                    pred_tail_keys(ops, &blocks[p], 2).as_ref() == Some(&keys)
-                })
+                && preds[bi]
+                    .iter()
+                    .all(|&p| pred_tail_keys(ops, &blocks[p], 2).as_ref() == Some(&keys))
             {
                 for &i in &tail {
                     remove.insert(i);
@@ -639,14 +637,8 @@ mod tests {
     #[test]
     fn within_block_dup_replaces_second_identical_const() {
         let mut ops = vec![
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -657,18 +649,9 @@ mod tests {
     #[test]
     fn within_block_const_run_compresses_to_dup_chain() {
         let mut ops = vec![
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -680,8 +663,14 @@ mod tests {
     #[test]
     fn within_block_dup_replaces_second_identical_load() {
         let mut ops = vec![
-            IlOp::Load { slot: 2, loc: loc() },
-            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -693,15 +682,12 @@ mod tests {
     fn within_block_store_pop_is_barrier() {
         // Effectful StorePop must reset numbering — second Const stays Const.
         let mut ops = vec![
-            IlOp::Const {
-                imm: 3,
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::StorePop {
+                slot: 0,
                 loc: loc(),
             },
-            IlOp::StorePop { slot: 0, loc: loc() },
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 3, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -712,18 +698,12 @@ mod tests {
     #[test]
     fn within_block_host_invoke_is_barrier() {
         let mut ops = vec![
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 3, loc: loc() },
             IlOp::HostInvoke {
                 arity: 0,
                 loc: loc(),
             },
-            IlOp::Const {
-                imm: 3,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 3, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -747,34 +727,22 @@ mod tests {
     fn join_cse_drops_redundant_const_on_jmpf_diamond() {
         // JMPF diamond with agreeing Known SP: join CONST is redundant.
         let mut ops = vec![
-            IlOp::Const {
-                imm: 0,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 0, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(1),
                 loc: loc(),
             },
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(1)),
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Label(Label(2)),
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);
@@ -790,25 +758,31 @@ mod tests {
     fn join_cse_drops_redundant_load_on_jmpf_diamond() {
         // Same Known-SP diamond as const join CSE, with Load producers.
         let mut ops = vec![
-            IlOp::Const {
-                imm: 0,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 0, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(1),
                 loc: loc(),
             },
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(1)),
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Label(Label(2)),
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Return { loc: loc() },
         ];
         let info = sp::analyze(&ops);
@@ -828,41 +802,39 @@ mod tests {
     #[test]
     fn join_cse_keeps_disagreeing_const() {
         let mut ops = vec![
-            IlOp::Const {
-                imm: 0,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 0, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(1),
                 loc: loc(),
             },
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(1)),
-            IlOp::Const {
-                imm: 2,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Label(Label(2)),
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         let before_len = ops.len();
         cfg_gvn(&mut ops);
-        assert_eq!(ops.len(), before_len, "disagreeing preds must not drop join");
-        assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 1, .. })));
-        assert!(ops.iter().any(|op| matches!(op, IlOp::Const { imm: 2, .. })));
+        assert_eq!(
+            ops.len(),
+            before_len,
+            "disagreeing preds must not drop join"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::Const { imm: 1, .. }))
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::Const { imm: 2, .. }))
+        );
     }
 
     #[test]
@@ -870,25 +842,31 @@ mod tests {
         // FfiInvoke fail-closes SP; Known-SP Load join CSE must not fire.
         let mut ops = vec![
             IlOp::byte(common::Byte::new(common::Instruction::FfiInvoke)),
-            IlOp::Const {
-                imm: 0,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 0, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(1),
                 loc: loc(),
             },
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(1)),
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Label(Label(2)),
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Return { loc: loc() },
         ];
         let join = ops
@@ -911,12 +889,18 @@ mod tests {
     #[test]
     fn load_field_cse_replaces_redundant_pair_with_dup() {
         let mut ops = vec![
-            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
             IlOp::LoadField {
                 index: 1,
                 loc: loc(),
             },
-            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
             IlOp::LoadField {
                 index: 1,
                 loc: loc(),
@@ -933,13 +917,19 @@ mod tests {
     #[test]
     fn load_field_cse_refuses_across_set_field() {
         let mut ops = vec![
-            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
             IlOp::LoadField {
                 index: 1,
                 loc: loc(),
             },
             IlOp::SetField { loc: loc() },
-            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
             IlOp::LoadField {
                 index: 1,
                 loc: loc(),
@@ -960,11 +950,23 @@ mod tests {
     #[test]
     fn get_field_cse_dups_repeated_obj_key_load() {
         let mut ops = vec![
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::GetField { loc: loc() },
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::GetField { loc: loc() },
             IlOp::Return { loc: loc() },
         ];
@@ -982,17 +984,35 @@ mod tests {
     #[test]
     fn get_field_cse_refuses_when_set_field_intervening() {
         let mut ops = vec![
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::GetField { loc: loc() },
             IlOp::Pop { loc: loc() },
             IlOp::Const { imm: 9, loc: loc() },
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::SetField { loc: loc() },
             IlOp::Pop { loc: loc() },
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::GetField { loc: loc() },
             IlOp::Return { loc: loc() },
         ];
@@ -1009,37 +1029,34 @@ mod tests {
     #[test]
     fn join_cse_drops_length_two_pure_tail() {
         let mut ops = vec![
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(1),
                 loc: loc(),
             },
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Const {
-                imm: 2,
+            IlOp::Load {
+                slot: 0,
                 loc: loc(),
             },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(1)),
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Const {
-                imm: 2,
+            IlOp::Load {
+                slot: 0,
                 loc: loc(),
             },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Label(Label(2)),
-            IlOp::Load { slot: 0, loc: loc() },
-            IlOp::Const {
-                imm: 2,
+            IlOp::Load {
+                slot: 0,
                 loc: loc(),
             },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         cfg_gvn(&mut ops);

@@ -41,7 +41,10 @@ fn is_libc_alias(name: &str) -> bool {
         "c" | "libc" | "libc.so.6" | "libsystem" | "libsystem.b.dylib" | "ucrtbase" | "msvcrt"
     ) || {
         let stem = library_stem(&lower);
-        matches!(stem.as_str(), "c" | "system" | "system.b" | "ucrtbase" | "msvcrt")
+        matches!(
+            stem.as_str(),
+            "c" | "system" | "system.b" | "ucrtbase" | "msvcrt"
+        )
     }
 }
 
@@ -77,11 +80,7 @@ fn platform_lib_names(stem: &str) -> Vec<String> {
 fn libc_platform_candidates() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        vec![
-            "ucrtbase.dll".into(),
-            "msvcrt.dll".into(),
-            "c".into(),
-        ]
+        vec!["ucrtbase.dll".into(), "msvcrt.dll".into(), "c".into()]
     }
     #[cfg(target_os = "macos")]
     {
@@ -249,28 +248,22 @@ mod tests {
     fn bare_name_generates_lib_prefix_candidates() {
         let base = PathBuf::from("/proj/examples");
         let c = library_candidates("sum", Some(&base), &[]);
-        assert!(
-            c.iter()
-                .any(|p| p.ends_with("libsum.so")
-                    || p.ends_with("libsum.dylib")
-                    || p.ends_with("sum.dll")
-                    || p.ends_with("libsum.dll"))
-        );
+        assert!(c.iter().any(|p| p.ends_with("libsum.so")
+            || p.ends_with("libsum.dylib")
+            || p.ends_with("sum.dll")
+            || p.ends_with("libsum.dll")));
         assert!(c.first().map(|p| p.starts_with(&base)).unwrap_or(false));
     }
 
     #[test]
     fn suffixed_so_name_still_generates_platform_candidates() {
         let c = library_candidates("libsum.so", None, &[]);
-        assert!(
-            c.iter()
-                .any(|p| p.ends_with("libsum.so")
-                    || p.ends_with("libsum.dylib")
-                    || p.ends_with("sum.dll")
-                    || p.ends_with("libsum.dll")
-                    || p.file_name().and_then(|s| s.to_str()) == Some("sum")
-                    || p.file_name().and_then(|s| s.to_str()) == Some("libsum.so"))
-        );
+        assert!(c.iter().any(|p| p.ends_with("libsum.so")
+            || p.ends_with("libsum.dylib")
+            || p.ends_with("sum.dll")
+            || p.ends_with("libsum.dll")
+            || p.file_name().and_then(|s| s.to_str()) == Some("sum")
+            || p.file_name().and_then(|s| s.to_str()) == Some("libsum.so")));
     }
 
     #[test]
@@ -285,9 +278,8 @@ mod tests {
         );
         #[cfg(target_os = "windows")]
         assert!(
-            c.iter()
-                .any(|p| p.to_string_lossy().contains("ucrtbase")
-                    || p.to_string_lossy().contains("msvcrt"))
+            c.iter().any(|p| p.to_string_lossy().contains("ucrtbase")
+                || p.to_string_lossy().contains("msvcrt"))
         );
     }
 

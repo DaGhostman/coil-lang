@@ -10,9 +10,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
-use common::{
-    BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value,
-};
+use common::{BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
 
@@ -363,11 +361,7 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
             .iter()
             .map(|v| {
                 let n = v.as_int();
-                if !(0..=255).contains(&n) {
-                    0
-                } else {
-                    n as u8
-                }
+                if !(0..=255).contains(&n) { 0 } else { n as u8 }
             })
             .collect(),
         _ => return Err(IoErrorTag::InvalidInput),
@@ -537,10 +531,7 @@ fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
     #[cfg(feature = "tls")]
     {
         let skip = with_stream_mut(heap, stream, |s| {
-            s.kind == StreamKind::Tls
-                && s.tls
-                    .as_ref()
-                    .is_some_and(|t| t.has_buffered_plaintext())
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.has_buffered_plaintext())
         })?;
         if skip {
             return Ok(());
@@ -1310,7 +1301,10 @@ mod tests {
         let t = udp_recv_from_wait(&mut heap, server, buf).expect("recv");
         let elems = tuple_elems(&heap, t);
         assert_eq!(elems[0].as_int(), 2);
-        assert_eq!(elems[2].as_int(), udp_local_port(&mut heap, client).unwrap());
+        assert_eq!(
+            elems[2].as_int(),
+            udp_local_port(&mut heap, client).unwrap()
+        );
         assert_eq!(&array_bytes(&heap, buf)[..2], b"Hi");
 
         stream_close(&mut heap, server).unwrap();
@@ -1402,7 +1396,10 @@ mod tests {
         // Port 1 is almost never listening; short timeout still fails fast.
         let err = tcp_connect_timeout(&mut heap, "127.0.0.1", 1, 50).unwrap_err();
         assert!(
-            matches!(err, IoErrorTag::Other | IoErrorTag::TimedOut | IoErrorTag::PermissionDenied),
+            matches!(
+                err,
+                IoErrorTag::Other | IoErrorTag::TimedOut | IoErrorTag::PermissionDenied
+            ),
             "unexpected {err:?}"
         );
     }

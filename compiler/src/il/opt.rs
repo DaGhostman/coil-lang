@@ -99,11 +99,7 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
 /// Whole-buffer [`multi_op_join_convoy`] is required: scoped multi_op can treat
 /// JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
 #[allow(dead_code)]
-pub fn optimize_per_func(
-    ops: &mut Vec<IlOp>,
-    funcs: &[super::IlFunc],
-    opts: &OptimizeOptions,
-) {
+pub fn optimize_per_func(ops: &mut Vec<IlOp>, funcs: &[super::IlFunc], opts: &OptimizeOptions) {
     if funcs.is_empty() {
         optimize(ops, opts);
         return;
@@ -115,7 +111,11 @@ pub fn optimize_per_func(
 
 /// Map inclusive-exclusive emitting indices to a raw op range, including
 /// leading labels bound at `emit_start`.
-pub(crate) fn emitting_range_to_raw(ops: &[IlOp], emit_start: usize, emit_end: usize) -> (usize, usize) {
+pub(crate) fn emitting_range_to_raw(
+    ops: &[IlOp],
+    emit_start: usize,
+    emit_end: usize,
+) -> (usize, usize) {
     let mut emitting = 0usize;
     let mut raw_start: Option<usize> = None;
     let mut raw_end: Option<usize> = None;
@@ -140,11 +140,7 @@ pub(crate) fn emitting_range_to_raw(ops: &[IlOp], emit_start: usize, emit_end: u
         raw_start.unwrap_or(0),
         raw_end.unwrap_or_else(|| {
             // emit_end past buffer: take through end once start was found.
-            if raw_start.is_some() {
-                ops.len()
-            } else {
-                0
-            }
+            if raw_start.is_some() { ops.len() } else { 0 }
         }),
     )
 }
@@ -249,7 +245,6 @@ fn eliminate_dead_blocks(ops: &mut Vec<IlOp>) {
     }
     *ops = out;
 }
-
 
 fn stack_dce(ops: &mut Vec<IlOp>) {
     let mut out = Vec::with_capacity(ops.len());
@@ -427,9 +422,7 @@ fn dead_store(ops: &mut Vec<IlOp>) {
 /// True if `byte` is a sinkable return producer (`LOAD s` or inline `CONST k`).
 fn is_return_producer(byte: &common::Byte) -> bool {
     match *byte.bytecode() {
-        Instruction::LOAD => byte
-            .load_store_single_slot()
-            .is_some_and(|s| s <= 255),
+        Instruction::LOAD => byte.load_store_single_slot().is_some_and(|s| s <= 255),
         Instruction::CONST => byte.operand_u32() & common::Byte::POOL_FLAG == 0,
         _ => false,
     }
@@ -438,7 +431,9 @@ fn is_return_producer(byte: &common::Byte) -> bool {
 fn fuse_producer_with_return(producer: common::Byte) -> IlOp {
     match *producer.bytecode() {
         Instruction::LOAD => IlOp::LoadReturnSlot {
-            slot: producer.load_store_single_slot().expect("is_return_producer gate"),
+            slot: producer
+                .load_store_single_slot()
+                .expect("is_return_producer gate"),
             loc: common::DebugLoc::unknown(),
         },
         Instruction::CONST => IlOp::ConstReturnImm {
@@ -588,10 +583,7 @@ fn join_label_cluster(ops: &[IlOp], i: usize) -> Option<(usize, usize, JoinKind)
 }
 
 fn is_cond_join_pred_kind(kind: IlJumpKind) -> bool {
-    matches!(
-        kind,
-        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue
-    )
+    matches!(kind, IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue)
 }
 
 fn is_match_join_pred_kind(kind: IlJumpKind) -> bool {
@@ -676,12 +668,7 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
         let mut saw_cond = false;
         let mut saw_match = false;
         for (j, op) in ops.iter().enumerate() {
-            let IlOp::Jump {
-                kind,
-                target,
-                ..
-            } = op
-            else {
+            let IlOp::Jump { kind, target, .. } = op else {
                 continue;
             };
             if !cluster.iter().any(|l| l == target) {
@@ -827,12 +814,7 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
             remove_tail_at.insert(fall_idx);
         }
         for (j, op) in ops.iter().enumerate() {
-            let IlOp::Jump {
-                kind,
-                target,
-                ..
-            } = op
-            else {
+            let IlOp::Jump { kind, target, .. } = op else {
                 continue;
             };
             if !cluster.iter().any(|l| l == target) {
@@ -955,9 +937,7 @@ fn is_multi_op_join_pred_kind(kind: IlJumpKind) -> bool {
 fn multi_op_pred_suffix_end(jump_idx: usize, kind: IlJumpKind) -> Option<usize> {
     match kind {
         IlJumpKind::Unconditional => Some(jump_idx),
-        IlJumpKind::JumpIfFalse
-        | IlJumpKind::JumpIfTrue
-        | IlJumpKind::JumpIfMatch { .. } => {
+        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue | IlJumpKind::JumpIfMatch { .. } => {
             if jump_idx == 0 {
                 None
             } else {
@@ -971,10 +951,7 @@ fn multi_op_pred_suffix_end(jump_idx: usize, kind: IlJumpKind) -> Option<usize> 
 /// consume values produced by the sunk suffix (e.g. `LOAD;CONST;EQ;JMPF`
 /// must not treat `EQ` as movable with its operands).
 fn multi_op_cond_is_independent_push(ops: &[IlOp], cond_idx: usize) -> bool {
-    matches!(
-        super::sp::stack_delta(&ops[cond_idx]),
-        Some(1)
-    )
+    matches!(super::sp::stack_delta(&ops[cond_idx]), Some(1))
 }
 
 /// Sink identical multi-op compute suffixes into a return or non-return join.
@@ -1003,9 +980,7 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
         let mut ok_edges = true;
         for (j, op) in ops.iter().enumerate() {
             let IlOp::Jump {
-                kind: jk,
-                target,
-                ..
+                kind: jk, target, ..
             } = op
             else {
                 continue;
@@ -1036,9 +1011,7 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
         for &(j, jk) in &jump_preds {
             if matches!(
                 jk,
-                IlJumpKind::JumpIfFalse
-                    | IlJumpKind::JumpIfTrue
-                    | IlJumpKind::JumpIfMatch { .. }
+                IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue | IlJumpKind::JumpIfMatch { .. }
             ) {
                 let Some(end) = multi_op_pred_suffix_end(j, jk) else {
                     cond_ok = false;
@@ -1134,9 +1107,7 @@ pub(crate) fn multi_op_join_convoy(ops: &mut Vec<IlOp>) {
         }
         for (j, op) in ops.iter().enumerate() {
             if let IlOp::Jump {
-                kind: jk,
-                target,
-                ..
+                kind: jk, target, ..
             } = op
                 && is_multi_op_join_pred_kind(*jk)
                 && cluster.iter().any(|l| l == target)
@@ -1212,12 +1183,7 @@ fn clone_shared_return(ops: &mut Vec<IlOp>) {
         let mut jump_only_jmps: Vec<usize> = Vec::new();
         let mut other_jumps = 0usize;
         for (j, op) in ops.iter().enumerate() {
-            let IlOp::Jump {
-                kind,
-                target,
-                ..
-            } = op
-            else {
+            let IlOp::Jump { kind, target, .. } = op else {
                 continue;
             };
             if !cluster.iter().any(|l| l == target) {
@@ -1342,12 +1308,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
         let mut saw_cond = false;
         let mut saw_match = false;
         for (j, op) in ops.iter().enumerate() {
-            let IlOp::Jump {
-                kind,
-                target,
-                ..
-            } = op
-            else {
+            let IlOp::Jump { kind, target, .. } = op else {
                 continue;
             };
             if !cluster.iter().any(|l| l == target) {
@@ -1475,8 +1436,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
         return;
     }
 
-    let mut remove_producer_at: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut remove_producer_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // cluster_start → fused op; keep all labels in [start,end], replace RETURN
     let mut fuse_at_cluster: std::collections::HashMap<usize, (usize, IlOp)> =
         std::collections::HashMap::new();
@@ -1489,12 +1449,7 @@ fn return_convoy(ops: &mut Vec<IlOp>) {
             remove_producer_at.insert(fall_idx);
         }
         for (j, op) in ops.iter().enumerate() {
-            let IlOp::Jump {
-                kind,
-                target,
-                ..
-            } = op
-            else {
+            let IlOp::Jump { kind, target, .. } = op else {
                 continue;
             };
             if !cluster.iter().any(|l| l == target) {
@@ -1796,7 +1751,8 @@ mod tests {
         ];
         return_convoy(&mut ops);
         assert!(
-            ops.iter().any(|op| is_insn(op, Instruction::ConstReturnImm)),
+            ops.iter()
+                .any(|op| is_insn(op, Instruction::ConstReturnImm)),
             "expected ConstReturnImm"
         );
         assert!(
@@ -1830,9 +1786,9 @@ mod tests {
         return_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
             matches!(op, IlOp::LoadReturnSlot { slot: 0, .. })
-                || op
-                    .as_encode_byte()
-                    .is_some_and(|b| *b.bytecode() == Instruction::LoadReturnSlot && b.operand_u32() == 0)
+                || op.as_encode_byte().is_some_and(|b| {
+                    *b.bytecode() == Instruction::LoadReturnSlot && b.operand_u32() == 0
+                })
         }));
     }
 
@@ -2083,10 +2039,7 @@ mod tests {
         return_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
             matches!(op, IlOp::ConstReturnImm { imm: 0, .. })
-                || matches!(
-                    op.instruction(),
-                    Some(Instruction::ConstReturnImm)
-                )
+                || matches!(op.instruction(), Some(Instruction::ConstReturnImm))
         }));
         assert_eq!(
             ops.iter()
@@ -2194,10 +2147,8 @@ mod tests {
         ];
         return_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
-            matches!(
-                op.instruction(),
-                Some(Instruction::ConstReturnImm)
-            ) || matches!(op, IlOp::ConstReturnImm { .. })
+            matches!(op.instruction(), Some(Instruction::ConstReturnImm))
+                || matches!(op, IlOp::ConstReturnImm { .. })
         }));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(54)))));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(48)))));
@@ -2245,11 +2196,16 @@ mod tests {
         ];
         bin_join_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
-            matches!(op, IlOp::BinReturn { op: Instruction::ADD, .. })
-                || op.as_encode_byte().is_some_and(|b| {
-                    *b.bytecode() == Instruction::BinReturn
-                        && b.bin_return_op() == Instruction::ADD as u8
-                })
+            matches!(
+                op,
+                IlOp::BinReturn {
+                    op: Instruction::ADD,
+                    ..
+                }
+            ) || op.as_encode_byte().is_some_and(|b| {
+                *b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::ADD as u8
+            })
         }));
         assert!(
             !ops.iter().any(|op| is_insn(op, Instruction::ADD)),
@@ -2263,11 +2219,8 @@ mod tests {
 
     #[test]
     fn bin_join_convoy_sinks_identical_bin_slot_slot() {
-        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
-            Instruction::ADD as u8,
-            0,
-            1,
-        );
+        let slot =
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::ADD as u8, 0, 1);
         let mut ops = vec![
             IlOp::byte(slot),
             IlOp::Jump {
@@ -2290,11 +2243,8 @@ mod tests {
 
     #[test]
     fn bin_join_convoy_sinks_identical_bin_slot_imm() {
-        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
-            Instruction::ADD as u8,
-            0,
-            1,
-        );
+        let imm =
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 0, 1);
         let mut ops = vec![
             IlOp::byte(imm),
             IlOp::Jump {
@@ -2392,18 +2342,20 @@ mod tests {
         ];
         bin_join_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
-            matches!(op, IlOp::BinReturn { op: Instruction::ADD, .. })
-                || is_insn(op, Instruction::BinReturn)
+            matches!(
+                op,
+                IlOp::BinReturn {
+                    op: Instruction::ADD,
+                    ..
+                }
+            ) || is_insn(op, Instruction::BinReturn)
         }));
     }
 
     #[test]
     fn bin_join_convoy_fuses_agreeing_binop_via_jump_if_match() {
-        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
-            Instruction::ADD as u8,
-            0,
-            1,
-        );
+        let imm =
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 0, 1);
         let mut ops = vec![
             IlOp::byte(imm),
             IlOp::Jump {
@@ -2467,11 +2419,16 @@ mod tests {
         ];
         bin_join_convoy(&mut ops);
         assert!(ops.iter().any(|op| {
-            matches!(op, IlOp::BinReturn { op: Instruction::SUB, .. })
-                || op.as_encode_byte().is_some_and(|b| {
-                    *b.bytecode() == Instruction::BinReturn
-                        && b.bin_return_op() == Instruction::SUB as u8
-                })
+            matches!(
+                op,
+                IlOp::BinReturn {
+                    op: Instruction::SUB,
+                    ..
+                }
+            ) || op.as_encode_byte().is_some_and(|b| {
+                *b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::SUB as u8
+            })
         }));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(1)))));
         assert!(ops.iter().any(|op| matches!(op, IlOp::Label(Label(9)))));
@@ -2499,7 +2456,10 @@ mod tests {
             },
         ];
         return_convoy(&mut ops);
-        assert!(ops.iter().any(|op| matches!(op, IlOp::ConstReturnImm { imm: 0, .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::ConstReturnImm { imm: 0, .. }))
+        );
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Const { .. })));
     }
 
@@ -2525,9 +2485,10 @@ mod tests {
             },
         ];
         return_convoy(&mut ops);
-        assert!(ops
-            .iter()
-            .any(|op| matches!(op, IlOp::LoadReturnSlot { slot: 3, .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::LoadReturnSlot { slot: 3, .. }))
+        );
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Load { .. })));
     }
 
@@ -2553,9 +2514,13 @@ mod tests {
             },
         ];
         bin_join_convoy(&mut ops);
-        assert!(ops
-            .iter()
-            .any(|op| matches!(op, IlOp::BinReturn { op: Instruction::MUL, .. })));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            IlOp::BinReturn {
+                op: Instruction::MUL,
+                ..
+            }
+        )));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Bin { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Return { .. })));
     }
@@ -2667,7 +2632,10 @@ mod tests {
             },
         ];
         dead_store(&mut ops);
-        assert!(ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 9, .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 9, .. }))
+        );
     }
 
     #[test]
@@ -2741,7 +2709,10 @@ mod tests {
             },
         ];
         dead_store(&mut ops);
-        assert!(ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 0, .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 0, .. }))
+        );
     }
 
     #[test]
@@ -2766,7 +2737,10 @@ mod tests {
             },
         ];
         dead_store(&mut ops);
-        assert!(ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 3, .. })));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 3, .. }))
+        );
     }
 
     #[test]
@@ -2854,7 +2828,15 @@ mod tests {
             .count();
         let add_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(load_count, 1, "suffix should appear once after join");
         assert_eq!(add_count, 1);
@@ -2993,7 +2975,15 @@ mod tests {
             .count();
         let add_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(load_count, 1, "suffix should appear once after join");
         assert_eq!(add_count, 1);
@@ -3039,10 +3029,7 @@ mod tests {
         ];
         let before = ops.clone();
         multi_op_join_convoy(&mut ops);
-        assert!(
-            ops == before,
-            "must not sink STORE/LOAD/CONST past EQ;JMPF"
-        );
+        assert!(ops == before, "must not sink STORE/LOAD/CONST past EQ;JMPF");
     }
 
     #[test]
@@ -3089,7 +3076,15 @@ mod tests {
             .expect("StorePop kept");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         assert!(add_idx < store_idx);
     }
@@ -3250,7 +3245,10 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(jmpf_count, 2, "JMPFs must not be stripped by jump-pred rewrite");
+        assert_eq!(
+            jmpf_count, 2,
+            "JMPFs must not be stripped by jump-pred rewrite"
+        );
     }
 
     #[test]
@@ -3309,7 +3307,15 @@ mod tests {
             .expect("join label");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("suffix sunk after join");
         assert!(load9 < store9 && store9 < lab && lab < add_idx);
         let sunk_loads = ops
@@ -3368,7 +3374,15 @@ mod tests {
             .expect("inner label");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         assert!(lab54 < lab48 && lab48 < add_idx);
     }
@@ -3412,7 +3426,15 @@ mod tests {
             .count();
         let add_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(load_count, 1, "suffix should appear once after join");
         assert_eq!(add_count, 1);
@@ -3590,7 +3612,15 @@ mod tests {
             .expect("inner label");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         assert!(lab54 < lab48 && lab48 < add_idx);
     }
@@ -3719,7 +3749,15 @@ mod tests {
             .count();
         let add_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(load_count, 1);
         assert_eq!(const_count, 2, "both consts from the length-4 suffix");
@@ -3812,7 +3850,15 @@ mod tests {
             .count();
         let add_count = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(load_count, 1, "suffix should appear once after join");
         assert_eq!(add_count, 1);
@@ -3823,7 +3869,15 @@ mod tests {
             .expect("StorePop kept");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         assert!(add_idx < store_idx, "suffix before shared continuation");
         assert!(ops.iter().any(|op| matches!(op, IlOp::Halt { .. })));
@@ -4008,7 +4062,15 @@ mod tests {
             .expect("StorePop kept");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         assert!(add_idx < store_idx);
     }
@@ -4114,7 +4176,15 @@ mod tests {
             .expect("inner label");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD sunk");
         let store_idx = ops
             .iter()
@@ -4165,7 +4235,15 @@ mod tests {
         assert_eq!(const_count, 2, "length-4 suffix keeps both consts once");
         let add_idx = ops
             .iter()
-            .position(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .position(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .expect("ADD");
         let store_idx = ops
             .iter()
@@ -4289,10 +4367,7 @@ mod tests {
                 loc: common::DebugLoc::unknown(),
             },
             IlOp::Jump {
-                kind: IlJumpKind::JumpIfMatch {
-                    tag: 0,
-                    arity: 0,
-                },
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
                 target: Label(1),
                 loc: common::DebugLoc::unknown(),
             },
@@ -4352,12 +4427,28 @@ mod tests {
         );
         let adds_before = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         bin_join_convoy(&mut ops);
         let adds_after = ops
             .iter()
-            .filter(|op| matches!(op, IlOp::Bin { op: Instruction::ADD, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::ADD,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(adds_after, adds_before);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::BinReturn { .. })));

@@ -20,7 +20,10 @@ pub enum IlJumpKind {
     /// Complete jump set (JMPT); constructed in opts/tests, matched in lower/sp.
     #[allow(dead_code)]
     JumpIfTrue,
-    JumpIfMatch { tag: u32, arity: u32 },
+    JumpIfMatch {
+        tag: u32,
+        arity: u32,
+    },
 }
 
 /// Call-like entry that carries a symbolic label instead of a PC.
@@ -42,38 +45,94 @@ pub enum IlOp {
     /// Ordinary VM instruction whose operand is not a code pointer.
     /// Jump/call ops that still embed absolute PCs are accepted for
     /// transitional emit paths; prefer [`IlOp::Jump`] / [`IlOp::Entry`].
-    Byte { byte: Byte, loc: DebugLoc },
-    Load { slot: u32, loc: DebugLoc },
-    StorePop { slot: u32, loc: DebugLoc },
+    Byte {
+        byte: Byte,
+        loc: DebugLoc,
+    },
+    Load {
+        slot: u32,
+        loc: DebugLoc,
+    },
+    StorePop {
+        slot: u32,
+        loc: DebugLoc,
+    },
     /// Inline `CONST` only (non-negative; pool / high-bit forms use [`IlOp::ConstPool`]).
-    Const { imm: i32, loc: DebugLoc },
+    Const {
+        imm: i32,
+        loc: DebugLoc,
+    },
     /// Pool-backed `CONST` (`POOL_FLAG | idx`); also absorbs high-bit inline encodings.
-    ConstPool { idx: u32, loc: DebugLoc },
-    Dup { loc: DebugLoc },
-    Pop { loc: DebugLoc },
+    ConstPool {
+        idx: u32,
+        loc: DebugLoc,
+    },
+    Dup {
+        loc: DebugLoc,
+    },
+    Pop {
+        loc: DebugLoc,
+    },
     /// `Index` — pop array + index, push element.
-    Index { loc: DebugLoc },
+    Index {
+        loc: DebugLoc,
+    },
     /// `MakeTuple` — pop `arity` values, push tuple.
-    MakeTuple { arity: u32, loc: DebugLoc },
+    MakeTuple {
+        arity: u32,
+        loc: DebugLoc,
+    },
     /// `MakeArray` — pop `arity` values, push array.
-    MakeArray { arity: u32, loc: DebugLoc },
+    MakeArray {
+        arity: u32,
+        loc: DebugLoc,
+    },
     /// `MakeEnum` — pop `arity` payloads, push enum with `tag`.
-    MakeEnum { tag: u16, arity: u16, loc: DebugLoc },
-    BoxValue { tag: u32, loc: DebugLoc },
-    UnboxValue { tag: u32, loc: DebugLoc },
-    LoadField { index: u32, loc: DebugLoc },
+    MakeEnum {
+        tag: u16,
+        arity: u16,
+        loc: DebugLoc,
+    },
+    BoxValue {
+        tag: u32,
+        loc: DebugLoc,
+    },
+    UnboxValue {
+        tag: u32,
+        loc: DebugLoc,
+    },
+    LoadField {
+        index: u32,
+        loc: DebugLoc,
+    },
     /// Dict / class field read — pop target + name, push value.
-    GetField { loc: DebugLoc },
+    GetField {
+        loc: DebugLoc,
+    },
     /// Dict / class field write — pop value + target + name, push value.
-    SetField { loc: DebugLoc },
+    SetField {
+        loc: DebugLoc,
+    },
     /// Host native call — pop fn id + args tuple; push result (delta −1).
-    HostInvoke { arity: u32, loc: DebugLoc },
+    HostInvoke {
+        arity: u32,
+        loc: DebugLoc,
+    },
     /// Print TOS string (consume).
-    Print { loc: DebugLoc },
-    Return { loc: DebugLoc },
-    Halt { loc: DebugLoc },
+    Print {
+        loc: DebugLoc,
+    },
+    Return {
+        loc: DebugLoc,
+    },
+    Halt {
+        loc: DebugLoc,
+    },
     /// Plain int/float binop or comparison (stack operands).
-    Bin { op: Instruction, loc: DebugLoc },
+    Bin {
+        op: Instruction,
+        loc: DebugLoc,
+    },
     BinSlotImm {
         op: u8,
         slot: u8,
@@ -86,9 +145,18 @@ pub enum IlOp {
         b: u8,
         loc: DebugLoc,
     },
-    LoadReturnSlot { slot: u32, loc: DebugLoc },
-    ConstReturnImm { imm: u32, loc: DebugLoc },
-    BinReturn { op: Instruction, loc: DebugLoc },
+    LoadReturnSlot {
+        slot: u32,
+        loc: DebugLoc,
+    },
+    ConstReturnImm {
+        imm: u32,
+        loc: DebugLoc,
+    },
+    BinReturn {
+        op: Instruction,
+        loc: DebugLoc,
+    },
     /// Bind `label` to the next emitting instruction's PC (last bind wins).
     Label(Label),
     /// Control-flow jump with a symbolic target.
@@ -105,7 +173,9 @@ pub enum IlOp {
         loc: DebugLoc,
     },
     /// Prologue JMP placeholder (`u32::MAX`); patched by the pipeline after lower.
-    PrologueJmp { loc: DebugLoc },
+    PrologueJmp {
+        loc: DebugLoc,
+    },
 }
 
 fn is_plain_bin_instruction(op: Instruction) -> bool {
@@ -257,7 +327,7 @@ impl IlOp {
             IlOp::Load { slot, .. } => Byte::new(Instruction::LOAD).with_load_store_slot(*slot),
             IlOp::StorePop { slot, .. } => {
                 Byte::new(Instruction::STORE).with_load_store_slot(*slot)
-            },
+            }
             IlOp::Const { imm, .. } => Byte::new(Instruction::CONST).with_const_inline(*imm),
             IlOp::ConstPool { idx, .. } => Byte::new(Instruction::CONST).with_const_pool(*idx),
             IlOp::Dup { .. } => Byte::new(Instruction::DUPLICATE),
@@ -272,9 +342,7 @@ impl IlOp {
             IlOp::MakeEnum { tag, arity, .. } => {
                 Byte::new(Instruction::MakeEnum).with_operands_u16([*tag, *arity])
             }
-            IlOp::BoxValue { tag, .. } => {
-                Byte::new(Instruction::BoxValue).with_operand_u32(*tag)
-            }
+            IlOp::BoxValue { tag, .. } => Byte::new(Instruction::BoxValue).with_operand_u32(*tag),
             IlOp::UnboxValue { tag, .. } => {
                 Byte::new(Instruction::UnboxValue).with_operand_u32(*tag)
             }
@@ -290,9 +358,9 @@ impl IlOp {
             IlOp::Return { .. } => Byte::new(Instruction::RETURN),
             IlOp::Halt { .. } => Byte::new(Instruction::HALT),
             IlOp::Bin { op, .. } => Byte::new(*op),
-            IlOp::BinSlotImm {
-                op, slot, imm, ..
-            } => Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(*op, *slot, *imm),
+            IlOp::BinSlotImm { op, slot, imm, .. } => {
+                Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(*op, *slot, *imm)
+            }
             IlOp::BinSlotSlot { op, a, b, .. } => {
                 Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(*op, *a, *b)
             }
@@ -305,10 +373,9 @@ impl IlOp {
             IlOp::BinReturn { op, .. } => {
                 Byte::new(Instruction::BinReturn).with_bin_return(*op as u8)
             }
-            IlOp::Label(_)
-            | IlOp::Jump { .. }
-            | IlOp::Entry { .. }
-            | IlOp::PrologueJmp { .. } => return None,
+            IlOp::Label(_) | IlOp::Jump { .. } | IlOp::Entry { .. } | IlOp::PrologueJmp { .. } => {
+                return None;
+            }
         })
     }
 
@@ -477,7 +544,13 @@ mod tests {
         );
         assert!(matches!(c, IlOp::Const { imm: 7, .. }));
         let add = IlOp::from_plain_byte(Byte::new(Instruction::ADD), DebugLoc::unknown());
-        assert!(matches!(add, IlOp::Bin { op: Instruction::ADD, .. }));
+        assert!(matches!(
+            add,
+            IlOp::Bin {
+                op: Instruction::ADD,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -505,7 +578,11 @@ mod tests {
                 Byte::new(Instruction::MakeEnum).with_operands_u16([9, 1]),
                 DebugLoc::unknown(),
             ),
-            IlOp::MakeEnum { tag: 9, arity: 1, .. }
+            IlOp::MakeEnum {
+                tag: 9,
+                arity: 1,
+                ..
+            }
         ));
     }
 
@@ -605,11 +682,8 @@ mod tests {
 
     #[test]
     fn from_plain_byte_lifts_bin_slot_and_fused_returns() {
-        let imm = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
-            Instruction::ADD as u8,
-            2,
-            -3,
-        );
+        let imm =
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::ADD as u8, 2, -3);
         assert!(matches!(
             IlOp::from_plain_byte(imm, DebugLoc::unknown()),
             IlOp::BinSlotImm {
@@ -619,11 +693,8 @@ mod tests {
                 ..
             } if op == Instruction::ADD as u8
         ));
-        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
-            Instruction::SUB as u8,
-            0,
-            1,
-        );
+        let slot =
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::SUB as u8, 0, 1);
         assert!(matches!(
             IlOp::from_plain_byte(slot, DebugLoc::unknown()),
             IlOp::BinSlotSlot {
@@ -705,26 +776,34 @@ mod tests {
 
     #[test]
     fn is_plain_return_excludes_fused_returns() {
-        assert!(IlOp::Return {
-            loc: DebugLoc::unknown()
-        }
-        .is_plain_return());
+        assert!(
+            IlOp::Return {
+                loc: DebugLoc::unknown()
+            }
+            .is_plain_return()
+        );
         assert!(IlOp::byte(Byte::new(Instruction::RETURN)).is_plain_return());
-        assert!(!IlOp::ConstReturnImm {
-            imm: 0,
-            loc: DebugLoc::unknown()
-        }
-        .is_plain_return());
-        assert!(!IlOp::LoadReturnSlot {
-            slot: 0,
-            loc: DebugLoc::unknown()
-        }
-        .is_plain_return());
-        assert!(!IlOp::BinReturn {
-            op: Instruction::ADD,
-            loc: DebugLoc::unknown()
-        }
-        .is_plain_return());
+        assert!(
+            !IlOp::ConstReturnImm {
+                imm: 0,
+                loc: DebugLoc::unknown()
+            }
+            .is_plain_return()
+        );
+        assert!(
+            !IlOp::LoadReturnSlot {
+                slot: 0,
+                loc: DebugLoc::unknown()
+            }
+            .is_plain_return()
+        );
+        assert!(
+            !IlOp::BinReturn {
+                op: Instruction::ADD,
+                loc: DebugLoc::unknown()
+            }
+            .is_plain_return()
+        );
     }
 
     #[test]

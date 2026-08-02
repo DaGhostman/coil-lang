@@ -484,9 +484,7 @@ fn slot_is_return_fusion(s: &Slot) -> bool {
     match s {
         Slot::Byte(b, _) => matches!(
             *b.bytecode(),
-            Instruction::LoadReturnSlot
-                | Instruction::ConstReturnImm
-                | Instruction::BinReturn
+            Instruction::LoadReturnSlot | Instruction::ConstReturnImm | Instruction::BinReturn
         ),
         _ => false,
     }
@@ -556,11 +554,7 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(*op, *slot, idx as u16)
         }
         Slot::BinSlotSlotJmpf {
-            op,
-            a,
-            b,
-            target,
-            ..
+            op, a, b, target, ..
         } => {
             let pc = resolve(labels, *target);
             let idx = pool.len();
@@ -684,10 +678,7 @@ fn load_slot(byte: &Byte) -> Option<u8> {
 }
 
 fn store_slot_u8(byte: &Byte) -> Option<u8> {
-    if !matches!(
-        *byte.bytecode(),
-        Instruction::STORE | Instruction::StorePop
-    ) {
+    if !matches!(*byte.bytecode(), Instruction::STORE | Instruction::StorePop) {
         return None;
     }
     let slot = byte.load_store_single_slot()?;
@@ -698,10 +689,7 @@ fn store_slot_u8(byte: &Byte) -> Option<u8> {
 }
 
 fn store_slot_u32(byte: &Byte) -> Option<u32> {
-    if !matches!(
-        *byte.bytecode(),
-        Instruction::STORE | Instruction::StorePop
-    ) {
+    if !matches!(*byte.bytecode(), Instruction::STORE | Instruction::StorePop) {
         return None;
     }
     byte.load_store_single_slot()
@@ -729,12 +717,8 @@ fn try_fuse_packed_loads(window: &[Slot]) -> Option<(Slot, usize)> {
         if ok {
             return Some((
                 Slot::Byte(
-                    Byte::new(Instruction::LOAD).with_load_store_packed(
-                        n as u8,
-                        slots[0],
-                        slots[1],
-                        slots[2],
-                    ),
+                    Byte::new(Instruction::LOAD)
+                        .with_load_store_packed(n as u8, slots[0], slots[1], slots[2]),
                     window[0].loc(),
                 ),
                 n,
@@ -766,12 +750,8 @@ fn try_fuse_packed_stores(window: &[Slot]) -> Option<(Slot, usize)> {
         if ok {
             return Some((
                 Slot::Byte(
-                    Byte::new(Instruction::STORE).with_load_store_packed(
-                        n as u8,
-                        slots[0],
-                        slots[1],
-                        slots[2],
-                    ),
+                    Byte::new(Instruction::STORE)
+                        .with_load_store_packed(n as u8, slots[0], slots[1], slots[2]),
                     window[0].loc(),
                 ),
                 n,
@@ -813,9 +793,7 @@ fn try_fuse_bin_slot_imm_store_local(b0: &Byte, b1: &Byte, pool: &mut Vec<u64>) 
     let dest = store_slot_u32(b1)?;
     let idx = pool.len();
     pool.push(((dest as u64) << 32) | (imm as i16 as u16 as u32 as u64));
-    Some(
-        Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(op, src as u8, idx as u16),
-    )
+    Some(Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(op, src as u8, idx as u16))
 }
 
 /// `BinSlotSlot; STORE dest` → `BinSlotSlotStore`.
@@ -900,10 +878,7 @@ mod tests {
         let lowered = lower(il.ops(), &mut pool);
         assert_eq!(lowered.bytecode.len(), 3);
         assert_eq!(lowered.bytecode[0].operand_u32(), 1);
-        assert!(matches!(
-            *lowered.bytecode[2].bytecode(),
-            Instruction::HALT
-        ));
+        assert!(matches!(*lowered.bytecode[2].bytecode(), Instruction::HALT));
     }
 
     #[test]
@@ -1087,9 +1062,11 @@ mod tests {
     fn lower_fuses_bin_slot_slot_and_jmpf() {
         let mut il = IlBuilder::new();
         let exit = il.fresh_label();
-        il.push_byte(
-            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::AND as u8, 0, 1),
-        );
+        il.push_byte(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::AND as u8,
+            0,
+            1,
+        ));
         il.emit_jump(IlJumpKind::JumpIfFalse, exit);
         il.push_byte(Byte::new(Instruction::CONST).with_const_inline(1));
         il.bind_label(exit);
@@ -1180,9 +1157,11 @@ mod tests {
     #[test]
     fn lower_fuses_bin_slot_imm_then_store() {
         let mut il = IlBuilder::new();
-        il.push_byte(
-            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::BITAND as u8, 0, 7),
-        );
+        il.push_byte(Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::BITAND as u8,
+            0,
+            7,
+        ));
         il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(1));
         il.push_byte(Byte::new(Instruction::HALT));
 
@@ -1210,10 +1189,7 @@ mod tests {
         let mut pool = Vec::new();
         let lowered = lower(il.ops(), &mut pool);
         assert_eq!(lowered.bytecode.len(), 2);
-        assert!(matches!(
-            *lowered.bytecode[0].bytecode(),
-            Instruction::LOAD
-        ));
+        assert!(matches!(*lowered.bytecode[0].bytecode(), Instruction::LOAD));
         assert_eq!(lowered.bytecode[0].load_store_parts(), (3, 0, 1, 2));
         assert_eq!(lowered.bytecode[0].load_store_count(), 3);
     }
@@ -1303,10 +1279,7 @@ mod tests {
                 .map(|b| b.bytecode())
                 .collect::<Vec<_>>()
         );
-        assert!(matches!(
-            *lowered.bytecode[0].bytecode(),
-            Instruction::LOAD
-        ));
+        assert!(matches!(*lowered.bytecode[0].bytecode(), Instruction::LOAD));
         assert_eq!(lowered.label_pcs.get(&mid.0).copied(), Some(1));
     }
 
@@ -1314,10 +1287,7 @@ mod tests {
     fn lower_resolves_jump_if_match_into_pool() {
         let mut il = IlBuilder::new();
         let arm = il.fresh_label();
-        il.emit_jump(
-            IlJumpKind::JumpIfMatch { tag: 2, arity: 1 },
-            arm,
-        );
+        il.emit_jump(IlJumpKind::JumpIfMatch { tag: 2, arity: 1 }, arm);
         il.push_byte(Byte::new(Instruction::CONST).with_const_inline(0));
         il.bind_label(arm);
         il.push_byte(Byte::new(Instruction::HALT));
@@ -1344,10 +1314,7 @@ mod tests {
 
         let mut pool = Vec::new();
         let lowered = lower(il.ops(), &mut pool);
-        assert!(matches!(
-            *lowered.bytecode[0].bytecode(),
-            Instruction::CALL
-        ));
+        assert!(matches!(*lowered.bytecode[0].bytecode(), Instruction::CALL));
         assert_eq!(lowered.bytecode[0].call_parts(), (1, 2));
     }
 
@@ -1377,9 +1344,7 @@ mod tests {
 
     #[test]
     fn residual_abs_jmp_byte_is_detected() {
-        let ops = vec![IlOp::byte(
-            Byte::new(Instruction::JMP).with_operand_u32(42),
-        )];
+        let ops = vec![IlOp::byte(Byte::new(Instruction::JMP).with_operand_u32(42))];
         assert!(is_residual_abs_jump(&ops[0]));
     }
 
@@ -1527,7 +1492,8 @@ mod tests {
             .filter(|b| matches!(*b.bytecode(), Instruction::LOAD))
             .count();
         assert_eq!(
-            loads, 2,
+            loads,
+            2,
             "join Load CSE via lower_module GVN; got {:?}",
             lowered
                 .bytecode

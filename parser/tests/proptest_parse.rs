@@ -6,13 +6,7 @@ use parser::Pratt;
 use proptest::prelude::*;
 
 /// Build a small well-formed-ish source string from constrained components.
-fn program_from_parts(
-    a: i32,
-    b: i32,
-    use_if: bool,
-    use_let: bool,
-    ident_idx: u8,
-) -> String {
+fn program_from_parts(a: i32, b: i32, use_if: bool, use_let: bool, ident_idx: u8) -> String {
     let names = ["x", "y", "n", "tmp", "acc"];
     let name = names[(ident_idx as usize) % names.len()];
     let mut body = String::new();
@@ -39,30 +33,14 @@ fn syntax_shape(kind: u8, a: i32, b: i32) -> String {
         2 => format!(
             "fn main() {{ if {a} < {b} {{ print \"%i\", 1; }} else {{ print \"%i\", 0; }} }}\n"
         ),
-        3 => format!(
-            "fn main() {{ let a = [{a}, {b}]; print \"%i\", a[0] + a[1]; }}\n"
-        ),
-        4 => format!(
-            "fn main() {{ let t = ({a}, {b}); print \"%i\", t[0] + t[1]; }}\n"
-        ),
-        5 => format!(
-            "fn main() {{ let d = {{ v: {a} }}; print \"%i\", d.v + {b}; }}\n"
-        ),
-        6 => format!(
-            "enum C {{ A, B }}\nfn main() {{ let c = C::A; print \"%z\", c == C::A; }}\n"
-        ),
-        7 => format!(
-            "fn main() {{ let i = 0; while i < 3 {{ i = i + 1; }} print \"%i\", i; }}\n"
-        ),
-        8 => format!(
-            "fn main() {{ for (let i = 0; i < 3; i = i + 1) {{ print \"%i\", i; }} }}\n"
-        ),
-        9 => format!(
-            "fn main() {{ print \"%s\", \"a\" + \"b\"; print \"%i\", {a}; }}\n"
-        ),
-        10 => format!(
-            "fn main() {{ let s = format \"%i-%i\", {a}, {b}; print \"%s\", s; }}\n"
-        ),
+        3 => format!("fn main() {{ let a = [{a}, {b}]; print \"%i\", a[0] + a[1]; }}\n"),
+        4 => format!("fn main() {{ let t = ({a}, {b}); print \"%i\", t[0] + t[1]; }}\n"),
+        5 => format!("fn main() {{ let d = {{ v: {a} }}; print \"%i\", d.v + {b}; }}\n"),
+        6 => format!("enum C {{ A, B }}\nfn main() {{ let c = C::A; print \"%z\", c == C::A; }}\n"),
+        7 => format!("fn main() {{ let i = 0; while i < 3 {{ i = i + 1; }} print \"%i\", i; }}\n"),
+        8 => format!("fn main() {{ for (let i = 0; i < 3; i = i + 1) {{ print \"%i\", i; }} }}\n"),
+        9 => format!("fn main() {{ print \"%s\", \"a\" + \"b\"; print \"%i\", {a}; }}\n"),
+        10 => format!("fn main() {{ let s = format \"%i-%i\", {a}, {b}; print \"%s\", s; }}\n"),
         _ => format!(
             "fn add(int x, int y) -> int {{ return x + y; }}\n\
              fn main() {{ print \"%i\", add({a}, {b}); }}\n"

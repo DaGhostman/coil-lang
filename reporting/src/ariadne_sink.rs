@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use ariadne::{
-    sources, Color, Config, IndexType, Label as AriadneLabel, LabelAttach, Report, ReportKind,
+    Color, Config, IndexType, Label as AriadneLabel, LabelAttach, Report, ReportKind, sources,
 };
 
 use crate::diagnostic::{Diagnostic, Severity};
@@ -139,7 +139,10 @@ impl DiagnosticSink for AriadneSink {
             self.write_spanless(&diag)
         };
         if let Err(err) = result {
-            let _ = writeln!(std::io::stderr(), "reporting: failed to render diagnostic: {err}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "reporting: failed to render diagnostic: {err}"
+            );
         }
     }
 
@@ -254,7 +257,10 @@ mod tests {
             out.contains("let x: int") || out.contains("\"hi\""),
             "expected source snippet in pretty output, got:\n{out}"
         );
-        assert!(out.contains("E0102") || out.contains("Type mismatch"), "{out}");
+        assert!(
+            out.contains("E0102") || out.contains("Type mismatch"),
+            "{out}"
+        );
         assert!(sink.had_errors());
     }
 

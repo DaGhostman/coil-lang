@@ -3,12 +3,12 @@
 //! See [`CRYPTO_WIRING`] for pipeline `HostInvoke` registry names and arities.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce as AesNonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2, Params, Version,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use blake3::Hasher as Blake3;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
@@ -23,9 +23,7 @@ use zeroize::Zeroize;
 use common::{BUILTIN_CRYPTO_ERROR_VARIANTS, Value};
 
 use crate::crypto_hasher_state::{HasherAlg, ObjCryptoHasher};
-use crate::io::{
-    alloc_result_err, alloc_result_ok, value_as_bytes, value_as_string,
-};
+use crate::io::{alloc_result_err, alloc_result_ok, value_as_bytes, value_as_string};
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjTuple, Object};
 
 /// Tag indices for [`CryptoError`](common::BUILTIN_CRYPTO_ERROR_ENUM).
@@ -181,7 +179,10 @@ pub fn host_hasher_update(heap: &mut Heap, args: &[Value]) -> Value {
 pub fn host_hasher_finalize(heap: &mut Heap, args: &[Value]) -> Value {
     let r = (|| {
         let digest: Vec<u8> = with_crypto_hasher(heap, args[0], |hasher| {
-            let state = hasher.state.take().ok_or(CryptoErrorTag::AlreadyFinalized)?;
+            let state = hasher
+                .state
+                .take()
+                .ok_or(CryptoErrorTag::AlreadyFinalized)?;
             Ok(state.finalize())
         })?;
         Ok(alloc_bytes(heap, &digest))
@@ -195,7 +196,8 @@ type HmacSha512 = Hmac<Sha512>;
 fn try_hmac_sha256(heap: &Heap, key: Value, data: Value) -> Result<Vec<u8>, CryptoErrorTag> {
     let key_bytes = value_as_bytes(heap, key).map_err(|_| CryptoErrorTag::InvalidInput)?;
     let data_bytes = value_as_bytes(heap, data).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let mut mac = HmacSha256::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
+    let mut mac =
+        HmacSha256::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
     mac.update(&data_bytes);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -203,7 +205,8 @@ fn try_hmac_sha256(heap: &Heap, key: Value, data: Value) -> Result<Vec<u8>, Cryp
 fn try_hmac_sha512(heap: &Heap, key: Value, data: Value) -> Result<Vec<u8>, CryptoErrorTag> {
     let key_bytes = value_as_bytes(heap, key).map_err(|_| CryptoErrorTag::InvalidInput)?;
     let data_bytes = value_as_bytes(heap, data).map_err(|_| CryptoErrorTag::InvalidInput)?;
-    let mut mac = HmacSha512::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
+    let mut mac =
+        HmacSha512::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
     mac.update(&data_bytes);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -221,7 +224,8 @@ pub fn host_hmac_verify_sha256(heap: &mut Heap, args: &[Value]) -> Value {
         let key_bytes = value_as_bytes(heap, args[0]).map_err(|_| CryptoErrorTag::InvalidInput)?;
         let data_bytes = value_as_bytes(heap, args[1]).map_err(|_| CryptoErrorTag::InvalidInput)?;
         let tag_bytes = value_as_bytes(heap, args[2]).map_err(|_| CryptoErrorTag::InvalidInput)?;
-        let mut mac = HmacSha256::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
+        let mut mac =
+            HmacSha256::new_from_slice(&key_bytes).map_err(|_| CryptoErrorTag::InvalidLength)?;
         mac.update(&data_bytes);
         mac.verify_slice(&tag_bytes)
             .map_err(|_| CryptoErrorTag::AuthenticationFailed)?;
@@ -269,7 +273,8 @@ fn aead_chacha_encrypt(
     if key.len() != 32 || nonce.len() != 12 {
         return Err(CryptoErrorTag::InvalidLength);
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
     let nonce: ChaChaNonce = nonce
         .as_slice()
         .try_into()
@@ -299,7 +304,8 @@ fn aead_chacha_decrypt(
     if key.len() != 32 || nonce.len() != 12 {
         return Err(CryptoErrorTag::InvalidLength);
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoErrorTag::InvalidInput)?;
     let nonce: ChaChaNonce = nonce
         .as_slice()
         .try_into()
@@ -392,17 +398,28 @@ fn aead_aes_decrypt(
 }
 
 pub fn host_aes_256_gcm_encrypt(heap: &mut Heap, args: &[Value]) -> Value {
-    as_result_bytes_crypto(heap, aead_aes_encrypt(heap, args[0], args[1], args[2], args[3]))
+    as_result_bytes_crypto(
+        heap,
+        aead_aes_encrypt(heap, args[0], args[1], args[2], args[3]),
+    )
 }
 
 pub fn host_aes_256_gcm_decrypt(heap: &mut Heap, args: &[Value]) -> Value {
-    as_result_bytes_crypto(heap, aead_aes_decrypt(heap, args[0], args[1], args[2], args[3]))
+    as_result_bytes_crypto(
+        heap,
+        aead_aes_decrypt(heap, args[0], args[1], args[2], args[3]),
+    )
 }
 
 fn alloc_keypair(heap: &mut Heap, secret: &[u8], public: &[u8]) -> Value {
     let sk = alloc_bytes(heap, secret);
     let pk = alloc_bytes(heap, public);
-    let (obj, _) = heap.alloc(ObjTuple { elements: vec![sk, pk] }, Object::Tuple);
+    let (obj, _) = heap.alloc(
+        ObjTuple {
+            elements: vec![sk, pk],
+        },
+        Object::Tuple,
+    );
     Value::from(obj.addr())
 }
 
@@ -413,7 +430,11 @@ pub fn host_ed25519_generate(heap: &mut Heap, _args: &[Value]) -> Value {
         let signing = SigningKey::from_bytes(&seed);
         seed.zeroize();
         let verifying: VerifyingKey = signing.verifying_key();
-        Ok(alloc_keypair(heap, signing.as_bytes(), verifying.as_bytes()))
+        Ok(alloc_keypair(
+            heap,
+            signing.as_bytes(),
+            verifying.as_bytes(),
+        ))
     })();
     as_result_value_crypto(heap, r)
 }
@@ -446,7 +467,10 @@ pub fn host_ed25519_verify(heap: &mut Heap, args: &[Value]) -> Value {
         let verifying = VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap())
             .map_err(|_| CryptoErrorTag::InvalidInput)?;
         let sig = ed25519_dalek::Signature::from_bytes(
-            sig_bytes.as_slice().try_into().map_err(|_| CryptoErrorTag::InvalidLength)?,
+            sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| CryptoErrorTag::InvalidLength)?,
         );
         verifying
             .verify_strict(&msg, &sig)
@@ -500,7 +524,8 @@ pub fn host_argon2id_hash(heap: &mut Heap, args: &[Value]) -> Value {
         }
         let salt_b64 = base64_salt(&salt)?;
         // Fixed MVP params (not caller-tunable): 19 MiB, 2 iters, parallelism 1.
-        let params = Params::new(19 * 1024, 2, 1, None).map_err(|_| CryptoErrorTag::InvalidInput)?;
+        let params =
+            Params::new(19 * 1024, 2, 1, None).map_err(|_| CryptoErrorTag::InvalidInput)?;
         let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
         let hash = argon2
             .hash_password(&password, &salt_b64)
@@ -700,7 +725,10 @@ mod tests {
 
         let ct_r = host_chacha20_poly1305_encrypt(&mut heap, &[key, nonce, pt, aad]);
         let ct = result_ok_bytes(&heap, ct_r);
-        assert!(ct.len() > b"coil-aead".len(), "ciphertext includes auth tag");
+        assert!(
+            ct.len() > b"coil-aead".len(),
+            "ciphertext includes auth tag"
+        );
 
         let ct_v = alloc_bytes(&mut heap, &ct);
         let pt_r = host_chacha20_poly1305_decrypt(&mut heap, &[key, nonce, ct_v, aad]);

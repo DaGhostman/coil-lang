@@ -51,8 +51,7 @@ impl Heap {
     #[must_use]
     pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
         if let Some(crate::memory::Object::String(gc)) = self.find_object_by_addr(addr) {
-            let s: std::ffi::CString =
-                std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
+            let s: std::ffi::CString = std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
             let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
             return Some(boxed.as_ptr());
         }
@@ -333,11 +332,7 @@ impl Heap {
     }
 
     #[cfg(feature = "regex")]
-    pub fn with_regex<R>(
-        &mut self,
-        addr: u64,
-        f: impl FnOnce(&mut ObjRegex) -> R,
-    ) -> Option<R> {
+    pub fn with_regex<R>(&mut self, addr: u64, f: impl FnOnce(&mut ObjRegex) -> R) -> Option<R> {
         if let Some(Object::Regex(gc)) = self.find_object_by_addr(addr) {
             return Some(f(gc.payload_mut()));
         }
@@ -1925,12 +1920,14 @@ mod tests {
     fn with_crypto_hasher_rejects_wrong_type() {
         let mut heap = Heap::default();
         let (obj, _) = heap.alloc(ObjString::from("not-hasher"), Object::String);
-        assert!(heap
-            .with_crypto_hasher(obj.addr(), |_| panic!("must not run"))
-            .is_none());
-        assert!(heap
-            .with_crypto_hasher(0, |_| panic!("must not run"))
-            .is_none());
+        assert!(
+            heap.with_crypto_hasher(obj.addr(), |_| panic!("must not run"))
+                .is_none()
+        );
+        assert!(
+            heap.with_crypto_hasher(0, |_| panic!("must not run"))
+                .is_none()
+        );
     }
 
     #[cfg(feature = "regex")]
@@ -1938,9 +1935,10 @@ mod tests {
     fn with_regex_rejects_wrong_type() {
         let mut heap = Heap::default();
         let (obj, _) = heap.alloc(ObjString::from("not-regex"), Object::String);
-        assert!(heap
-            .with_regex(obj.addr(), |_| panic!("must not run"))
-            .is_none());
+        assert!(
+            heap.with_regex(obj.addr(), |_| panic!("must not run"))
+                .is_none()
+        );
         assert!(heap.with_regex(0, |_| panic!("must not run")).is_none());
     }
 

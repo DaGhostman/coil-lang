@@ -1,15 +1,18 @@
 //! Stack VM, managed heap, and FFI runtime for coil bytecode.
 
-mod ffi;
+pub mod char_ord;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "crypto")]
 mod crypto_hasher_state;
 pub mod debug;
 pub mod env;
+mod ffi;
 pub mod fs;
 pub mod io;
-pub mod char_ord;
+mod memory;
+mod opcode;
+pub mod packed_la;
 #[cfg(feature = "regex")]
 pub mod regex;
 #[cfg(feature = "regex")]
@@ -19,29 +22,26 @@ pub mod thread;
 pub mod time;
 #[cfg(feature = "tls")]
 pub mod tls;
-mod memory;
-mod opcode;
-pub mod packed_la;
 mod vm;
 
 #[cfg(feature = "crypto")]
-pub use crypto::{CryptoErrorTag, CRYPTO_WIRING};
+pub use crypto::{CRYPTO_WIRING, CryptoErrorTag};
 pub use debug::{DebugController, StepMode, StopReason};
 pub use env::ENV_WIRING;
-pub use fs::FS_WIRING;
-#[cfg(feature = "regex")]
-pub use regex::{RegexErrorTag, REGEX_WIRING};
-#[cfg(feature = "time")]
-pub use time::TIME_WIRING;
 pub use ffi::*;
+pub use fs::FS_WIRING;
 pub use memory::*;
 pub use opcode::*;
 pub use packed_la::{
     PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot, packed_matmul,
     packed_matrix_neg, packed_matrix_zip,
 };
+#[cfg(feature = "regex")]
+pub use regex::{REGEX_WIRING, RegexErrorTag};
 pub use thread::{
-    join_undetached_threads, new_live_thread_registry, LiveThreadRegistry, ThreadErrorTag,
-    ThreadProgram,
+    LiveThreadRegistry, ThreadErrorTag, ThreadProgram, join_undetached_threads,
+    new_live_thread_registry,
 };
+#[cfg(feature = "time")]
+pub use time::TIME_WIRING;
 pub use vm::*;

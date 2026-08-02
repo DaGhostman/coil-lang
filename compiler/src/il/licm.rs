@@ -164,10 +164,7 @@ fn licm_string_keys(ops: &mut Vec<IlOp>) -> bool {
         }
         replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         for (start, end, slot) in replacements {
-            ops.splice(
-                start..end,
-                std::iter::once(IlOp::Load { slot, loc }),
-            );
+            ops.splice(start..end, std::iter::once(IlOp::Load { slot, loc }));
         }
 
         // Re-find loop after splice (header label unchanged; indices shifted).
@@ -318,9 +315,7 @@ fn loop_has_barrier(ops: &[IlOp], lp: &NaturalLoop) -> bool {
 fn loop_has_hard_barrier(ops: &[IlOp], lp: &NaturalLoop) -> bool {
     for i in lp.header..=lp.latch {
         match &ops[i] {
-            IlOp::HostInvoke { .. }
-            | IlOp::Print { .. }
-            | IlOp::Entry { .. } => return true,
+            IlOp::HostInvoke { .. } | IlOp::Print { .. } | IlOp::Entry { .. } => return true,
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfMatch { .. },
                 ..
@@ -467,7 +462,10 @@ mod tests {
                 loc: loc(),
             },
             IlOp::Label(Label(0)),
-            IlOp::Const { imm: 42, loc: loc() },
+            IlOp::Const {
+                imm: 42,
+                loc: loc(),
+            },
             IlOp::Pop { loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
@@ -501,8 +499,14 @@ mod tests {
     fn refuses_when_load_slot_stored_in_loop() {
         let mut ops = vec![
             IlOp::Label(Label(0)),
-            IlOp::Load { slot: 1, loc: loc() },
-            IlOp::StorePop { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(0),
@@ -523,7 +527,10 @@ mod tests {
                 loc: loc(),
             },
             IlOp::Label(Label(0)),
-            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
             IlOp::Pop { loc: loc() },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
@@ -580,7 +587,11 @@ mod tests {
         else {
             panic!("expected entry jump");
         };
-        assert_ne!(*target, Label(0), "external entry must not keep header target");
+        assert_ne!(
+            *target,
+            Label(0),
+            "external entry must not keep header target"
+        );
         let latch = ops
             .iter()
             .rposition(|op| {
@@ -716,7 +727,10 @@ mod tests {
                 imm: 1,
                 loc: loc(),
             },
-            IlOp::StorePop { slot: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(0),
@@ -725,7 +739,11 @@ mod tests {
         ];
         let before = ops.clone();
         licm(&mut ops);
-        assert_eq!(ops.len(), before.len(), "stored dep must refuse BinSlotImm hoist");
+        assert_eq!(
+            ops.len(),
+            before.len(),
+            "stored dep must refuse BinSlotImm hoist"
+        );
     }
 
     #[test]
@@ -757,10 +775,9 @@ mod tests {
             .position(|op| matches!(op, IlOp::Label(Label(0))))
             .unwrap();
         assert!(
-            ops[..header].iter().any(|op| matches!(
-                op,
-                IlOp::BinSlotSlot { a: 1, b: 2, .. }
-            )),
+            ops[..header]
+                .iter()
+                .any(|op| matches!(op, IlOp::BinSlotSlot { a: 1, b: 2, .. })),
             "invariant BinSlotSlot should hoist before header"
         );
     }
@@ -780,12 +797,18 @@ mod tests {
                 loc: loc(),
             },
             IlOp::Label(Label(0)),
-            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
         ];
         str_x(&mut ops);
         ops.push(IlOp::GetField { loc: loc() });
         ops.push(IlOp::Pop { loc: loc() });
-        ops.push(IlOp::Load { slot: 0, loc: loc() });
+        ops.push(IlOp::Load {
+            slot: 0,
+            loc: loc(),
+        });
         str_x(&mut ops);
         ops.push(IlOp::GetField { loc: loc() });
         ops.push(IlOp::Pop { loc: loc() });
@@ -800,7 +823,9 @@ mod tests {
 
         let string_ops = ops
             .iter()
-            .filter(|op| matches!(op.as_encode_byte(), Some(b) if *b.bytecode() == Instruction::STRING))
+            .filter(
+                |op| matches!(op.as_encode_byte(), Some(b) if *b.bytecode() == Instruction::STRING),
+            )
             .count();
         assert_eq!(string_ops, 1, "STRING should materialize once in preheader");
         let loads_of_temp = ops

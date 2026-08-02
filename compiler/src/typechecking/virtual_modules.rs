@@ -27,6 +27,9 @@ pub const PRELUDE_MATH_MODULE: &str = "prelude::math";
 /// Canonical module path for IO streams (`open`, `read`, `Stream`, …).
 pub const IO_MODULE: &str = "io";
 
+/// Canonical module path for string helpers (`format`, `from_bytes`, `to_bytes`).
+pub const STRING_MODULE: &str = "string";
+
 /// TCP helpers under `io::net::tcp` (`connect`, `listen`, …).
 pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
 
@@ -395,6 +398,48 @@ impl IoBuiltin {
     }
 }
 
+/// String helpers exported from virtual `string`.
+///
+/// `format` is a compiler intrinsic that lowers to [`common::Instruction::FORMAT`];
+/// byte conversion helpers reuse the same host-native registry entries as `io`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StringBuiltin {
+    Format,
+    FromBytes,
+    ToBytes,
+}
+
+impl StringBuiltin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Format => "format",
+            Self::FromBytes => "from_bytes",
+            Self::ToBytes => "to_bytes",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "format" => Some(Self::Format),
+            "from_bytes" => Some(Self::FromBytes),
+            "to_bytes" => Some(Self::ToBytes),
+            _ => None,
+        }
+    }
+
+    pub fn native_name(self) -> Option<&'static str> {
+        match self {
+            Self::Format => None,
+            Self::FromBytes => Some(IoBuiltin::FromBytes.native_name()),
+            Self::ToBytes => Some(IoBuiltin::ToBytes.native_name()),
+        }
+    }
+
+    pub fn all() -> &'static [StringBuiltin] {
+        &[Self::Format, Self::FromBytes, Self::ToBytes]
+    }
+}
+
 /// Thread host natives exported from virtual `thread`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadBuiltin {
@@ -510,6 +555,8 @@ pub enum BuiltinExport {
     OpaqueType { name: &'static str },
     /// IO host native (`open`, `read`, …).
     IoFn { kind: IoBuiltin },
+    /// String helper (`format`, `from_bytes`, `to_bytes`).
+    StringFn { kind: StringBuiltin },
     /// Thread host native (`spawn`, `send`, …).
     ThreadFn { kind: ThreadBuiltin },
     /// Generic pipeline host native (`registry` key for [`HostInvoke`]).
@@ -529,6 +576,7 @@ impl BuiltinExport {
             Self::Fn { kind } => kind.as_str(),
             Self::OpaqueType { name } => name,
             Self::IoFn { kind } => kind.as_str(),
+            Self::StringFn { kind } => kind.as_str(),
             Self::ThreadFn { kind } => kind.as_str(),
             Self::HostFn { surface, .. } => surface,
         }
@@ -667,6 +715,12 @@ impl VirtualModules {
         }
         modules.insert(IO_MODULE, io_exports);
 
+        let string_exports: Vec<BuiltinExport> = StringBuiltin::all()
+            .iter()
+            .map(|kind| BuiltinExport::StringFn { kind: *kind })
+            .collect();
+        modules.insert(STRING_MODULE, string_exports);
+
         let tcp_exports: Vec<BuiltinExport> = IoBuiltin::tcp()
             .iter()
             .map(|kind| BuiltinExport::IoFn { kind: *kind })
@@ -714,10 +768,7 @@ impl VirtualModules {
         fn host_exports(pairs: &[(&'static str, &'static str)]) -> Vec<BuiltinExport> {
             pairs
                 .iter()
-                .map(|(surface, registry)| BuiltinExport::HostFn {
-                    surface,
-                    registry,
-                })
+                .map(|(surface, registry)| BuiltinExport::HostFn { surface, registry })
                 .collect()
         }
 
@@ -923,9 +974,12 @@ impl VirtualModules {
         }
         let (module_segs, name) = segments.split_at(segments.len() - 1);
         let module = module_segs.join("::");
-        match self.modules.get(module.as_str())?.iter().find(|e| {
-            matches!(e, BuiltinExport::TypeClass { name: n } if n == &name[0])
-        })? {
+        match self
+            .modules
+            .get(module.as_str())?
+            .iter()
+            .find(|e| matches!(e, BuiltinExport::TypeClass { name: n } if n == &name[0]))?
+        {
             BuiltinExport::TypeClass { name } => Some(*name),
             _ => None,
         }
@@ -938,9 +992,12 @@ impl VirtualModules {
         }
         let (module_segs, name) = segments.split_at(segments.len() - 1);
         let module = module_segs.join("::");
-        match self.modules.get(module.as_str())?.iter().find(|e| {
-            matches!(e, BuiltinExport::Enum { name: n } if n == &name[0])
-        })? {
+        match self
+            .modules
+            .get(module.as_str())?
+            .iter()
+            .find(|e| matches!(e, BuiltinExport::Enum { name: n } if n == &name[0]))?
+        {
             BuiltinExport::Enum { name } => Some(*name),
             _ => None,
         }
@@ -970,22 +1027,18 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, BuiltinExport::TypeClass { name: "Into" }))
         );
-        assert!(
-            exports.iter().any(|e| matches!(
-                e,
-                BuiltinExport::Fn {
-                    kind: PreludeFn::Assert
-                }
-            ))
-        );
-        assert!(
-            exports.iter().any(|e| matches!(
-                e,
-                BuiltinExport::Fn {
-                    kind: PreludeFn::Dot
-                }
-            ))
-        );
+        assert!(exports.iter().any(|e| matches!(
+            e,
+            BuiltinExport::Fn {
+                kind: PreludeFn::Assert
+            }
+        )));
+        assert!(exports.iter().any(|e| matches!(
+            e,
+            BuiltinExport::Fn {
+                kind: PreludeFn::Dot
+            }
+        )));
         assert!(
             !exports
                 .iter()
@@ -1050,10 +1103,7 @@ mod tests {
         assert!(!exports.iter().any(|e| e.short_name() == "udp_bind"));
 
         let bind = vm
-            .resolve_item(
-                &["io".into(), "net".into(), "udp".into()],
-                "bind",
-            )
+            .resolve_item(&["io".into(), "net".into(), "udp".into()], "bind")
             .expect("io::net::udp::bind");
         assert_eq!(
             bind,
@@ -1094,8 +1144,14 @@ mod tests {
         assert!(server.iter().any(|e| e.short_name() == "enable"));
         assert!(server.iter().any(|e| e.short_name() == "disable"));
 
-        assert_eq!(IoBuiltin::TlsClientEnable.native_name(), "tls_client_enable");
-        assert_eq!(IoBuiltin::TlsServerEnable.native_name(), "tls_server_enable");
+        assert_eq!(
+            IoBuiltin::TlsClientEnable.native_name(),
+            "tls_client_enable"
+        );
+        assert_eq!(
+            IoBuiltin::TlsServerEnable.native_name(),
+            "tls_server_enable"
+        );
         assert_eq!(IoBuiltin::TlsClientEnable.as_str(), "enable");
         assert_eq!(IoBuiltin::TlsServerEnable.as_str(), "enable");
 
@@ -1177,7 +1233,11 @@ mod tests {
         assert!(exports.iter().any(|e| e.short_name() == "open"));
         assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
         assert!(exports.iter().any(|e| e.short_name() == "set_read_timeout"));
-        assert!(exports.iter().any(|e| e.short_name() == "set_write_timeout"));
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.short_name() == "set_write_timeout")
+        );
         assert!(!exports.iter().any(|e| e.short_name() == "bind"));
         assert!(!exports.iter().any(|e| e.short_name() == "listen"));
         let tcp_path = ["io".into(), "net".into(), "tcp".into()];
@@ -1188,6 +1248,27 @@ mod tests {
         assert!(vm.resolves_use(&tcp_path, "local_addr"));
         assert!(vm.resolves_use(&tcp_path, "set_nodelay"));
         assert!(vm.resolves_use(&tcp_path, "shutdown"));
+    }
+
+    #[test]
+    fn string_exports_format_and_byte_helpers() {
+        let vm = VirtualModules::new();
+        let exports = vm.resolve_glob(&["string".into()]).expect("string");
+        assert!(exports.iter().any(|e| e.short_name() == "format"));
+        assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
+        assert!(exports.iter().any(|e| e.short_name() == "to_bytes"));
+
+        let format = vm
+            .resolve_item(&["string".into()], "format")
+            .expect("string::format");
+        assert_eq!(
+            format,
+            BuiltinExport::StringFn {
+                kind: StringBuiltin::Format
+            }
+        );
+        assert_eq!(StringBuiltin::FromBytes.native_name(), Some("from_bytes"));
+        assert_eq!(StringBuiltin::ToBytes.native_name(), Some("to_bytes"));
     }
 
     #[test]

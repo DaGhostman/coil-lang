@@ -52,18 +52,15 @@ pub fn eval_expr<'a>(
                 _ => None,
             }
         }
-        Expression::Add(lhs, rhs) => eval_string_add(lhs, rhs, env).or_else(|| {
-            eval_binop(lhs, rhs, env, |a, b| a + b, |a, b| a + b)
-        }),
+        Expression::Add(lhs, rhs) => eval_string_add(lhs, rhs, env)
+            .or_else(|| eval_binop(lhs, rhs, env, |a, b| a + b, |a, b| a + b)),
         Expression::Sub(lhs, rhs) => eval_binop(lhs, rhs, env, |a, b| a - b, |a, b| a - b),
         Expression::Mul(lhs, rhs) => eval_binop(lhs, rhs, env, |a, b| a * b, |a, b| a * b),
         Expression::Div(lhs, rhs) => {
             let a = eval_expr(lhs, env)?;
             let b = eval_expr(rhs, env)?;
             match (a, b) {
-                (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => {
-                    Some(ConstValue::Int(x / y))
-                }
+                (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => Some(ConstValue::Int(x / y)),
                 (ConstValue::Float(x), ConstValue::Float(y)) if y != 0.0 && y.is_finite() => {
                     Some(ConstValue::Float(x / y))
                 }
@@ -74,9 +71,7 @@ pub fn eval_expr<'a>(
             let a = eval_expr(lhs, env)?;
             let b = eval_expr(rhs, env)?;
             match (a, b) {
-                (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => {
-                    Some(ConstValue::Int(x % y))
-                }
+                (ConstValue::Int(x), ConstValue::Int(y)) if y != 0 => Some(ConstValue::Int(x % y)),
                 _ => None,
             }
         }
@@ -170,11 +165,7 @@ pub fn strength_mul_to_shl<'a>(
         match eval_expr(side, env)? {
             ConstValue::Int(k) => {
                 let shift = strength_mul_int(k)?;
-                if shift == 0 {
-                    None
-                } else {
-                    Some(shift)
-                }
+                if shift == 0 { None } else { Some(shift) }
             }
             _ => None,
         }
@@ -193,9 +184,13 @@ pub fn strength_reduced_inner<'a>(
     expr: &'a (SimpleSpan, Box<Expression<'a>>),
 ) -> Option<&'a Output<'a>> {
     match expr.1.as_ref() {
-        Expression::Add(lhs, rhs) => zero_int(rhs).map(|_| lhs).or_else(|| zero_int(lhs).map(|_| rhs)),
+        Expression::Add(lhs, rhs) => zero_int(rhs)
+            .map(|_| lhs)
+            .or_else(|| zero_int(lhs).map(|_| rhs)),
         Expression::Sub(lhs, rhs) if zero_int(rhs).is_some() => Some(lhs),
-        Expression::Mul(lhs, rhs) => one_int(rhs).map(|_| lhs).or_else(|| one_int(lhs).map(|_| rhs)),
+        Expression::Mul(lhs, rhs) => one_int(rhs)
+            .map(|_| lhs)
+            .or_else(|| one_int(lhs).map(|_| rhs)),
         Expression::Div(lhs, rhs) if one_int(rhs).is_some() => Some(lhs),
         // `x ** 1` → `x` (exponent identity).
         Expression::Pow(lhs, rhs) if one_int(rhs).is_some() => Some(lhs),
@@ -352,11 +347,7 @@ fn for_step_increments_by_one<'a>(step: &'a Output<'a>) -> bool {
 }
 
 /// Range `start..end` inclusive/exclusive trip count (cap 8).
-pub fn range_trip_count<'a>(
-    start: &Output<'a>,
-    end: &Output<'a>,
-    inclusive: bool,
-) -> Option<u32> {
+pub fn range_trip_count<'a>(start: &Output<'a>, end: &Output<'a>, inclusive: bool) -> Option<u32> {
     let ConstValue::Int(s) = eval_expr(start, &HashMap::new())? else {
         return None;
     };
@@ -417,7 +408,10 @@ mod tests {
     }
 
     fn id_expr(name: &'static str) -> Output<'static> {
-        (SimpleSpan::from(0..1), Box::new(Expression::Identifier(name)))
+        (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::Identifier(name)),
+        )
     }
 
     #[test]
@@ -473,7 +467,10 @@ mod tests {
     fn const_ident_in_env() {
         let mut env = HashMap::new();
         env.insert("x".into(), ConstValue::Int(5));
-        let id: Output = (SimpleSpan::from(0..1), Box::new(Expression::Identifier("x")));
+        let id: Output = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::Identifier("x")),
+        );
         let add = (
             SimpleSpan::from(0..3),
             Box::new(Expression::Add(id, int_expr(5))),
@@ -553,7 +550,10 @@ mod tests {
             SimpleSpan::from(0..3),
             Box::new(Expression::Mul(
                 id_expr("x"),
-                (SimpleSpan::from(0..1), Box::new(Expression::Identifier("K"))),
+                (
+                    SimpleSpan::from(0..1),
+                    Box::new(Expression::Identifier("K")),
+                ),
             )),
         );
         let (inner, shift) = strength_mul_to_shl(&mul, &env).expect("x*K");
@@ -679,10 +679,7 @@ mod tests {
             SimpleSpan::from(0..3),
             Box::new(Expression::Le(id_expr("i"), int_expr(4))),
         );
-        let le_cond = (
-            SimpleSpan::from(0..3),
-            Box::new(Expression::Expr(le_inner)),
-        );
+        let le_cond = (SimpleSpan::from(0..3), Box::new(Expression::Expr(le_inner)));
         assert_eq!(
             for_loop_trip_count(Some(&init), &le_cond, Some(&step)),
             Some(4)
@@ -691,14 +688,8 @@ mod tests {
 
     #[test]
     fn range_trip_count_exclusive_and_inclusive() {
-        assert_eq!(
-            range_trip_count(&int_expr(0), &int_expr(3), false),
-            Some(3)
-        );
-        assert_eq!(
-            range_trip_count(&int_expr(0), &int_expr(2), true),
-            Some(3)
-        );
+        assert_eq!(range_trip_count(&int_expr(0), &int_expr(3), false), Some(3));
+        assert_eq!(range_trip_count(&int_expr(0), &int_expr(2), true), Some(3));
         assert_eq!(range_trip_count(&int_expr(0), &int_expr(9), false), None);
     }
 
@@ -733,14 +724,8 @@ mod tests {
     #[test]
     fn string_add_folds_concatenation() {
         let env = HashMap::new();
-        let lhs = (
-            SimpleSpan::from(0..1),
-            Box::new(Expression::String("he")),
-        );
-        let rhs = (
-            SimpleSpan::from(0..1),
-            Box::new(Expression::String("llo")),
-        );
+        let lhs = (SimpleSpan::from(0..1), Box::new(Expression::String("he")));
+        let rhs = (SimpleSpan::from(0..1), Box::new(Expression::String("llo")));
         assert_eq!(
             eval_string_add(&lhs, &rhs, &env),
             Some(ConstValue::Str("hello".into()))

@@ -7,8 +7,8 @@ use std::time::UNIX_EPOCH;
 use common::Value;
 
 use crate::io::{
-    alloc_io_error, alloc_result_err, alloc_result_ok, as_result_int, as_result_unit,
-    as_result_value, value_as_string, IoErrorTag,
+    IoErrorTag, alloc_io_error, alloc_result_err, alloc_result_ok, as_result_int, as_result_unit,
+    as_result_value, value_as_string,
 };
 use crate::memory::{Heap, Member, ObjArray, ObjInstance, Object};
 
@@ -181,9 +181,7 @@ pub fn fs_rename(heap: &mut Heap, from: Value, to: Value) -> Value {
 
 pub fn fs_copy(heap: &mut Heap, from: Value, to: Value) -> Value {
     with_two_paths(heap, from, to, |heap, a, b| {
-        let r = host_fs::copy(a, b)
-            .map(|n| n as usize)
-            .map_err(io_err);
+        let r = host_fs::copy(a, b).map(|n| n as usize).map_err(io_err);
         as_result_int(heap, r)
     })
 }
@@ -209,15 +207,17 @@ pub fn fs_symlink(heap: &mut Heap, target: Value, link: Value) -> Value {
         }
         #[cfg(windows)]
         {
-            let r = host_fs::metadata(original).map_err(io_err).and_then(|meta| {
-                if meta.is_dir() {
-                    use std::os::windows::fs::symlink_dir;
-                    symlink_dir(original, link_path).map_err(io_err)
-                } else {
-                    use std::os::windows::fs::symlink_file;
-                    symlink_file(original, link_path).map_err(io_err)
-                }
-            });
+            let r = host_fs::metadata(original)
+                .map_err(io_err)
+                .and_then(|meta| {
+                    if meta.is_dir() {
+                        use std::os::windows::fs::symlink_dir;
+                        symlink_dir(original, link_path).map_err(io_err)
+                    } else {
+                        use std::os::windows::fs::symlink_file;
+                        symlink_file(original, link_path).map_err(io_err)
+                    }
+                });
             as_result_unit(heap, r)
         }
         #[cfg(not(any(unix, windows)))]
@@ -230,18 +230,16 @@ pub fn fs_symlink(heap: &mut Heap, target: Value, link: Value) -> Value {
 
 pub fn fs_list_dir(heap: &mut Heap, path: Value) -> Value {
     with_path(heap, path, |heap, p| {
-        let r = host_fs::read_dir(p)
-            .map_err(io_err)
-            .and_then(|rd| {
-                let mut names = Vec::new();
-                for entry in rd {
-                    let entry = entry.map_err(io_err)?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    names.push(name);
-                }
-                names.sort();
-                Ok(alloc_string_array(heap, names))
-            });
+        let r = host_fs::read_dir(p).map_err(io_err).and_then(|rd| {
+            let mut names = Vec::new();
+            for entry in rd {
+                let entry = entry.map_err(io_err)?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                names.push(name);
+            }
+            names.sort();
+            Ok(alloc_string_array(heap, names))
+        });
         as_result_value(heap, r)
     })
 }

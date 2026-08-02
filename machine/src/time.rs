@@ -206,7 +206,10 @@ fn utc_to_nanos(dt: DateTime<Utc>) -> Result<i64, TimeErrorTag> {
 
 fn period_to_timedelta(p: &PeriodParts) -> Result<TimeDelta, TimeErrorTag> {
     let mut delta = TimeDelta::zero();
-    let add = |delta: TimeDelta, n: i64, f: fn(i64) -> Option<TimeDelta>| -> Result<TimeDelta, TimeErrorTag> {
+    let add = |delta: TimeDelta,
+               n: i64,
+               f: fn(i64) -> Option<TimeDelta>|
+     -> Result<TimeDelta, TimeErrorTag> {
         if n == 0 {
             return Ok(delta);
         }
@@ -467,7 +470,9 @@ pub fn date_from_period(heap: &mut Heap, p: Value) -> Value {
             return Err(TimeErrorTag::InvalidInput);
         }
         let date = NaiveDate::from_ymd_opt(y, m, d).ok_or(TimeErrorTag::InvalidInput)?;
-        let naive = date.and_hms_opt(0, 0, 0).ok_or(TimeErrorTag::InvalidInput)?;
+        let naive = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or(TimeErrorTag::InvalidInput)?;
         let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
         utc_to_nanos(dt).map(|n| alloc_timestamp(heap, n))
     })();
@@ -559,9 +564,7 @@ pub fn host_time_elapsed_millis(heap: &mut Heap, args: &[Value]) -> Value {
 
 pub fn host_time_period(heap: &mut Heap, args: &[Value]) -> Value {
     match args {
-        [y, mo, d, h, mi, s, ms, us, ns] => {
-            period(heap, *y, *mo, *d, *h, *mi, *s, *ms, *us, *ns)
-        }
+        [y, mo, d, h, mi, s, ms, us, ns] => period(heap, *y, *mo, *d, *h, *mi, *s, *ms, *us, *ns),
         _ => time_wrong_arity(heap),
     }
 }
@@ -652,7 +655,11 @@ pub const TIME_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
     ("time_period_sub", 2, host_time_period_sub),
     ("time_date", 0, host_time_date),
     ("time_date_from_period", 1, host_time_date_from_period),
-    ("time_date_from_epoch_period", 1, host_time_date_from_epoch_period),
+    (
+        "time_date_from_epoch_period",
+        1,
+        host_time_date_from_epoch_period,
+    ),
     ("time_epoch", 0, host_time_epoch),
     ("time_format", 2, host_time_format),
     ("time_parse", 2, host_time_parse),
@@ -678,7 +685,8 @@ mod tests {
         let mut heap = Heap::default();
         let nanos = 1_704_067_200_i64 * NS_PER_SEC; // 2024-01-01 00:00:00 UTC
         let ts = alloc_timestamp(&mut heap, nanos);
-        let fmt_v = Value::from(heap.intern("%Y-%m-%d %H:%M:%S".to_string()).as_ptr() as *mut u8 as u64);
+        let fmt_v =
+            Value::from(heap.intern("%Y-%m-%d %H:%M:%S".to_string()).as_ptr() as *mut u8 as u64);
         let formatted_r = format(&mut heap, ts, fmt_v);
         let formatted = unwrap_result_ok(&heap, formatted_r);
         let s = value_as_string(&heap, formatted).unwrap();

@@ -86,9 +86,7 @@ impl AssocTypeDecl {
             .iter()
             .rev()
             .cloned()
-            .fold(Kind::Type, |codomain, domain| {
-                Kind::arrow(domain, codomain)
-            });
+            .fold(Kind::Type, |codomain, domain| Kind::arrow(domain, codomain));
         Self {
             name: name.into(),
             params,
@@ -255,10 +253,8 @@ impl Generics {
         self.register_nominal_type("ArrayIter", PRELUDE_MODULE);
         // Nominal matrix wrapper: `Matrix<Data>` where `Data` is nested
         // static rows (`[[T; N]; M]`). `*` is matmul (Mul), not zip.
-        self.generic_type_ctors.insert(
-            common::BUILTIN_MATRIX_TYPE.into(),
-            vec!["T".into()],
-        );
+        self.generic_type_ctors
+            .insert(common::BUILTIN_MATRIX_TYPE.into(), vec!["T".into()]);
         self.register_nominal_type(common::BUILTIN_MATRIX_TYPE, PRELUDE_MATH_MODULE);
     }
 
@@ -463,12 +459,7 @@ impl Generics {
                 defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
-                superclasses: vec![
-                    "Add".into(),
-                    "Sub".into(),
-                    "Mul".into(),
-                    "Div".into(),
-                ],
+                superclasses: vec!["Add".into(), "Sub".into(), "Mul".into(), "Div".into()],
                 assoc_types: vec![],
                 methods: vec![],
             },
@@ -478,12 +469,7 @@ impl Generics {
         // Individual ordering traits so a type can implement only the
         // comparisons it supports. `Ord` is a convenience supertrait that
         // implies all four (see below).
-        for (name, method) in [
-            ("Lt", "lt"),
-            ("Le", "le"),
-            ("Gt", "gt"),
-            ("Ge", "ge"),
-        ] {
+        for (name, method) in [("Lt", "lt"), ("Le", "le"), ("Gt", "gt"), ("Ge", "ge")] {
             self.typeclasses.insert(
                 name.into(),
                 TypeClassDef {
@@ -513,12 +499,7 @@ impl Generics {
                 defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
-                superclasses: vec![
-                    "Lt".into(),
-                    "Le".into(),
-                    "Gt".into(),
-                    "Ge".into(),
-                ],
+                superclasses: vec!["Lt".into(), "Le".into(), "Gt".into(), "Ge".into()],
                 assoc_types: vec![],
                 methods: vec![],
             },
@@ -883,12 +864,7 @@ impl Generics {
             method_fqns: make_fqns("Show", "byte", &["show"]),
             assoc_tys: HashMap::new(),
         });
-        for (class, method) in [
-            ("Lt", "lt"),
-            ("Le", "le"),
-            ("Gt", "gt"),
-            ("Ge", "ge"),
-        ] {
+        for (class, method) in [("Lt", "lt"), ("Le", "le"), ("Gt", "gt"), ("Ge", "ge")] {
             self.instances.push(InstanceDef {
                 class: class.into(),
                 defined_module: PRELUDE_OPS_MODULE.into(),
@@ -1100,10 +1076,9 @@ mod tests {
             assoc_tys: HashMap::new(),
         });
 
-        assert!(generics.has_overlapping_instance(
-            "Collect",
-            &[option_app_ty(Ty::Var(TyVarId(999)))]
-        ));
+        assert!(
+            generics.has_overlapping_instance("Collect", &[option_app_ty(Ty::Var(TyVarId(999)))])
+        );
     }
 
     #[test]
@@ -1152,14 +1127,8 @@ mod tests {
                 "missing prelude typeclass `{name}`"
             );
         }
-        assert_eq!(
-            g.typeclass("Default").unwrap().methods[0].name,
-            "default"
-        );
-        assert_eq!(
-            g.typeclass("String").unwrap().methods[0].name,
-            "to_string"
-        );
+        assert_eq!(g.typeclass("Default").unwrap().methods[0].name, "default");
+        assert_eq!(g.typeclass("String").unwrap().methods[0].name, "to_string");
         assert!(g.typeclass("Send").unwrap().methods.is_empty());
     }
 

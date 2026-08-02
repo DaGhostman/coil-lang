@@ -27,12 +27,7 @@ fn aggregate_elements(heap: &Heap, v: Value) -> Option<Vec<Value>> {
     }
 }
 
-fn extract_matrix_row_major(
-    heap: &Heap,
-    v: Value,
-    m: usize,
-    n: usize,
-) -> Option<Vec<Value>> {
+fn extract_matrix_row_major(heap: &Heap, v: Value, m: usize, n: usize) -> Option<Vec<Value>> {
     let rows = aggregate_elements(heap, v)?;
     if rows.len() < m {
         return None;

@@ -4224,7 +4224,7 @@ impl Compiler {
         specs
     }
 
-    /// Emit `print`/`format` body: format string, then args (with `%v`
+    /// Emit `string::format` body: format string, then args (with `%v`
     /// lowered through `Show`), then `FORMAT`.
     fn emit_format_expression(&mut self, format: &Output, params: Option<&Vec<Output>>) {
         let fmt_lit = match format.1.as_ref() {
@@ -4279,6 +4279,14 @@ impl Compiler {
             self.bytecode
                 .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len));
         }
+    }
+
+    fn string_builtin_for_call(&self, ident: &str) -> Option<crate::typechecking::StringBuiltin> {
+        self.checker.string_fn_in_scope(ident).or_else(|| {
+            ident
+                .strip_prefix("string::")
+                .and_then(crate::typechecking::StringBuiltin::from_name)
+        })
     }
 
     fn show_format_arg_ty(&self, arg: &Output) -> Option<Ty> {
@@ -5112,22 +5120,35 @@ impl Compiler {
             self.messages.push(message);
             return;
         };
-        let arity = args.len();
-        self.bytecode
-            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-        // Native id sits on the stack while args compile — protect it (and
-        // prior arg values) from Instantiate `StorePop` temps.
         let depth_on_entry = self.expr_depth;
-        self.expr_depth = depth_on_entry + 1;
+        let result_slot = self.context.variables.len() as u32 + depth_on_entry;
+        let mut arg_slots = Vec::with_capacity(args.len());
         for arg in args {
             // Nested IO HostInvoke writes to `self.bytecode`; also fold any
             // bytes returned in the local vec (non-IO subexpressions).
             let mut arg_bc = self.do_compile(arg);
             self.bytecode.append(&mut arg_bc);
+            let slot = self.alloc_temp_slot();
+            self.bytecode.push_store_pop(slot);
+            arg_slots.push(slot);
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+        self.expr_depth = depth_on_entry + 1;
+        for slot in &arg_slots {
+            self.bytecode.push_load(*slot);
             self.expr_depth += 1;
         }
+        let arity = args.len();
         self.bytecode.push_make_tuple(arity as u32);
         self.bytecode.push_host_invoke(arity as u32);
+        let temp_slots = (self.context.variables.len() as u32).saturating_sub(result_slot);
+        if temp_slots > 0 {
+            self.bytecode.push_store_pop(result_slot);
+            for _ in 0..temp_slots.saturating_sub(1) {
+                self.bytecode.push_pop();
+            }
+        }
         // Restore: caller owns counting the result value if it needs to.
         self.expr_depth = depth_on_entry;
     }
@@ -6515,14 +6536,6 @@ impl Compiler {
                 Self::count_field_key_uses(start, counts);
                 Self::count_field_key_uses(end, counts);
             }
-            Print(fmt, params) | Format(fmt, params) => {
-                Self::count_field_key_uses(fmt, counts);
-                if let Some(ps) = params {
-                    for p in ps {
-                        Self::count_field_key_uses(p, counts);
-                    }
-                }
-            }
             List(v) | Array(v) | Fragment(v) | Block(v) | Program(v) | Tuple(v) | If(v)
             | Declare(v) | Invoke(v) => {
                 for c in v {
@@ -6711,9 +6724,7 @@ impl Compiler {
             Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
             Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
             Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
-            Expression::String(_) | Expression::Format(_, _) => {
-                Some(Ty::Con(crate::typechecking::ty::STRING.into()))
-            }
+            Expression::String(_) => Some(Ty::Con(crate::typechecking::ty::STRING.into())),
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
                 for item in items {
@@ -8216,23 +8227,11 @@ impl Compiler {
                 // coroutine is resumed, the VM starts by executing that POP,
                 // which pops whatever happens to be on top of the (shared)
                 // stack at the resumer's call site. For a `resume` used inline
-                // inside another expression (e.g. `print "%i", resume h;`),
+                // inside another expression (e.g. formatting `resume h`),
                 // that top-of-stack value belongs to the RESUMER (e.g. the
                 // format string), not the coroutine — corrupting it.
                 Self::discard_statement_value(&mut bytecode);
             }
-            Expression::Print(format, params) => {
-                // Emit directly to `self.bytecode` so nested control flow
-                // (e.g. `match` in params) can compute absolute jump targets.
-                // `%v` args are lowered through `Show` to strings and the
-                // format literal is rewritten to `%s` before FORMAT.
-                self.emit_format_expression(format, params.as_ref());
-                self.emit_byte(*span, Byte::new(Instruction::PRINT));
-            }
-            Expression::Format(format, params) => {
-                self.emit_format_expression(format, params.as_ref());
-            }
-
             // ---- Userland FFI builtins ----
             Expression::Dload(path) => {
                 let bc = self.do_compile(path);
@@ -8748,6 +8747,46 @@ impl Compiler {
                     .expect("BlockBuilder::finalize: defer after label bound");
             }
             Expression::Call { name, args } => {
+                if let Expression::Identifier(fname) = name.1.as_ref() {
+                    if let Some(kind) = self.string_builtin_for_call(fname) {
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        match kind {
+                            crate::typechecking::StringBuiltin::Format => {
+                                if let Some((format, rest)) = arg_slice.split_first() {
+                                    let params = rest.to_vec();
+                                    self.emit_format_expression(format, Some(&params));
+                                }
+                            }
+                            crate::typechecking::StringBuiltin::FromBytes
+                            | crate::typechecking::StringBuiltin::ToBytes => {
+                                if let Some(native_name) = kind.native_name() {
+                                    self.emit_host_native_invoke(native_name, arg_slice);
+                                }
+                            }
+                        }
+                        return bytecode;
+                    }
+                } else if let Expression::QualifiedAccess { owner, member } = name.1.as_ref() {
+                    let fqn = format!("{}::{}", owner, member);
+                    if let Some(kind) = self.string_builtin_for_call(&fqn) {
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        match kind {
+                            crate::typechecking::StringBuiltin::Format => {
+                                if let Some((format, rest)) = arg_slice.split_first() {
+                                    let params = rest.to_vec();
+                                    self.emit_format_expression(format, Some(&params));
+                                }
+                            }
+                            crate::typechecking::StringBuiltin::FromBytes
+                            | crate::typechecking::StringBuiltin::ToBytes => {
+                                if let Some(native_name) = kind.native_name() {
+                                    self.emit_host_native_invoke(native_name, arg_slice);
+                                }
+                            }
+                        }
+                        return bytecode;
+                    }
+                }
                 // `assert` from `prelude::test` (auto-imported).
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.prelude_fn_in_scope(fname)
@@ -11931,7 +11970,21 @@ mod tests {
     use parser::Pratt;
 
     fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
-        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let mut owned = String::new();
+        let needs_io = src.contains("write_all(")
+            || src.contains("stdout()")
+            || src.contains("to_bytes(")
+            || src.contains("format(");
+        if needs_io && !src.contains("use io::") && !src.contains("use io::*") {
+            owned.push_str("use io::{stdout, write_all};\n");
+        }
+        if needs_io && !src.contains("use string::") && !src.contains("use string::*") {
+            owned.push_str("use string::{format, to_bytes};\n");
+        }
+        owned.push_str(src);
+        let mut ast = Pratt::default()
+            .parse(owned.as_str())
+            .expect("parse failed");
         let mut compiler = Compiler::default();
         // Stable placeholder ids so Approach A packed HostInvoke lowering
         // fires in unit tests (Pipeline assigns real ids at runtime).
@@ -12200,10 +12253,8 @@ test("two") { assert(true)?; }
     /// must NOT emit a trailing `POP` after `YieldCoro` (or
     /// `YieldFromCoro`) — that POP becomes the coroutine's `resume_ip`
     /// and, on the NEXT resume, pops whatever the resumer happens to
-    /// have on top of the shared operand stack (e.g. a `print` format
-    /// string mid-construction), corrupting it. See the crash this
-    /// guards against: `print "%i", resume h;` used to misalign a
-    /// pointer dereference in the VM.
+    /// have on top of the shared operand stack (e.g. a format string
+    /// mid-construction), corrupting it.
     #[test]
     fn bare_yield_statement_does_not_emit_trailing_pop() {
         use common::Instruction;
@@ -12238,6 +12289,8 @@ test("two") { assert(true)?; }
     fn let_match_omits_fusion_barrier() {
         let (bc, _pool) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn foo() -> Result<int, int> { return Result::Ok(0); }
 fn main() {
@@ -12245,7 +12298,7 @@ fn main() {
         Result::Ok(s) => s,
         Result::Err(_) => panic "bad",
     };
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -12309,6 +12362,8 @@ fn foo() -> int {
     fn assignment_match_omits_fusion_barrier() {
         let (bc, _pool) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn main() {
     let x = 0;
@@ -12316,7 +12371,7 @@ fn main() {
         Result::Ok(n) => n,
         Result::Err(_) => panic "bad",
     };
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -12432,6 +12487,8 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
             fn main() {
                 let d = { x: 0, y: 0 };
                 let i = 0;
@@ -12440,7 +12497,7 @@ fn main() {
                     d.y = d.y + 2;
                     i = i + 1;
                 }
-                print "%i", d.x + d.y;
+                write_all(stdout(), to_bytes(format("%i", d.x + d.y)));
             }
             "#,
         );
@@ -12508,7 +12565,9 @@ fn main() {
     #[test]
     fn for_in_array_hoists_array_len_out_of_loop() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("fn main() { for x in [1, 2, 3] { print \"%i\", x; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { for x in [1, 2, 3] { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+        );
         let len_at = bc
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::ArrayLen))
@@ -12751,10 +12810,10 @@ fn main() {
     fn register_native_visible_to_emitter() {
         use crate::typechecking::ty::{string, unit};
         let mut c = Compiler::default();
-        c.register("print", &[string()], &unit());
-        // `print "hi";` should compile without errors.
+        c.register("native_print", &[string()], &unit());
+        // Native calls registered with the checker should compile without errors.
         let mut ast = Pratt::default()
-            .parse("print \"hi\";")
+            .parse("native_print(\"hi\");")
             .expect("parse failed");
         let _bc = c.compile("test", &mut ast);
         let msgs = std::mem::take(&mut c.messages);
@@ -13375,7 +13434,9 @@ sum = sum + i; \
     #[test]
     fn for_in_array_emits_array_len_index_and_back_edge() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("fn main() { for x in [1, 2, 3] { print \"%i\", x; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { for x in [1, 2, 3] { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+        );
         let has_len = bc
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::ArrayLen));
@@ -13397,8 +13458,9 @@ sum = sum + i; \
     #[test]
     fn for_in_dict_emits_dict_entries() {
         use common::Instruction;
-        let (bc, _pool) =
-            compile_src("fn main() { let d = { a: 1, b: 2 }; for p in d { print \"%i\", p[1]; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { let d = { a: 1, b: 2 }; for p in d { write_all(stdout(), to_bytes(format(\"%i\", p[1]))); } }",
+        );
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::DictEntries)),
@@ -13423,7 +13485,7 @@ impl Iterator<Counter> { \
         return Option::None; \
     } \
 } \
-fn main() { let c = new Counter(0, 3); for x in c { print \"%i\", x; } }",
+fn main() { let c = new Counter(0, 3); for x in c { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
         let call_indirect = bc
             .iter()
@@ -13448,7 +13510,7 @@ fn main() { let c = new Counter(0, 3); for x in c { print \"%i\", x; } }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "async fn counter() { yield 0; yield 1; return 99; } \
-fn main() { for x in counter() { print \"%i\", x; } }",
+fn main() { for x in counter() { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
 
         let resume = bc
@@ -13790,7 +13852,7 @@ fn main() { for x in counter() { if x == 1 { break; } } }",
         let (bc, _pool) = compile_src(
             r#"enum E { Foo { x: int, y: int, z: int } }
 fn main() {
- print "%i", E::Foo { z: 1, x: 2, y: 3 };
+ let foo = E::Foo { z: 1, x: 2, y: 3 };
 }"#,
         );
 
@@ -13870,7 +13932,7 @@ fn main() {
  let v = match e { \
  E::Foo { y: _, x: a } => a, \
  }; \
- print \"%i\", v; \
+ write_all(stdout(), to_bytes(format(\"%i\", v))); \
  }",
         );
         // `let e` / `let v` emit STORE; match binding `a` does not.
@@ -13899,14 +13961,14 @@ fn main() {
     #[test]
     fn mixed_enum_unit_tuple_record_all_in_one() {
         use common::Instruction;
-        // Use prints to keep the constructs alive in the
+        // Use bindings to keep the constructs alive in the
         // bytecode (the codegen is silent on unused `let _`).
         let (bc, _pool) = compile_src(
             "enum E { A, B(int), C { x: int } } \
  fn main() { \
- print \"%i\", E::A; \
- print \"%i\", E::B(1); \
- print \"%i\", E::C { x: 2 }; \
+ let a = E::A; \
+ let b = E::B(1); \
+ let c = E::C { x: 2 }; \
  }",
         );
 
@@ -14373,7 +14435,7 @@ fn main() {
         let (bc, _pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
  fn get_x(Point p) -> int { return p.x; } \
- fn main() { print \"%i\", get_x(Point::Point { x: 42, y: 7 }); }",
+ fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x(Point::Point { x: 42, y: 7 })))); }",
         );
 
         // Exactly 1 LoadField (in the get_x function body).
@@ -14418,8 +14480,8 @@ fn main() {
  fn x_coord(Point p) -> int { return p.x; } \
  fn y_coord(Point p) -> int { return p.y; } \
  fn main() { \
- print \"%i\", x_coord(Point::Point { x: 5, y: 12 }); \
- print \"%i\", y_coord(Point::Point { x: 5, y: 12 }); \
+ write_all(stdout(), to_bytes(format(\"%i\", x_coord(Point::Point { x: 5, y: 12 })))); \
+ write_all(stdout(), to_bytes(format(\"%i\", y_coord(Point::Point { x: 5, y: 12 })))); \
  }",
         );
 
@@ -14474,13 +14536,13 @@ fn main() {
     // (re-assignment picks up the new value, multiple bindings
     // are preserved).
 
-    /// Codegen test 24 : a simple `let x = expr; print x;`
+    /// Codegen test 24 : a simple `let x = expr; let y = x;`
     /// emits exactly one `STORE_POP` (the store of the
     /// RHS into `x`'s slot) in addition to the RHS's `CONST`.
     #[test]
     fn let_x_then_print_x_emits_store_pop() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("fn main() { let x = 42; print \"%i\", x; }");
+        let (bc, _pool) = compile_src("fn main() { let x = 42; let y = x; }");
 
         // At least one STORE — pop-and-write for `let x = 42`.
         let store_pop_count = bc
@@ -14523,7 +14585,7 @@ fn main() {
  let x = 1; \
  let y = 2; \
  let z = 3; \
- print \"%i\", add(x, y, z); \
+ let result = add(x, y, z); \
  }",
         );
         let packed = bc
@@ -14550,7 +14612,7 @@ fn main() {
             "fn main() { \
  let x = 5; \
  let y = 10; \
- print \"%i\", x + y; \
+ let z = x + y; \
  }",
         );
 
@@ -14585,7 +14647,7 @@ fn main() {
             "fn main() { \
  let x = 5; \
  x = 10; \
- print \"%i\", x; \
+ let y = x; \
  }",
         );
 
@@ -14607,14 +14669,16 @@ fn main() {
     #[test]
     fn const_scalar_folds_add_to_single_const() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("fn main() { const x = 5; print \"%i\", x + 5; }");
+        let (bc, _pool) = compile_src("fn value() -> int { const x = 5; return x + 5; }");
         let const_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::CONST))
             .count();
         assert!(
             bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 10
+                (matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 10)
+                    || (matches!(b.bytecode(), Instruction::ConstReturnImm)
+                        && b.operand_u32() as i32 == 10)
             }),
             "expected folded CONST 10 for `const x = 5; x + 5`"
         );
@@ -14625,8 +14689,9 @@ fn main() {
     #[test]
     fn const_if_strict_lt_does_not_take_then_branch() {
         use common::Instruction;
-        let (bc, _pool) =
-            compile_src("fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+        );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "both branches constant-folded; expected only else body"
@@ -14637,8 +14702,9 @@ fn main() {
     #[test]
     fn const_if_emits_only_taken_branch() {
         use common::Instruction;
-        let (bc, _pool) =
-            compile_src("fn main() { if 4 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { if 4 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+        );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `if 4 < 5` should not emit JMPF; opcodes: {:?}",
@@ -14655,7 +14721,7 @@ fn main() {
 if n <= 0 { return acc; } \
 return sum_to(n - 1, acc + n); \
 } \
-fn main() { print \"%i\", sum_to(5, 0); }",
+fn main() { write_all(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
         );
         assert!(
             bc.iter()
@@ -14670,7 +14736,7 @@ fn main() { print \"%i\", sum_to(5, 0); }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn add(int a, int b) -> int { return a + b; } \
-fn main() { print \"%i\", add(3, 4); }",
+fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
         );
         assert!(
             bc.iter().any(|b| {
@@ -14877,7 +14943,7 @@ fn main() { print \"%i\", add(3, 4); }",
                if is_neg == 1 { return 99; } \
                return n * 2; \
              } \
-             fn main() { print \"%i\", early(4, 0); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", early(4, 0)))); }",
         );
         // Prologue may contain one CALL to main; the early() call site must not.
         let calls = bc
@@ -14961,7 +15027,7 @@ fn main() { print \"%i\", add(3, 4); }",
                if n <= 2 { return 1; } \
                return fib(n - 1) + fib(n - 2); \
              } \
-             fn main() { print \"%i\", fib(5); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", fib(5)))); }",
         );
         let calls = bc
             .iter()
@@ -14992,11 +15058,11 @@ fn main() { print \"%i\", add(3, 4); }",
     #[test]
     fn pure_arg_reorder_stores_pure_before_effectful() {
         use common::Instruction;
-        // `sink` prints (not tiny-inlinable) so the CALL path runs reorder.
+        // `sink` is non-tiny so the CALL path runs reorder.
         let (bc, _pool) = compile_src(
-            "fn effect() -> int { print \"%i\", 7; return 2; } \
-             fn sink(int a, int b) -> int { print \"%i\", a + b; return a + b; } \
-             fn main() { print \"%i\", sink(effect(), 10); }",
+            "fn effect() -> int { let acc = 0; while acc < 2 { acc = acc + 1; } return acc; } \
+             fn sink(int a, int b) -> int { let sum = a + b; if sum < 0 { return 0; } return sum; } \
+             fn main() { let result = sink(effect(), 10); }",
         );
         // Prologue CALL is index 0 (arity 0). The effect() CALL is the next arity-0 CALL.
         let effect_call = bc
@@ -15044,7 +15110,7 @@ fn main() { print \"%i\", add(3, 4); }",
                if n <= 0 { return 1; } \
                return other(n) + 1; \
              } \
-             fn main() { print \"%i\", base(5); }",
+             fn main() { let result = base(5); }",
         );
         let cmp_jmps: Vec<usize> = bc
             .iter()
@@ -15086,7 +15152,7 @@ fn main() { print \"%i\", add(3, 4); }",
             "fn main() { \
 let s = 0; \
 for (let i = 0; i < 3; i = i + 1) { s = s + i; } \
-print \"%i\", s; \
+write_all(stdout(), to_bytes(format(\"%i\", s))); \
 }",
         );
         assert!(
@@ -15103,8 +15169,9 @@ print \"%i\", s; \
     #[test]
     fn const_if_strict_lt_equality_takes_else() {
         use common::Instruction;
-        let (bc, _pool) =
-            compile_src("fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }");
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+        );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `if 5 < 5` should not emit JMPF"
@@ -15124,8 +15191,9 @@ print \"%i\", s; \
     #[test]
     fn const_while_false_eliminates_loop() {
         use common::Instruction;
-        let (bc, _pool) =
-            compile_src("fn main() { while false { print \"%i\", 1; } print \"%i\", 2; }");
+        let (bc, _pool) = compile_src(
+            "fn main() { while false { write_all(stdout(), to_bytes(format(\"%i\", 1))); } write_all(stdout(), to_bytes(format(\"%i\", 2))); }",
+        );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
             "folded `while false` should not emit JMPF; opcodes: {:?}",
@@ -15144,7 +15212,7 @@ for (let i = 0; i < 3; i = i + 1) { \
   s = s + i; \
   break; \
 } \
-print \"%i\", s; \
+write_all(stdout(), to_bytes(format(\"%i\", s))); \
 }",
         );
         // Peephole may fuse JMPF into CmpJmpf / BinSlotImmJmpf / LogNotJmpf.
@@ -15175,7 +15243,7 @@ if n <= 0 { return 0; } \
 yield n; \
 return tick(n - 1); \
 } \
-fn main() { let h = tick(2); print \"%i\", resume h; }",
+fn main() { let h = tick(2); write_all(stdout(), to_bytes(format(\"%i\", resume h))); }",
         );
         assert!(
             !bc.iter()
@@ -15195,7 +15263,7 @@ fn main() { let h = tick(2); print \"%i\", resume h; }",
             "fn main() { \
 let a = [1, 2]; \
 a[] = 3; \
-print \"%i\", len(a); \
+let n = len(a); \
 }",
         );
 
@@ -15243,7 +15311,7 @@ print \"%i\", len(a); \
             "enum Inner { Inner { v: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 }); }",
+ fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.v`)
@@ -15273,7 +15341,7 @@ print \"%i\", len(a); \
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+ fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField in the function body.
@@ -15328,7 +15396,7 @@ print \"%i\", len(a); \
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_w(Outer o) -> int { return o.x.w; } \
- fn main() { print \"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+ fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.w`).
@@ -15799,7 +15867,7 @@ print \"%i\", len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { print \"%i\", add(1, 2); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
         );
 
         // Shared body uses the dictionary ABI (CallIndirect), not DynAdd.
@@ -16096,10 +16164,9 @@ print \"%i\", len(a); \
         assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
     }
 
-    /// Nested IO HostInvoke (`read_to_end(stdin())`) must emit the outer
-    /// native-id `CONST` *before* the nested `HostInvoke` in bytecode.
-    /// Staging args into a side buffer first left nested invokes above the
-    /// id (piped stdin then looked empty).
+    /// Nested IO HostInvoke (`read_to_end(stdin())`) stages args before pushing
+    /// the outer native id, so temp slots from nested calls cannot sit between
+    /// the id and the tuple that HostInvoke consumes.
     #[test]
     fn nested_io_host_invoke_emits_outer_const_before_inner_host_invoke() {
         use common::Instruction;
@@ -16111,8 +16178,7 @@ fn main() { \
         let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
         // Stable ids matching Pipeline::register_io_natives order is not
-        // required — only that outer CONST(id=read_to_end) precedes the
-        // inner HostInvoke for stdin.
+        // required — only the relative nesting shape is asserted.
         compiler.register_native_id("stdin", 1);
         compiler.register_native_id("read_to_end", 2);
         let bc = compiler.compile("", &mut ast);
@@ -16129,8 +16195,8 @@ fn main() { \
             host_idxs.len()
         );
         let outer_host = *host_idxs.last().expect("outer HostInvoke");
-        // Outer native id is CONST value 2, emitted before its args (which
-        // include the inner HostInvoke).
+        // Outer native id is CONST value 2, emitted after its args (which
+        // include the inner HostInvoke) but before the outer HostInvoke.
         let outer_const = bc[..outer_host]
             .iter()
             .rposition(|b| matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 2)
@@ -16141,8 +16207,8 @@ fn main() { \
             .find(|&i| i < outer_host)
             .expect("inner stdin HostInvoke before outer");
         assert!(
-            outer_const < inner_host,
-            "outer native-id CONST must precede nested HostInvoke \
+            inner_host < outer_const && outer_const < outer_host,
+            "outer native-id CONST must follow nested HostInvoke and precede outer HostInvoke \
              (const@{outer_const} vs inner@{inner_host})"
         );
     }
@@ -16209,7 +16275,7 @@ fn main() { \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn id<T>(T x) -> T { return x; } \
-             fn main() { let f = id; print \"%i\", f(42); }",
+             fn main() { let f = id; let y = f(42); }",
         );
         let poly = bc
             .iter()
@@ -16241,7 +16307,7 @@ fn main() { \
              } \
              fn main() { \
                let f = id; \
-               print \"%i\", f(fib(5)); \
+               write_all(stdout(), to_bytes(format(\"%i\", f(fib(5))))); \
              }",
         );
         assert!(
@@ -16338,12 +16404,15 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
-fn greet(string name, int age) {
-    print "%s", name;
-    print "%i", age;
+fn greet(string name, int age) -> int {
+    let acc = 0;
+    while acc < age {
+        acc = acc + 1;
+    }
+    return acc;
 }
 fn main() {
-    greet(age: 36, name: "Ada");
+    let years = greet(age: 36, name: "Ada");
 }
 "#,
         );
@@ -16467,10 +16536,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let (a, b) = (1, 2);
-    print "%i", a;
-    print "%i", b;
+    write_all(stdout(), to_bytes(format("%i", a)));
+    write_all(stdout(), to_bytes(format("%i", b)));
 }
 "#,
         );
@@ -16502,7 +16573,7 @@ fn main() {
 fn add(int a, int b) -> int { return a + b; }
 fn main() {
     let f = add;
-    print "%i", f(20, 22);
+    let y = f(20, 22);
 }
 "#,
         );
@@ -16540,7 +16611,7 @@ fn main() {
 fn add(int a, int b) -> int { return a + b; }
 fn main() {
     let g = add(1);
-    print "%i", g(2);
+    let y = g(2);
 }
 "#,
         );
@@ -16575,10 +16646,12 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let y = 10;
     let f = fn (int x) use (y) => x + y;
-    print "%i", f(32);
+    write_all(stdout(), to_bytes(format("%i", f(32))));
 }
 "#,
         );
@@ -16605,9 +16678,11 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = (1, 1) + (1, 1);
-    print "%i", a[0];
+    write_all(stdout(), to_bytes(format("%i", a[0])));
 }
 "#,
         );
@@ -16640,7 +16715,6 @@ fn main() {
     let a = [[1, 2], [3, 4]];
     let b = [[5, 6], [7, 8]];
     let c = matmul(a, b);
-    print "%i", c[0][0];
 }
 "#,
         );
@@ -16703,7 +16777,7 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 fn main() {
-    print "%i", dot([1, 2], [3, 4]);
+    let x = dot([1, 2], [3, 4]);
 }
 "#,
         );
@@ -16721,11 +16795,13 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let b = matrix([[5, 6], [7, 8]]);
     let c = a * b;
-    print "%i", c[0][0];
+    write_all(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -16761,10 +16837,12 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let c = a + a;
-    print "%i", c[0][0];
+    write_all(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -16785,11 +16863,13 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = matrix([[5, 7], [9, 11]]);
     let b = matrix([[1, 2], [3, 4]]);
     let c = a - b;
-    print "%i", c[0][0];
+    write_all(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -16812,10 +16892,12 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let c = -a;
-    print "%i", c[0][0];
+    write_all(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -16833,9 +16915,11 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let c = cross((1, 0, 0), (0, 1, 0));
-    print "%i", c[0];
+    write_all(stdout(), to_bytes(format("%i", c[0])));
 }
 "#,
         );
@@ -16860,7 +16944,7 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 fn main() {
-    print "%f", dot([1.0, 2.0], [3.0, 4.0]);
+    let x = dot([1.0, 2.0], [3.0, 4.0]);
 }
 "#,
         );
@@ -16889,9 +16973,11 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 3.5 as int;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -16915,7 +17001,7 @@ fn main() {
                if n <= 0 { return 1; } \
                return other(n) + 1; \
              } \
-             fn main() { print \"%i\", base(0); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", base(0)))); }",
         );
         let bad: Vec<_> = bc
             .iter()
@@ -16937,6 +17023,7 @@ fn main() {
         let (bc, pool) = compile_src(
             r#"
 use io::*;
+use string::*;
 fn bytes_slice([byte] src, int start, int end) -> [byte] {
     let out: [byte] = [];
     let i = start;
@@ -16951,7 +17038,7 @@ fn bytes_slice([byte] src, int start, int end) -> [byte] {
 fn main() {
     let b = to_bytes("abcd");
     let s = bytes_slice(b, 0, 4);
-    print "%i", len(s);
+    write_all(stdout(), to_bytes(format("%i", len(s))));
 }
 "#,
         );

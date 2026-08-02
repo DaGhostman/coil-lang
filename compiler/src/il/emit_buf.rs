@@ -219,7 +219,14 @@ mod tests {
         assert!(matches!(ops[0], IlOp::Index { .. }));
         assert!(matches!(ops[1], IlOp::MakeTuple { arity: 2, .. }));
         assert!(matches!(ops[2], IlOp::MakeArray { arity: 3, .. }));
-        assert!(matches!(ops[3], IlOp::MakeEnum { tag: 7, arity: 1, .. }));
+        assert!(matches!(
+            ops[3],
+            IlOp::MakeEnum {
+                tag: 7,
+                arity: 1,
+                ..
+            }
+        ));
         assert!(matches!(ops[4], IlOp::Pop { .. }));
     }
 

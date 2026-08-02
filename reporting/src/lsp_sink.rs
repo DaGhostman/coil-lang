@@ -257,10 +257,7 @@ mod tests {
         msg.with_help("expected int".into());
         msg.push(MsgLabel::new("here".into(), 8..9));
         sink.emit(Diagnostic::from_message(&msg, file));
-        sink.emit(
-            Diagnostic::error("missing file")
-                .with_code(ErrorCode::MissingInputFile),
-        );
+        sink.emit(Diagnostic::error("missing file").with_code(ErrorCode::MissingInputFile));
         sink.finish().unwrap();
 
         let out = shared.into_string();

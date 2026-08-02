@@ -539,12 +539,14 @@ pub fn strip_readonly<'a>(ty: &'a Ty) -> &'a Ty {
 pub fn is_shallow_const_mutable(ty: &Ty) -> bool {
     match strip_readonly(ty) {
         Ty::Array { .. } | Ty::Record { .. } => true,
-        Ty::Con(name) => name != "int"
-            && name != "float"
-            && name != "string"
-            && name != "bool"
-            && name != "byte"
-            && name != "unit",
+        Ty::Con(name) => {
+            name != "int"
+                && name != "float"
+                && name != "string"
+                && name != "bool"
+                && name != "byte"
+                && name != "unit"
+        }
         Ty::App(_, _) => true,
         _ => false,
     }

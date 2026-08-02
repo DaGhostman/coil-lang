@@ -1795,7 +1795,9 @@ fn main() {
         let mut pipeline = Pipeline::with_reporter(config, Box::new(shared.clone()));
 
         // Unknown value → E0100.
-        let src = r#"fn main() { print "%i", missing; }"#;
+        let src = r#"use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn main() { write_all(stdout(), to_bytes(format("%i", missing))); }"#;
         let _ = pipeline.compile_src(src);
         pipeline.finish_reporting().unwrap();
 

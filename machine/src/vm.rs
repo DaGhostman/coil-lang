@@ -2407,6 +2407,7 @@ impl<const S: usize> Machine<S> {
                         let (object, _) = self.heap.alloc(obj_array, Object::Array);
                         object.addr()
                     };
+                    self.stack.push(Value::from(addr));
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
@@ -2415,7 +2416,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(addr));
                 }
                 Instruction::Index => {
                     let index_val = self.stack.pop();
