@@ -177,7 +177,7 @@ roots = ["./src"]
 "#;
     let files = &[
         ("src/main.hy", "use foo::sadge;\nfn main() { sadge(); }\n"),
-        ("src/foo/sadge.hy", "fn sadge() { print \"%x\\n\", 420; }\n"),
+        ("src/foo/sadge.hy", "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
     ];
     let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -194,7 +194,7 @@ roots = ["./src"]
         ("src/main.hy", "use foo::sadge as f;\nfn main() { f(); }\n"),
         (
             "src/foo/sadge.hy",
-            "fn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.hy");
@@ -212,7 +212,7 @@ roots = ["./src"]
         ("src/main.hy", "use lib::io::read;\nfn main() { read(); }\n"),
         (
             "src/lib/io/read.hy",
-            "fn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.hy");
@@ -230,11 +230,11 @@ roots = ["./src", "./vendor"]
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "fn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
         ),
         (
             "vendor/foo/greet.hy",
-            "fn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
         ),
     ];
     let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.hy");
@@ -248,7 +248,7 @@ fn no_manifest_uses_default_src_root() {
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
         ),
     ];
     let tmp = std::env::temp_dir().join("coil_ns_test_no_manifest");
@@ -279,7 +279,7 @@ roots = ["./src"]
         ),
         (
             "src/foo.hy",
-            "fn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
              fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 200))); }\n",
         ),
     ];
@@ -298,11 +298,11 @@ roots = ["./src"]
         ("src/main.hy", "use foo::*;\nfn main() { top_only(); }\n"),
         (
             "src/foo.hy",
-            "fn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
         ),
         (
             "src/foo/bar.hy",
-            "fn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.hy");
@@ -350,7 +350,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use util::inc;\n\
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::inc;\n\
              fn id<T>(T x) -> T { return x; }\n\
              fn fib(int n) -> int {\n\
                if n <= 2 { return 1; }\n\
@@ -433,11 +433,11 @@ roots = ["./src"]
         ),
         (
             "src/a.hy",
-            "fn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
         ),
         (
             "src/b.hy",
-            "fn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
         ),
     ];
     let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.hy");
@@ -455,7 +455,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use util::*;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::*;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
         ),
         (
             "src/util.hy",
@@ -478,7 +478,7 @@ roots = ["./src"]
         ("src/counter.hy", "static let n = 0;\n"),
         (
             "src/main.hy",
-            "mod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
         ),
     ];
     let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.hy");
@@ -495,7 +495,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
         ),
         (
             "src/math.hy",
@@ -518,7 +518,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
         ),
         (
             "src/math.hy",
@@ -609,7 +609,7 @@ file = "./src/main.hy"
 "#;
     let files = &[(
         "src/main.hy",
-        "fn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+        "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
     )];
     let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
 
@@ -651,7 +651,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
         ),
         (
             "src/math.hy",
