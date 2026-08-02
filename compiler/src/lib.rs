@@ -751,6 +751,10 @@ pub struct Compiler {
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
 
+    /// Function-local cache of field-name string keys used ≥2 times
+    /// (`STRING`/`DATA` materialized once at entry, then `LOAD`).
+    field_key_slots: HashMap<String, u32>,
+
     /// Count of expression values currently live on the operand stack
     /// *above* interned locals (e.g. a `HostInvoke` native-id `CONST`
     /// pushed before argument codegen). `alloc_temp_slot` must allocate
@@ -882,6 +886,7 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            field_key_slots: HashMap::new(),
             expr_depth: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
@@ -1160,6 +1165,43 @@ impl Compiler {
             bytecode.push_const(shift as i32);
             bytecode.push(Byte::new(Instruction::SHL));
             true
+        } else if let Some((base, kind)) =
+            const_fold::strength_pow_int(ast, self.const_env())
+        {
+            use crate::typechecking::subst::apply_ty_prune;
+            use crate::typechecking::ty::{BYTE, INT};
+            let base_is_int_like = self.codegen_expr_ty(base).is_some_and(|ty| {
+                matches!(
+                    apply_ty_prune(self.checker.subst(), &ty),
+                    Ty::Con(ref n) if n == INT || n == BYTE
+                )
+            });
+            if !base_is_int_like {
+                return false;
+            }
+            match kind {
+                const_fold::StrengthPow::ConstOne => {
+                    // Still walk `base` for NodeId alignment, then push 1.
+                    self.discard_compile(base);
+                    bytecode.push_const(1);
+                    true
+                }
+                const_fold::StrengthPow::Square => {
+                    // Dup-safe bases only: Identifier or pure (no Call / IO).
+                    if !(matches!(
+                        unwrap_expr_output(base).1.as_ref(),
+                        Expression::Identifier(_)
+                    ) || Self::call_arg_is_pure(base))
+                    {
+                        return false;
+                    }
+                    let mut base_bc = self.do_compile(base);
+                    bytecode.append(&mut base_bc);
+                    bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    bytecode.push(Byte::new(Instruction::MUL));
+                    true
+                }
+            }
         } else {
             false
         }
@@ -1182,6 +1224,38 @@ impl Compiler {
             }
             self.discard_compile(body);
         }
+    }
+
+    /// Rewrite `if (!c) { A } else { B }` as `if (c) { B } else { A }` so the
+    /// condition can fuse into `BinSlot*Jmpf` / `CmpJmpf` without `LogNotJmpf`.
+    fn try_invert_not_if_else<'a>(branches: &'a [Output<'a>]) -> Option<Vec<Output<'a>>> {
+        if branches.len() != 2 {
+            return None;
+        }
+        let Expression::Branch(Some(cond), then_body) = branches[0].1.as_ref() else {
+            return None;
+        };
+        let Expression::Branch(else_cond, else_body) = branches[1].1.as_ref() else {
+            return None;
+        };
+        if else_cond.is_some() {
+            return None;
+        }
+        let cond = unwrap_expr_output(cond);
+        let Expression::LogicalNot(inner) = cond.1.as_ref() else {
+            return None;
+        };
+        let inner = unwrap_expr_output(inner).clone();
+        Some(vec![
+            (
+                branches[0].0,
+                Box::new(Expression::Branch(Some(inner), else_body.clone())),
+            ),
+            (
+                branches[1].0,
+                Box::new(Expression::Branch(None, then_body.clone())),
+            ),
+        ])
     }
 
     /// Constant-folded `if` / `else if` / `else`. Returns true when handled.
@@ -3394,13 +3468,13 @@ impl Compiler {
             Some(
                 Instruction::STORE
                     | Instruction::StorePop
-                    | Instruction::SetField
-                    | Instruction::StoreIndex
                     | Instruction::StoreStatic
+                    | Instruction::POP
             )
         ) {
-            // `x = expr;` / compound updates already consumed the
-            // RHS via StorePop/SetField/StoreIndex/StoreStatic — no trailing POP.
+            // Slot/static stores consume the RHS; a prior POP already discarded.
+            // SetField / StoreIndex push the value back — still need POP when
+            // they are last (handled by the final branch).
         } else if !matches!(
             bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
@@ -4230,6 +4304,9 @@ impl Compiler {
         if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
             let rewritten = Self::rewrite_format_v_to_s(fmt);
             let specs = Self::format_consuming_specs(fmt);
+            // Evaluate args into temps first. Emitting the format string
+            // before args leaves it under CALL/STORE frames (self-unroll /
+            // nested calls) and corrupts the shared stack.
             let mut arg_slots = Vec::with_capacity(params.len());
             let mut emitted = 0usize;
             for (param, spec) in params.iter().zip(specs.iter()) {
@@ -4240,24 +4317,20 @@ impl Compiler {
                     self.bytecode.extend(bc);
                 }
                 let slot = self.alloc_temp_slot();
-                self.bytecode
-                    .push_store_pop(slot);
+                self.bytecode.push_store_pop(slot);
                 arg_slots.push(slot);
                 emitted += 1;
             }
-            // Extra args beyond specifiers — still push them (VM pops by count).
             for param in params.iter().skip(emitted) {
                 let bc = self.do_compile(param);
                 self.bytecode.extend(bc);
                 let slot = self.alloc_temp_slot();
-                self.bytecode
-                    .push_store_pop(slot);
+                self.bytecode.push_store_pop(slot);
                 arg_slots.push(slot);
             }
             self.emit_string_literal(&rewritten);
             for slot in arg_slots {
-                self.bytecode
-                    .push_load(slot);
+                self.bytecode.push_load(slot);
             }
             self.bytecode
                 .push(Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32));
@@ -5734,6 +5807,8 @@ impl Compiler {
             let mut a = self.do_compile(args);
             self.bytecode.append(&mut a);
             let body_op_start = self.bytecode.ops().len();
+            let prev_field_keys = std::mem::take(&mut self.field_key_slots);
+            self.emit_field_key_prologue(body);
             let mut c = self.do_compile(body);
             self.bytecode.append(&mut c);
 
@@ -5744,6 +5819,7 @@ impl Compiler {
             self.fn_defers = prev_fn_defers;
             self.mono_codegen_var_types.pop();
             self.compiling_result_mode = prev_result_mode;
+            self.field_key_slots = prev_field_keys;
             self.context.variables = prev_fn_vars;
             self.polyfn_vars = prev_fn_polyfn_vars;
             self.polyfn_sources = prev_fn_polyfn_sources;
@@ -6107,6 +6183,12 @@ impl Compiler {
         self.bytecode
             .push_store_pop(idx_slot);
 
+        // Hoist ArrayLen once — the array slot is not mutated by for-in.
+        let len_slot = self.alloc_temp_slot();
+        self.bytecode.push_load(arr_slot);
+        self.bytecode.push(Byte::new(Instruction::ArrayLen));
+        self.bytecode.push_store_pop(len_slot);
+
         // Consume binding Identifier NodeId (iterable → binding → body).
         let _ = self.next_emit_id();
         let binding_slot = self.alloc_binding_slot(binding_name);
@@ -6117,12 +6199,11 @@ impl Compiler {
         let exit_label = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(top_label, self.bytecode.il_mut());
 
-        // cond: idx < len(arr)  (LE is `<`)
+        // cond: idx < len  (LE is `<`)
         self.bytecode
             .push_load(idx_slot);
         self.bytecode
-            .push_load(arr_slot);
-        self.bytecode.push(Byte::new(Instruction::ArrayLen));
+            .push_load(len_slot);
         self.bytecode.push(Byte::new(Instruction::LE));
         bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
 
@@ -6471,8 +6552,208 @@ impl Compiler {
             .expect("BlockBuilder::finalize: for-in custom labels bound");
     }
 
-    fn emit_field_name(&self, bytecode: &mut Vec<Byte>, field: &str) {
+    fn emit_field_name(&self, bytecode: &mut impl EmitBuf, field: &str) {
+        if let Some(&slot) = self.field_key_slots.get(field) {
+            bytecode.push_load(slot);
+            return;
+        }
         Self::emit_raw_string_literal(bytecode, field);
+    }
+
+    /// Count GetField/SetField string-key uses in `node` (Access / OptionalAccess).
+    fn count_field_key_uses(node: &Output<'_>, counts: &mut HashMap<String, u32>) {
+        use Expression::*;
+        match node.1.as_ref() {
+            Access(recv, field) | OptionalAccess(recv, field) => {
+                *counts.entry((*field).to_string()).or_insert(0) += 1;
+                Self::count_field_key_uses(recv, counts);
+            }
+            CompoundAssign(target, _, rhs) | Assignment(target, rhs) => {
+                Self::count_field_key_uses(target, counts);
+                Self::count_field_key_uses(rhs, counts);
+            }
+            Adjust { target, .. } => Self::count_field_key_uses(target, counts),
+            Negate(e)
+            | Not(e)
+            | LogicalNot(e)
+            | Positive(e)
+            | Return(e)
+            | ImplicitReturn(e)
+            | Raise(e)
+            | Panic(e)
+            | Yield(e)
+            | YieldFrom(e)
+            | Try(e)
+            | Expr(e)
+            | Group(e)
+            | ExprStatement(e)
+            | Statement(e)
+            | Readonly(e)
+            | Noop(e)
+            | Dload(e)
+            | Done(e)
+            | Spread(e)
+            | NamedArg(_, e)
+            | Member(e)
+            | Method(_, e)
+            | Constant(e, _)
+            | Variable(_, Some(e)) => Self::count_field_key_uses(e, counts),
+            Variable(_, None) => {}
+            Resume(e, Some(v)) | Coalesce(e, v) | Cast(e, v) | Index(e, Some(v)) => {
+                Self::count_field_key_uses(e, counts);
+                Self::count_field_key_uses(v, counts);
+            }
+            Resume(e, None) | Index(e, None) => Self::count_field_key_uses(e, counts),
+            Add(a, b)
+            | Sub(a, b)
+            | Mul(a, b)
+            | Div(a, b)
+            | Mod(a, b)
+            | Pow(a, b)
+            | Shl(a, b)
+            | Shr(a, b)
+            | Xor(a, b)
+            | And(a, b)
+            | BitAnd(a, b)
+            | Or(a, b)
+            | BitOr(a, b)
+            | Eq(a, b)
+            | Neq(a, b)
+            | Leq(a, b)
+            | Geq(a, b)
+            | Le(a, b)
+            | Gt(a, b)
+            | TypeFun(a, b) => {
+                Self::count_field_key_uses(a, counts);
+                Self::count_field_key_uses(b, counts);
+            }
+            Range { start, end, .. } => {
+                Self::count_field_key_uses(start, counts);
+                Self::count_field_key_uses(end, counts);
+            }
+            Print(fmt, params) | Format(fmt, params) => {
+                Self::count_field_key_uses(fmt, counts);
+                if let Some(ps) = params {
+                    for p in ps {
+                        Self::count_field_key_uses(p, counts);
+                    }
+                }
+            }
+            List(v)
+            | Array(v)
+            | Fragment(v)
+            | Block(v)
+            | Program(v)
+            | Tuple(v)
+            | If(v)
+            | Declare(v)
+            | Invoke(v) => {
+                for c in v {
+                    Self::count_field_key_uses(c, counts);
+                }
+            }
+            Dict(fields) => {
+                for f in fields {
+                    Self::count_field_key_uses(&f.value, counts);
+                }
+            }
+            Branch(cond, body) => {
+                if let Some(c) = cond {
+                    Self::count_field_key_uses(c, counts);
+                }
+                Self::count_field_key_uses(body, counts);
+            }
+            Call { name, args } => {
+                Self::count_field_key_uses(name, counts);
+                if let Some(as_) = args {
+                    for a in as_ {
+                        Self::count_field_key_uses(a, counts);
+                    }
+                }
+            }
+            For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(i) = init {
+                    Self::count_field_key_uses(i, counts);
+                }
+                Self::count_field_key_uses(cond, counts);
+                if let Some(s) = step {
+                    Self::count_field_key_uses(s, counts);
+                }
+                Self::count_field_key_uses(body, counts);
+            }
+            Loop {
+                identifier,
+                iterable,
+                body,
+            } => {
+                if let Some(id) = identifier {
+                    Self::count_field_key_uses(id, counts);
+                }
+                Self::count_field_key_uses(iterable, counts);
+                Self::count_field_key_uses(body, counts);
+            }
+            LetDestructure { rhs, .. } => Self::count_field_key_uses(rhs, counts),
+            Defer { body, .. } | Lambda { body, .. } | TestCase { body, .. } => {
+                Self::count_field_key_uses(body, counts);
+            }
+            Function { body: Some(b), .. } => Self::count_field_key_uses(b, counts),
+            Function { body: None, .. } => {}
+            Instantiate(recv, args) => {
+                Self::count_field_key_uses(recv, counts);
+                if let Some(as_) = args {
+                    for a in as_ {
+                        Self::count_field_key_uses(a, counts);
+                    }
+                }
+            }
+            Match { scrutinee, arms } => {
+                Self::count_field_key_uses(scrutinee, counts);
+                for arm in arms {
+                    Self::count_field_key_uses(&arm.body, counts);
+                }
+            }
+            Construct { fields, .. } => match fields {
+                parser::ast::EnumConstructPayload::Tuple(parts) => {
+                    for p in parts {
+                        Self::count_field_key_uses(p, counts);
+                    }
+                }
+                parser::ast::EnumConstructPayload::Record(fs) => {
+                    for f in fs {
+                        Self::count_field_key_uses(&f.value, counts);
+                    }
+                }
+                parser::ast::EnumConstructPayload::Unit => {}
+            },
+            StaticDecl { init, .. } => Self::count_field_key_uses(init, counts),
+            Field { init: Some(i), .. } => Self::count_field_key_uses(i, counts),
+            // Type-only / declaration / leaf nodes — no runtime field keys.
+            _ => {}
+        }
+    }
+
+    /// Materialize field-name strings used ≥2 times into temp slots at fn entry.
+    fn emit_field_key_prologue(&mut self, body: &Output<'_>) {
+        let mut counts = HashMap::new();
+        Self::count_field_key_uses(body, &mut counts);
+        let mut keys: Vec<String> = counts
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort();
+        self.field_key_slots.clear();
+        for key in keys {
+            let slot = self.alloc_temp_slot();
+            Self::emit_raw_string_literal(&mut self.bytecode, &key);
+            self.bytecode.push_store_pop(slot);
+            self.field_key_slots.insert(key, slot);
+        }
     }
 
     fn emit_raw_string_literal(bytecode: &mut impl EmitBuf, value: &str) {
@@ -6729,6 +7010,8 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(receiver));
                 self.emit_field_name(bytecode, field);
                 bytecode.push_set_field();
+                // SetField leaves the value; caller uses leave_value_on_stack /
+                // discard_statement_value to keep or POP.
             }
             Expression::Index(arr, Some(idx)) => {
                 // Always stash the RHS — `StoreIndex` pops value/index/array.
@@ -7942,6 +8225,8 @@ impl Compiler {
 
                 let body_start = self.bytecode.len();
                 let body_op_start = self.bytecode.ops().len();
+                let prev_field_keys = std::mem::take(&mut self.field_key_slots);
+                self.emit_field_key_prologue(body);
                 let prev_active = self.active_fn_name.take();
                 let prev_fn_defers = std::mem::take(&mut self.fn_defers);
                 self.active_fn_name = Some(name.to_string());
@@ -7958,6 +8243,7 @@ impl Compiler {
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
+                self.field_key_slots = prev_field_keys;
                 let body_end = self.bytecode.len();
                 self.fn_bytecode_spans
                     .insert(table_key.clone(), (body_start, body_end));
@@ -8005,6 +8291,8 @@ impl Compiler {
                 let mut a = self.do_compile(args);
                 self.bytecode.append(&mut a);
                 let (arity, is_rest) = fn_arity_from_args(args);
+                let prev_field_keys = std::mem::take(&mut self.field_key_slots);
+                self.emit_field_key_prologue(body);
                 let mut b = self.do_compile(body);
                 self.bytecode.append(&mut b);
                 // Expression-bodied lambdas (`=> x + y` / `{ …; last }`) leave
@@ -8025,6 +8313,7 @@ impl Compiler {
                     }
                     self.bytecode.push_return();
                 }
+                self.field_key_slots = prev_field_keys;
                 self.context.variables = prev_fn_vars;
 
                 bb.bind_label(after, self.bytecode.il_mut());
@@ -9632,6 +9921,11 @@ impl Compiler {
                 if self.try_compile_const_if(branches) {
                     return bytecode;
                 }
+                // `if (!c) { A } else { B }` ≡ `if (c) { B } else { A }` — exposes
+                // BinSlot*/Cmp JMPF fusion (avoids LogNotJmpf after fused cond).
+                let inverted = Self::try_invert_not_if_else(branches);
+                let branches: &[Output<'_>] = inverted.as_deref().unwrap_or(branches);
+
                 let mut bb = BlockBuilder::new();
                 let end_label = bb.fresh_label(self.bytecode.il_mut());
                 let mut branch_start_labels: Vec<Option<crate::block_builder::Label>> =
@@ -10141,7 +10435,9 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(lhs));
             }
             Expression::Pow(lhs, rhs) => {
-                if self.try_emit_aggregate_arith(
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                    // **0 / **1 / **2 strength-reduced or const-folded.
+                } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
                     span.start,
@@ -10321,6 +10617,7 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push_set_field();
+                    // Value left on stack for expression result; ExprStatement POPs.
                 }
                 Expression::Index(arr, None) => {
                     bytecode.append(&mut self.do_compile(arr));
@@ -10597,6 +10894,8 @@ impl Compiler {
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
 
                 let body_op_start = self.bytecode.ops().len();
+                let prev_field_keys = std::mem::take(&mut self.field_key_slots);
+                self.emit_field_key_prologue(body);
                 let mut body_bc = self.do_compile(body);
                 self.bytecode.append(&mut body_bc);
 
@@ -10606,6 +10905,7 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.field_key_slots = prev_field_keys;
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
@@ -11502,7 +11802,11 @@ impl Compiler {
                 if let Some(field_index) = enum_field_index {
                     self.bytecode.push_load_field(field_index as u32);
                 } else if is_record || is_class {
-                    Self::emit_raw_string_literal(&mut self.bytecode, field);
+                    if let Some(&slot) = self.field_key_slots.get(*field) {
+                        self.bytecode.push_load(slot);
+                    } else {
+                        Self::emit_raw_string_literal(&mut self.bytecode, field);
+                    }
                     self.bytecode.push_get_field();
                 } else {
                     self.bytecode.push_load_field(0);
@@ -11819,6 +12123,8 @@ fn unwrap_expr_output<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
         | Expression::Group(inner)
         | Expression::Statement(inner)
         | Expression::ExprStatement(inner) => unwrap_expr_output(inner),
+        // Parenthesized conditions often parse as a one-element Fragment.
+        Expression::Fragment(items) if items.len() == 1 => unwrap_expr_output(&items[0]),
         _ => expr,
     }
 }
@@ -12166,7 +12472,6 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
-enum Option<T> { None, Some(T) }
 fn foo() -> int {
     return match Option::Some(1) {
         Option::None => 0,
@@ -12175,17 +12480,40 @@ fn foo() -> int {
 }
 "#,
         );
-        // IL: join Label is the fuse barrier (DUPLICATE;POP is stack_dce'd).
-        // Peephole safety = stacked arm value not dropped by ConstReturnImm.
+        // clone_shared_return may fuse the const arm to ConstReturnImm, but the
+        // payload arm must RETURN locally — never JMP into ConstReturnImm (that
+        // would ignore the stacked Unpack value). Scope to the match region so
+        // prologue / other fn JMPs do not trip the guard.
+        let make_enum = bc
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::MakeEnum))
+            .expect("expected MakeEnum for Option::Some(1)");
+        let jim = bc[make_enum..]
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::JumpIfMatch))
+            .map(|i| make_enum + i)
+            .expect("expected JumpIfMatch after MakeEnum");
+        let region_end = bc[jim..]
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm))
+            .map(|i| jim + i)
+            .expect("expected ConstReturnImm on None arm");
+        let region = &bc[jim..=region_end];
+        let unpack = region
+            .iter()
+            .position(|b| matches!(*b.bytecode(), Instruction::Unpack))
+            .expect("expected Unpack on Some arm");
         assert!(
-            !bc.iter()
-                .any(|b| matches!(*b.bytecode(), Instruction::ConstReturnImm)),
-            "return match join must not lower to ConstReturnImm"
+            matches!(*region[unpack + 1].bytecode(), Instruction::RETURN),
+            "Some arm must RETURN immediately after Unpack; got {:?}",
+            region[unpack + 1].bytecode()
         );
         assert!(
-            bc.iter()
-                .any(|b| matches!(*b.bytecode(), Instruction::RETURN)),
-            "return match must still end in RETURN"
+            !region
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::JMP)),
+            "match return region must not JMP into a fused const return; slice={:?}",
+            region.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -12282,6 +12610,183 @@ fn main() {
         assert!(
             bytecode_has_shl_by(&bc, 3),
             "expected LOAD/CONST/SHL (shift 3) or fused BinSlotImm(SHL, 3) for x*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x ** 2` strength-reduces to `x; DUP; MUL` (not `Pow`).
+    #[test]
+    fn pow_two_emits_dup_mul_not_pow() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn sq(int x) -> int { return x ** 2; }");
+        let has_pow = bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow));
+        let has_mul = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::MUL)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::MUL as u8)
+                || (*b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::MUL as u8)
+        });
+        let has_dup = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
+        assert!(
+            !has_pow && has_mul && has_dup,
+            "expected DUP+MUL for x**2; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x ** 0` folds to const 1.
+    
+    #[test]
+    fn dict_hot_loop_hoists_field_name_strings() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+            fn main() {
+                let d = { x: 0, y: 0 };
+                let i = 0;
+                while (i < 10) {
+                    d.x = d.x + 1;
+                    d.y = d.y + 2;
+                    i = i + 1;
+                }
+                print "%i", d.x + d.y;
+            }
+            "#,
+        );
+        // Count STRING ops after the loop header fuse (BinSlotImmJmpf).
+        let jmpf = bc.iter().position(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf));
+        let Some(j) = jmpf else {
+            panic!("no loop header");
+        };
+        let latch = bc.iter().rposition(|b| matches!(b.bytecode(), Instruction::JMP)).unwrap();
+        let strings_in_loop = bc[j..=latch]
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STRING))
+            .count();
+        assert_eq!(
+            strings_in_loop, 0,
+            "field-name STRING should be hoisted out of loop; slice={:?}",
+            bc[j..=latch].iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repeated_field_keys_materialize_once_per_function() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+            class Point {
+                x: int,
+                y: int,
+            }
+            impl Point {
+                fn twice_x() -> int {
+                    return self.x + self.x;
+                }
+            }
+            "#,
+        );
+        // Key cached once; second GetField CSE'd to DUPLICATE (see ops tail).
+        let strings = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STRING))
+            .count();
+        let get_fields = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::GetField))
+            .count();
+        let has_dup = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
+        assert!(
+            strings <= 1 && get_fields >= 1 && (get_fields >= 2 || has_dup),
+            "expected ≤1 STRING for repeated .x plus GetField/Dup; strings={strings} gets={get_fields} dup={has_dup}; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_in_array_hoists_array_len_out_of_loop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { for x in [1, 2, 3] { print \"%i\", x; } }",
+        );
+        let len_at = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .expect("ArrayLen");
+        let header = bc
+            .iter()
+            .position(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::CmpJmpf
+                        | Instruction::BinSlotImmJmpf
+                        | Instruction::BinSlotSlotJmpf
+                        | Instruction::JMPF
+                )
+            })
+            .expect("loop header compare/jmp");
+        assert!(
+            len_at < header,
+            "ArrayLen should be hoisted before loop header; len@{len_at} header@{header}; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let latch = bc
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::JMP))
+            .unwrap();
+        let lens_in_loop = bc[header..=latch]
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .count();
+        assert_eq!(lens_in_loop, 0, "no ArrayLen inside loop body/latch");
+    }
+
+    #[test]
+    fn pow_zero_emits_const_one() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn one(int x) -> int { return x ** 0; }");
+        let has_pow = bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow));
+        let has_one = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() == 1
+                || matches!(b.bytecode(), Instruction::ConstReturnImm) && b.operand_u32() == 1
+        });
+        assert!(
+            !has_pow && has_one,
+            "expected const 1 for x**0; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `if (!cond) { A } else { B }` inverts so fused JMPF sees `cond` (no LogNotJmpf).
+    #[test]
+    fn not_if_else_inverts_away_log_not_jmpf() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+            fn f(int i) -> int {
+                if (!(i & 1)) {
+                    return 10;
+                } else {
+                    return 20;
+                }
+            }
+            "#,
+        );
+        let has_log_not_jmpf = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::LogNotJmpf));
+        let has_bin_slot_jmpf = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::BinSlotImmJmpf)
+                && b.bin_slot_imm_jmpf_parts().0 == Instruction::BITAND as u8
+        });
+        assert!(
+            !has_log_not_jmpf && has_bin_slot_jmpf,
+            "expected BinSlotImmJmpf(BITAND) without LogNotJmpf; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

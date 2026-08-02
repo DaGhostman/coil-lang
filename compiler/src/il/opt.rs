@@ -21,6 +21,8 @@ pub struct OptimizeOptions {
     pub licm: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
+    /// Clone plain `RETURN` onto jump-only preds of mixed return joins.
+    pub clone_shared_return: bool,
     /// Sink identical binop / BinSlot* tails into a return-label cluster.
     pub bin_join_convoy: bool,
     /// Sink identical multi-op suffixes (len 2..=4) at return / non-return joins.
@@ -37,6 +39,7 @@ impl Default for OptimizeOptions {
             algebraic: true,
             licm: true,
             return_convoy: true,
+            clone_shared_return: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
         }
@@ -70,6 +73,9 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
         let _ = entry_sp;
         super::licm::licm(ops);
+    }
+    if opts.clone_shared_return {
+        clone_shared_return(ops);
     }
     if opts.return_convoy {
         return_convoy(ops);
@@ -881,16 +887,33 @@ fn bin_join_convoy(ops: &mut Vec<IlOp>) {
 
 const MULTI_OP_SUFFIX_MAX: usize = 4;
 
+/// Compute-only ops eligible for multi-op join sinking.
+///
+/// Residual `STRING`/`DATA`/`FORMAT`/`PRINT`/… encode as bytes but must not
+/// sink — Known SP after FORMAT would otherwise splice format runs across joins.
 fn is_multi_op_suffix_op(op: &IlOp) -> bool {
     if matches!(
         op,
-        IlOp::Label(_) | IlOp::Jump { .. } | IlOp::Entry { .. } | IlOp::PrologueJmp { .. }
-    ) || op.is_plain_return()
-        || is_return_terminator(op)
-    {
-        return false;
+        IlOp::Load { .. }
+            | IlOp::Const { .. }
+            | IlOp::ConstPool { .. }
+            | IlOp::Dup { .. }
+            | IlOp::Bin { .. }
+            | IlOp::BinSlotImm { .. }
+            | IlOp::BinSlotSlot { .. }
+            | IlOp::Index { .. }
+            | IlOp::LoadField { .. }
+            | IlOp::BoxValue { .. }
+            | IlOp::UnboxValue { .. }
+            | IlOp::Pop { .. }
+    ) {
+        return true;
     }
-    op.as_encode_byte().is_some()
+    // Unary residual compute (NOT/NEG stay as Byte until typed lift).
+    matches!(
+        op.as_encode_byte().as_ref().map(|b| *b.bytecode()),
+        Some(Instruction::NOT | Instruction::NEG)
+    )
 }
 
 fn suffix_before(ops: &[IlOp], end: usize, len: usize) -> Option<&[IlOp]> {
@@ -1167,6 +1190,123 @@ fn label_cluster_ids(ops: &[IlOp], start: usize, end: usize) -> Vec<Label> {
             _ => None,
         })
         .collect()
+}
+
+/// Clone a shared plain `RETURN` onto jump-only unconditional preds, then fuse
+/// a lone fall-through `CONST`/`LOAD` producer when no jumps remain.
+///
+/// Typical shape (option unwrap): `Unpack; JMP ret` vs `CONST 0; …; Label; RETURN`.
+/// Convoy refuses mixed / jump-only arms; cloning lets each arm return locally
+/// so the const arm can become `ConstReturnImm`.
+fn clone_shared_return(ops: &mut Vec<IlOp>) {
+    let mut changed = false;
+    let mut r = 0usize;
+    while r < ops.len() {
+        let Some((cluster_start, cluster_end)) = return_label_cluster(ops, r) else {
+            r += 1;
+            continue;
+        };
+        let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
+        let loc = ops[r].loc();
+
+        let mut jump_only_jmps: Vec<usize> = Vec::new();
+        let mut other_jumps = 0usize;
+        for (j, op) in ops.iter().enumerate() {
+            let IlOp::Jump {
+                kind,
+                target,
+                ..
+            } = op
+            else {
+                continue;
+            };
+            if !cluster.iter().any(|l| l == target) {
+                continue;
+            }
+            if *kind == IlJumpKind::Unconditional
+                && convoy_pred_producer_before(ops, j, *kind).is_none()
+            {
+                jump_only_jmps.push(j);
+            } else {
+                other_jumps += 1;
+            }
+        }
+        // Only rewrite when the join is "mixed": jump-only arm(s) plus either a
+        // fall-through producer or another jump class with a producer.
+        let fall = immediate_producer_before(ops, cluster_start);
+        if jump_only_jmps.is_empty() {
+            r += 1;
+            continue;
+        }
+        if fall.is_none() && other_jumps == 0 {
+            r += 1;
+            continue;
+        }
+
+        for j in jump_only_jmps {
+            ops[j] = IlOp::Return { loc };
+            changed = true;
+        }
+        r += 1;
+    }
+
+    if !changed {
+        return;
+    }
+
+    // Fuse CONST/LOAD immediately before a return cluster that no longer has
+    // any jump predecessors.
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut fuse_at: std::collections::HashMap<usize, IlOp> = std::collections::HashMap::new();
+    let mut r = 0usize;
+    while r < ops.len() {
+        let Some((cluster_start, cluster_end)) = return_label_cluster(ops, r) else {
+            r += 1;
+            continue;
+        };
+        let cluster = label_cluster_ids(ops, cluster_start, cluster_end);
+        let still_targeted = ops.iter().any(|op| {
+            matches!(
+                op,
+                IlOp::Jump { target, .. } if cluster.iter().any(|l| l == target)
+            )
+        });
+        if still_targeted {
+            r += 1;
+            continue;
+        }
+        let Some((pi, producer)) = immediate_producer_before(ops, cluster_start) else {
+            r += 1;
+            continue;
+        };
+        if !is_return_producer(&producer) {
+            r += 1;
+            continue;
+        }
+        remove.insert(pi);
+        fuse_at.insert(cluster_start, fuse_producer_with_return(producer));
+        // Drop labels + plain RETURN; keep fused op at cluster_start.
+        for i in cluster_start..=cluster_end {
+            remove.insert(i);
+        }
+        remove.insert(r);
+        r += 1;
+    }
+    if fuse_at.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(fused) = fuse_at.get(&i) {
+            out.push(fused.clone());
+            continue;
+        }
+        if remove.contains(&i) {
+            continue;
+        }
+        out.push(op.clone());
+    }
+    *ops = out;
 }
 
 /// Sink identical `LOAD`/`CONST` producers into a return-label cluster and fuse
@@ -1733,6 +1873,61 @@ mod tests {
     }
 
     #[test]
+    fn clone_shared_return_fuses_const_arm_after_jump_only_clone() {
+        // Unwrap-shaped: jump-only Some arm + CONST None arm into shared RETURN.
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::byte(Byte::new(Instruction::Unpack).with_operand_u32(1)),
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        clone_shared_return(&mut ops);
+        assert!(
+            ops.iter().any(|op| matches!(op, IlOp::Return { .. })),
+            "Some arm should RETURN locally"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(op, IlOp::ConstReturnImm { imm: 0, .. })
+                    || op
+                        .as_encode_byte()
+                        .is_some_and(|b| *b.bytecode() == Instruction::ConstReturnImm)
+            }),
+            "None arm should fuse ConstReturnImm"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    ..
+                }
+            )),
+            "jump-only JMP to shared return should be gone"
+        );
+    }
+
+    #[test]
     fn return_convoy_skips_conditional_jump_into_cluster() {
         // CONST immediately before JMPF is the condition, not a value-under-cond.
         let mut ops = vec![
@@ -1934,9 +2129,9 @@ mod tests {
 
     #[test]
     fn return_convoy_skips_jump_if_match_unknown_join_sp() {
-        // FORMAT poisons SP; JumpIfMatch diamond must refuse.
+        // FfiInvoke poisons SP; JumpIfMatch diamond must refuse.
         let mut ops = vec![
-            IlOp::byte(Byte::new(Instruction::FORMAT)),
+            IlOp::byte(Byte::new(Instruction::FfiInvoke)),
             IlOp::byte(Byte::new(Instruction::CONST).with_const_inline(0)),
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 0 },
@@ -2594,6 +2789,7 @@ mod tests {
                 algebraic: false,
                 licm: false,
                 return_convoy: false,
+                clone_shared_return: false,
                 bin_join_convoy: false,
                 multi_op_join_convoy: false,
             },
@@ -3976,6 +4172,59 @@ mod tests {
             .position(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
             .expect("StorePop");
         assert!(add_idx < store_idx);
+    }
+
+    #[test]
+    fn multi_op_join_convoy_refuses_format_string_suffix() {
+        // STRING/DATA/FORMAT must not count as sinkable compute — Known SP after
+        // FORMAT would otherwise splice format runs across joins.
+        let fmt = vec![
+            IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
+            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
+            IlOp::byte(Byte::new(Instruction::FORMAT).with_operand_u32(0)),
+            IlOp::Print {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+        ];
+        ops.extend(fmt.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(2)));
+        ops.extend(fmt.clone());
+        ops.push(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: Label(0),
+            loc: common::DebugLoc::unknown(),
+        });
+        ops.push(IlOp::Label(Label(0)));
+        ops.push(IlOp::Return {
+            loc: common::DebugLoc::unknown(),
+        });
+
+        let before = ops.len();
+        multi_op_join_convoy(&mut ops);
+        assert_eq!(ops.len(), before, "format suffixes must not sink");
+        let strings = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.as_encode_byte(),
+                    Some(b) if *b.bytecode() == Instruction::STRING
+                )
+            })
+            .count();
+        assert_eq!(strings, 2, "each arm keeps its STRING");
     }
 
     #[test]

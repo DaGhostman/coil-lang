@@ -242,8 +242,7 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 ops[i] = IlOp::Dup {
                     loc: ops[i].loc(),
                 };
-                last_key = producer_key(&ops[i]);
-                last_idx = Some(i);
+                // Keep the original producer key so Const;Const;Const → Const;Dup;Dup.
                 continue;
             }
             last_key = key;
@@ -251,6 +250,122 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
         }
     }
     load_field_cse(ops, blocks);
+    // load_field_cse may shrink `ops`; rebuild block bounds before GetField CSE.
+    let blocks = build_blocks(ops);
+    get_field_cse(ops, &blocks);
+}
+
+/// `Load obj; Load key; GetField` twice → drop second loads, replace second
+/// GetField with `Dup` when only labels intervene (same field still TOS).
+fn get_field_cse(ops: &mut Vec<IlOp>, blocks: &[Block]) {
+    let mut remove: HashSet<usize> = HashSet::new();
+    for b in blocks {
+        let mut last: Option<(u32, u32, usize)> = None; // obj, key, getfield_idx
+        let mut i = b.start;
+        while i < b.end {
+            if matches!(ops[i], IlOp::Label(_)) {
+                i += 1;
+                continue;
+            }
+            // SetField / stores / calls invalidate; GetField itself is the CSE site.
+            if is_get_field_barrier(&ops[i]) {
+                last = None;
+                i += 1;
+                continue;
+            }
+            if i + 2 < b.end
+                && let (
+                    IlOp::Load { slot: obj, .. },
+                    IlOp::Load { slot: key, .. },
+                    IlOp::GetField { loc },
+                ) = (&ops[i], &ops[i + 1], &ops[i + 2])
+            {
+                let obj = *obj;
+                let key = *key;
+                let loc = *loc;
+                if let Some((po, pk, fi)) = last
+                    && po == obj
+                    && pk == key
+                {
+                    let mut only_labels = true;
+                    for j in fi + 1..i {
+                        if !matches!(ops[j], IlOp::Label(_)) {
+                            only_labels = false;
+                            break;
+                        }
+                    }
+                    if only_labels {
+                        remove.insert(i);
+                        remove.insert(i + 1);
+                        ops[i + 2] = IlOp::Dup { loc };
+                        last = Some((obj, key, i + 2));
+                        i += 3;
+                        continue;
+                    }
+                }
+                last = Some((obj, key, i + 2));
+                i += 3;
+                continue;
+            }
+            if !matches!(
+                &ops[i],
+                IlOp::Const { .. }
+                    | IlOp::ConstPool { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. }
+                    | IlOp::Dup { .. }
+            ) {
+                last = None;
+            }
+            i += 1;
+        }
+    }
+    if remove.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if !remove.contains(&i) {
+            out.push(op.clone());
+        }
+    }
+    *ops = out;
+}
+
+fn is_get_field_barrier(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::StorePop { .. }
+            | IlOp::SetField { .. }
+            | IlOp::HostInvoke { .. }
+            | IlOp::Print { .. }
+            | IlOp::Entry { .. }
+            | IlOp::MakeTuple { .. }
+            | IlOp::MakeArray { .. }
+            | IlOp::MakeEnum { .. }
+            | IlOp::BoxValue { .. }
+    ) || matches!(
+        op.as_encode_byte(),
+        Some(b) if matches!(
+            *b.bytecode(),
+            Instruction::STORE
+                | Instruction::StorePop
+                | Instruction::SetField
+                | Instruction::HostInvoke
+                | Instruction::PRINT
+                | Instruction::CALL
+                | Instruction::TailCall
+                | Instruction::MakeCoro
+                | Instruction::MakeTuple
+                | Instruction::MakeArray
+                | Instruction::MakeEnum
+                | Instruction::BoxValue
+                | Instruction::FORMAT
+                | Instruction::FfiInvoke
+                | Instruction::StoreIndex
+                | Instruction::ArrayPush
+        )
+    )
 }
 
 /// `Load s; LoadField i; Load s; LoadField i` → drop second Load, replace second
@@ -540,6 +655,29 @@ mod tests {
     }
 
     #[test]
+    fn within_block_const_run_compresses_to_dup_chain() {
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: 3,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 3, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+        assert!(matches!(ops[2], IlOp::Dup { .. }));
+    }
+
+    #[test]
     fn within_block_dup_replaces_second_identical_load() {
         let mut ops = vec![
             IlOp::Load { slot: 2, loc: loc() },
@@ -729,9 +867,9 @@ mod tests {
 
     #[test]
     fn join_cse_keeps_load_when_join_sp_unknown() {
-        // FORMAT fail-closes SP; Known-SP Load join CSE must not fire.
+        // FfiInvoke fail-closes SP; Known-SP Load join CSE must not fire.
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(common::Instruction::FORMAT)),
+            IlOp::byte(common::Byte::new(common::Instruction::FfiInvoke)),
             IlOp::Const {
                 imm: 0,
                 loc: loc(),
@@ -816,6 +954,55 @@ mod tests {
                 .filter(|op| matches!(op, IlOp::LoadField { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn get_field_cse_dups_repeated_obj_key_load() {
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, IlOp::GetField { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(ops[2], IlOp::GetField { .. }));
+        assert!(matches!(ops[3], IlOp::Dup { .. }));
+    }
+
+    #[test]
+    fn get_field_cse_refuses_when_set_field_intervening() {
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::SetField { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::GetField { loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, IlOp::GetField { .. }))
+                .count(),
+            2,
+            "SetField must invalidate GetField CSE"
         );
     }
 

@@ -20,15 +20,17 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             continue;
         }
 
-        // Const a; Const b; CMP → Const 0/1 when both inline.
+        // Const a; Const b; Bin → Const result for scalar int ops.
+        // Refuse results that cannot be encoded as inline CONST (bit 31 is
+        // POOL_FLAG — negatives would be misread as pool indices).
         if i + 2 < ops.len()
             && let (IlOp::Const { imm: a, loc }, IlOp::Const { imm: b, .. }, IlOp::Bin { op, .. }) =
                 (&ops[i], &ops[i + 1], &ops[i + 2])
-            && is_int_cmp(*op)
             && info.sp_before(i + 1).is_known()
             && info.sp_before(i + 2).is_known()
+            && let Some(r) = eval_const_bin(*op, *a, *b)
+            && r >= 0
         {
-            let r = eval_cmp(*op, *a, *b);
             out.push(IlOp::Const {
                 imm: r,
                 loc: *loc,
@@ -72,6 +74,27 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             continue;
         }
 
+        // Load s; Const 2; Pow → Load s; Dup; Mul (square).
+        if i + 2 < ops.len()
+            && info.sp_before(i + 1).is_known()
+            && info.sp_before(i + 2).is_known()
+            && let (IlOp::Load { slot, loc }, IlOp::Const { imm: 2, .. }, IlOp::Bin { op, .. }) =
+                (&ops[i], &ops[i + 1], &ops[i + 2])
+            && *op == Instruction::Pow
+        {
+            out.push(IlOp::Load {
+                slot: *slot,
+                loc: *loc,
+            });
+            out.push(IlOp::Dup { loc: *loc });
+            out.push(IlOp::Bin {
+                op: Instruction::MUL,
+                loc: *loc,
+            });
+            i += 3;
+            continue;
+        }
+
         out.push(ops[i].clone());
         i += 1;
     }
@@ -108,11 +131,38 @@ fn eval_cmp(op: Instruction, a: i32, b: i32) -> i32 {
     i32::from(t)
 }
 
+/// Fold `Const a; Const b; Bin` when both immediates are inline ints.
+fn eval_const_bin(op: Instruction, a: i32, b: i32) -> Option<i32> {
+    if is_int_cmp(op) {
+        return Some(eval_cmp(op, a, b));
+    }
+    match op {
+        Instruction::ADD => Some(a.wrapping_add(b)),
+        Instruction::SUB => Some(a.wrapping_sub(b)),
+        Instruction::MUL => Some(a.wrapping_mul(b)),
+        Instruction::DIV if b != 0 => Some(a / b),
+        Instruction::MOD if b != 0 => Some(a % b),
+        Instruction::BITAND => Some(a & b),
+        Instruction::BITOR => Some(a | b),
+        Instruction::XOR => Some(a ^ b),
+        Instruction::SHL if (0..32).contains(&b) => Some(a.wrapping_shl(b as u32)),
+        Instruction::SHR if (0..32).contains(&b) => Some(a.wrapping_shr(b as u32)),
+        Instruction::AND => Some(i32::from(a != 0 && b != 0)),
+        Instruction::OR => Some(i32::from(a != 0 || b != 0)),
+        Instruction::Pow if (0..32).contains(&b) => Some(a.wrapping_pow(b as u32)),
+        _ => None,
+    }
+}
+
 fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> Option<IlOp> {
     let insn = Instruction::from(op);
     let keep = match insn {
         Instruction::ADD | Instruction::SUB if imm == 0 => true,
         Instruction::MUL | Instruction::DIV if imm == 1 => true,
+        Instruction::BITOR | Instruction::XOR | Instruction::SHL | Instruction::SHR if imm == 0 => {
+            true
+        }
+        Instruction::BITAND if imm == -1 => true,
         _ => false,
     };
     if keep {
@@ -122,9 +172,26 @@ fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> O
         })
     } else if matches!(insn, Instruction::MUL) && imm == 0 {
         Some(IlOp::Const { imm: 0, loc })
+    } else if matches!(insn, Instruction::BITAND) && imm == 0 {
+        Some(IlOp::Const { imm: 0, loc })
+    } else if matches!(insn, Instruction::Pow) && imm == 0 {
+        Some(IlOp::Const { imm: 1, loc })
+    } else if matches!(insn, Instruction::Pow) && imm == 1 {
+        Some(IlOp::Load {
+            slot: slot as u32,
+            loc,
+        })
     } else {
         None
     }
+}
+
+/// Ops that can stand alone as a binop stack operand in a 3-op window.
+fn is_scalar_producer(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }
+    )
 }
 
 fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
@@ -136,7 +203,7 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         // x + 0 / x - 0 / x * 1 / x / 1 → x
         (Instruction::ADD | Instruction::SUB, x, IlOp::Const { imm: 0, .. })
         | (Instruction::MUL | Instruction::DIV, x, IlOp::Const { imm: 1, .. }) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
@@ -145,11 +212,39 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         // 0 + x / 1 * x → x
         (Instruction::ADD, IlOp::Const { imm: 0, .. }, x)
         | (Instruction::MUL, IlOp::Const { imm: 1, .. }, x) => {
-            if matches!(x, IlOp::Load { .. } | IlOp::Const { .. } | IlOp::ConstPool { .. }) {
+            if is_scalar_producer(x) {
                 Some(x.clone())
             } else {
                 None
             }
+        }
+        // x | 0 / x ^ 0 / x << 0 / x >> 0 → x
+        (
+            Instruction::BITOR | Instruction::XOR | Instruction::SHL | Instruction::SHR,
+            x,
+            IlOp::Const { imm: 0, .. },
+        ) => {
+            if is_scalar_producer(x) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
+        // x & -1 → x; x & 0 → 0
+        (Instruction::BITAND, x, IlOp::Const { imm: -1, .. }) => {
+            if is_scalar_producer(x) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
+        // Zeroing folds require both window ops to be scalar producers. A bare
+        // `_` would match `Const 0; Index; MUL` (index literal, not MUL operand).
+        (Instruction::BITAND, x, IlOp::Const { imm: 0, .. })
+        | (Instruction::BITAND, IlOp::Const { imm: 0, .. }, x)
+            if is_scalar_producer(x) =>
+        {
+            Some(IlOp::Const { imm: 0, loc })
         }
         // x - x / x * 0 / 0 * x → Const 0 (same Load slot or same Const)
         (Instruction::SUB, IlOp::Load { slot: s0, .. }, IlOp::Load { slot: s1, .. })
@@ -160,8 +255,23 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
         (Instruction::SUB, IlOp::Const { imm: a, .. }, IlOp::Const { imm: b, .. }) if a == b => {
             Some(IlOp::Const { imm: 0, loc })
         }
-        (Instruction::MUL, _, IlOp::Const { imm: 0, .. })
-        | (Instruction::MUL, IlOp::Const { imm: 0, .. }, _) => Some(IlOp::Const { imm: 0, loc }),
+        (Instruction::MUL, x, IlOp::Const { imm: 0, .. })
+        | (Instruction::MUL, IlOp::Const { imm: 0, .. }, x)
+            if is_scalar_producer(x) =>
+        {
+            Some(IlOp::Const { imm: 0, loc })
+        }
+        // x ** 0 → 1; x ** 1 → x
+        (Instruction::Pow, x, IlOp::Const { imm: 0, .. }) if is_scalar_producer(x) => {
+            Some(IlOp::Const { imm: 1, loc })
+        }
+        (Instruction::Pow, x, IlOp::Const { imm: 1, .. }) => {
+            if is_scalar_producer(x) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -268,7 +378,7 @@ mod tests {
     #[test]
     fn refuses_when_sp_unknown() {
         let mut ops = vec![
-            IlOp::byte(common::Byte::new(Instruction::FORMAT)),
+            IlOp::byte(common::Byte::new(Instruction::FfiInvoke)),
             IlOp::Load { slot: 1, loc: loc() },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
@@ -279,7 +389,7 @@ mod tests {
         ];
         let before = ops.clone();
         algebraic_simplify(&mut ops);
-        // Window starting at Load has Unknown SP-in after FORMAT.
+        // Window starting at Load has Unknown SP-in after FfiInvoke.
         assert_eq!(ops.len(), before.len());
     }
 
@@ -334,5 +444,193 @@ mod tests {
     fn analyze_known_gate_smoke() {
         let ops = vec![IlOp::Const { imm: 1, loc: loc() }];
         assert!(matches!(sp::analyze(&ops).sp_before(0), Sp::Known(0)));
+    }
+
+    #[test]
+    fn bitand_minus_one_folds_to_load() {
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Const { imm: -1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn pow_square_becomes_dup_mul() {
+        let mut ops = vec![
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::MUL, .. }));
+    }
+
+    #[test]
+    fn pow_zero_folds_to_one() {
+        let mut ops = vec![
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
+    }
+
+    #[test]
+    fn const_const_binop_folds() {
+        let mut ops = vec![
+            IlOp::Const { imm: 6, loc: loc() },
+            IlOp::Const { imm: 7, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 1, .. }));
+        assert!(matches!(ops[2], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn const_const_div_mod_zero_and_wide_shift_refused() {
+        let mut div0 = vec![
+            IlOp::Const { imm: 8, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::DIV,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = div0.clone();
+        algebraic_simplify(&mut div0);
+        assert_eq!(div0.len(), before.len(), "DIV by 0 must not fold");
+
+        let mut mod0 = vec![
+            IlOp::Const { imm: 8, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MOD,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = mod0.clone();
+        algebraic_simplify(&mut mod0);
+        assert_eq!(mod0.len(), before.len(), "MOD by 0 must not fold");
+
+        let mut shl = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Const { imm: 32, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::SHL,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = shl.clone();
+        algebraic_simplify(&mut shl);
+        assert_eq!(shl.len(), before.len(), "SHL amount ≥ 32 must not fold");
+    }
+
+    #[test]
+    fn pow_one_identity_and_bitand_zero() {
+        let mut pow1 = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::Pow,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut pow1);
+        assert!(matches!(pow1[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(pow1[1], IlOp::Return { .. }));
+
+        let mut and0 = vec![
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut and0);
+        assert!(matches!(and0[0], IlOp::Const { imm: 0, .. }));
+    }
+
+    #[test]
+    fn refuses_fold_to_negative_inline_const() {
+        // 0 - 1 → -1 cannot be IlOp::Const (POOL_FLAG bit collision).
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::SUB,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_len = ops.len();
+        algebraic_simplify(&mut ops);
+        assert_eq!(
+            ops.len(),
+            before_len,
+            "negative fold result must stay Const;Const;SUB"
+        );
+        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::SUB, .. }));
+    }
+
+    #[test]
+    fn refuses_mul_zero_fold_through_index() {
+        // `2 * t[0]` is Load; Load; Const 0; Index; MUL — Const 0 indexes, not multiplies.
+        let mut ops = vec![
+            IlOp::Load { slot: 11, loc: loc() },
+            IlOp::Load { slot: 10, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Index { loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops);
+        assert!(
+            matches!(ops[3], IlOp::Index { .. }),
+            "Index must survive Const 0; Index; MUL"
+        );
+        assert!(
+            matches!(ops[4], IlOp::Bin { op: Instruction::MUL, .. }),
+            "MUL must survive Const 0; Index; MUL"
+        );
     }
 }

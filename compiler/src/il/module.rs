@@ -395,6 +395,7 @@ mod tests {
             algebraic: false,
             licm: false,
             return_convoy: false,
+            clone_shared_return: false,
             bin_join_convoy: false,
             multi_op_join_convoy: true,
         });

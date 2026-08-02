@@ -5059,3 +5059,193 @@ fn main() {
         "preceding sibling `name` and nested `x`/`y` must all bind"
     );
 }
+
+/// `x ** 0/1/2` strength-reduce must still match `i32::pow` (incl. `0 ** 0` → 1).
+#[test]
+fn int_pow_strength_reduce_prints_correct_values() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let x = 5;
+    print "%i,", x ** 0;
+    print "%i,", x ** 1;
+    print "%i,", x ** 2;
+    print "%i,", x ** 3;
+    print "%i", 0 ** 0;
+}
+"#,
+    );
+    assert_eq!(output, "1,5,25,125,1");
+}
+
+/// `if (!c) { A } else { B }` inverts to `if (c) { B } else { A }` — arms must
+/// not swap incorrectly when LogNot is eliminated.
+#[test]
+fn invert_not_if_else_preserves_arm_semantics() {
+    let src = r#"
+fn pick(bool c) -> int {
+    if !c {
+        return 10;
+    } else {
+        return 20;
+    }
+}
+fn main() {
+    print "%i,", pick(false);
+    print "%i", pick(true);
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        !bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::LogNot | common::Instruction::LogNotJmpf)),
+        "inverted if(!c) else should drop LogNot / LogNotJmpf"
+    );
+    assert_eq!(run_example_src(src), "10,20");
+}
+
+/// SetField / StoreIndex leave the RHS on the stack — statement forms must POP
+/// or later ops see a corrupted stack.
+#[test]
+fn set_field_and_store_index_statements_pop_value() {
+    let src = r#"
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    let p = new Point(0, 0);
+    p.x = 3;
+    p.y = 4;
+    let a = [0, 0];
+    a[0] = 10;
+    a[1] = 20;
+    print "%i,", p.x + p.y;
+    print "%i", a[0] + a[1];
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    let mut set_field_followed_by_pop = 0usize;
+    let mut store_index_followed_by_pop = 0usize;
+    for w in bytecode.windows(2) {
+        if matches!(w[0].bytecode(), common::Instruction::SetField)
+            && matches!(w[1].bytecode(), common::Instruction::POP)
+        {
+            set_field_followed_by_pop += 1;
+        }
+        if matches!(w[0].bytecode(), common::Instruction::StoreIndex)
+            && matches!(w[1].bytecode(), common::Instruction::POP)
+        {
+            store_index_followed_by_pop += 1;
+        }
+    }
+    assert!(
+        set_field_followed_by_pop >= 2,
+        "class field assignment statements need SetField; POP"
+    );
+    assert!(
+        store_index_followed_by_pop >= 2,
+        "index assignment statements need StoreIndex; POP"
+    );
+    assert_eq!(run_example_src(src), "7,30");
+}
+
+/// Repeated GetField of the same name materializes the key once and reuses the value.
+#[test]
+fn repeated_field_key_reuses_prologue_temp() {
+    let src = r#"
+class Point {
+    x: int,
+    y: int,
+}
+fn twice(Point p) -> int {
+    return p.x + p.x;
+}
+fn main() {
+    print "%i", twice(new Point(3, 4));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    // Prologue: STRING "x"; STORE temp (ctor also emits STRING "x" for SetField).
+    let has_string_x_store = bytecode.windows(3).any(|w| {
+        matches!(w[0].bytecode(), common::Instruction::STRING)
+            && w[0].operand_u32() == 1
+            && matches!(w[1].bytecode(), common::Instruction::DATA)
+            && w[1].operand_u32() == u32::from(b'x')
+            && matches!(
+                w[2].bytecode(),
+                common::Instruction::STORE | common::Instruction::StorePop
+            )
+    });
+    assert!(
+        has_string_x_store,
+        "p.x + p.x should materialize STRING \"x\" into a temp slot"
+    );
+    // Value reuse: GetField then DUPLICATE (not a second GetField of x).
+    let has_getfield_dup = bytecode.windows(2).any(|w| {
+        matches!(w[0].bytecode(), common::Instruction::GetField)
+            && matches!(w[1].bytecode(), common::Instruction::DUPLICATE)
+    });
+    assert!(
+        has_getfield_dup,
+        "p.x + p.x should GetField once then DUPLICATE"
+    );
+    assert_eq!(run_example_src(src), "6");
+}
+
+/// for-in over arrays hoists ArrayLen out of the loop header.
+#[test]
+fn for_in_array_hoists_array_len_once() {
+    let src = r#"
+fn main() {
+    let a = [1, 2, 3];
+    for x in a {
+        print "%i", x;
+    }
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    let lens = bytecode
+        .iter()
+        .filter(|b| matches!(b.bytecode(), common::Instruction::ArrayLen))
+        .count();
+    assert_eq!(lens, 1, "for-in should ArrayLen once before the loop");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpf)),
+        "loop header should fuse idx < len into BinSlotSlotJmpf"
+    );
+    assert_eq!(run_example_src(src), "123");
+}
+
+/// Option unwrap join-clone + field_hot smoke (GetField / key reuse under load).
+#[test]
+fn example_perf_field_hot_prints_expected() {
+    let output = run_example("examples/perf/field_hot.hy");
+    assert_eq!(output, "4000000");
+}
+
+#[test]
+fn option_unwrap_both_arms_correct_after_return_clone() {
+    let output = run_example_src(
+        r#"
+fn unwrap(Option o) -> int {
+    return match o {
+        Option::None => 0,
+        Option::Some(v) => v,
+    };
+}
+fn main() {
+    print "%i,", unwrap(Option::Some(42));
+    print "%i", unwrap(Option::None);
+}
+"#,
+    );
+    assert_eq!(output, "42,0");
+}
