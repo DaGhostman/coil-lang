@@ -1,6 +1,8 @@
 // Unary higher-kinded trait: Container<F: * -> *>.
 // Expected output: 42
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Container<F: * -> *> {
     fn first<A>(F<A> xs) -> A;
 }
@@ -19,5 +21,5 @@ fn get<F: Container, A>(F<A> xs) -> A {
 }
 
 fn main() {
-    print "%i", get(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", get(Option::Some(42)))));
 }

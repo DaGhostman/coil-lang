@@ -1,4 +1,6 @@
 // CPU: Pow, BITAND, BITOR, LogNot in a tight loop.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let acc = 0;
     let i = 1;
@@ -10,5 +12,5 @@ fn main() {
         }
         i = i + 1;
     }
-    print "%i", acc;
+    write_all(stdout(), to_bytes(format("%i", acc)));
 }

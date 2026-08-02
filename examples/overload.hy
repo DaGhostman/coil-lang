@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int x) -> int {
     return x;
 }
@@ -7,6 +9,6 @@ fn add(int x, int y) -> int {
 }
 
 fn main() {
-    print "%i", add(1);
-    print "%i", add(2, 3);
+    write_all(stdout(), to_bytes(format("%i", add(1))));
+    write_all(stdout(), to_bytes(format("%i", add(2, 3))));
 }

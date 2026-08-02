@@ -1,6 +1,7 @@
 // Nested IO HostInvoke: `read_to_end(open(...))` must pass the stream, not
 // the native id, into MakeTuple (regression for emit_io_host_invoke arg order).
 use io::*;
+use string::*;
 
 fn main() {
     let path = "/tmp/coil_io_nested_host.bin";
@@ -16,5 +17,5 @@ fn main() {
         Result::Ok(buf) => buf,
         Result::Err(_) => [z],
     };
-    print "%i", len(got);
+    write_all(stdout(), to_bytes(format("%i", len(got))));
 }

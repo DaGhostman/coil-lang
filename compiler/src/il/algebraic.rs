@@ -31,10 +31,7 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             && let Some(r) = eval_const_bin(*op, *a, *b)
             && r >= 0
         {
-            out.push(IlOp::Const {
-                imm: r,
-                loc: *loc,
-            });
+            out.push(IlOp::Const { imm: r, loc: *loc });
             i += 3;
             continue;
         }
@@ -50,12 +47,7 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
         }
 
         // BinSlotImm identity: slot+0, slot-0, slot*1, slot/1 → Load slot
-        if let IlOp::BinSlotImm {
-            op,
-            slot,
-            imm,
-            loc,
-        } = &ops[i]
+        if let IlOp::BinSlotImm { op, slot, imm, loc } = &ops[i]
             && let Some(load) = bin_slot_imm_identity(*op, *slot, *imm, *loc)
         {
             out.push(load);
@@ -278,9 +270,9 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
 
 #[cfg(test)]
 mod tests {
+    use super::sp::Sp;
     use super::*;
     use common::DebugLoc;
-    use super::sp::Sp;
 
     fn loc() -> DebugLoc {
         DebugLoc::unknown()
@@ -289,7 +281,10 @@ mod tests {
     #[test]
     fn add_zero_folds_to_load() {
         let mut ops = vec![
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
                 op: Instruction::ADD,
@@ -305,7 +300,10 @@ mod tests {
     #[test]
     fn mul_zero_folds_to_const_zero() {
         let mut ops = vec![
-            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
                 op: Instruction::MUL,
@@ -320,8 +318,14 @@ mod tests {
     #[test]
     fn sub_same_load_folds_to_zero() {
         let mut ops = vec![
-            IlOp::Load { slot: 4, loc: loc() },
-            IlOp::Load { slot: 4, loc: loc() },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
             IlOp::Bin {
                 op: Instruction::SUB,
                 loc: loc(),
@@ -379,7 +383,10 @@ mod tests {
     fn refuses_when_sp_unknown() {
         let mut ops = vec![
             IlOp::byte(common::Byte::new(Instruction::FfiInvoke)),
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
                 op: Instruction::ADD,
@@ -397,7 +404,10 @@ mod tests {
     fn zero_plus_load_folds_to_load() {
         let mut ops = vec![
             IlOp::Const { imm: 0, loc: loc() },
-            IlOp::Load { slot: 5, loc: loc() },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
             IlOp::Bin {
                 op: Instruction::ADD,
                 loc: loc(),
@@ -449,8 +459,14 @@ mod tests {
     #[test]
     fn bitand_minus_one_folds_to_load() {
         let mut ops = vec![
-            IlOp::Load { slot: 2, loc: loc() },
-            IlOp::Const { imm: -1, loc: loc() },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Const {
+                imm: -1,
+                loc: loc(),
+            },
             IlOp::Bin {
                 op: Instruction::BITAND,
                 loc: loc(),
@@ -465,7 +481,10 @@ mod tests {
     #[test]
     fn pow_square_becomes_dup_mul() {
         let mut ops = vec![
-            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
             IlOp::Const { imm: 2, loc: loc() },
             IlOp::Bin {
                 op: Instruction::Pow,
@@ -476,13 +495,22 @@ mod tests {
         algebraic_simplify(&mut ops);
         assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
         assert!(matches!(ops[1], IlOp::Dup { .. }));
-        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::MUL, .. }));
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::MUL,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn pow_zero_folds_to_one() {
         let mut ops = vec![
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
                 op: Instruction::Pow,
@@ -547,7 +575,10 @@ mod tests {
 
         let mut shl = vec![
             IlOp::Const { imm: 1, loc: loc() },
-            IlOp::Const { imm: 32, loc: loc() },
+            IlOp::Const {
+                imm: 32,
+                loc: loc(),
+            },
             IlOp::Bin {
                 op: Instruction::SHL,
                 loc: loc(),
@@ -562,7 +593,10 @@ mod tests {
     #[test]
     fn pow_one_identity_and_bitand_zero() {
         let mut pow1 = vec![
-            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
             IlOp::Const { imm: 1, loc: loc() },
             IlOp::Bin {
                 op: Instruction::Pow,
@@ -575,7 +609,10 @@ mod tests {
         assert!(matches!(pow1[1], IlOp::Return { .. }));
 
         let mut and0 = vec![
-            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Bin {
                 op: Instruction::BITAND,
@@ -606,15 +643,27 @@ mod tests {
             before_len,
             "negative fold result must stay Const;Const;SUB"
         );
-        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::SUB, .. }));
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::SUB,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn refuses_mul_zero_fold_through_index() {
         // `2 * t[0]` is Load; Load; Const 0; Index; MUL — Const 0 indexes, not multiplies.
         let mut ops = vec![
-            IlOp::Load { slot: 11, loc: loc() },
-            IlOp::Load { slot: 10, loc: loc() },
+            IlOp::Load {
+                slot: 11,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 10,
+                loc: loc(),
+            },
             IlOp::Const { imm: 0, loc: loc() },
             IlOp::Index { loc: loc() },
             IlOp::Bin {
@@ -629,7 +678,13 @@ mod tests {
             "Index must survive Const 0; Index; MUL"
         );
         assert!(
-            matches!(ops[4], IlOp::Bin { op: Instruction::MUL, .. }),
+            matches!(
+                ops[4],
+                IlOp::Bin {
+                    op: Instruction::MUL,
+                    ..
+                }
+            ),
             "MUL must survive Const 0; Index; MUL"
         );
     }

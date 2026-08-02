@@ -7,6 +7,8 @@
 
 use ffi::*;
 use ffi::types::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let lib = match dload("sum") {
@@ -24,8 +26,8 @@ fn main() {
     // Non-zero pointer address — print low 16 bits as a smoke check
     // that we got a real address back (not -1 / null).
     if ptr == 0 {
-        print "%i", 0;
+        write_all(stdout(), to_bytes(format("%i", 0)));
     } else {
-        print "%i", 1;
+        write_all(stdout(), to_bytes(format("%i", 1)));
     }
 }

@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter() {
     yield 0;
     yield 1;
@@ -11,9 +13,9 @@ async fn wrap() {
 fn main() {
     let h = wrap();
     let v0 = resume h;
-    print "%i", v0;
+    write_all(stdout(), to_bytes(format("%i", v0)));
     let v1 = resume h;
-    print "%i", v1;
+    write_all(stdout(), to_bytes(format("%i", v1)));
     let v2 = resume h;
-    print "%i", v2;
+    write_all(stdout(), to_bytes(format("%i", v2)));
 }

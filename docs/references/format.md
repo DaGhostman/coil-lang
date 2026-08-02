@@ -1,20 +1,33 @@
-# `format`
+# `string::format`
 
 ### Syntax
 
 ```
-format_expr ::= 'format' STRING (',' expr)*
+format_call ::= 'format' '(' STRING (',' expr)* ')'
 ```
 
-`format` uses the same specifier rules as `print`, but returns the formatted `string` instead of writing to stdout.
+`format` is exported by the virtual `string` module. It is a compiler intrinsic, not a `HostInvoke`, and lowers to the `FORMAT` opcode.
+
+The first argument must be a string literal so the typechecker can validate each `%` specifier against the corresponding argument.
 
 ```coil
-let s = format "%i-%s", 42, "x";
-print "%s", s; // 42-x
+use string::format;
+
+let s = format("%i-%s", 42, "x");
+```
+
+Use `io` and `to_bytes` to write the formatted string:
+
+```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+write_all(stdout(), to_bytes(format("%s", "hello")));
 ```
 
 ---
 
 ## Related
 
-- [print](print.md)
+- [string](string.md)
+- [print migration note](print.md)

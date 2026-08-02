@@ -76,12 +76,8 @@ pub const BUILTIN_ENV_ERROR_ENUM: &str = "EnvError";
 pub const BUILTIN_TIME_ERROR_ENUM: &str = "TimeError";
 
 /// `TimeError` variants in tag order.
-pub const BUILTIN_TIME_ERROR_VARIANTS: &[&str] = &[
-    "InvalidInput",
-    "Overflow",
-    "ParseError",
-    "Other",
-];
+pub const BUILTIN_TIME_ERROR_VARIANTS: &[&str] =
+    &["InvalidInput", "Overflow", "ParseError", "Other"];
 
 /// `EnvError` variants in tag order.
 pub const BUILTIN_ENV_ERROR_VARIANTS: &[&str] = &[

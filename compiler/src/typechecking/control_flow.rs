@@ -17,10 +17,7 @@ pub struct CfAnalysis {
 /// Analyze `body` for path completeness helpers and soft warnings.
 ///
 /// `lookup` folds `const` bindings for infinite-loop proofs.
-pub fn analyze_fn_body(
-    body: &Output<'_>,
-    lookup: &dyn Fn(&str) -> Option<ConstVal>,
-) -> CfAnalysis {
+pub fn analyze_fn_body(body: &Output<'_>, lookup: &dyn Fn(&str) -> Option<ConstVal>) -> CfAnalysis {
     let mut out = CfAnalysis::default();
     let mut pending_defers: Vec<Range<usize>> = Vec::new();
     out.always_exits = walk(body, lookup, &mut pending_defers, &mut out.messages, false);
@@ -30,13 +27,7 @@ pub fn analyze_fn_body(
 /// True when `expr` never transfers control to a following sibling.
 #[allow(dead_code)] // used by tests / future callers; analyze_fn_body covers production
 pub fn always_exits(expr: &Output<'_>, lookup: &dyn Fn(&str) -> Option<ConstVal>) -> bool {
-    walk(
-        expr,
-        lookup,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        false,
-    )
+    walk(expr, lookup, &mut Vec::new(), &mut Vec::new(), false)
 }
 
 /// Walk `expr`. Returns whether it always exits the enclosing function.
@@ -53,11 +44,14 @@ fn walk(
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
-        | Expression::Group(inner) => walk(inner, lookup, pending_defers, messages, inside_infinite),
-
-        Expression::Return(_) | Expression::ImplicitReturn(_) | Expression::Raise(_) | Expression::Panic(_) => {
-            true
+        | Expression::Group(inner) => {
+            walk(inner, lookup, pending_defers, messages, inside_infinite)
         }
+
+        Expression::Return(_)
+        | Expression::ImplicitReturn(_)
+        | Expression::Raise(_)
+        | Expression::Panic(_) => true,
 
         Expression::Block(children) => {
             let mut exited = false;
@@ -65,7 +59,11 @@ fn walk(
             while i < children.len() {
                 let child = &children[i];
                 if exited {
-                    warn_unreachable(messages, child.0.into_range(), children[i - 1].0.into_range());
+                    warn_unreachable(
+                        messages,
+                        child.0.into_range(),
+                        children[i - 1].0.into_range(),
+                    );
                     // Still walk for nested defer warnings / typecheck later.
                     let _ = walk(child, lookup, pending_defers, messages, inside_infinite);
                     i += 1;
@@ -133,9 +131,8 @@ fn walk(
             if arms.is_empty() {
                 return false;
             }
-            arms.iter().all(|arm| {
-                walk(&arm.body, lookup, pending_defers, messages, inside_infinite)
-            })
+            arms.iter()
+                .all(|arm| walk(&arm.body, lookup, pending_defers, messages, inside_infinite))
         }
 
         Expression::Loop {
@@ -150,17 +147,25 @@ fn walk(
             }
             // while cond { body }
             let infinite = eval_bool_const(iterable, lookup) == Some(true) && !may_break(body, 0);
-            walk(body, lookup, pending_defers, messages, inside_infinite || infinite);
+            walk(
+                body,
+                lookup,
+                pending_defers,
+                messages,
+                inside_infinite || infinite,
+            );
             infinite
         }
 
-        Expression::For {
-            cond,
-            body,
-            ..
-        } => {
+        Expression::For { cond, body, .. } => {
             let infinite = eval_bool_const(cond, lookup) == Some(true) && !may_break(body, 0);
-            walk(body, lookup, pending_defers, messages, inside_infinite || infinite);
+            walk(
+                body,
+                lookup,
+                pending_defers,
+                messages,
+                inside_infinite || infinite,
+            );
             infinite
         }
 
@@ -306,10 +311,7 @@ mod tests {
     fn nested_break_does_not_defeat_outer_infinite_while() {
         // break in an inner loop only exits depth 0 of that loop; outer while
         // true {} with no outer break remains infinite.
-        let inner = while_loop(
-            Expression::Bool(false),
-            block(vec![out(Expression::Break)]),
-        );
+        let inner = while_loop(Expression::Bool(false), block(vec![out(Expression::Break)]));
         let body = block(vec![while_loop(Expression::Bool(true), block(vec![inner]))]);
         assert!(always_exits(&body, &|_| None));
     }
@@ -345,7 +347,10 @@ mod tests {
             captures: vec![],
             body: block(vec![]),
         });
-        let body = block(vec![defer, while_loop(Expression::Bool(true), block(vec![]))]);
+        let body = block(vec![
+            defer,
+            while_loop(Expression::Bool(true), block(vec![])),
+        ]);
         let cf = analyze_fn_body(&body, &|_| None);
         assert!(cf.always_exits);
         assert!(

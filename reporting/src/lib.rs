@@ -19,5 +19,5 @@ pub use codes::ErrorCode;
 pub use config::{ReportConfig, ReportFormat};
 pub use diagnostic::{Diagnostic, Location, RelatedLabel, Severity};
 pub use message::{Label, Message, MessageKind};
-pub use sink::{create_sink, emit_all, DiagnosticSink};
+pub use sink::{DiagnosticSink, create_sink, emit_all};
 pub use source::{SourceId, SourceMap};

@@ -22,7 +22,12 @@ pub struct IlFunc {
 }
 
 impl IlFunc {
-    pub fn new(name: impl Into<String>, entry: Option<Label>, code_start: usize, code_end: usize) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        entry: Option<Label>,
+        code_start: usize,
+        code_end: usize,
+    ) -> Self {
         Self::with_entry_sp(name, entry, code_start, code_end, 0)
     }
 

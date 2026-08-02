@@ -4,8 +4,8 @@
 
 use ast::{
     AdjustOp, AssignOp, AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload,
-    Expression, FieldModifier, LetFieldPattern, LetPattern, MatchArm, Output, Pattern, PatternField,
-    PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
+    Expression, FieldModifier, LetFieldPattern, LetPattern, MatchArm, Output, Pattern,
+    PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -260,13 +260,7 @@ impl<'pratt> Pratt<'pratt> {
                 .ignore_then(self.arg_list_typed(base_atom.clone()))
                 .then(op!("->").ignore_then(type_ann.clone()))
                 .map_with(|(params, ret), e| {
-                    (
-                        e.span(),
-                        Box::new(Expression::TypeFnSig {
-                            params,
-                            ret,
-                        }),
-                    )
+                    (e.span(), Box::new(Expression::TypeFnSig { params, ret }))
                 });
             choice((fn_sig_type, base_atom))
                 .then(op!("->").ignore_then(type_ann.clone()).or_not())
@@ -285,8 +279,8 @@ impl<'pratt> Pratt<'pratt> {
     fn single_type_param(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, TypeParam<'pratt>, extra::Err<Rich<'pratt, char>>>
-           + Clone
-           + 'pratt {
+    + Clone
+    + 'pratt {
         use crate::ast::Kind;
 
         let kind_ann = recursive(|kind| {
@@ -303,9 +297,7 @@ impl<'pratt> Pratt<'pratt> {
                 })
         });
 
-        let class_bound = text::ident()
-            .padded()
-            .then_ignore(op!(":").not());
+        let class_bound = text::ident().padded().then_ignore(op!(":").not());
         let class_bounds = class_bound
             .separated_by(op!("+"))
             .at_least(1)
@@ -332,8 +324,8 @@ impl<'pratt> Pratt<'pratt> {
     fn type_param_list(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Vec<TypeParam<'pratt>>, extra::Err<Rich<'pratt, char>>>
-           + Clone
-           + 'pratt {
+    + Clone
+    + 'pratt {
         self.single_type_param()
             .separated_by(op!(","))
             .allow_trailing()
@@ -366,7 +358,6 @@ impl<'pratt> Pratt<'pratt> {
                 keyword!("panic")
                     .ignore_then(expr.clone())
                     .map_with(|inner, e| (e.span(), Box::new(Expression::Panic(inner)))),
-                self.format_expr(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -619,9 +610,7 @@ impl<'pratt> Pratt<'pratt> {
                 postfix(
                     Precedence::Primary as u16,
                     just("?.").ignore_then(text::ident()),
-                    |lhs, field, e| {
-                        (e.span(), Box::new(Expression::OptionalAccess(lhs, field)))
-                    },
+                    |lhs, field, e| (e.span(), Box::new(Expression::OptionalAccess(lhs, field))),
                 ),
                 postfix(
                     Precedence::Primary as u16,
@@ -637,9 +626,7 @@ impl<'pratt> Pratt<'pratt> {
                 postfix(
                     Precedence::Primary as u16,
                     choice((
-                        expr.clone()
-                            .map(Some)
-                            .delimited_by(op!('['), op!(']')),
+                        expr.clone().map(Some).delimited_by(op!('['), op!(']')),
                         op!('[').ignore_then(op!(']')).to(None),
                     )),
                     |lhs, index, e| (e.span(), Box::new(Expression::Index(lhs, index))),
@@ -658,12 +645,9 @@ impl<'pratt> Pratt<'pratt> {
                         .collect::<Vec<_>>(),
                 )
                 .map(|(base, casts)| {
-                    casts.into_iter().fold(base, |lhs, ty| {
-                        (
-                            lhs.0,
-                            Box::new(Expression::Cast(lhs, ty)),
-                        )
-                    })
+                    casts
+                        .into_iter()
+                        .fold(base, |lhs, ty| (lhs.0, Box::new(Expression::Cast(lhs, ty))))
                 })
         })
         .map_with(output!(Expr))
@@ -714,9 +698,7 @@ impl<'pratt> Pratt<'pratt> {
         // `... name` (tuple rest), `T... name` (homogeneous rest), or `T name` (fixed).
         let tuple_rest_arg = op!("...")
             .ignore_then(text::ident().padded())
-            .map_with(|name, e| {
-                (e.span(), Box::new(Expression::Argument(None, name, true)))
-            });
+            .map_with(|name, e| (e.span(), Box::new(Expression::Argument(None, name, true))));
         let rest_arg = ty_parser
             .clone()
             .then_ignore(just("...").padded())
@@ -816,8 +798,12 @@ impl<'pratt> Pratt<'pratt> {
     /// Parse one `where` constraint: `Convert<A, B>` or unary `Num<T>`.
     fn where_constraint(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, ast::WhereConstraint<'pratt>, extra::Err<Rich<'pratt, char>>>
-    + Clone
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        ast::WhereConstraint<'pratt>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
     + 'pratt {
         text::ident()
             .padded()
@@ -840,7 +826,7 @@ impl<'pratt> Pratt<'pratt> {
         Vec<ast::WhereConstraint<'pratt>>,
         extra::Err<Rich<'pratt, char>>,
     > + Clone
-           + 'pratt {
+    + 'pratt {
         keyword!("where")
             .ignore_then(
                 self.where_constraint()
@@ -868,23 +854,29 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.where_clause())
-            .map_with(|(((((((is_coro, is_static), _), name), type_params), args), returns), where_constraints), e| {
-                let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
-                (
-                    e.span(),
-                    Box::new(Expression::Function {
-                        attrs: vec![],
-                        name,
-                        is_coro: is_coro.is_some(),
-                        is_static: is_static.is_some(),
-                        type_params,
-                        args,
-                        returns,
-                        where_constraints,
-                        body: Some(empty_block),
-                    }),
-                )
-            })
+            .map_with(
+                |(
+                    ((((((is_coro, is_static), _), name), type_params), args), returns),
+                    where_constraints,
+                ),
+                 e| {
+                    let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
+                    (
+                        e.span(),
+                        Box::new(Expression::Function {
+                            attrs: vec![],
+                            name,
+                            is_coro: is_coro.is_some(),
+                            is_static: is_static.is_some(),
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body: Some(empty_block),
+                        }),
+                    )
+                },
+            )
     }
 
     /// `attr Name<T>(target, extras..., ...args) -> R { body }`
@@ -934,13 +926,18 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.where_clause())
-            .then(choice((
-                self.block(stmt).map(Some),
-                op!(";").to(None),
-            )))
+            .then(choice((self.block(stmt).map(Some), op!(";").to(None))))
             .map_with(|full, e| {
-                let (((((((((attrs, is_coro), is_static), _), name), type_params), args), returns), where_constraints), body) =
-                    full;
+                let (
+                    (
+                        (
+                            ((((((attrs, is_coro), is_static), _), name), type_params), args),
+                            returns,
+                        ),
+                        where_constraints,
+                    ),
+                    body,
+                ) = full;
                 (
                     e.span(),
                     Box::new(Expression::Function {
@@ -1026,10 +1023,7 @@ impl<'pratt> Pratt<'pratt> {
             .ignore_then(captures)
             .then(self.block(stmt))
             .map_with(|(captures, body), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Defer { captures, body }),
-                )
+                (e.span(), Box::new(Expression::Defer { captures, body }))
             })
     }
 
@@ -1162,44 +1156,6 @@ impl<'pratt> Pratt<'pratt> {
         })
     }
 
-    fn print(
-        &self,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        keyword!("print")
-            .labelled("print statement")
-            .ignore_then(self.string())
-            .then(
-                self.expr()
-                    .separated_by(op!(','))
-                    .allow_leading()
-                    .collect::<Vec<_>>()
-                    .or_not(),
-            )
-            .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
-    }
-
-    fn format_expr<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        keyword!("format")
-            .labelled("format expression")
-            .ignore_then(self.string())
-            .then(
-                expr.separated_by(op!(','))
-                    .allow_leading()
-                    .collect::<Vec<_>>()
-                    .or_not(),
-            )
-            .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Format(fmt, params))))
-    }
-
     /// `done(handle)` — true when a coroutine has completed.
     fn done_<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
@@ -1238,9 +1194,7 @@ impl<'pratt> Pratt<'pratt> {
             .ignore_then(self.expr().or_not())
             .map_with(|opt, e| {
                 let span = e.span();
-                let result = opt.unwrap_or_else(|| {
-                    (span, Box::new(Expression::Tuple(Vec::new())))
-                });
+                let result = opt.unwrap_or_else(|| (span, Box::new(Expression::Tuple(Vec::new()))));
                 (span, Box::new(Expression::Return(result)))
             })
     }
@@ -1318,7 +1272,6 @@ impl<'pratt> Pratt<'pratt> {
                 self.constant().then_ignore(op!(';')),
                 // Statement keywords before `expr_statement`: otherwise
                 // `return -1;` parses as `Sub(Identifier("return"), 1)`.
-                self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
                 self.raise_().then_ignore(op!(';')),
                 self.panic_().then_ignore(op!(';')),
@@ -1387,17 +1340,9 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("test")
-            .ignore_then(
-                self.expr()
-                    .delimited_by(op!("("), op!(")")),
-            )
+            .ignore_then(self.expr().delimited_by(op!("("), op!(")")))
             .then(self.block(stmt))
-            .map_with(|(name, body), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::TestCase { name, body }),
-                )
-            })
+            .map_with(|(name, body), e| (e.span(), Box::new(Expression::TestCase { name, body })))
             .labelled("test case")
     }
 
@@ -1472,13 +1417,9 @@ impl<'pratt> Pratt<'pratt> {
 
         let path_end = choice((
             // `::{a, b as c}`
-            op!("::")
-                .ignore_then(brace_group)
-                .map(EndKind::Brace),
+            op!("::").ignore_then(brace_group).map(EndKind::Brace),
             // `::*`
-            op!("::")
-                .ignore_then(just('*').padded())
-                .to(EndKind::Glob),
+            op!("::").ignore_then(just('*').padded()).to(EndKind::Glob),
             // bare end — optional `as alias`
             keyword!("as")
                 .ignore_then(text::ident().padded())
@@ -1492,62 +1433,63 @@ impl<'pratt> Pratt<'pratt> {
             .then_ignore(op!(";"))
             .map_with(
                 |((first, middle), end): ((&str, Vec<String>), EndKind), e| {
-                let span = e.span();
-                match end {
-                    EndKind::Brace(items) => {
-                        // `use foo::bar::{a, b as c};` → path = [foo, bar]
-                        let mut path = Vec::with_capacity(1 + middle.len());
-                        path.push(first.to_string());
-                        path.extend(middle);
-                        if items.len() == 1 {
-                            let (name, alias) = items.into_iter().next().unwrap();
-                            return (span, Box::new(Expression::Use { path, name, alias }));
+                    let span = e.span();
+                    match end {
+                        EndKind::Brace(items) => {
+                            // `use foo::bar::{a, b as c};` → path = [foo, bar]
+                            let mut path = Vec::with_capacity(1 + middle.len());
+                            path.push(first.to_string());
+                            path.extend(middle);
+                            if items.len() == 1 {
+                                let (name, alias) = items.into_iter().next().unwrap();
+                                return (span, Box::new(Expression::Use { path, name, alias }));
+                            }
+                            let children: Vec<Output<'pratt>> = items
+                                .into_iter()
+                                .map(|(name, alias)| {
+                                    (
+                                        span,
+                                        Box::new(Expression::Use {
+                                            path: path.clone(),
+                                            name,
+                                            alias,
+                                        }),
+                                    )
+                                })
+                                .collect();
+                            (span, Box::new(Expression::Fragment(children)))
                         }
-                        let children: Vec<Output<'pratt>> = items
-                            .into_iter()
-                            .map(|(name, alias)| {
-                                (
-                                    span,
-                                    Box::new(Expression::Use {
-                                        path: path.clone(),
-                                        name,
-                                        alias,
-                                    }),
-                                )
-                            })
-                            .collect();
-                        (span, Box::new(Expression::Fragment(children)))
+                        EndKind::Glob => {
+                            let mut path = Vec::with_capacity(1 + middle.len());
+                            path.push(first.to_string());
+                            path.extend(middle);
+                            (
+                                span,
+                                Box::new(Expression::Use {
+                                    path,
+                                    name: "*".to_string(),
+                                    alias: None,
+                                }),
+                            )
+                        }
+                        EndKind::Concrete(alias) => {
+                            // `use foo;` / `use foo::bar;` / `use foo::bar as x;`
+                            let mut segs = Vec::with_capacity(1 + middle.len());
+                            segs.push(first.to_string());
+                            segs.extend(middle);
+                            let name = segs.pop().expect("at least the leading ident");
+                            (
+                                span,
+                                Box::new(Expression::Use {
+                                    path: segs,
+                                    name,
+                                    alias,
+                                }),
+                            )
+                        }
                     }
-                    EndKind::Glob => {
-                        let mut path = Vec::with_capacity(1 + middle.len());
-                        path.push(first.to_string());
-                        path.extend(middle);
-                        (
-                            span,
-                            Box::new(Expression::Use {
-                                path,
-                                name: "*".to_string(),
-                                alias: None,
-                            }),
-                        )
-                    }
-                    EndKind::Concrete(alias) => {
-                        // `use foo;` / `use foo::bar;` / `use foo::bar as x;`
-                        let mut segs = Vec::with_capacity(1 + middle.len());
-                        segs.push(first.to_string());
-                        segs.extend(middle);
-                        let name = segs.pop().expect("at least the leading ident");
-                        (
-                            span,
-                            Box::new(Expression::Use {
-                                path: segs,
-                                name,
-                                alias,
-                            }),
-                        )
-                    }
-                }
-            })
+                },
+            )
             .labelled("use statement")
     }
 
@@ -1611,13 +1553,9 @@ impl<'pratt> Pratt<'pratt> {
     /// Language rest (`T... name`) is rejected with a clear diagnostic.
     fn extern_arg_list(
         &self,
-    ) -> impl Parser<
-        'pratt,
-        &'pratt str,
-        (Output<'pratt>, bool),
-        extra::Err<Rich<'pratt, char>>,
-    > + Clone
-           + 'pratt {
+    ) -> impl Parser<'pratt, &'pratt str, (Output<'pratt>, bool), extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         #[derive(Clone)]
         enum ExternArg<'a> {
             Fixed(Output<'a>),
@@ -1644,12 +1582,7 @@ impl<'pratt> Pratt<'pratt> {
 
         let bare_only = just("...")
             .padded()
-            .map_with(|_, e| {
-                (
-                    (e.span(), Box::new(Expression::Fragment(Vec::new()))),
-                    true,
-                )
-            });
+            .map_with(|_, e| ((e.span(), Box::new(Expression::Fragment(Vec::new()))), true));
 
         let fixed_then_ellipsis = arg
             .separated_by(op!(','))
@@ -1717,13 +1650,15 @@ impl<'pratt> Pratt<'pratt> {
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             // The trailing `;` is required (no body).
             .then_ignore(op!(";"))
-            .map_with(|(((_, name), (args, variadic)), returns), _e| ExternFunction {
-                name,
-                symbol: None,
-                args,
-                returns,
-                variadic,
-            });
+            .map_with(
+                |(((_, name), (args, variadic)), returns), _e| ExternFunction {
+                    name,
+                    symbol: None,
+                    args,
+                    returns,
+                    variadic,
+                },
+            );
 
         // Inline string-literal parser for the library name.
         // We don't use `self.string()` because it returns an
@@ -1757,8 +1692,9 @@ impl<'pratt> Pratt<'pratt> {
     /// Zero or more `#[attr]` / `#[attr(args)]` prefixes on a declaration.
     fn attr_list(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, Vec<Attribute<'pratt>>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, Vec<Attribute<'pratt>>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         let attr_float = text::int(10)
             .then(just('.').then(text::int(10)))
             .to_slice()
@@ -1781,9 +1717,7 @@ impl<'pratt> Pratt<'pratt> {
             keyword!("false").to(AttrLit::Bool(false)),
         ));
 
-        let attr_kv = text::ident()
-            .then_ignore(op!("="))
-            .then(attr_lit.clone());
+        let attr_kv = text::ident().then_ignore(op!("=")).then(attr_lit.clone());
 
         let attr_args = choice((
             attr_kv
@@ -2032,10 +1966,7 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(name, type_params), e| {
                 (
                     e.span(),
-                    Box::new(Expression::AssocTypeDecl {
-                        name,
-                        type_params,
-                    }),
+                    Box::new(Expression::AssocTypeDecl { name, type_params }),
                 )
             });
 
@@ -2050,7 +1981,14 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!("{"), op!("}")),
             )
             .map_with(|((name, type_params), methods), e| {
-                (e.span(), Box::new(Expression::TypeClass { name, type_params, methods }))
+                (
+                    e.span(),
+                    Box::new(Expression::TypeClass {
+                        name,
+                        type_params,
+                        methods,
+                    }),
+                )
             })
     }
 
@@ -2205,7 +2143,14 @@ impl<'pratt> Pratt<'pratt> {
                         .into_iter()
                         .map(|p| (e.span(), Box::new(Expression::Type(p.name))))
                         .collect();
-                    (e.span(), Box::new(Expression::TypeClassImpl { class: name, args, methods }))
+                    (
+                        e.span(),
+                        Box::new(Expression::TypeClassImpl {
+                            class: name,
+                            args,
+                            methods,
+                        }),
+                    )
                 } else {
                     // e.g. `impl Cell {}` or `impl Cell<T>` or `impl Cell<T: Num>`.
                     (
@@ -2282,7 +2227,14 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!("{"), op!("}")),
             )
             .map_with(|((class, args), methods), e| {
-                (e.span(), Box::new(Expression::TypeClassImpl { class, args, methods }))
+                (
+                    e.span(),
+                    Box::new(Expression::TypeClassImpl {
+                        class,
+                        args,
+                        methods,
+                    }),
+                )
             })
     }
 
@@ -2372,15 +2324,17 @@ impl<'pratt> Pratt<'pratt> {
     /// Top-level `let` destructure LHS: `(p, …)` or `{ field, … }` only.
     fn let_destructure_lhs(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         choice((self.let_tuple_pattern(), self.let_record_pattern()))
     }
 
     fn let_tuple_pattern(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         let inner = self.let_pattern();
         // Require a comma (or trailing comma) so `(a)` is not a
         // 1-tuple — same rule as tuple literals.
@@ -2400,8 +2354,9 @@ impl<'pratt> Pratt<'pratt> {
 
     fn let_record_pattern(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         let field = text::ident()
             .padded()
             .then(op!(":").ignore_then(self.let_pattern()).or_not())
@@ -2420,8 +2375,9 @@ impl<'pratt> Pratt<'pratt> {
     /// Nested irrefutable `let` pattern: `_`, binding, `(p, …)`, `{ field, … }`.
     fn let_pattern(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         recursive(|pattern_parser| {
             let record_field = text::ident()
                 .padded()
@@ -2500,9 +2456,7 @@ impl<'pratt> Pratt<'pratt> {
             .padded()
             .then_ignore(op!(":"))
             .then(expr.clone())
-            .map_with(|(name, value), e| {
-                (e.span(), Box::new(Expression::NamedArg(name, value)))
-            })
+            .map_with(|(name, value), e| (e.span(), Box::new(Expression::NamedArg(name, value))))
             .labelled("named argument");
         let spread = op!("...")
             .ignore_then(expr.clone())
@@ -2703,6 +2657,44 @@ impl<'pratt> Pratt<'pratt> {
                     let joined = segments.join("::");
                     Box::leak(joined.into_boxed_str()) as &str
                 };
+                // `module::fn(...)` when both sides look like module/fn paths
+                // (`string::format`). PascalCase owners stay Construct
+                // (`Point::new`); PascalCase members stay Construct
+                // (`ffi::types::Int`, `Option::Some`).
+                if enum_name
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_lowercase())
+                    && variant_name
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_lowercase())
+                {
+                    let name = (
+                        e.span(),
+                        Box::new(Expression::QualifiedAccess {
+                            owner: enum_name,
+                            member: variant_name,
+                        }),
+                    );
+                    return match fields {
+                        Some(EnumConstructPayload::Tuple(args)) => (
+                            e.span(),
+                            Box::new(Expression::Call {
+                                name,
+                                args: Some(args),
+                            }),
+                        ),
+                        Some(EnumConstructPayload::Unit) | None => name,
+                        Some(EnumConstructPayload::Record(_)) => (
+                            e.span(),
+                            Box::new(Expression::QualifiedAccess {
+                                owner: enum_name,
+                                member: variant_name,
+                            }),
+                        ),
+                    };
+                }
                 (
                     e.span(),
                     Box::new(Expression::Construct {
@@ -2975,11 +2967,8 @@ impl<'pratt> Pratt<'pratt> {
                     .first()
                     .map(|err| err.span().into_range())
                     .unwrap_or_default();
-                let mut message = Message::error(
-                    ErrorCode::ParseError,
-                    "Parse error".to_string(),
-                    primary,
-                );
+                let mut message =
+                    Message::error(ErrorCode::ParseError, "Parse error".to_string(), primary);
 
                 errs.iter().for_each(|err| {
                     message.push(Label::new(err.to_string(), err.span().into_range()));
@@ -3090,9 +3079,9 @@ mod tests {
 
     #[test]
     fn pratt_test_statements() {
-        stmt!("print \"%i\", 42;");
-        stmt!("print \"Hello, World!\";");
-        stmt!("defer { print \"%i\", 42; }");
+        stmt!("write(\"%i\", 42);");
+        stmt!("write(\"Hello, World!\");");
+        stmt!("defer { write(\"%i\", 42); }");
         stmt!("while x < 10 { x = x + 1; }");
     }
 
@@ -3100,11 +3089,11 @@ mod tests {
     fn defer_parses_inside_function_body() {
         // Regression: `defer` must be a statement, not only a top-level
         // declaration — otherwise `defer {` inside `fn` fails looking for `:`.
-        let ast = decl_ast!(
-            "fn f() { defer { print \"x\"; } print \"y\"; }"
-        );
+        let ast = decl_ast!("fn f() { defer { write(\"x\"); } write(\"y\"); }");
         match ast {
-            Expression::Function { body: Some(body), .. } => {
+            Expression::Function {
+                body: Some(body), ..
+            } => {
                 let Expression::Block(items) = body.1.as_ref() else {
                     panic!("expected function body block, got {:?}", body.1);
                 };
@@ -3127,11 +3116,11 @@ mod tests {
 
     #[test]
     fn defer_use_parses_captures() {
-        let ast = decl_ast!(
-            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
-        );
+        let ast = decl_ast!("fn f() { let x = 1; defer use (x) { write(\"%i\", x); } }");
         match ast {
-            Expression::Function { body: Some(body), .. } => {
+            Expression::Function {
+                body: Some(body), ..
+            } => {
                 let Expression::Block(items) = body.1.as_ref() else {
                     panic!("expected function body block, got {:?}", body.1);
                 };
@@ -3152,30 +3141,97 @@ mod tests {
     #[test]
     fn defer_use_display_round_trips() {
         // Block Display omits braces; just check the capture list renders.
-        let ast = decl_ast!(
-            "fn f() { let x = 1; defer use (x) { print \"%i\", x; } }"
-        );
+        let ast = decl_ast!("fn f() { let x = 1; defer use (x) { write(\"%i\", x); } }");
         let rendered = format!("{}", ast);
         assert!(
             rendered.contains("defer use (x)"),
             "expected Display to include capture list, got {rendered}"
         );
         // Bare defer still parses.
-        let _ = stmt!("defer { print \"x\"; }");
+        let _ = stmt!("defer { write(\"x\"); }");
     }
 
     #[test]
-    fn format_keyword_parses_as_expression() {
-        same!("format \"%i-%s\", 42, \"x\"");
-        let ast = expr_ast!("format \"%i-%s\", 42, \"x\"");
+    fn format_parses_as_call_expression() {
+        same!("format(\"%i-%s\", 42, \"x\")");
+        let ast = expr_ast!("format(\"%i-%s\", 42, \"x\")");
         let inner = match ast {
             Expression::Expr(e) => e.1.as_ref().clone(),
             other => other,
         };
         match inner {
-            Expression::Format(_, Some(params)) => assert_eq!(params.len(), 2),
-            other => panic!("expected format expression, got {:?}", other),
+            Expression::Call {
+                name,
+                args: Some(params),
+            } => {
+                assert!(matches!(name.1.as_ref(), Expression::Identifier("format")));
+                assert_eq!(params.len(), 3);
+            }
+            other => panic!("expected format call expression, got {:?}", other),
         }
+    }
+
+    /// Lowercase::lowercase paths are module calls (`string::format`), not Construct.
+    #[test]
+    fn string_format_parses_as_qualified_module_call() {
+        let ast = expr_ast!("string::format(\"%i\", 1)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Call {
+                name,
+                args: Some(params),
+            } => {
+                match name.1.as_ref() {
+                    Expression::QualifiedAccess { owner, member } => {
+                        assert_eq!(*owner, "string");
+                        assert_eq!(*member, "format");
+                    }
+                    other => panic!("expected QualifiedAccess callee, got {:?}", other),
+                }
+                assert_eq!(params.len(), 2);
+            }
+            other => panic!("expected Call(string::format), got {:?}", other),
+        }
+    }
+
+    /// PascalCase owners stay Construct even when the member is lowercase (`Point::new`).
+    #[test]
+    fn pascal_case_method_call_stays_construct() {
+        let ast = expr_ast!("Point::new(40, 2)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                fields: EnumConstructPayload::Tuple(args),
+            } => {
+                assert_eq!(enum_name, "Point");
+                assert_eq!(variant_name, "new");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Construct(Point::new), got {:?}", other),
+        }
+    }
+
+    /// `Statement(ExprStatement)` must not append a second `;` (Display regression).
+    #[test]
+    fn statement_wrapping_expr_statement_display_has_one_semicolon() {
+        let ast = decl_ast!("write_all(stdout(), to_bytes(\"x\"));");
+        let rendered = format!("{}", ast);
+        assert!(
+            !rendered.contains(";;"),
+            "ExprStatement already emits `;`; got {rendered:?}"
+        );
+        assert!(
+            rendered.trim_end().ends_with(';'),
+            "expected a single trailing semicolon, got {rendered:?}"
+        );
     }
 
     #[test]
@@ -3249,7 +3305,7 @@ mod tests {
 
     #[test]
     fn for_in_parses_to_loop_with_identifier() {
-        let ast = decl_ast!("for x in counter() { print \"%i\", x; }");
+        let ast = decl_ast!("for x in counter() { write(\"%i\", x); }");
         match ast {
             Expression::Statement(inner) => match inner.1.as_ref() {
                 Expression::Loop {
@@ -3272,7 +3328,7 @@ mod tests {
 
     #[test]
     fn for_in_display_round_trips() {
-        let rendered = stmt!("for x in counter() { print \"%i\", x; }");
+        let rendered = stmt!("for x in counter() { write(\"%i\", x); }");
         assert!(
             rendered.contains("for x in"),
             "expected for-in Display, got {rendered:?}"
@@ -3317,8 +3373,8 @@ mod tests {
     #[test]
     fn pratt_test_fn_declaration() {
         assert_eq!(
-            "fn main() -> void {\nprint \"Hello, %s\", 42;\n}",
-            stmt!("fn main() -> void {\n  print \"Hello, %s\", 42;\n  }")
+            "fn main() -> void {\nwrite(\"Hello, %s\", 42);\n}",
+            stmt!("fn main() -> void {\n  write(\"Hello, %s\", 42);\n  }")
         );
         same!("foo(1, 3, 4) * foo(2)");
     }
@@ -4241,21 +4297,23 @@ mod tests {
             }
         }
         match expr.as_ref() {
-            Expression::Function { body, .. } => match body.as_ref().expect("function body").1.as_ref() {
-                Expression::Block(stmts) => match stmts[0].1.as_ref() {
-                    Expression::Statement(stmt) => match stmt.1.as_ref() {
-                        // `yield` is preferred over `expr_statement`, so the
-                        // node is bare `Yield` (not `ExprStatement(Yield)`).
-                        Expression::Yield(_) => expect_yield_42(stmt.1.as_ref()),
-                        Expression::ExprStatement(inner) => {
-                            expect_yield_42(inner.1.as_ref());
-                        }
-                        other => panic!("expected Yield statement, got {:?}", other),
+            Expression::Function { body, .. } => {
+                match body.as_ref().expect("function body").1.as_ref() {
+                    Expression::Block(stmts) => match stmts[0].1.as_ref() {
+                        Expression::Statement(stmt) => match stmt.1.as_ref() {
+                            // `yield` is preferred over `expr_statement`, so the
+                            // node is bare `Yield` (not `ExprStatement(Yield)`).
+                            Expression::Yield(_) => expect_yield_42(stmt.1.as_ref()),
+                            Expression::ExprStatement(inner) => {
+                                expect_yield_42(inner.1.as_ref());
+                            }
+                            other => panic!("expected Yield statement, got {:?}", other),
+                        },
+                        other => panic!("expected Statement, got {:?}", other),
                     },
-                    other => panic!("expected Statement, got {:?}", other),
-                },
-                other => panic!("expected Block, got {:?}", other),
-            },
+                    other => panic!("expected Block, got {:?}", other),
+                }
+            }
             other => panic!("expected Function, got {:?}", other),
         }
     }
@@ -4337,35 +4395,39 @@ mod tests {
     fn parse_let_binding_yield_round_trips() {
         let ast = decl_ast!("async fn f() { let x = yield 1; }");
         match ast {
-            Expression::Function { body, .. } => match body.as_ref().expect("function body").1.as_ref() {
-                Expression::Block(stmts) => match stmts[0].1.as_ref() {
-                    Expression::Statement(stmt) => match stmt.1.as_ref() {
-                        Expression::Fragment(children) => {
-                            assert_eq!(children.len(), 2);
-                            let init = children[1].1.as_ref();
-                            let yield_expr = match init {
-                                Expression::Yield(y) => y.1.as_ref(),
-                                Expression::Expr(e) => match e.1.as_ref() {
+            Expression::Function { body, .. } => {
+                match body.as_ref().expect("function body").1.as_ref() {
+                    Expression::Block(stmts) => match stmts[0].1.as_ref() {
+                        Expression::Statement(stmt) => match stmt.1.as_ref() {
+                            Expression::Fragment(children) => {
+                                assert_eq!(children.len(), 2);
+                                let init = children[1].1.as_ref();
+                                let yield_expr = match init {
                                     Expression::Yield(y) => y.1.as_ref(),
+                                    Expression::Expr(e) => match e.1.as_ref() {
+                                        Expression::Yield(y) => y.1.as_ref(),
+                                        other => {
+                                            panic!("expected Yield initializer, got {:?}", other)
+                                        }
+                                    },
                                     other => panic!("expected Yield initializer, got {:?}", other),
-                                },
-                                other => panic!("expected Yield initializer, got {:?}", other),
-                            };
-                            match yield_expr {
-                                Expression::Expr(e) => match e.1.as_ref() {
+                                };
+                                match yield_expr {
+                                    Expression::Expr(e) => match e.1.as_ref() {
+                                        Expression::Integer(1) => {}
+                                        other => panic!("expected yield 1, got {:?}", other),
+                                    },
                                     Expression::Integer(1) => {}
                                     other => panic!("expected yield 1, got {:?}", other),
-                                },
-                                Expression::Integer(1) => {}
-                                other => panic!("expected yield 1, got {:?}", other),
+                                }
                             }
-                        }
-                        other => panic!("expected Fragment let, got {:?}", other),
+                            other => panic!("expected Fragment let, got {:?}", other),
+                        },
+                        other => panic!("expected Statement, got {:?}", other),
                     },
-                    other => panic!("expected Statement, got {:?}", other),
-                },
-                other => panic!("expected Block, got {:?}", other),
-            },
+                    other => panic!("expected Block, got {:?}", other),
+                }
+            }
             other => panic!("expected Function, got {:?}", other),
         }
     }
@@ -4658,7 +4720,7 @@ mod tests {
     /// so a user may define `fn dload(...)` when they have not imported `ffi`.
     #[test]
     fn dload_is_not_a_keyword_and_can_name_a_user_function() {
-        let src = "fn dload(int x) -> int { return x; } fn main() { print \"%i\", dload(1); }";
+        let src = "fn dload(int x) -> int { return x; } fn main() { let y = dload(1); }";
         let result = Pratt::default().parse(src);
         assert!(
             result.is_ok(),
@@ -4798,9 +4860,7 @@ mod tests {
     #[test]
     fn parse_readonly_array_literal() {
         let src = "readonly [1, 2, 3];";
-        let ast = Pratt::default()
-            .parse(src)
-            .expect("parse readonly array");
+        let ast = Pratt::default().parse(src).expect("parse readonly array");
         fn find_readonly_array(e: &Expression<'_>) -> bool {
             match e {
                 Expression::Readonly(inner) => {
@@ -4958,9 +5018,7 @@ mod tests_error_handling {
     }
 
     macro_rules! expr {
-        ($case: expr) => {{
-            parse_expr($case).to_string()
-        }};
+        ($case: expr) => {{ parse_expr($case).to_string() }};
     }
 
     macro_rules! same_try {
@@ -5138,20 +5196,28 @@ mod tests_generics {
     /// `type Pair<A, B> = (A, B);` — two type params, no bounds.
     #[test]
     fn type_alias_with_two_type_params_round_trips() {
-        assert_eq!(stmt!("type Pair<A, B> = (A, B);"), "type Pair<A, B> = (A, B);");
+        assert_eq!(
+            stmt!("type Pair<A, B> = (A, B);"),
+            "type Pair<A, B> = (A, B);"
+        );
     }
 
     /// `type Num<T: Add + Mul> = T;` — single param with two bounds.
     #[test]
     fn type_alias_with_bounded_type_param_round_trips() {
-        assert_eq!(stmt!("type Bounded<T: Add + Mul> = T;"), "type Bounded<T: Add + Mul> = T;");
+        assert_eq!(
+            stmt!("type Bounded<T: Add + Mul> = T;"),
+            "type Bounded<T: Add + Mul> = T;"
+        );
     }
 
     /// AST: `type Id<T> = T;` has one type param named `T` with no bounds.
     #[test]
     fn type_alias_type_param_ast_structure() {
         match decl_ast!("type Id<T> = T;") {
-            Expression::TypeAlias { name, type_params, .. } => {
+            Expression::TypeAlias {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "Id");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5180,7 +5246,9 @@ mod tests_generics {
     #[test]
     fn fn_with_single_type_param_parses() {
         match decl_ast!("fn id<T>(T x) -> T {}") {
-            Expression::Function { name, type_params, .. } => {
+            Expression::Function {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "id");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5194,7 +5262,9 @@ mod tests_generics {
     #[test]
     fn fn_with_bounded_type_param_parses() {
         match decl_ast!("fn add<T: Num>(T a, T b) -> T {}") {
-            Expression::Function { name, type_params, .. } => {
+            Expression::Function {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "add");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5208,7 +5278,9 @@ mod tests_generics {
     #[test]
     fn fn_with_two_type_params_parses() {
         match decl_ast!("fn zip<A, B>(A a, B b) -> (A, B) {}") {
-            Expression::Function { name, type_params, .. } => {
+            Expression::Function {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "zip");
                 assert_eq!(type_params.len(), 2);
                 assert_eq!(type_params[0].name, "A");
@@ -5298,7 +5370,9 @@ mod tests_generics {
     #[test]
     fn enum_with_single_type_param_parses() {
         match decl_ast!("enum Option<T> { None, Some(T), }") {
-            Expression::EnumDecl { name, type_params, .. } => {
+            Expression::EnumDecl {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "Option");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5311,7 +5385,9 @@ mod tests_generics {
     #[test]
     fn enum_with_two_type_params_parses() {
         match decl_ast!("enum Result<T, E> { Ok(T), Err(E), }") {
-            Expression::EnumDecl { name, type_params, .. } => {
+            Expression::EnumDecl {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "Result");
                 assert_eq!(type_params.len(), 2);
                 assert_eq!(type_params[0].name, "T");
@@ -5327,7 +5403,9 @@ mod tests_generics {
     #[test]
     fn class_with_single_type_param_parses() {
         match decl_ast!("class Box<T> { value: T, }") {
-            Expression::Class { name, type_params, .. } => {
+            Expression::Class {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "Box");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5340,7 +5418,9 @@ mod tests_generics {
     #[test]
     fn class_with_bounded_type_params_parses() {
         match decl_ast!("class Pair<A, B: Ord> { first: A, second: B, }") {
-            Expression::Class { name, type_params, .. } => {
+            Expression::Class {
+                name, type_params, ..
+            } => {
                 assert_eq!(name, "Pair");
                 assert_eq!(type_params.len(), 2);
                 assert_eq!(type_params[0].name, "A");
@@ -5358,7 +5438,9 @@ mod tests_generics {
     #[test]
     fn inherent_impl_with_type_param_parses() {
         match decl_ast!("impl Cell<T> { fn get() -> T {} }") {
-            Expression::Implementation { owner, type_params, .. } => {
+            Expression::Implementation {
+                owner, type_params, ..
+            } => {
                 assert_eq!(owner, "Cell");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5371,7 +5453,9 @@ mod tests_generics {
     #[test]
     fn inherent_impl_with_bounded_type_param_parses() {
         match decl_ast!("impl Foo<T: Num + Eq> { fn bar() {} }") {
-            Expression::Implementation { owner, type_params, .. } => {
+            Expression::Implementation {
+                owner, type_params, ..
+            } => {
                 assert_eq!(owner, "Foo");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
@@ -5385,7 +5469,9 @@ mod tests_generics {
     #[test]
     fn inherent_impl_without_type_params_parses() {
         match decl_ast!("impl Point { fn sum() {} }") {
-            Expression::Implementation { owner, type_params, .. } => {
+            Expression::Implementation {
+                owner, type_params, ..
+            } => {
                 assert_eq!(owner, "Point");
                 assert!(type_params.is_empty());
             }
@@ -5443,14 +5529,20 @@ mod tests_generics {
     #[test]
     fn typeclass_with_sig_only_method_parses() {
         match decl_ast!("trait Eq<T> { fn eq(T a, T b) -> bool; }") {
-            Expression::TypeClass { name, type_params, methods } => {
+            Expression::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
                 assert_eq!(name, "Eq");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "T");
                 assert_eq!(methods.len(), 1);
                 // The sig-only method is a Function with an empty Block body.
                 match methods[0].1.as_ref() {
-                    Expression::Function { name: mname, body, .. } => {
+                    Expression::Function {
+                        name: mname, body, ..
+                    } => {
                         assert_eq!(*mname, "eq");
                         assert!(matches!(
                             body.as_ref().expect("method body").1.as_ref(),
@@ -5468,13 +5560,19 @@ mod tests_generics {
     #[test]
     fn typeclass_with_default_method_parses() {
         match decl_ast!("trait Num<T> { fn add(T a, T b) -> T { return a + b; } }") {
-            Expression::TypeClass { name, type_params, methods } => {
+            Expression::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
                 assert_eq!(name, "Num");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(methods.len(), 1);
                 // A default method has a non-empty block.
                 match methods[0].1.as_ref() {
-                    Expression::Function { name: mname, body, .. } => {
+                    Expression::Function {
+                        name: mname, body, ..
+                    } => {
                         assert_eq!(*mname, "add");
                         // Block is non-empty (contains the return statement).
                         assert!(matches!(
@@ -5492,10 +5590,12 @@ mod tests_generics {
     /// `trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }` — two sig-only.
     #[test]
     fn typeclass_with_bounded_param_and_two_methods_parses() {
-        match decl_ast!(
-            "trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }"
-        ) {
-            Expression::TypeClass { name, type_params, methods } => {
+        match decl_ast!("trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }") {
+            Expression::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
                 assert_eq!(name, "Ord");
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].bounds, vec!["Eq"]);
@@ -5509,7 +5609,11 @@ mod tests_generics {
     #[test]
     fn typeclass_without_type_params_parses() {
         match decl_ast!("trait Show { fn show() -> string; }") {
-            Expression::TypeClass { name, type_params, methods } => {
+            Expression::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
                 assert_eq!(name, "Show");
                 assert!(type_params.is_empty());
                 assert_eq!(methods.len(), 1);
@@ -5524,7 +5628,11 @@ mod tests_generics {
     #[test]
     fn forall_in_type_alias_parses() {
         match decl_ast!("type F = forall T. T;") {
-            Expression::TypeAlias { ty, type_params: alias_params, .. } => {
+            Expression::TypeAlias {
+                ty,
+                type_params: alias_params,
+                ..
+            } => {
                 assert!(alias_params.is_empty()); // the alias itself has no params
                 match ty.1.as_ref() {
                     Expression::Forall { params, ty: inner } => {
@@ -5548,16 +5656,14 @@ mod tests_generics {
     #[test]
     fn forall_with_bounded_param_in_type_alias_parses() {
         match decl_ast!("type F = forall T: Num. T;") {
-            Expression::TypeAlias { ty, .. } => {
-                match ty.1.as_ref() {
-                    Expression::Forall { params, .. } => {
-                        assert_eq!(params.len(), 1);
-                        assert_eq!(params[0].name, "T");
-                        assert_eq!(params[0].bounds, vec!["Num"]);
-                    }
-                    other => panic!("expected Forall, got {:?}", other),
+            Expression::TypeAlias { ty, .. } => match ty.1.as_ref() {
+                Expression::Forall { params, .. } => {
+                    assert_eq!(params.len(), 1);
+                    assert_eq!(params[0].name, "T");
+                    assert_eq!(params[0].bounds, vec!["Num"]);
                 }
-            }
+                other => panic!("expected Forall, got {:?}", other),
+            },
             other => panic!("expected TypeAlias, got {:?}", other),
         }
     }
@@ -5566,16 +5672,14 @@ mod tests_generics {
     #[test]
     fn forall_with_two_params_in_type_alias_parses() {
         match decl_ast!("type F = forall T, U. T;") {
-            Expression::TypeAlias { ty, .. } => {
-                match ty.1.as_ref() {
-                    Expression::Forall { params, .. } => {
-                        assert_eq!(params.len(), 2);
-                        assert_eq!(params[0].name, "T");
-                        assert_eq!(params[1].name, "U");
-                    }
-                    other => panic!("expected Forall, got {:?}", other),
+            Expression::TypeAlias { ty, .. } => match ty.1.as_ref() {
+                Expression::Forall { params, .. } => {
+                    assert_eq!(params.len(), 2);
+                    assert_eq!(params[0].name, "T");
+                    assert_eq!(params[1].name, "U");
                 }
-            }
+                other => panic!("expected Forall, got {:?}", other),
+            },
             other => panic!("expected TypeAlias, got {:?}", other),
         }
     }
@@ -5629,8 +5733,7 @@ mod tests_generics {
 
     #[test]
     fn constraint_kind_annotation_parses() {
-        match decl_ast!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }")
-        {
+        match decl_ast!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }") {
             Expression::Function { type_params, .. } => {
                 assert_eq!(type_params.len(), 2);
                 assert_eq!(type_params[0].name, "c");
@@ -5728,7 +5831,10 @@ mod tests_generics {
             s.contains("c: * -> Constraint"),
             "expected constraint kind annotation in display, got: {s}"
         );
-        assert!(s.contains("T: c"), "expected abstract bound in display, got: {s}");
+        assert!(
+            s.contains("T: c"),
+            "expected abstract bound in display, got: {s}"
+        );
     }
 
     /// TypeClassImpl Display: `impl Num<int> { … }`
@@ -5780,14 +5886,13 @@ mod tests_generics {
     /// Phase 6: associated type decl + projection parse / Display round-trip.
     #[test]
     fn assoc_type_decl_and_projection_round_trip() {
-        match decl_ast!(
-            "trait Collect<C> { type Elem; fn head(C xs) -> Elem; }"
-        ) {
+        match decl_ast!("trait Collect<C> { type Elem; fn head(C xs) -> Elem; }") {
             Expression::TypeClass { methods, .. } => {
                 assert!(
-                    methods
-                        .iter()
-                        .any(|m| matches!(m.1.as_ref(), Expression::AssocTypeDecl { name: "Elem", .. })),
+                    methods.iter().any(|m| matches!(
+                        m.1.as_ref(),
+                        Expression::AssocTypeDecl { name: "Elem", .. }
+                    )),
                     "expected AssocTypeDecl Elem, got {:?}",
                     methods
                 );
@@ -5829,9 +5934,7 @@ mod tests_generics {
         );
         assert_eq!(format!("{}", proj.1), "Collect::Elem");
 
-        let s = stmt!(
-            "trait Collect<C> { type Elem; fn head(C xs) -> Elem; }"
-        );
+        let s = stmt!("trait Collect<C> { type Elem; fn head(C xs) -> Elem; }");
         assert!(s.contains("type Elem;"), "got: {s}");
         assert!(s.contains("Collect"), "got: {s}");
     }
@@ -5846,10 +5949,7 @@ mod tests_generics {
                 assert!(
                     methods.iter().any(|m| matches!(
                         m.1.as_ref(),
-                        Expression::AssocTypeDef {
-                            name: "Elem",
-                            ..
-                        }
+                        Expression::AssocTypeDef { name: "Elem", .. }
                     )),
                     "expected AssocTypeDef Elem, got {:?}",
                     methods
@@ -5861,12 +5961,13 @@ mod tests_generics {
 
     #[test]
     fn generic_assoc_type_decl_parses() {
-        match decl_ast!(
-            "trait Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }"
-        ) {
+        match decl_ast!("trait Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }") {
             Expression::TypeClass { methods, .. } => {
                 let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
-                    Expression::AssocTypeDecl { name: "Ref", type_params } => Some(type_params),
+                    Expression::AssocTypeDecl {
+                        name: "Ref",
+                        type_params,
+                    } => Some(type_params),
                     _ => None,
                 });
                 let params = assoc.expect("expected Ref associated type declaration");
@@ -5884,9 +5985,11 @@ mod tests_generics {
         ) {
             Expression::TypeClassImpl { methods, .. } => {
                 let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
-                    Expression::AssocTypeDef { name: "Ref", type_params, .. } => {
-                        Some(type_params)
-                    }
+                    Expression::AssocTypeDef {
+                        name: "Ref",
+                        type_params,
+                        ..
+                    } => Some(type_params),
                     _ => None,
                 });
                 let params = assoc.expect("expected Ref associated type definition");
@@ -5982,10 +6085,7 @@ mod tests_generics {
     fn ffi_attr_signature_only_fn_parses() {
         match decl_ast!("#[ffi(lib = \"c\", name = \"strlen\")] fn strlen(string s) -> int;") {
             Expression::Function {
-                attrs,
-                name,
-                body,
-                ..
+                attrs, name, body, ..
             } => {
                 assert_eq!(name, "strlen");
                 assert!(body.is_none());
@@ -5999,7 +6099,9 @@ mod tests_generics {
     #[test]
     fn test_attr_on_fn_parses() {
         match decl_ast!("#[test(\"desc\")] fn foo() { return; }") {
-            Expression::Function { attrs, name, body, .. } => {
+            Expression::Function {
+                attrs, name, body, ..
+            } => {
                 assert_eq!(name, "foo");
                 assert!(body.is_some());
                 assert_eq!(attrs.len(), 1);
@@ -6077,7 +6179,9 @@ mod tests_generics {
     #[test]
     fn call_site_spread_parses() {
         match decl_ast!("fn main() { pair_sum(...(1, 2)); }") {
-            Expression::Function { body: Some(body), .. } => match body.1.as_ref() {
+            Expression::Function {
+                body: Some(body), ..
+            } => match body.1.as_ref() {
                 Expression::Block(items) => {
                     let call = match items[0].1.as_ref() {
                         Expression::Statement(inner) => match inner.1.as_ref() {
@@ -6094,7 +6198,9 @@ mod tests_generics {
                         other => panic!("expected Call, got {:?}", other),
                     };
                     match call.1.as_ref() {
-                        Expression::Call { args: Some(args), .. } => {
+                        Expression::Call {
+                            args: Some(args), ..
+                        } => {
                             assert_eq!(args.len(), 1);
                             assert!(matches!(args[0].1.as_ref(), Expression::Spread(_)));
                         }
@@ -6121,7 +6227,10 @@ mod tests_generics {
 
     #[test]
     fn parse_unclosed_block_fails() {
-        let result = Pratt::default().declaration().parse("fn main() {").into_result();
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() {")
+            .into_result();
         assert!(
             result.is_err(),
             "expected unclosed brace to fail, got {:?}",
@@ -6131,14 +6240,28 @@ mod tests_generics {
 
     #[test]
     fn parse_unclosed_paren_in_call_fails() {
-        let result = Pratt::default().declaration().parse("fn main() { foo(1; }").into_result();
-        assert!(result.is_err(), "expected unclosed call paren to fail, got {:?}", result);
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() { foo(1; }")
+            .into_result();
+        assert!(
+            result.is_err(),
+            "expected unclosed call paren to fail, got {:?}",
+            result
+        );
     }
 
     #[test]
     fn parse_unclosed_string_fails() {
-        let result = Pratt::default().declaration().parse(r#"fn main() { print "hi; }"#).into_result();
-        assert!(result.is_err(), "expected unclosed string to fail, got {:?}", result);
+        let result = Pratt::default()
+            .declaration()
+            .parse(r#"fn main() { write("hi); }"#)
+            .into_result();
+        assert!(
+            result.is_err(),
+            "expected unclosed string to fail, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -6157,7 +6280,10 @@ mod tests_generics {
     #[test]
     fn parse_mod_missing_semicolon_fails() {
         // `mod foo` without `;` / body should not parse as a complete declaration.
-        let result = Pratt::default().declaration().parse("mod foo").into_result();
+        let result = Pratt::default()
+            .declaration()
+            .parse("mod foo")
+            .into_result();
         assert!(
             result.is_err(),
             "expected `mod foo` without terminator to fail, got {:?}",
@@ -6181,10 +6307,20 @@ mod tests_generics {
     #[test]
     fn parse_parenthesized_expr_is_not_one_tuple() {
         // `(1)` must parse as a grouped expression, not a 1-tuple.
-        let result = Pratt::default().declaration().parse("fn main() { let x = (1); }").into_result();
-        assert!(result.is_ok(), "expected `(1)` to parse as group, got {:?}", result);
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() { let x = (1); }")
+            .into_result();
+        assert!(
+            result.is_ok(),
+            "expected `(1)` to parse as group, got {:?}",
+            result
+        );
         let src = result.unwrap().1.to_string();
-        assert!(!src.contains("(1,)"), "group should not render as 1-tuple: {src}");
+        assert!(
+            !src.contains("(1,)"),
+            "group should not render as 1-tuple: {src}"
+        );
     }
 
     #[test]
@@ -6193,7 +6329,11 @@ mod tests_generics {
             .declaration()
             .parse("fn main() { let x = (1,); }")
             .into_result();
-        assert!(result.is_ok(), "expected `(1,)` to parse as 1-tuple, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected `(1,)` to parse as 1-tuple, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -6202,7 +6342,11 @@ mod tests_generics {
             .declaration()
             .parse("fn main() { let x = (1 2); }")
             .into_result();
-        assert!(result.is_err(), "expected `(1 2)` to fail, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected `(1 2)` to fail, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -6211,7 +6355,11 @@ mod tests_generics {
             .declaration()
             .parse("enum E { A B }")
             .into_result();
-        assert!(result.is_err(), "expected missing comma between variants to fail, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected missing comma between variants to fail, got {:?}",
+            result
+        );
     }
 
     /// P3: `return -1;` is a Return of negated int, not `return - 1` subtraction.
@@ -6219,9 +6367,7 @@ mod tests_generics {
     fn return_negative_literal_parses_as_return() {
         fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
             match expr {
-                Expression::Expr(inner) | Expression::Group(inner) => {
-                    unwrap_expr(inner.1.as_ref())
-                }
+                Expression::Expr(inner) | Expression::Group(inner) => unwrap_expr(inner.1.as_ref()),
                 other => other,
             }
         }
@@ -6258,9 +6404,7 @@ mod tests_generics {
     fn return_subtraction_still_parses() {
         fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
             match expr {
-                Expression::Expr(inner) | Expression::Group(inner) => {
-                    unwrap_expr(inner.1.as_ref())
-                }
+                Expression::Expr(inner) | Expression::Group(inner) => unwrap_expr(inner.1.as_ref()),
                 other => other,
             }
         }
@@ -6299,9 +6443,7 @@ mod tests_generics {
     fn yield_negative_literal_parses_as_yield() {
         fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
             match expr {
-                Expression::Expr(inner) | Expression::Group(inner) => {
-                    unwrap_expr(inner.1.as_ref())
-                }
+                Expression::Expr(inner) | Expression::Group(inner) => unwrap_expr(inner.1.as_ref()),
                 other => other,
             }
         }
@@ -6375,9 +6517,7 @@ fn main() {
             )
             .expect("parse failed");
         match find_lambda(ast.1.as_ref()) {
-            Some(Expression::Lambda {
-                captures, body, ..
-            }) => {
+            Some(Expression::Lambda { captures, body, .. }) => {
                 assert_eq!(captures, &["y"]);
                 // Arrow body is an expression tree, not a Block.
                 assert!(
@@ -6402,10 +6542,11 @@ fn main() {
             )
             .expect("parse failed");
         match find_lambda(ast.1.as_ref()) {
-            Some(Expression::Lambda {
-                captures, body, ..
-            }) => {
-                assert!(captures.is_empty(), "expected no captures, got {captures:?}");
+            Some(Expression::Lambda { captures, body, .. }) => {
+                assert!(
+                    captures.is_empty(),
+                    "expected no captures, got {captures:?}"
+                );
                 assert!(
                     matches!(body.1.as_ref(), Expression::Block(_)),
                     "brace body should be Block; got {}",

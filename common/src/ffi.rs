@@ -24,21 +24,8 @@ pub const BUILTIN_FFI_TYPE_ENUM: &str = "FFIType";
 
 /// Built-in `FFIType` variant names in tag order (must match VM decoder).
 pub const BUILTIN_FFI_TYPE_VARIANTS: &[&str] = &[
-    "Int",
-    "Float",
-    "String",
-    "Void",
-    "Bool",
-    "Int8",
-    "Int16",
-    "Int32",
-    "UInt8",
-    "UInt16",
-    "UInt32",
-    "UInt64",
-    "Ptr",
-    "Callback",
-    "Struct",
+    "Int", "Float", "String", "Void", "Bool", "Int8", "Int16", "Int32", "UInt8", "UInt16",
+    "UInt32", "UInt64", "Ptr", "Callback", "Struct",
 ];
 
 /// Map a bare type name (extern blocks, aliases) to a tag.

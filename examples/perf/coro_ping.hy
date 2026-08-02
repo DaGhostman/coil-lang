@@ -1,4 +1,6 @@
 // CPU: coroutine resume/yield traffic.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn ping(int n) {
     let i = 0;
     while (i < n) {
@@ -15,5 +17,5 @@ fn main() {
         acc += resume h;
         i = i + 1;
     }
-    print "%i", acc;
+    write_all(stdout(), to_bytes(format("%i", acc)));
 }

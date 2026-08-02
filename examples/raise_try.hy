@@ -1,4 +1,6 @@
 // raise + ? with inferred Result return.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn parse_pos(int n, int is_neg) {
     if is_neg == 1 {
         raise "neg";
@@ -26,6 +28,6 @@ fn show_e(Result r) -> string {
 }
 
 fn main() {
-    print "%i,", show_i(double_pos(5, 0));
-    print "%s", show_e(double_pos(1, 1));
+    write_all(stdout(), to_bytes(format("%i,", show_i(double_pos(5, 0)))));
+    write_all(stdout(), to_bytes(format("%s", show_e(double_pos(1, 1)))));
 }

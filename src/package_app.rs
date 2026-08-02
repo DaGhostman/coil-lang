@@ -5,31 +5,33 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use common::{
-    append_package_payload, bytecode_uses_ffi, embedded_archive_slice, ffi_library_names_from_bytecode,
-    is_packaged_executable, read_package_trailer, ArchivedArchivedProgram, ArchivedProgram,
-    Byte, ProgramDebug, ARCHIVE_VERSION, PACKAGE_FLAG_USES_FFI,
+    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, PACKAGE_FLAG_USES_FFI,
+    ProgramDebug, append_package_payload, bytecode_uses_ffi, embedded_archive_slice,
+    ffi_library_names_from_bytecode, is_packaged_executable, read_package_trailer,
 };
 use compiler::Pipeline;
 use machine::{check_native_libraries, packaged_app_ffi_startup_check};
 use reporting::ErrorCode;
 use rkyv::rancor::Error;
 
-use crate::{execute_archive, fail_and_exit, LoadErr};
+use crate::{LoadErr, execute_archive, fail_and_exit};
 
 /// Deserialize an `ArchivedProgram` blob (from `.hyc` or an embedded slice).
 pub fn load_archive_bytes(
     buffer: &[u8],
-) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), LoadErr> {
+) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
     let archived =
         rkyv::access::<ArchivedArchivedProgram, Error>(buffer).map_err(|_| LoadErr::Corrupt)?;
     let version = u32::from(archived.version);
     if version != ARCHIVE_VERSION {
         return Err(LoadErr::Version(version));
     }
-    let bytecode = rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode)
-        .map_err(|_| LoadErr::Corrupt)?;
-    let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
-        .map_err(|_| LoadErr::Corrupt)?;
+    let bytecode =
+        rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode).map_err(|_| LoadErr::Corrupt)?;
+    let constants =
+        rkyv::deserialize::<Vec<u64>, Error>(&archived.constants).map_err(|_| LoadErr::Corrupt)?;
+    let strings =
+        rkyv::deserialize::<Vec<String>, Error>(&archived.strings).map_err(|_| LoadErr::Corrupt)?;
     let static_slot_count = u32::from(archived.static_slot_count);
     let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
         .map_err(|_| LoadErr::Corrupt)?;
@@ -38,6 +40,7 @@ pub fn load_archive_bytes(
     Ok((
         bytecode,
         constants,
+        strings,
         static_slot_count,
         ProgramDebug {
             source_files,
@@ -62,6 +65,7 @@ fn compile_program_archive_bytes(
         version: ARCHIVE_VERSION,
         static_slot_count: pipeline.static_slot_count(),
         constants,
+        strings: pipeline.strings().to_vec(),
         bytecode,
         source_files,
         debug_locs,
@@ -73,7 +77,9 @@ fn compile_program_archive_bytes(
 fn resolve_runner_path(runner: Option<&Path>) -> Result<PathBuf, String> {
     match runner {
         Some(p) => Ok(p.to_path_buf()),
-        None => std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}")),
+        None => {
+            std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))
+        }
     }
 }
 
@@ -105,7 +111,7 @@ pub fn try_run_embedded() -> Option<bool> {
         exit(1);
     }
 
-    let (bytecode, constants, static_slots, debug) = match load_archive_bytes(archive) {
+    let (bytecode, constants, strings, static_slots, debug) = match load_archive_bytes(archive) {
         Ok(ok) => ok,
         Err(LoadErr::Version(v)) => {
             eprintln!(
@@ -130,6 +136,7 @@ pub fn try_run_embedded() -> Option<bool> {
         &pipeline,
         &bytecode,
         &constants,
+        &strings,
         static_slots,
         debug,
         Some(entry),
@@ -157,6 +164,8 @@ pub fn cmd_package(
         .expect("freshly serialized archive");
     let bytecode: Vec<Byte> =
         rkyv::deserialize::<Vec<Byte>, Error>(&program.bytecode).expect("bytecode");
+    let strings: Vec<String> =
+        rkyv::deserialize::<Vec<String>, Error>(&program.strings).expect("strings");
     let uses_ffi = bytecode_uses_ffi(&bytecode);
     let mut flags = 0u32;
     if uses_ffi {
@@ -170,9 +179,11 @@ pub fn cmd_package(
         );
     }
 
-    let base_dir = Path::new(filename).parent().filter(|p| !p.as_os_str().is_empty());
+    let base_dir = Path::new(filename)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
     if check_native && uses_ffi {
-        let libs = ffi_library_names_from_bytecode(&bytecode);
+        let libs = ffi_library_names_from_bytecode(&bytecode, &strings);
         if let Err(msg) = check_native_libraries(&libs, base_dir) {
             fail_and_exit(pipeline, ErrorCode::IoError, msg);
         }
@@ -208,12 +219,7 @@ pub fn cmd_package(
         );
     }
 
-    let packaged = append_package_payload(
-        &runner_bytes,
-        &archive_bytes,
-        flags,
-        ARCHIVE_VERSION,
-    );
+    let packaged = append_package_payload(&runner_bytes, &archive_bytes, flags, ARCHIVE_VERSION);
 
     if let Err(e) = fs::write(output, &packaged) {
         fail_and_exit(
@@ -268,6 +274,7 @@ mod tests {
             version: ARCHIVE_VERSION.wrapping_sub(1),
             static_slot_count: 0,
             constants: vec![],
+            strings: vec![],
             bytecode: vec![Byte::new(common::Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![],

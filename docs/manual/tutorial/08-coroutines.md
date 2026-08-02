@@ -7,6 +7,8 @@ coil supports **stackful coroutines** via `async fn`, `yield`, `resume`, and (Ph
 An `async fn` returns a **handle** with type `coroutine<Y>` when it only yields values out, or `coroutine<Y, S>` when it also receives values on resume (`S` defaults to `unit` when unused).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter() {
     yield 0;
     yield 1;
@@ -16,7 +18,7 @@ async fn counter() {
 fn main() {
     let h = counter();
     let v = resume h;
-    print "%i", v;  // 0
+    write_all(stdout(), to_bytes(format("%i", v)));  // 0
 }
 ```
 
@@ -27,6 +29,8 @@ Calling an async function emits `MakeCoro` — it allocates a suspended coroutin
 `resume h` continues the coroutine until the next `yield` or `return`. The yielded (or returned) value becomes the result of the `resume` expression — `resume` has a single static result type covering both.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn two_step() {
     yield 10;
     yield 20;
@@ -38,9 +42,9 @@ fn main() {
     let a = resume h;
     let b = resume h;
     let c = resume h;
-    print "%i", a;  // 10
-    print "%i", b;  // 20
-    print "%i", c;  // 30 (the `return` value)
+    write_all(stdout(), to_bytes(format("%i", a)));  // 10
+    write_all(stdout(), to_bytes(format("%i", b)));  // 20
+    write_all(stdout(), to_bytes(format("%i", c)));  // 30 (the `return` value)
 }
 ```
 
@@ -49,18 +53,22 @@ Resuming an already-**done** coroutine always returns `0` (`Value::default()`) �
 Use `done(h)` to ask whether a handle has completed (returns `bool`):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let h = two_step();
-print "%z", done(h); // false
+write_all(stdout(), to_bytes(format("%z", done(h)))); // false
 resume h;
 resume h;
 resume h;            // completes
-print "%z", done(h); // true
+write_all(stdout(), to_bytes(format("%z", done(h)))); // true
 ```
 
-`resume h` can be used inline anywhere an expression is expected, including directly as a `print` argument:
+`resume h` can be used inline anywhere an expression is expected, including inside `string::format`:
 
 ```coil
-print "%i,", resume h;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+write_all(stdout(), to_bytes(format("%i,", resume h)));
 ```
 
 ## Send and receive (Phase 2)
@@ -82,9 +90,11 @@ The send type `S` in `coroutine<Y, S>` is inferred from binding-yield patterns a
 Example (`examples/coro_send.hy`):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn ping() {
     let msg = yield "ready";
-    print "%s", msg;
+    write_all(stdout(), to_bytes(format("%s", msg)));
 }
 
 fn main() {
@@ -101,6 +111,8 @@ Output: `hello`
 Delegate to another coroutine; values and sends propagate through the delegate chain.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn inner() {
     yield 0;
     yield 1;
@@ -114,8 +126,8 @@ fn main() {
     let h = outer();
     let v0 = resume h;
     let v1 = resume h;
-    print "%i", v0;
-    print "%i", v1;
+    write_all(stdout(), to_bytes(format("%i", v0)));
+    write_all(stdout(), to_bytes(format("%i", v1)));
 }
 ```
 
@@ -126,6 +138,8 @@ Output: `01` (from `examples/coro_yield_from.hy`).
 Two handles are independent — resuming one does not advance the other, even when both handles come from the same (possibly parameterized) `async fn`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter(int base) {
     yield base;
     yield base + 1;
@@ -136,10 +150,10 @@ fn main() {
     let a = counter(1);
     let b = counter(100);
 
-    print "%i,", resume a; // 1
-    print "%i,", resume b; // 100
-    print "%i,", resume a; // 2
-    print "%i", resume b;  // 101
+    write_all(stdout(), to_bytes(format("%i,", resume a))); // 1
+    write_all(stdout(), to_bytes(format("%i,", resume b))); // 100
+    write_all(stdout(), to_bytes(format("%i,", resume a))); // 2
+    write_all(stdout(), to_bytes(format("%i", resume b)));  // 101
 }
 ```
 
@@ -155,6 +169,8 @@ Coroutines participate: the loop resumes until `done`, binding each
 `break` / `continue` work as usual.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter() {
     yield 0;
     yield 1;
@@ -164,7 +180,7 @@ async fn counter() {
 
 fn main() {
     for x in counter() {
-        print "%i", x; // 012
+        write_all(stdout(), to_bytes(format("%i", x))); // 012
     }
 }
 ```

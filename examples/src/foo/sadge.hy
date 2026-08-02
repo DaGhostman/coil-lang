@@ -6,6 +6,8 @@
 // with `::`). Its top-level function `sadge()` has
 // the fully qualified name `foo::sadge::sadge`.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sadge() {
-    print "%x\n", 420;
+    write_all(stdout(), to_bytes(format("%x\n", 420)));
 }

@@ -3,9 +3,7 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{
-    BUILTIN_ENV_ERROR_VARIANTS, BUILTIN_RESULT_VARIANTS, Value,
-};
+use common::{BUILTIN_ENV_ERROR_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
 use crate::io::{alloc_result_err, alloc_result_ok};
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, Object};
@@ -209,11 +207,7 @@ fn try_host_set_cwd(heap: &mut Heap, args: &[Value]) -> Result<(), EnvErrorTag> 
 
 /// Terminates the process (`std::process::exit`). Never returns.
 pub fn host_exit(_heap: &mut Heap, args: &[Value]) -> Value {
-    let code = if args.is_empty() {
-        0
-    } else {
-        args[0].as_int()
-    };
+    let code = if args.is_empty() { 0 } else { args[0].as_int() };
     std::process::exit(code as i32);
 }
 
@@ -384,7 +378,10 @@ mod tests {
         let mut heap = Heap::default();
         let prog = heap.intern("true".into());
         let args = make_string_array(&mut heap, &[]);
-        let r = host_exec(&mut heap, &[Value::from(prog.as_ptr() as *mut u8 as u64), args]);
+        let r = host_exec(
+            &mut heap,
+            &[Value::from(prog.as_ptr() as *mut u8 as u64), args],
+        );
         assert_eq!(result_err_tag(&heap, r), EnvErrorTag::ExecDisabled);
         ALLOW_EXEC.store(prev, Ordering::Relaxed);
     }

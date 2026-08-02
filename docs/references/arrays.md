@@ -15,10 +15,12 @@ len(arr)
 Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let a = [1, 2];
 a[] = 3;
-print "%i", len(a); // 3
-print "%i", a[2];  // 3
+write_all(stdout(), to_bytes(format("%i", len(a)))); // 3
+write_all(stdout(), to_bytes(format("%i", a[2])));  // 3
 ```
 
 ---

@@ -5,6 +5,8 @@
 // returns the applied projection `P::Ref<A>`, pinned by the
 // `Pointer<Option>` instance to `A`.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
@@ -25,5 +27,5 @@ fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
 }
 
 fn main() {
-    print "%i", get(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", get(Option::Some(42)))));
 }

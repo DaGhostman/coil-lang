@@ -1,25 +1,27 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 5;
     x += 3;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 
     let y = 0;
-    print "%i", y++;
-    print "%i", y;
+    write_all(stdout(), to_bytes(format("%i", y++)));
+    write_all(stdout(), to_bytes(format("%i", y)));
 
     let z = 0;
-    print "%i", ++z;
+    write_all(stdout(), to_bytes(format("%i", ++z)));
 
     let arr = [10, 20, 30];
     arr[1] += 5;
-    print "%i", arr[1];
+    write_all(stdout(), to_bytes(format("%i", arr[1])));
 
     let d = { val: 1 };
     d.val += 41;
-    print "%i", d.val;
+    write_all(stdout(), to_bytes(format("%i", d.val)));
 
-    print "%i", 2 ** 3;
-    print "%z", true && false;
-    print "%z", 5 != 4;
-    print "%i", 7 & 3;
+    write_all(stdout(), to_bytes(format("%i", 2 ** 3)));
+    write_all(stdout(), to_bytes(format("%z", true && false)));
+    write_all(stdout(), to_bytes(format("%z", 5 != 4)));
+    write_all(stdout(), to_bytes(format("%i", 7 & 3)));
 }

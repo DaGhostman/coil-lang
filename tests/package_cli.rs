@@ -23,9 +23,7 @@ fn package_fib_embedded_run_prints_55() {
         .expect("spawn coil package");
     assert!(status.success(), "package failed");
 
-    let run = Command::new(&out)
-        .output()
-        .expect("run packaged binary");
+    let run = Command::new(&out).output().expect("run packaged binary");
     assert!(
         run.status.success(),
         "packaged app failed: {}",

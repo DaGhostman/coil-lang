@@ -61,10 +61,7 @@ impl Diagnostic {
                 .filter(|loc| loc.range.start < loc.range.end)
                 .map(|loc| loc.range.clone())
             {
-                diag = diag.with_label(RelatedLabel::new(
-                    Location::new(file, range),
-                    "",
-                ));
+                diag = diag.with_label(RelatedLabel::new(Location::new(file, range), ""));
             }
         }
 

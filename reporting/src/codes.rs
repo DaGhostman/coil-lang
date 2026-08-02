@@ -336,7 +336,11 @@ mod tests {
         let all = all_error_codes();
         let mut seen = std::collections::HashSet::new();
         for c in &all {
-            assert!(seen.insert(c.as_str()), "duplicate code string {}", c.as_str());
+            assert!(
+                seen.insert(c.as_str()),
+                "duplicate code string {}",
+                c.as_str()
+            );
             assert!(c.as_number() > 0, "{} should parse as positive", c.as_str());
             assert_eq!(c.to_string(), c.as_str());
             assert!(!c.description().is_empty());

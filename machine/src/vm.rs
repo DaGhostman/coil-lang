@@ -17,7 +17,7 @@ use common::{
 
 use crate::{
     CStructLayout, CoroState, DebugController, Frame, Heap, Member, ObjArray, ObjBoxed,
-    ObjCoroutine, ObjEnum, ObjInstance, ObjFn, ObjPolyFn, ObjString, ObjTuple, Object,
+    ObjCoroutine, ObjEnum, ObjFn, ObjInstance, ObjPolyFn, ObjString, ObjTuple, Object,
     RefCoroutine, Stack, StopReason,
 };
 use common::ValueTag;
@@ -145,6 +145,7 @@ pub struct Machine<const S: usize> {
     /// Bytecode/constants for nested `call_function` / callbacks.
     program_code: Vec<RawByte>,
     program_constants: Vec<u64>,
+    program_strings: Vec<String>,
     /// When > 0, `RETURN` captures into `nested_return` instead of unwinding to caller.
     nested_depth: u32,
     /// Stack of frame-stack lengths at each active [`call_function`] entry.
@@ -196,6 +197,7 @@ impl<const S: usize> Default for Machine<S> {
             ffi_closures: Vec::new(),
             program_code: Vec::new(),
             program_constants: Vec::new(),
+            program_strings: Vec::new(),
             nested_depth: 0,
             nested_frame_depths: Vec::new(),
             nested_return: None,
@@ -246,8 +248,7 @@ impl<const S: usize> Machine<S> {
         use std::collections::HashMap;
         let mut texts: HashMap<u32, String> = HashMap::new();
         self.pc_lines.clear();
-        self.pc_lines
-            .reserve(self.program_debug.debug_locs.len());
+        self.pc_lines.reserve(self.program_debug.debug_locs.len());
         for loc in &self.program_debug.debug_locs {
             if !loc.is_known() {
                 self.pc_lines.push(None);
@@ -367,6 +368,7 @@ impl<const S: usize> Machine<S> {
         &mut self,
         code: &[Byte],
         constants: &[u64],
+        strings: &[String],
         static_slots: u32,
         start_ip: usize,
     ) -> StopReason {
@@ -381,6 +383,7 @@ impl<const S: usize> Machine<S> {
                 std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
             };
             self.program_constants = constants.to_vec();
+            self.program_strings = strings.to_vec();
             self.sync_thread_program_from_current();
         }
         let mut ip = start_ip;
@@ -411,11 +414,12 @@ impl<const S: usize> Machine<S> {
         &mut self,
         code: &[RawByte],
         constants: &[u64],
+        strings: &[String],
         static_slots: u32,
         start_ip: usize,
     ) -> StopReason {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
-        self.debug_run_until(code, constants, static_slots, start_ip)
+        self.debug_run_until(code, constants, strings, static_slots, start_ip)
     }
 
     fn resolve_source_path(&self, path: &str) -> PathBuf {
@@ -449,10 +453,7 @@ impl<const S: usize> Machine<S> {
         let read_path = self.resolve_source_path(path);
         let text = std::fs::read_to_string(&read_path).ok()?;
         let pos = byte_to_position(&text, loc.start_byte as usize);
-        Some(format!(
-            "{}:{}:{}",
-            path, pos.line, pos.column
-        ))
+        Some(format!("{}:{}:{}", path, pos.line, pos.column))
     }
 
     pub fn with_ffi_paths(mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) -> Self {
@@ -730,6 +731,9 @@ impl<const S: usize> Machine<S> {
     pub fn with_output<W: IoWrite + Send + 'static>(&mut self, writer: W) -> Option<OutputSink> {
         let prev = self.output.take();
         self.output = Some(Box::new(writer));
+        if let Some(out) = self.output.as_mut() {
+            crate::io::set_output_redirect(Some(out.as_mut() as *mut (dyn IoWrite + Send)));
+        }
         prev
     }
 
@@ -737,6 +741,7 @@ impl<const S: usize> Machine<S> {
     /// sink so the caller can recover it (useful in tests that
     /// want to scope the redirection).
     pub fn restore_output(&mut self) -> Option<OutputSink> {
+        crate::io::set_output_redirect(None);
         self.output.take()
     }
 
@@ -775,7 +780,8 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn set_shared_print(&mut self, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-        self.shared_print = Some(buf);
+        self.shared_print = Some(buf.clone());
+        crate::io::set_shared_print_redirect(Some(buf));
     }
 
     pub fn shared_print(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> {
@@ -822,6 +828,7 @@ impl<const S: usize> Machine<S> {
         self.thread_program = Some(std::sync::Arc::new(crate::thread::ThreadProgram {
             code: std::sync::Arc::new(self.program_code.clone()),
             constants: std::sync::Arc::new(self.program_constants.clone()),
+            strings: std::sync::Arc::new(self.program_strings.clone()),
             static_slot_count: self.statics.len() as u32,
             debug: self.program_debug.clone(),
         }));
@@ -992,7 +999,10 @@ impl<const S: usize> Machine<S> {
 
         if push_send_for_receive
             && *ip < code.len()
-            && matches!(code[*ip].bytecode(), Instruction::STORE | Instruction::StorePop)
+            && matches!(
+                code[*ip].bytecode(),
+                Instruction::STORE | Instruction::StorePop
+            )
         {
             self.stack.push(send_val);
         }
@@ -1136,9 +1146,10 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Load bytecode for reentrant [`call_function`] without running `main`.
-    pub fn load_program(&mut self, code: &[RawByte], constants: &[u64]) {
+    pub fn load_program(&mut self, code: &[RawByte], constants: &[u64], strings: &[String]) {
         self.program_code = code.to_vec();
         self.program_constants = constants.to_vec();
+        self.program_strings = strings.to_vec();
         self.panicked = false;
     }
 
@@ -1151,11 +1162,17 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn run(&mut self, code: &[Byte]) {
-        self.run_with_pool(code, &[], 0);
+        self.run_with_pool(code, &[], &[], 0);
     }
 
     /// Run bytecode with an optional constant pool for wide immediates.
-    pub fn run_with_pool(&mut self, code: &[Byte], constants: &[u64], static_slots: u32) {
+    pub fn run_with_pool(
+        &mut self,
+        code: &[Byte],
+        constants: &[u64],
+        strings: &[String],
+        static_slots: u32,
+    ) {
         if code.is_empty() {
             return;
         }
@@ -1164,6 +1181,7 @@ impl<const S: usize> Machine<S> {
             std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
         };
         self.program_constants = constants.to_vec();
+        self.program_strings = strings.to_vec();
         self.sync_thread_program_from_current();
         let mut ip = 0usize;
         loop {
@@ -1335,9 +1353,15 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Run compiler-produced bytecode (archived layout, no `.hyc` round-trip).
-    pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64], static_slots: u32) {
+    pub fn run_raw(
+        &mut self,
+        code: &[RawByte],
+        constants: &[u64],
+        strings: &[String],
+        static_slots: u32,
+    ) {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
-        self.run_with_pool(code, constants, static_slots);
+        self.run_with_pool(code, constants, strings, static_slots);
     }
 
     /// Never-inline: `#[inline(always)]` forced fat LTO to paste this giant
@@ -1598,9 +1622,7 @@ impl<const S: usize> Machine<S> {
                             }
                         }
 
-                        let (obj, _) = self
-                            .heap
-                            .alloc(ObjString::from(message.as_str()), Object::String);
+                        let gc_string = self.heap.intern(message);
 
                         self.alloc_counter += 1;
                         if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
@@ -1612,7 +1634,8 @@ impl<const S: usize> Machine<S> {
                             );
                         }
 
-                        self.stack.push(Value::from(obj.addr()));
+                        self.stack
+                            .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                     }
                 }
                 Instruction::STRINGIFY => {
@@ -1621,9 +1644,7 @@ impl<const S: usize> Machine<S> {
                     // raw immediate (treated as int).
                     let v = self.stack.pop();
                     let text = Self::stringify_value(&self.heap, v);
-                    let (obj, _) = self
-                        .heap
-                        .alloc(ObjString::from(text.as_str()), Object::String);
+                    let gc_string = self.heap.intern(text);
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -1633,7 +1654,8 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(obj.addr()));
+                    self.stack
+                        .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                 }
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
@@ -2224,10 +2246,7 @@ impl<const S: usize> Machine<S> {
                         None => {
                             self.push_result_err(
                                 crate::ffi::FfiErrorKindTag::InvalidHandle,
-                                format!(
-                                    "FFI declare: library at 0x{:x} is not loaded",
-                                    lib_addr
-                                ),
+                                format!("FFI declare: library at 0x{:x} is not loaded", lib_addr),
                             );
                         }
                     }
@@ -2267,10 +2286,7 @@ impl<const S: usize> Machine<S> {
                         #[cfg(not(debug_assertions))]
                         None => {}
                     }
-                    let allocated = self
-                        .heap
-                        .live_object_count()
-                        .saturating_sub(live_before);
+                    let allocated = self.heap.live_object_count().saturating_sub(live_before);
                     if allocated > 0 {
                         self.alloc_counter += allocated;
                         if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
@@ -2310,15 +2326,9 @@ impl<const S: usize> Machine<S> {
                     return false;
                 }
                 Instruction::STRING => {
-                    let length = opcode.operand_u32() as usize;
-                    let mut value: String = String::with_capacity(length);
-
-                    while length != value.len() && ip < code.len() {
-                        let data = &code[ip];
-                        ip += 1;
-                        value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
-                    }
-
+                    let idx = opcode.operand_u32() as usize;
+                    promise!(idx < self.program_strings.len());
+                    let value = unsafe { self.program_strings.get_unchecked(idx) }.clone();
                     let gc_string = self.heap.intern(value);
 
                     self.alloc_counter += 1;
@@ -2396,6 +2406,7 @@ impl<const S: usize> Machine<S> {
                         let (object, _) = self.heap.alloc(obj_array, Object::Array);
                         object.addr()
                     };
+                    self.stack.push(Value::from(addr));
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
@@ -2404,7 +2415,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(addr));
                 }
                 Instruction::Index => {
                     let index_val = self.stack.pop();
@@ -3031,8 +3041,7 @@ impl<const S: usize> Machine<S> {
                         let addr = raw.raw() as u64;
                         if raw.raw().is_null() {
                             (raw.as_int() as usize, Vec::new())
-                        } else if let Some(Object::PolyFn(gc)) =
-                            self.heap.find_object_by_addr(addr)
+                        } else if let Some(Object::PolyFn(gc)) = self.heap.find_object_by_addr(addr)
                         {
                             let pfn = gc.as_ref();
                             (pfn.entry as usize, pfn.captured_dicts.clone())
@@ -3149,11 +3158,7 @@ impl<const S: usize> Machine<S> {
                         "LoadStatic slot {slot} out of bounds (len {})",
                         self.statics.len()
                     );
-                    let val = self
-                        .statics
-                        .get(slot)
-                        .copied()
-                        .unwrap_or_default();
+                    let val = self.statics.get(slot).copied().unwrap_or_default();
                     self.stack.push(val);
                 }
                 Instruction::StoreStatic => {
@@ -3209,7 +3214,9 @@ impl<const S: usize> Machine<S> {
                             Value::default()
                         }
                     } else {
-                        Value::default()
+                        // Already unboxed (e.g. raw enum passed to a Show
+                        // thunk that still emits UnboxValue). Pass through.
+                        v
                     };
                     self.stack.push(result);
                 }
@@ -3242,9 +3249,7 @@ impl<const S: usize> Machine<S> {
                         captured_dicts[slot] = if addr == 0 {
                             // Unresolved evidence — filled at CallIndirect.
                             None
-                        } else if let Some(obj) =
-                            Self::find_object_by_addr(&self.heap, addr)
-                        {
+                        } else if let Some(obj) = Self::find_object_by_addr(&self.heap, addr) {
                             Some(Member::Object(obj))
                         } else {
                             Some(Member::Value(value))
@@ -3283,8 +3288,7 @@ impl<const S: usize> Machine<S> {
                             return match obj {
                                 Object::Boxed(gc) => {
                                     let b = gc.as_ref();
-                                    let tag =
-                                        ValueTag::from_u16(b.tag).unwrap_or(ValueTag::Int);
+                                    let tag = ValueTag::from_u16(b.tag).unwrap_or(ValueTag::Int);
                                     let inner = match &b.payload {
                                         Member::Value(iv) => *iv,
                                         Member::Object(o) => Value::from(o.addr()),
@@ -3324,10 +3328,7 @@ impl<const S: usize> Machine<S> {
                             let sa = Self::object_string_value(&self.heap, &a_inner);
                             let sb = Self::object_string_value(&self.heap, &b_inner);
                             let concat = sa + &sb;
-                            let (obj, _) = self.heap.alloc(
-                                ObjString::from(concat.as_str()),
-                                Object::String,
-                            );
+                            let gc_string = self.heap.intern(concat);
                             self.alloc_counter += 1;
                             if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                                 Self::gc_collect(
@@ -3337,7 +3338,7 @@ impl<const S: usize> Machine<S> {
                                     &mut self.alloc_counter,
                                 );
                             }
-                            Value::from(obj.addr())
+                            Value::from(gc_string.as_ptr() as *mut u8 as u64)
                         }
                         _ => {
                             let ai = a_inner.as_int();
@@ -3347,10 +3348,18 @@ impl<const S: usize> Machine<S> {
                                 Instruction::DynSub => ai.wrapping_sub(bi),
                                 Instruction::DynMul => ai.wrapping_mul(bi),
                                 Instruction::DynDiv => {
-                                    if bi == 0 { 0 } else { ai / bi }
+                                    if bi == 0 {
+                                        0
+                                    } else {
+                                        ai / bi
+                                    }
                                 }
                                 Instruction::DynMod => {
-                                    if bi == 0 { 0 } else { ai % bi }
+                                    if bi == 0 {
+                                        0
+                                    } else {
+                                        ai % bi
+                                    }
                                 }
                                 _ => unreachable!(),
                             };
@@ -3379,10 +3388,10 @@ impl<const S: usize> Machine<S> {
                     let ai = classify_int_dyn(a_val, &self.heap);
                     let bi = classify_int_dyn(b_val, &self.heap);
                     let result = match kind {
-                        0 => ai < bi,   // Le
-                        1 => ai <= bi,  // Leq
-                        2 => ai > bi,   // Gt
-                        3 => ai >= bi,  // Geq
+                        0 => ai < bi,  // Le
+                        1 => ai <= bi, // Leq
+                        2 => ai > bi,  // Gt
+                        3 => ai >= bi, // Geq
                         _ => false,
                     };
                     self.stack.push(Value::from(result));
@@ -3436,7 +3445,7 @@ mod tests {
     };
 
     use super::{dispatch_count, reset_dispatch_count};
-    use crate::{Heap, Machine, ObjEnum};
+    use crate::{Heap, Machine, ObjArray, ObjEnum, Object};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -3552,7 +3561,7 @@ mod tests {
 
         reset_dispatch_count();
         let (code, pool) = fused_fib_bytecode(13);
-        Machine::<512>::default().run_with_pool(&code, &pool, 0);
+        Machine::<512>::default().run_with_pool(&code, &pool, &[], 0);
         let fused_ops = dispatch_count();
 
         // Both forms recurse identically, so the unfused run must
@@ -3631,24 +3640,23 @@ mod tests {
     }
 
     /// Emit a STRING opcode that pushes an interned heap string.
-    fn string_lit(s: &str) -> Vec<Byte> {
-        let mut out = vec![Byte::new(Instruction::STRING).with_operand_u32(s.len() as u32)];
-        for ch in s.chars() {
-            out.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
-        out
+    fn string_lit(strings: &mut Vec<String>, s: &str) -> Vec<Byte> {
+        let idx = strings.len() as u32;
+        strings.push(s.to_string());
+        vec![Byte::new(Instruction::STRING).with_operand_u32(idx)]
     }
 
     #[test]
     fn dict_entries_yields_array_of_key_value_tuples() {
         // MakeDict with {a: 1, b: 2}, then DictEntries → array of pairs.
         let mut code = Vec::new();
+        let mut strings = Vec::new();
         // value, name for field a
         code.push(const_int(1));
-        code.extend(string_lit("a"));
+        code.extend(string_lit(&mut strings, "a"));
         // value, name for field b
         code.push(const_int(2));
-        code.extend(string_lit("b"));
+        code.extend(string_lit(&mut strings, "b"));
         code.push(Byte::new(Instruction::MakeDict).with_operand_u32(2));
         code.push(Byte::new(Instruction::DictEntries));
         code.push(Byte::new(Instruction::DUPLICATE));
@@ -3656,7 +3664,7 @@ mod tests {
         code.push(Byte::new(Instruction::HALT));
 
         let mut vm = Machine::<16>::default();
-        vm.run(&code);
+        vm.run_with_pool(&code, &[], &strings, 0);
         assert_eq!(vm.pop().as_int(), 2, "DictEntries should produce 2 pairs");
 
         // Index 0 → tuple; Index 1 on tuple → value (1 or 2 depending on table order)
@@ -3670,10 +3678,7 @@ mod tests {
             Byte::new(Instruction::HALT),
         ]);
         let v0 = vm.pop().as_int();
-        assert!(
-            v0 == 1 || v0 == 2,
-            "pair value should be 1 or 2, got {v0}"
-        );
+        assert!(v0 == 1 || v0 == 2, "pair value should be 1 or 2, got {v0}");
     }
 
     #[test]
@@ -3739,6 +3744,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &constants,
+            &[],
             0,
         );
         // After the jump, the payload (42) was pushed. Top of
@@ -3786,6 +3792,7 @@ mod tests {
                 // Target for the (non-taken) jump at offset 4.
                 Byte::new(Instruction::HALT),
             ],
+            &[],
             &[],
             0,
         );
@@ -3942,6 +3949,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_float(), 3.5);
@@ -4138,17 +4146,15 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
+        let strings = vec!["boom".to_string()];
         let mut bytecode = Vec::new();
-        // STRING 4 "boom"
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(4));
-        for ch in "boom".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        // STRING table[0] == "boom"
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         bytecode.push(Byte::new(Instruction::Panic));
         // Unreachable if Panic aborts.
         bytecode.push(Byte::new(Instruction::HALT));
 
-        vm.run(&bytecode);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
         assert!(vm.panicked());
         let _ = vm.restore_output();
         let bytes = take_test_output(buf);
@@ -4156,24 +4162,23 @@ mod tests {
         assert_eq!(s, "panic: boom");
     }
 
+    #[test]
     fn with_output_captures_print() {
         let mut vm = Machine::<16>::default();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
         // Build bytecode:
-        //   STRING 5 "hello"
+        //   STRING table[0] == "hello"
         //   PRINT
         //   HALT
+        let strings = vec!["hello".to_string()];
         let mut bytecode: Vec<Byte> = Vec::new();
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(5));
-        for ch in "hello".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         bytecode.push(Byte::new(Instruction::PRINT));
         bytecode.push(Byte::new(Instruction::HALT));
 
-        vm.run(&bytecode);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
 
         // Drop the sink first so the `Rc` we hold is the
         // only one (then we can move the `Vec` out).
@@ -4184,42 +4189,56 @@ mod tests {
         assert_eq!(s, "hello");
     }
 
+    #[test]
+    fn with_output_captures_io_stdout_write_all() {
+        let mut vm = Machine::<16>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let heap = vm.heap_mut();
+        let stdout = crate::io::stream_stdout(heap).expect("stdout stream");
+        let elements = b"hello via io"
+            .iter()
+            .map(|&b| Value::from(b as i64))
+            .collect();
+        let (arr, _) = heap.alloc(ObjArray { elements }, Object::Array);
+        let data = Value::from(arr.addr());
+        crate::io::stream_write_all(heap, stdout, data).expect("write_all stdout");
+
+        let _ = vm.restore_output();
+        let bytes = take_test_output(buf);
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "hello via io");
+    }
+
     /// GetField must return heap-object field values (strings,
     /// nested dicts, …) by address — not the `-1` sentinel used
     /// for missing fields. Pre-P0 returned `-1` for `Member::Object`.
     #[test]
     fn get_field_returns_heap_object_field() {
         let mut vm = Machine::<16>::default();
-        // STRING 2 "hi"  → heap string
-        // STRING 1 "s"   → field name
+        // STRING table[0] == "hi"  → heap string
+        // STRING table[1] == "s"   → field name
         // MakeDict 1     → { s: "hi" }
         // DUPLICATE
         // STRING 1 "s"
         // GetField       → should push the "hi" string address
         // PRINT
         // HALT
+        let strings = vec!["hi".to_string(), "s".to_string()];
         let mut bytecode: Vec<Byte> = Vec::new();
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(2));
-        for ch in "hi".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
-        for ch in "s".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
         bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
         bytecode.push(Byte::new(Instruction::DUPLICATE));
         bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
-        for ch in "s".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
         bytecode.push(Byte::new(Instruction::GetField));
         bytecode.push(Byte::new(Instruction::PRINT));
         bytecode.push(Byte::new(Instruction::HALT));
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
-        vm.run(&bytecode);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
         let _ = vm.restore_output();
         let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
@@ -4376,11 +4395,9 @@ mod tests {
         let mut vm = Machine::<64>::default();
         // STRING "hi" → MakeArray(1) → store slot 0 → allocate 128 enums →
         // load slot 0 → Index 0 → PRINT → HALT
+        let strings = vec!["hi".to_string()];
         let mut code = Vec::new();
-        code.push(Byte::new(Instruction::STRING).with_operand_u32(2));
-        for ch in "hi".chars() {
-            code.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         code.push(Byte::new(Instruction::MakeArray).with_operand_u32(1));
         code.push(store_pop(0));
         for _ in 0..128 {
@@ -4395,7 +4412,7 @@ mod tests {
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
-        vm.run(&code);
+        vm.run_with_pool(&code, &[], &strings, 1);
         let _ = vm.restore_output();
         let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("utf-8");
@@ -4410,11 +4427,9 @@ mod tests {
         let mut vm = Machine::<64>::default();
         // STRING "ok" → MakeTuple(1) → store slot 0 → allocate 128 enums →
         // load slot 0 → Index 0 → PRINT → HALT
+        let strings = vec!["ok".to_string()];
         let mut code = Vec::new();
-        code.push(Byte::new(Instruction::STRING).with_operand_u32(2));
-        for ch in "ok".chars() {
-            code.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         code.push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
         code.push(store_pop(0));
         for _ in 0..128 {
@@ -4429,7 +4444,7 @@ mod tests {
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
-        vm.run(&code);
+        vm.run_with_pool(&code, &[], &strings, 1);
         let _ = vm.restore_output();
         let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("utf-8");
@@ -4465,14 +4480,12 @@ mod tests {
             flushes: Arc::clone(&flushes),
         });
 
+        let strings = vec!["xyz".to_string()];
         let mut bytecode = Vec::new();
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(3));
-        for ch in "xyz".chars() {
-            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
         bytecode.push(Byte::new(Instruction::PRINT));
         bytecode.push(Byte::new(Instruction::HALT));
-        vm.run(&bytecode);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
         let _ = vm.restore_output();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert_eq!(text, "xyz");
@@ -4557,7 +4570,7 @@ mod tests {
         let raw: Vec<RawByte> = unsafe {
             std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
         };
-        vm.load_program(&raw, &[]);
+        vm.load_program(&raw, &[], &[]);
         let out = vm.call_function(0, &[Value::from(39_i64)]);
         assert_eq!(out.as_int(), 42);
         assert!(!vm.panicked());
@@ -4989,6 +5002,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            &[],
             0,
         );
         // 1.5 + 2.5 = 4.0
@@ -5131,6 +5145,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            &[],
             0,
         );
         let s = vm.pop();
@@ -5145,13 +5160,17 @@ mod tests {
     #[test]
     fn stringify_string_copies_contents() {
         let mut vm = Machine::<64>::default();
-        vm.run(&[
-            Byte::new(Instruction::STRING).with_operand_u32(2),
-            Byte::new(Instruction::DATA).with_operand_u32('h' as u32),
-            Byte::new(Instruction::DATA).with_operand_u32('i' as u32),
-            Byte::new(Instruction::STRINGIFY),
-            Byte::new(Instruction::HALT),
-        ]);
+        let strings = vec!["hi".to_string()];
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::STRING).with_operand_u32(0),
+                Byte::new(Instruction::STRINGIFY),
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+            &strings,
+            0,
+        );
         let s = vm.pop();
         let text = Machine::<64>::object_string_value(&vm.heap, &s);
         assert_eq!(text, "hi");
@@ -5208,6 +5227,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[0u64],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 7);
@@ -5224,6 +5244,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[0u64],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 3);
@@ -5270,23 +5291,32 @@ mod tests {
             load(2),
             Byte::new(Instruction::HALT),
         ]);
-        assert_eq!(vm.pop().as_int(), 7, "payload[1] must survive push after UnpackAt");
+        assert_eq!(
+            vm.pop().as_int(),
+            7,
+            "payload[1] must survive push after UnpackAt"
+        );
         assert_eq!(vm.pop().as_int(), 3, "payload[0] at slot 1");
         assert_eq!(vm.pop().as_int(), 99, "sibling at slot 0 preserved");
-        assert_eq!(vm.pop().as_int(), 111, "push must land past unpacked payload");
+        assert_eq!(
+            vm.pop().as_int(),
+            111,
+            "push must land past unpacked payload"
+        );
     }
 
     #[test]
     fn get_field_missing_returns_minus_one() {
         let mut vm = Machine::<16>::default();
         let mut code = Vec::new();
+        let mut strings = Vec::new();
         code.push(const_int(1));
-        code.extend(string_lit("a"));
+        code.extend(string_lit(&mut strings, "a"));
         code.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
-        code.extend(string_lit("missing"));
+        code.extend(string_lit(&mut strings, "missing"));
         code.push(Byte::new(Instruction::GetField));
         code.push(Byte::new(Instruction::HALT));
-        vm.run(&code);
+        vm.run_with_pool(&code, &[], &strings, 0);
         assert_eq!(vm.pop().as_int(), -1);
     }
 
@@ -5343,7 +5373,10 @@ mod tests {
             Byte::new(Instruction::ADD),
             Byte::new(Instruction::RETURN),
         ];
-        assert!(matches!(code[body_entry as usize].bytecode(), Instruction::LOAD));
+        assert!(matches!(
+            code[body_entry as usize].bytecode(),
+            Instruction::LOAD
+        ));
         let mut vm = Machine::<16>::default();
         vm.run(&code);
         assert_eq!(vm.pop().as_int(), 30);
@@ -5420,7 +5453,10 @@ mod tests {
             Byte::new(Instruction::ADD),
             Byte::new(Instruction::RETURN),
         ];
-        assert!(matches!(code[body_entry as usize].bytecode(), Instruction::LOAD));
+        assert!(matches!(
+            code[body_entry as usize].bytecode(),
+            Instruction::LOAD
+        ));
         let mut vm = Machine::<32>::default();
         vm.run(&code);
         assert_eq!(vm.pop().as_int(), 6);
@@ -5442,7 +5478,7 @@ mod tests {
             Byte::new(Instruction::HALT),
         ];
         let mut vm = Machine::<256>::default();
-        vm.run_with_pool(&code, &[], 2);
+        vm.run_with_pool(&code, &[], &[], 2);
     }
 
     /// StoreStatic must write the popped value so a later LoadStatic observes it.
@@ -5455,7 +5491,7 @@ mod tests {
             Byte::new(Instruction::HALT),
         ];
         let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 1);
+        vm.run_with_pool(&code, &[], &[], 1);
         assert_eq!(vm.pop().as_int(), 42);
     }
 
@@ -5527,7 +5563,7 @@ mod tests {
             Byte::new(Instruction::HALT),
         ];
         let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 1);
+        vm.run_with_pool(&code, &[], &[], 1);
         assert_eq!(vm.pop().as_int(), 1);
     }
 
@@ -5541,7 +5577,7 @@ mod tests {
             Byte::new(Instruction::HALT),
         ];
         let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 1);
+        vm.run_with_pool(&code, &[], &[], 1);
     }
 
     #[test]
@@ -5567,6 +5603,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[neg1],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 255);
@@ -5672,6 +5709,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[a, b],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
@@ -5703,6 +5741,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5723,6 +5762,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
@@ -5752,6 +5792,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
@@ -5772,6 +5813,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5794,6 +5836,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 11);
@@ -5814,6 +5857,7 @@ mod tests {
                 load(2),
                 Byte::new(Instruction::RETURN),
             ],
+            &[],
             &[],
             0,
         );
@@ -5836,6 +5880,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[target as u64],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5851,6 +5896,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[4u64],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5902,6 +5948,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
@@ -5922,6 +5969,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5943,6 +5991,7 @@ mod tests {
                 Byte::new(Instruction::RETURN),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
@@ -5969,6 +6018,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[packed],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 11, "dest slot must hold fused result");
@@ -5990,6 +6040,7 @@ mod tests {
                 load(2),
                 Byte::new(Instruction::RETURN),
             ],
+            &[],
             &[],
             0,
         );
@@ -6026,6 +6077,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[5u64],
+            &[],
             0,
         );
         assert_eq!(vm.pop().as_int(), 1);
@@ -6115,8 +6167,8 @@ mod tests {
     fn debug_breakpoint_stops_before_target() {
         use crate::DebugController;
         use crate::StopReason;
-        use common::Instruction as OwnedInsn;
         use common::Byte as OwnedByte;
+        use common::Instruction as OwnedInsn;
 
         // Build owned bytes then transmute like run_raw.
         let owned = vec![
@@ -6133,7 +6185,7 @@ mod tests {
         dbg.add_breakpoint(2); // stop at ADD
         vm.attach_debug(dbg);
 
-        let reason = vm.debug_run_until(code, &[], 0, 0);
+        let reason = vm.debug_run_until(code, &[], &[], 0, 0);
         assert_eq!(reason, StopReason::Breakpoint { pc: 2 });
         assert_eq!(vm.debug_ip(), 2);
 
@@ -6141,7 +6193,7 @@ mod tests {
         if let Some(d) = vm.debug_controller_mut() {
             d.skip_breakpoint_once(2);
         }
-        let reason = vm.debug_run_until(code, &[], 0, 2);
+        let reason = vm.debug_run_until(code, &[], &[], 0, 2);
         assert_eq!(reason, StopReason::Halt);
     }
 
@@ -6149,8 +6201,8 @@ mod tests {
     fn debug_stepi_advances_one_insn() {
         use crate::DebugController;
         use crate::StopReason;
-        use common::Instruction as OwnedInsn;
         use common::Byte as OwnedByte;
+        use common::Instruction as OwnedInsn;
 
         let owned = vec![
             OwnedByte::new(OwnedInsn::CONST).with_const_inline(7),
@@ -6165,7 +6217,7 @@ mod tests {
         if let Some(d) = vm.debug_controller_mut() {
             d.set_stepi();
         }
-        let reason = vm.debug_run_until(code, &[], 0, 0);
+        let reason = vm.debug_run_until(code, &[], &[], 0, 0);
         assert_eq!(reason, StopReason::Step);
         assert_eq!(vm.debug_ip(), 1);
     }

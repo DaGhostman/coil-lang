@@ -2,6 +2,8 @@
 //
 // Output: falsefalsetrue
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn steps() {
     yield 1;
     yield 2;
@@ -9,10 +11,10 @@ async fn steps() {
 
 fn main() {
     let h = steps();
-    print "%z", done(h);
+    write_all(stdout(), to_bytes(format("%z", done(h))));
     resume h;
-    print "%z", done(h);
+    write_all(stdout(), to_bytes(format("%z", done(h))));
     resume h;
     resume h; // completes
-    print "%z", done(h);
+    write_all(stdout(), to_bytes(format("%z", done(h))));
 }

@@ -5,7 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::debug::{DebugLoc, ProgramDebug};
 
 /// Bump when bytecode encoding or `Byte` layout changes incompatibly.
-pub const ARCHIVE_VERSION: u32 = 34;
+pub const ARCHIVE_VERSION: u32 = 35;
 
 /// Serialized program with constant pool and bytecode.
 #[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -17,6 +17,8 @@ pub struct ArchivedProgram {
     /// Wide immediates (floats, large ints, jump targets, …).
     /// Referenced from `Byte.operands` via pool index or `Byte::POOL_FLAG`.
     pub constants: Vec<u64>,
+    /// Interned program string literals. `STRING` operands index this table.
+    pub strings: Vec<String>,
     pub bytecode: Vec<Byte>,
     /// Paths in stable order (project-relative when compiled from disk).
     pub source_files: Vec<String>,
@@ -45,7 +47,11 @@ mod tests {
     #[test]
     fn byte_layout_is_eight_bytes() {
         use std::mem::{align_of, size_of};
-        assert_eq!(size_of::<Byte>(), 8, "Byte must be 8 bytes for archive layout");
+        assert_eq!(
+            size_of::<Byte>(),
+            8,
+            "Byte must be 8 bytes for archive layout"
+        );
         assert_eq!(align_of::<Byte>(), 4);
         assert_eq!(size_of::<Instruction>(), 1);
     }
@@ -56,8 +62,10 @@ mod tests {
             version: ARCHIVE_VERSION,
             static_slot_count: 0,
             constants: vec![1.5f64.to_bits(), 42],
+            strings: vec!["hi".into()],
             bytecode: vec![
                 Byte::new(Instruction::CONST).with_const_inline(7),
+                Byte::new(Instruction::STRING).with_operand_u32(0),
                 Byte::new(Instruction::HALT),
             ],
             source_files: vec!["main.hy".into()],
@@ -68,11 +76,12 @@ mod tests {
                     end_byte: 4,
                 },
                 DebugLoc::unknown(),
+                DebugLoc::unknown(),
             ],
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
-        let archived = rkyv::access::<ArchivedArchivedProgram, Error>(bytes.as_slice())
-            .expect("access");
+        let archived =
+            rkyv::access::<ArchivedArchivedProgram, Error>(bytes.as_slice()).expect("access");
         assert_eq!(u32::from(archived.version), ARCHIVE_VERSION);
         let back: ArchivedProgram =
             rkyv::deserialize::<ArchivedProgram, Error>(archived).expect("deserialize");

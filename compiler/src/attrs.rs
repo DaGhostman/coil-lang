@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet};
 use parser::{
     SimpleSpan,
     ast::{
-        AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
-        ExternStructDecl, Expression, LetPattern, MatchArm, Output, Pattern, PatternField, PatternPayload,
-        RecordFieldDecl, RecordFieldValue, Visibility,
+        AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload, Expression,
+        ExternFunction, ExternStructDecl, LetPattern, MatchArm, Output, Pattern, PatternField,
+        PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
     },
 };
 use reporting::{ErrorCode, Message};
@@ -304,7 +304,10 @@ fn user_attrs_on<'a>(
     attrs: &'a [Attribute<'a>],
     user_attrs: &HashSet<String>,
 ) -> Vec<&'a Attribute<'a>> {
-    attrs.iter().filter(|a| is_user_attr(a, user_attrs)).collect()
+    attrs
+        .iter()
+        .filter(|a| is_user_attr(a, user_attrs))
+        .collect()
 }
 
 fn strip_user_attrs(attrs: &mut Vec<Attribute<'_>>, user_attrs: &HashSet<String>) {
@@ -387,11 +390,7 @@ fn resolve_attr_extras<'a>(
             }
         }
     }
-    if missing {
-        None
-    } else {
-        Some(out)
-    }
+    if missing { None } else { Some(out) }
 }
 
 fn collect_attr_function_bodies<'a>(decls: &[Output<'a>]) -> HashMap<String, Output<'a>> {
@@ -436,7 +435,10 @@ fn decoratee_param_names<'a>(decoratee_args: &Output<'a>) -> HashSet<&'static st
 
 /// Free identifiers in `expr` that must be captured by a lambda wrapping
 /// `decoratee_args` parameters (e.g. implicit `self` on methods).
-fn collect_lambda_captures<'a>(expr: &Output<'a>, decoratee_args: &Output<'a>) -> Vec<&'static str> {
+fn collect_lambda_captures<'a>(
+    expr: &Output<'a>,
+    decoratee_args: &Output<'a>,
+) -> Vec<&'static str> {
     let mut bound = decoratee_param_names(decoratee_args);
     let mut free = HashSet::new();
     collect_free_idents(expr, &mut bound, &mut free);
@@ -464,7 +466,11 @@ fn collect_free_idents<'a>(
                 free.insert((*name).to_string());
             }
         }
-        Expression::Lambda { args, captures, body } => {
+        Expression::Lambda {
+            args,
+            captures,
+            body,
+        } => {
             let mut inner_bound = bound.clone();
             for cap in captures {
                 inner_bound.insert(leak((*cap).to_string()));
@@ -536,7 +542,12 @@ fn collect_free_idents<'a>(
                 collect_free_idents(&arm.body, bound, free);
             }
         }
-        Expression::For { init, cond, step, body } => {
+        Expression::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
             if let Some(i) = init {
                 collect_free_idents(i, bound, free);
             }
@@ -546,7 +557,11 @@ fn collect_free_idents<'a>(
             }
             collect_free_idents(body, bound, free);
         }
-        Expression::Loop { identifier, iterable, body } => {
+        Expression::Loop {
+            identifier,
+            iterable,
+            body,
+        } => {
             if let Some(id) = identifier {
                 collect_free_idents(id, bound, free);
             }
@@ -622,14 +637,6 @@ fn collect_free_idents<'a>(
             collect_free_idents(start, bound, free);
             collect_free_idents(end, bound, free);
         }
-        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-            collect_free_idents(fmt, bound, free);
-            if let Some(items) = params {
-                for p in items {
-                    collect_free_idents(p, bound, free);
-                }
-            }
-        }
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {
                 collect_free_idents(c, bound, free);
@@ -687,7 +694,10 @@ fn collect_free_idents<'a>(
             }
         }
         Expression::TypeFun(lhs, rhs)
-        | Expression::TypeFnSig { params: lhs, ret: rhs } => {
+        | Expression::TypeFnSig {
+            params: lhs,
+            ret: rhs,
+        } => {
             collect_free_idents(lhs, bound, free);
             collect_free_idents(rhs, bound, free);
         }
@@ -696,7 +706,12 @@ fn collect_free_idents<'a>(
                 collect_free_idents(t, bound, free);
             }
         }
-        Expression::AttrDecl { args, returns, body, .. } => {
+        Expression::AttrDecl {
+            args,
+            returns,
+            body,
+            ..
+        } => {
             collect_free_idents(args, bound, free);
             if let Some(r) = returns {
                 collect_free_idents(r, bound, free);
@@ -708,12 +723,7 @@ fn collect_free_idents<'a>(
         }
         Expression::Forall { ty, .. } => collect_free_idents(ty, bound, free),
         Expression::Module(_, child) => collect_free_idents(child, bound, free),
-        Expression::Field {
-            ty,
-            name,
-            init,
-            ..
-        } => {
+        Expression::Field { ty, name, init, .. } => {
             collect_free_idents(ty, bound, free);
             collect_free_idents(name, bound, free);
             if let Some(init) = init {
@@ -733,8 +743,7 @@ fn collect_free_idents<'a>(
                 collect_free_idents(item, bound, free);
             }
         }
-        Expression::Implementation { methods, .. }
-        | Expression::TypeClass { methods, .. } => {
+        Expression::Implementation { methods, .. } | Expression::TypeClass { methods, .. } => {
             for m in methods {
                 collect_free_idents(m, bound, free);
             }
@@ -957,14 +966,13 @@ fn rewrite_expr_inline<'a>(
                 span,
                 Expression::Call {
                     name: rw(name),
-                    args: args.as_ref().map(|items| rewrite_outputs(items, target, subs, decoratee_args)),
+                    args: args
+                        .as_ref()
+                        .map(|items| rewrite_outputs(items, target, subs, decoratee_args)),
                 },
             )
         }
-        Expression::Identifier(name) => subs
-            .get(*name)
-            .cloned()
-            .unwrap_or_else(|| expr.clone()),
+        Expression::Identifier(name) => subs.get(*name).cloned().unwrap_or_else(|| expr.clone()),
 
         // Literals and leaves with no nested expressions.
         Expression::Integer(_)
@@ -1008,18 +1016,14 @@ fn rewrite_expr_inline<'a>(
 
         Expression::Resume(handle, send) => at(
             span,
-            Expression::Resume(
-                rw(handle),
-                send.as_ref().map(|s| rw(s)),
-            ),
+            Expression::Resume(rw(handle), send.as_ref().map(|s| rw(s))),
         ),
         Expression::OptionalAccess(receiver, field) => {
             at(span, Expression::OptionalAccess(rw(receiver), *field))
         }
-        Expression::CompoundAssign(lhs, op, rhs) => at(
-            span,
-            Expression::CompoundAssign(rw(lhs), *op, rw(rhs)),
-        ),
+        Expression::CompoundAssign(lhs, op, rhs) => {
+            at(span, Expression::CompoundAssign(rw(lhs), *op, rw(rhs)))
+        }
         Expression::Adjust {
             op,
             prefix,
@@ -1065,24 +1069,11 @@ fn rewrite_expr_inline<'a>(
                 inclusive: *inclusive,
             },
         ),
-        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-            let params = params
-                .as_ref()
-                .map(|items| rewrite_outputs(items, target, subs, decoratee_args));
-            match expr.1.as_ref() {
-                Expression::Print(..) => at(span, Expression::Print(rw(fmt), params)),
-                Expression::Format(..) => at(span, Expression::Format(rw(fmt), params)),
-                _ => unreachable!(),
-            }
-        }
         Expression::Assignment(lhs, rhs) => at(span, Expression::Assignment(rw(lhs), rw(rhs))),
         Expression::Access(receiver, field) => at(span, Expression::Access(rw(receiver), *field)),
         Expression::Index(receiver, index) => at(
             span,
-            Expression::Index(
-                rw(receiver),
-                index.as_ref().map(|idx| rw(idx)),
-            ),
+            Expression::Index(rw(receiver), index.as_ref().map(|idx| rw(idx))),
         ),
         Expression::NamedArg(name, value) => at(span, Expression::NamedArg(*name, rw(value))),
         Expression::Branch(cond, body) => at(
@@ -1101,10 +1092,13 @@ fn rewrite_expr_inline<'a>(
                     body: rw(&arm.body),
                 })
                 .collect();
-            at(span, Expression::Match {
-                scrutinee: rw(scrutinee),
-                arms,
-            })
+            at(
+                span,
+                Expression::Match {
+                    scrutinee: rw(scrutinee),
+                    arms,
+                },
+            )
         }
         Expression::For {
             init,
@@ -1137,9 +1131,13 @@ fn rewrite_expr_inline<'a>(
         | Expression::Tuple(items)
         | Expression::Fragment(items)
         | Expression::Declare(items)
-        | Expression::Invoke(items) => {
-            at(span, clone_expr_list(expr.1.as_ref(), rewrite_outputs(items, target, subs, decoratee_args)))
-        }
+        | Expression::Invoke(items) => at(
+            span,
+            clone_expr_list(
+                expr.1.as_ref(),
+                rewrite_outputs(items, target, subs, decoratee_args),
+            ),
+        ),
         Expression::Block(items) => {
             let items = items
                 .iter()
@@ -1147,9 +1145,10 @@ fn rewrite_expr_inline<'a>(
                 .collect();
             at(span, Expression::Block(items))
         }
-        Expression::Program(items) => {
-            at(span, Expression::Program(rewrite_outputs(items, target, subs, decoratee_args)))
-        }
+        Expression::Program(items) => at(
+            span,
+            Expression::Program(rewrite_outputs(items, target, subs, decoratee_args)),
+        ),
         Expression::Dict(fields) => {
             let fields = fields
                 .iter()
@@ -1577,28 +1576,14 @@ fn expand_function_user_attrs<'a>(
     for attr in user_attrs_copy.iter().rev() {
         let extra_params: Vec<(&'static str, Option<Output<'a>>)> = attr_extra_names
             .get(attr.name)
-            .map(|names| {
-                names
-                    .iter()
-                    .map(|n| (leak(n.clone()), None))
-                    .collect()
-            })
+            .map(|names| names.iter().map(|n| (leak(n.clone()), None)).collect())
             .unwrap_or_default();
-        let extra_names = attr_extra_names
-            .get(attr.name)
-            .cloned()
-            .unwrap_or_default();
+        let extra_names = attr_extra_names.get(attr.name).cloned().unwrap_or_default();
         let Some(extras) = resolve_attr_extras(attr, &extra_params, span, messages) else {
             continue;
         };
         if let Some(attr_body) = find_attr_function_body(attr_bodies, attr.name) {
-            wrapped = inline_attr_body(
-                &attr_body,
-                wrapped,
-                &extras,
-                &extra_names,
-                args,
-            );
+            wrapped = inline_attr_body(&attr_body, wrapped, &extras, &extra_names, args);
         } else {
             let inner = at(
                 span,
@@ -1727,7 +1712,14 @@ fn expand_decls<'a>(
         } = decls[i].1.as_mut()
         {
             let is_ffi_sig = body.is_none();
-            validate_attrs(attrs, "function", user_attrs, &mut messages, span, is_ffi_sig);
+            validate_attrs(
+                attrs,
+                "function",
+                user_attrs,
+                &mut messages,
+                span,
+                is_ffi_sig,
+            );
             if body.is_some() {
                 if *is_coro && !user_attrs_on(attrs, user_attrs).is_empty() {
                     messages.push(Message::error(
@@ -1768,11 +1760,7 @@ fn expand_decls<'a>(
                         let c_sym = ffi.symbol.unwrap_or(zs_name);
                         let extern_fn = ExternFunction {
                             name: zs_name,
-                            symbol: if c_sym != zs_name {
-                                Some(c_sym)
-                            } else {
-                                None
-                            },
+                            symbol: if c_sym != zs_name { Some(c_sym) } else { None },
                             args: args.clone(),
                             returns: returns.clone(),
                             variadic: ffi.variadic,
@@ -1803,10 +1791,7 @@ fn expand_decls<'a>(
             for method in methods.iter_mut() {
                 if let Expression::Method(_, func_out) = method.1.as_mut() {
                     if let Expression::Function {
-                        attrs,
-                        args,
-                        body,
-                        ..
+                        attrs, args, body, ..
                     } = func_out.1.as_mut()
                     {
                         validate_attrs(attrs, "function", user_attrs, &mut messages, span, false);
@@ -2083,13 +2068,13 @@ fn check_derivable(trait_name: &str, span: SimpleSpan) -> Option<Message> {
     } else {
         let mut msg = Message::error(
             ErrorCode::GenericTypeError,
-            format!("Cannot derive unknown or non-derivable trait `{}`", trait_name),
+            format!(
+                "Cannot derive unknown or non-derivable trait `{}`",
+                trait_name
+            ),
             span.into_range(),
         );
-        msg.with_help(format!(
-            "derivable traits are: {}",
-            DERIVABLE.join(", ")
-        ));
+        msg.with_help(format!("derivable traits are: {}", DERIVABLE.join(", ")));
         Some(msg)
     }
 }
@@ -2098,7 +2083,9 @@ fn class_field_names<'a>(fields: &[Output<'a>]) -> Vec<&'a str> {
     fields
         .iter()
         .filter_map(|f| match f.1.as_ref() {
-            Expression::Field { name: name_expr, .. } => match name_expr.1.as_ref() {
+            Expression::Field {
+                name: name_expr, ..
+            } => match name_expr.1.as_ref() {
                 Expression::Identifier(n) => Some(*n),
                 _ => None,
             },
@@ -2131,9 +2118,9 @@ fn clone_attr_args_static(args: &AttrArgs<'_>) -> AttrArgs<'static> {
                 .map(|(k, lit)| (leak(k.to_string()), clone_attr_lit_static(lit)))
                 .collect(),
         ),
-        AttrArgs::Positional(lits) => AttrArgs::Positional(
-            lits.iter().map(clone_attr_lit_static).collect(),
-        ),
+        AttrArgs::Positional(lits) => {
+            AttrArgs::Positional(lits.iter().map(clone_attr_lit_static).collect())
+        }
         AttrArgs::String(s) => AttrArgs::String(leak(s.to_string())),
     }
 }
@@ -2169,11 +2156,7 @@ fn ty_name<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
 
 /// Parse `int` / `string` or dynamic `[elem]` (not `Type("[byte]")`, which is invalid).
 fn ty_ret<'a>(span: SimpleSpan, ret: &'a str) -> Output<'a> {
-    if ret.len() >= 2
-        && ret.starts_with('[')
-        && ret.ends_with(']')
-        && !ret.contains(';')
-    {
+    if ret.len() >= 2 && ret.starts_with('[') && ret.ends_with(']') && !ret.contains(';') {
         let elem = &ret[1..ret.len() - 1];
         return at(span, Expression::Array(vec![ty_name(span, elem)]));
     }
@@ -2188,6 +2171,25 @@ fn str_lit<'a>(span: SimpleSpan, s: &'a str) -> Output<'a> {
     at(span, Expression::String(s))
 }
 
+fn string_format_call<'a>(span: SimpleSpan, fmt: &'a str, fmt_args: Vec<Output<'a>>) -> Output<'a> {
+    let mut args = Vec::with_capacity(fmt_args.len() + 1);
+    args.push(str_lit(span, fmt));
+    args.extend(fmt_args);
+    at(
+        span,
+        Expression::Call {
+            name: at(
+                span,
+                Expression::QualifiedAccess {
+                    owner: "string",
+                    member: "format",
+                },
+            ),
+            args: Some(args),
+        },
+    )
+}
+
 fn stmt<'a>(span: SimpleSpan, inner: Output<'a>) -> Output<'a> {
     at(span, Expression::Statement(inner))
 }
@@ -2195,10 +2197,7 @@ fn stmt<'a>(span: SimpleSpan, inner: Output<'a>) -> Output<'a> {
 fn block_return<'a>(span: SimpleSpan, value: Output<'a>) -> Output<'a> {
     at(
         span,
-        Expression::Block(vec![stmt(
-            span,
-            at(span, Expression::Return(value)),
-        )]),
+        Expression::Block(vec![stmt(span, at(span, Expression::Return(value)))]),
     )
 }
 
@@ -2262,10 +2261,7 @@ fn synth_show_enum<'a>(
     let mut arms = Vec::new();
     for v in variants {
         let (pattern, fmt, fmt_args) = show_variant_arm(span, enum_name, v.name, &v.shape, p);
-        let body = at(
-            span,
-            Expression::Format(str_lit(span, fmt), Some(fmt_args)),
-        );
+        let body = string_format_call(span, fmt, fmt_args);
         arms.push(MatchArm { pattern, body });
     }
     let match_expr = at(
@@ -2312,12 +2308,7 @@ fn show_variant_arm<'a>(
                 fmt_args.push(at(span, Expression::Access(ident(span, recv), fname)));
                 specs.push("%v");
             }
-            let fmt = leak(format!(
-                "{}::{}({})",
-                enum_name,
-                vname,
-                specs.join(", ")
-            ));
+            let fmt = leak(format!("{}::{}({})", enum_name, vname, specs.join(", ")));
             (
                 Pattern::Constructor {
                     enum_name,
@@ -2577,7 +2568,12 @@ fn synth_ord_enum<'a>(
         let a = leak(format!("__ord_{}_a_{}", op.name(), enum_name));
         let b = leak(format!("__ord_{}_b_{}", op.name(), enum_name));
         let method = ord_method(span, enum_name, variants, a, b, op);
-        out.push(typeclass_impl(span, op.trait_name(), enum_name, vec![method]));
+        out.push(typeclass_impl(
+            span,
+            op.trait_name(),
+            enum_name,
+            vec![method],
+        ));
     }
     out.push(typeclass_impl(span, "Ord", enum_name, vec![]));
     out
@@ -2800,10 +2796,7 @@ fn synth_show_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> 
         fmt_args.push(at(span, Expression::Access(ident(span, p), f)));
     }
     let fmt = leak(format!("{} {{ {} }}", name, specs.join(", ")));
-    let format = at(
-        span,
-        Expression::Format(str_lit(span, fmt), Some(fmt_args)),
-    );
+    let format = string_format_call(span, fmt, fmt_args);
     let show_m = method_fn(
         span,
         "show",
@@ -2985,10 +2978,7 @@ fn synth_default_enum<'a>(
 
 fn synth_default_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
     let args: Vec<Output<'a>> = fields.iter().map(|_| int_zero(span)).collect();
-    let value = at(
-        span,
-        Expression::Instantiate(ident(span, name), Some(args)),
-    );
+    let value = at(span, Expression::Instantiate(ident(span, name), Some(args)));
     let m = method_fn(span, "default", vec![], name, block_return(span, value));
     typeclass_impl(span, "Default", name, vec![m])
 }
@@ -3080,10 +3070,7 @@ fn synth_string_enum<'a>(
     let mut arms = Vec::new();
     for v in variants {
         let (pattern, fmt, fmt_args) = show_variant_arm(span, enum_name, v.name, &v.shape, p);
-        let body = at(
-            span,
-            Expression::Format(str_lit(span, fmt), Some(fmt_args)),
-        );
+        let body = string_format_call(span, fmt, fmt_args);
         arms.push(MatchArm { pattern, body });
     }
     let match_expr = at(
@@ -3112,10 +3099,7 @@ fn synth_string_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -
         fmt_args.push(at(span, Expression::Access(ident(span, p), f)));
     }
     let fmt = leak(format!("{name} {{ {} }}", specs.join(", ")));
-    let format = at(
-        span,
-        Expression::Format(str_lit(span, fmt), Some(fmt_args)),
-    );
+    let format = string_format_call(span, fmt, fmt_args);
     let m = method_fn(
         span,
         "to_string",
@@ -3274,10 +3258,7 @@ fn synth_deserialize_enum<'a>(
 ) -> Output<'a> {
     let data = leak(format!("__de_{enum_name}"));
     let panic_msg = leak(format!("deserialize: invalid tag for `{enum_name}`"));
-    let err_body = at(
-        span,
-        Expression::Panic(str_lit(span, panic_msg)),
-    );
+    let err_body = at(span, Expression::Panic(str_lit(span, panic_msg)));
     let mut branches: Vec<Output<'a>> = variants
         .iter()
         .enumerate()
@@ -3327,10 +3308,7 @@ fn synth_deserialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a st
         .enumerate()
         .map(|(i, _)| as_int(span, data_at(span, &ident(span, data), i)))
         .collect();
-    let value = at(
-        span,
-        Expression::Instantiate(ident(span, name), Some(args)),
-    );
+    let value = at(span, Expression::Instantiate(ident(span, name), Some(args)));
     let m = method_fn(
         span,
         "deserialize",
@@ -3359,9 +3337,7 @@ mod tests {
         let mut names = Vec::new();
         for node in decls {
             if let Expression::TypeClassImpl {
-                class: c,
-                methods,
-                ..
+                class: c, methods, ..
             } = node.1.as_ref()
             {
                 if *c != class {
@@ -3399,9 +3375,8 @@ mod tests {
 
     #[test]
     fn derive_hash_emits_recursive_field_hash_calls() {
-        let (_exp, decls) = expand_src(
-            "#[derive(Hash)] enum E { A(int), B { s: string } } fn main() {}",
-        );
+        let (_exp, decls) =
+            expand_src("#[derive(Hash)] enum E { A(int), B { s: string } } fn main() {}");
         let hash_impl = decls.iter().find(|n| {
             matches!(
                 n.1.as_ref(),
@@ -3418,8 +3393,7 @@ mod tests {
 
     #[test]
     fn derive_deserialize_emits_deserialize_method() {
-        let (_exp, decls) =
-            expand_src("#[derive(Deserialize)] enum E { A, B(int) } fn main() {}");
+        let (_exp, decls) = expand_src("#[derive(Deserialize)] enum E { A, B(int) } fn main() {}");
         assert!(
             impl_method_names(&decls, "Deserialize").contains(&"deserialize".to_string()),
             "expected Deserialize::deserialize impl"
@@ -3441,8 +3415,7 @@ mod tests {
 
     #[test]
     fn derive_serialize_class_emits_serialize_method() {
-        let (_exp, decls) =
-            expand_src("#[derive(Serialize)] class P { x: int } fn main() {}");
+        let (_exp, decls) = expand_src("#[derive(Serialize)] class P { x: int } fn main() {}");
         assert!(
             impl_method_names(&decls, "Serialize").contains(&"serialize".to_string()),
             "expected Serialize::serialize on class"

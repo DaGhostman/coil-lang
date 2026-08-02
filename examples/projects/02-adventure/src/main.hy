@@ -12,6 +12,7 @@ use io::*;
 use world::*;
 use commands::*;
 use save::*;
+use string::*;
 
 fn save_player(string path, int room, int has_key) {
     let payload = encode_save(room, has_key);
@@ -30,23 +31,23 @@ fn load_player(string path) {
 
 fn print_look(Player p) {
     let room = player_room(p);
-    print "You are in the ";
-    print "%s", room_title(room);
-    print ". Exits: ";
-    print "%s", room_exits(room);
-    print ". ";
+    write_all(stdout(), to_bytes("You are in the "));
+    write_all(stdout(), to_bytes(format("%s", room_title(room))));
+    write_all(stdout(), to_bytes(". Exits: "));
+    write_all(stdout(), to_bytes(format("%s", room_exits(room))));
+    write_all(stdout(), to_bytes(". "));
     if key_here(p) == 1 {
-        print "A brass key glints on a shelf. ";
+        write_all(stdout(), to_bytes("A brass key glints on a shelf. "));
     }
     if player_has_key(p) == 1 {
         if room == 2 {
-            print "The garden gate unlocks - you win! ";
+            write_all(stdout(), to_bytes("The garden gate unlocks - you win! "));
         }
     }
 }
 
 fn print_help() {
-    print "Commands: look, go north/south/east/west, take [key], inventory, save, load, help, quit";
+    write_all(stdout(), to_bytes("Commands: look, go north/south/east/west, take [key], inventory, save, load, help, quit"));
 }
 
 fn handle_line(Player p, [byte] line, string save_path) -> int {
@@ -58,40 +59,40 @@ fn handle_line(Player p, [byte] line, string save_path) -> int {
 
     if k == 0 {
         print_look(p);
-        print " ";
+        write_all(stdout(), to_bytes(" "));
     }
     if k == 1 {
         let d = cmd_dir(c);
         if move_ok(p, d) == 1 {
             try_move(p, d);
-            print "OK. ";
+            write_all(stdout(), to_bytes("OK. "));
             print_look(p);
-            print " ";
+            write_all(stdout(), to_bytes(" "));
         } else {
-            print "You cannot go that way. ";
+            write_all(stdout(), to_bytes("You cannot go that way. "));
         }
     }
     if k == 2 {
         if key_here(p) == 1 {
             try_take_key(p);
-            print "Taken: brass key. ";
+            write_all(stdout(), to_bytes("Taken: brass key. "));
         } else {
-            print "Nothing to take. ";
+            write_all(stdout(), to_bytes("Nothing to take. "));
         }
     }
     if k == 3 {
         if player_has_key(p) == 1 {
-            print "Inventory: brass key. ";
+            write_all(stdout(), to_bytes("Inventory: brass key. "));
         } else {
-            print "Inventory: (empty). ";
+            write_all(stdout(), to_bytes("Inventory: (empty). "));
         }
     }
     if k == 4 {
         let r = save_player(save_path, player_room(p), player_has_key(p));
-        print "%s", match r {
+        write_all(stdout(), to_bytes(format("%s", match r {
             Result::Ok(_) => "Saved. ",
             Result::Err(_) => "Save failed. ",
-        };
+        })));
     }
     if k == 5 {
         let r = load_player(save_path);
@@ -106,36 +107,36 @@ fn handle_line(Player p, [byte] line, string save_path) -> int {
             };
             p.room = data.room;
             p.has_key = data.has_key;
-            print "Loaded. ";
+            write_all(stdout(), to_bytes("Loaded. "));
             print_look(p);
-            print " ";
+            write_all(stdout(), to_bytes(" "));
         } else {
-            print "Load failed. ";
+            write_all(stdout(), to_bytes("Load failed. "));
         }
     }
     if k == 6 {
         print_help();
-        print " ";
+        write_all(stdout(), to_bytes(" "));
     }
     if k == 7 {
-        print "Bye.";
+        write_all(stdout(), to_bytes("Bye."));
         return 0;
     }
     if k == 8 {
-        print "Unknown command. Type help. ";
+        write_all(stdout(), to_bytes("Unknown command. Type help. "));
     }
     return 1;
 }
 
 fn main() {
-    print "=== Tiny Adventure === ";
-    print "Type help for commands (end input with Ctrl+D / EOF). ";
+    write_all(stdout(), to_bytes("=== Tiny Adventure === "));
+    write_all(stdout(), to_bytes("Type help for commands (end input with Ctrl+D / EOF). "));
     print_help();
-    print " ";
+    write_all(stdout(), to_bytes(" "));
 
     let p = new_player();
     print_look(p);
-    print " ";
+    write_all(stdout(), to_bytes(" "));
 
     let save_path = "/tmp/coil_adventure_save.dat";
     let z: byte = 0;
@@ -152,7 +153,7 @@ fn main() {
     let running = 1;
     while running == 1 {
         if i >= len(raw) {
-            print "Bye.";
+            write_all(stdout(), to_bytes("Bye."));
             running = 0;
         }
         if running == 1 {
@@ -175,7 +176,7 @@ fn main() {
                     }
                 }
             }
-            print "> ";
+            write_all(stdout(), to_bytes("> "));
             if len(line) > 1 {
                 let out: [byte] = [line[1]];
                 let j = 2;

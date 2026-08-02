@@ -219,7 +219,9 @@ fn main() {
         msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::AmbiguousOverload)),
         "expected AmbiguousOverload (E0122), got: {:?}",
-        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
     );
     assert!(
         msgs.iter()
@@ -242,7 +244,9 @@ fn main() { let a = f(1); }
         msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::DuplicateOverload)),
         "expected DuplicateOverload (E0121), got: {:?}",
-        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -256,10 +260,11 @@ fn main() { let a = f(1, 2, 3); }
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::WrongArity)),
         "expected WrongArity (E0120), got: {:?}",
-        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -288,16 +293,17 @@ fn main() {
 fn defer_cannot_capture_without_use() {
     let msgs = check_messages(
         r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let y = 10;
-    defer { print "%i", y; }
+    defer { write_all(stdout(), to_bytes(format("%i", y))); }
 }
 "#,
     );
     assert!(
-        msgs.iter().any(|m| {
-            m.message().contains("cannot capture `y` without `use (y)`")
-        }),
+        msgs.iter()
+            .any(|m| { m.message().contains("cannot capture `y` without `use (y)`") }),
         "expected explicit-capture diagnostic for defer, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
@@ -307,8 +313,10 @@ fn main() {
 fn defer_undefined_variable_is_rejected() {
     let msgs = check_messages(
         r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    defer { print "%i", totally_undefined_var; }
+    defer { write_all(stdout(), to_bytes(format("%i", totally_undefined_var))); }
 }
 "#,
     );
@@ -607,7 +615,10 @@ fn constructor_wrong_arity_errors() {
 #[test]
 fn format_string_type_mismatch_errors() {
     // %s requires a string; passing int is a type error.
-    let (_ty, msgs) = check("print \"%s\", 42;");
+    let (_ty, msgs) = check(
+        r#"use string::format;
+format("%s", 42);"#,
+    );
     assert!(
         msgs.iter().any(|m| m.contains("requires string")),
         "expected format-string type error, got: {:?}",
@@ -617,9 +628,12 @@ fn format_string_type_mismatch_errors() {
 
 #[test]
 fn format_string_percent_z_accepts_bool() {
-    // `%z` is the bool specifier. `print "%z", true` should
+    // `%z` is the bool specifier. `string::format("%z", true)` should
     // type-check with no diagnostics.
-    let (_ty, msgs) = check("print \"%z\", true;");
+    let (_ty, msgs) = check(
+        r#"use string::format;
+format("%z", true);"#,
+    );
     assert!(
         msgs.is_empty(),
         "expected `%z` to accept bool, got: {:?}",
@@ -630,7 +644,10 @@ fn format_string_percent_z_accepts_bool() {
 #[test]
 fn format_string_percent_z_rejects_int() {
     // `%z` requires a bool; passing an int is a type error.
-    let (_ty, msgs) = check("print \"%z\", 42;");
+    let (_ty, msgs) = check(
+        r#"use string::format;
+format("%z", 42);"#,
+    );
     assert!(
         msgs.iter().any(|m| m.contains("requires bool")),
         "expected 'requires bool' error for `%z` with int, got: {:?}",
@@ -641,8 +658,9 @@ fn format_string_percent_z_rejects_int() {
 #[test]
 fn format_percent_i_rejects_open_type_suggests_percent_v() {
     let msgs = check_messages(
-        "fn bad<T>(T x) { print \"%i\", x; } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%i", x); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter().any(|m| {
@@ -656,8 +674,9 @@ fn format_percent_i_rejects_open_type_suggests_percent_v() {
 #[test]
 fn format_percent_v_requires_show_bound() {
     let (_ty, msgs) = check(
-        "fn bad<T>(T x) { print \"%v\", x; } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%v", x); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter()
@@ -670,8 +689,9 @@ fn format_percent_v_requires_show_bound() {
 #[test]
 fn format_percent_v_requires_show_bound_inside_structural_tuple() {
     let (_ty, msgs) = check(
-        "fn bad<T>(T x) { print \"%v\", (x, 1); } \
-         fn main() { bad(1); }",
+        r#"use string::format;
+fn bad<T>(T x) { format("%v", (x, 1)); }
+fn main() { bad(1); }"#,
     );
     assert!(
         msgs.iter()
@@ -684,8 +704,9 @@ fn format_percent_v_requires_show_bound_inside_structural_tuple() {
 #[test]
 fn format_percent_v_accepts_show_bound() {
     let (_ty, msgs) = check(
-        "fn ok<T: Show>(T x) { print \"%v\", x; } \
-         fn main() { ok(1); }",
+        r#"use string::format;
+fn ok<T: Show>(T x) { format("%v", x); }
+fn main() { ok(1); }"#,
     );
     assert!(
         msgs.is_empty(),
@@ -1162,8 +1183,7 @@ fn duplicate_typeclass_errors() {
         "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate trait `Tiny`")),
+        msgs.iter().any(|m| m.contains("Duplicate trait `Tiny`")),
         "expected duplicate trait diagnostic, got: {:?}",
         msgs
     );
@@ -1303,7 +1323,8 @@ fn ffi_attr_with_body_reports_diagnostic() {
         "#[ffi(lib = \"c\")] fn strlen(string s) -> int { return 0; } fn main() {}",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("requires a signature-only function")),
+        msgs.iter()
+            .any(|m| m.contains("requires a signature-only function")),
         "expected ffi-with-body diagnostic, got: {:?}",
         msgs
     );
@@ -1365,8 +1386,7 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.message().contains("cannot spread")),
+        msgs.iter().any(|m| m.message().contains("cannot spread")),
         "expected cannot-spread diagnostic, got: {:?}",
         msgs
     );
@@ -1499,7 +1519,8 @@ fn main() {}
 fn ffi_dload_without_use_errors() {
     let (_ty, msgs) = check(r#"fn main() { let lib = dload("x.so"); }"#);
     assert!(
-        msgs.iter().any(|m| m.contains("Cannot find value `dload`") || m.contains("Cannot find function `dload`")),
+        msgs.iter().any(|m| m.contains("Cannot find value `dload`")
+            || m.contains("Cannot find function `dload`")),
         "expected missing dload without `use ffi`, got: {:?}",
         msgs
     );
@@ -1520,9 +1541,10 @@ fn declare_wrong_arity_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::DeclareArity)
-            || m.message().contains("declare")
-            || m.message().contains("Declare")),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::DeclareArity)
+                || m.message().contains("declare")
+                || m.message().contains("Declare")),
         "expected DeclareArity diagnostic, got: {:?}",
         msgs
     );
@@ -1572,8 +1594,9 @@ fn array_literal_index_oob_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
-            || m.message().contains("out of bounds")),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
+                || m.message().contains("out of bounds")),
         "expected IndexOutOfBounds, got: {:?}",
         msgs
     );
@@ -1590,8 +1613,9 @@ fn tuple_literal_index_oob_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
-            || m.message().contains("out of bounds")),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
+                || m.message().contains("out of bounds")),
         "expected tuple IndexOutOfBounds, got: {:?}",
         msgs
     );
@@ -1628,7 +1652,9 @@ fn record_pattern_missing_field_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Missing field") || m.contains("missing field") || m.contains("`y`")),
+        msgs.iter().any(|m| m.contains("Missing field")
+            || m.contains("missing field")
+            || m.contains("`y`")),
         "expected missing field in record pattern, got: {:?}",
         msgs
     );
@@ -1647,7 +1673,8 @@ fn record_pattern_duplicate_field_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Duplicate field") || m.contains("duplicate field")),
+        msgs.iter()
+            .any(|m| m.contains("Duplicate field") || m.contains("duplicate field")),
         "expected duplicate field in record pattern, got: {:?}",
         msgs
     );
@@ -1666,7 +1693,10 @@ fn record_pattern_shape_mismatch_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("shape") || m.contains("payload") || m.contains("Missing field") || m.contains("Constructor")),
+        msgs.iter().any(|m| m.contains("shape")
+            || m.contains("payload")
+            || m.contains("Missing field")
+            || m.contains("Constructor")),
         "expected record/tuple shape mismatch, got: {:?}",
         msgs
     );
@@ -1677,8 +1707,7 @@ fn shallow_const_on_array_emits_warning() {
     let msgs = check_messages(r#"fn main() { const a = [1, 2, 3]; }"#);
     assert!(
         msgs.iter().any(|m| {
-            m.message().contains("binding `a` is constant")
-                && m.message().contains("still mutable")
+            m.message().contains("binding `a` is constant") && m.message().contains("still mutable")
         }),
         "expected shallow-const warning, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
@@ -1690,8 +1719,7 @@ fn shallow_const_on_record_emits_warning() {
     let msgs = check_messages(r#"fn main() { const d = { foo: 1 }; }"#);
     assert!(
         msgs.iter().any(|m| {
-            m.message().contains("binding `d` is constant")
-                && m.message().contains("still mutable")
+            m.message().contains("binding `d` is constant") && m.message().contains("still mutable")
         }),
         "expected shallow-const warning for record, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
@@ -1719,7 +1747,9 @@ fn main() {
                 && m.code() == Some(ErrorCode::InvalidAssignment)
         }),
         "expected readonly external mutation diagnostic, got: {:?}",
-        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1734,7 +1764,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.message().contains("Cannot mutate a `readonly` value")),
+        msgs.iter()
+            .any(|m| m.message().contains("Cannot mutate a `readonly` value")),
         "expected readonly append rejection, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
@@ -1797,7 +1828,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.message().contains("append assignment requires an array")),
+        msgs.iter()
+            .any(|m| m.message().contains("append assignment requires an array")),
         "expected non-array append diagnostic, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
@@ -1814,7 +1846,8 @@ fn const_reassignment_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Cannot assign to constant `x`") || m.contains("constant")),
+        msgs.iter()
+            .any(|m| m.contains("Cannot assign to constant `x`") || m.contains("constant")),
         "expected const reassignment diagnostic, got: {:?}",
         msgs
     );
@@ -1829,7 +1862,8 @@ fn panic_non_string_errors() {
         msgs
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Type mismatch") || m.contains("string")),
+        msgs.iter()
+            .any(|m| m.contains("Type mismatch") || m.contains("string")),
         "expected string/type mismatch for panic, got: {:?}",
         msgs
     );
@@ -1839,8 +1873,9 @@ fn panic_non_string_errors() {
 fn array_element_type_mismatch_errors() {
     let msgs = check_messages(r#"fn main() { let a = [1, "x"]; }"#);
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::ArrayElementMismatch)
-            || m.message().contains("array element")),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::ArrayElementMismatch)
+                || m.message().contains("array element")),
         "expected ArrayElementMismatch, got: {:?}",
         msgs
     );
@@ -1857,7 +1892,8 @@ fn main() {}
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("cannot zip dynamic-length arrays")),
+        msgs.iter()
+            .any(|m| m.contains("cannot zip dynamic-length arrays")),
         "expected dynamic zip diagnostic, got: {:?}",
         msgs
     );
@@ -1873,7 +1909,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("cannot zip tuples of length")),
+        msgs.iter()
+            .any(|m| m.contains("cannot zip tuples of length")),
         "expected tuple length mismatch diagnostic, got: {:?}",
         msgs
     );
@@ -1905,7 +1942,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("not supported on aggregates")),
+        msgs.iter()
+            .any(|m| m.contains("not supported on aggregates")),
         "expected bitwise-on-aggregate rejection, got: {:?}",
         msgs
     );
@@ -1923,7 +1961,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("cannot zip arrays of length")),
+        msgs.iter()
+            .any(|m| m.contains("cannot zip arrays of length")),
         "expected static array length mismatch, got: {:?}",
         msgs
     );
@@ -1984,7 +2023,9 @@ fn matmul_dims_over_packed_u8_limit_warns() {
                 && m.message().contains("256")
         }),
         "expected packed-dim warning for matmul, got: {:?}",
-        msgs.iter().map(|m| (m.kind(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.kind(), m.message()))
+            .collect::<Vec<_>>()
     );
     assert!(
         msgs.iter().any(|m| {
@@ -2015,7 +2056,9 @@ fn matrix_mul_dims_over_packed_u8_limit_warns() {
                 && m.message().contains("exceed the packed kernel meta limit")
         }),
         "expected packed-dim warning for Matrix *, got: {:?}",
-        msgs.iter().map(|m| (m.kind(), m.message())).collect::<Vec<_>>()
+        msgs.iter()
+            .map(|m| (m.kind(), m.message()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2031,8 +2074,7 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("inner dimensions mismatch")),
+        msgs.iter().any(|m| m.contains("inner dimensions mismatch")),
         "expected Matrix * dimension mismatch, got: {:?}",
         msgs
     );
@@ -2049,8 +2091,7 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("not supported on `Matrix`")),
+        msgs.iter().any(|m| m.contains("not supported on `Matrix`")),
         "expected Matrix / rejection, got: {:?}",
         msgs
     );
@@ -2083,7 +2124,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("length-3") || m.contains("`cross`")),
+        msgs.iter()
+            .any(|m| m.contains("length-3") || m.contains("`cross`")),
         "expected cross length diagnostic, got: {:?}",
         msgs
     );
@@ -2098,9 +2140,9 @@ fn main() { let t = spawn(work); }
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("spawn")
-                && (m.contains("Cannot find") || m.contains("cannot find"))),
+        msgs.iter().any(
+            |m| m.contains("spawn") && (m.contains("Cannot find") || m.contains("cannot find"))
+        ),
         "expected missing spawn without `use thread`, got: {:?}",
         msgs
     );
@@ -2142,8 +2184,7 @@ fn primitive_cast_rejects_float_to_byte() {
 fn primitive_cast_rejects_literal_int_as_byte_oob() {
     let (_ty, msgs) = check("fn main() { let x = 257 as byte; }");
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("byte literal out of range")),
+        msgs.iter().any(|m| m.contains("byte literal out of range")),
         "expected literal int as byte OOB diagnostic, got: {:?}",
         msgs
     );
@@ -2153,8 +2194,7 @@ fn primitive_cast_rejects_literal_int_as_byte_oob() {
 fn primitive_cast_rejects_negative_literal_int_as_byte() {
     let (_ty, msgs) = check("fn main() { let x = -1 as byte; }");
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("byte literal out of range")),
+        msgs.iter().any(|m| m.contains("byte literal out of range")),
         "expected negative literal int as byte diagnostic, got: {:?}",
         msgs
     );
@@ -2171,8 +2211,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("env::exec")
-            && m.contains("trusted inputs")),
+        msgs.iter()
+            .any(|m| m.contains("env::exec") && m.contains("trusted inputs")),
         "expected env::exec trusted-inputs warning, got: {:?}",
         msgs
     );
@@ -2189,8 +2229,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("env::exit")
-            && m.contains("terminates the process")),
+        msgs.iter()
+            .any(|m| m.contains("env::exit") && m.contains("terminates the process")),
         "expected env::exit process-termination warning, got: {:?}",
         msgs
     );
@@ -2200,9 +2240,8 @@ fn main() {
 fn primitive_cast_rejects_non_primitive_target() {
     let (_ty, msgs) = check(r#"fn main() { let x = "hi" as int; }"#);
     assert!(
-        msgs.iter().any(|m| m.contains(
-            "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
-        )),
+        msgs.iter().any(|m| m
+            .contains("cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)")),
         "expected non-primitive cast rejection, got: {:?}",
         msgs
     );
@@ -2228,8 +2267,8 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("static method")
-            && (m.contains("call it as") || m.contains("::"))),
+        msgs.iter()
+            .any(|m| m.contains("static method") && (m.contains("call it as") || m.contains("::"))),
         "expected static-on-instance diagnostic, got: {:?}",
         msgs
     );

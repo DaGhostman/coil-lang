@@ -6,6 +6,8 @@
 //
 // Expected output: `alice:30bob:25total:55`
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Row = (string, int);
 type Table = [Row];
 
@@ -13,7 +15,7 @@ fn sum_ages(Table rows) -> int {
     let total = 0;
     for row in rows {
         let (name, age) = row;
-        print "%s:%i", name, age;
+        write_all(stdout(), to_bytes(format("%s:%i", name, age)));
         total = total + age;
     }
     return total;
@@ -21,5 +23,5 @@ fn sum_ages(Table rows) -> int {
 
 fn main() {
     let people: Table = [("alice", 30), ("bob", 25)];
-    print "total:%i", sum_ages(people);
+    write_all(stdout(), to_bytes(format("total:%i", sum_ages(people))));
 }

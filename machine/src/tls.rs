@@ -19,7 +19,7 @@ use rustls::{
 
 use common::Value;
 
-use crate::io::{value_as_string, with_stream_mut, IoErrorTag};
+use crate::io::{IoErrorTag, value_as_string, with_stream_mut};
 use crate::memory::{Heap, Member, Object, StreamKind};
 
 /// rustls session state owned by a TLS [`crate::memory::ObjStream`] (client or server).
@@ -136,9 +136,7 @@ fn add_pem_certs(roots: &mut RootCertStore, pem: &str) -> Result<(), IoErrorTag>
         return Err(IoErrorTag::InvalidInput);
     }
     for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|_| IoErrorTag::InvalidInput)?;
+        roots.add(cert).map_err(|_| IoErrorTag::InvalidInput)?;
     }
     Ok(())
 }
@@ -251,7 +249,9 @@ fn handshake_with_deadline(
                 // rustls may return Ok(0) when the socket is not ready.
                 Ok(0) => wait_fd_deadline(fd, false, deadline)?,
                 Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
                     wait_fd_deadline(fd, false, deadline)?;
                 }
                 Err(e) => return Err(map_io(e)),
@@ -266,7 +266,9 @@ fn handshake_with_deadline(
                 Ok(_) => {
                     let _ = conn.process_new_packets().map_err(map_tls_err)?;
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
                     wait_fd_deadline(fd, true, deadline)?;
                 }
                 Err(e) => return Err(map_io(e)),
@@ -710,7 +712,11 @@ fn read_tls_records(fd: RawFd, tls: &mut TlsSession) -> Result<usize, IoErrorTag
 /// Non-blocking TLS application read into `buf`.
 ///
 /// `Ok(None)` = clean EOF; `Err(WouldBlock)` when more socket data is needed.
-pub fn tls_read(fd: RawFd, tls: &mut TlsSession, buf: &mut [u8]) -> Result<Option<usize>, IoErrorTag> {
+pub fn tls_read(
+    fd: RawFd,
+    tls: &mut TlsSession,
+    buf: &mut [u8],
+) -> Result<Option<usize>, IoErrorTag> {
     if buf.is_empty() {
         return Ok(Some(0));
     }
@@ -734,11 +740,7 @@ pub fn tls_read(fd: RawFd, tls: &mut TlsSession, buf: &mut [u8]) -> Result<Optio
             // Peer closed; drain any final plaintext.
             tls.pull_plaintext_from_conn()?;
             let n = tls.drain_plaintext_into(buf);
-            if n > 0 {
-                Ok(Some(n))
-            } else {
-                Ok(None)
-            }
+            if n > 0 { Ok(Some(n)) } else { Ok(None) }
         }
         Ok(_) => {
             let n = tls.drain_plaintext_into(buf);
@@ -839,10 +841,12 @@ mod tests {
         let k_to = heap.intern("timeout_ms".into());
         let ca_pem_m = option_string_member(heap, ca_pem);
         let ca_path_m = option_string_member(heap, ca_path);
-        gc.as_mut().set(k_verify, Member::Value(Value::from(verify)));
+        gc.as_mut()
+            .set(k_verify, Member::Value(Value::from(verify)));
         gc.as_mut().set(k_ca, ca_pem_m);
         gc.as_mut().set(k_path, ca_path_m);
-        gc.as_mut().set(k_to, Member::Value(Value::from(timeout_ms)));
+        gc.as_mut()
+            .set(k_to, Member::Value(Value::from(timeout_ms)));
         Value::from(obj.addr())
     }
 
@@ -872,7 +876,8 @@ mod tests {
         let k_cca = heap.intern("client_ca_pem".into());
         gc.as_mut().set(k_cert, Member::Object(cert_obj));
         gc.as_mut().set(k_key, Member::Object(key_obj));
-        gc.as_mut().set(k_to, Member::Value(Value::from(timeout_ms)));
+        gc.as_mut()
+            .set(k_to, Member::Value(Value::from(timeout_ms)));
         gc.as_mut().set(k_cca, Member::Object(cca_obj));
         Value::from(obj.addr())
     }
@@ -894,7 +899,12 @@ mod tests {
         }
     }
 
-    fn tcp_then_enable(heap: &mut Heap, host: &str, port: i64, verify: bool) -> Result<Value, IoErrorTag> {
+    fn tcp_then_enable(
+        heap: &mut Heap,
+        host: &str,
+        port: i64,
+        verify: bool,
+    ) -> Result<Value, IoErrorTag> {
         let s = tcp_connect(heap, host, port)?;
         let opts = make_opts(heap, verify);
         tls_client_enable(heap, s, host, opts)
@@ -930,9 +940,7 @@ mod tests {
             };
             // Handshake (best-effort; client may abort mid-way).
             while conn.is_handshaking() {
-                if conn.wants_write()
-                    && conn.write_tls(&mut sock).is_err()
-                {
+                if conn.wants_write() && conn.write_tls(&mut sock).is_err() {
                     return;
                 }
                 if conn.is_handshaking() {
@@ -981,8 +989,7 @@ mod tests {
                         }
                     }
                     Err(e)
-                        if e.kind() == ErrorKind::WouldBlock
-                            || e.kind() == ErrorKind::TimedOut =>
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
                     {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -1002,7 +1009,9 @@ mod tests {
                 }
             }
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("server ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server ready");
         (port, handle)
     }
 
@@ -1075,7 +1084,10 @@ mod tests {
         let opts = make_opts(&mut heap, false);
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert!(
-            matches!(err, IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated),
+            matches!(
+                err,
+                IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated
+            ),
             "unexpected handshake err: {err:?}"
         );
         assert_eq!(
@@ -1109,7 +1121,10 @@ mod tests {
         let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
         let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
         assert!(
-            matches!(err, IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated),
+            matches!(
+                err,
+                IoErrorTag::Handshake | IoErrorTag::Other | IoErrorTag::Truncated
+            ),
             "unexpected handshake err: {err:?}"
         );
         assert_eq!(
@@ -1171,8 +1186,10 @@ mod tests {
         let k0 = heap.intern("verify".into());
         let k1 = heap.intern("alpn".into());
         gc.as_mut().set(k0, Member::Value(Value::from(false)));
-        gc.as_mut()
-            .set(k1, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
+        gc.as_mut().set(
+            k1,
+            Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)),
+        );
         let opts = Value::from(obj.addr());
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
@@ -1283,7 +1300,9 @@ mod tests {
             stream_write_all(&mut heap, s, echo).expect("echo");
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "localhost", port as i64, false).expect("client enable");
         let msg = make_byte_array(&mut heap, b"ping-encrypt");
@@ -1329,8 +1348,10 @@ mod tests {
         let k2 = heap.intern("alpn".into());
         gc.as_mut().set(k0, Member::Object(cert_obj));
         gc.as_mut().set(k1, Member::Object(key_obj));
-        gc.as_mut()
-            .set(k2, Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)));
+        gc.as_mut().set(
+            k2,
+            Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)),
+        );
         let err = tls_server_enable(&mut heap, s, Value::from(obj.addr())).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
@@ -1370,7 +1391,9 @@ mod tests {
             assert_eq!(kind, StreamKind::Tcp);
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "localhost", port as i64, false).expect("client");
         // Client handshake completes; then peer decrypts (may race). Close client.
@@ -1400,7 +1423,9 @@ mod tests {
             assert_eq!(err, IoErrorTag::InvalidInput);
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "localhost", port as i64, false).expect("client");
         stream_close(&mut heap, s).ok();
@@ -1688,7 +1713,9 @@ mod tests {
             assert_eq!(kind, StreamKind::Tcp);
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_then_enable(&mut heap, "localhost", port as i64, false).expect("client");
         stream_close(&mut heap, s).ok();
@@ -1730,7 +1757,9 @@ mod tests {
             stream_write_all(&mut heap, s, echo).expect("echo");
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
         // Trust the self-signed leaf via custom CA PEM (leaf-as-CA is fine for tests).
@@ -1748,10 +1777,7 @@ mod tests {
     fn enable_with_custom_ca_path_round_trips() {
         let (cert_pem, key_pem) = test_server_pem();
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "coil_tls_ca_{}.pem",
-            std::process::id()
-        ));
+        let path = dir.join(format!("coil_tls_ca_{}.pem", std::process::id()));
         std::fs::write(&path, &cert_pem).expect("write ca");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
@@ -1785,7 +1811,9 @@ mod tests {
             stream_write_all(&mut heap, s, echo).expect("echo");
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
         let path_s = path.to_string_lossy();
@@ -1841,7 +1869,8 @@ mod tests {
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
         let k_verify = heap.intern("verify".into());
         gc.as_mut().set(k_verify, Member::Value(Value::from(false)));
-        let err = tls_client_enable(&mut heap, s, "127.0.0.1", Value::from(obj.addr())).unwrap_err();
+        let err =
+            tls_client_enable(&mut heap, s, "127.0.0.1", Value::from(obj.addr())).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
         stream_close(&mut heap, s).ok();
         let _ = handle.join();
@@ -1933,14 +1962,18 @@ mod tests {
             err_tx.send(result.map(|_| ())).ok();
             stream_close(&mut heap, s).ok();
         });
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
         let mut heap = Heap::default();
         // Client has no client certificate; mTLS server must fail the handshake.
         let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
         let opts = make_opts_full(&mut heap, false, None, None, 2000);
         let client_err = tls_client_enable(&mut heap, s, "localhost", opts).err();
         stream_close(&mut heap, s).ok();
-        let server_err = err_rx.recv_timeout(Duration::from_secs(3)).expect("server result");
+        let server_err = err_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server result");
         server.join().expect("server");
         assert!(
             client_err.is_some() || server_err.is_err(),
@@ -1974,4 +2007,3 @@ mod tests {
         }
     }
 }
-

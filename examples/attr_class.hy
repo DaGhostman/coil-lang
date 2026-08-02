@@ -1,5 +1,7 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
-    print "%s", message;
+    write_all(stdout(), to_bytes(format("%s", message)));
     return target(...args);
 }
 
@@ -11,6 +13,6 @@ class Point {
 
 fn main() {
     let p = new Point(5, 12);
-    print "%i", p.x;
-    print "%i", p.y;
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.y)));
 }

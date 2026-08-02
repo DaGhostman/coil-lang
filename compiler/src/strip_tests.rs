@@ -1,8 +1,6 @@
 //! Remove harness-only declarations from the AST when compiling for production.
 
-use parser::{
-    ast::{Expression, Output},
-};
+use parser::ast::{Expression, Output};
 
 /// Drop top-level `test("…") { … }` blocks and `#[test]` functions.
 pub fn strip_test_declarations(ast: &mut Output<'_>) {
@@ -42,7 +40,9 @@ fn main() { }
             panic!("expected program");
         };
         assert_eq!(children.len(), 1);
-        assert!(matches!(children[0].1.as_ref(), Expression::Function { name, .. } if *name == "main"));
+        assert!(
+            matches!(children[0].1.as_ref(), Expression::Function { name, .. } if *name == "main")
+        );
     }
 
     /// Production stripping must not drop ordinary functions or `attr`
@@ -94,6 +94,8 @@ fn main() { }
             panic!("expected program");
         };
         assert_eq!(children.len(), 1);
-        assert!(matches!(children[0].1.as_ref(), Expression::Function { name, .. } if *name == "main"));
+        assert!(
+            matches!(children[0].1.as_ref(), Expression::Function { name, .. } if *name == "main")
+        );
     }
 }

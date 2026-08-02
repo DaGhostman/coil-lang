@@ -10,6 +10,7 @@ use io::net::tcp::*;
 use protocol::*;
 use server::*;
 use client::*;
+use string::*;
 
 async fn greeting_bytes() {
     yield 65;
@@ -78,8 +79,8 @@ fn run_echo() {
 }
 
 fn main() {
-    print "%s", match run_echo() {
+    write_all(stdout(), to_bytes(format("%s", match run_echo() {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
-    };
+    })));
 }

@@ -1,20 +1,22 @@
 // prelude::test::assert — returns Result<(), string>.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn check_ok(int n) {
     assert(n == 42)?;
     return "ok";
 }
 
 fn main() {
-    print "%s,", match check_ok(42) {
+    write_all(stdout(), to_bytes(format("%s,", match check_ok(42) {
         Result::Ok(v) => v,
         Result::Err(e) => e,
-    };
-    print "%s,", match assert(false) {
+    })));
+    write_all(stdout(), to_bytes(format("%s,", match assert(false) {
         Result::Ok(_) => "ok",
         Result::Err(e) => e,
-    };
-    print "%s", match assert(1 == 0, "custom") {
+    })));
+    write_all(stdout(), to_bytes(format("%s", match assert(1 == 0, "custom") {
         Result::Ok(_) => "ok",
         Result::Err(e) => e,
-    };
+    })));
 }

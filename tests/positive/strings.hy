@@ -1,5 +1,7 @@
 // String concat / format. Note: `==` on strings is pointer identity (interned
 // literals compare equal; concat/format results are fresh allocations).
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 test("literal string equality") {
     assert("hi" == "hi")?;
     assert("a" != "b")?;
@@ -14,9 +16,9 @@ test("concat produces usable string") {
 }
 
 test("format produces usable string") {
-    let s = format "%i-%s", 42, "x";
+    let s = format("%i-%s", 42, "x");
     assert(s != "")?;
-    let t = format "%z:%i", true, 7;
+    let t = format("%z:%i", true, 7);
     assert(t != s)?;
 }
 
@@ -30,7 +32,7 @@ test("concat chains") {
 }
 
 test("format multi-arg distinct from literals") {
-    let s = format "%i+%i=%i", 1, 2, 3;
+    let s = format("%i+%i=%i", 1, 2, 3);
     assert(s != "1")?;
     assert(s != "hello")?;
 }

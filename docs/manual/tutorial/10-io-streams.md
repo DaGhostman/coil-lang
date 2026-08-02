@@ -19,11 +19,13 @@ Buffers use the **`byte`** primitive and **`[byte]`** arrays.
 | `[byte]` | Homogeneous byte buffer for `read` / `write`. |
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let b: byte = 255;
     let arr: [byte] = [1, 2, 3];
-    print "%i", b;
-    print "%i", len(arr);
+    write_all(stdout(), to_bytes(format("%i", b)));
+    write_all(stdout(), to_bytes(format("%i", len(arr))));
 }
 ```
 
@@ -39,13 +41,14 @@ fn main() {
 
 ```coil
 use io::*;
+use string::*;
 
 fn main() {
     let hello: [byte] = [104, 101, 108, 108, 111];
-    print "%s", match from_bytes(hello) {
+    write_all(stdout(), to_bytes(format("%s", match from_bytes(hello) {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
-    };
+    })));
 }
 ```
 
@@ -72,7 +75,7 @@ See `examples/io_text.hy`.
 | `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |
 | `io::net::tls::server::*` | TLS server | `enable` / `disable` (feature `tls`) |
 
-`print` still uses the `PRINT` opcode (not redirected through `stdout`).
+For stdout text, call `write_all(stdout(), to_bytes(...))`.
 
 TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 (like `ffi::types`):
@@ -104,6 +107,7 @@ you need peer addresses:
 ```coil
 use io::*;
 use io::net::udp::*;
+use string::*;
 
 fn main() {
     let server = bind("127.0.0.1", 0)?;
@@ -113,7 +117,7 @@ fn main() {
     send_to(client, msg, "127.0.0.1", port)?;
     let buf: [byte] = [0, 0, 0, 0, 0, 0, 0, 0];
     let t = recv_from_wait(server, buf)?;
-    print "%i", t[0];
+    write_all(stdout(), to_bytes(format("%i", t[0])));
 }
 ```
 
@@ -194,6 +198,7 @@ See `examples/io_tls.hy`.
 
 ```coil
 use io::*;
+use string::*;
 
 fn main() {
     let path = "/tmp/demo.bin";
@@ -205,7 +210,7 @@ fn main() {
     let s = open(path, "r")?;
     let buf = read_to_end(s)?;
     close(s)?;
-    print "%i", len(buf);
+    write_all(stdout(), to_bytes(format("%i", len(buf))));
 }
 ```
 

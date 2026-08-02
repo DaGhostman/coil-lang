@@ -2,6 +2,8 @@
 //
 // Expected output: ok
 use http::client::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let label = "err";
@@ -16,5 +18,5 @@ fn main() {
     if label != "ok" {
         panic "get failed";
     }
-    print "ok";
+    write_all(stdout(), to_bytes("ok"));
 }

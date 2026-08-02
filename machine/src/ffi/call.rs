@@ -69,7 +69,10 @@ fn ffi_type_to_libffi(ty: FfiType, layouts: &[CStructLayout]) -> Result<Type, Ff
     }
 }
 
-pub fn prepare_cif(sig: &FfiSignature, layouts: &[CStructLayout]) -> Result<PreparedCall, FfiError> {
+pub fn prepare_cif(
+    sig: &FfiSignature,
+    layouts: &[CStructLayout],
+) -> Result<PreparedCall, FfiError> {
     let arg_types: Result<Vec<Type>, FfiError> = sig
         .args
         .iter()
@@ -367,9 +370,7 @@ pub fn invoke_via_libffi(
             });
         }
         let tags = variadic_arg_types.ok_or_else(|| {
-            FfiError::Unsupported(
-                "variadic FFI invoke requires per-argument type tags".into(),
-            )
+            FfiError::Unsupported("variadic FFI invoke requires per-argument type tags".into())
         })?;
         if tags.len() != args.len() {
             return Err(FfiError::ArityMismatch {
@@ -621,8 +622,8 @@ pub fn invoke_via_libffi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::load_library;
     use crate::ffi::FfiSignatureBuilder;
+    use crate::ffi::load_library;
 
     extern "C" fn add_two(a: i64, b: i64) -> i64 {
         a + b
@@ -696,7 +697,9 @@ mod tests {
         let lib = match crate::ffi::resolve_library("c", None, &[]) {
             Ok(l) => l,
             Err(_) => {
-                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libc not reachable via dlopen"); }
+                if std::env::var_os("CI").is_some() {
+                    panic!("FFI soft-skip forbidden in CI: libc not reachable via dlopen");
+                }
                 eprintln!("skipping: libc not reachable via dlopen");
                 return;
             }
@@ -705,7 +708,9 @@ mod tests {
         let prepared = match prepare_cif_for_symbol(&sig, &lib, "strlen", &[]) {
             Ok(p) => p,
             Err(e) => {
-                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: {e}"); }
+                if std::env::var_os("CI").is_some() {
+                    panic!("FFI soft-skip forbidden in CI: {e}");
+                }
                 eprintln!("skipping: {e}");
                 return;
             }
@@ -741,7 +746,9 @@ mod tests {
         let lib = match crate::ffi::resolve_library(lib_path.to_str().unwrap(), None, &[]) {
             Ok(l) => l,
             Err(e) => {
-                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: {e}"); }
+                if std::env::var_os("CI").is_some() {
+                    panic!("FFI soft-skip forbidden in CI: {e}");
+                }
                 eprintln!("skipping: {e}");
                 return;
             }
@@ -802,7 +809,8 @@ mod tests {
         let args = [Value::from(1_i64)];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let err = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures).unwrap_err();
+        let err =
+            invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures).unwrap_err();
         assert!(matches!(
             err,
             FfiError::ArityMismatch {
@@ -864,8 +872,8 @@ mod tests {
         let args = [Value::from(obj.addr())];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let err = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
-            .unwrap_err();
+        let err =
+            invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures).unwrap_err();
         assert!(matches!(err, FfiError::Unsupported(_)));
     }
 
@@ -914,24 +922,12 @@ mod tests {
             Value::from(fmt_obj.addr()),
             Value::from(42_i64),
         ];
-        let tags = [
-            FfiType::Ptr,
-            FfiType::Int,
-            FfiType::String,
-            FfiType::Int,
-        ];
+        let tags = [FfiType::Ptr, FfiType::Int, FfiType::String, FfiType::Int];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(
-            &prepared,
-            &sig,
-            &args,
-            Some(&tags),
-            &mut ctx,
-            &mut closures,
-        )
-        .unwrap()
-        .unwrap();
+        let ret = invoke_via_libffi(&prepared, &sig, &args, Some(&tags), &mut ctx, &mut closures)
+            .unwrap()
+            .unwrap();
         assert!(ret.as_int() > 0);
         let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
         assert_eq!(s.to_string_lossy(), "hello 42");

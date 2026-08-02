@@ -1,20 +1,22 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
-    print "%s", message;
+    write_all(stdout(), to_bytes(format("%s", message)));
     return target(...args);
 }
 
 attr measure<T>(fn(...args) -> T target, string metric, ...args) -> T {
-    print "%s", metric;
+    write_all(stdout(), to_bytes(format("%s", metric)));
     return target(...args);
 }
 
 #[log(message = "enter")]
 #[measure(metric = "do_thing")]
 fn do_thing(int x, string name) -> int {
-    print "%s", name;
+    write_all(stdout(), to_bytes(format("%s", name)));
     return x;
 }
 
 fn main() {
-    print "%i", do_thing(42, "hi");
+    write_all(stdout(), to_bytes(format("%i", do_thing(42, "hi"))));
 }

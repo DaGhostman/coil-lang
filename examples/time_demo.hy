@@ -1,4 +1,6 @@
 use time::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn epoch_ok() -> int {
     return match epoch() {
@@ -8,5 +10,5 @@ fn epoch_ok() -> int {
 }
 
 fn main() {
-    print "%i", epoch_ok();
+    write_all(stdout(), to_bytes(format("%i", epoch_ok())));
 }

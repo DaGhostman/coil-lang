@@ -1,16 +1,11 @@
-// Phase 1.6 — CFG-path `print "literal";` test.
+// Literal stdout smoke test.
 //
-// Exercises the linearizer's new `Inst::Print` arm and the
-// `is_straight_line` lift for `Expression::Print`. The function
-// body is straight-line (no control flow, no Call, no
-// Construct, no Access), so it routes through the
-// `cfg_builder` + `linearize` pipeline. The linearizer emits
-// `DATA chars + STRING + PRINT` after the cfg_builder pushes
-// `Inst::ConstString` for the format and `Inst::Print { args:
-// [fmt] }` for the print.
+// Exercises writing a string literal through io::stdout and string::to_bytes.
 //
 // Expected output: "hello".
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }

@@ -1,5 +1,7 @@
 // Expected output: 424.0424242
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Describable<T> {
     fn describe_val(T x) -> int;
 }
@@ -31,13 +33,13 @@ fn capture_show<T: Describable>(T _witness) {
 
 fn main() {
     let f = id;
-    print "%i", f(42);
-    print "%f", f(4.0);
+    write_all(stdout(), to_bytes(format("%i", f(42))));
+    write_all(stdout(), to_bytes(format("%f", f(4.0))));
 
     let constrained = show;
-    print "%i", constrained(41);
-    print "%i", apply_id(id, 42);
+    write_all(stdout(), to_bytes(format("%i", constrained(41))));
+    write_all(stdout(), to_bytes(format("%i", apply_id(id, 42))));
 
     let captured = capture_show(0);
-    print "%i", captured(41);
+    write_all(stdout(), to_bytes(format("%i", captured(41))));
 }

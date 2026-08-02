@@ -1,5 +1,6 @@
 // EOF is Ok(None) from a non-blocking `read` on an empty file.
 use io::*;
+use string::*;
 
 fn make_empty(string path) {
     let s = open(path, "w")?;
@@ -26,8 +27,8 @@ fn describe(string path) {
 
 fn main() {
     let path = "/tmp/coil_io_eof_test.bin";
-    print "%s", match describe(path) {
+    write_all(stdout(), to_bytes(format("%s", match describe(path) {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
-    };
+    })));
 }

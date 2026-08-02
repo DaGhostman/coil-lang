@@ -3,6 +3,8 @@
 // User-defined IntoIterator + Iterator on a class. `next` mutates the
 // heap instance in place so state advances across resumes.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Counter {
     cur: int,
     end: int,
@@ -31,6 +33,6 @@ impl Iterator<Counter> {
 fn main() {
     let c = new Counter(0, 3);
     for x in c {
-        print "%i", x;
+        write_all(stdout(), to_bytes(format("%i", x)));
     }
 }

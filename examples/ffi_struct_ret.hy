@@ -4,6 +4,8 @@
 
 use ffi::*;
 use ffi::types::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 extern struct Point {
     x: int32,
@@ -14,6 +16,6 @@ fn main() -> Result<(), Error> {
     let lib = dload("sum")?;
     let make_id = declare(lib, "make_point", (Int32, Int32), Point)?;
     let p = invoke(lib, make_id, (3, 4))?;
-    print "%i", p.x;
-    print "%i", p.y;
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.y)));
 }

@@ -1,9 +1,11 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fizbuz(int n) {
     if (n % 3) == 0 {
-        print "FIZ";
+        write_all(stdout(), to_bytes("FIZ"));
     } 
     if (n % 5) == 0 {
-        print "BUZ";
+        write_all(stdout(), to_bytes("BUZ"));
     } 
 }
 fn main() {

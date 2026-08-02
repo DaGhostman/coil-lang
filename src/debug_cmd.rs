@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use common::{ProgramDebug, byte_to_position};
-use compiler::{
-    DissectArtifacts, FnSym, Pipeline, format_bytecode_section, matches_fn_pat,
-};
+use compiler::{DissectArtifacts, FnSym, Pipeline, format_bytecode_section, matches_fn_pat};
 use machine::{DebugController, Machine, StopReason};
 use reporting::ReportConfig;
 
@@ -158,7 +156,12 @@ pub fn cmd_debug(config: ReportConfig, args: DebugArgs) {
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, Some(&entry_path));
     pipeline.wire_host_natives(&mut machine);
-    pipeline.wire_thread_program(&mut machine, &artifacts.bytecode, &artifacts.constants);
+    pipeline.wire_thread_program(
+        &mut machine,
+        &artifacts.bytecode,
+        &artifacts.constants,
+        &artifacts.strings,
+    );
     machine.set_program_debug(artifacts.debug.clone());
     machine.attach_debug(DebugController::new());
 
@@ -264,7 +267,10 @@ fn exec_line(session: &mut DebugSession, line: &str, batch: bool) -> Result<CmdR
         }
         "quit" | "q" => Ok(CmdResult::Quit),
         "break" | "b" => {
-            let arg = rest.first().copied().ok_or("usage: break <fn|file:line|line>")?;
+            let arg = rest
+                .first()
+                .copied()
+                .ok_or("usage: break <fn|file:line|line>")?;
             cmd_break(session, arg)?;
             Ok(CmdResult::ContinuePrompt)
         }
@@ -303,7 +309,10 @@ fn exec_line(session: &mut DebugSession, line: &str, batch: bool) -> Result<CmdR
                 "registers" | "reg" => {
                     let ip = session.machine.debug_ip();
                     let depth = session.machine.debug_frame_depth();
-                    let sp = session.machine.debug_frame_sp(depth.saturating_sub(1)).unwrap_or(0);
+                    let sp = session
+                        .machine
+                        .debug_frame_sp(depth.saturating_sub(1))
+                        .unwrap_or(0);
                     println!("ip={ip}  sp={sp}  depth={depth}");
                 }
                 "locals" => {
@@ -325,6 +334,7 @@ fn exec_line(session: &mut DebugSession, line: &str, batch: bool) -> Result<CmdR
             let reason = session.machine.debug_run_until_raw(
                 &session.artifacts.bytecode,
                 &session.artifacts.constants,
+                &session.artifacts.strings,
                 session.static_slots,
                 session.machine.debug_ip(),
             );
@@ -421,10 +431,7 @@ fn cmd_break(session: &mut DebugSession, arg: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_break_target(
-    session: &DebugSession,
-    arg: &str,
-) -> Result<(Vec<usize>, String), String> {
+fn resolve_break_target(session: &DebugSession, arg: &str) -> Result<(Vec<usize>, String), String> {
     // file:line
     if let Some((file, line_s)) = arg.rsplit_once(':')
         && !file.is_empty()
@@ -439,9 +446,7 @@ fn resolve_break_target(
     // bare line
     if arg.chars().all(|c| c.is_ascii_digit()) {
         let line: u32 = arg.parse().map_err(|_| "invalid line number")?;
-        let pcs = session
-            .line_index
-            .pcs_for_line(None, line, &session.entry);
+        let pcs = session.line_index.pcs_for_line(None, line, &session.entry);
         return Ok((pcs, format!("{}:{line}", session.entry)));
     }
     // function name
@@ -470,6 +475,7 @@ fn cmd_run(session: &mut DebugSession) -> Result<(), String> {
     let reason = session.machine.debug_run_until_raw(
         &session.artifacts.bytecode,
         &session.artifacts.constants,
+        &session.artifacts.strings,
         session.static_slots,
         0,
     );
@@ -507,6 +513,7 @@ fn cmd_stepi(session: &mut DebugSession, batch: bool) -> Result<(), String> {
     let reason = session.machine.debug_run_until_raw(
         &session.artifacts.bytecode,
         &session.artifacts.constants,
+        &session.artifacts.strings,
         session.static_slots,
         ip,
     );
@@ -546,6 +553,7 @@ fn cmd_step_line(session: &mut DebugSession, next: bool, batch: bool) -> Result<
     let reason = session.machine.debug_run_until_raw(
         &session.artifacts.bytecode,
         &session.artifacts.constants,
+        &session.artifacts.strings,
         session.static_slots,
         ip,
     );
@@ -577,6 +585,7 @@ fn cmd_finish(session: &mut DebugSession, batch: bool) -> Result<(), String> {
     let reason = session.machine.debug_run_until_raw(
         &session.artifacts.bytecode,
         &session.artifacts.constants,
+        &session.artifacts.strings,
         session.static_slots,
         ip,
     );

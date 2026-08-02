@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 static let hits = 0;
 
 class Counter {
@@ -17,7 +19,7 @@ fn main() {
     Counter::count = Counter::count + 1;
     let c = new Counter(0);
     c.bump();
-    print "%i", hits;
-    print "%i", Counter::count;
-    print "%i", c.value;
+    write_all(stdout(), to_bytes(format("%i", hits)));
+    write_all(stdout(), to_bytes(format("%i", Counter::count)));
+    write_all(stdout(), to_bytes(format("%i", c.value)));
 }

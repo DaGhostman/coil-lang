@@ -354,8 +354,8 @@ impl CodeBuf {
 
     /// Rebuild an owning [`IlModule`] from the flat emit stream and lower once.
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
-        let mut module =
-            IlModule::from_flat(self.il.ops(), &self.funcs).with_entries(self.entry_at_offset.clone());
+        let mut module = IlModule::from_flat(self.il.ops(), &self.funcs)
+            .with_entries(self.entry_at_offset.clone());
         let lowered = lower_module(&mut module, pool);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
@@ -575,7 +575,13 @@ mod tests {
         let ops = buf.ops();
         assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
         assert!(matches!(ops[1], IlOp::Const { imm: 2, .. }));
-        assert!(matches!(ops[2], IlOp::Bin { op: Instruction::ADD, .. }));
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::ADD,
+                ..
+            }
+        ));
         assert!(matches!(ops[3], IlOp::Return { .. }));
     }
 
@@ -636,7 +642,15 @@ mod tests {
         let ops: Vec<_> = lowered.bytecode.iter().map(|b| *b.bytecode()).collect();
         // Entry label binds the Const producer, so ConstReturnImm fuse is refused.
         assert!(
-            matches!(ops.as_slice(), [Instruction::CONST, Instruction::RETURN, Instruction::CALL, Instruction::HALT]),
+            matches!(
+                ops.as_slice(),
+                [
+                    Instruction::CONST,
+                    Instruction::RETURN,
+                    Instruction::CALL,
+                    Instruction::HALT
+                ]
+            ),
             "unexpected lowered ops: {ops:?}"
         );
         assert_eq!(lowered.bytecode[0].operand_u32(), 7);

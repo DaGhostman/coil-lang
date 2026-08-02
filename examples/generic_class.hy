@@ -2,6 +2,8 @@
 //
 // Output: 42
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Cell<T> {
     value: T
 }
@@ -14,5 +16,5 @@ impl Cell<T> {
 
 fn main() {
     let c = new Cell(42);
-    print "%i", c.get();
+    write_all(stdout(), to_bytes(format("%i", c.get())));
 }

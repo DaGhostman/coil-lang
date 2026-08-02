@@ -14,10 +14,7 @@ fn fib_entry() -> PathBuf {
 fn run_debug_script(script_body: &str, cwd_suffix: &str) -> (std::process::Output, PathBuf) {
     let bin = coil_bin();
     let entry = fib_entry();
-    let cwd = std::env::temp_dir().join(format!(
-        "coil_debug_{cwd_suffix}_{}",
-        std::process::id()
-    ));
+    let cwd = std::env::temp_dir().join(format!("coil_debug_{cwd_suffix}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cwd);
     std::fs::create_dir_all(&cwd).expect("temp cwd");
     let script = cwd.join("cmds.txt");

@@ -45,10 +45,7 @@ fn build_project(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "coil_ns_test_{}_{}_{}",
-        test_name, pid, nanos
-    ));
+    let tmp = std::env::temp_dir().join(format!("coil_ns_test_{}_{}_{}", test_name, pid, nanos));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp project dir");
 
@@ -86,11 +83,7 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     })
 }
 
-fn run_bytecode(
-    bytecode: Vec<common::Byte>,
-    constants: Vec<u64>,
-    pipeline: &Pipeline,
-) -> String {
+fn run_bytecode(bytecode: Vec<common::Byte>, constants: Vec<u64>, pipeline: &Pipeline) -> String {
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
@@ -98,9 +91,14 @@ fn run_bytecode(
     machine.set_shared_print(shared.inner.clone());
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
     machine.set_program_debug(pipeline.program_debug());
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    machine.run_raw(
+        &bytecode,
+        &constants,
+        pipeline.strings(),
+        pipeline.static_slot_count(),
+    );
     let _ = machine.restore_output();
     let bytes = shared
         .inner
@@ -179,7 +177,7 @@ roots = ["./src"]
 "#;
     let files = &[
         ("src/main.hy", "use foo::sadge;\nfn main() { sadge(); }\n"),
-        ("src/foo/sadge.hy", "fn sadge() { print \"%x\\n\", 420; }\n"),
+        ("src/foo/sadge.hy", "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
     ];
     let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -194,7 +192,10 @@ roots = ["./src"]
 "#;
     let files = &[
         ("src/main.hy", "use foo::sadge as f;\nfn main() { f(); }\n"),
-        ("src/foo/sadge.hy", "fn sadge() { print \"%i\", 99; }\n"),
+        (
+            "src/foo/sadge.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
+        ),
     ];
     let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -209,7 +210,10 @@ roots = ["./src"]
 "#;
     let files = &[
         ("src/main.hy", "use lib::io::read;\nfn main() { read(); }\n"),
-        ("src/lib/io/read.hy", "fn read() { print \"%i\", 7; }\n"),
+        (
+            "src/lib/io/read.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
+        ),
     ];
     let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -226,11 +230,11 @@ roots = ["./src", "./vendor"]
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "fn greet() { print \"%s\", \"from-src\"; }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
         ),
         (
             "vendor/foo/greet.hy",
-            "fn greet() { print \"%s\", \"from-vendor\"; }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
         ),
     ];
     let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.hy");
@@ -242,7 +246,10 @@ roots = ["./src", "./vendor"]
 fn no_manifest_uses_default_src_root() {
     let files = &[
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
-        ("src/foo/greet.hy", "fn greet() { print \"%i\", 42; }\n"),
+        (
+            "src/foo/greet.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+        ),
     ];
     let tmp = std::env::temp_dir().join("coil_ns_test_no_manifest");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -272,8 +279,8 @@ roots = ["./src"]
         ),
         (
             "src/foo.hy",
-            "fn sadge() { print \"%i\", 100; }\n\
-             fn greet() { print \"%i\", 200; }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
+             fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 200))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_glob", manifest, files, "src/main.hy");
@@ -289,8 +296,14 @@ roots = ["./src"]
 "#;
     let files = &[
         ("src/main.hy", "use foo::*;\nfn main() { top_only(); }\n"),
-        ("src/foo.hy", "fn top_only() { print \"%s\", \"ok\"; }\n"),
-        ("src/foo/bar.hy", "fn bar() { print \"%s\", \"BAD\"; }\n"),
+        (
+            "src/foo.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
+        ),
+        (
+            "src/foo/bar.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
+        ),
     ];
     let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -310,10 +323,7 @@ roots = ["./src"]
              impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
              fn main() { }\n",
         ),
-        (
-            "src/iface.hy",
-            "trait Foreign<T> { fn id(T x) -> int; }\n",
-        ),
+        ("src/iface.hy", "trait Foreign<T> { fn id(T x) -> int; }\n"),
     ];
     let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.hy");
     let msgs = compile_project_errors(&root, &entry);
@@ -340,7 +350,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use util::inc;\n\
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::inc;\n\
              fn id<T>(T x) -> T { return x; }\n\
              fn fib(int n) -> int {\n\
                if n <= 2 { return 1; }\n\
@@ -348,7 +358,7 @@ roots = ["./src"]
              }\n\
              fn main() {\n\
                let f = id;\n\
-               print \"%i\", f(inc(fib(5)));\n\
+               write_all(stdout(), to_bytes(format(\"%i\", f(inc(fib(5))))));\n\
              }\n",
         ),
         (
@@ -401,10 +411,7 @@ roots = ["./src"]
     assert!(
         has_fused,
         "final-link fusion should leave fused ops; opcodes: {:?}",
-        bytecode
-            .iter()
-            .map(|b| b.bytecode())
-            .collect::<Vec<_>>()
+        bytecode.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
     );
 
     let output = run_bytecode(bytecode, constants, &pipeline);
@@ -424,8 +431,14 @@ roots = ["./src"]
             "src/main.hy",
             "use a::*;\nuse b::*;\nfn main() { from_a(); from_b(); }\n",
         ),
-        ("src/a.hy", "fn from_a() { print \"%i\", 1; }\n"),
-        ("src/b.hy", "fn from_b() { print \"%i\", 2; }\n"),
+        (
+            "src/a.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
+        ),
+        (
+            "src/b.hy",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
+        ),
     ];
     let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -442,7 +455,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use util::*;\nfn main() { print \"%i\", public_fn(); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::*;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
         ),
         (
             "src/util.hy",
@@ -465,7 +478,7 @@ roots = ["./src"]
         ("src/counter.hy", "static let n = 0;\n"),
         (
             "src/main.hy",
-            "mod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    print \"%i\", counter::n;\n}\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
         ),
     ];
     let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.hy");
@@ -482,7 +495,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::{add, mul};\nfn main() { print \"%i\", add(2, 3); print \"%i\", mul(4, 5); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
         ),
         (
             "src/math.hy",
@@ -505,7 +518,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::{add as plus};\nfn main() { print \"%i\", plus(2, 3); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
         ),
         (
             "src/math.hy",
@@ -561,10 +574,12 @@ roots = ["./src"]
     let _guard = CwdGuard(original_cwd);
 
     let capture = Capture::default();
-    let mut pipeline =
-        Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
+    let mut pipeline = Pipeline::with_reporter(ReportConfig::default(), Box::new(capture.clone()));
     let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
-    assert!(result.is_err(), "expected compile to fail on bad dependency");
+    assert!(
+        result.is_err(),
+        "expected compile to fail on bad dependency"
+    );
     let _ = pipeline.finish_reporting();
     let out = String::from_utf8_lossy(&capture.inner.lock().unwrap()).into_owned();
     assert!(
@@ -594,7 +609,7 @@ file = "./src/main.hy"
 "#;
     let files = &[(
         "src/main.hy",
-        "fn main() { print \"%i\", 42; }\n",
+        "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
     )];
     let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
 
@@ -636,7 +651,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use math::add;\nfn main() { print \"%i\", add(10, 32); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
         ),
         (
             "src/math.hy",
@@ -695,6 +710,8 @@ fn main() {
             "src/pool/worker.hy",
             r#"
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
     while true {
@@ -702,7 +719,7 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
         if job == "stop" {
             break;
         }
-        print "%s,", job;
+        write_all(stdout(), to_bytes(format("%s,", job)));
     }
     return 0;
 }
@@ -735,10 +752,11 @@ roots = ["./src"]
             r#"
 use io::*;
 use helper::write_greeting;
+use string::*;
 
 fn main() {
     write_greeting()?;
-    print "ok";
+    write_all(stdout(), to_bytes("ok"));
 }
 "#,
         ),
@@ -788,10 +806,12 @@ roots = ["./src"]
             "src/main.hy",
             r#"
 use facade::roundtrip;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     roundtrip()?;
-    print "ok";
+    write_all(stdout(), to_bytes("ok"));
 }
 "#,
         ),
@@ -856,9 +876,11 @@ roots = ["./src"]
             "src/main.hy",
             r#"
 use server::check;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
-    print "%i", check();
+    write_all(stdout(), to_bytes(format("%i", check())));
 }
 "#,
         ),

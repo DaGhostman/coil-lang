@@ -1,6 +1,8 @@
 // Built-in Result + Option — nested match with two Ok arms
 // (inner Some vs None) plus Err. Exercises Phase 18A inner-pattern
 // dispatch. Output: 420-1
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Ok(Option::Some(v)) => v,
@@ -10,7 +12,7 @@ fn unwrap_result(Result r) -> int {
 }
 
 fn main() {
-    print "%i", unwrap_result(Result::Ok(Option::Some(42)));
-    print "%i", unwrap_result(Result::Ok(Option::None));
-    print "%i", unwrap_result(Result::Err("oops"));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::Some(42))))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::None)))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Err("oops")))));
 }

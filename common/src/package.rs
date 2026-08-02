@@ -98,7 +98,10 @@ pub fn append_package_payload(
 fn is_ffi_opcode(op: Instruction) -> bool {
     matches!(
         op,
-        Instruction::FfiLoad | Instruction::FfiInvoke | Instruction::DeclareFFI | Instruction::NATIVE
+        Instruction::FfiLoad
+            | Instruction::FfiInvoke
+            | Instruction::DeclareFFI
+            | Instruction::NATIVE
     )
 }
 
@@ -107,33 +110,27 @@ pub fn bytecode_uses_ffi(bytecode: &[Byte]) -> bool {
     bytecode.iter().any(|b| is_ffi_opcode(*b.bytecode()))
 }
 
-/// Decode a `STRING` + `DATA` literal starting at `i`. Returns `(text, index_after)`.
-fn decode_string_literal(bytecode: &[Byte], i: usize) -> Option<(String, usize)> {
+/// Decode a `STRING` table index at `i`. Returns `(text, index_after)`.
+fn decode_string_literal(
+    bytecode: &[Byte],
+    strings: &[String],
+    i: usize,
+) -> Option<(String, usize)> {
     let b = bytecode.get(i)?;
     if *b.bytecode() != Instruction::STRING {
         return None;
     }
-    let count = b.operand_u32() as usize;
-    let mut chars = String::with_capacity(count);
-    let mut j = i + 1;
-    for _ in 0..count {
-        let data = bytecode.get(j)?;
-        if *data.bytecode() != Instruction::DATA {
-            return None;
-        }
-        let ch = char::from_u32(data.operand_u32())?;
-        chars.push(ch);
-        j += 1;
-    }
-    Some((chars, j))
+    let idx = b.operand_u32() as usize;
+    let text = strings.get(idx)?.clone();
+    Some((text, i + 1))
 }
 
-/// Library names passed to `FfiLoad` (STRING literal immediately before each `FfiLoad`).
-pub fn ffi_library_names_from_bytecode(bytecode: &[Byte]) -> Vec<String> {
+/// Library names passed to `FfiLoad` (`STRING` immediately before each `FfiLoad`).
+pub fn ffi_library_names_from_bytecode(bytecode: &[Byte], strings: &[String]) -> Vec<String> {
     let mut names = Vec::new();
     let mut i = 0;
     while i < bytecode.len() {
-        if let Some((name, end)) = decode_string_literal(bytecode, i) {
+        if let Some((name, end)) = decode_string_literal(bytecode, strings, i) {
             if bytecode
                 .get(end)
                 .is_some_and(|b| *b.bytecode() == Instruction::FfiLoad)
@@ -192,12 +189,14 @@ mod tests {
 
     #[test]
     fn extracts_dload_library_name_before_ffi_load() {
-        let mut bc = Vec::new();
-        bc.push(Byte::new(Instruction::STRING).with_operand_u32(3));
-        for ch in "sum".chars() {
-            bc.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
-        }
-        bc.push(Byte::new(Instruction::FfiLoad));
-        assert_eq!(ffi_library_names_from_bytecode(&bc), vec!["sum".to_string()]);
+        let strings = vec!["sum".to_string()];
+        let bc = vec![
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::FfiLoad),
+        ];
+        assert_eq!(
+            ffi_library_names_from_bytecode(&bc, &strings),
+            vec!["sum".to_string()]
+        );
     }
 }

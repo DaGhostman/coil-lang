@@ -46,9 +46,11 @@ Index tuples with integer literals: `t[0]`, `t[1]`, and so on.
 When the index is a **compile-time constant**, the typechecker verifies it is in bounds:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let t = (10, 20);
-print "%i", t[0];   // OK — index 0
-print "%i", t[5];   // compile error: tuple index 5 out of bounds for tuple of length 2
+write_all(stdout(), to_bytes(format("%i", t[0])));   // OK — index 0
+write_all(stdout(), to_bytes(format("%i", t[5])));   // compile error: tuple index 5 out of bounds for tuple of length 2
 ```
 
 Variable indices (for example `t[i]`) are not checked at compile time.
@@ -149,12 +151,14 @@ Indexing uses the same `arr[i]` syntax as tuples.
 `arr[] = value` appends in place (empty index is only legal on the left of `=`). `len(arr)` returns the current runtime length.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = [1, 2];
     a[] = 3;
     a[] = 4;
-    print "%i", len(a); // 4
-    print "%i", a[3];  // 4
+    write_all(stdout(), to_bytes(format("%i", len(a)))); // 4
+    write_all(stdout(), to_bytes(format("%i", a[3])));  // 4
 }
 ```
 
@@ -167,9 +171,11 @@ The appended value must match the element type. After append, a fixed literal ar
 A **dict** (anonymous record) is written with curly braces and named fields:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let d = { foo: 42, bar: 100 };
-print "%i", d.foo;   // 42
-print "%i", d.bar;   // 100
+write_all(stdout(), to_bytes(format("%i", d.foo)));   // 42
+write_all(stdout(), to_bytes(format("%i", d.bar)));   // 100
 ```
 
 ### Structural typing
@@ -189,8 +195,10 @@ There is no separate type name to declare — the shape `{ foo: int, bar: int }`
 Use dot notation: `d.foo`. The compiler resolves the field at compile time. Accessing a field that does not exist on the record's type is an error:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 let d = { foo: 42 };
-print "%i", d.bar;   // error: Cannot find field `bar` on record `{ foo: int }`
+write_all(stdout(), to_bytes(format("%i", d.bar)));   // error: Cannot find field `bar` on record `{ foo: int }`
 ```
 
 Duplicate field names in one literal are also rejected:
@@ -210,6 +218,8 @@ Enum variants can also use record-shaped payloads (`Point { x: int, y: int }`), 
 Give a readable name to any type with `type Name = T;`:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Point = (int, int);
 
 fn distance(Point p) -> int {
@@ -220,9 +230,9 @@ fn distance(Point p) -> int {
 
 fn main() {
     let p: Point = (3, 4);
-    print "%i", p[0];          // 3
-    print "%i", p[1];          // 4
-    print "%i", distance(p);   // 7
+    write_all(stdout(), to_bytes(format("%i", p[0])));          // 3
+    write_all(stdout(), to_bytes(format("%i", p[1])));          // 4
+    write_all(stdout(), to_bytes(format("%i", distance(p))));   // 7
 }
 ```
 
@@ -262,6 +272,8 @@ See `examples/aliases.hy` for a complete runnable example.
 Aggregates compose. A common shape is an **array of typed tuples** — a table of heterogeneous rows:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Row = (string, int);
 type Table = [Row];
 
@@ -269,7 +281,7 @@ fn main() {
     let people: Table = [("alice", 30), ("bob", 25)];
     for row in people {
         let (name, age) = row;
-        print "%s:%i", name, age;
+        write_all(stdout(), to_bytes(format("%s:%i", name, age)));
     }
 }
 ```

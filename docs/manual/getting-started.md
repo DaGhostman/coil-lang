@@ -79,6 +79,8 @@ The canonical starter example computes the 10th Fibonacci number recursively
 workload in `examples/fib_bench.hy`):
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -88,7 +90,7 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(10);
+    write_all(stdout(), to_bytes(format("%i", fib(10))));
 }
 ```
 
@@ -198,8 +200,10 @@ cargo run -- examples/print_literal.hy
 Source:
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -260,7 +264,7 @@ coil uses **AST → stack IL (symbolic labels) → lower/fuse → bytecode**. Th
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
 3. **Codegen (IL)** — walks the AST into a stack IL (`compiler/src/il`) with symbolic jump labels. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`**; tiny callees may be inlined at call sites.
 4. **Lower** — after link, `finalize_bytecode` runs IL opts then fuse-select (`BinSlotImm`, `CmpJmpf`, …), assigns PCs once, and emits `Vec<Byte>`. Label binds act as fusion barriers.
-5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **34**) must match at load time.
+5. **Archive** — bytecode, constant pool, and string table are wrapped in `ArchivedProgram { version, bytecode, constants, strings }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **35**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention
@@ -292,8 +296,7 @@ The language includes:
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
 - **Classes** (partial — see `examples/classes.hy`)
 - **Coroutines** — `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` (see [tutorial/08-coroutines.md](tutorial/08-coroutines.md))
-
-Not yet available: string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
+- **String helpers** — `string::format(...)` and UTF-8 byte conversions via `string::{from_bytes, to_bytes}`
 
 ## Next steps
 
@@ -306,7 +309,7 @@ Not yet available: string concatenation with `+`, and a user-facing `format` key
 
 | Step | Example | Teaches |
 |------|---------|---------|
-| 1 | `print_literal.hy` | `print`, `main` |
+| 1 | `print_literal.hy` | stdout via `io`, `main` |
 | 2 | `let_test.hy` | `let`, reassignment |
 | 3 | `fizbuz.hy` | `if`, modulo, multiple prints |
 | 4 | `option.hy` | enums, `match` |

@@ -54,9 +54,7 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
             Some(1)
         }
         IlOp::StorePop { .. } | IlOp::Pop { .. } | IlOp::Index { .. } => Some(-1),
-        IlOp::MakeTuple { arity, .. } | IlOp::MakeArray { arity, .. } => {
-            Some(1 - *arity as i32)
-        }
+        IlOp::MakeTuple { arity, .. } | IlOp::MakeArray { arity, .. } => Some(1 - *arity as i32),
         IlOp::MakeEnum { arity, .. } => Some(1 - *arity as i32),
         IlOp::BoxValue { .. } | IlOp::UnboxValue { .. } | IlOp::LoadField { .. } => Some(0),
         // GetField: pop target+name, push value (−1). SetField: pop value+target+name, push value (−2).
@@ -69,9 +67,7 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
         // Slot forms push a computed value without consuming eval-stack args.
         IlOp::BinSlotImm { .. } | IlOp::BinSlotSlot { .. } => Some(1),
         // Terminators: treat as consuming the returned value for fall-through SP.
-        IlOp::Return { .. } | IlOp::LoadReturnSlot { .. } | IlOp::ConstReturnImm { .. } => {
-            Some(-1)
-        }
+        IlOp::Return { .. } | IlOp::LoadReturnSlot { .. } | IlOp::ConstReturnImm { .. } => Some(-1),
         IlOp::BinReturn { .. } => Some(-2),
         IlOp::Halt { .. } => Some(0),
         IlOp::Jump {
@@ -110,8 +106,12 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
 
 fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
     match insn {
-        Instruction::LOAD | Instruction::CONST | Instruction::DUPLICATE | Instruction::STRING
-        | Instruction::CodePtr | Instruction::MakePolyFn => {
+        Instruction::LOAD
+        | Instruction::CONST
+        | Instruction::DUPLICATE
+        | Instruction::STRING
+        | Instruction::CodePtr
+        | Instruction::MakePolyFn => {
             if insn == Instruction::LOAD {
                 Some(byte.load_store_count() as i32)
             } else {
@@ -162,18 +162,14 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         | Instruction::BinSlotSlotStore => Some(0),
         Instruction::CmpJmpf => Some(-2),
         Instruction::LogNotJmpf => Some(-1),
-        Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => {
-            Some(-1)
-        }
+        Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => Some(-1),
         Instruction::BinReturn => Some(-2),
         Instruction::HALT | Instruction::NOOP => Some(0),
         Instruction::JMP => Some(0),
         Instruction::JMPF | Instruction::JMPT => Some(-1),
         Instruction::Index => Some(-1),
         Instruction::BoxValue | Instruction::UnboxValue | Instruction::LoadField => Some(0),
-        Instruction::MakeTuple | Instruction::MakeArray => {
-            Some(1 - byte.operand_u32() as i32)
-        }
+        Instruction::MakeTuple | Instruction::MakeArray => Some(1 - byte.operand_u32() as i32),
         Instruction::MakeDict => {
             let arity = (byte.operand_u32() & 0xFFFF) as i32;
             Some(1 - 2 * arity)
@@ -187,16 +183,12 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::HostInvoke => Some(-1),
         Instruction::PRINT | Instruction::GetField => Some(-1),
         Instruction::SetField => Some(-2),
-        // STRING pushes the ObjString; subsequent DATA chars mutate it in place.
+        // STRING pushes the ObjString; DATA is a stack-neutral archive tombstone.
         Instruction::DATA => Some(0),
         // FORMAT n: pop n args + format string, push result (−n). n==0 is a no-op.
         Instruction::FORMAT => {
             let n = byte.operand_u32() as i32;
-            if n == 0 {
-                Some(0)
-            } else {
-                Some(-n)
-            }
+            if n == 0 { Some(0) } else { Some(-n) }
         }
         // STRINGIFY: pop value, push string (net 0).
         Instruction::STRINGIFY => Some(0),
@@ -321,9 +313,7 @@ pub fn analyze_at(ops: &[IlOp], entry_sp: i32) -> SpInfo {
                 if let Some(&t) = label_at.get(&target.0) {
                     let edge_sp = match kind {
                         IlJumpKind::Unconditional => before.apply(Some(0)),
-                        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue => {
-                            before.apply(Some(-1))
-                        }
+                        IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue => before.apply(Some(-1)),
                         IlJumpKind::JumpIfMatch { .. } => before.apply(Some(-1)),
                     };
                     changed |= meet_into(&mut sp_in[t], edge_sp);
@@ -498,12 +488,8 @@ mod tests {
     #[test]
     fn stack_delta_packed_load_store_and_fused_stores() {
         use common::Byte;
-        let load3 = IlOp::byte(
-            Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2),
-        );
-        let store2 = IlOp::byte(
-            Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0),
-        );
+        let load3 = IlOp::byte(Byte::new(Instruction::LOAD).with_load_store_packed(3, 0, 1, 2));
+        let store2 = IlOp::byte(Byte::new(Instruction::STORE).with_load_store_packed(2, 4, 5, 0));
         let imm_store = IlOp::byte(
             Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
                 Instruction::ADD as u8,
@@ -563,10 +549,7 @@ mod tests {
 
     #[test]
     fn stack_delta_typed_longtail_ops() {
-        assert_eq!(
-            stack_delta(&IlOp::Index { loc: loc() }),
-            Some(-1)
-        );
+        assert_eq!(stack_delta(&IlOp::Index { loc: loc() }), Some(-1));
         assert_eq!(
             stack_delta(&IlOp::MakeTuple {
                 arity: 3,
@@ -597,18 +580,9 @@ mod tests {
             }),
             Some(-1)
         );
+        assert_eq!(stack_delta(&IlOp::BoxValue { tag: 0, loc: loc() }), Some(0));
         assert_eq!(
-            stack_delta(&IlOp::BoxValue {
-                tag: 0,
-                loc: loc(),
-            }),
-            Some(0)
-        );
-        assert_eq!(
-            stack_delta(&IlOp::UnboxValue {
-                tag: 0,
-                loc: loc(),
-            }),
+            stack_delta(&IlOp::UnboxValue { tag: 0, loc: loc() }),
             Some(0)
         );
         assert_eq!(
@@ -629,10 +603,7 @@ mod tests {
         );
         assert_eq!(stack_delta(&IlOp::Print { loc: loc() }), Some(-1));
         assert_eq!(
-            stack_delta(&IlOp::ConstPool {
-                idx: 2,
-                loc: loc(),
-            }),
+            stack_delta(&IlOp::ConstPool { idx: 2, loc: loc() }),
             Some(1)
         );
     }
@@ -653,20 +624,20 @@ mod tests {
             )),
             Some(1)
         );
-        // DATA mutates the STRING already on the stack (net 0).
+        // DATA is a legacy archive tombstone (net 0).
         assert_eq!(
-            stack_delta(&IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'a' as u32))),
+            stack_delta(&IlOp::byte(
+                Byte::new(Instruction::DATA).with_operand_u32(b'a' as u32)
+            )),
             Some(0)
         );
         let ops = vec![
             IlOp::byte(Byte::new(Instruction::STRING).with_operand_u32(1)),
-            IlOp::byte(Byte::new(Instruction::DATA).with_operand_u32(b'x' as u32)),
             IlOp::Return { loc: loc() },
         ];
         let info = analyze(&ops);
         assert_eq!(info.sp_before(0), Sp::Known(0));
         assert_eq!(info.sp_before(1), Sp::Known(1));
-        assert_eq!(info.sp_before(2), Sp::Known(1));
     }
 
     #[test]

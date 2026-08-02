@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let sum = 0;
     for (let i = 0; i < 10; i = i + 1) {
@@ -5,5 +7,5 @@ fn main() {
         if i == 7 { break; }
         sum = sum + i;
     }
-    print "%i", sum;
+    write_all(stdout(), to_bytes(format("%i", sum)));
 }

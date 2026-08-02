@@ -1,5 +1,7 @@
 // Expected output: 7
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Tiny<T> {
     fn base(T x) -> int;
 
@@ -19,5 +21,5 @@ fn get<T: Tiny>(T x) -> int {
 }
 
 fn main() {
-    print "%i", get(41);
+    write_all(stdout(), to_bytes(format("%i", get(41))));
 }

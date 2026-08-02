@@ -112,10 +112,7 @@ fn with_regex<R>(
         .ok_or(RegexErrorTag::Runtime)?
 }
 
-fn expand_replacement(
-    template: &str,
-    caps: &Captures<'_>,
-) -> Result<String, RegexErrorTag> {
+fn expand_replacement(template: &str, caps: &Captures<'_>) -> Result<String, RegexErrorTag> {
     let mut out = String::new();
     let bytes = template.as_bytes();
     let mut i = 0;
@@ -226,7 +223,10 @@ pub fn host_regex_find(heap: &mut Heap, args: &[Value]) -> Value {
 fn try_find(heap: &mut Heap, args: &[Value]) -> Result<Value, RegexErrorTag> {
     let subject = heap_string(heap, args[1])?;
     let span = with_regex(heap, args[0], |re| {
-        match re.find(subject.as_bytes()).map_err(|_| RegexErrorTag::Runtime)? {
+        match re
+            .find(subject.as_bytes())
+            .map_err(|_| RegexErrorTag::Runtime)?
+        {
             Some(m) => Ok((m.start() as i64, m.end() as i64)),
             None => Err(RegexErrorTag::NoMatch),
         }
@@ -331,11 +331,7 @@ pub fn host_regex_replace_all(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_replace(
-    heap: &mut Heap,
-    args: &[Value],
-    all: bool,
-) -> Result<Value, RegexErrorTag> {
+fn try_replace(heap: &mut Heap, args: &[Value], all: bool) -> Result<Value, RegexErrorTag> {
     let subject = heap_string(heap, args[1])?;
     let template = heap_string(heap, args[2])?;
     let replaced = with_regex(heap, args[0], |re| {

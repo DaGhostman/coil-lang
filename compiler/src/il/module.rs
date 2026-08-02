@@ -156,10 +156,7 @@ mod tests {
                 slot: 0,
                 loc: loc(),
             },
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Bin {
                 op: Instruction::ADD,
                 loc: loc(),
@@ -170,15 +167,9 @@ mod tests {
     #[test]
     fn from_flat_splits_prologue_body_epilogue() {
         let ops = vec![
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Pop { loc: loc() },
-            IlOp::Const {
-                imm: 2,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Return { loc: loc() },
             IlOp::Halt { loc: loc() },
         ];
@@ -194,28 +185,16 @@ mod tests {
     #[test]
     fn from_flat_preserves_inter_func_glue() {
         let ops = vec![
-            IlOp::Const {
-                imm: 0,
-                loc: loc(),
-            },
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Return { loc: loc() },
             IlOp::Dup { loc: loc() },
             IlOp::Pop { loc: loc() },
-            IlOp::Const {
-                imm: 2,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 2, loc: loc() },
             IlOp::Return { loc: loc() },
             IlOp::Halt { loc: loc() },
         ];
-        let funcs = vec![
-            IlFunc::new("a", None, 1, 3),
-            IlFunc::new("b", None, 5, 7),
-        ];
+        let funcs = vec![IlFunc::new("a", None, 1, 3), IlFunc::new("b", None, 5, 7)];
         let m = IlModule::from_flat(&ops, &funcs);
         assert_eq!(m.prologue.len(), 1);
         assert_eq!(m.funcs.len(), 2);
@@ -229,10 +208,7 @@ mod tests {
     #[test]
     fn with_entries_preserves_entry_map() {
         let ops = vec![
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         let funcs = vec![IlFunc::new("f", Some(Label(9)), 0, 2)];
@@ -247,10 +223,7 @@ mod tests {
     #[test]
     fn with_entries_survives_empty_funcs_from_flat() {
         let ops = vec![
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Return { loc: loc() },
         ];
         let mut entries = HashMap::new();
@@ -267,18 +240,16 @@ mod tests {
             prologue: vec![
                 IlOp::Dup { loc: loc() },
                 IlOp::Pop { loc: loc() },
-                IlOp::Const {
-                    imm: 1,
-                    loc: loc(),
-                },
+                IlOp::Const { imm: 1, loc: loc() },
                 IlOp::Return { loc: loc() },
             ],
             ..IlModule::default()
         };
         let flat = m.optimize_and_flatten(&OptimizeOptions::default());
         assert!(!flat.iter().any(|op| matches!(op, IlOp::Dup { .. })));
-        assert!(flat.iter().any(|op| matches!(op, IlOp::ConstReturnImm { .. })
-            || matches!(op, IlOp::Return { .. })));
+        assert!(flat.iter().any(
+            |op| matches!(op, IlOp::ConstReturnImm { .. }) || matches!(op, IlOp::Return { .. })
+        ));
     }
 
     #[test]
@@ -286,10 +257,7 @@ mod tests {
         let ops = vec![
             IlOp::Dup { loc: loc() },
             IlOp::Pop { loc: loc() },
-            IlOp::Const {
-                imm: 1,
-                loc: loc(),
-            },
+            IlOp::Const { imm: 1, loc: loc() },
             IlOp::Dup { loc: loc() },
             IlOp::Pop { loc: loc() },
             IlOp::Return { loc: loc() },
@@ -310,10 +278,7 @@ mod tests {
     #[test]
     fn multi_op_on_full_buffer_refuses_when_prologue_poisons_sp() {
         let suf = load_const_add_suffix();
-        let cond = IlOp::Const {
-            imm: 1,
-            loc: loc(),
-        };
+        let cond = IlOp::Const { imm: 1, loc: loc() };
         let mut ops = vec![IlOp::byte(Byte::new(Instruction::PRINT))];
         let body_start = ops.len();
         ops.extend(suf.clone());
@@ -362,10 +327,7 @@ mod tests {
     #[test]
     fn multi_op_on_full_buffer_still_sinks_clean_body() {
         let suf = load_const_add_suffix();
-        let cond = IlOp::Const {
-            imm: 1,
-            loc: loc(),
-        };
+        let cond = IlOp::Const { imm: 1, loc: loc() };
         let mut ops = Vec::new();
         ops.extend(suf.clone());
         ops.push(cond.clone());
@@ -403,6 +365,9 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))
             .count();
-        assert_eq!(loads, 1, "clean body must still sink via whole-buffer multi_op");
+        assert_eq!(
+            loads, 1,
+            "clean body must still sink via whole-buffer multi_op"
+        );
     }
 }

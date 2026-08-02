@@ -150,7 +150,10 @@ fn signature_from_function(type_params: &[TypeParam<'_>], args: &Output) -> Gene
     if let Expression::Fragment(children) = args.1.as_ref() {
         for child in children {
             if let Expression::Argument(ty, _, is_rest) = child.1.as_ref() {
-                param_type_params.push(ty.as_ref().and_then(|t| type_param_ref_index(t, &type_param_names)));
+                param_type_params.push(
+                    ty.as_ref()
+                        .and_then(|t| type_param_ref_index(t, &type_param_names)),
+                );
                 param_is_rest.push(*is_rest);
             }
         }
@@ -339,10 +342,7 @@ fn split_call_args_for_mono<'a>(
                     rest.push(value);
                     continue;
                 }
-                if let Some(idx) = param_names[..fixed_count]
-                    .iter()
-                    .position(|p| p == *name)
-                {
+                if let Some(idx) = param_names[..fixed_count].iter().position(|p| p == *name) {
                     slots[idx] = Some(value);
                 }
             }
@@ -363,10 +363,7 @@ fn split_call_args_for_mono<'a>(
         }
     }
     let pack_rest = has_rest
-        && (has_named
-            || next_pos >= fixed_count
-            || args.len() >= fixed_count
-            || fixed_count == 0);
+        && (has_named || next_pos >= fixed_count || args.len() >= fixed_count || fixed_count == 0);
     let fixed: Vec<_> = slots.into_iter().flatten().collect();
     if pack_rest {
         Some((fixed, rest, true))
@@ -650,14 +647,6 @@ where
             f(start);
             f(end);
         }
-        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-            f(fmt);
-            if let Some(params) = params {
-                for param in params {
-                    f(param);
-                }
-            }
-        }
         Expression::Resume(target, arg) => {
             f(target);
             if let Some(arg) = arg {
@@ -837,7 +826,12 @@ where
             f(params);
             f(ret);
         }
-        Expression::AttrDecl { args, returns, body, .. } => {
+        Expression::AttrDecl {
+            args,
+            returns,
+            body,
+            ..
+        } => {
             f(args);
             if let Some(returns) = returns {
                 f(returns);
@@ -853,7 +847,8 @@ mod tests {
     use parser::Pratt;
 
     fn plan(src: &str) -> MonoPlan {
-        let ast = Pratt::default().parse(src).expect("parse failed");
+        let src = format!("use io::{{stdout, write_all}}; use string::{{format, to_bytes}}; {src}");
+        let ast = Pratt::default().parse(src.as_str()).expect("parse failed");
         let mut checker = Checker::new();
         let _ = checker.check_program(&ast);
         plan_monomorphization("", &ast, &checker)
@@ -863,7 +858,7 @@ mod tests {
     fn plans_ground_bounded_generic_call() {
         let plan = plan(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { print \"%i\", add(1, 2); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.fn_name, "add");
@@ -878,7 +873,7 @@ mod tests {
         // *element* ground type (one slot per formal), not the packed array.
         let plan = plan(
             "fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; } \
-             fn main() { print \"%i\", twice_first(21); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", twice_first(21)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.fn_name, "twice_first");
@@ -890,7 +885,7 @@ mod tests {
     fn plans_named_arg_ground_bounded_generic_call() {
         let plan = plan(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { print \"%i\", add(b: 2, a: 1); }",
+             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(b: 2, a: 1)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.subst, vec!["int"]);

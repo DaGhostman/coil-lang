@@ -1,4 +1,6 @@
 // ?. optional field access + ?? fallback on a record (dict).
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn show(Option o) -> int {
     return match o {
         Option::Some(n) => n,
@@ -9,6 +11,6 @@ fn show(Option o) -> int {
 fn main() {
     let some = Option::Some({ v: 42 });
     let none = Option::None;
-    print "%i,", show(some?.v);
-    print "%i", none?.v ?? 0;
+    write_all(stdout(), to_bytes(format("%i,", show(some?.v))));
+    write_all(stdout(), to_bytes(format("%i", none?.v ?? 0)));
 }

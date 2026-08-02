@@ -3,6 +3,8 @@
 // User trait dictionaries are consumed inside generic bodies and
 // forwarded through nested generic calls.
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 trait Describable<T> {
     fn describe_val(T x) -> int;
 }
@@ -26,6 +28,6 @@ fn outer<T: Describable>(T x) -> int {
 }
 
 fn main() {
-    print "%i", show(41);
-    print "%i", outer(41);
+    write_all(stdout(), to_bytes(format("%i", show(41))));
+    write_all(stdout(), to_bytes(format("%i", outer(41))));
 }

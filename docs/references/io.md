@@ -15,7 +15,7 @@ use io::*;
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
 | `read_exact` / `read_to_end` / `write_all` | Sync adapters | May block in the host via `poll` |
 | `set_read_timeout` / `set_write_timeout` | Sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
-| `from_bytes` / `to_bytes` | Text | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`) |
+| `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
 | `io::net::tcp::{connect,connect_timeout,listen,accept,accept_wait,accept_wait_timeout}` | TCP | Nested module — `use io::net::tcp::*;`; timeout `ms <= 0` waits forever |
 | `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
 | `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
@@ -42,8 +42,7 @@ TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
 non-empty PEM enables mTLS. `timeout_ms <= 0` means no handshake deadline.
 
-Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still
-uses the `PRINT` opcode (not `stdout`). HTTP remains userland (`stdlib/http`).
+Buffers are **`[byte]`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP remains userland (`stdlib/http`).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 
@@ -53,3 +52,4 @@ See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examp
 
 - [IO tutorial](../manual/tutorial/10-io-streams.md)
 - [io::fs](io-fs.md)
+- [string](string.md)

@@ -4,6 +4,8 @@
 // target type must be local (strict orphan rule — builtin heads like `int`
 // are not allowed as instance arguments for foreign traits).
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Celsius {
     c: int,
 }
@@ -21,5 +23,5 @@ impl Into<Fahrenheit> for Celsius {
 fn main() {
     let c = new Celsius(0);
     let f: Fahrenheit = c.into();
-    print "%i", f.f;
+    write_all(stdout(), to_bytes(format("%i", f.f)));
 }

@@ -1,4 +1,6 @@
 // Hot GetField path: repeated reads of the same class fields.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -25,5 +27,5 @@ fn main() {
         acc = acc + p.x + p.y;
         i = i + 1;
     }
-    print "%i", acc;
+    write_all(stdout(), to_bytes(format("%i", acc)));
 }

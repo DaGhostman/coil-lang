@@ -28,7 +28,7 @@ fn fib(n: u16) {
         Byte::new(Instruction::BinReturn).with_bin_return(add),
     ];
 
-    Machine::<512>::default().run_with_pool(fib.as_slice(), &pool, 0)
+    Machine::<512>::default().run_with_pool(fib.as_slice(), &pool, &[], 0)
 }
 
 fn fib_benchmark(c: &mut Criterion) {

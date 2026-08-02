@@ -2,7 +2,7 @@
 //
 // Exercises the linearizer's new `Inst::Call` arm and the
 // `is_straight_line` lift for `Call`. Both `add` and `main` are
-// straight-line (no control flow, no Print/Format/Construct/
+// straight-line (no control flow, no Construct/
 // Access, no Assignment/Defer), so both route through the
 // `cfg_builder` + `linearize` pipeline.
 //
@@ -13,15 +13,17 @@
 // "add" up in `Compiler::function_offsets` and patches the JMP's
 // operand with the resolved offset.
 //
-// Expected output (one `print "done";` statement, no trailing
-// newline): `"done"`. The return value of `add(3, 4)` is
+// Expected output (one stdout write, no trailing newline): `"done"`.
+// The return value of `add(3, 4)` is
 // discarded (it's an expression statement with no consumer).
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
     add(3, 4);
-    print "done";
+    write_all(stdout(), to_bytes("done"));
 }

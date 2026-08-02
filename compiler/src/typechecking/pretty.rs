@@ -30,11 +30,7 @@ fn fresh_diag_name(next: &mut u32) -> String {
     }
 }
 
-fn format_ty_renamed(
-    ty: &Ty,
-    rename: &mut HashMap<TyVarId, String>,
-    next: &mut u32,
-) -> String {
+fn format_ty_renamed(ty: &Ty, rename: &mut HashMap<TyVarId, String>, next: &mut u32) -> String {
     match ty {
         Ty::Var(v) => rename
             .entry(*v)
@@ -149,9 +145,7 @@ fn format_ty_renamed(
             body,
         } => {
             for v in bounds {
-                rename
-                    .entry(*v)
-                    .or_insert_with(|| fresh_diag_name(next));
+                rename.entry(*v).or_insert_with(|| fresh_diag_name(next));
             }
             let vars = bounds
                 .iter()
@@ -442,12 +436,11 @@ mod tests {
     /// (word-boundary `t` + digits). Must not use `contains('t')` —
     /// class names such as `Convert` contain the letter `t`.
     fn contains_raw_tvar_id(s: &str) -> bool {
-        s.split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|tok| {
-                tok.len() > 1
-                    && tok.starts_with('t')
-                    && tok.as_bytes()[1..].iter().all(u8::is_ascii_digit)
-            })
+        s.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+            tok.len() > 1
+                && tok.starts_with('t')
+                && tok.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+        })
     }
 
     #[test]

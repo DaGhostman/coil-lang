@@ -56,7 +56,8 @@ mod tests {
     fn create_sink_builds_pretty_sarif_and_lsp() {
         for format in [ReportFormat::Pretty, ReportFormat::Sarif, ReportFormat::Lsp] {
             let config = ReportConfig { format };
-            let mut sink = create_sink(&config, SourceMap::new(), Box::new(Cursor::new(Vec::new())));
+            let mut sink =
+                create_sink(&config, SourceMap::new(), Box::new(Cursor::new(Vec::new())));
             assert!(!sink.had_errors());
             sink.emit(Diagnostic::error("boom").with_code(ErrorCode::ParseError));
             assert!(sink.had_errors());
@@ -82,4 +83,3 @@ mod tests {
         sink.finish().expect("finish");
     }
 }
-

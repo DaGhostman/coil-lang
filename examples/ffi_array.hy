@@ -2,6 +2,8 @@
 
 use ffi::*;
 use ffi::types::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let lib = match dload("sum") {
@@ -17,5 +19,5 @@ fn main() {
         Result::Ok(v) => v,
         Result::Err(e) => panic e.message,
     };
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }

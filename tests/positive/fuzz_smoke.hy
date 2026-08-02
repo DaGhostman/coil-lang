@@ -1,4 +1,6 @@
 // Dense smoke coverage: many small independent syntax shapes in one file.
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Tiny {
     A,
     B,
@@ -65,7 +67,7 @@ test("reassign through arithmetic chain") {
 }
 
 test("string format with int float bool") {
-    let s = format "%i %f %z", 1, 2.5, false;
+    let s = format("%i %f %z", 1, 2.5, false);
     // Fresh allocation — just check it is a distinct usable string.
     assert(s != "")?;
     assert(s != "x")?;

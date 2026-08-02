@@ -168,9 +168,7 @@ pub fn homogeneous_aggregate_elem(ty: &Ty) -> Option<Ty> {
 pub fn result_ty_for(shape: &ArithShape) -> Ty {
     match shape {
         ArithShape::Scalar(t) => t.clone(),
-        ArithShape::Tuple { elem, arity } => {
-            Ty::Tuple(vec![elem.clone(); *arity])
-        }
+        ArithShape::Tuple { elem, arity } => Ty::Tuple(vec![elem.clone(); *arity]),
         ArithShape::Array { elem, length } => Ty::Array {
             element: Box::new(elem.clone()),
             length: *length,
@@ -247,7 +245,13 @@ pub fn classify_vector(ty: &Ty) -> Option<(Ty /*elem*/, usize /*len*/, bool /*is
 /// Accepts `[[T; N]; M]` or a homogeneous tuple of equal-arity row tuples/arrays.
 pub fn classify_matrix(
     ty: &Ty,
-) -> Option<(Ty /*elem*/, usize /*m*/, usize /*n*/, bool /*outer_tuple*/, bool /*row_tuple*/)> {
+) -> Option<(
+    Ty,    /*elem*/
+    usize, /*m*/
+    usize, /*n*/
+    bool,  /*outer_tuple*/
+    bool,  /*row_tuple*/
+)> {
     match ty {
         Ty::Array {
             element,
@@ -368,7 +372,10 @@ mod tests {
         assert_eq!(arr.0, float());
         assert_eq!(arr.1, 2);
         assert!(!arr.2, "array flag");
-        assert!(classify_vector(&array(int())).is_none(), "dynamic [T] is not a vector");
+        assert!(
+            classify_vector(&array(int())).is_none(),
+            "dynamic [T] is not a vector"
+        );
     }
 
     #[test]
@@ -402,6 +409,9 @@ mod tests {
             array_fixed(int(), 3),
         ]))
         .unwrap();
-        assert_eq!((mixed2.1, mixed2.2, mixed2.3, mixed2.4), (2, 3, true, false));
+        assert_eq!(
+            (mixed2.1, mixed2.2, mixed2.3, mixed2.4),
+            (2, 3, true, false)
+        );
     }
 }

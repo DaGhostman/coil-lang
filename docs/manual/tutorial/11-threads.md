@@ -18,6 +18,8 @@ All primitives return `prelude::Result<…, thread::Error>`. Use `?` in result-m
 
 ```coil
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn work() -> int {
     return 40 + 2;
@@ -25,7 +27,7 @@ fn work() -> int {
 
 fn main() {
     let t = spawn(work)?;
-    print "%i", join(t)?;
+    write_all(stdout(), to_bytes(format("%i", join(t)?)));
 }
 ```
 
@@ -39,6 +41,8 @@ fn main() {
 
 ```coil
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn producer(Sender tx) {
     send(tx, "hello")?;
@@ -49,7 +53,7 @@ fn main() {
     let tx = pair[0];
     let rx = pair[1];
     let t = spawn(producer, tx)?;
-    print "%s", recv(rx)?;
+    write_all(stdout(), to_bytes(format("%s", recv(rx)?)));
     join(t)?;
 }
 ```
@@ -60,6 +64,8 @@ One channel is one-way. To send work *and* receive a reply, create **two** chann
 
 ```coil
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn worker((Receiver, Sender) ends) {
     let job = recv(ends[0])?;
@@ -71,7 +77,7 @@ fn main() {
     let replies = channel()?;
     let t = spawn(worker, (jobs[1], replies[0]))?;
     send(jobs[0], "ping")?;
-    print "%s", recv(replies[1])?;
+    write_all(stdout(), to_bytes(format("%s", recv(replies[1])?)));
     join(t)?;
 }
 ```
@@ -94,6 +100,8 @@ Channels are **unbounded** today: `try_send` always enqueues (same as `send`) an
 
 ```coil
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn bump(Mutex m) {
     with_lock(m, fn (int n) => (n + 1, 0))?;
@@ -106,7 +114,7 @@ fn main() {
     join(t1)?;
     join(t2)?;
     let n = with_lock(m, fn (int x) => (x, x))?;
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 

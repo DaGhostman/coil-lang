@@ -4,16 +4,57 @@
 //! (`read_exact`, `read_to_end`, `write_all`, …) may block in Rust
 //! via `poll`, but never busy-spin on `WouldBlock`.
 
+use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
-use common::{
-    BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value,
-};
+use common::{BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
+
+type OutputRedirect = *mut (dyn Write + Send);
+
+thread_local! {
+    static OUTPUT_REDIRECT: RefCell<Option<OutputRedirect>> = RefCell::new(None);
+    static SHARED_PRINT: RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>> =
+        RefCell::new(None);
+}
+
+pub fn set_output_redirect(sink: Option<OutputRedirect>) -> Option<OutputRedirect> {
+    OUTPUT_REDIRECT.with(|cell| cell.replace(sink))
+}
+
+/// Install the process-wide shared print buffer for this OS thread (workers).
+pub fn set_shared_print_redirect(
+    buf: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+) -> Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> {
+    SHARED_PRINT.with(|cell| cell.replace(buf))
+}
+
+fn with_output_redirect<T>(f: impl FnOnce(&mut (dyn Write + Send)) -> T) -> Option<T> {
+    OUTPUT_REDIRECT.with(|cell| {
+        let ptr = (*cell.borrow())?;
+        Some(f(unsafe { &mut *ptr }))
+    })
+}
+
+fn write_captured_stdout(bytes: &[u8]) -> Option<Result<usize, IoErrorTag>> {
+    if let Some(result) = with_output_redirect(|out| match out.write(bytes) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+    }) {
+        return Some(result);
+    }
+    SHARED_PRINT.with(|cell| {
+        let guard = cell.borrow();
+        let buf = guard.as_ref()?;
+        let mut g = buf.lock().ok()?;
+        g.extend_from_slice(bytes);
+        Some(Ok(bytes.len()))
+    })
+}
 
 /// Tag indices for [`IoError`](common::BUILTIN_IO_ERROR_ENUM).
 ///
@@ -345,11 +386,7 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
             .iter()
             .map(|v| {
                 let n = v.as_int();
-                if !(0..=255).contains(&n) {
-                    0
-                } else {
-                    n as u8
-                }
+                if !(0..=255).contains(&n) { 0 } else { n as u8 }
             })
             .collect(),
         _ => return Err(IoErrorTag::InvalidInput),
@@ -358,6 +395,11 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
     with_stream_mut(heap, stream, |s| -> Result<usize, IoErrorTag> {
         if s.closed || s.fd.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
+        }
+        if matches!(s.kind, StreamKind::Stdout | StreamKind::Stderr)
+            && let Some(result) = write_captured_stdout(&bytes)
+        {
+            return result;
         }
         let fd = s.fd.as_ref().unwrap().as_raw_fd();
         #[cfg(feature = "tls")]
@@ -511,10 +553,7 @@ fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
     #[cfg(feature = "tls")]
     {
         let skip = with_stream_mut(heap, stream, |s| {
-            s.kind == StreamKind::Tls
-                && s.tls
-                    .as_ref()
-                    .is_some_and(|t| t.has_buffered_plaintext())
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.has_buffered_plaintext())
         })?;
         if skip {
             return Ok(());
@@ -1284,7 +1323,10 @@ mod tests {
         let t = udp_recv_from_wait(&mut heap, server, buf).expect("recv");
         let elems = tuple_elems(&heap, t);
         assert_eq!(elems[0].as_int(), 2);
-        assert_eq!(elems[2].as_int(), udp_local_port(&mut heap, client).unwrap());
+        assert_eq!(
+            elems[2].as_int(),
+            udp_local_port(&mut heap, client).unwrap()
+        );
         assert_eq!(&array_bytes(&heap, buf)[..2], b"Hi");
 
         stream_close(&mut heap, server).unwrap();
@@ -1376,7 +1418,10 @@ mod tests {
         // Port 1 is almost never listening; short timeout still fails fast.
         let err = tcp_connect_timeout(&mut heap, "127.0.0.1", 1, 50).unwrap_err();
         assert!(
-            matches!(err, IoErrorTag::Other | IoErrorTag::TimedOut | IoErrorTag::PermissionDenied),
+            matches!(
+                err,
+                IoErrorTag::Other | IoErrorTag::TimedOut | IoErrorTag::PermissionDenied
+            ),
             "unexpected {err:?}"
         );
     }

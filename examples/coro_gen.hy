@@ -1,3 +1,5 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 async fn counter() {
     yield 0;
     yield 1;
@@ -6,7 +8,7 @@ async fn counter() {
 
 fn main() {
     let h = counter();
-    print "%i", resume h;
-    print "%i", resume h;
-    print "%i", resume h;
+    write_all(stdout(), to_bytes(format("%i", resume h)));
+    write_all(stdout(), to_bytes(format("%i", resume h)));
+    write_all(stdout(), to_bytes(format("%i", resume h)));
 }

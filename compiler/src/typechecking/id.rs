@@ -128,8 +128,8 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Not(e)
         | Expression::LogicalNot(e)
         | Expression::Positive(e)
-            | Expression::Adjust { target: e, .. }
-            | Expression::Member(e) => pre_walk(e, table),
+        | Expression::Adjust { target: e, .. }
+        | Expression::Member(e) => pre_walk(e, table),
         Expression::Defer { body, .. } => pre_walk(body, table),
 
         Expression::CompoundAssign(name, _, value) => {
@@ -172,15 +172,6 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         Expression::Range { start, end, .. } => {
             pre_walk(start, table);
             pre_walk(end, table);
-        }
-
-        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-            pre_walk(fmt, table);
-            if let Some(p) = params {
-                for param in p {
-                    pre_walk(param, table);
-                }
-            }
         }
 
         Expression::Resume(target, arg) => {

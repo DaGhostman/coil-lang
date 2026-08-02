@@ -40,11 +40,18 @@ pub struct FfiSignatureBuilder {
 pub enum FfiError {
     MissingName,
     MissingReturnType,
-    VoidArgument { index: usize },
+    VoidArgument {
+        index: usize,
+    },
     EmptyName,
     Libffi(String),
-    ArityMismatch { expected: usize, got: usize },
-    SymbolNotFound { name: String },
+    ArityMismatch {
+        expected: usize,
+        got: usize,
+    },
+    SymbolNotFound {
+        name: String,
+    },
     LibraryNotFound {
         name: String,
         tried: Vec<String>,

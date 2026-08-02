@@ -32,7 +32,10 @@ impl ConstVal {
 /// Evaluate `expr` to a [`ConstVal`] when it is a pure compile-time form.
 ///
 /// `lookup` resolves `const` bindings by name. Mutable `let` bindings are not folded.
-pub fn eval_const(expr: &Output<'_>, lookup: &dyn Fn(&str) -> Option<ConstVal>) -> Option<ConstVal> {
+pub fn eval_const(
+    expr: &Output<'_>,
+    lookup: &dyn Fn(&str) -> Option<ConstVal>,
+) -> Option<ConstVal> {
     match expr.1.as_ref() {
         Expression::Statement(inner)
         | Expression::Expr(inner)

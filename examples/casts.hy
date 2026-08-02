@@ -1,9 +1,11 @@
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let n = 257;
     let b = n as byte;
-    print "%i", b as int;
+    write_all(stdout(), to_bytes(format("%i", b as int)));
     let f = 3.9 as int;
-    print "%i", f;
+    write_all(stdout(), to_bytes(format("%i", f)));
     let flag = 1 as bool;
-    print "%z", flag;
+    write_all(stdout(), to_bytes(format("%z", flag)));
 }

@@ -11,9 +11,11 @@
 //   100
 //   42
 
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let d = { foo: 42, bar: 100 };
-    print "%i", d.foo;
-    print "%i", d.bar;
-    print "%i", d.foo;
+    write_all(stdout(), to_bytes(format("%i", d.foo)));
+    write_all(stdout(), to_bytes(format("%i", d.bar)));
+    write_all(stdout(), to_bytes(format("%i", d.foo)));
 }

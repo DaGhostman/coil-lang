@@ -4,9 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, RwLock,
-};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 
 /// Per-root-VM registry of undetached spawns (shared with nested workers via
@@ -50,22 +48,25 @@ pub fn join_undetached_threads(registry: &LiveThreadRegistry) {
                 continue;
             }
             let _ = state.wait_result();
-            if let Some(h) = state.join_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(h) = state
+                .join_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 let _ = h.join();
             }
         }
     }
 }
 
-use common::{
-    Byte, BUILTIN_RESULT_VARIANTS, BUILTIN_THREAD_ERROR_VARIANTS, ProgramDebug, Value,
-};
+use common::{BUILTIN_RESULT_VARIANTS, BUILTIN_THREAD_ERROR_VARIANTS, Byte, ProgramDebug, Value};
 
 use crate::ffi::Natives;
 use crate::io::{alloc_result_err, alloc_result_ok};
 use crate::memory::{
-    Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjReceiver, ObjRwLock, ObjSender,
-    ObjThread, ObjThreadMutex, ObjTuple, Object,
+    Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjReceiver, ObjRwLock, ObjSender, ObjThread,
+    ObjThreadMutex, ObjTuple, Object,
 };
 use crate::vm::Machine;
 
@@ -77,6 +78,7 @@ pub const WORKER_STACK_SLOTS: usize = 256;
 pub struct ThreadProgram {
     pub code: Arc<Vec<Byte>>,
     pub constants: Arc<Vec<u64>>,
+    pub strings: Arc<Vec<String>>,
     pub static_slot_count: u32,
     pub debug: ProgramDebug,
 }
@@ -130,7 +132,9 @@ impl std::fmt::Debug for PortableValue {
                 .field("tag", tag)
                 .field("payload", payload)
                 .finish(),
-            Self::Instance { fields } => f.debug_struct("Instance").field("fields", fields).finish(),
+            Self::Instance { fields } => {
+                f.debug_struct("Instance").field("fields", fields).finish()
+            }
             Self::Boxed(inner) => f.debug_tuple("Boxed").field(inner).finish(),
             Self::Sender(_) => write!(f, "Sender(..)"),
             Self::Receiver(_) => write!(f, "Receiver(..)"),
@@ -211,10 +215,7 @@ impl JoinState {
     fn wait_result(&self) -> Result<PortableValue, ThreadErrorTag> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         while g.result.is_none() {
-            g = self
-                .finished
-                .wait(g)
-                .unwrap_or_else(|e| e.into_inner());
+            g = self.finished.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         g.result.take().unwrap_or(Err(ThreadErrorTag::JoinFailed))
     }
@@ -525,7 +526,13 @@ fn decode_portable(heap: &mut Heap, p: PortableValue) -> Result<Value, ThreadErr
                 let v = decode_portable(heap, pv)?;
                 members.push(member_from_value(heap, v));
             }
-            let (obj, _) = heap.alloc(ObjEnum { tag, payload: members }, Object::Enum);
+            let (obj, _) = heap.alloc(
+                ObjEnum {
+                    tag,
+                    payload: members,
+                },
+                Object::Enum,
+            );
             Ok(Value::from(obj.addr()))
         }
         PortableValue::Instance { fields } => {
@@ -667,8 +674,13 @@ fn run_worker(ctx: WorkerCtx) {
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
             vm.with_output(SharedPrintWriter(Arc::clone(buf)));
+            crate::io::set_shared_print_redirect(Some(Arc::clone(buf)));
         }
-        vm.load_program(program.code.as_slice(), program.constants.as_slice());
+        vm.load_program(
+            program.code.as_slice(),
+            program.constants.as_slice(),
+            program.strings.as_slice(),
+        );
         vm.init_static_slots(program.static_slot_count);
         let mut child_args = Vec::new();
         for a in args {
@@ -796,10 +808,7 @@ pub fn host_channel(heap: &mut Heap, _args: &[Value]) -> Value {
         Object::Sender,
     );
     let (rx_obj, _) = heap.alloc(ObjReceiver { inner }, Object::Receiver);
-    let pair = vec![
-        Value::from(tx_obj.addr()),
-        Value::from(rx_obj.addr()),
-    ];
+    let pair = vec![Value::from(tx_obj.addr()), Value::from(rx_obj.addr())];
     let (tup, _) = heap.alloc(ObjTuple { elements: pair }, Object::Tuple);
     let v = Value::from(tup.addr());
     as_result_value(heap, Ok(v))
@@ -911,7 +920,11 @@ pub fn host_with_lock(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_host_with_lock(heap: &mut Heap, mtx: Value, callback: Value) -> Result<Value, ThreadErrorTag> {
+fn try_host_with_lock(
+    heap: &mut Heap,
+    mtx: Value,
+    callback: Value,
+) -> Result<Value, ThreadErrorTag> {
     let (entry, _) = fn_entry_from_value(heap, callback)?;
     let Some(Object::Mutex(gc)) = heap.find_object_by_addr(mtx.raw() as u64) else {
         return Err(ThreadErrorTag::Other);
@@ -925,10 +938,7 @@ fn try_host_with_lock(heap: &mut Heap, mtx: Value, callback: Value) -> Result<Va
     Ok(out_r)
 }
 
-fn parse_lock_callback_result(
-    heap: &Heap,
-    ret: Value,
-) -> Result<(Value, Value), ThreadErrorTag> {
+fn parse_lock_callback_result(heap: &Heap, ret: Value) -> Result<(Value, Value), ThreadErrorTag> {
     let Some(Object::Tuple(gc)) = heap.find_object_by_addr(ret.raw() as u64) else {
         return Err(ThreadErrorTag::Other);
     };
@@ -1039,7 +1049,11 @@ pub fn host_with_read(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_host_with_read(heap: &mut Heap, lock: Value, callback: Value) -> Result<Value, ThreadErrorTag> {
+fn try_host_with_read(
+    heap: &mut Heap,
+    lock: Value,
+    callback: Value,
+) -> Result<Value, ThreadErrorTag> {
     let (entry, _) = fn_entry_from_value(heap, callback)?;
     let Some(Object::RwLock(gc)) = heap.find_object_by_addr(lock.raw() as u64) else {
         return Err(ThreadErrorTag::Other);
@@ -1061,7 +1075,11 @@ pub fn host_with_write(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_host_with_write(heap: &mut Heap, lock: Value, callback: Value) -> Result<Value, ThreadErrorTag> {
+fn try_host_with_write(
+    heap: &mut Heap,
+    lock: Value,
+    callback: Value,
+) -> Result<Value, ThreadErrorTag> {
     let (entry, _) = fn_entry_from_value(heap, callback)?;
     let Some(Object::RwLock(gc)) = heap.find_object_by_addr(lock.raw() as u64) else {
         return Err(ThreadErrorTag::Other);
@@ -1080,7 +1098,11 @@ pub fn host_try_read(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_host_try_read(heap: &mut Heap, lock: Value, callback: Value) -> Result<Value, ThreadErrorTag> {
+fn try_host_try_read(
+    heap: &mut Heap,
+    lock: Value,
+    callback: Value,
+) -> Result<Value, ThreadErrorTag> {
     let (entry, _) = fn_entry_from_value(heap, callback)?;
     let Some(Object::RwLock(gc)) = heap.find_object_by_addr(lock.raw() as u64) else {
         return Err(ThreadErrorTag::Other);
@@ -1101,7 +1123,11 @@ pub fn host_try_write(heap: &mut Heap, args: &[Value]) -> Value {
     as_result_value(heap, r)
 }
 
-fn try_host_try_write(heap: &mut Heap, lock: Value, callback: Value) -> Result<Value, ThreadErrorTag> {
+fn try_host_try_write(
+    heap: &mut Heap,
+    lock: Value,
+    callback: Value,
+) -> Result<Value, ThreadErrorTag> {
     let (entry, _) = fn_entry_from_value(heap, callback)?;
     let Some(Object::RwLock(gc)) = heap.find_object_by_addr(lock.raw() as u64) else {
         return Err(ThreadErrorTag::Other);

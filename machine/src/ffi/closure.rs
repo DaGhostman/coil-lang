@@ -106,8 +106,7 @@ mod tests {
             }
         }
         let cif = callback_cif(&[FfiType::Int], FfiType::Int, &[]).unwrap();
-        let closure =
-            make_int_callback(std::ptr::null_mut(), 0, fake_call, cif).expect("closure");
+        let closure = make_int_callback(std::ptr::null_mut(), 0, fake_call, cif).expect("closure");
         type Cb = unsafe extern "C" fn(i64) -> i64;
         let cb: Cb = unsafe { std::mem::transmute(closure.code_ptr_usize()) };
         assert_eq!(unsafe { cb(21) }, 42);

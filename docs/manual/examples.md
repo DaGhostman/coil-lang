@@ -18,11 +18,13 @@ Core syntax: functions, `let`, arithmetic, control flow, and I/O.
 
 ### `examples/print_literal.hy`
 
-**Demonstrates:** Literal string output with `print`.
+**Demonstrates:** Literal string output with `io::write_all`.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "hello";
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -35,11 +37,13 @@ fn main() {
 
 ### `examples/format_literal.hy`
 
-**Demonstrates:** Formatted output — `print "%i", expr` pushes the value then formats it.
+**Demonstrates:** Formatted output with `string::format` and `io::write_all`.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "%i", 42;
+    write_all(stdout(), to_bytes(format("%i", 42)));
 }
 ```
 
@@ -55,12 +59,14 @@ fn main() {
 **Demonstrates:** String concatenation with `+` and the `format` expression returning a string.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = "hello";
     let b = "world";
-    print "%s", a + " " + b;
-    let s = format "%i-%s", 42, "x";
-    print "%s", s;
+    write_all(stdout(), to_bytes(format("%s", a + " " + b)));
+    let s = format("%i-%s", 42, "x");
+    write_all(stdout(), to_bytes(format("%s", s)));
 }
 ```
 
@@ -76,9 +82,11 @@ fn main() {
 **Demonstrates:** `%v` structural Show for tuples and anonymous records.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
-    print "%v", (1, 2);
-    print "%v", { a: 3, b: 4 };
+    write_all(stdout(), to_bytes(format("%v", (1, 2))));
+    write_all(stdout(), to_bytes(format("%v", { a: 3, b: 4 })));
 }
 ```
 
@@ -94,13 +102,15 @@ fn main() {
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let x = 5;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
     let y = 10;
-    print "%i", y;
+    write_all(stdout(), to_bytes(format("%i", y)));
     x = 20;
-    print "%i", x;
+    write_all(stdout(), to_bytes(format("%i", x)));
 }
 ```
 
@@ -116,41 +126,43 @@ fn main() {
 **Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered, plus `defer use (n)` to capture an outer local.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn with_cleanup() {
-    defer { print "leave"; }
-    print "enter";
+    defer { write_all(stdout(), to_bytes("leave")); }
+    write_all(stdout(), to_bytes("enter"));
 }
 
 fn lifo() {
-    defer { print "1"; }
-    defer { print "2"; }
-    print "0";
+    defer { write_all(stdout(), to_bytes("1")); }
+    defer { write_all(stdout(), to_bytes("2")); }
+    write_all(stdout(), to_bytes("0"));
 }
 
 fn early_return(int n) -> int {
-    defer { print "d"; }
+    defer { write_all(stdout(), to_bytes("d")); }
     if n == 0 {
         return 99;
     }
-    print "ok";
+    write_all(stdout(), to_bytes("ok"));
     return n;
 }
 
 fn capture_n(int n) -> int {
-    defer use (n) { print "%i", n; }
+    defer use (n) { write_all(stdout(), to_bytes(format("%i", n))); }
     return n;
 }
 
 fn main() {
     with_cleanup();
-    print ",";
+    write_all(stdout(), to_bytes(","));
     lifo();
-    print ",";
-    print "%i", early_return(7);
-    print ",";
-    print "%i", early_return(0);
-    print ",";
-    print "%i", capture_n(5);
+    write_all(stdout(), to_bytes(","));
+    write_all(stdout(), to_bytes(format("%i", early_return(7))));
+    write_all(stdout(), to_bytes(","));
+    write_all(stdout(), to_bytes(format("%i", early_return(0))));
+    write_all(stdout(), to_bytes(","));
+    write_all(stdout(), to_bytes(format("%i", capture_n(5))));
 }
 ```
 
@@ -166,9 +178,11 @@ fn main() {
 **Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn greet(string name, int age) {
-    print "%s", name;
-    print "%i", age;
+    write_all(stdout(), to_bytes(format("%s", name)));
+    write_all(stdout(), to_bytes(format("%i", age)));
 }
 
 fn main() {
@@ -189,13 +203,15 @@ fn main() {
 **Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sum(int... xs) -> int { /* len + loop */ }
 fn greet(string name, string... extras) -> string { /* concat */ }
 
 fn main() {
-    print "%i", sum(1, 2, 3);           // 6
-    print "%i", sum();                  // 0
-    print "%s", greet(name: "Hi", "!", "?"); // Hi!?
+    write_all(stdout(), to_bytes(format("%i", sum(1, 2, 3))));           // 6
+    write_all(stdout(), to_bytes(format("%i", sum())));                  // 0
+    write_all(stdout(), to_bytes(format("%s", greet(name: "Hi", "!", "?")))); // Hi!?
 }
 ```
 
@@ -211,11 +227,13 @@ fn main() {
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     const answer = 42;
-    print "%i", answer;
+    write_all(stdout(), to_bytes(format("%i", answer)));
     const greeting = "hi";
-    print "%s", greeting;
+    write_all(stdout(), to_bytes(format("%s", greeting)));
 }
 ```
 
@@ -231,6 +249,8 @@ fn main() {
 **Demonstrates:** C-style `for` with `continue` and `break` (sum `0+1+2+4+5+6` = `18`).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let sum = 0;
     for (let i = 0; i < 10; i = i + 1) {
@@ -238,7 +258,7 @@ fn main() {
         if i == 7 { break; }
         sum = sum + i;
     }
-    print "%i", sum;
+    write_all(stdout(), to_bytes(format("%i", sum)));
 }
 ```
 
@@ -251,15 +271,17 @@ fn main() {
 
 ### `examples/fizbuz.hy`
 
-**Demonstrates:** `if` conditions, modulo, and independent `print` calls (FizzBuzz-style, without newlines between numbers).
+**Demonstrates:** `if` conditions, modulo, and independent stdout writes (FizzBuzz-style, without newlines between numbers).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fizbuz(int n) {
     if (n % 3) == 0 {
-        print "FIZ";
+        write_all(stdout(), to_bytes("FIZ"));
     }
     if (n % 5) == 0 {
-        print "BUZ";
+        write_all(stdout(), to_bytes("BUZ"));
     }
 }
 
@@ -282,6 +304,8 @@ fn main() {
 **Demonstrates:** Recursive functions, `if`, and integer arithmetic (smoke / docs).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -290,7 +314,7 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(10);
+    write_all(stdout(), to_bytes(format("%i", fib(10))));
 }
 ```
 
@@ -321,11 +345,13 @@ dedicated entry for release `poop` / `perf_metrics` without long wall time.
 **Demonstrates:** Minimal `let` + arithmetic smoke test (not a performance benchmark).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = 5;
     let b = 7;
     let c = a + b;
-    print "%i\n", c;
+    write_all(stdout(), to_bytes(format("%i\n", c)));
 }
 ```
 
@@ -341,13 +367,15 @@ fn main() {
 **Demonstrates:** Calling a function for side effect; expression statement discards the return value.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
 }
 
 fn main() {
     add(3, 4);
-    print "done";
+    write_all(stdout(), to_bytes("done"));
 }
 ```
 
@@ -360,11 +388,13 @@ fn main() {
 
 ### `examples/gc.hy`
 
-**Demonstrates:** String parameter passing and `print "%s"` (also exercises heap allocation / GC paths when many strings are allocated).
+**Demonstrates:** String parameter passing and stdout text writes (also exercises heap allocation / GC paths when many strings are allocated).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sadge(string n) {
-    print "%s", n;
+    write_all(stdout(), to_bytes(format("%s", n)));
 }
 
 fn main() {
@@ -388,6 +418,8 @@ Sum types with unit, tuple, and record-shaped payloads.
 **Demonstrates:** Built-in `Option`, constructor calls, and `match` with a binding arm.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -396,7 +428,7 @@ fn unwrap(Option o) -> int {
 }
 
 fn main() {
-    print "%i", unwrap(Option::Some(42));
+    write_all(stdout(), to_bytes(format("%i", unwrap(Option::Some(42)))));
 }
 ```
 
@@ -412,6 +444,8 @@ fn main() {
 **Demonstrates:** Built-in `Result` wrapping `Option`, multiple `match` arms sharing an outer tag with different inner patterns, and inner-pattern dispatch at runtime.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -421,9 +455,9 @@ fn unwrap_result(Result r) -> int {
 }
 
 fn main() {
-    print "%i", unwrap_result(Result::Ok(Option::Some(42)));
-    print "%i", unwrap_result(Result::Ok(Option::None));
-    print "%i", unwrap_result(Result::Err("oops"));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::Some(42))))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Ok(Option::None)))));
+    write_all(stdout(), to_bytes(format("%i", unwrap_result(Result::Err("oops")))));
 }
 ```
 
@@ -598,12 +632,14 @@ enum Outer {
 **Demonstrates:** `#[ffi(lib = "c")]` attribute sugar for a single libc binding (equivalent to an `extern` block entry).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
 
 fn main() {
     let n = strlen("hello");
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -620,12 +656,14 @@ fn main() {
 **Demonstrates:** Call-site spread for tuples and arrays.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn pair_sum(int a, int b) -> int { return a + b; }
 fn triple_sum(int a, int b, int c) -> int { return a + b + c; }
 
 fn main() {
-    print "%i", pair_sum(...(1, 2));
-    print "%i", triple_sum(...[10, 20, 30]);
+    write_all(stdout(), to_bytes(format("%i", pair_sum(...(1, 2)))));
+    write_all(stdout(), to_bytes(format("%i", triple_sum(...[10, 20, 30]))));
 }
 ```
 
@@ -706,7 +744,7 @@ fn read_x_v(Outer o) -> int {
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/chained.hy` |
-| **Output** | `427` (42 and 7 concatenated in one print stream) |
+| **Output** | `427` (42 and 7 concatenated in one stdout stream) |
 
 ---
 
@@ -793,13 +831,15 @@ Tuples, arrays, dicts, and `type` aliases.
 **Demonstrates:** Growing arrays with `arr[] =`, reading the runtime length with `len`, and indexing appended elements.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let a = [1, 2];
     a[] = 3;
     a[] = 4;
-    print "%i", len(a);
-    print "%i", a[0];
-    print "%i", a[3];
+    write_all(stdout(), to_bytes(format("%i", len(a))));
+    write_all(stdout(), to_bytes(format("%i", a[0])));
+    write_all(stdout(), to_bytes(format("%i", a[3])));
 }
 ```
 
@@ -815,11 +855,13 @@ fn main() {
 **Demonstrates:** Anonymous structurally typed records (`{ foo: 42, bar: 100 }`) and field read via `d.foo`.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn main() {
     let d = { foo: 42, bar: 100 };
-    print "%i", d.foo;
-    print "%i", d.bar;
-    print "%i", d.foo;
+    write_all(stdout(), to_bytes(format("%i", d.foo)));
+    write_all(stdout(), to_bytes(format("%i", d.bar)));
+    write_all(stdout(), to_bytes(format("%i", d.foo)));
 }
 ```
 
@@ -859,13 +901,15 @@ fn main() {
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Point = (int, int);
 
 fn main() {
     let p: Point = (3, 4);
-    print "%i", p[0];
-    print "%i", p[1];
-    print "%i", distance(p);
+    write_all(stdout(), to_bytes(format("%i", p[0])));
+    write_all(stdout(), to_bytes(format("%i", p[1])));
+    write_all(stdout(), to_bytes(format("%i", distance(p))));
 }
 ```
 
@@ -969,11 +1013,13 @@ fn main() {
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 type Pair<T> = (T, T);
 
 fn main() {
     let p: Pair<int> = (3, 4);
-    print "%i", p[0] + p[1];
+    write_all(stdout(), to_bytes(format("%i", p[0] + p[1])));
 }
 ```
 
@@ -989,6 +1035,8 @@ fn main() {
 **Demonstrates:** User generic enums — `enum Box<T> { Empty, Full(T) }` with construct/match typed as `Box<int>` (same machinery as builtin `Option` / `Result`).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 enum Box<T> {
     Empty,
     Full(T),
@@ -1002,7 +1050,7 @@ fn unwrap(Box<int> b) -> int {
 }
 
 fn main() {
-    print "%i", unwrap(Box::Full(7));
+    write_all(stdout(), to_bytes(format("%i", unwrap(Box::Full(7)))));
 }
 ```
 
@@ -1018,14 +1066,16 @@ fn main() {
 **Demonstrates:** Generic functions with a `Num` trait bound — one `add<T: Num>` body used at `int` and `float` call sites.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn add<T: Num>(T a, T b) -> T {
     return a + b;
 }
 
 fn main() {
-    print "%i", add(3, 4);
-    print "%i", add(10, 32);
-    print "%f", add(1.5, 2.5);
+    write_all(stdout(), to_bytes(format("%i", add(3, 4))));
+    write_all(stdout(), to_bytes(format("%i", add(10, 32))));
+    write_all(stdout(), to_bytes(format("%f", add(1.5, 2.5))));
 }
 ```
 
@@ -1039,7 +1089,7 @@ fn main() {
 ### `examples/generic_print.hy`
 
 **Demonstrates:** Format `%v` via the `Show` trait — builtin instances for
-primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
+primitives, a user `impl Show<Point>`, and `string::format("%v", ...)`.
 
 | | |
 |---|---|
@@ -1055,8 +1105,10 @@ primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
 `show(x)` dispatches through that stored dictionary.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn print_any(Show x) {
-    print "%s", show(x);
+    write_all(stdout(), to_bytes(format("%s", show(x))));
 }
 
 fn main() {
@@ -1241,10 +1293,12 @@ Multi-file projects using `use` and `mod`. Support files live under `examples/sr
 
 ```coil
 use foo::sadge;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     sadge();
-    print "%x\n", 69;
+    write_all(stdout(), to_bytes(format("%x\n", 69)));
 }
 ```
 
@@ -1263,10 +1317,12 @@ fn main() {
 
 ```coil
 use math::{add, mul};
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
-    print "%i", add(5, 7);
-    print "%i", mul(6, 7);
+    write_all(stdout(), to_bytes(format("%i", add(5, 7))));
+    write_all(stdout(), to_bytes(format("%i", mul(6, 7))));
 }
 ```
 
@@ -1293,8 +1349,10 @@ fn main() {
 **Demonstrates:** Alternate / legacy module layout (single `foo.hy` with a top-level `sadge`).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 fn sadge() {
-    print "%x\n", 420;
+    write_all(stdout(), to_bytes(format("%x\n", 420)));
 }
 ```
 
@@ -1313,13 +1371,15 @@ Calling C from coil. Requires **libffi**.
 **Demonstrates:** Compile-time `extern` block — no manual `dload`/`declare` in source. The compiler emits library load and symbol registration bytecode (unwraps `Result`, panics on failure).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 extern "c" {
     fn strlen(string s) -> int;
 }
 
 fn main() {
     let n = strlen("hello");
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -1360,6 +1420,8 @@ fn main() {
 ```coil
 use ffi::*;
 use ffi::types::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let lib = match dload("sum") {
@@ -1374,7 +1436,7 @@ fn main() {
         Result::Ok(v) => v,
         Result::Err(e) => panic e.message,
     };
-    print "%i", n;
+    write_all(stdout(), to_bytes(format("%i", n)));
 }
 ```
 
@@ -1439,6 +1501,8 @@ int sum(int a, int b) { return a + b; }
 **Demonstrates:** Positional ctor args, field read/write, and method calls (`self`).
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -1455,12 +1519,12 @@ impl Point {
 }
 
 fn main() {
-    print "%i", (2 * 2 + 3);
+    write_all(stdout(), to_bytes(format("%i", (2 * 2 + 3))));
     let p = new Point(1, 3);
-    print "%i", p.sum();
+    write_all(stdout(), to_bytes(format("%i", p.sum())));
     p.set_x(5);
-    print "%i", p.x;
-    print "%i", p.sum();
+    write_all(stdout(), to_bytes(format("%i", p.x)));
+    write_all(stdout(), to_bytes(format("%i", p.sum())));
 }
 ```
 
@@ -1474,6 +1538,8 @@ fn main() {
 **Demonstrates:** `static fn` constructors via `Class::new(...)` alongside unchanged positional `new Class(...)`. Bodies build instances with `new ClassName(...)`.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Point {
     x: int,
     y: int,
@@ -1491,7 +1557,7 @@ impl Point {
 
 fn main() {
     let p = Point::new(40, 2);
-    print "%i,", p.sum();
+    write_all(stdout(), to_bytes(format("%i,", p.sum())));
 }
 ```
 
@@ -1526,6 +1592,8 @@ return match m {
 and a method that returns the type parameter.
 
 ```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 class Cell<T> {
     value: T
 }
@@ -1538,7 +1606,7 @@ impl Cell<T> {
 
 fn main() {
     let c = new Cell(42);
-    print "%i", c.get();
+    write_all(stdout(), to_bytes(format("%i", c.get())));
 }
 ```
 
@@ -1610,7 +1678,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ### `examples/coro_interleave.hy`
 
-**Demonstrates:** Two independent handles from the same parameterized `async fn`, resumed in arbitrary order, with `resume` used inline as a `print` argument.
+**Demonstrates:** Two independent handles from the same parameterized `async fn`, resumed in arbitrary order, with `resume` used inline inside `string::format`.
 
 | | |
 |---|---|

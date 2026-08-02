@@ -1,4 +1,6 @@
 use thread::*;
+use io::{stdout, write_all};
+use string::{format, to_bytes};
 
 fn work() -> int {
     return 40 + 2;
@@ -6,5 +8,5 @@ fn work() -> int {
 
 fn main() {
     let t = spawn(work)?;
-    print "%i", join(t)?;
+    write_all(stdout(), to_bytes(format("%i", join(t)?)));
 }
