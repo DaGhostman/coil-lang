@@ -1987,8 +1987,7 @@ impl Compiler {
         if !Self::remap_peel_ops_ok(&peel, &fake_temps) {
             return false;
         }
-        // Evaluate args into temps on self.bytecode (HostInvoke/format/match),
-        // then leave LOADs in `bytecode` for the peel/CALL sequence.
+        // Evaluate args into temps (reuse pure-first when mixed).
         let mut temps = Vec::with_capacity(flat.len());
         if Self::should_reorder_pure_call_args(&flat) {
             let mut slots = vec![0u32; flat.len()];
@@ -2000,7 +1999,10 @@ impl Compiler {
                     Expression::NamedArg(_, v) => v,
                     _ => arg,
                 };
-                self.stage_call_arg_to_temp(value, false, &mut slots[i]);
+                bytecode.append(&mut self.do_compile(value));
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                slots[i] = tmp;
             }
             for (i, arg) in flat.iter().enumerate() {
                 if Self::call_arg_is_pure(arg) {
@@ -2010,7 +2012,14 @@ impl Compiler {
                     Expression::NamedArg(_, v) => v,
                     _ => arg,
                 };
-                self.stage_call_arg_to_temp(value, false, &mut slots[i]);
+                if self.arg_emits_on_self_bytecode(value) {
+                    self.stage_call_arg_to_temp(value, false, &mut slots[i]);
+                } else {
+                    bytecode.append(&mut self.do_compile(value));
+                    let tmp = self.alloc_temp_slot();
+                    bytecode.push_store_pop(tmp);
+                    slots[i] = tmp;
+                }
             }
             temps = slots;
         } else {
@@ -2019,9 +2028,16 @@ impl Compiler {
                     Expression::NamedArg(_, v) => v,
                     _ => arg,
                 };
-                let mut slot = 0u32;
-                self.stage_call_arg_to_temp(value, false, &mut slot);
-                temps.push(slot);
+                if self.arg_emits_on_self_bytecode(value) {
+                    let mut slot = 0u32;
+                    self.stage_call_arg_to_temp(value, false, &mut slot);
+                    temps.push(slot);
+                } else {
+                    bytecode.append(&mut self.do_compile(value));
+                    let tmp = self.alloc_temp_slot();
+                    bytecode.push_store_pop(tmp);
+                    temps.push(tmp);
+                }
             }
         }
 
@@ -3250,6 +3266,18 @@ impl Compiler {
         if !pack_rest && Self::should_reorder_pure_call_args(&fixed) {
             return self.emit_call_args_pure_first(&fixed, bytecode, box_generic);
         }
+        // Two+ HostInvoke/format/match args leave values on the shared
+        // operand/local stack; the next self-bytecode emit clobbers the prior
+        // result. Stage those onto temps; leave identifiers in the Call vec.
+        if !pack_rest
+            && fixed
+                .iter()
+                .filter(|a| self.arg_emits_on_self_bytecode(a))
+                .count()
+                >= 2
+        {
+            return self.emit_call_args_stage_self_bc(&fixed, bytecode, box_generic);
+        }
 
         for arg in &fixed {
             self.append_with_existential_pack(bytecode, arg);
@@ -3281,39 +3309,69 @@ impl Compiler {
     /// True when multi-arg calls must evaluate into temps before the CALL.
     ///
     /// Mixed pure/effectful args need reordering (2A pure-first). Two or more
-    /// call-like args (e.g. nested `to_bytes` HostInvokes) must also stage —
-    /// compiling the second clobbers the first result left on the stack when
-    /// HostInvoke emits onto `self.bytecode` while the CALL lives in a local vec.
-    /// Bare identifiers stay unstaged (see [`Self::call_arg_is_pure`]).
+    /// HostInvoke/`format`/`match` args are handled via
+    /// [`Self::emit_call_args_stage_self_bc`]. Bare identifiers stay unstaged
+    /// (see [`Self::call_arg_is_pure`]).
     fn should_reorder_pure_call_args(args: &[Output<'_>]) -> bool {
         if args.len() < 2 {
             return false;
         }
         let mut saw_pure = false;
-        let mut effect_count = 0u32;
-        let mut call_like = 0u32;
+        let mut saw_effect = false;
         for arg in args {
             if Self::call_arg_is_pure(arg) {
                 saw_pure = true;
             } else {
-                effect_count += 1;
-                if Self::call_arg_is_call_like(arg) {
-                    call_like += 1;
-                }
+                saw_effect = true;
+            }
+            if saw_pure && saw_effect {
+                return true;
             }
         }
-        (saw_pure && effect_count > 0) || call_like >= 2
+        false
     }
 
-    /// Call / match args whose compile may emit onto [`Self::bytecode`] (or a
-    /// multi-op local sequence) and leave a stack value that sibling args can
-    /// clobber without temp staging.
-    fn call_arg_is_call_like(expr: &Output<'_>) -> bool {
+    /// True when compiling `expr` writes into [`Self::bytecode`] (HostInvoke,
+    /// `string::format`, `match`, …) rather than only returning a local `Vec`.
+    fn arg_emits_on_self_bytecode(&self, expr: &Output<'_>) -> bool {
         match expr.1.as_ref() {
             Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
-                Self::call_arg_is_call_like(v)
+                self.arg_emits_on_self_bytecode(v)
             }
-            Expression::Call { .. } | Expression::Match { .. } => true,
+            Expression::Match { .. } => true,
+            Expression::Call { name, .. } => {
+                if let Expression::Identifier(fname) = name.1.as_ref() {
+                    if self.string_builtin_for_call(fname).is_some() {
+                        return true;
+                    }
+                    if self.checker.io_fn_in_scope(fname).is_some() {
+                        return true;
+                    }
+                    if self.checker.thread_fn_in_scope(fname).is_some() {
+                        return true;
+                    }
+                    if self.checker.host_fn_in_scope(fname).is_some() {
+                        return true;
+                    }
+                    if let Some(kind) = self.checker.prelude_fn_in_scope(fname) {
+                        return matches!(
+                            kind,
+                            crate::typechecking::PreludeFn::Ord
+                                | crate::typechecking::PreludeFn::Char
+                                | crate::typechecking::PreludeFn::Assert
+                        );
+                    }
+                    if self.checker.ffi_fn_in_scope(fname).is_some() {
+                        return true;
+                    }
+                } else if let Expression::QualifiedAccess { owner, member } = name.1.as_ref() {
+                    let fqn = format!("{}::{}", owner, member);
+                    if self.string_builtin_for_call(&fqn).is_some() {
+                        return true;
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -3368,10 +3426,6 @@ impl Compiler {
     }
 
     /// Evaluate pure args into temps, then effectful args, then `LOAD` in order.
-    ///
-    /// Staging writes through [`Self::bytecode`] so HostInvoke / `format` /
-    /// `match` (which also emit there) stay contiguous with their StorePops.
-    /// Only the final `LOAD`s go into the Call's local `bytecode` vec.
     fn emit_call_args_pure_first(
         &mut self,
         args: &[Output<'_>],
@@ -3383,16 +3437,70 @@ impl Compiler {
             if !Self::call_arg_is_pure(arg) {
                 continue;
             }
-            self.stage_call_arg_to_temp(arg, box_generic, &mut temps[i]);
+            self.append_with_existential_pack(bytecode, arg);
+            if box_generic {
+                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                }
+            }
+            let tmp = self.alloc_temp_slot();
+            bytecode.push_store_pop(tmp);
+            temps[i] = tmp;
         }
         for (i, arg) in args.iter().enumerate() {
             if Self::call_arg_is_pure(arg) {
                 continue;
             }
-            self.stage_call_arg_to_temp(arg, box_generic, &mut temps[i]);
+            // HostInvoke/format/match emit onto self.bytecode — StorePop must
+            // follow immediately there, not in the Call local vec.
+            if self.arg_emits_on_self_bytecode(arg) {
+                self.stage_call_arg_to_temp(arg, box_generic, &mut temps[i]);
+            } else {
+                self.append_with_existential_pack(bytecode, arg);
+                if box_generic {
+                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                    }
+                }
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                temps[i] = tmp;
+            }
         }
         for &tmp in &temps {
             bytecode.push_load(tmp);
+        }
+        args.len() as u32
+    }
+
+    /// Stage HostInvoke/`format`/`match` args on [`Self::bytecode`]; emit other
+    /// args (identifiers, etc.) into the Call local vec in original order.
+    fn emit_call_args_stage_self_bc(
+        &mut self,
+        args: &[Output<'_>],
+        bytecode: &mut Vec<Byte>,
+        box_generic: bool,
+    ) -> u32 {
+        let mut temps: Vec<Option<u32>> = vec![None; args.len()];
+        for (i, arg) in args.iter().enumerate() {
+            if !self.arg_emits_on_self_bytecode(arg) {
+                continue;
+            }
+            let mut slot = 0u32;
+            self.stage_call_arg_to_temp(arg, box_generic, &mut slot);
+            temps[i] = Some(slot);
+        }
+        for (i, arg) in args.iter().enumerate() {
+            if let Some(tmp) = temps[i] {
+                bytecode.push_load(tmp);
+            } else {
+                self.append_with_existential_pack(bytecode, arg);
+                if box_generic {
+                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                    }
+                }
+            }
         }
         args.len() as u32
     }
