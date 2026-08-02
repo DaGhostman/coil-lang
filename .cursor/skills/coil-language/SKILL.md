@@ -9,7 +9,7 @@ description: >-
 
 # coil language
 
-coil is a **statically typed** scripting language with Hindley–Milner inference. Sources are `.hy`; the CLI compiles to versioned `.hyc` archives and runs them on a custom stack VM.
+coil is a **statically typed** scripting language with Hindley–Milner inference. Sources are `.hy`; the CLI compiles to versioned `.hyc` archives (`compile` / `run`) or runs in memory (default).
 
 **Do not invent stdlib APIs** — check [docs/references/not-builtins.md](docs/references/not-builtins.md). Compiler builtins live in virtual modules, not user `.hy` files.
 
@@ -17,8 +17,8 @@ coil is a **statically typed** scripting language with Hindley–Milner inferenc
 
 ```bash
 cargo build --workspace
-cargo run -- examples/fib.hy          # compile (cached out.hyc) + run
-rm -f out.hyc                         # force recompile after edits
+cargo run -- examples/fib.hy          # in-memory compile + run (no out.hyc)
+cargo run -- compile examples/fib.hy    # writes out.hyc (or -o path)
 cargo run -- test                     # discover **/*.hy under ./tests
 ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
 ```
@@ -26,11 +26,11 @@ ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
 | Goal | Command |
 |------|---------|
 | Run one file | `cargo run -- path/to/file.hy` |
-| Compile only | `cargo run -- compile file.hy -o out.hyc` |
+| Compile only | `cargo run -- compile file.hy [-o path]` (default `out.hyc`) |
 | Run archive | `cargo run -- run out.hyc` |
 | Project tests | `cargo run -- test [path] [--fail-fast]` |
 
-Delete `out.hyc` when switching examples or after source edits — stale bytecode is a common agent mistake.
+`coil compile` always recompiles; `coil run` never recompiles. Default mode always recompiles in memory — no stale bytecode cache.
 
 ## File shape
 
@@ -119,11 +119,11 @@ Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) 
 
 ## Common pitfalls
 
-1. **Stale `out.hyc`** — delete before re-run after edits.
-2. **`main` + `test()`** — do not combine in one file.
-3. **Assuming stdlib** — no `sort`, `sqrt`, HTTP in VM; use `io` TCP + userland or FFI.
-4. **Missing `use`** — `io`/`string` are not auto-imported.
-5. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
+1. **`main` + `test()`** — do not combine in one file.
+2. **Assuming stdlib** — no `sort`, `sqrt`, HTTP in VM; use `io` TCP + userland or FFI.
+3. **Missing `use`** — `io`/`string` are not auto-imported.
+4. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
+5. **Stale `out.hyc`** — only from `coil compile`; delete before `coil run` if sources changed.
 6. **Type errors** — read diagnostic `E####`; index in [docs/references/error-codes.md](docs/references/error-codes.md).
 
 ## Debugging programs

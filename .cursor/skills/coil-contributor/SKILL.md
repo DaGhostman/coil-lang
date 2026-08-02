@@ -65,7 +65,7 @@ cargo test --workspace           # ~minutes; pipeline + perf_metrics are slow
 ulimit -v 65536 && cargo run -- test   # leak smoke (64MB)
 cargo build --release --workspace
 ./scripts/poop_baseline.sh       # soft CPU check before/after perf work
-rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55
+rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default run needs no out.hyc)
 ```
 
 | Work type | Extra check |
