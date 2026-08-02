@@ -3253,7 +3253,7 @@ impl Compiler {
         self.consume_spread_emit_ids(args);
         let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
 
-        if !pack_rest && Self::should_reorder_pure_call_args(&fixed) {
+        if !pack_rest && fixed.len() >= 2 {
             return self.emit_call_args_pure_first(&fixed, bytecode, box_generic);
         }
 
@@ -3284,24 +3284,25 @@ impl Compiler {
         fixed.len() as u32
     }
 
-    /// True when `args` has both a pure and an effectful argument.
+    /// True when multi-arg calls must evaluate into temps before the CALL.
+    ///
+    /// Mixed pure/effectful args need reordering (2A pure-first). Two or more
+    /// effectful args (e.g. nested `to_bytes` HostInvokes) must also stage —
+    /// compiling the second arg clobbers the first result left on the stack.
     fn should_reorder_pure_call_args(args: &[Output<'_>]) -> bool {
         if args.len() < 2 {
             return false;
         }
         let mut saw_pure = false;
-        let mut saw_effect = false;
+        let mut effect_count = 0u32;
         for arg in args {
             if Self::call_arg_is_pure(arg) {
                 saw_pure = true;
             } else {
-                saw_effect = true;
-            }
-            if saw_pure && saw_effect {
-                return true;
+                effect_count += 1;
             }
         }
-        false
+        (saw_pure && effect_count > 0) || effect_count >= 2
     }
 
     /// Pure call arg: literals and pure arith/cmp/logic — no Call / HostInvoke /
@@ -5084,20 +5085,31 @@ impl Compiler {
     /// `HostInvoke` expects. Compiling args into a side buffer first left nested
     /// invokes *above* the id and `MakeTuple` packed the wrong values (piped
     /// stdin then looked empty).
-    fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
-        self.emit_host_native_invoke(kind.native_name(), args);
+    fn emit_io_host_invoke(
+        &mut self,
+        bytecode: &mut impl EmitBuf,
+        kind: crate::typechecking::IoBuiltin,
+        args: &[Output],
+    ) {
+        self.emit_host_native_invoke(bytecode, kind.native_name(), args);
     }
 
     fn emit_thread_host_invoke(
         &mut self,
+        bytecode: &mut impl EmitBuf,
         kind: crate::typechecking::ThreadBuiltin,
         args: &[Output],
     ) {
-        self.emit_host_native_invoke(kind.native_name(), args);
+        self.emit_host_native_invoke(bytecode, kind.native_name(), args);
     }
 
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
-    fn emit_host_native_invoke(&mut self, native_name: &str, args: &[Output]) {
+    fn emit_host_native_invoke(
+        &mut self,
+        bytecode: &mut impl EmitBuf,
+        native_name: &str,
+        args: &[Output],
+    ) {
         let Some(native_id) = self.native_id(native_name) else {
             let range = args.first().map(|a| a.0.into_range()).unwrap_or(0..0);
             let mut message = Message::error(
@@ -5123,32 +5135,36 @@ impl Compiler {
         let depth_on_entry = self.expr_depth;
         let mut arg_slots = Vec::with_capacity(args.len());
         for arg in args {
-            // Nested IO HostInvoke writes to `self.bytecode`; also fold any
-            // bytes returned in the local vec (non-IO subexpressions).
             let mut arg_bc = self.do_compile(arg);
-            self.bytecode.append(&mut arg_bc);
+            for b in arg_bc.drain(..) {
+                bytecode.push_byte(b);
+            }
             let slot = self.alloc_temp_slot();
-            self.bytecode.push_store_pop(slot);
+            bytecode.push_store_pop(slot);
             arg_slots.push(slot);
         }
         // Native id first, then reload staged args — nested HostInvoke in
         // args must not sit above the id on the runtime stack.
-        self.bytecode
-            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+        bytecode.push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
         self.expr_depth = depth_on_entry + 1;
         for slot in &arg_slots {
-            self.bytecode.push_load(*slot);
+            bytecode.push_load(*slot);
             self.expr_depth += 1;
         }
         let arity = args.len();
-        self.bytecode.push_make_tuple(arity as u32);
-        self.bytecode.push_host_invoke(arity as u32);
+        bytecode.push_make_tuple(arity as u32);
+        bytecode.push_host_invoke(arity as u32);
         // Result stays on the stack for the caller (ExprStatement POPs it).
         self.expr_depth = depth_on_entry;
     }
 
-    fn emit_prelude_host_call(&mut self, args: &[Output], native_name: &str) {
-        self.emit_host_native_invoke(native_name, args);
+    fn emit_prelude_host_call(
+        &mut self,
+        bytecode: &mut impl EmitBuf,
+        args: &[Output],
+        native_name: &str,
+    ) {
+        self.emit_host_native_invoke(bytecode, native_name, args);
     }
 
     /// Emit bytecode thunks for compiler-provided primitive instances.
@@ -8754,7 +8770,11 @@ impl Compiler {
                             crate::typechecking::StringBuiltin::FromBytes
                             | crate::typechecking::StringBuiltin::ToBytes => {
                                 if let Some(native_name) = kind.native_name() {
-                                    self.emit_host_native_invoke(native_name, arg_slice);
+                                    self.emit_host_native_invoke(
+                                        &mut bytecode,
+                                        native_name,
+                                        arg_slice,
+                                    );
                                 }
                             }
                         }
@@ -8774,7 +8794,11 @@ impl Compiler {
                             crate::typechecking::StringBuiltin::FromBytes
                             | crate::typechecking::StringBuiltin::ToBytes => {
                                 if let Some(native_name) = kind.native_name() {
-                                    self.emit_host_native_invoke(native_name, arg_slice);
+                                    self.emit_host_native_invoke(
+                                        &mut bytecode,
+                                        native_name,
+                                        arg_slice,
+                                    );
                                 }
                             }
                         }
@@ -8809,7 +8833,7 @@ impl Compiler {
                         }
                         crate::typechecking::PreludeFn::Ord
                         | crate::typechecking::PreludeFn::Char => {
-                            self.emit_prelude_host_call(arg_slice, kind.as_str());
+                            self.emit_prelude_host_call(&mut bytecode, arg_slice, kind.as_str());
                         }
                     }
                     return bytecode;
@@ -8840,13 +8864,21 @@ impl Compiler {
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.io_fn_in_scope(fname)
                 {
-                    self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    self.emit_io_host_invoke(
+                        &mut bytecode,
+                        kind,
+                        args.as_deref().unwrap_or(&[]),
+                    );
                     return bytecode;
                 }
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.thread_fn_in_scope(fname)
                 {
-                    self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    self.emit_thread_host_invoke(
+                        &mut bytecode,
+                        kind,
+                        args.as_deref().unwrap_or(&[]),
+                    );
                     return bytecode;
                 }
                 if let Expression::Identifier(fname) = name.1.as_ref()
@@ -8866,7 +8898,11 @@ impl Compiler {
                             span.into_range(),
                         ));
                     }
-                    self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
+                    self.emit_host_native_invoke(
+                        &mut bytecode,
+                        registry,
+                        args.as_deref().unwrap_or(&[]),
+                    );
                     return bytecode;
                 }
 

@@ -5680,3 +5680,69 @@ fn main() {
     );
     assert_eq!(output, "ok");
 }
+
+/// Nested HostInvoke call args must stage through temps — evaluating the second
+/// `to_bytes` inline must not clobber the first result on the operand stack.
+#[test]
+fn nested_host_invoke_call_args_stage_without_clobber() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+fn concat_bytes([byte] a, [byte] b) -> [byte] {
+    let out: [byte] = [];
+    let i = 0;
+    while i < len(a) {
+        out[] = a[i];
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(b) {
+        out[] = b[j];
+        j = j + 1;
+    }
+    return out;
+}
+
+fn main() {
+    let msg = concat_bytes(to_bytes("GET "), to_bytes("/hi"));
+    write_all(stdout(), msg);
+}
+"#,
+    );
+    assert_eq!(output, "GET /hi");
+}
+
+#[test]
+fn variable_string_add_concatenates() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::to_bytes;
+
+fn main() {
+    let a = "GET";
+    let b = "/hi";
+    write_all(stdout(), to_bytes(a + b));
+}
+"#,
+    );
+    assert_eq!(output, "GET/hi");
+}
+
+#[test]
+fn variable_string_add_in_test_harness() {
+    let src = r#"
+use io::{stdout, write_all};
+use string::to_bytes;
+
+test("add") {
+    let a = "GET";
+    let b = "/hi";
+    write_all(stdout(), to_bytes(a + b));
+}
+"#;
+    let output = run_harness_src(src);
+    assert_eq!(output, "GET/hi");
+}
