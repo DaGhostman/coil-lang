@@ -5121,7 +5121,6 @@ impl Compiler {
             return;
         };
         let depth_on_entry = self.expr_depth;
-        let result_slot = self.context.variables.len() as u32 + depth_on_entry;
         let mut arg_slots = Vec::with_capacity(args.len());
         for arg in args {
             // Nested IO HostInvoke writes to `self.bytecode`; also fold any
@@ -5132,6 +5131,8 @@ impl Compiler {
             self.bytecode.push_store_pop(slot);
             arg_slots.push(slot);
         }
+        // Native id first, then reload staged args — nested HostInvoke in
+        // args must not sit above the id on the runtime stack.
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
         self.expr_depth = depth_on_entry + 1;
@@ -5142,14 +5143,7 @@ impl Compiler {
         let arity = args.len();
         self.bytecode.push_make_tuple(arity as u32);
         self.bytecode.push_host_invoke(arity as u32);
-        let temp_slots = (self.context.variables.len() as u32).saturating_sub(result_slot);
-        if temp_slots > 0 {
-            self.bytecode.push_store_pop(result_slot);
-            for _ in 0..temp_slots.saturating_sub(1) {
-                self.bytecode.push_pop();
-            }
-        }
-        // Restore: caller owns counting the result value if it needs to.
+        // Result stays on the stack for the caller (ExprStatement POPs it).
         self.expr_depth = depth_on_entry;
     }
 
