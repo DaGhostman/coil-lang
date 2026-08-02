@@ -674,6 +674,7 @@ fn run_worker(ctx: WorkerCtx) {
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
             vm.with_output(SharedPrintWriter(Arc::clone(buf)));
+            crate::io::set_shared_print_redirect(Some(Arc::clone(buf)));
         }
         vm.load_program(
             program.code.as_slice(),

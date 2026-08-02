@@ -18,16 +18,41 @@ type OutputRedirect = *mut (dyn Write + Send);
 
 thread_local! {
     static OUTPUT_REDIRECT: RefCell<Option<OutputRedirect>> = RefCell::new(None);
+    static SHARED_PRINT: RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>> =
+        RefCell::new(None);
 }
 
 pub fn set_output_redirect(sink: Option<OutputRedirect>) -> Option<OutputRedirect> {
     OUTPUT_REDIRECT.with(|cell| cell.replace(sink))
 }
 
+/// Install the process-wide shared print buffer for this OS thread (workers).
+pub fn set_shared_print_redirect(
+    buf: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+) -> Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> {
+    SHARED_PRINT.with(|cell| cell.replace(buf))
+}
+
 fn with_output_redirect<T>(f: impl FnOnce(&mut (dyn Write + Send)) -> T) -> Option<T> {
     OUTPUT_REDIRECT.with(|cell| {
         let ptr = (*cell.borrow())?;
         Some(f(unsafe { &mut *ptr }))
+    })
+}
+
+fn write_captured_stdout(bytes: &[u8]) -> Option<Result<usize, IoErrorTag>> {
+    if let Some(result) = with_output_redirect(|out| match out.write(bytes) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+    }) {
+        return Some(result);
+    }
+    SHARED_PRINT.with(|cell| {
+        let guard = cell.borrow();
+        let buf = guard.as_ref()?;
+        let mut g = buf.lock().ok()?;
+        g.extend_from_slice(bytes);
+        Some(Ok(bytes.len()))
     })
 }
 
@@ -372,10 +397,7 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
             return Err(IoErrorTag::AlreadyClosed);
         }
         if matches!(s.kind, StreamKind::Stdout | StreamKind::Stderr)
-            && let Some(result) = with_output_redirect(|out| match out.write(&bytes) {
-                Ok(n) => Ok(n),
-                Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-            })
+            && let Some(result) = write_captured_stdout(&bytes)
         {
             return result;
         }

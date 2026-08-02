@@ -780,7 +780,8 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn set_shared_print(&mut self, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-        self.shared_print = Some(buf);
+        self.shared_print = Some(buf.clone());
+        crate::io::set_shared_print_redirect(Some(buf));
     }
 
     pub fn shared_print(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> {
