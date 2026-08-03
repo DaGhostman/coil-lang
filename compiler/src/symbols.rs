@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use parser::ast::{Expression, Output};
+use parser::ast::{EnumConstructPayload, EnumVariantPayload, Expression, Output};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -101,7 +101,22 @@ impl SymbolIndex {
     }
 
     fn collect_references(&mut self, file: &PathBuf, expression: &Output<'_>) {
-        fn visit(index: &mut SymbolIndex, file: &PathBuf, expression: &Expression<'_>, span: Range<usize>) {
+        fn visit_output(index: &mut SymbolIndex, file: &PathBuf, output: &Output<'_>) {
+            visit(index, file, output.1.as_ref(), output.0.start..output.0.end);
+        }
+
+        fn visit_outputs(index: &mut SymbolIndex, file: &PathBuf, outputs: &[Output<'_>]) {
+            for output in outputs {
+                visit_output(index, file, output);
+            }
+        }
+
+        fn visit(
+            index: &mut SymbolIndex,
+            file: &PathBuf,
+            expression: &Expression<'_>,
+            span: Range<usize>,
+        ) {
             match expression {
                 Expression::Identifier(name) => {
                     index
@@ -114,31 +129,248 @@ impl SymbolIndex {
                             range: span,
                         });
                 }
+                Expression::Integer(_)
+                | Expression::Float(_)
+                | Expression::String(_)
+                | Expression::Bool(_)
+                | Expression::Type(_)
+                | Expression::TypeProjection { .. }
+                | Expression::Comment(_)
+                | Expression::Default(_)
+                | Expression::QualifiedAccess { .. }
+                | Expression::Use { .. }
+                | Expression::ExternBlock { .. }
+                | Expression::ExternStruct(_)
+                | Expression::Break
+                | Expression::Continue
+                | Expression::AssocTypeDecl { .. } => {}
                 Expression::Program(items)
                 | Expression::Block(items)
-                | Expression::Fragment(items) => {
-                    for (child_span, child) in items {
-                        visit(index, file, child, child_span.start..child_span.end);
+                | Expression::Fragment(items)
+                | Expression::List(items)
+                | Expression::Array(items)
+                | Expression::Tuple(items)
+                | Expression::If(items)
+                | Expression::Declare(items)
+                | Expression::Invoke(items) => visit_outputs(index, file, items),
+                Expression::Noop(inner)
+                | Expression::Module(_, inner)
+                | Expression::Spread(inner)
+                | Expression::Return(inner)
+                | Expression::ImplicitReturn(inner)
+                | Expression::Raise(inner)
+                | Expression::Panic(inner)
+                | Expression::Yield(inner)
+                | Expression::YieldFrom(inner)
+                | Expression::Try(inner)
+                | Expression::TypeOf(inner)
+                | Expression::OptionalAccess(inner, _)
+                | Expression::Negate(inner)
+                | Expression::Not(inner)
+                | Expression::LogicalNot(inner)
+                | Expression::Positive(inner)
+                | Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Statement(inner)
+                | Expression::Readonly(inner)
+                | Expression::Dload(inner)
+                | Expression::Done(inner)
+                | Expression::Member(inner)
+                | Expression::Access(inner, _)
+                | Expression::Method(_, inner)
+                | Expression::NamedArg(_, inner)
+                | Expression::Branch(None, inner)
+                | Expression::Adjust { target: inner, .. } => visit_output(index, file, inner),
+                Expression::Resume(a, b) => {
+                    visit_output(index, file, a);
+                    if let Some(b) = b {
+                        visit_output(index, file, b);
                     }
                 }
+                Expression::Coalesce(a, b)
+                | Expression::Cast(a, b)
+                | Expression::TypeFun(a, b)
+                | Expression::CompoundAssign(a, _, b)
+                | Expression::Add(a, b)
+                | Expression::Sub(a, b)
+                | Expression::Mul(a, b)
+                | Expression::Div(a, b)
+                | Expression::Mod(a, b)
+                | Expression::Pow(a, b)
+                | Expression::Shl(a, b)
+                | Expression::Shr(a, b)
+                | Expression::Xor(a, b)
+                | Expression::And(a, b)
+                | Expression::BitAnd(a, b)
+                | Expression::Or(a, b)
+                | Expression::BitOr(a, b)
+                | Expression::Eq(a, b)
+                | Expression::Neq(a, b)
+                | Expression::Leq(a, b)
+                | Expression::Geq(a, b)
+                | Expression::Le(a, b)
+                | Expression::Gt(a, b)
+                | Expression::Assignment(a, b)
+                | Expression::Branch(Some(a), b) => {
+                    visit_output(index, file, a);
+                    visit_output(index, file, b);
+                }
+                Expression::Range { start, end, .. } => {
+                    visit_output(index, file, start);
+                    visit_output(index, file, end);
+                }
+                Expression::Dict(fields) => {
+                    for field in fields {
+                        visit_output(index, file, &field.value);
+                    }
+                }
+                Expression::Index(target, index_expr) => {
+                    visit_output(index, file, target);
+                    if let Some(index_expr) = index_expr {
+                        visit_output(index, file, index_expr);
+                    }
+                }
+                Expression::StaticDecl { ty, init, .. } => {
+                    if let Some(ty) = ty {
+                        visit_output(index, file, ty);
+                    }
+                    visit_output(index, file, init);
+                }
+                Expression::Argument { ty, .. } => {
+                    if let Some(ty) = ty {
+                        visit_output(index, file, ty);
+                    }
+                }
+                Expression::TypeFnSig { params, ret } => {
+                    visit_output(index, file, params);
+                    visit_output(index, file, ret);
+                }
+                Expression::TypeApp { args, .. } => visit_outputs(index, file, args),
+                Expression::AttrDecl {
+                    args,
+                    returns,
+                    body,
+                    ..
+                } => {
+                    visit_output(index, file, args);
+                    if let Some(returns) = returns {
+                        visit_output(index, file, returns);
+                    }
+                    visit_output(index, file, body);
+                }
                 Expression::Function { args, body, .. } => {
-                    visit(index, file, &args.1, args.0.start..args.0.end);
+                    visit_output(index, file, args);
                     if let Some(body) = body {
-                        visit(index, file, &body.1, body.0.start..body.0.end);
+                        visit_output(index, file, body);
                     }
                 }
                 Expression::Call { name, args } => {
-                    visit(index, file, &name.1, name.0.start..name.0.end);
+                    visit_output(index, file, name);
                     if let Some(args) = args {
-                        for arg in args {
-                            visit(index, file, &arg.1, arg.0.start..arg.0.end);
-                        }
+                        visit_outputs(index, file, args);
                     }
                 }
-                _ => {}
+                Expression::Defer { body, .. } => visit_output(index, file, body),
+                Expression::Lambda { args, body, .. } => {
+                    visit_output(index, file, args);
+                    visit_output(index, file, body);
+                }
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    if let Some(init) = init {
+                        visit_output(index, file, init);
+                    }
+                    visit_output(index, file, cond);
+                    if let Some(step) = step {
+                        visit_output(index, file, step);
+                    }
+                    visit_output(index, file, body);
+                }
+                Expression::Loop {
+                    identifier,
+                    iterable,
+                    body,
+                } => {
+                    if let Some(identifier) = identifier {
+                        visit_output(index, file, identifier);
+                    }
+                    visit_output(index, file, iterable);
+                    visit_output(index, file, body);
+                }
+                Expression::Variable(_, init) => {
+                    if let Some(init) = init {
+                        visit_output(index, file, init);
+                    }
+                }
+                Expression::Constant(name, init) => {
+                    visit_output(index, file, name);
+                    if let Some(init) = init {
+                        visit_output(index, file, init);
+                    }
+                }
+                Expression::LetDestructure { rhs, .. } => visit_output(index, file, rhs),
+                Expression::Class { fields, .. } => visit_outputs(index, file, fields),
+                Expression::Implementation { methods, .. }
+                | Expression::TypeClass { methods, .. } => visit_outputs(index, file, methods),
+                Expression::TypeClassImpl { args, methods, .. } => {
+                    visit_outputs(index, file, args);
+                    visit_outputs(index, file, methods);
+                }
+                Expression::Field { name, ty, init, .. } => {
+                    visit_output(index, file, name);
+                    visit_output(index, file, ty);
+                    if let Some(init) = init {
+                        visit_output(index, file, init);
+                    }
+                }
+                Expression::Instantiate(name, args) => {
+                    visit_output(index, file, name);
+                    if let Some(args) = args {
+                        visit_outputs(index, file, args);
+                    }
+                }
+                Expression::TypeAlias { ty, .. } | Expression::Forall { ty, .. } => {
+                    visit_output(index, file, ty)
+                }
+                Expression::TestCase { name, body } => {
+                    visit_output(index, file, name);
+                    visit_output(index, file, body);
+                }
+                Expression::EnumDecl { variants, .. } => visit_outputs(index, file, variants),
+                Expression::EnumVariant { payload, .. } => match payload {
+                    EnumVariantPayload::Unit => {}
+                    EnumVariantPayload::Tuple(parts) => visit_outputs(index, file, parts),
+                    EnumVariantPayload::Record(fields) => {
+                        for field in fields {
+                            visit_output(index, file, &field.value);
+                        }
+                    }
+                },
+                Expression::Construct { fields, .. } => match fields {
+                    EnumConstructPayload::Unit => {}
+                    EnumConstructPayload::Tuple(parts) => visit_outputs(index, file, parts),
+                    EnumConstructPayload::Record(fields) => {
+                        for field in fields {
+                            visit_output(index, file, &field.value);
+                        }
+                    }
+                },
+                Expression::Match { scrutinee, arms } => {
+                    visit_output(index, file, scrutinee);
+                    for arm in arms {
+                        visit_output(index, file, &arm.body);
+                    }
+                }
+                Expression::AssocTypeDef { ty, .. } => visit_output(index, file, ty),
             }
         }
-        visit(self, file, &expression.1, expression.0.start..expression.0.end);
+
+        visit(self, file, expression.1.as_ref(), expression.0.start..expression.0.end);
     }
 }
 
