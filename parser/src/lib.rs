@@ -358,6 +358,10 @@ impl<'pratt> Pratt<'pratt> {
                 keyword!("panic")
                     .ignore_then(expr.clone())
                     .map_with(|inner, e| (e.span(), Box::new(Expression::Panic(inner)))),
+                // `typeof expr` — compile-time type name (string).
+                keyword!("typeof")
+                    .ignore_then(expr.clone())
+                    .map_with(|inner, e| (e.span(), Box::new(Expression::TypeOf(inner)))),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -5040,6 +5044,18 @@ mod tests_error_handling {
         match unwrap_expr(parse_expr("panic \"boom\"").as_ref()) {
             Expression::Panic(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
             other => panic!("expected Panic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn typeof_parses_as_typeof_expression() {
+        match unwrap_expr(parse_expr("typeof x").as_ref()) {
+            Expression::TypeOf(inner) => assert_eq!(inner.1.to_string(), "x"),
+            other => panic!("expected TypeOf, got {:?}", other),
+        }
+        match unwrap_expr(parse_expr("typeof (1 + 2)").as_ref()) {
+            Expression::TypeOf(_) => {}
+            other => panic!("expected TypeOf of group, got {:?}", other),
         }
     }
 
