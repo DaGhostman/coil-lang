@@ -616,6 +616,18 @@ class (prints the type name via `typeof self`).
 
 ---
 
+### `examples/length_trait.hy`
+
+**Demonstrates:** `len` via the `Length` typeclass — builtin string length,
+a custom `impl Length for Pair`, and a generic `T: Length` helper.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/length_trait.hy` |
+| **Output** | `3` / `2` / `42` (one per line) |
+
+---
+
 ### `examples/derive_hash.hy`
 
 **Demonstrates:** `#[derive(Hash)]` with recursive `field.hash()` — primitives (`int`, `string`, …) and nested Hash types.

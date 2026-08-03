@@ -152,7 +152,7 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 
 ### Growing arrays
 
-Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed. `len(value)` returns length as `int` for arrays, strings, tuples, and dicts; literal / fixed-size cases fold at compile time.
+Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed. `len(value)` returns length as `int` for arrays, strings, tuples, and dicts (structural); for other types it requires a `Length` instance (`impl Length for T { fn len(T x) -> int { … } }`). Literal / fixed-size cases fold at compile time.
 
 ```coil
 use io::{stdout, write_all};
@@ -589,6 +589,7 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 | `Ord` | Convenience bundle | Supertrait of `Lt` + `Le` + `Gt` + `Ge` (no own methods) |
 | `Eq` | Equality | `==`, `!=` |
 | `Show` | Display | `show(T) -> string`; used by format `%v` |
+| `Length` | Size query | `len(T) -> int`; used by `len(x)` for custom types (arrays/tuples/dicts/strings are structural) |
 | `Into` | Conversion | `into(Self) -> T` via `impl Into<T> for Self` (no builtin instances) |
 
 `Into` is multi-parameter: `impl Into<T> for S` stores instance args

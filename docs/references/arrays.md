@@ -10,9 +10,15 @@ len(value)
 | Form | Argument types | Returns | Behavior |
 |------|----------------|---------|----------|
 | `arr[] = v` | `[T]`, `T` | `[T]` (discarded in statement form) | Appends in place; promotes fixed `[T; N]` bindings to dynamic `[T]` |
-| `len` | `[T]`, `string`, tuple, or dict | `int` | Current length (elements / bytes / fields) |
+| `len` | `[T]`, `string`, tuple, dict, or `T: Length` | `int` | Structural length, or `Length::len` for custom types |
 
-`len` of a string, array, tuple, or dict **literal** (and of fixed-size array/tuple types) folds to a compile-time integer when the length is statically known.
+`len` of a string, array, tuple, or dict **literal** (and of fixed-size array/tuple types) folds to a compile-time integer when the length is statically known. Custom types implement `Length`:
+
+```coil
+impl Length for Pair {
+    fn len(Pair p) -> int { return 2; }
+}
+```
 
 Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
 

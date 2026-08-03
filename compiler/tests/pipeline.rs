@@ -2057,6 +2057,12 @@ fn example_typeof_len_prints_expected() {
     );
 }
 
+#[test]
+fn example_length_trait_prints_expected() {
+    let output = run_example("examples/length_trait.hy");
+    assert_eq!(output, "3\n2\n42\n");
+}
+
 /// Regression: derived `Serialize::serialize` must typecheck (`[byte]` return,
 /// payload fields cast to `byte`).
 #[test]
