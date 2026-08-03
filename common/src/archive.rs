@@ -165,4 +165,21 @@ mod tests {
             runtime
         ));
     }
+
+    #[test]
+    fn pack_archive_version_splits_major_minor_bits() {
+        let v = pack_archive_version(0xABCD, 0x1234);
+        assert_eq!(archive_major(v), 0xABCD);
+        assert_eq!(archive_minor(v), 0x1234);
+        assert_eq!(format_archive_version(v), "43981.4660");
+        // Equal major with older minor is accepted; reverse is not.
+        assert!(archive_version_compatible(
+            pack_archive_version(7, 1),
+            pack_archive_version(7, 9)
+        ));
+        assert!(!archive_version_compatible(
+            pack_archive_version(7, 9),
+            pack_archive_version(7, 1)
+        ));
+    }
 }
