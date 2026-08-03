@@ -737,4 +737,58 @@ mod tests {
         );
         assert!(format_ty_fqn(&Ty::Var(TyVarId(0)), &modules).is_none());
     }
+
+    #[test]
+    fn format_ty_fqn_aggregates_result_and_nominal_modules() {
+        use crate::typechecking::ty::{array, array_fixed, record, result_ty, tuple};
+
+        let modules = HashMap::from([
+            (
+                common::BUILTIN_RESULT_ENUM.to_string(),
+                "prelude".to_string(),
+            ),
+            ("Point".to_string(), "math".to_string()),
+            ("Local".to_string(), String::new()),
+        ]);
+
+        assert_eq!(
+            format_ty_fqn(&tuple(vec![int(), string()]), &modules).as_deref(),
+            Some("(int, string)")
+        );
+        assert_eq!(
+            format_ty_fqn(&array(int()), &modules).as_deref(),
+            Some("[int]")
+        );
+        assert_eq!(
+            format_ty_fqn(&array_fixed(int(), 3), &modules).as_deref(),
+            Some("[int; 3]")
+        );
+        assert_eq!(
+            format_ty_fqn(
+                &record(vec![("a".into(), int()), ("b".into(), string())]),
+                &modules
+            )
+            .as_deref(),
+            Some("{ a: int, b: string }")
+        );
+        assert_eq!(
+            format_ty_fqn(&result_ty(int(), string()), &modules).as_deref(),
+            Some("prelude::Result<int, string>")
+        );
+        assert_eq!(
+            format_ty_fqn(&Ty::Con("Point".into()), &modules).as_deref(),
+            Some("math::Point")
+        );
+        assert_eq!(
+            format_ty_fqn(&Ty::Con("Local".into()), &modules).as_deref(),
+            Some("Local"),
+            "empty defining module stays bare"
+        );
+        assert!(format_ty_fqn(&Ty::Never, &modules).is_none());
+        let fun = Ty::Fun(Box::new(int()), Box::new(string()));
+        assert_eq!(
+            format_ty_fqn(&fun, &modules).as_deref(),
+            Some("int -> string")
+        );
+    }
 }
