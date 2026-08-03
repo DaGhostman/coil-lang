@@ -2068,7 +2068,8 @@ fn expand_class<'a>(
 }
 
 /// Auto-generate FQN-only `Show`/`String` when neither derive nor an explicit
-/// `impl` covers the type. Bodies return `typeof self`.
+/// `impl` covers the type. Bodies return the type name as a string literal
+/// (same display as `typeof self` for non-generic types).
 ///
 /// Inserted beside the type so typecheck sees the instance before later
 /// `fn main` / statements. Script-style top-level match/expr after the type
@@ -2082,10 +2083,10 @@ fn push_default_display_impls<'a>(
     out: &mut Vec<Output<'a>>,
 ) {
     if !derives.iter().any(|t| *t == "Show") && !has_explicit_impl(decls, "Show", name) {
-        out.push(synth_show_typeof(span, name));
+        out.push(synth_show_type_name(span, name));
     }
     if !derives.iter().any(|t| *t == "String") && !has_explicit_impl(decls, "String", name) {
-        out.push(synth_string_typeof(span, name));
+        out.push(synth_string_type_name(span, name));
     }
 }
 
@@ -2105,9 +2106,9 @@ fn has_explicit_impl(decls: &[Output<'_>], class: &str, ty_name: &str) -> bool {
     })
 }
 
-fn synth_show_typeof<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
+fn synth_show_type_name<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     let p = leak(format!("__show_{}", name));
-    let body = at(span, Expression::TypeOf(ident(span, p)));
+    let body = str_lit(span, name);
     let show_m = method_fn(
         span,
         "show",
@@ -2118,9 +2119,9 @@ fn synth_show_typeof<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     typeclass_impl(span, "Show", name, vec![show_m])
 }
 
-fn synth_string_typeof<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
+fn synth_string_type_name<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     let p = leak(format!("__str_{}", name));
-    let body = at(span, Expression::TypeOf(ident(span, p)));
+    let body = str_lit(span, name);
     let m = method_fn(
         span,
         "to_string",
@@ -3514,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    fn default_show_string_use_typeof_when_no_derive() {
+    fn default_show_string_use_type_name_when_no_derive() {
         let (_exp, decls) = expand_src("class Point { x: int, y: int } fn main() {}");
         assert!(
             impl_method_names(&decls, "Show").contains(&"show".to_string()),
@@ -3535,8 +3536,8 @@ mod tests {
             .map(|n| format!("{:?}", n.1))
             .unwrap_or_default();
         assert!(
-            show_dbg.contains("TypeOf"),
-            "default Show should return typeof self, got: {show_dbg}"
+            show_dbg.contains("String(\"Point\")") || show_dbg.contains("Point"),
+            "default Show should return type name string, got: {show_dbg}"
         );
     }
 }

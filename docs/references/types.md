@@ -188,7 +188,8 @@ let n = d.x;              // field access
 - Anonymous records have structural `Show` support for `%v` when every field is showable. Fields print in canonical name order as `{ a: 1, b: 2 }`.
 
 Structural `Show` covers tuples and anonymous records automatically. Non-generic
-enums and classes receive a **default** `Show`/`String` that returns `typeof self`
+enums and classes receive a **default** `Show`/`String` that returns the type name
+as a string (same display as `typeof self` for non-generic types)
 (the type's fully-qualified name). Prefer `#[derive(Show)]` for structural field
 formatting (see [Trait derive](#trait-derive)), or write an explicit `impl Show for T`.
 
@@ -635,7 +636,7 @@ class Cell {
 
 **Default display (no derive):** every non-generic `enum` / `class` that lacks
 `#[derive(Show)]` / `#[derive(String)]` and has no explicit `impl` gets a
-compiler-generated instance whose body is `return typeof self;`. Explicit
+compiler-generated instance whose body returns the type name string. Explicit
 `impl` and structural `#[derive(Show)]` take precedence (overlap with a manual
 `impl` is still an error if both exist).
 

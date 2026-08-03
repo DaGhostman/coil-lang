@@ -607,7 +607,7 @@ class Cell {
 
 **Demonstrates:** compile-time `typeof` (FQN string constants), static `len`
 folding for string/array/tuple/dict literals, and the default `Show` for a
-class (prints the type name via `typeof self`).
+class (prints the type name).
 
 | | |
 |---|---|
