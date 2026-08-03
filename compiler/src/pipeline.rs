@@ -1384,7 +1384,7 @@ impl Pipeline {
         let program = ArchivedProgram {
             version: ARCHIVE_VERSION,
             static_slot_count: self.compiler.static_slot_count(),
-            constants: self.compiler.constants.clone(),
+            constants: self.compiler.constants().to_vec(),
             strings: self.compiler.strings().to_vec(),
             bytecode: self.bytecode,
             source_files: self.compiler.source_files_list(),
@@ -1421,7 +1421,7 @@ impl Pipeline {
                 Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
-        (bytecode, self.compiler.constants.clone())
+        (bytecode, self.compiler.constants().to_vec())
     }
 
     pub fn compile_src(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
@@ -1450,7 +1450,7 @@ impl Pipeline {
                 Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
-        Ok((bytecode, self.compiler.constants.clone()))
+        Ok((bytecode, self.compiler.constants().to_vec()))
     }
 
     /// Compile a single source file in-memory and return the
@@ -1509,7 +1509,7 @@ impl Pipeline {
 
         Ok((
             std::mem::take(&mut self.bytecode),
-            self.compiler.constants.clone(),
+            self.compiler.constants().to_vec(),
         ))
     }
 
@@ -1571,7 +1571,7 @@ impl Pipeline {
         let debug = self.program_debug();
         Ok(crate::DissectArtifacts {
             bytecode: std::mem::take(&mut self.bytecode),
-            constants: self.compiler.constants.clone(),
+            constants: self.compiler.constants().to_vec(),
             strings: self.compiler.strings().to_vec(),
             functions,
             il,

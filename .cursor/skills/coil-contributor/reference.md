@@ -7,9 +7,10 @@
 | `common/src/opcode.rs` | `Instruction` enum — append-only |
 | `common/src/archive.rs` | Packed `ARCHIVE_MAJOR`/`ARCHIVE_MINOR`, archive envelope |
 | `machine/src/vm.rs` | Main dispatch loop, `promise!` opcode ceiling |
-| `compiler/src/lib.rs` | Codegen driver, `finalize_bytecode` |
+| `compiler/src/codegen/` | Codegen driver (`Compiler`, `finalize_bytecode`, `do_compile`) |
+| `compiler/src/lib.rs` | Crate root: re-exports, `#[macro_use] mod codegen` |
 | `compiler/src/il/` | IL ops, lower, fuse-select, opts |
-| `compiler/src/typechecking/` | HM Algorithm W |
+| `compiler/src/typechecking/infer/` | HM `Checker` (`mod.rs` types + `checker.rs` impl) |
 | `parser/src/` | Pratt parser |
 | `machine/src/packed_la.rs` | LA ops via HostInvoke (no LA opcodes) |
 
