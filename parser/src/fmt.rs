@@ -4,7 +4,7 @@
 
 use crate::ast::{
     AdjustOp, AssignOp, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
-    ExternStructDecl, Expression, FieldModifier, LetPattern, Output, Pattern,
+    ExternStructDecl, Expression, FieldModifier, LetPattern, Output, Pattern, RecordFieldDecl,
     RecordFieldValue, TypeParam, Visibility, WhereConstraint,
 };
 use crate::Pratt;
@@ -99,12 +99,204 @@ impl Formatter {
         self.fmt_expression(output.1.as_ref());
     }
 
-    fn fmt_outputs_comma(&mut self, items: &[Output<'_>]) {
+    /// Comma-separated list inside `open`/`close`, soft-wrapping with trailing commas.
+    ///
+    /// - Flat when the whole list fits in [`MAX_WIDTH`].
+    /// - Broken form puts each item on its own indented line with a trailing `,`
+    ///   (including after the last item) for cleaner diffs.
+    /// - `single_item_trailing`: always keep a trailing comma when there is exactly
+    ///   one item (needed for 1-tuples: `(x,)`).
+    fn fmt_delimited_outputs(
+        &mut self,
+        open: &str,
+        close: &str,
+        items: &[Output<'_>],
+        single_item_trailing: bool,
+    ) {
+        if items.is_empty() {
+            self.push_str(open);
+            self.push_str(close);
+            return;
+        }
+
+        let flat = {
+            let mut f = Formatter {
+                indent: self.indent,
+                out: String::new(),
+                flat: true,
+            };
+            f.push_str(open);
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    f.push_str(", ");
+                }
+                f.fmt_output(item);
+            }
+            if single_item_trailing && items.len() == 1 {
+                f.push_str(",");
+            }
+            f.push_str(close);
+            f.out
+        };
+
+        if self.fits_flat(&flat) {
+            self.push_str(open);
+            let was = self.flat;
+            self.flat = true;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    self.push_str(", ");
+                }
+                self.fmt_output(item);
+            }
+            if single_item_trailing && items.len() == 1 {
+                self.push_str(",");
+            }
+            self.flat = was;
+            self.push_str(close);
+            return;
+        }
+
+        self.push_str(open);
+        self.newline();
+        self.with_indent(|f| {
+            for item in items {
+                f.write_indent();
+                f.fmt_output(item);
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
+        self.push_str(close);
+    }
+
+    fn fmt_delimited_strings(
+        &mut self,
+        open: &str,
+        close: &str,
+        items: &[String],
+        single_item_trailing: bool,
+    ) {
+        if items.is_empty() {
+            self.push_str(open);
+            self.push_str(close);
+            return;
+        }
+        let mut flat = String::from(open);
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
-                self.push_str(", ");
+                flat.push_str(", ");
             }
-            self.fmt_output(item);
+            flat.push_str(item);
+        }
+        if single_item_trailing && items.len() == 1 {
+            flat.push(',');
+        }
+        flat.push_str(close);
+        if self.fits_flat(&flat) {
+            self.push_str(&flat);
+            return;
+        }
+        self.push_str(open);
+        self.newline();
+        self.with_indent(|f| {
+            for item in items {
+                f.write_indent();
+                f.push_str(item);
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
+        self.push_str(close);
+    }
+
+    fn fmt_record_list(&mut self, items: &[RecordFieldValue<'_>]) {
+        if items.is_empty() {
+            self.push_str("{}");
+            return;
+        }
+        let flat = {
+            let mut f = Formatter {
+                indent: self.indent,
+                out: String::new(),
+                flat: true,
+            };
+            f.push_str("{ ");
+            for (i, field) in items.iter().enumerate() {
+                if i > 0 {
+                    f.push_str(", ");
+                }
+                f.push_str(field.name);
+                f.push_str(": ");
+                f.fmt_output(&field.value);
+            }
+            f.push_str(" }");
+            f.out
+        };
+        if self.fits_flat(&flat) {
+            self.push_str("{ ");
+            let was = self.flat;
+            self.flat = true;
+            for (i, field) in items.iter().enumerate() {
+                if i > 0 {
+                    self.push_str(", ");
+                }
+                self.push_str(field.name);
+                self.push_str(": ");
+                self.fmt_output(&field.value);
+            }
+            self.flat = was;
+            self.push_str(" }");
+            return;
+        }
+        self.push_str("{");
+        self.newline();
+        self.with_indent(|f| {
+            for field in items {
+                f.write_indent();
+                f.push_str(field.name);
+                f.push_str(": ");
+                f.fmt_output(&field.value);
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
+        self.push_str("}");
+    }
+
+    /// Class / enum-style body: always multiline when non-empty, trailing commas.
+    fn fmt_comma_body(&mut self, items: &[Output<'_>]) {
+        if items.is_empty() {
+            self.push_str(" {}");
+            return;
+        }
+        self.push_str(" {");
+        self.newline();
+        self.with_indent(|f| {
+            for item in items {
+                f.write_indent();
+                f.fmt_expression(item.1.as_ref());
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
+        self.push_str("}");
+    }
+
+    fn fmt_paren_arg_list(&mut self, args: &Output<'_>) {
+        match args.1.as_ref() {
+            Expression::Fragment(items) => {
+                self.fmt_delimited_outputs("(", ")", items, false);
+            }
+            other => {
+                self.push_str("(");
+                self.fmt_expression(other);
+                self.push_str(")");
+            }
         }
     }
 
@@ -297,16 +489,12 @@ impl Formatter {
             }
 
             Expression::List(items) | Expression::Array(items) => {
-                self.push_str("[");
-                self.fmt_outputs_comma(items);
-                self.push_str("]");
+                self.fmt_delimited_outputs("[", "]", items, false);
             }
             Expression::Tuple(items) => {
-                self.push_str("(");
-                self.fmt_outputs_comma(items);
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", items, items.len() == 1);
             }
-            Expression::Dict(items) => self.fmt_record_values(items),
+            Expression::Dict(items) => self.fmt_record_list(items),
             Expression::Index(target, index) => {
                 self.fmt_output(target);
                 self.push_str("[");
@@ -361,11 +549,7 @@ impl Formatter {
             Expression::Instantiate(class, args) => {
                 self.push_str("new ");
                 self.fmt_output(class);
-                self.push_str("(");
-                if let Some(args) = args {
-                    self.fmt_outputs_comma(args);
-                }
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", args.as_deref().unwrap_or(&[]), false);
             }
 
             Expression::Dload(path) => {
@@ -385,9 +569,7 @@ impl Formatter {
                     "invoke"
                 };
                 self.push_str(kw);
-                self.push_str("(");
-                self.fmt_outputs_comma(args);
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", args, false);
             }
 
             Expression::Use { path, name, alias } => {
@@ -546,18 +728,12 @@ impl Formatter {
                 captures,
                 body,
             } => {
-                self.push_str("fn (");
-                self.fmt_lambda_params(args);
-                self.push_str(")");
+                self.push_str("fn ");
+                self.fmt_paren_arg_list(args);
                 if !captures.is_empty() {
-                    self.push_str(" use (");
-                    for (i, c) in captures.iter().enumerate() {
-                        if i > 0 {
-                            self.push_str(", ");
-                        }
-                        self.push_str(c);
-                    }
-                    self.push_str(")");
+                    let caps: Vec<String> = captures.iter().map(|c| (*c).to_string()).collect();
+                    self.push_str(" use ");
+                    self.fmt_delimited_strings("(", ")", &caps, false);
                 }
                 match body.1.as_ref() {
                     Expression::Block(_) => {
@@ -587,18 +763,14 @@ impl Formatter {
             }
             Expression::TypeApp { name, args } => {
                 self.push_str(name);
-                self.push_str("<");
-                self.fmt_outputs_comma(args);
-                self.push_str(">");
+                self.fmt_delimited_outputs("<", ">", args, false);
             }
             Expression::TypeProjection { owner, name, args } => {
                 self.push_str(owner);
                 self.push_str("::");
                 self.push_str(name);
                 if !args.is_empty() {
-                    self.push_str("<");
-                    self.fmt_outputs_comma(args);
-                    self.push_str(">");
+                    self.fmt_delimited_outputs("<", ">", args, false);
                 }
             }
             Expression::TypeFun(arg, ret) => {
@@ -608,7 +780,7 @@ impl Formatter {
             }
             Expression::TypeFnSig { params, ret } => {
                 self.push_str("fn");
-                self.fmt_output(params);
+                self.fmt_paren_arg_list(params);
                 self.push_str(" -> ");
                 self.fmt_output(ret);
             }
@@ -632,7 +804,7 @@ impl Formatter {
                 self.push_str("attr ");
                 self.push_str(name);
                 self.fmt_type_params(type_params);
-                self.fmt_output(args);
+                self.fmt_paren_arg_list(args);
                 if let Some(ret) = returns {
                     self.push_str(" -> ");
                     self.fmt_output(ret);
@@ -661,14 +833,7 @@ impl Formatter {
                 self.push_str("enum ");
                 self.push_str(name);
                 self.fmt_type_params(type_params);
-                self.push_str(" { ");
-                for (i, v) in variants.iter().enumerate() {
-                    if i > 0 {
-                        self.push_str(", ");
-                    }
-                    self.fmt_output(v);
-                }
-                self.push_str(" }");
+                self.fmt_comma_body(variants);
             }
             Expression::EnumVariant { docs, name, payload } => {
                 self.fmt_docs(docs);
@@ -688,7 +853,7 @@ impl Formatter {
                 self.push_str("class ");
                 self.push_str(name);
                 self.fmt_type_params(type_params);
-                self.fmt_braced_items(fields);
+                self.fmt_comma_body(fields);
             }
             Expression::Field {
                 docs,
@@ -752,9 +917,7 @@ impl Formatter {
                 self.push_str(class);
                 if let Some((for_ty, rest)) = args.split_first() {
                     if !rest.is_empty() {
-                        self.push_str("<");
-                        self.fmt_outputs_comma(rest);
-                        self.push_str(">");
+                        self.fmt_delimited_outputs("<", ">", rest, false);
                     }
                     self.push_str(" for ");
                     self.fmt_output(for_ty);
@@ -950,20 +1113,6 @@ impl Formatter {
         self.push_str("}");
     }
 
-    fn fmt_lambda_params(&mut self, args: &Output<'_>) {
-        match args.1.as_ref() {
-            Expression::Fragment(items) => {
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        self.push_str(", ");
-                    }
-                    self.fmt_output(item);
-                }
-            }
-            other => self.fmt_expression(other),
-        }
-    }
-
     fn fmt_match_arm_body(&mut self, body: &Output<'_>) {
         match body.1.as_ref() {
             Expression::Block(items) => self.fmt_block_braced(items),
@@ -971,28 +1120,13 @@ impl Formatter {
         }
     }
 
-    fn fmt_record_values(&mut self, items: &[RecordFieldValue<'_>]) {
-        self.push_str("{ ");
-        for (i, field) in items.iter().enumerate() {
-            if i > 0 {
-                self.push_str(", ");
-            }
-            self.push_str(field.name);
-            self.push_str(": ");
-            self.fmt_output(&field.value);
-        }
-        self.push_str(" }");
-    }
-
     fn fmt_construct_payload(&mut self, fields: &EnumConstructPayload<'_>) {
         match fields {
             EnumConstructPayload::Unit => {}
             EnumConstructPayload::Tuple(args) => {
-                self.push_str("(");
-                self.fmt_outputs_comma(args);
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", args, args.len() == 1);
             }
-            EnumConstructPayload::Record(parts) => self.fmt_record_values(parts),
+            EnumConstructPayload::Record(parts) => self.fmt_record_list(parts),
         }
     }
 
@@ -1003,34 +1137,137 @@ impl Formatter {
                 if parts.is_empty() {
                     return;
                 }
-                self.push_str("(");
-                self.fmt_outputs_comma(parts);
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", parts, parts.len() == 1);
             }
             EnumVariantPayload::Record(fields) => {
-                self.push_str(" { ");
-                for (i, rf) in fields.iter().enumerate() {
-                    if i > 0 {
-                        self.push_str(", ");
-                    }
-                    self.push_str(rf.name);
-                    self.push_str(": ");
-                    self.fmt_output(&rf.value);
-                }
-                self.push_str(" }");
+                self.push_str(" ");
+                self.fmt_record_decls(fields);
             }
         }
+    }
+
+    fn fmt_record_decls(&mut self, fields: &[RecordFieldDecl<'_>]) {
+        if fields.is_empty() {
+            self.push_str("{}");
+            return;
+        }
+        let flat = {
+            let mut f = Formatter {
+                indent: self.indent,
+                out: String::new(),
+                flat: true,
+            };
+            f.push_str("{ ");
+            for (i, rf) in fields.iter().enumerate() {
+                if i > 0 {
+                    f.push_str(", ");
+                }
+                f.push_str(rf.name);
+                f.push_str(": ");
+                f.fmt_output(&rf.value);
+            }
+            f.push_str(" }");
+            f.out
+        };
+        if self.fits_flat(&flat) {
+            self.push_str("{ ");
+            let was = self.flat;
+            self.flat = true;
+            for (i, rf) in fields.iter().enumerate() {
+                if i > 0 {
+                    self.push_str(", ");
+                }
+                self.push_str(rf.name);
+                self.push_str(": ");
+                self.fmt_output(&rf.value);
+            }
+            self.flat = was;
+            self.push_str(" }");
+            return;
+        }
+        self.push_str("{");
+        self.newline();
+        self.with_indent(|f| {
+            for rf in fields {
+                f.write_indent();
+                f.push_str(rf.name);
+                f.push_str(": ");
+                f.fmt_output(&rf.value);
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
+        self.push_str("}");
     }
 
     fn fmt_extern_function(&mut self, decl: &ExternFunction<'_>) {
         self.push_str("fn ");
         self.push_str(decl.name);
-        self.push_str("(");
-        self.fmt_output(&decl.args);
-        if decl.variadic {
-            self.push_str(", ...");
+        match decl.args.1.as_ref() {
+            Expression::Fragment(items) => {
+                // Variadic FFI uses a synthetic trailing `...` after args.
+                if decl.variadic {
+                    self.push_str("(");
+                    if items.is_empty() {
+                        self.push_str("...");
+                    } else {
+                        let flat = {
+                            let mut f = Formatter {
+                                indent: self.indent,
+                                out: String::new(),
+                                flat: true,
+                            };
+                            for (i, item) in items.iter().enumerate() {
+                                if i > 0 {
+                                    f.push_str(", ");
+                                }
+                                f.fmt_output(item);
+                            }
+                            f.push_str(", ...");
+                            f.out
+                        };
+                        if self.fits_flat(&format!("({flat})")) {
+                            let was = self.flat;
+                            self.flat = true;
+                            for (i, item) in items.iter().enumerate() {
+                                if i > 0 {
+                                    self.push_str(", ");
+                                }
+                                self.fmt_output(item);
+                            }
+                            self.push_str(", ...");
+                            self.flat = was;
+                        } else {
+                            self.newline();
+                            self.with_indent(|f| {
+                                for item in items {
+                                    f.write_indent();
+                                    f.fmt_output(item);
+                                    f.push_str(",");
+                                    f.newline();
+                                }
+                                f.write_indent();
+                                f.push_str("...,");
+                                f.newline();
+                            });
+                            self.write_indent();
+                        }
+                    }
+                    self.push_str(")");
+                } else {
+                    self.fmt_delimited_outputs("(", ")", items, false);
+                }
+            }
+            other => {
+                self.push_str("(");
+                self.fmt_expression(other);
+                if decl.variadic {
+                    self.push_str(", ...");
+                }
+                self.push_str(")");
+            }
         }
-        self.push_str(")");
         if let Some(ret) = &decl.returns {
             self.push_str(" -> ");
             self.fmt_output(ret);
@@ -1041,17 +1278,19 @@ impl Formatter {
     fn fmt_extern_struct(&mut self, decl: &ExternStructDecl<'_>) {
         self.push_str("extern struct ");
         self.push_str(decl.name);
+        if decl.fields.is_empty() {
+            self.push_str(" {};");
+            return;
+        }
         self.push_str(" {");
         self.newline();
         self.with_indent(|f| {
-            for (i, (name, ty)) in decl.fields.iter().enumerate() {
+            for (name, ty) in &decl.fields {
                 f.write_indent();
                 f.push_str(name);
                 f.push_str(": ");
                 f.fmt_output(ty);
-                if i + 1 < decl.fields.len() {
-                    f.push_str(",");
-                }
+                f.push_str(",");
                 f.newline();
             }
         });
@@ -1138,11 +1377,7 @@ impl Formatter {
             }
             Expression::Call { name, args } => {
                 self.fmt_output(name);
-                self.push_str("(");
-                if let Some(args) = args {
-                    self.fmt_outputs_comma(args);
-                }
-                self.push_str(")");
+                self.fmt_delimited_outputs("(", ")", args.as_deref().unwrap_or(&[]), false);
             }
             other => self.fmt_expression(other),
         }
@@ -1191,9 +1426,7 @@ impl Formatter {
                 }
                 self.push_str(name);
                 if let Some(args) = call_args {
-                    self.push_str("(");
-                    self.fmt_outputs_comma(args);
-                    self.push_str(")");
+                    self.fmt_delimited_outputs("(", ")", args, false);
                 }
             }
         }
@@ -1278,9 +1511,7 @@ impl Formatter {
         self.push_str("fn ");
         self.push_str(name);
         self.fmt_type_params(type_params);
-        self.push_str("(");
-        self.fmt_output(args);
-        self.push_str(")");
+        self.fmt_paren_arg_list(args);
         if let Some(ret) = returns {
             self.push_str(" -> ");
             self.fmt_output(ret);
@@ -1306,18 +1537,31 @@ impl Formatter {
         if params.is_empty() {
             return;
         }
-        self.push_str("<");
-        self.fmt_type_params_list(params);
-        self.push_str(">");
+        let items: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+        self.fmt_delimited_strings("<", ">", &items, false);
     }
 
     fn fmt_type_params_list(&mut self, params: &[TypeParam<'_>]) {
-        for (i, p) in params.iter().enumerate() {
-            if i > 0 {
-                self.push_str(", ");
-            }
-            self.push_str(&p.to_string());
+        let items: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+        // Bare list without brackets (forall …).
+        if items.is_empty() {
+            return;
         }
+        let flat = items.join(", ");
+        if self.fits_flat(&flat) {
+            self.push_str(&flat);
+            return;
+        }
+        self.newline();
+        self.with_indent(|f| {
+            for item in &items {
+                f.write_indent();
+                f.push_str(item);
+                f.push_str(",");
+                f.newline();
+            }
+        });
+        self.write_indent();
     }
 
     fn fmt_where(&mut self, constraints: &[WhereConstraint<'_>]) {
@@ -1661,5 +1905,79 @@ fn main() {
             !formatted.contains("&&\n"),
             "should not wrap short &&:\n{formatted}"
         );
+    }
+
+    #[test]
+    fn wraps_long_call_args_with_trailing_commas() {
+        let src = "\
+fn main() {
+    write_all(stdout(), to_bytes(format(\"%s %s %s %s\", \"alpha-alpha-alpha\", \"beta-beta-beta-beta\", \"gamma-gamma-gamma\", \"delta-delta-delta-delta\")));
+    return;
+}
+";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains(",\n"),
+            "expected wrapped args with commas:\n{formatted}"
+        );
+        // Last wrapped arg should still have a trailing comma before the closing paren.
+        let broken = formatted
+            .lines()
+            .filter(|l| l.contains('"') && l.trim_end().ends_with(','))
+            .count();
+        assert!(
+            broken >= 2,
+            "expected multiple trailing-comma argument lines:\n{formatted}"
+        );
+        round_trip(&formatted);
+    }
+
+    #[test]
+    fn wraps_long_array_and_dict_with_trailing_commas() {
+        let src = "\
+fn main() {
+    let a = [\"one-long-string-value\", \"two-long-string-value\", \"three-long-string-value\", \"four-long-string-value\"];
+    let d = { alpha: 1, beta: 2, gamma: 3, delta: 4, epsilon: 5, zeta: 6, eta: 7, theta: 8, iota: 9, kappa: 10 };
+    return;
+}
+";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("[\n") || formatted.contains("{\n"),
+            "expected wrapped collection:\n{formatted}"
+        );
+        assert!(
+            formatted.contains(",\n"),
+            "expected trailing commas on wrapped items:\n{formatted}"
+        );
+        round_trip(&formatted);
+    }
+
+    #[test]
+    fn class_fields_keep_trailing_commas() {
+        let src = "\
+class Point {
+    pub x: int,
+    pub y: int
+}
+fn main() { return; }
+";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("pub x: int,") && formatted.contains("pub y: int,"),
+            "class fields need trailing commas:\n{formatted}"
+        );
+        round_trip(&formatted);
+    }
+
+    #[test]
+    fn one_tuple_keeps_trailing_comma() {
+        let src = "fn main() {\n    let t = (1,);\n    return;\n}\n";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("(1,)"),
+            "1-tuple must keep trailing comma:\n{formatted}"
+        );
+        round_trip(src);
     }
 }

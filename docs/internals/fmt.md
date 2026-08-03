@@ -29,8 +29,11 @@ Soft wraps kick in when a construct would exceed **100** columns:
 |-----------|-------------|
 | `&&` / `\|\|` / `??` chains | Operator stays at end of the previous line; continuation hangs under the first operand |
 | `.` / `?.` member and method chains | Each `.name` / `.name(args)` on its own line at +1 indent |
+| Call args, tuples, arrays/lists, dicts, type args, params | One item per line at +1 indent; **trailing comma** after every item (including the last) |
 
-Short chains stay on one line.
+Short forms stay on one line (except 1-tuples, which always keep `(x,)`).
+
+Class and enum bodies are always multiline when non-empty and use trailing commas after each field/variant.
 
 ## Comments and docs
 
