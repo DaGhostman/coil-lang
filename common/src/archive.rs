@@ -1,16 +1,59 @@
 //! Versioned bytecode archive format.
+//!
+//! `ArchivedProgram::version` is a packed `major.minor` (`u16` each in a `u32`):
+//! - **same major**, archive minor ≤ runtime minor → loadable (older archives on newer minor runtimes)
+//! - **different major** → never loadable either direction
+//! - archive minor **greater** than runtime minor → rejected (needs newer opcodes/layout)
+//!
+//! Early development uses major `0`. Additive append-only bytecode changes bump the
+//! minor; incompatible ABI/layout changes bump the major (and reset minor).
 
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::debug::{DebugLoc, ProgramDebug};
 
-/// Bump when bytecode encoding or `Byte` layout changes incompatibly.
-pub const ARCHIVE_VERSION: u32 = 35;
+/// Archive ABI major. Bump (and reset minor to 0) on incompatible layout/opcode changes.
+pub const ARCHIVE_MAJOR: u16 = 0;
+
+/// Archive ABI minor. Bump on additive, append-only bytecode changes.
+pub const ARCHIVE_MINOR: u16 = 0;
+
+/// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
+pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
+
+/// Pack major/minor into the `u32` stored in archives and package trailers.
+pub const fn pack_archive_version(major: u16, minor: u16) -> u32 {
+    ((major as u32) << 16) | (minor as u32)
+}
+
+/// High 16 bits of a packed archive version.
+pub const fn archive_major(version: u32) -> u16 {
+    (version >> 16) as u16
+}
+
+/// Low 16 bits of a packed archive version.
+pub const fn archive_minor(version: u32) -> u16 {
+    (version & 0xffff) as u16
+}
+
+/// Whether `archive` can run on a runtime stamped with `runtime`.
+///
+/// Requires equal majors and `archive` minor ≤ `runtime` minor.
+pub const fn archive_version_compatible(archive: u32, runtime: u32) -> bool {
+    archive_major(archive) == archive_major(runtime)
+        && archive_minor(archive) <= archive_minor(runtime)
+}
+
+/// Human-readable `major.minor` for diagnostics.
+pub fn format_archive_version(version: u32) -> String {
+    format!("{}.{}", archive_major(version), archive_minor(version))
+}
 
 /// Serialized program with constant pool and bytecode.
 #[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(compare(PartialEq))]
 pub struct ArchivedProgram {
+    /// Packed `major.minor` (`pack_archive_version`); see module docs.
     pub version: u32,
     /// Number of global static slots (`LoadStatic` / `StoreStatic`).
     pub static_slot_count: u32,
@@ -91,7 +134,35 @@ mod tests {
     }
 
     #[test]
-    fn archive_version_constant_is_positive() {
-        assert!(ARCHIVE_VERSION >= 1);
+    fn archive_version_is_wip_zero_dot_zero() {
+        assert_eq!(ARCHIVE_MAJOR, 0);
+        assert_eq!(ARCHIVE_MINOR, 0);
+        assert_eq!(ARCHIVE_VERSION, 0);
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "0.0");
+    }
+
+    #[test]
+    fn archive_version_compatible_within_major() {
+        let runtime = pack_archive_version(1, 2);
+        assert!(archive_version_compatible(
+            pack_archive_version(1, 0),
+            runtime
+        ));
+        assert!(archive_version_compatible(
+            pack_archive_version(1, 2),
+            runtime
+        ));
+        assert!(!archive_version_compatible(
+            pack_archive_version(1, 3),
+            runtime
+        ));
+        assert!(!archive_version_compatible(
+            pack_archive_version(2, 0),
+            runtime
+        ));
+        assert!(!archive_version_compatible(
+            pack_archive_version(0, 99),
+            runtime
+        ));
     }
 }
