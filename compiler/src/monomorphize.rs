@@ -218,14 +218,13 @@ fn candidate_for_call(
 
     // Skip monomorphization when the shared body needs dictionary dispatch:
     // - user-defined typeclasses always use dict tuples
-    // - `Show` always uses dict / `%v` CallIndirect (Phase 2–4); it must not
-    //   be ground-specialized, or `%v` sites keep an open `Ty::Var` and skip
-    //   boxing into the Show thunk
+    // - `Show` / `Length` always use dict / CallIndirect; they must not
+    //   be ground-specialized, or call sites keep an open `Ty::Var`
     // Num / Ord / Eq still monomorphize so arithmetic becomes direct opcodes.
     let requires_dictionary_body = sig.type_param_bounds.iter().any(|bounds| {
         bounds
             .iter()
-            .any(|b| b == "Show" || !Checker::is_builtin_class(b))
+            .any(|b| b == "Show" || b == "Length" || !Checker::is_builtin_class(b))
     });
     if requires_dictionary_body {
         return None;
