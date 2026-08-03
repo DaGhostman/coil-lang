@@ -1047,7 +1047,7 @@ use string::{format, to_bytes};
     #[test]
     fn compile_module_diff_matches_compile_tail_for_fib() {
         use common::Instruction;
-        let src = include_str!("../../examples/fib.hy");
+        let src = include_str!("../../../examples/fib.hy");
         let mut ast = Pratt::default().parse(src).expect("parse fib");
 
         // `compile_module` appends IL to the shared buffer; fusion/label
@@ -1131,7 +1131,7 @@ use string::{format, to_bytes};
     #[test]
     fn fib_compiles_with_fused_superinstructions() {
         use common::Instruction;
-        let src = include_str!("../../examples/fib.hy");
+        let src = include_str!("../../../examples/fib.hy");
         let (bc, _) = compile_src(src);
         // fib's body fuses `n <= 2` into `BinSlotImm` / `BinSlotImmJmpf`
         // and may fuse tails into ConstReturnImm / BinReturn when the join

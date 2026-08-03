@@ -3248,7 +3248,7 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
 
     #[test]
     fn coro_send_example_typechecks() {
-        let src = include_str!("../../../examples/coro_send.hy");
+        let src = include_str!("../../../../examples/coro_send.hy");
         let (c, _) = check(src);
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
     }
@@ -5350,4 +5350,3 @@ fn main() {
             msgs[0].message()
         );
     }
-}
