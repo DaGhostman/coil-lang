@@ -60,7 +60,7 @@ class Point { x: int, y: int }
 
 | Attribute | Target | Semantics |
 |-----------|--------|-----------|
-| `#[derive(Trait, …)]` | `enum` / `class` | Synthesizes builtin trait instances (`Show`, `Eq`, `Ord`) |
+| `#[derive(Trait, …)]` | `enum` / `class` | Synthesizes structural trait instances (`Show`, `Eq`, `Ord`, …). Without derive, non-generic types still get a default `Show`/`String` that returns `typeof self`. |
 | `#[test]` / `#[test("desc")]` | `fn` with body | Registers a `coil test` harness case (Result mode) |
 | `#[ffi(lib = "…", name = "…", variadic = true)]` | signature-only `fn …;` | Desugars to compile-time `extern` lowering |
 | User `attr` names | `fn`, methods, `class` | Expands to a wrapper that receives the decoratee callable, attribute extras, and forwarded call arguments (`...args`); class attrs wrap the constructor |

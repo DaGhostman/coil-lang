@@ -152,7 +152,7 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 
 ### Growing arrays
 
-Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed, and `len(arr)` returns its current runtime length as `int`.
+Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed. `len(value)` returns length as `int` for arrays, strings, tuples, and dicts; literal / fixed-size cases fold at compile time.
 
 ```coil
 use io::{stdout, write_all};
@@ -188,8 +188,28 @@ let n = d.x;              // field access
 - Anonymous records have structural `Show` support for `%v` when every field is showable. Fields print in canonical name order as `{ a: 1, b: 2 }`.
 
 Structural `Show` covers tuples and anonymous records automatically. Non-generic
-enums and classes can also opt in with `#[derive(Show)]` (see
-[Trait derive](#trait-derive)); otherwise write an explicit `impl Show for T`.
+enums and classes receive a **default** `Show`/`String` that returns `typeof self`
+(the type's fully-qualified name). Prefer `#[derive(Show)]` for structural field
+formatting (see [Trait derive](#trait-derive)), or write an explicit `impl Show for T`.
+
+---
+
+## `typeof`
+
+`typeof expr` is a compile-time query: it typechecks `expr`, formats the ground
+type as a fully-qualified name, and lowers to an ordinary string constant. The
+operand is **not** evaluated at runtime.
+
+```coil
+typeof 42                 // "int"
+typeof (1, 2)             // "(int, int)"
+typeof Option::Some(1)    // "prelude::Option<int>"
+```
+
+Open / unsolved types (free type variables, `never`, bare `Option::None`
+without an annotation) are a compile error. Nominal types include their defining
+module when non-empty (`prelude::Option<int>`, `math::Point`); entry-file types
+stay bare (`Point`).
 
 ---
 
@@ -612,6 +632,12 @@ class Cell {
 | `Send` | _(marker)_ | Empty instance (thread spawn still uses structural sendability) |
 | `Sensitive` | _(marker)_ | Empty instance (redaction hooks deferred) |
 
+**Default display (no derive):** every non-generic `enum` / `class` that lacks
+`#[derive(Show)]` / `#[derive(String)]` and has no explicit `impl` gets a
+compiler-generated instance whose body is `return typeof self;`. Explicit
+`impl` and structural `#[derive(Show)]` take precedence (overlap with a manual
+`impl` is still an error if both exist).
+
 Rules:
 
 - Placement: immediately before the `enum` / `class` keyword (after any doc comment).
@@ -620,7 +646,7 @@ Rules:
 - Combining `#[derive(Show)]` with a hand-written `impl Show for T` hits the usual overlap diagnostic.
 - Empty `#[derive()]` with no traits is a parse error.
 
-See `examples/derive_show_eq.hy` and `examples/derive_hash.hy`.
+See `examples/derive_show_eq.hy`, `examples/derive_hash.hy`, and `examples/typeof_len.hy`.
 
 ### User-defined traits (sketch)
 

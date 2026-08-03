@@ -603,6 +603,19 @@ class Cell {
 
 ---
 
+### `examples/typeof_len.hy`
+
+**Demonstrates:** compile-time `typeof` (FQN string constants), static `len`
+folding for string/array/tuple/dict literals, and the default `Show` for a
+class (prints the type name via `typeof self`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/typeof_len.hy` |
+| **Output** | `int` / `string` / `(int, int)` / `3` / `3` / `2` / `2` / `Point` / `Point` (one per line) |
+
+---
+
 ### `examples/derive_hash.hy`
 
 **Demonstrates:** `#[derive(Hash)]` with recursive `field.hash()` — primitives (`int`, `string`, …) and nested Hash types.

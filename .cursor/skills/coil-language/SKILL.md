@@ -65,6 +65,7 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 | Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
 | FFI | `extern { … }` blocks or `use ffi::*` + `dload`/`declare`/`invoke` |
 | Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
+| Type query | `typeof expr` → compile-time FQN string (not evaluated at runtime) |
 
 Named call-site args: positional prefix then `f(name: v)`. Rest: trailing `T... xs`. Spread: `f(...pack)`.
 

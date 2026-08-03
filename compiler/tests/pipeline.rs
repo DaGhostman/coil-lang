@@ -2048,6 +2048,15 @@ fn example_derive_show_eq_prints_expected() {
     );
 }
 
+#[test]
+fn example_typeof_len_prints_expected() {
+    let output = run_example("examples/typeof_len.hy");
+    assert_eq!(
+        output,
+        "int\nstring\n(int, int)\n3\n3\n2\n2\nPoint\nPoint\n"
+    );
+}
+
 /// Regression: derived `Serialize::serialize` must typecheck (`[byte]` return,
 /// payload fields cast to `byte`).
 #[test]

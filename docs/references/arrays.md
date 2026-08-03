@@ -4,13 +4,15 @@ Append with empty index assignment; query length with `len`.
 
 ```coil
 arr[] = value   // append (assignment target only)
-len(arr)
+len(value)
 ```
 
 | Form | Argument types | Returns | Behavior |
 |------|----------------|---------|----------|
 | `arr[] = v` | `[T]`, `T` | `[T]` (discarded in statement form) | Appends in place; promotes fixed `[T; N]` bindings to dynamic `[T]` |
-| `len` | `[T]` | `int` | Current runtime length |
+| `len` | `[T]`, `string`, tuple, or dict | `int` | Current length (elements / bytes / fields) |
+
+`len` of a string, array, tuple, or dict **literal** (and of fixed-size array/tuple types) folds to a compile-time integer when the length is statically known.
 
 Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
 
@@ -21,6 +23,7 @@ let a = [1, 2];
 a[] = 3;
 write_all(stdout(), to_bytes(format("%i", len(a)))); // 3
 write_all(stdout(), to_bytes(format("%i", a[2])));  // 3
+write_all(stdout(), to_bytes(format("%i", len("foo")))); // 3 (folded)
 ```
 
 ---
