@@ -14,7 +14,7 @@ use crate::typechecking::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use crate::typechecking::ty::{AssocProjection, Constraint, Scheme};
 use crate::typechecking::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use crate::typechecking::ty::{
-    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
+    EnumVariantPayloadTy, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
     list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
     result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
     strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty,
@@ -3898,6 +3898,7 @@ impl Checker {
 
             // ---- Function declarations ----
             Expression::Function {
+                docs: _,
                 attrs,
                 name,
                 is_coro,
@@ -4054,6 +4055,7 @@ impl Checker {
                 unit_ty()
             }
             Expression::Class {
+                docs: _,
                 name,
                 type_params,
                 fields,
@@ -4249,6 +4251,7 @@ impl Checker {
 
             // ---- Enums / constructors / type aliases ----
             Expression::EnumDecl {
+                docs: _,
                 name,
                 type_params,
                 variants,
@@ -4259,6 +4262,7 @@ impl Checker {
                 unit_ty()
             }
             Expression::TypeAlias {
+                docs: _,
                 name,
                 type_params,
                 ty,
@@ -4346,6 +4350,7 @@ impl Checker {
 
             // ---- Generics ----
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -4382,6 +4387,7 @@ impl Checker {
                             None
                         }
                         Expression::Function {
+                            docs: _,
                             name: mname, body, ..
                         } => {
                             let has_default = body.as_ref().is_some_and(
@@ -4479,6 +4485,7 @@ impl Checker {
                 }];
                 for method in methods {
                     if let Expression::Function {
+                        docs: _,
                         name: method_name,
                         type_params: method_params,
                         args,
@@ -4786,6 +4793,7 @@ impl Checker {
                         _ => {
                             let maybe_fn = match m.1.as_ref() {
                                 Expression::Function {
+                                    docs: _,
                                     name,
                                     type_params,
                                     args,
@@ -4805,6 +4813,7 @@ impl Checker {
                                 )),
                                 Expression::Method(_, body) => match body.1.as_ref() {
                                     Expression::Function {
+                                        docs: _,
                                         name,
                                         type_params,
                                         args,
@@ -9748,6 +9757,7 @@ impl Checker {
         let mut field_info = Vec::new();
         for field in fields {
             if let Expression::Field {
+                docs: _,
                 visibility: vis,
                 modifier,
                 name: fname,
@@ -9887,6 +9897,7 @@ impl Checker {
         for method in methods {
             if let Expression::Method(vis, body) = method.1.as_ref() {
                 if let Expression::Function {
+                    docs: _,
                     name,
                     is_coro,
                     is_static,
@@ -11322,6 +11333,7 @@ impl Checker {
                 self.pre_register_enums_walk(ty, errors);
             }
             Expression::EnumDecl {
+                docs: _,
                 name,
                 type_params,
                 variants,
@@ -11336,6 +11348,7 @@ impl Checker {
 
                 for v in variants {
                     if let Expression::EnumVariant {
+                        docs: _,
                         name: vname,
                         payload,
                     } = v.1.as_ref()
@@ -11769,6 +11782,7 @@ impl Checker {
                 self.pre_register_enums_walk(ret, errors);
             }
             Expression::AttrDecl {
+                docs: _,
                 args,
                 returns,
                 body,
@@ -11828,6 +11842,7 @@ impl Checker {
             let _ = self.infer(v);
 
             if let Expression::EnumVariant {
+                docs: _,
                 name: vname,
                 payload,
             } = v.1.as_ref()

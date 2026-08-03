@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = ["crypto", "time", "regex", "tls"]
+dissect = []
 crypto = ["machine/crypto"]
 time = ["machine/time"]
 regex = ["machine/regex"]
@@ -23,3 +24,7 @@ machine = { path = "../machine", default-features = false, features = ["vm_profi
 proptest = "1"
 libc = "0.2"
 rcgen = "0.13"
+
+[[test]]
+name = "dissect"
+required-features = ["dissect"]

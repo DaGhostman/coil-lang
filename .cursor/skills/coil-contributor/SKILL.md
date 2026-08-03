@@ -73,7 +73,9 @@ rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default r
 |-----------|-------------|
 | VM / alloc | valgrind memcheck on debug build |
 | Perf | `poop` on `examples/fib_bench.hy`; prefer alloc reduction over new opcodes |
-| Debug info | `coil debug`, `coil dissect` |
+| Debug info | `coil debug`, `coil dissect` (need `coil-debug` / `coil-dissect` beside `coil`) |
+| Formatting | `coil fmt` (need `coil-fmt` beside `coil`) |
+| Packaged apps | `coil package` defaults to `coil-embed` runner |
 
 ## Feature work workflow
 
@@ -102,6 +104,7 @@ Prefer compiler builtins over userland for core type machinery.
 |------|-----|
 | `coil dissect file.hy --fn pat` | IL/bytecode dump without running |
 | `coil debug file.hy -x script --batch` | VM debugger (see coil-debug skill) |
+| `coil fmt [--check] path` | Pretty-print `.hy` (AST; comments dropped) |
 | `poop` | Instruction/HW counter baselines |
 | `valgrind` | Leaks, callgrind |
 | `heaptrack` | Allocation tracing |

@@ -1,0 +1,1343 @@
+//! Source pretty-printer for coil `.hy` files.
+//!
+//! Preserves `//` comments and emits attached `///` docs on declarations.
+
+use crate::ast::{
+    AdjustOp, AssignOp, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
+    ExternStructDecl, Expression, FieldModifier, LetPattern, Output, Pattern,
+    RecordFieldValue, TypeParam, Visibility, WhereConstraint,
+};
+use crate::Pratt;
+use reporting::Message;
+
+const INDENT: &str = "    ";
+
+pub fn format_source(src: &str) -> Result<String, Message> {
+    let ast = Pratt::default().parse(src)?;
+    Ok(format_program(ast.1.as_ref()))
+}
+
+pub fn format_program(expr: &Expression<'_>) -> String {
+    let mut f = Formatter::new();
+    f.fmt_expression(expr);
+    if !f.out.ends_with('\n') {
+        f.out.push('\n');
+    }
+    f.out
+}
+
+struct Formatter {
+    indent: usize,
+    out: String,
+}
+
+impl Formatter {
+    fn new() -> Self {
+        Self {
+            indent: 0,
+            out: String::new(),
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.out.push_str(s);
+    }
+
+    fn newline(&mut self) {
+        self.out.push('\n');
+    }
+
+    fn write_indent(&mut self) {
+        for _ in 0..self.indent {
+            self.out.push_str(INDENT);
+        }
+    }
+
+    fn with_indent(&mut self, f: impl FnOnce(&mut Self)) {
+        self.indent += 1;
+        f(self);
+        self.indent -= 1;
+    }
+
+    fn fmt_output(&mut self, output: &Output<'_>) {
+        self.fmt_expression(output.1.as_ref());
+    }
+
+    fn fmt_outputs_comma(&mut self, items: &[Output<'_>]) {
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                self.push_str(", ");
+            }
+            self.fmt_output(item);
+        }
+    }
+
+    fn fmt_expression(&mut self, expr: &Expression<'_>) {
+        match expr {
+            Expression::Comment(text) => self.fmt_comment_line(text),
+
+            Expression::Integer(n) => self.push_str(&n.to_string()),
+            Expression::Float(n) => self.push_str(&format!("{n:?}")),
+            Expression::Bool(b) => self.push_str(if *b { "true" } else { "false" }),
+            Expression::String(s) => {
+                self.push_str("\"");
+                self.push_str(s);
+                self.push_str("\"");
+            }
+            Expression::Identifier(id) => self.push_str(id),
+            Expression::Type(n) => self.push_str(n),
+            Expression::Break => self.push_str("break"),
+            Expression::Continue => self.push_str("continue"),
+            Expression::Noop(n) => {
+                self.push_str("@{ ");
+                self.fmt_output(n);
+                self.push_str(" }@");
+            }
+            Expression::Default(name) => self.push_str(name),
+            Expression::Module(name, _) => {
+                self.push_str("mod ");
+                self.push_str(name);
+                self.push_str(";");
+            }
+
+            Expression::Expr(inner) | Expression::ImplicitReturn(inner) => self.fmt_output(inner),
+            Expression::Group(g) => {
+                self.push_str("(");
+                self.fmt_output(g);
+                self.push_str(")");
+            }
+            Expression::ExprStatement(e) => {
+                self.fmt_output(e);
+                self.push_str(";");
+            }
+            Expression::Statement(s) => self.fmt_statement_line(s),
+
+            Expression::Fragment(items) => self.fmt_fragment(items),
+            Expression::Block(items) => self.fmt_block_braced(items),
+            Expression::Program(items) => self.fmt_program(items),
+
+            Expression::If(branches) => self.fmt_if(branches),
+            Expression::Branch(cond, body) => {
+                if let Some(c) = cond {
+                    self.push_str("if ");
+                    self.fmt_output(c);
+                    self.push_str(" ");
+                } else {
+                    self.push_str("else ");
+                }
+                self.fmt_block_or_inline(body);
+            }
+
+            Expression::Return(e) => {
+                self.push_str("return");
+                if !is_bare_return(e.1.as_ref()) {
+                    self.push_str(" ");
+                    self.fmt_output(e);
+                }
+            }
+            Expression::Raise(inner) => {
+                self.push_str("raise ");
+                self.fmt_output(inner);
+            }
+            Expression::Panic(inner) => {
+                self.push_str("panic ");
+                self.fmt_output(inner);
+            }
+            Expression::Yield(inner) => {
+                self.push_str("yield ");
+                self.fmt_output(inner);
+            }
+            Expression::YieldFrom(inner) => {
+                self.push_str("yield from ");
+                self.fmt_output(inner);
+            }
+            Expression::Resume(target, arg) => {
+                self.push_str("resume ");
+                self.fmt_output(target);
+                if let Some(a) = arg {
+                    self.push_str(" with ");
+                    self.fmt_output(a);
+                }
+            }
+
+            Expression::Negate(n) => {
+                self.push_str("-");
+                self.fmt_output(n);
+            }
+            Expression::Positive(n) => {
+                self.push_str("+");
+                self.fmt_output(n);
+            }
+            Expression::Not(n) => {
+                self.push_str("~");
+                self.fmt_output(n);
+            }
+            Expression::LogicalNot(n) => {
+                self.push_str("!");
+                self.fmt_output(n);
+            }
+            Expression::Try(inner) => {
+                self.fmt_output(inner);
+                self.push_str("?");
+            }
+            Expression::Readonly(inner) => {
+                self.push_str("readonly ");
+                self.fmt_output(inner);
+            }
+            Expression::TypeOf(inner) => {
+                self.push_str("typeof ");
+                self.fmt_output(inner);
+            }
+
+            Expression::Add(lhs, rhs)
+            | Expression::Sub(lhs, rhs)
+            | Expression::Mul(lhs, rhs)
+            | Expression::Div(lhs, rhs)
+            | Expression::Mod(lhs, rhs)
+            | Expression::Pow(lhs, rhs)
+            | Expression::Shl(lhs, rhs)
+            | Expression::Shr(lhs, rhs)
+            | Expression::Xor(lhs, rhs)
+            | Expression::And(lhs, rhs)
+            | Expression::BitAnd(lhs, rhs)
+            | Expression::Or(lhs, rhs)
+            | Expression::BitOr(lhs, rhs)
+            | Expression::Eq(lhs, rhs)
+            | Expression::Neq(lhs, rhs)
+            | Expression::Le(lhs, rhs)
+            | Expression::Gt(lhs, rhs)
+            | Expression::Leq(lhs, rhs)
+            | Expression::Geq(lhs, rhs) => {
+                self.fmt_output(lhs);
+                self.push_str(" ");
+                self.push_str(binary_op(expr));
+                self.push_str(" ");
+                self.fmt_output(rhs);
+            }
+            Expression::Coalesce(lhs, rhs) => {
+                self.fmt_output(lhs);
+                self.push_str(" ?? ");
+                self.fmt_output(rhs);
+            }
+            Expression::Cast(expr, ty) => {
+                self.fmt_output(expr);
+                self.push_str(" as ");
+                self.fmt_output(ty);
+            }
+            Expression::CompoundAssign(lhs, op, rhs) => {
+                self.fmt_output(lhs);
+                self.push_str(" ");
+                self.push_str(compound_op(*op));
+                self.push_str(" ");
+                self.fmt_output(rhs);
+            }
+            Expression::Adjust { op, prefix, target } => {
+                let sym = match op {
+                    AdjustOp::Inc => "++",
+                    AdjustOp::Dec => "--",
+                };
+                if *prefix {
+                    self.push_str(sym);
+                    self.fmt_output(target);
+                } else {
+                    self.fmt_output(target);
+                    self.push_str(sym);
+                }
+            }
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                self.fmt_output(start);
+                if *inclusive {
+                    self.push_str("..=");
+                } else {
+                    self.push_str("..");
+                }
+                self.fmt_output(end);
+            }
+            Expression::Assignment(lhs, rhs) => {
+                self.fmt_output(lhs);
+                self.push_str(" = ");
+                self.fmt_output(rhs);
+            }
+
+            Expression::List(items) | Expression::Array(items) => {
+                self.push_str("[");
+                self.fmt_outputs_comma(items);
+                self.push_str("]");
+            }
+            Expression::Tuple(items) => {
+                self.push_str("(");
+                self.fmt_outputs_comma(items);
+                self.push_str(")");
+            }
+            Expression::Dict(items) => self.fmt_record_values(items),
+            Expression::Index(target, index) => {
+                self.fmt_output(target);
+                self.push_str("[");
+                if let Some(idx) = index {
+                    self.fmt_output(idx);
+                }
+                self.push_str("]");
+            }
+            Expression::Access(receiver, field) => {
+                self.fmt_output(receiver);
+                self.push_str(".");
+                self.push_str(field);
+            }
+            Expression::OptionalAccess(receiver, field) => {
+                self.fmt_output(receiver);
+                self.push_str("?.");
+                self.push_str(field);
+            }
+            Expression::QualifiedAccess { owner, member } => {
+                self.push_str(owner);
+                self.push_str("::");
+                self.push_str(member);
+            }
+            Expression::Member(inner) => self.fmt_output(inner),
+
+            Expression::Call { name, args } => {
+                self.fmt_output(name);
+                self.push_str("(");
+                if let Some(args) = args {
+                    self.fmt_outputs_comma(args);
+                }
+                self.push_str(")");
+            }
+            Expression::NamedArg(name, value) => {
+                self.push_str(name);
+                self.push_str(": ");
+                self.fmt_output(value);
+            }
+            Expression::Spread(inner) => {
+                self.push_str("...");
+                self.fmt_output(inner);
+            }
+            Expression::Argument(ty, name, is_rest) => {
+                if *is_rest {
+                    match ty {
+                        None => {
+                            self.push_str("... ");
+                            self.push_str(name);
+                        }
+                        Some(t) => {
+                            self.fmt_output(t);
+                            self.push_str("... ");
+                            self.push_str(name);
+                        }
+                    }
+                } else {
+                    self.fmt_output(ty.as_ref().expect("fixed param"));
+                    self.push_str(" ");
+                    self.push_str(name);
+                }
+            }
+
+            Expression::Instantiate(class, args) => {
+                self.push_str("new ");
+                self.fmt_output(class);
+                self.push_str("(");
+                if let Some(args) = args {
+                    self.fmt_outputs_comma(args);
+                }
+                self.push_str(")");
+            }
+
+            Expression::Dload(path) => {
+                self.push_str("dload(");
+                self.fmt_output(path);
+                self.push_str(")");
+            }
+            Expression::Done(handle) => {
+                self.push_str("done(");
+                self.fmt_output(handle);
+                self.push_str(")");
+            }
+            Expression::Declare(args) | Expression::Invoke(args) => {
+                let kw = if matches!(expr, Expression::Declare(_)) {
+                    "declare"
+                } else {
+                    "invoke"
+                };
+                self.push_str(kw);
+                self.push_str("(");
+                self.fmt_outputs_comma(args);
+                self.push_str(")");
+            }
+
+            Expression::Use { path, name, alias } => {
+                self.push_str("use ");
+                for (i, seg) in path.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str("::");
+                    }
+                    self.push_str(seg);
+                }
+                if !path.is_empty() {
+                    self.push_str("::");
+                }
+                self.push_str(name);
+                if let Some(a) = alias {
+                    self.push_str(" as ");
+                    self.push_str(a);
+                }
+                self.push_str(";");
+            }
+
+            Expression::Variable(name, ty) => {
+                self.push_str("let ");
+                self.push_str(name);
+                if let Some(t) = ty {
+                    self.push_str(": ");
+                    self.fmt_output(t);
+                }
+            }
+            Expression::Constant(name, ty) => {
+                self.push_str("const ");
+                self.fmt_output(name);
+                if let Some(t) = ty {
+                    self.push_str(": ");
+                    self.fmt_output(t);
+                }
+            }
+            Expression::LetDestructure { pattern, rhs } => {
+                self.push_str("let ");
+                self.fmt_let_pattern(pattern);
+                self.push_str(" = ");
+                self.fmt_output(rhs);
+            }
+            Expression::StaticDecl {
+                is_const,
+                name,
+                ty,
+                init,
+            } => {
+                if *is_const {
+                    self.push_str("static const");
+                } else {
+                    self.push_str("static let");
+                }
+                if let Some(t) = ty {
+                    self.push_str(": ");
+                    self.fmt_output(t);
+                }
+                self.push_str(" ");
+                self.push_str(name);
+                self.push_str(" = ");
+                self.fmt_output(init);
+                self.push_str(";");
+            }
+
+            Expression::Defer { captures, body } => {
+                self.push_str("defer");
+                if !captures.is_empty() {
+                    self.push_str(" use (");
+                    for (i, c) in captures.iter().enumerate() {
+                        if i > 0 {
+                            self.push_str(", ");
+                        }
+                        self.push_str(c);
+                    }
+                    self.push_str(")");
+                }
+                self.push_str(" ");
+                self.fmt_block_or_inline(body);
+            }
+
+            Expression::Function { .. } => self.fmt_function_expr(expr, true),
+
+            Expression::Loop {
+                identifier,
+                iterable,
+                body,
+            } => {
+                if let Some(ident) = identifier {
+                    self.push_str("for ");
+                    self.fmt_output(ident);
+                    self.push_str(" in ");
+                    self.fmt_output(iterable);
+                    self.push_str(" ");
+                    self.fmt_block_or_inline(body);
+                } else {
+                    self.push_str("while ");
+                    self.fmt_output(iterable);
+                    self.push_str(" ");
+                    self.fmt_block_or_inline(body);
+                }
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                self.push_str("for (");
+                if let Some(i) = init {
+                    self.fmt_output(i);
+                }
+                self.push_str("; ");
+                self.fmt_output(cond);
+                self.push_str("; ");
+                if let Some(s) = step {
+                    self.fmt_output(s);
+                }
+                self.push_str(") ");
+                self.fmt_block_or_inline(body);
+            }
+
+            Expression::Match { scrutinee, arms } => {
+                self.push_str("match ");
+                self.fmt_output(scrutinee);
+                self.push_str(" {");
+                self.newline();
+                self.with_indent(|f| {
+                    for (i, arm) in arms.iter().enumerate() {
+                        f.write_indent();
+                        f.fmt_pattern(&arm.pattern);
+                        f.push_str(" => ");
+                        f.fmt_match_arm_body(&arm.body);
+                        if i + 1 < arms.len() {
+                            f.push_str(",");
+                        }
+                        f.newline();
+                    }
+                });
+                self.push_str("}");
+            }
+
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                fields,
+            } => {
+                self.push_str(enum_name);
+                self.push_str("::");
+                self.push_str(variant_name);
+                self.fmt_construct_payload(fields);
+            }
+
+            Expression::Lambda {
+                args,
+                captures,
+                body,
+            } => {
+                self.push_str("fn (");
+                self.fmt_lambda_params(args);
+                self.push_str(")");
+                if !captures.is_empty() {
+                    self.push_str(" use (");
+                    for (i, c) in captures.iter().enumerate() {
+                        if i > 0 {
+                            self.push_str(", ");
+                        }
+                        self.push_str(c);
+                    }
+                    self.push_str(")");
+                }
+                match body.1.as_ref() {
+                    Expression::Block(_) => {
+                        self.push_str(" ");
+                        self.fmt_block_or_inline(body);
+                    }
+                    _ => {
+                        self.push_str(" => ");
+                        self.fmt_output(body);
+                    }
+                }
+            }
+
+            Expression::TypeAlias {
+                docs,
+                name,
+                type_params,
+                ty,
+            } => {
+                self.fmt_docs(docs);
+                self.push_str("type ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.push_str(" = ");
+                self.fmt_output(ty);
+                self.push_str(";");
+            }
+            Expression::TypeApp { name, args } => {
+                self.push_str(name);
+                self.push_str("<");
+                self.fmt_outputs_comma(args);
+                self.push_str(">");
+            }
+            Expression::TypeProjection { owner, name, args } => {
+                self.push_str(owner);
+                self.push_str("::");
+                self.push_str(name);
+                if !args.is_empty() {
+                    self.push_str("<");
+                    self.fmt_outputs_comma(args);
+                    self.push_str(">");
+                }
+            }
+            Expression::TypeFun(arg, ret) => {
+                self.fmt_output(arg);
+                self.push_str(" -> ");
+                self.fmt_output(ret);
+            }
+            Expression::TypeFnSig { params, ret } => {
+                self.push_str("fn");
+                self.fmt_output(params);
+                self.push_str(" -> ");
+                self.fmt_output(ret);
+            }
+            Expression::Forall { params, ty } => {
+                self.push_str("forall ");
+                self.fmt_type_params_list(params);
+                self.push_str(". ");
+                self.fmt_output(ty);
+            }
+
+            Expression::AttrDecl {
+                docs,
+                name,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                body,
+            } => {
+                self.fmt_docs(docs);
+                self.push_str("attr ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.fmt_output(args);
+                if let Some(ret) = returns {
+                    self.push_str(" -> ");
+                    self.fmt_output(ret);
+                }
+                self.fmt_where(where_constraints);
+                self.push_str(" ");
+                self.fmt_block_or_inline(body);
+            }
+
+            Expression::TestCase { name, body } => {
+                self.push_str("test(");
+                self.fmt_output(name);
+                self.push_str(") ");
+                self.fmt_block_or_inline(body);
+            }
+
+            Expression::EnumDecl {
+                docs,
+                attrs,
+                name,
+                type_params,
+                variants,
+            } => {
+                self.fmt_docs(docs);
+                self.fmt_attrs(attrs);
+                self.push_str("enum ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.push_str(" { ");
+                for (i, v) in variants.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str(", ");
+                    }
+                    self.fmt_output(v);
+                }
+                self.push_str(" }");
+            }
+            Expression::EnumVariant { docs, name, payload } => {
+                self.fmt_docs(docs);
+                self.push_str(name);
+                self.fmt_enum_variant_payload(payload);
+            }
+
+            Expression::Class {
+                docs,
+                attrs,
+                name,
+                type_params,
+                fields,
+            } => {
+                self.fmt_docs(docs);
+                self.fmt_attrs(attrs);
+                self.push_str("class ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.fmt_braced_items(fields);
+            }
+            Expression::Field {
+                docs,
+                visibility,
+                modifier,
+                name,
+                ty,
+                init,
+            } => {
+                self.fmt_docs(docs);
+                self.fmt_visibility(*visibility);
+                self.fmt_field_modifier(*modifier);
+                self.fmt_output(name);
+                self.push_str(": ");
+                self.fmt_output(ty);
+                if let Some(i) = init {
+                    self.push_str(" = ");
+                    self.fmt_output(i);
+                }
+            }
+            Expression::Method(visibility, func) => {
+                if let Expression::Function { docs, .. } = func.1.as_ref() {
+                    self.fmt_docs(docs);
+                }
+                self.fmt_visibility(*visibility);
+                self.fmt_function(func, false);
+            }
+            Expression::Implementation {
+                what,
+                owner,
+                type_params,
+                methods,
+            } => {
+                self.push_str("impl ");
+                if !what.is_empty() {
+                    self.push_str(what);
+                    self.push_str(" for ");
+                }
+                self.push_str(owner);
+                self.fmt_type_params(type_params);
+                self.fmt_braced_items(methods);
+            }
+            Expression::TypeClass {
+                docs,
+                name,
+                type_params,
+                methods,
+            } => {
+                self.fmt_docs(docs);
+                self.push_str("trait ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.fmt_braced_items(methods);
+            }
+            Expression::TypeClassImpl {
+                class,
+                args,
+                methods,
+            } => {
+                self.push_str("impl ");
+                self.push_str(class);
+                if let Some((for_ty, rest)) = args.split_first() {
+                    if !rest.is_empty() {
+                        self.push_str("<");
+                        self.fmt_outputs_comma(rest);
+                        self.push_str(">");
+                    }
+                    self.push_str(" for ");
+                    self.fmt_output(for_ty);
+                }
+                self.fmt_braced_items(methods);
+            }
+            Expression::AssocTypeDecl { name, type_params } => {
+                self.push_str("type ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.push_str(";");
+            }
+            Expression::AssocTypeDef {
+                name,
+                type_params,
+                ty,
+            } => {
+                self.push_str("type ");
+                self.push_str(name);
+                self.fmt_type_params(type_params);
+                self.push_str(" = ");
+                self.fmt_output(ty);
+                self.push_str(";");
+            }
+
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                self.push_str("extern \"");
+                self.push_str(library);
+                self.push_str("\" {");
+                self.newline();
+                self.with_indent(|f| {
+                    for decl in declarations {
+                        f.write_indent();
+                        f.fmt_extern_function(decl);
+                        f.newline();
+                    }
+                });
+                self.push_str("}");
+            }
+            Expression::ExternStruct(decl) => self.fmt_extern_struct(decl),
+        }
+    }
+
+    fn fmt_statement_line(&mut self, s: &Output<'_>) {
+        match s.1.as_ref() {
+            Expression::Comment(text) => self.fmt_comment_line(text),
+            Expression::ExprStatement(_) => self.fmt_expression(s.1.as_ref()),
+            other => {
+                self.fmt_expression(other);
+                if stmt_needs_semicolon(other) {
+                    self.push_str(";");
+                }
+            }
+        }
+    }
+
+    fn fmt_block_stmt(&mut self, item: &Output<'_>) {
+        match item.1.as_ref() {
+            Expression::Comment(text) => {
+                self.write_indent();
+                self.fmt_comment_line(text);
+                self.newline();
+            }
+            Expression::Statement(s) => {
+                self.write_indent();
+                self.fmt_statement_line(s);
+                self.newline();
+            }
+            other => {
+                self.write_indent();
+                self.fmt_expression(other);
+                if stmt_needs_semicolon(other) {
+                    self.push_str(";");
+                }
+                self.newline();
+            }
+        }
+    }
+
+    fn fmt_block_braced(&mut self, items: &[Output<'_>]) {
+        self.push_str("{");
+        self.newline();
+        self.with_indent(|f| {
+            for item in items {
+                f.fmt_block_stmt(item);
+            }
+        });
+        self.write_indent();
+        self.push_str("}");
+    }
+
+    fn fmt_block_or_inline(&mut self, body: &Output<'_>) {
+        match body.1.as_ref() {
+            Expression::Block(items) => self.fmt_block_braced(items),
+            other => self.fmt_expression(other),
+        }
+    }
+
+    fn fmt_program(&mut self, items: &[Output<'_>]) {
+        let mut prev_comment = false;
+        for (i, item) in items.iter().enumerate() {
+            let is_comment = matches!(item.1.as_ref(), Expression::Comment(_));
+            if i > 0 {
+                self.newline();
+                if !(prev_comment && is_comment) {
+                    self.newline();
+                }
+            }
+            self.fmt_expression(item.1.as_ref());
+            prev_comment = is_comment;
+        }
+    }
+
+    fn fmt_if(&mut self, branches: &[Output<'_>]) {
+        for (i, branch) in branches.iter().enumerate() {
+            let Expression::Branch(cond, body) = branch.1.as_ref() else {
+                self.fmt_output(branch);
+                continue;
+            };
+            if i > 0 {
+                self.push_str(" ");
+            }
+            if i == 0 {
+                self.push_str("if ");
+                if let Some(c) = cond {
+                    self.fmt_output(c);
+                    self.push_str(" ");
+                }
+            } else if cond.is_some() {
+                self.push_str("else if ");
+                self.fmt_output(cond.as_ref().unwrap());
+                self.push_str(" ");
+            } else {
+                self.push_str("else ");
+            }
+            self.fmt_block_or_inline(body);
+        }
+    }
+
+    fn fmt_fragment(&mut self, items: &[Output<'_>]) {
+        if items.is_empty() {
+            return;
+        }
+        match items[0].1.as_ref() {
+            Expression::Variable(name, ty) => {
+                self.push_str("let ");
+                self.push_str(name);
+                if let Some(t) = ty {
+                    self.push_str(": ");
+                    self.fmt_output(t);
+                }
+                if let Some(val) = items.get(1) {
+                    self.push_str(" = ");
+                    self.fmt_output(val);
+                }
+            }
+            Expression::Constant(name, ty) => {
+                self.push_str("const ");
+                self.fmt_output(name);
+                if let Some(t) = ty {
+                    self.push_str(": ");
+                    self.fmt_output(t);
+                }
+                if let Some(val) = items.get(1) {
+                    self.push_str(" = ");
+                    self.fmt_output(val);
+                }
+            }
+            _ => {
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str(", ");
+                    }
+                    self.fmt_output(item);
+                }
+            }
+        }
+    }
+
+    fn fmt_braced_items(&mut self, items: &[Output<'_>]) {
+        self.push_str(" {");
+        self.newline();
+        self.with_indent(|f| {
+            for item in items {
+                f.write_indent();
+                f.fmt_expression(item.1.as_ref());
+                f.newline();
+            }
+        });
+        self.push_str("}");
+    }
+
+    fn fmt_lambda_params(&mut self, args: &Output<'_>) {
+        match args.1.as_ref() {
+            Expression::Fragment(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str(", ");
+                    }
+                    self.fmt_output(item);
+                }
+            }
+            other => self.fmt_expression(other),
+        }
+    }
+
+    fn fmt_match_arm_body(&mut self, body: &Output<'_>) {
+        match body.1.as_ref() {
+            Expression::Block(items) => self.fmt_block_braced(items),
+            other => self.fmt_expression(other),
+        }
+    }
+
+    fn fmt_record_values(&mut self, items: &[RecordFieldValue<'_>]) {
+        self.push_str("{ ");
+        for (i, field) in items.iter().enumerate() {
+            if i > 0 {
+                self.push_str(", ");
+            }
+            self.push_str(field.name);
+            self.push_str(": ");
+            self.fmt_output(&field.value);
+        }
+        self.push_str(" }");
+    }
+
+    fn fmt_construct_payload(&mut self, fields: &EnumConstructPayload<'_>) {
+        match fields {
+            EnumConstructPayload::Unit => {}
+            EnumConstructPayload::Tuple(args) => {
+                self.push_str("(");
+                self.fmt_outputs_comma(args);
+                self.push_str(")");
+            }
+            EnumConstructPayload::Record(parts) => self.fmt_record_values(parts),
+        }
+    }
+
+    fn fmt_enum_variant_payload(&mut self, payload: &EnumVariantPayload<'_>) {
+        match payload {
+            EnumVariantPayload::Unit => {}
+            EnumVariantPayload::Tuple(parts) => {
+                if parts.is_empty() {
+                    return;
+                }
+                self.push_str("(");
+                self.fmt_outputs_comma(parts);
+                self.push_str(")");
+            }
+            EnumVariantPayload::Record(fields) => {
+                self.push_str(" { ");
+                for (i, rf) in fields.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str(", ");
+                    }
+                    self.push_str(rf.name);
+                    self.push_str(": ");
+                    self.fmt_output(&rf.value);
+                }
+                self.push_str(" }");
+            }
+        }
+    }
+
+    fn fmt_extern_function(&mut self, decl: &ExternFunction<'_>) {
+        self.push_str("fn ");
+        self.push_str(decl.name);
+        self.push_str("(");
+        self.fmt_output(&decl.args);
+        if decl.variadic {
+            self.push_str(", ...");
+        }
+        self.push_str(")");
+        if let Some(ret) = &decl.returns {
+            self.push_str(" -> ");
+            self.fmt_output(ret);
+        }
+        self.push_str(";");
+    }
+
+    fn fmt_extern_struct(&mut self, decl: &ExternStructDecl<'_>) {
+        self.push_str("extern struct ");
+        self.push_str(decl.name);
+        self.push_str(" {");
+        self.newline();
+        self.with_indent(|f| {
+            for (i, (name, ty)) in decl.fields.iter().enumerate() {
+                f.write_indent();
+                f.push_str(name);
+                f.push_str(": ");
+                f.fmt_output(ty);
+                if i + 1 < decl.fields.len() {
+                    f.push_str(",");
+                }
+                f.newline();
+            }
+        });
+        self.push_str("};");
+    }
+
+    fn fmt_visibility(&mut self, visibility: Visibility) {
+        if visibility == Visibility::Public {
+            self.push_str("pub ");
+        }
+    }
+
+    fn fmt_field_modifier(&mut self, modifier: FieldModifier) {
+        match modifier {
+            FieldModifier::Const => self.push_str("const "),
+            FieldModifier::Static => self.push_str("static "),
+            FieldModifier::Instance => {}
+        }
+    }
+
+    fn fmt_docs(&mut self, docs: &[&str]) {
+        if docs.is_empty() {
+            return;
+        }
+        for (i, line) in docs.iter().enumerate() {
+            if i > 0 {
+                self.write_indent();
+            }
+            self.push_str("///");
+            if !line.is_empty() {
+                self.push_str(" ");
+                self.push_str(line);
+            }
+            self.newline();
+            self.write_indent();
+        }
+    }
+
+    fn fmt_comment_line(&mut self, text: &str) {
+        self.push_str("//");
+        if !text.is_empty() {
+            self.push_str(" ");
+            self.push_str(text);
+        }
+    }
+
+    /// Pretty-print a [`Expression::Function`], optionally emitting attached docs.
+    fn fmt_function(&mut self, func: &Output<'_>, emit_docs: bool) {
+        self.fmt_function_expr(func.1.as_ref(), emit_docs);
+    }
+
+    fn fmt_function_expr(&mut self, expr: &Expression<'_>, emit_docs: bool) {
+        let Expression::Function {
+            docs,
+            attrs,
+            name,
+            is_coro,
+            is_static,
+            type_params,
+            args,
+            returns,
+            where_constraints,
+            body,
+        } = expr
+        else {
+            self.fmt_expression(expr);
+            return;
+        };
+        if emit_docs {
+            self.fmt_docs(docs);
+        }
+        self.fmt_attrs(attrs);
+        if *is_coro {
+            self.push_str("async ");
+        }
+        if *is_static {
+            self.push_str("static ");
+        }
+        self.push_str("fn ");
+        self.push_str(name);
+        self.fmt_type_params(type_params);
+        self.push_str("(");
+        self.fmt_output(args);
+        self.push_str(")");
+        if let Some(ret) = returns {
+            self.push_str(" -> ");
+            self.fmt_output(ret);
+        }
+        self.fmt_where(where_constraints);
+        match body {
+            Some(b) => {
+                self.push_str(" ");
+                self.fmt_block_or_inline(b);
+            }
+            None => self.push_str(";"),
+        }
+    }
+
+    fn fmt_attrs(&mut self, attrs: &[Attribute<'_>]) {
+        for attr in attrs {
+            self.push_str(&attr.to_string());
+            self.newline();
+        }
+    }
+
+    fn fmt_type_params(&mut self, params: &[TypeParam<'_>]) {
+        if params.is_empty() {
+            return;
+        }
+        self.push_str("<");
+        self.fmt_type_params_list(params);
+        self.push_str(">");
+    }
+
+    fn fmt_type_params_list(&mut self, params: &[TypeParam<'_>]) {
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 {
+                self.push_str(", ");
+            }
+            self.push_str(&p.to_string());
+        }
+    }
+
+    fn fmt_where(&mut self, constraints: &[WhereConstraint<'_>]) {
+        if constraints.is_empty() {
+            return;
+        }
+        self.push_str(" where ");
+        for (i, c) in constraints.iter().enumerate() {
+            if i > 0 {
+                self.push_str(", ");
+            }
+            self.push_str(&c.to_string());
+        }
+    }
+
+    fn fmt_pattern(&mut self, pattern: &Pattern<'_>) {
+        self.push_str(&pattern.to_string());
+    }
+
+    fn fmt_let_pattern(&mut self, pattern: &LetPattern<'_>) {
+        self.push_str(&pattern.to_string());
+    }
+}
+
+fn binary_op(expr: &Expression<'_>) -> &'static str {
+    match expr {
+        Expression::Add(_, _) => "+",
+        Expression::Sub(_, _) => "-",
+        Expression::Mul(_, _) => "*",
+        Expression::Div(_, _) => "/",
+        Expression::Mod(_, _) => "%",
+        Expression::Pow(_, _) => "**",
+        Expression::Shl(_, _) => "<<",
+        Expression::Shr(_, _) => ">>",
+        Expression::Xor(_, _) => "^",
+        Expression::And(_, _) => "&&",
+        Expression::BitAnd(_, _) => "&",
+        Expression::Or(_, _) => "||",
+        Expression::BitOr(_, _) => "|",
+        Expression::Eq(_, _) => "==",
+        Expression::Neq(_, _) => "!=",
+        Expression::Le(_, _) => "<",
+        Expression::Gt(_, _) => ">",
+        Expression::Leq(_, _) => "<=",
+        Expression::Geq(_, _) => ">=",
+        _ => "?",
+    }
+}
+
+fn is_bare_return(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::Noop(_) => true,
+        Expression::Tuple(items) => items.is_empty(),
+        Expression::Expr(inner) => is_bare_return(inner.1.as_ref()),
+        _ => false,
+    }
+}
+
+fn stmt_needs_semicolon(expr: &Expression<'_>) -> bool {
+    !matches!(
+        expr,
+        Expression::ExprStatement(_)
+            | Expression::If(_)
+            | Expression::Block(_)
+            | Expression::Loop { .. }
+            | Expression::For { .. }
+            | Expression::Defer { .. }
+    )
+}
+
+fn compound_op(op: AssignOp) -> &'static str {
+    match op {
+        AssignOp::Add => "+=",
+        AssignOp::Sub => "-=",
+        AssignOp::Mul => "*=",
+        AssignOp::Div => "/=",
+        AssignOp::Mod => "%=",
+        AssignOp::Pow => "**=",
+        AssignOp::Shl => "<<=",
+        AssignOp::Shr => ">>=",
+        AssignOp::BitAnd => "&=",
+        AssignOp::BitOr => "|=",
+        AssignOp::BitXor => "^=",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Expression;
+    use crate::Pratt;
+
+    fn parse_program(src: &str) -> Expression<'_> {
+        Pratt::default()
+            .parse(src)
+            .expect("parse failed")
+            .1
+            .as_ref()
+            .clone()
+    }
+
+    fn parse_exprs(src: &str) -> Vec<Expression<'_>> {
+        match parse_program(src) {
+            Expression::Program(items) => items.iter().map(|(_, e)| e.as_ref().clone()).collect(),
+            other => vec![other],
+        }
+    }
+
+    fn round_trip(src: &str) {
+        let ast1 = parse_exprs(src);
+        let formatted = format_source(src).expect("format failed");
+        let ast2 = parse_exprs(&formatted);
+        assert_eq!(ast1, ast2, "formatted:\n{formatted}");
+    }
+
+    #[test]
+    fn format_fib_like_function() {
+        let src = r#"fn fib(int n) -> int {
+    if n <= 2 {
+        return 1;
+    }
+    return fib(n - 1) + fib(n - 2);
+}"#;
+        round_trip(src);
+        let formatted = format_source(src).unwrap();
+        assert!(formatted.contains("if n <= 2"));
+        assert!(formatted.contains("return fib(n - 1) + fib(n - 2);"));
+    }
+
+    #[test]
+    fn format_simple_main_with_calls() {
+        let src = r#"fn main() {
+    write_all(stdout(), to_bytes(format("%i", fib(32))));
+    return;
+}"#;
+        round_trip(src);
+    }
+
+    #[test]
+    fn format_is_idempotent() {
+        let src = "fn main() { return; }\n";
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn comments_are_preserved() {
+        let src = "fn main() {\n    // hello\n    return;\n}\n";
+        round_trip(src);
+        let formatted = format_source(src).unwrap();
+        assert!(formatted.contains("// hello"));
+    }
+
+    #[test]
+    fn doc_comments_attach_and_round_trip() {
+        let src = "/// Adds one.\n/// More detail.\nfn add(int x) -> int {\n    return x + 1;\n}\n";
+        round_trip(src);
+        let formatted = format_source(src).unwrap();
+        assert!(formatted.contains("/// Adds one."));
+        assert!(formatted.contains("/// More detail."));
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn orphan_doc_comment_is_error() {
+        let err = Pratt::default()
+            .parse("/// orphan\n")
+            .expect_err("should fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("doc comment") || msg.contains("Parse error"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn item_docs_reads_attached_lines() {
+        use crate::ast::item_docs;
+        let src = "/// Hello\n/// World\nfn f() { return; }\n";
+        let ast = Pratt::default().parse(src).unwrap();
+        let Expression::Program(items) = ast.1.as_ref() else {
+            panic!("expected program");
+        };
+        let docs = item_docs(items[0].1.as_ref()).expect("docs");
+        assert_eq!(docs, ["Hello", "World"]);
+    }
+}

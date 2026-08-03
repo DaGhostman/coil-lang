@@ -107,6 +107,7 @@
         let ast = decl_ast!("fn f() { defer { write(\"x\"); } write(\"y\"); }");
         match ast {
             Expression::Function {
+                docs: _,
                 body: Some(body), ..
             } => {
                 let Expression::Block(items) = body.1.as_ref() else {
@@ -134,6 +135,7 @@
         let ast = decl_ast!("fn f() { let x = 1; defer use (x) { write(\"%i\", x); } }");
         match ast {
             Expression::Function {
+                docs: _,
                 body: Some(body), ..
             } => {
                 let Expression::Block(items) = body.1.as_ref() else {
@@ -403,7 +405,7 @@
                 assert_eq!(variants.len(), 2);
 
                 match variants[0].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "None");
                         assert!(matches!(payload, EnumVariantPayload::Unit));
                     }
@@ -411,7 +413,7 @@
                 }
 
                 match variants[1].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "Some");
                         match payload {
                             EnumVariantPayload::Tuple(parts) => {
@@ -439,7 +441,7 @@
                 assert_eq!(name, "Shape");
                 assert_eq!(variants.len(), 1);
                 match variants[0].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "Circle");
                         match payload {
                             EnumVariantPayload::Record(fields) => {

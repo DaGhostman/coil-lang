@@ -50,12 +50,13 @@ The `compiler` and root `coil` crates mirror the same feature names. With a feat
 
 ## Build the project
 
-Clone the repository and build the workspace from the root:
+Clone the repository and build from the root (builds `coil` plus helpers
+`coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed`):
 
 ```bash
 git clone git@github.com:DaGhostman/coil-lang.git
 cd coil-lang
-cargo build --workspace
+cargo build
 ```
 
 The GitHub repository is named **`coil-lang`**. If you previously cloned **`zero`** / **zero-script**, update the remote after the repository is renamed on GitHub, or clone fresh:
@@ -111,10 +112,20 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 | `coil [<file.hy>]` | Compile to `out.hyc` (cached) and run; omit the file to use `[entry].file` from `coil.toml` |
 | `coil compile [<file.hy>] [-o path]` | Compile only; default output is `out.hyc`; omit the file to use `[entry].file` |
 | `coil run <file.hyc>` | Execute a previously compiled archive |
-| `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`); always requires an explicit `.hy` path (does not read `[entry].file`) |
+| `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embeds `.hyc` into `coil-embed` by default); always requires an explicit `.hy` path (does not read `[entry].file`) |
 | `coil test [path] [--fail-fast]` | Compile and run every `.hy` under `[path]` (default `./tests`) |
-| `coil dissect <file.hy> [--fn pat] [--il] [--ast]` | In-memory compile and dump filtered bytecode (optional pre-opt IL / entry AST); never writes `out.hyc` |
-| `coil debug <file.hy> [-x script] [--batch]` | GDB-style debugger (REPL; optional script / batch mode); never writes `out.hyc` |
+| `coil dissect <file.hy> [--fn pat] [--il] [--ast]` | Re-execs `coil-dissect`: in-memory compile and dump filtered bytecode (optional pre-opt IL / entry AST); never writes `out.hyc` |
+| `coil debug <file.hy> [-x script] [--batch]` | Re-execs `coil-debug`: GDB-style debugger (REPL; optional script / batch mode); never writes `out.hyc` |
+| `coil fmt [--check] <file.hy\|dir>...` | Re-execs `coil-fmt`: pretty-print `.hy` sources (in place; `--check` exits non-zero if changes needed). Preserves `//` and `///` docs. |
+
+Sibling binaries (install next to `coil`):
+
+| Binary | Role |
+|--------|------|
+| `coil-debug` | Debugger implementation (`coil debug` dispatches here) |
+| `coil-dissect` | Bytecode / IL / AST dump (`coil dissect` dispatches here) |
+| `coil-fmt` | Source formatter (`coil fmt` dispatches here) |
+| `coil-embed` | VM-only runner template for `coil package` (no compiler) |
 
 Examples:
 
@@ -133,9 +144,17 @@ cargo run -- dissect examples/fib.hy --fn fib --il
 cargo run -- debug examples/fib.hy
 cargo run -- debug examples/fib.hy -x /tmp/cmds.txt --batch
 
-# Single-file app for this machine (no separate .hyc or coil install needed to run)
+# Format sources (rewrites in place; --check for CI)
+cargo run -- fmt examples/fib.hy
+cargo run -- fmt --check .
+
+# Single-file app for this machine (embeds into `coil-embed`; no separate .hyc needed to run)
+cargo build --release
 cargo run --release -- package examples/fib.hy -o ./fib-app
 ./fib-app
+
+# Or pass an explicit runner template
+cargo run --release -- package examples/fib.hy -o ./fib-app --runner ./target/release/coil-embed
 
 # With FFI: verify required shared libraries exist on this machine before shipping
 cargo run --release -- package examples/strlen.hy -o ./strlen-app --check-native

@@ -17,11 +17,14 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 - Language features: draft plans first; full HM integration; update `docs/`; minimal runnable example with expected output.
 - Granular conventional commits; stage only related files.
 - Prefer compiler virtual modules over userland for core machinery.
+- Dev install: `cargo build` at the repo root builds `coil`, `coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed` side-by-side (`coil debug` / `coil dissect` / `coil fmt` re-exec helpers; `coil package` defaults to `coil-embed`).
+- Prefer `coil dissect` for IL/bytecode inspection; do not reintroduce verbose debug-build dumps now that dissect covers that.
 
 ## Invariants (do not break)
 
 - **Append-only opcodes** in `common/src/opcode.rs` (`#[repr(u8)]` discriminants). New variants at the end only — then bump archive **minor** (`ARCHIVE_MINOR` in `common/src/archive.rs`), `promise!` ceiling in `machine/src/vm.rs`, and `instruction_from_u8_covers_last_appended_variant`. Incompatible ABI/layout changes bump **major** (reset minor). Load check: same major and archive minor ≤ runtime minor.
-- **Virtual-module natives** via `HostInvoke` — not new opcodes for `io` / `thread` / etc.
+- **Virtual-module natives** via `HostInvoke` — not new opcodes for `io` / `thread` / etc. Host native wiring lives in `machine` (not the compiler pipeline).
+- **Feature gates**: machine debugger API behind `feature = "debugger"` (or `cfg(test)`); compiler dissect behind `feature = "dissect"` — enabled by helper binaries / tests, not the default `coil` binary.
 - **Lint gate**: `cargo check --workspace` (not clippy — pre-existing `Gc::payload_mut` deny).
 
 Codegen / IL / match / `STORE` rules and typechecker limitations: `.cursor/skills/coil-contributor/reference.md`. Pipeline stages: `docs/internals/pipeline.md`.

@@ -642,7 +642,7 @@ compiler-generated instance whose body returns the type name string. Explicit
 
 Rules:
 
-- Placement: immediately before the `enum` / `class` keyword (after any doc comment).
+- Placement: immediately before the `enum` / `class` keyword (after any `///` doc comment).
 - Whitelist only: `Show`, `Eq`, `Ord`, `Default`, `Hash`, `String`, `Serialize`, `Deserialize`, `Send`, `Sensitive`. Unknown / arithmetic traits (`Num`, …) error.
 - Generics (`#[derive(Show)] enum Box<T> { … }`) are rejected for now — write an explicit `impl`.
 - Combining `#[derive(Show)]` with a hand-written `impl Show for T` hits the usual overlap diagnostic.

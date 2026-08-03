@@ -1,54 +1,21 @@
-//! `coil package` and embedded-archive startup.
+//! `coil package` — compile entry and append to a runner template.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use coil_cli::resolve_default_runner;
 use common::{
     ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, PACKAGE_FLAG_USES_FFI,
-    ProgramDebug, append_package_payload, archive_version_compatible, bytecode_uses_ffi,
-    embedded_archive_slice, ffi_library_names_from_bytecode, format_archive_version,
-    is_packaged_executable, read_package_trailer,
+    append_package_payload, bytecode_uses_ffi, ffi_library_names_from_bytecode,
+    is_packaged_executable,
 };
 use compiler::Pipeline;
-use machine::{check_native_libraries, packaged_app_ffi_startup_check};
+use machine::check_native_libraries;
 use reporting::ErrorCode;
 use rkyv::rancor::Error;
 
-use crate::{LoadErr, execute_archive, fail_and_exit};
-
-/// Deserialize an `ArchivedProgram` blob (from `.hyc` or an embedded slice).
-pub fn load_archive_bytes(
-    buffer: &[u8],
-) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
-    let archived =
-        rkyv::access::<ArchivedArchivedProgram, Error>(buffer).map_err(|_| LoadErr::Corrupt)?;
-    let version = u32::from(archived.version);
-    if !archive_version_compatible(version, ARCHIVE_VERSION) {
-        return Err(LoadErr::Version(version));
-    }
-    let bytecode =
-        rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode).map_err(|_| LoadErr::Corrupt)?;
-    let constants =
-        rkyv::deserialize::<Vec<u64>, Error>(&archived.constants).map_err(|_| LoadErr::Corrupt)?;
-    let strings =
-        rkyv::deserialize::<Vec<String>, Error>(&archived.strings).map_err(|_| LoadErr::Corrupt)?;
-    let static_slot_count = u32::from(archived.static_slot_count);
-    let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
-        .map_err(|_| LoadErr::Corrupt)?;
-    let debug_locs = rkyv::deserialize::<Vec<common::DebugLoc>, Error>(&archived.debug_locs)
-        .map_err(|_| LoadErr::Corrupt)?;
-    Ok((
-        bytecode,
-        constants,
-        strings,
-        static_slot_count,
-        ProgramDebug {
-            source_files,
-            debug_locs,
-        },
-    ))
-}
+use crate::fail_and_exit;
 
 fn compile_program_archive_bytes(
     pipeline: &mut Pipeline,
@@ -75,12 +42,11 @@ fn compile_program_archive_bytes(
         .map(|b| b.as_slice().to_vec())
         .map_err(|_| ())
 }
+
 fn resolve_runner_path(runner: Option<&Path>) -> Result<PathBuf, String> {
     match runner {
         Some(p) => Ok(p.to_path_buf()),
-        None => {
-            std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))
-        }
+        None => resolve_default_runner(),
     }
 }
 
@@ -96,57 +62,6 @@ fn make_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
-
-/// If this process is a packaged binary, run the embedded program and return `Some(panicked)`.
-pub fn try_run_embedded() -> Option<bool> {
-    let exe = std::env::current_exe().ok()?;
-    let data = fs::read(&exe).ok()?;
-    let trailer = read_package_trailer(&data)?;
-    let archive = embedded_archive_slice(&data, trailer)?;
-
-    if !archive_version_compatible(trailer.archive_version, ARCHIVE_VERSION) {
-        eprintln!(
-            "embedded bytecode version {} does not match this runner ({}); rebuild with `coil package`",
-            format_archive_version(trailer.archive_version),
-            format_archive_version(ARCHIVE_VERSION)
-        );
-        exit(1);
-    }
-
-    let (bytecode, constants, strings, static_slots, debug) = match load_archive_bytes(archive) {
-        Ok(ok) => ok,
-        Err(LoadErr::Version(v)) => {
-            eprintln!(
-                "embedded archive version {} is not compatible with runner {}",
-                format_archive_version(v),
-                format_archive_version(ARCHIVE_VERSION)
-            );
-            exit(1);
-        }
-        Err(_) => {
-            eprintln!("embedded bytecode archive is corrupt");
-            exit(1);
-        }
-    };
-
-    if let Err(msg) = packaged_app_ffi_startup_check(trailer.uses_ffi()) {
-        eprintln!("error: {msg}");
-        exit(1);
-    }
-
-    let pipeline = Pipeline::new();
-    let entry = exe.as_path();
-    let panicked = execute_archive(
-        &pipeline,
-        &bytecode,
-        &constants,
-        &strings,
-        static_slots,
-        debug,
-        Some(entry),
-    );
-    Some(panicked)
-}
 
 pub fn cmd_package(
     pipeline: &mut Pipeline,
@@ -192,7 +107,6 @@ pub fn cmd_package(
             fail_and_exit(pipeline, ErrorCode::IoError, msg);
         }
         if libs.is_empty() {
-            // `extern "c"` and compile-time FFI may not leave STRING literals before FfiLoad.
             if let Err(msg) = check_native_libraries(&["c".to_string()], base_dir) {
                 fail_and_exit(pipeline, ErrorCode::IoError, msg);
             }
@@ -217,7 +131,8 @@ pub fn cmd_package(
             pipeline,
             ErrorCode::IoError,
             format!(
-                "runner `{}` is already a packaged executable; use an unpackaged `coil` binary as the template",
+                "runner `{}` is already a packaged executable; use an unpackaged `coil-embed` \
+                 (or `coil`) binary as the template",
                 runner_path.display()
             ),
         );
@@ -243,16 +158,18 @@ pub fn cmd_package(
     }
 
     eprintln!(
-        "packaged `{}` for {}-{} ({} bytes)",
+        "packaged `{}` for {}-{} ({} bytes; runner {})",
         output,
         std::env::consts::OS,
         std::env::consts::ARCH,
-        packaged.len()
+        packaged.len(),
+        runner_path.display()
     );
 }
 
 /// Run a freshly packaged binary (integration tests).
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn run_packaged_output(path: &Path) -> Result<String, String> {
     use std::process::Command as StdCommand;
     let out = StdCommand::new(path)
@@ -271,16 +188,17 @@ pub fn run_packaged_output(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coil_cli::{LoadErr, load_archive_bytes};
+    use common::{ArchivedProgram, Instruction, pack_archive_version};
 
     #[test]
     fn load_archive_bytes_rejects_version() {
-        // Newer minor than this runtime must be rejected.
         let too_new = ArchivedProgram {
-            version: common::pack_archive_version(0, 1),
+            version: pack_archive_version(0, 1),
             static_slot_count: 0,
             constants: vec![],
             strings: vec![],
-            bytecode: vec![Byte::new(common::Instruction::HALT)],
+            bytecode: vec![Byte::new(Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![],
         };
@@ -290,13 +208,12 @@ mod tests {
             Err(LoadErr::Version(_))
         ));
 
-        // Different major is never compatible.
         let other_major = ArchivedProgram {
-            version: common::pack_archive_version(1, 0),
+            version: pack_archive_version(1, 0),
             static_slot_count: 0,
             constants: vec![],
             strings: vec![],
-            bytecode: vec![Byte::new(common::Instruction::HALT)],
+            bytecode: vec![Byte::new(Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![],
         };

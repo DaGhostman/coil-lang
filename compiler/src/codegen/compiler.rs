@@ -1,6 +1,11 @@
 use super::*;
-use crate::typechecking::{CStructDef, ForInKind, IoBuiltin, ThreadBuiltin};
+use crate::typechecking::{CStructDef, ForInKind};
 use reporting::{ErrorCode, Message};
+
+#[cfg(any(test, feature = "dissect"))]
+type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
+#[cfg(not(any(test, feature = "dissect")))]
+type FinalizeIlOut = ();
 
 impl Compiler {
     pub fn constants(&self) -> &[u64] {
@@ -4524,6 +4529,7 @@ impl Compiler {
     ) {
         let _method_id = self.next_emit_id();
         let Expression::Function {
+            docs: _,
             name,
             is_coro,
             args,
@@ -7014,6 +7020,7 @@ impl Compiler {
                 self.polyfn_sources = saved_polyfn_sources;
             }
             Expression::Function {
+                docs: _,
                 attrs,
                 name,
                 is_coro,
@@ -7379,6 +7386,7 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
             Expression::Class {
+                docs: _,
                 name,
                 fields: state,
                 ..
@@ -7389,6 +7397,7 @@ impl Compiler {
                 for v in state {
                     match v.1.borrow() {
                         Expression::Field {
+                            docs: _,
                             modifier,
                             name: n,
                             init,
@@ -7423,6 +7432,7 @@ impl Compiler {
                     match method_node.1.borrow() {
                         Expression::Method(_, body) => {
                             if let Expression::Function {
+                                docs: _,
                                 name, is_static, ..
                             } = body.1.borrow()
                             {
@@ -8595,6 +8605,7 @@ impl Compiler {
                             let _ = self.do_compile(method);
                         }
                         Expression::Function {
+                            docs: _,
                             name: method_name,
                             body,
                             ..
@@ -8648,6 +8659,7 @@ impl Compiler {
                             let _ = self.do_compile(method);
                         }
                         Expression::Function {
+                            docs: _,
                             name: method_name, ..
                         } => {
                             let fqn = format!("{}__{}__{}", class, ty_part, method_name);
@@ -8659,6 +8671,7 @@ impl Compiler {
                             let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
                             self.emit_idx += 1;
                             if let Expression::Function {
+                                docs: _,
                                 name: method_name, ..
                             } = body.1.as_ref()
                             {
@@ -9733,6 +9746,7 @@ impl Compiler {
                 }
             }
             Expression::EnumDecl {
+                docs: _,
                 name: _, variants, ..
             } => {
                 // Recurse into each variant. Each variant's
@@ -10842,12 +10856,13 @@ impl Compiler {
     }
 
     /// Like [`finalize_bytecode`], but also returns a pre-opt IL snapshot for dissect.
+    #[cfg(any(test, feature = "dissect"))]
     pub fn finalize_bytecode_capturing_il(&mut self) -> crate::dissect::IlSnapshot {
         self.finalize_bytecode_inner(true)
             .expect("capture_il requested")
     }
 
-    fn finalize_bytecode_inner(&mut self, capture_il: bool) -> Option<crate::dissect::IlSnapshot> {
+    fn finalize_bytecode_inner(&mut self, capture_il: bool) -> FinalizeIlOut {
         // Splice static initializers into the IL before lower — no absolute
         // target bumping required for symbolic jumps.
         let static_init_region = if !self.static_init_bytecode.is_empty() {
@@ -10911,6 +10926,7 @@ impl Compiler {
             }
         }
 
+        #[cfg(any(test, feature = "dissect"))]
         let il_snapshot = if capture_il {
             Some(crate::dissect::IlSnapshot::new(
                 self.bytecode.ops().to_vec(),
@@ -10969,10 +10985,17 @@ impl Compiler {
             "debug_locs / bytecode length mismatch after finalize"
         );
 
-        il_snapshot
+        #[cfg(any(test, feature = "dissect"))]
+        return il_snapshot;
+        #[cfg(not(any(test, feature = "dissect")))]
+        {
+            debug_assert!(!capture_il);
+            ()
+        }
     }
 
     /// Post-lower function symbols sorted by entry PC (for dissect / debug).
+    #[cfg(any(test, feature = "dissect"))]
     pub fn function_symbols(&self) -> Vec<crate::dissect::FnSym> {
         let mut syms: Vec<_> = self
             .functions

@@ -17,7 +17,7 @@ fn main() {
 Run any program from the repository root:
 
 ```bash
-cargo build --workspace
+cargo build   # coil + coil-debug + coil-dissect + coil-fmt + coil-embed
 cargo run -- examples/print_literal.hy
 ```
 
@@ -113,7 +113,9 @@ coil/
 ## Building and running
 
 ```bash
-# Build everything
+# Build CLI binaries (coil + helpers)
+cargo build
+# Or every workspace crate:
 cargo build --workspace
 
 # Default: compile to out.hyc (cached) and run
@@ -134,7 +136,7 @@ cargo run --release -- examples/fib.hy
 | *(no subcommand)* `<file.hy>` | Compile → `out.hyc` (cached) → run |
 | `compile <file.hy> [-o path]` | Compile entry file to a `.hyc` archive |
 | `run <file.hyc>` | Execute a compiled archive |
-| `package <file.hy> [-o path] [--check-native]` | Single executable for this OS/arch (embedded `.hyc`) |
+| `package <file.hy> [-o path] [--check-native]` | Single executable (embeds `.hyc` into `coil-embed` by default) |
 | `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.hy` (default `./tests`); continue after failures unless `--fail-fast` |
 
 For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](manual/getting-started.md).

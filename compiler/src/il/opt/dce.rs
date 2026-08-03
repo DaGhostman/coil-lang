@@ -1,6 +1,6 @@
 //! IL optimization — dce passes.
 
-use crate::il::op::{IlJumpKind, IlOp, Label};
+use crate::il::op::IlOp;
 use common::Instruction;
 
 pub(super) fn stack_dce(ops: &mut Vec<IlOp>) {

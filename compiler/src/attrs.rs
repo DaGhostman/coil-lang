@@ -220,6 +220,7 @@ fn collect_and_desugar_attr_decls(
     let mut i = 0;
     while i < decls.len() {
         if let Expression::AttrDecl {
+            docs,
             name,
             type_params,
             args,
@@ -246,6 +247,7 @@ fn collect_and_desugar_attr_decls(
             decls[i] = at(
                 span,
                 Expression::Function {
+                    docs: docs.clone(),
                     attrs: vec![],
                     name,
                     is_coro: false,
@@ -397,6 +399,7 @@ fn collect_attr_function_bodies<'a>(decls: &[Output<'a>]) -> HashMap<String, Out
     let mut out = HashMap::new();
     for node in decls {
         if let Expression::Function {
+            docs: _,
             name,
             body: Some(body),
             ..
@@ -708,6 +711,7 @@ fn collect_free_idents<'a>(
             }
         }
         Expression::AttrDecl {
+            docs: _,
             args,
             returns,
             body,
@@ -1223,12 +1227,14 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::TypeAlias {
+            docs,
             name,
             type_params,
             ty,
         } => at(
             span,
             Expression::TypeAlias {
+                docs: docs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
                 ty: Box::new(rw(ty)),
@@ -1247,6 +1253,7 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::AttrDecl {
+            docs,
             name,
             type_params,
             args,
@@ -1256,6 +1263,7 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::AttrDecl {
+                docs: docs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
                 args: rw(args),
@@ -1265,6 +1273,7 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::Function {
+            docs,
             attrs,
             name,
             is_coro,
@@ -1277,6 +1286,7 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::Function {
+                docs: docs.clone(),
                 attrs: attrs.clone(),
                 name: *name,
                 is_coro: *is_coro,
@@ -1318,6 +1328,7 @@ fn rewrite_expr_inline<'a>(
         ),
         Expression::Module(path, child) => at(span, Expression::Module(path.clone(), rw(child))),
         Expression::Field {
+            docs,
             visibility,
             modifier,
             name,
@@ -1326,6 +1337,7 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::Field {
+                docs: docs.clone(),
                 visibility: *visibility,
                 modifier: *modifier,
                 name: rw(name),
@@ -1357,6 +1369,7 @@ fn rewrite_expr_inline<'a>(
         ),
         Expression::Method(vis, method) => at(span, Expression::Method(*vis, rw(method))),
         Expression::Class {
+            docs,
             attrs,
             name,
             type_params,
@@ -1364,6 +1377,7 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::Class {
+                docs: docs.clone(),
                 attrs: attrs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
@@ -1385,6 +1399,7 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::EnumDecl {
+            docs,
             attrs,
             name,
             type_params,
@@ -1392,15 +1407,17 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::EnumDecl {
+                docs: docs.clone(),
                 attrs: attrs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
                 variants: rewrite_outputs(variants, target, subs, decoratee_args),
             },
         ),
-        Expression::EnumVariant { name, payload } => at(
+        Expression::EnumVariant { docs, name, payload } => at(
             span,
             Expression::EnumVariant {
+                docs: docs.clone(),
                 name: *name,
                 payload: rewrite_enum_variant_payload(payload, target, subs, decoratee_args),
             },
@@ -1430,12 +1447,14 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::TypeClass {
+            docs,
             name,
             type_params,
             methods,
         } => at(
             span,
             Expression::TypeClass {
+                docs: docs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
                 methods: rewrite_outputs(methods, target, subs, decoratee_args),
@@ -1620,6 +1639,7 @@ fn synthesize_class_ctor<'a>(
     let mut call_args = Vec::new();
     for field in fields {
         if let Expression::Field {
+            docs: _,
             name: name_expr,
             ty: ty_expr,
             ..
@@ -1645,6 +1665,7 @@ fn synthesize_class_ctor<'a>(
     at(
         span,
         Expression::Function {
+            docs: vec![],
             attrs: vec![],
             name: ctor_name,
             is_coro: false,
@@ -1676,7 +1697,7 @@ fn variant_metas<'a>(variants: &[Output<'a>]) -> Vec<VariantMeta<'a>> {
     variants
         .iter()
         .filter_map(|v| match v.1.as_ref() {
-            Expression::EnumVariant { name, payload } => Some(VariantMeta {
+            Expression::EnumVariant { docs: _, name, payload } => Some(VariantMeta {
                 name,
                 shape: match payload {
                     EnumVariantPayload::Unit => VariantShape::Unit,
@@ -1705,6 +1726,7 @@ fn expand_decls<'a>(
 
         // `#[ffi]` signature-only function -> `extern` block lowering input.
         if let Expression::Function {
+            docs: _,
             attrs,
             name,
             is_coro,
@@ -1794,6 +1816,7 @@ fn expand_decls<'a>(
             for method in methods.iter_mut() {
                 if let Expression::Method(_, func_out) = method.1.as_mut() {
                     if let Expression::Function {
+                        docs: _,
                         attrs, args, body, ..
                     } = func_out.1.as_mut()
                     {
@@ -1832,6 +1855,7 @@ fn expand_decls<'a>(
         }
         let job = match decls[i].1.as_ref() {
             Expression::EnumDecl {
+                docs: _,
                 name,
                 type_params,
                 attrs,
@@ -1848,6 +1872,7 @@ fn expand_decls<'a>(
                 })
             }
             Expression::Class {
+                docs: _,
                 name,
                 type_params,
                 attrs,
@@ -1867,6 +1892,7 @@ fn expand_decls<'a>(
 
         let mut ctor_insert: Option<Output> = None;
         if let Expression::Class {
+            docs: _,
             name,
             attrs,
             fields,
@@ -1878,6 +1904,7 @@ fn expand_decls<'a>(
                 let fields_copy = fields.clone();
                 let mut ctor = synthesize_class_ctor(span, class_name, &fields_copy);
                 if let Expression::Function {
+                    docs: _,
                     attrs: ctor_attrs,
                     args,
                     body,
@@ -2154,6 +2181,7 @@ fn class_field_names<'a>(fields: &[Output<'a>]) -> Vec<&'a str> {
         .iter()
         .filter_map(|f| match f.1.as_ref() {
             Expression::Field {
+                docs: _,
                 name: name_expr, ..
             } => match name_expr.1.as_ref() {
                 Expression::Identifier(n) => Some(*n),
@@ -2281,6 +2309,7 @@ fn method_fn<'a>(
     let func = at(
         span,
         Expression::Function {
+            docs: vec![],
             attrs: vec![],
             name,
             is_coro: false,

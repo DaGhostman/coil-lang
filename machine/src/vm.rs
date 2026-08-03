@@ -16,10 +16,11 @@ use common::{
 };
 
 use crate::{
-    CStructLayout, CoroState, DebugController, Frame, Heap, Member, ObjArray, ObjBoxed,
-    ObjCoroutine, ObjEnum, ObjFn, ObjInstance, ObjPolyFn, ObjString, ObjTuple, Object,
-    RefCoroutine, Stack, StopReason,
+    CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjBoxed, ObjCoroutine, ObjEnum,
+    ObjFn, ObjInstance, ObjPolyFn, ObjString, ObjTuple, Object, RefCoroutine, Stack,
 };
+#[cfg(any(test, feature = "debugger"))]
+use crate::{DebugController, StopReason};
 use common::ValueTag;
 
 /// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
@@ -165,8 +166,10 @@ pub struct Machine<const S: usize> {
     program_debug: ProgramDebug,
     /// Cached `(file_index, line)` per PC for debug stepping (built from `program_debug`).
     pc_lines: Vec<Option<(u32, u32)>>,
+    #[cfg(any(test, feature = "debugger"))]
     /// Optional debug controller; when set, `execute` may pause at stops.
     debug: Option<Box<DebugController>>,
+    #[cfg(any(test, feature = "debugger"))]
     /// Set when `execute` pauses for the debugger (alongside `pending_ffi`).
     pending_debug_stop: Option<StopReason>,
     /// Shared program image for OS thread workers (`spawn`).
@@ -206,7 +209,9 @@ impl<const S: usize> Default for Machine<S> {
             statics: Vec::new(),
             program_debug: ProgramDebug::default(),
             pc_lines: Vec::new(),
+            #[cfg(any(test, feature = "debugger"))]
             debug: None,
+            #[cfg(any(test, feature = "debugger"))]
             pending_debug_stop: None,
             thread_program: None,
             shared_print: None,
@@ -227,6 +232,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Attach a debug controller (enables stop checks in `execute`).
+    #[cfg(any(test, feature = "debugger"))]
     pub fn attach_debug(&mut self, controller: DebugController) {
         self.debug = Some(Box::new(controller));
         self.pending_debug_stop = None;
@@ -236,10 +242,12 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Borrow the attached debug controller, if any.
+    #[cfg(any(test, feature = "debugger"))]
     pub fn debug_controller_mut(&mut self) -> Option<&mut DebugController> {
         self.debug.as_deref_mut()
     }
 
+    #[cfg(any(test, feature = "debugger"))]
     pub fn debug_controller(&self) -> Option<&DebugController> {
         self.debug.as_deref()
     }
@@ -338,6 +346,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Reset execution state for a fresh `run` (keeps natives / debug / program_debug).
+    #[cfg(any(test, feature = "debugger"))]
     pub fn debug_reset(&mut self) {
         self.stack = Stack::new();
         self.frames = ArrayVec::default();
@@ -357,6 +366,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    #[cfg(any(test, feature = "debugger"))]
     fn debug_check_stop_at(&mut self, ip: usize) -> Option<StopReason> {
         let depth = self.frames.len();
         let loc = self.pc_lines.get(ip).copied().flatten();
@@ -364,6 +374,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Run until the next debug stop, halt, or panic. Auto-resumes FFI pauses.
+    #[cfg(any(test, feature = "debugger"))]
     pub fn debug_run_until(
         &mut self,
         code: &[Byte],
@@ -410,6 +421,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Like [`debug_run_until`] for compiler-owned [`RawByte`] buffers.
+    #[cfg(any(test, feature = "debugger"))]
     pub fn debug_run_until_raw(
         &mut self,
         code: &[RawByte],
@@ -1398,6 +1410,7 @@ impl<const S: usize> Machine<S> {
         let mut sp = self.frames.get_mut().get();
 
         while ip < code.len() {
+            #[cfg(any(test, feature = "debugger"))]
             if unlikely(self.debug.is_some())
                 && let Some(reason) = self.debug_check_stop_at(ip)
             {

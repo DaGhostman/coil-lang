@@ -1,7 +1,8 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+use coil_cli::{LoadErr, dispatch_helper, try_load_archive};
 use common::{ARCHIVE_VERSION, ArchivedProgram, Byte, ProgramDebug, format_archive_version};
 use compiler::Pipeline;
 use machine::Machine;
@@ -11,13 +12,9 @@ use rkyv::rancor::Error;
 const DEFAULT_OUT: &str = "out.hyc";
 const TESTS_DIR: &str = "tests";
 
-mod debug_cmd;
-mod dissect;
 mod package_app;
 
-use debug_cmd::{DebugArgs, cmd_debug};
-use dissect::{DissectArgs, cmd_dissect};
-use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
+use package_app::cmd_package;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -54,6 +51,8 @@ enum Command {
         script: Option<String>,
         batch: bool,
     },
+    /// Re-exec `coil-fmt` (paths / `--check` forwarded via argv).
+    Fmt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +73,7 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \x20 coil [--log-json | --log-lsp] dissect <file.hy> [--fn <pat>] [--il] [--ast]\n\
          \x20 coil [--log-json | --log-lsp] debug <file.hy> [-x <script>] [--batch]\n\
+         \x20 coil fmt [--check] <file.hy|dir>...\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) in memory and run it\n\
@@ -84,10 +84,11 @@ fn print_help() {
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
          \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no archive file)\n\
          \x20 debug      GDB-style debugger (REPL; optional -x script / --batch)\n\
+         \x20 fmt        Format `.hy` sources (re-execs `coil-fmt`; preserves `//` and `///`)\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` or packaged binary for `package`\n\
-         \x20 --runner <path>       Runner template for `package` (default: current executable)\n\
+         \x20 --runner <path>       Runner template for `package` (default: `coil-embed` beside this binary)\n\
          \x20 --check-native        With `package`, fail if required shared libraries are missing\n\
          \x20 --strip-debug         With `package`, omit debug line table from embedded archive\n\
          \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
@@ -97,6 +98,7 @@ fn print_help() {
          \x20 --ast                With `dissect`, also print the entry-file AST\n\
          \x20 -x <script>          With `debug`, run commands from a script file\n\
          \x20 --batch              With `debug`, non-interactive (use -x or stdin); exit after script\n\
+         \x20 --check              With `fmt`, exit 1 if files would change (no writes)\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
@@ -116,6 +118,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut show_il = false;
     let mut show_ast = false;
     let mut batch = false;
+    let mut check = false;
     let mut fn_pat: Option<String> = None;
     let mut script: Option<String> = None;
     let mut runner: Option<PathBuf> = None;
@@ -135,6 +138,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--il" => show_il = true,
             "--ast" => show_ast = true,
             "--batch" => batch = true,
+            "--check" => check = true,
             "--fn" => {
                 i += 1;
                 let Some(pat) = args.get(i) else {
@@ -190,7 +194,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             s if s.starts_with('-') => {
                 return Err(
-                    "unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, -o/--output, or a command/file)",
+                    "unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, --check, -o/--output, or a command/file)",
                 );
             }
             _ => positionals.push(arg.clone()),
@@ -200,8 +204,35 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
 
     let has_dissect_flags = fn_pat.is_some() || show_il || show_ast;
     let has_debug_flags = script.is_some() || batch;
+    let has_fmt_flags = check;
 
     let command = match positionals.as_slice() {
+        [cmd, rest @ ..] if cmd == "fmt" => {
+            if rest.is_empty() {
+                return Err("fmt requires at least one file or directory");
+            }
+            if output.is_some() {
+                return Err("-o/--output is not valid with `fmt`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if include_tests {
+                return Err("--include-tests is not valid with `fmt`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err(
+                    "--check-native, --strip-debug, and --runner are only valid with `package`",
+                );
+            }
+            if has_dissect_flags {
+                return Err("--fn, --il, and --ast are only valid with `dissect`");
+            }
+            if has_debug_flags {
+                return Err("-x and --batch are only valid with `debug`");
+            }
+            Command::Fmt
+        }
         [] => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile` or `package`");
@@ -219,6 +250,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
+            }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
             }
             // Resolved later from coil.toml `[entry].file`.
             Command::BuildAndRun {
@@ -243,6 +277,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
             }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
+            }
             Command::Test {
                 path: None,
                 fail_fast,
@@ -266,12 +303,16 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
             }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
+            }
             if path == "compile"
                 || path == "run"
                 || path == "test"
                 || path == "package"
                 || path == "dissect"
                 || path == "debug"
+                || path == "fmt"
             {
                 return Err("test path must be a directory");
             }
@@ -295,6 +336,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
             }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
+            }
             // Filename filled from `[entry].file` when empty.
             Command::Compile {
                 filename: String::new(),
@@ -312,6 +356,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "test"
                 || filename == "dissect"
                 || filename == "debug"
+                || filename == "fmt"
             {
                 return Err("package requires an entry file");
             }
@@ -326,6 +371,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
+            }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
             }
             let out = output.unwrap_or_else(|| {
                 Path::new(filename)
@@ -349,6 +397,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "test"
                 || filename == "dissect"
                 || filename == "debug"
+                || filename == "fmt"
             {
                 return Err("debug requires an entry .hy file");
             }
@@ -382,6 +431,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "test"
                 || filename == "dissect"
                 || filename == "debug"
+                || filename == "fmt"
             {
                 return Err("dissect requires an entry .hy file");
             }
@@ -402,6 +452,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
             }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
+            }
             Command::Dissect {
                 filename: filename.clone(),
                 fn_pat,
@@ -416,6 +469,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "package"
                 || filename == "dissect"
                 || filename == "debug"
+                || filename == "fmt"
             {
                 return Err("compile requires an entry file");
             }
@@ -432,6 +486,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
+            }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
             }
             Command::Compile {
                 filename: filename.clone(),
@@ -456,6 +513,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
             }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
+            }
             Command::Run {
                 archive: archive.clone(),
             }
@@ -477,6 +537,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             if has_debug_flags {
                 return Err("-x and --batch are only valid with `debug`");
+            }
+            if has_fmt_flags {
+                return Err("--check is only valid with `fmt`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -685,22 +748,6 @@ mod archive_staleness {
             _ => false,
         }
     }
-}
-
-fn try_load_archive(
-    path: &str,
-) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
-    let mut f = std::fs::File::open(path).map_err(|_| LoadErr::Missing)?;
-    let mut buffer = Vec::with_capacity(1024);
-    f.read_to_end(&mut buffer).map_err(|_| LoadErr::Corrupt)?;
-    load_archive_bytes(&buffer)
-}
-
-#[derive(Debug)]
-pub(crate) enum LoadErr {
-    Missing,
-    Corrupt,
-    Version(u32),
 }
 
 /// Run archived bytecode. Returns `true` when a language-level `panic` aborted.
@@ -1065,10 +1112,6 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
 }
 
 fn main() {
-    if let Some(panicked) = try_run_embedded() {
-        exit(if panicked { 1 } else { 0 });
-    }
-
     let raw_args: Vec<String> = std::env::args().collect();
     let cli = match parse_args(&raw_args) {
         Ok(c) => c,
@@ -1100,32 +1143,9 @@ fn main() {
 
     match cli.command {
         Command::Test { path, fail_fast } => cmd_test(config, path, fail_fast),
-        Command::Dissect {
-            filename,
-            fn_pat,
-            show_il,
-            show_ast,
-        } => cmd_dissect(
-            config,
-            DissectArgs {
-                filename,
-                fn_pat,
-                show_il,
-                show_ast,
-            },
-        ),
-        Command::Debug {
-            filename,
-            script,
-            batch,
-        } => cmd_debug(
-            config,
-            DebugArgs {
-                filename,
-                script,
-                batch,
-            },
-        ),
+        Command::Dissect { .. } => dispatch_helper("dissect"),
+        Command::Debug { .. } => dispatch_helper("debug"),
+        Command::Fmt => dispatch_helper("fmt"),
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
@@ -1156,7 +1176,10 @@ fn main() {
                     check_native,
                     strip_debug,
                 ),
-                Command::Test { .. } | Command::Dissect { .. } | Command::Debug { .. } => {
+                Command::Test { .. }
+                | Command::Dissect { .. }
+                | Command::Debug { .. }
+                | Command::Fmt => {
                     unreachable!()
                 }
             }
@@ -1176,6 +1199,24 @@ mod tests {
         std::iter::once("coil".to_string())
             .chain(parts.iter().map(|s| (*s).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn parse_fmt_paths() {
+        let cli = parse_args(&args(&["fmt", "a.hy", "src/"])).unwrap();
+        assert_eq!(cli.command, Command::Fmt);
+    }
+
+    #[test]
+    fn parse_fmt_with_check() {
+        let cli = parse_args(&args(&["fmt", "--check", "a.hy"])).unwrap();
+        assert_eq!(cli.command, Command::Fmt);
+    }
+
+    #[test]
+    fn parse_rejects_check_on_non_fmt() {
+        assert!(parse_args(&args(&["compile", "a.hy", "--check"])).is_err());
+        assert!(parse_args(&args(&["--check", "a.hy"])).is_err());
     }
 
     #[test]

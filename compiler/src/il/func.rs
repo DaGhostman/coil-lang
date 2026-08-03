@@ -22,6 +22,7 @@ pub struct IlFunc {
 }
 
 impl IlFunc {
+    #[cfg(test)]
     pub fn new(
         name: impl Into<String>,
         entry: Option<Label>,

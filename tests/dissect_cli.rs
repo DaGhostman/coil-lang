@@ -7,12 +7,30 @@ fn coil_bin() -> String {
     std::env::var("CARGO_BIN_EXE_coil").expect("CARGO_BIN_EXE_coil (run via `cargo test -p coil`)")
 }
 
+fn ensure_coil_dissect() {
+    let coil = PathBuf::from(coil_bin());
+    let helper = coil.with_file_name("coil-dissect");
+    if helper.is_file() {
+        return;
+    }
+    let status = Command::new("cargo")
+        .args(["build", "-q", "-p", "coil-dissect"])
+        .status()
+        .expect("spawn cargo build -p coil-dissect");
+    assert!(
+        status.success() && helper.is_file(),
+        "coil-dissect missing at {}",
+        helper.display()
+    );
+}
+
 fn fib_entry() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fib.hy")
 }
 
 #[test]
 fn dissect_fib_fn_prints_bytecode_without_out_hyc() {
+    ensure_coil_dissect();
     let bin = coil_bin();
     let entry = fib_entry();
     let cwd = std::env::temp_dir().join(format!("coil_dissect_{}", std::process::id()));
@@ -47,6 +65,7 @@ fn dissect_fib_fn_prints_bytecode_without_out_hyc() {
 
 #[test]
 fn dissect_fn_miss_exits_nonzero() {
+    ensure_coil_dissect();
     let bin = coil_bin();
     let entry = fib_entry();
 
@@ -67,6 +86,7 @@ fn dissect_fn_miss_exits_nonzero() {
 
 #[test]
 fn dissect_fib_il_and_ast_sections() {
+    ensure_coil_dissect();
     let bin = coil_bin();
     let entry = fib_entry();
     let cwd = std::env::temp_dir().join(format!("coil_dissect_il_{}", std::process::id()));

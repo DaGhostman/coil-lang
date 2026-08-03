@@ -3,19 +3,17 @@
 //! [`Checker`] owns the substitution, accumulates diagnostics with error
 //! recovery, and caches inferred types keyed by pre-walk [`NodeId`]s.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, Visibility};
-use reporting::{ErrorCode, Label, Message};
+use parser::ast::{Expression, Output, Visibility};
+use reporting::Message;
 
-use crate::typechecking::env::{Env, TyVarCounter, instantiate_with_kinds};
-use crate::typechecking::generics::{
-    AssocTypeDecl, AssocTypeValue, Generics, InstanceDef, TypeClassDef, TypeClassMethodDef,
-};
-use crate::typechecking::id::{self, IdTable, NodeId};
+use crate::typechecking::env::{Env, TyVarCounter};
+use crate::typechecking::generics::InstanceDef;
+use crate::typechecking::id::{IdTable, NodeId};
 use crate::typechecking::kind::Kind;
-use crate::typechecking::subst::{Subst, apply_ty, apply_ty_prune, compose};
+use crate::typechecking::subst::Subst;
 use crate::typechecking::ty::{AssocProjection, Constraint, Scheme};
 
 /// Code-generation recipe for a trait method call in a generic body.
@@ -85,16 +83,11 @@ pub enum ForInKind {
 pub struct ForInInfo {
     pub kind: ForInKind,
 }
-use crate::typechecking::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use crate::typechecking::ty::{
-    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
-    result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
-    strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty,
+    EnumVariantPayloadTy, STRING, Ty, TyVarId,
 };
-use crate::typechecking::unify::{UnifyError, unify_with};
 use crate::typechecking::virtual_modules::{
-    BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,
+    BuiltinExport, VirtualModules,
 };
 
 /// One candidate in a compile-time arity overload set.

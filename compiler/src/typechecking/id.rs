@@ -86,6 +86,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         }
 
         Expression::AttrDecl {
+            docs: _,
             args,
             returns,
             body,

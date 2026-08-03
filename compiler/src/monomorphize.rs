@@ -112,6 +112,7 @@ fn collect_generic_functions(
 ) {
     match node.1.as_ref() {
         Expression::Function {
+            docs: _,
             name,
             type_params,
             args,
@@ -705,6 +706,7 @@ where
             }
         }
         Expression::Function {
+            docs: _,
             args,
             body,
             returns,
@@ -827,6 +829,7 @@ where
             f(ret);
         }
         Expression::AttrDecl {
+            docs: _,
             args,
             returns,
             body,

@@ -1,0 +1,657 @@
+//! Standard host-native registry for compile-time and packaged-runtime wiring.
+//!
+//! Registration order is ABI: `HostInvoke` fn_ids must match between the
+//! compiler's `register_native_id` map and the runtime `Natives` table.
+
+use std::sync::Arc;
+
+use common::Value;
+
+use crate::{
+    ENV_WIRING, FS_WIRING, FfiSignature, FfiType, HostClosureFn, NativeFn, PACKED_DOT,
+    PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot, packed_matmul,
+    packed_matrix_neg, packed_matrix_zip,
+};
+
+#[cfg(feature = "crypto")]
+use crate::CRYPTO_WIRING;
+#[cfg(feature = "regex")]
+use crate::REGEX_WIRING;
+#[cfg(feature = "time")]
+use crate::TIME_WIRING;
+
+/// Build the standard host-native table in stable order.
+///
+/// `register_id` is invoked as each native is appended (`name`, `id`) so the
+/// compiler can record `HostInvoke` lookups. Runtime-only callers may pass a
+/// no-op closure.
+pub fn build_standard_host_natives(
+    mut register_id: impl FnMut(&str, usize),
+) -> Vec<Arc<dyn NativeFn>> {
+    let mut out: Vec<Arc<dyn NativeFn>> = Vec::new();
+    push_io_natives(&mut out, &mut register_id);
+    push_wiring(&mut out, &mut register_id, FS_WIRING, "fs");
+    #[cfg(feature = "time")]
+    push_wiring(&mut out, &mut register_id, TIME_WIRING, "time");
+    push_wiring(&mut out, &mut register_id, ENV_WIRING, "env");
+    #[cfg(feature = "crypto")]
+    push_wiring(&mut out, &mut register_id, CRYPTO_WIRING, "crypto");
+    #[cfg(feature = "regex")]
+    push_wiring(&mut out, &mut register_id, REGEX_WIRING, "regex");
+    push_prelude_char_ord(&mut out, &mut register_id);
+    push_thread_natives(&mut out, &mut register_id);
+    push_packed_la(&mut out, &mut register_id);
+    out
+}
+
+/// Register each native on `machine` (same order as [`build_standard_host_natives`]).
+pub fn wire_standard_host_natives<const N: usize>(machine: &mut crate::Machine<N>) {
+    for native in build_standard_host_natives(|_name, _id| {}) {
+        machine.register_native(native);
+    }
+}
+
+fn push_wiring(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+    table: &[(&str, usize, fn(&mut crate::Heap, &[Value]) -> Value)],
+    label: &str,
+) {
+    for &(name, arity, host) in table {
+        let args = vec![FfiType::Int; arity];
+        let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+            .unwrap_or_else(|_| panic!("{label} native signature"));
+        let id = out.len();
+        register_id(name, id);
+        out.push(Arc::new(HostClosureFn::new(sig, move |heap, args| {
+            Ok(Some(host(heap, args)))
+        })));
+    }
+}
+
+fn push_prelude_char_ord(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    use crate::char_ord::{prelude_char, prelude_hash_string, prelude_ord};
+
+    let ord_sig = FfiSignature::from_parts("ord".to_string(), vec![FfiType::Int], FfiType::Int)
+        .expect("ord signature");
+    let ord_id = out.len();
+    register_id("ord", ord_id);
+    out.push(Arc::new(HostClosureFn::new(ord_sig, |heap, args| {
+        Ok(Some(prelude_ord(heap, args)))
+    })));
+
+    let char_sig = FfiSignature::from_parts("char".to_string(), vec![FfiType::Int], FfiType::Int)
+        .expect("char signature");
+    let char_id = out.len();
+    register_id("char", char_id);
+    out.push(Arc::new(HostClosureFn::new(char_sig, |heap, args| {
+        Ok(Some(prelude_char(heap, args)))
+    })));
+
+    let hash_sig = FfiSignature::from_parts(
+        "hash_string".to_string(),
+        vec![FfiType::String],
+        FfiType::Int,
+    )
+    .expect("hash_string signature");
+    let hash_id = out.len();
+    register_id("hash_string", hash_id);
+    out.push(Arc::new(HostClosureFn::new(hash_sig, |heap, args| {
+        Ok(Some(prelude_hash_string(heap, args)))
+    })));
+}
+
+fn push_packed_la(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut(&str, usize)) {
+    let specs: &[(&str, usize, fn(&mut crate::Heap, &[Value]) -> Value)] = &[
+        (PACKED_DOT, 3, packed_dot),
+        (PACKED_MATMUL, 3, packed_matmul),
+        (PACKED_MATRIX_ZIP, 3, packed_matrix_zip),
+        (PACKED_MATRIX_NEG, 2, packed_matrix_neg),
+    ];
+    for &(name, arity, kernel) in specs {
+        let args = vec![FfiType::Int; arity];
+        let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+            .expect("packed LA native signature");
+        let id = out.len();
+        register_id(name, id);
+        out.push(Arc::new(HostClosureFn::new(sig, move |heap, args| {
+            Ok(Some(kernel(heap, args)))
+        })));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IoKind {
+    Stdin,
+    Stdout,
+    Stderr,
+    Open,
+    Close,
+    Read,
+    Write,
+    ReadExact,
+    ReadToEnd,
+    WriteAll,
+    SetReadTimeout,
+    SetWriteTimeout,
+    FromBytes,
+    ToBytes,
+    TcpConnect,
+    TcpConnectTimeout,
+    TcpListen,
+    TcpAccept,
+    TcpAcceptWait,
+    TcpAcceptWaitTimeout,
+    TcpPeerAddr,
+    TcpLocalAddr,
+    TcpSetNodelay,
+    TcpShutdown,
+    UdpBind,
+    UdpConnect,
+    UdpSendTo,
+    UdpRecvFrom,
+    UdpRecvFromWait,
+    UdpLocalPort,
+    #[cfg(feature = "tls")]
+    TlsClientEnable,
+    #[cfg(feature = "tls")]
+    TlsClientDisable,
+    #[cfg(feature = "tls")]
+    TlsServerEnable,
+    #[cfg(feature = "tls")]
+    TlsServerDisable,
+}
+
+impl IoKind {
+    fn all() -> &'static [IoKind] {
+        &[
+            Self::Stdin,
+            Self::Stdout,
+            Self::Stderr,
+            Self::Open,
+            Self::Close,
+            Self::Read,
+            Self::Write,
+            Self::ReadExact,
+            Self::ReadToEnd,
+            Self::WriteAll,
+            Self::SetReadTimeout,
+            Self::SetWriteTimeout,
+            Self::FromBytes,
+            Self::ToBytes,
+            Self::TcpConnect,
+            Self::TcpConnectTimeout,
+            Self::TcpListen,
+            Self::TcpAccept,
+            Self::TcpAcceptWait,
+            Self::TcpAcceptWaitTimeout,
+            Self::TcpPeerAddr,
+            Self::TcpLocalAddr,
+            Self::TcpSetNodelay,
+            Self::TcpShutdown,
+            Self::UdpBind,
+            Self::UdpConnect,
+            Self::UdpSendTo,
+            Self::UdpRecvFrom,
+            Self::UdpRecvFromWait,
+            Self::UdpLocalPort,
+            #[cfg(feature = "tls")]
+            Self::TlsClientEnable,
+            #[cfg(feature = "tls")]
+            Self::TlsClientDisable,
+            #[cfg(feature = "tls")]
+            Self::TlsServerEnable,
+            #[cfg(feature = "tls")]
+            Self::TlsServerDisable,
+        ]
+    }
+
+    fn native_name(self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadExact => "read_exact",
+            Self::ReadToEnd => "read_to_end",
+            Self::WriteAll => "write_all",
+            Self::SetReadTimeout => "set_read_timeout",
+            Self::SetWriteTimeout => "set_write_timeout",
+            Self::FromBytes => "from_bytes",
+            Self::ToBytes => "to_bytes",
+            Self::TcpConnect => "tcp_connect",
+            Self::TcpConnectTimeout => "tcp_connect_timeout",
+            Self::TcpListen => "tcp_listen",
+            Self::TcpAccept => "tcp_accept",
+            Self::TcpAcceptWait => "tcp_accept_wait",
+            Self::TcpAcceptWaitTimeout => "tcp_accept_wait_timeout",
+            Self::TcpPeerAddr => "tcp_peer_addr",
+            Self::TcpLocalAddr => "tcp_local_addr",
+            Self::TcpSetNodelay => "tcp_set_nodelay",
+            Self::TcpShutdown => "tcp_shutdown",
+            Self::UdpBind => "udp_bind",
+            Self::UdpConnect => "udp_connect",
+            Self::UdpSendTo => "udp_send_to",
+            Self::UdpRecvFrom => "udp_recv_from",
+            Self::UdpRecvFromWait => "udp_recv_from_wait",
+            Self::UdpLocalPort => "udp_local_port",
+            #[cfg(feature = "tls")]
+            Self::TlsClientEnable => "tls_client_enable",
+            #[cfg(feature = "tls")]
+            Self::TlsClientDisable => "tls_client_disable",
+            #[cfg(feature = "tls")]
+            Self::TlsServerEnable => "tls_server_enable",
+            #[cfg(feature = "tls")]
+            Self::TlsServerDisable => "tls_server_disable",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::Stdin | Self::Stdout | Self::Stderr => 0,
+            Self::Close
+            | Self::ReadToEnd
+            | Self::FromBytes
+            | Self::ToBytes
+            | Self::TcpAccept
+            | Self::TcpAcceptWait
+            | Self::TcpPeerAddr
+            | Self::TcpLocalAddr
+            | Self::UdpLocalPort => 1,
+            Self::Open
+            | Self::Read
+            | Self::Write
+            | Self::ReadExact
+            | Self::WriteAll
+            | Self::SetReadTimeout
+            | Self::SetWriteTimeout
+            | Self::TcpConnect
+            | Self::TcpListen
+            | Self::TcpAcceptWaitTimeout
+            | Self::TcpSetNodelay
+            | Self::TcpShutdown
+            | Self::UdpBind
+            | Self::UdpConnect
+            | Self::UdpRecvFrom
+            | Self::UdpRecvFromWait => 2,
+            Self::TcpConnectTimeout => 3,
+            #[cfg(feature = "tls")]
+            Self::TlsClientEnable => 3,
+            #[cfg(feature = "tls")]
+            Self::TlsClientDisable | Self::TlsServerDisable => 1,
+            #[cfg(feature = "tls")]
+            Self::TlsServerEnable => 2,
+            Self::UdpSendTo => 4,
+        }
+    }
+}
+
+fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut(&str, usize)) {
+    use crate::io::{
+        as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
+        stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
+        stream_set_read_timeout, stream_set_write_timeout, stream_stderr, stream_stdin,
+        stream_stdout, stream_write, stream_write_all, tcp_accept, tcp_accept_wait,
+        tcp_accept_wait_timeout, tcp_connect, tcp_connect_timeout, tcp_listen, tcp_local_addr,
+        tcp_peer_addr, tcp_set_nodelay, tcp_shutdown, to_bytes, udp_bind, udp_connect,
+        udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
+    };
+    #[cfg(feature = "tls")]
+    use crate::tls::{
+        tls_client_disable, tls_client_enable, tls_server_disable, tls_server_enable,
+    };
+
+    for &kind in IoKind::all() {
+        let name = kind.native_name().to_string();
+        let arity = kind.arity();
+        let args = vec![FfiType::Int; arity];
+        let sig = FfiSignature::from_parts(name.clone(), args, FfiType::Int)
+            .expect("io native arity/signature");
+        let id = out.len();
+        register_id(&name, id);
+        out.push(Arc::new(HostClosureFn::new(sig, move |heap, args| {
+            let v = match kind {
+                            // Stdio handles are `() -> Stream` (not Result).
+                            IoKind::Stdin => stream_stdin(heap).unwrap_or_default(),
+                            IoKind::Stdout => stream_stdout(heap).unwrap_or_default(),
+                            IoKind::Stderr => stream_stderr(heap).unwrap_or_default(),
+                            IoKind::Open => {
+                                let path = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let mode = match value_as_string(heap, args[1]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = stream_open(heap, &path, &mode);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::Close => {
+                                let r = stream_close(heap, args[0]);
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::Read => {
+                                let r = stream_read(heap, args[0], args[1]);
+                                as_result_option_int(heap, r)
+                            }
+                            IoKind::Write => {
+                                let r = stream_write(heap, args[0], args[1]);
+                                as_result_int(heap, r)
+                            }
+                            IoKind::ReadExact => {
+                                let r = stream_read_exact(heap, args[0], args[1]);
+                                as_result_option_int(heap, r)
+                            }
+                            IoKind::ReadToEnd => {
+                                let r = stream_read_to_end(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::WriteAll => {
+                                let r = stream_write_all(heap, args[0], args[1]);
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::SetReadTimeout => {
+                                let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::SetWriteTimeout => {
+                                let r = stream_set_write_timeout(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::FromBytes => {
+                                let r = from_bytes(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::ToBytes => to_bytes(heap, args[0]),
+                            IoKind::TcpConnect => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_connect(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpConnectTimeout => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_connect_timeout(
+                                    heap,
+                                    &host,
+                                    args[1].as_int(),
+                                    args[2].as_int(),
+                                );
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpListen => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tcp_listen(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpAccept => {
+                                let r = tcp_accept(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpAcceptWait => {
+                                let r = tcp_accept_wait(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpAcceptWaitTimeout => {
+                                let r = tcp_accept_wait_timeout(heap, args[0], args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpPeerAddr => {
+                                let r = tcp_peer_addr(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpLocalAddr => {
+                                let r = tcp_local_addr(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::TcpSetNodelay => {
+                                let r = tcp_set_nodelay(heap, args[0], args[1].as_bool());
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::TcpShutdown => {
+                                let r = tcp_shutdown(heap, args[0], args[1].as_int());
+                                as_result_unit(heap, r)
+                            }
+                            IoKind::UdpBind => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = udp_bind(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoKind::UdpConnect => {
+                                let host = match value_as_string(heap, args[0]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = udp_connect(heap, &host, args[1].as_int());
+                                as_result_value(heap, r)
+                            }
+                            IoKind::UdpSendTo => {
+                                let host = match value_as_string(heap, args[2]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r =
+                                    udp_send_to(heap, args[0], args[1], &host, args[3].as_int());
+                                as_result_int(heap, r)
+                            }
+                            IoKind::UdpRecvFrom => {
+                                let r = udp_recv_from(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::UdpRecvFromWait => {
+                                let r = udp_recv_from_wait(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            IoKind::UdpLocalPort => {
+                                let r = udp_local_port(heap, args[0]).map(Value::from);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoKind::TlsClientEnable => {
+                                let host = match value_as_string(heap, args[1]) {
+                                    Ok(s) => s,
+                                    Err(tag) => {
+                                        return Ok(Some(as_result_value(heap, Err(tag))));
+                                    }
+                                };
+                                let r = tls_client_enable(heap, args[0], &host, args[2]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoKind::TlsClientDisable => {
+                                let r = tls_client_disable(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoKind::TlsServerEnable => {
+                                let r = tls_server_enable(heap, args[0], args[1]);
+                                as_result_value(heap, r)
+                            }
+                            #[cfg(feature = "tls")]
+                            IoKind::TlsServerDisable => {
+                                let r = tls_server_disable(heap, args[0]);
+                                as_result_value(heap, r)
+                            }
+                        };
+                        Ok(Some(v))
+        })));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadKind {
+    Spawn,
+    Join,
+    Detach,
+    Channel,
+    Send,
+    Recv,
+    TrySend,
+    TryRecv,
+    Close,
+    Mutex,
+    WithLock,
+    Lock,
+    TryLock,
+    Unlock,
+    Rwlock,
+    WithRead,
+    WithWrite,
+    TryRead,
+    TryWrite,
+}
+
+impl ThreadKind {
+    fn all() -> &'static [ThreadKind] {
+        &[
+            Self::Spawn,
+            Self::Join,
+            Self::Detach,
+            Self::Channel,
+            Self::Send,
+            Self::Recv,
+            Self::TrySend,
+            Self::TryRecv,
+            Self::Close,
+            Self::Mutex,
+            Self::WithLock,
+            Self::Lock,
+            Self::TryLock,
+            Self::Unlock,
+            Self::Rwlock,
+            Self::WithRead,
+            Self::WithWrite,
+            Self::TryRead,
+            Self::TryWrite,
+        ]
+    }
+
+    fn native_name(self) -> &'static str {
+        match self {
+            Self::Spawn => "thread_spawn",
+            Self::Join => "thread_join",
+            Self::Detach => "thread_detach",
+            Self::Channel => "thread_channel",
+            Self::Send => "thread_send",
+            Self::Recv => "thread_recv",
+            Self::TrySend => "thread_try_send",
+            Self::TryRecv => "thread_try_recv",
+            Self::Close => "thread_close",
+            Self::Mutex => "thread_mutex",
+            Self::WithLock => "thread_with_lock",
+            Self::Lock => "thread_lock",
+            Self::TryLock => "thread_try_lock",
+            Self::Unlock => "thread_unlock",
+            Self::Rwlock => "thread_rwlock",
+            Self::WithRead => "thread_with_read",
+            Self::WithWrite => "thread_with_write",
+            Self::TryRead => "thread_try_read",
+            Self::TryWrite => "thread_try_write",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::Channel => 0,
+            Self::Spawn
+            | Self::Recv
+            | Self::TryRecv
+            | Self::Close
+            | Self::Mutex
+            | Self::Rwlock
+            | Self::Lock
+            | Self::TryLock
+            | Self::Unlock
+            | Self::Join
+            | Self::Detach => 1,
+            Self::Send
+            | Self::TrySend
+            | Self::WithLock
+            | Self::WithRead
+            | Self::WithWrite
+            | Self::TryRead
+            | Self::TryWrite => 2,
+        }
+    }
+}
+
+fn push_thread_natives(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    use crate::thread;
+
+    for &kind in ThreadKind::all() {
+        let name = kind.native_name().to_string();
+        let arity = kind.arity();
+        let args = vec![FfiType::Int; arity];
+        let sig = FfiSignature::from_parts(name.clone(), args, FfiType::Int)
+            .expect("thread native arity/signature");
+        let id = out.len();
+        register_id(&name, id);
+        let closure = move |heap: &mut crate::Heap, args: &[Value]| {
+            let v = match kind {
+                ThreadKind::Spawn => thread::thread_spawn(heap, args),
+                ThreadKind::Join => thread::thread_join(heap, args),
+                ThreadKind::Detach => thread::thread_detach(heap, args),
+                ThreadKind::Channel => thread::thread_channel(heap, args),
+                ThreadKind::Send => thread::thread_send(heap, args),
+                ThreadKind::Recv => thread::thread_recv(heap, args),
+                ThreadKind::TrySend => thread::thread_try_send(heap, args),
+                ThreadKind::TryRecv => thread::thread_try_recv(heap, args),
+                ThreadKind::Close => thread::thread_close(heap, args),
+                ThreadKind::Mutex => thread::thread_mutex(heap, args),
+                ThreadKind::WithLock => thread::thread_with_lock(heap, args),
+                ThreadKind::Lock => thread::thread_lock(heap, args),
+                ThreadKind::TryLock => thread::thread_try_lock(heap, args),
+                ThreadKind::Unlock => thread::thread_unlock(heap, args),
+                ThreadKind::Rwlock => thread::thread_rwlock(heap, args),
+                ThreadKind::WithRead => thread::thread_with_read(heap, args),
+                ThreadKind::WithWrite => thread::thread_with_write(heap, args),
+                ThreadKind::TryRead => thread::thread_try_read(heap, args),
+                ThreadKind::TryWrite => thread::thread_try_write(heap, args),
+            };
+            Ok(Some(v))
+        };
+        let native: Arc<dyn NativeFn> = if kind == ThreadKind::Spawn {
+            Arc::new(HostClosureFn::new_with_arity_range(sig, 1, 2, closure))
+        } else {
+            Arc::new(HostClosureFn::new(sig, closure))
+        };
+        out.push(native);
+    }
+}

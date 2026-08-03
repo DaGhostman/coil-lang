@@ -395,6 +395,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "coil"
 version = "0.1.0"
 dependencies = [
+ "coil-cli",
  "common",
  "compiler",
  "criterion",
@@ -402,6 +403,52 @@ dependencies = [
  "parser",
  "reporting",
  "rkyv",
+]
+
+[[package]]
+name = "coil-cli"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "machine",
+ "rkyv",
+]
+
+[[package]]
+name = "coil-debug"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+ "common",
+ "compiler",
+ "machine",
+ "reporting",
+]
+
+[[package]]
+name = "coil-dissect"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+ "common",
+ "compiler",
+ "parser",
+ "reporting",
+]
+
+[[package]]
+name = "coil-embed"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+]
+
+[[package]]
+name = "coil-fmt"
+version = "0.1.0"
+dependencies = [
+ "parser",
+ "reporting",
 ]
 
 [[package]]

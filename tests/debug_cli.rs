@@ -7,11 +7,30 @@ fn coil_bin() -> String {
     std::env::var("CARGO_BIN_EXE_coil").expect("CARGO_BIN_EXE_coil (run via `cargo test -p coil`)")
 }
 
+fn ensure_helper(name: &str) {
+    let coil = PathBuf::from(coil_bin());
+    let helper = coil.with_file_name(name);
+    if helper.is_file() {
+        return;
+    }
+    let pkg = name; // coil-debug / coil-dissect package names match binary names
+    let status = Command::new("cargo")
+        .args(["build", "-q", "-p", pkg])
+        .status()
+        .unwrap_or_else(|e| panic!("spawn cargo build -p {pkg}: {e}"));
+    assert!(
+        status.success() && helper.is_file(),
+        "{name} missing at {} (cargo build -p {pkg})",
+        helper.display()
+    );
+}
+
 fn fib_entry() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fib.hy")
 }
 
 fn run_debug_script(script_body: &str, cwd_suffix: &str) -> (std::process::Output, PathBuf) {
+    ensure_helper("coil-debug");
     let bin = coil_bin();
     let entry = fib_entry();
     let cwd = std::env::temp_dir().join(format!("coil_debug_{cwd_suffix}_{}", std::process::id()));

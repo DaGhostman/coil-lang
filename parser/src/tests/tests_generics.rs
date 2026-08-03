@@ -59,6 +59,7 @@
     fn type_alias_type_param_ast_structure() {
         match decl_ast!("type Id<T> = T;") {
             Expression::TypeAlias {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "Id");
@@ -90,6 +91,7 @@
     fn fn_with_single_type_param_parses() {
         match decl_ast!("fn id<T>(T x) -> T {}") {
             Expression::Function {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "id");
@@ -106,6 +108,7 @@
     fn fn_with_bounded_type_param_parses() {
         match decl_ast!("fn add<T: Num>(T a, T b) -> T {}") {
             Expression::Function {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "add");
@@ -122,6 +125,7 @@
     fn fn_with_two_type_params_parses() {
         match decl_ast!("fn zip<A, B>(A a, B b) -> (A, B) {}") {
             Expression::Function {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "zip");
@@ -166,6 +170,7 @@
     fn fn_with_multiparam_where_clause_parses() {
         match decl_ast!("fn f<A, B>(A x) -> B where Convert<A, B> {}") {
             Expression::Function {
+                docs: _,
                 name,
                 type_params,
                 where_constraints,
@@ -186,6 +191,7 @@
     fn fn_with_unary_where_clause_parses() {
         match decl_ast!("fn g<T>(T x) -> T where Num<T> {}") {
             Expression::Function {
+                docs: _,
                 where_constraints, ..
             } => {
                 assert_eq!(where_constraints.len(), 1);
@@ -214,6 +220,7 @@
     fn enum_with_single_type_param_parses() {
         match decl_ast!("enum Option<T> { None, Some(T), }") {
             Expression::EnumDecl {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "Option");
@@ -229,6 +236,7 @@
     fn enum_with_two_type_params_parses() {
         match decl_ast!("enum Result<T, E> { Ok(T), Err(E), }") {
             Expression::EnumDecl {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "Result");
@@ -247,6 +255,7 @@
     fn class_with_single_type_param_parses() {
         match decl_ast!("class Box<T> { value: T, }") {
             Expression::Class {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "Box");
@@ -262,6 +271,7 @@
     fn class_with_bounded_type_params_parses() {
         match decl_ast!("class Pair<A, B: Ord> { first: A, second: B, }") {
             Expression::Class {
+                docs: _,
                 name, type_params, ..
             } => {
                 assert_eq!(name, "Pair");
@@ -373,6 +383,7 @@
     fn typeclass_with_sig_only_method_parses() {
         match decl_ast!("trait Eq<T> { fn eq(T a, T b) -> bool; }") {
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -384,6 +395,7 @@
                 // The sig-only method is a Function with an empty Block body.
                 match methods[0].1.as_ref() {
                     Expression::Function {
+                        docs: _,
                         name: mname, body, ..
                     } => {
                         assert_eq!(*mname, "eq");
@@ -404,6 +416,7 @@
     fn typeclass_with_default_method_parses() {
         match decl_ast!("trait Num<T> { fn add(T a, T b) -> T { return a + b; } }") {
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -414,6 +427,7 @@
                 // A default method has a non-empty block.
                 match methods[0].1.as_ref() {
                     Expression::Function {
+                        docs: _,
                         name: mname, body, ..
                     } => {
                         assert_eq!(*mname, "add");
@@ -435,6 +449,7 @@
     fn typeclass_with_bounded_param_and_two_methods_parses() {
         match decl_ast!("trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }") {
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -453,6 +468,7 @@
     fn typeclass_without_type_params_parses() {
         match decl_ast!("trait Show { fn show() -> string; }") {
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -472,6 +488,7 @@
     fn forall_in_type_alias_parses() {
         match decl_ast!("type F = forall T. T;") {
             Expression::TypeAlias {
+                docs: _,
                 ty,
                 type_params: alias_params,
                 ..
@@ -742,6 +759,7 @@
                 // Return type of head should be bare Type("Elem") (resolved as assoc later).
                 let head = methods.iter().find_map(|m| match m.1.as_ref() {
                     Expression::Function {
+                        docs: _,
                         name: "head",
                         returns: Some(r),
                         ..
@@ -928,6 +946,7 @@
     fn ffi_attr_signature_only_fn_parses() {
         match decl_ast!("#[ffi(lib = \"c\", name = \"strlen\")] fn strlen(string s) -> int;") {
             Expression::Function {
+                docs: _,
                 attrs, name, body, ..
             } => {
                 assert_eq!(name, "strlen");
@@ -943,6 +962,7 @@
     fn test_attr_on_fn_parses() {
         match decl_ast!("#[test(\"desc\")] fn foo() { return; }") {
             Expression::Function {
+                docs: _,
                 attrs, name, body, ..
             } => {
                 assert_eq!(name, "foo");
@@ -1023,6 +1043,7 @@
     fn call_site_spread_parses() {
         match decl_ast!("fn main() { pair_sum(...(1, 2)); }") {
             Expression::Function {
+                docs: _,
                 body: Some(body), ..
             } => match body.1.as_ref() {
                 Expression::Block(items) => {

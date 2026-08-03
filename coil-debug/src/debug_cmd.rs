@@ -9,9 +9,14 @@ use std::process::exit;
 use common::{ProgramDebug, byte_to_position};
 use compiler::{DissectArtifacts, FnSym, Pipeline, format_bytecode_section, matches_fn_pat};
 use machine::{DebugController, Machine, StopReason};
-use reporting::ReportConfig;
+use reporting::{ReportConfig, ReportFormat};
 
-use crate::writer_for;
+fn writer_for(format: ReportFormat) -> Box<dyn Write + Send> {
+    match format {
+        ReportFormat::Pretty => Box::new(std::io::stderr()),
+        ReportFormat::Sarif | ReportFormat::Lsp => Box::new(std::io::stdout()),
+    }
+}
 
 pub struct DebugArgs {
     pub filename: String,
