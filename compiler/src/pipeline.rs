@@ -8,6 +8,7 @@ use std::{
 
 use common::{
     ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, ProgramDebug,
+    archive_version_compatible,
     Value,
 };
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
@@ -1634,10 +1635,9 @@ impl Pipeline {
         let archived = rkyv::access::<ArchivedArchivedProgram, Error>(&buffer)
             .expect("Unable to decode rkyv binary");
 
-        // Reject archives whose format doesn't match the in-tree
-        // bytecode layout. `ARCHIVE_VERSION` is bumped whenever
-        // `Byte` or any opcode changes incompatibly.
-        if archived.version != ARCHIVE_VERSION {
+        // Reject archives the current runtime cannot load (major mismatch
+        // or archive minor newer than this toolchain).
+        if !archive_version_compatible(u32::from(archived.version), ARCHIVE_VERSION) {
             return Err(());
         }
 
