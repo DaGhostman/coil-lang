@@ -3547,6 +3547,30 @@ impl Compiler {
         self.checker.codegen_var_type(name).cloned()
     }
 
+    /// Identifier type for codegen: mono arm overrides, then span cache, then
+    /// the flat name map. Preferring span avoids later functions' `let x`
+    /// overwriting earlier `x` entries used by `static_len_of` / arith.
+    fn codegen_ident_ty(&self, node: &Output) -> Option<Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        let Expression::Identifier(name) = node.1.as_ref() else {
+            return None;
+        };
+        for frame in self.mono_codegen_var_types.iter().rev() {
+            if let Some(ty) = frame.get(*name) {
+                return Some(apply_ty_prune(self.checker.subst(), ty));
+            }
+        }
+        if let Some(ty) = self
+            .checker
+            .lookup_for_codegen_span(node.0.start, node.0.end)
+        {
+            return Some(ty);
+        }
+        self.checker
+            .codegen_var_type(name)
+            .map(|t| apply_ty_prune(self.checker.subst(), t))
+    }
+
     fn mono_ty_from_name(name: &str) -> Ty {
         if let Some(ty) = parse_mono_ty_name(name) {
             return ty;
@@ -4199,7 +4223,7 @@ impl Compiler {
 
     fn expr_codegen_ty(&self, expr: &Output) -> Option<Ty> {
         match expr.1.as_ref() {
-            Expression::Identifier(name) => self.codegen_var_type_for(name),
+            Expression::Identifier(_) => self.codegen_ident_ty(expr),
             Expression::Integer(_) => Some(Ty::Con("int".into())),
             Expression::Float(_) => Some(Ty::Con("float".into())),
             Expression::Tuple(items) => {
@@ -6119,19 +6143,14 @@ impl Compiler {
     /// Return `true` when `operand` resolves to an open type variable — i.e.
     /// the operand is a generic type parameter that is not yet concrete.
     ///
-    /// Handles `Expression::Identifier` via the `codegen_var_types` side-table
-    /// (which is reliable inside function bodies even when the ID cache is
-    /// misaligned). All other expression shapes return `false` conservatively;
-    /// they are either concrete literals or sub-expressions whose containing
-    /// `Identifier` was already flagged on the inner call.
+    /// Handles `Expression::Identifier` via span-preferring [`Self::codegen_ident_ty`].
+    /// All other expression shapes return `false` conservatively; they are either
+    /// concrete literals or sub-expressions whose containing `Identifier` was
+    /// already flagged on the inner call.
     fn operand_is_open_ty(&self, operand: &Output) -> bool {
-        use crate::typechecking::subst::apply_ty_prune;
         match operand.1.as_ref() {
-            Expression::Identifier(name) => match self.codegen_var_type_for(name) {
-                Some(ty) => {
-                    let pruned = apply_ty_prune(self.checker.subst(), &ty);
-                    matches!(pruned, Ty::Var(_))
-                }
+            Expression::Identifier(_) => match self.codegen_ident_ty(operand) {
+                Some(ty) => matches!(ty, Ty::Var(_)),
                 None => false,
             },
             _ => false,
@@ -6796,13 +6815,11 @@ impl Compiler {
     }
 
     fn is_float_ty(&self, _node: &Output) -> bool {
-        if let Expression::Identifier(name) = _node.1.as_ref()
-            && matches!(
-                self.codegen_var_type_for(name),
-                Some(crate::typechecking::ty::Ty::Con(ref ty))
-                    if ty == crate::typechecking::ty::FLOAT
-            )
-        {
+        if matches!(
+            self.codegen_ident_ty(_node),
+            Some(crate::typechecking::ty::Ty::Con(ref ty))
+                if ty == crate::typechecking::ty::FLOAT
+        ) {
             return true;
         }
         let Some(id) = self.checker.id_table().ids().get(self.emit_idx).copied() else {
@@ -6895,9 +6912,7 @@ impl Compiler {
                 tys.sort_by(|a, b| a.0.cmp(&b.0));
                 Some(Ty::Record { fields: tys })
             }
-            Expression::Identifier(name) => self
-                .codegen_var_type_for(name)
-                .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
+            Expression::Identifier(_) => self.codegen_ident_ty(node),
             // `Construct` / `Instantiate` must NOT collapse to a bare
             // `Ty::Con(name)`: generic apps like `Option::Some(42)` are
             // `Option<int>` (`Ty::App`), and call-site dictionary emission
@@ -7299,12 +7314,7 @@ impl Compiler {
             | Expression::Group(inner)
             | Expression::Statement(inner)
             | Expression::ExprStatement(inner) => self.receiver_type(inner),
-            Expression::Identifier(name) => {
-                self.codegen_var_type_for(name).map(|t| {
-                    // Apply substitution so inferred record types resolve fully.
-                    crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
-                })
-            }
+            Expression::Identifier(_) => self.codegen_ident_ty(receiver),
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
                 if let Some(name) = Checker::class_name_of_ty(&inner_ty) {
