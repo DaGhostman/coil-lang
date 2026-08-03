@@ -17366,6 +17366,43 @@ fn main() {
     }
 
     #[test]
+    fn typeof_rejects_open_type_parameter() {
+        let src = r#"
+fn name_of<T>(T x) -> string { return typeof x; }
+fn main() { name_of(1); }
+"#;
+        let (_c, msgs) = check_warn(src);
+        let found = msgs
+            .iter()
+            .any(|m| m.message().contains("`typeof` requires a ground type"));
+        assert!(
+            found,
+            "expected ground-type diagnostic for typeof on open T, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_rejects_wrong_arity() {
+        let (_c, msgs0) = check_warn("fn main() { len(); }");
+        assert!(
+            msgs0
+                .iter()
+                .any(|m| m.message().contains("len expects 1 argument")),
+            "expected arity diagnostic for len(), got: {:?}",
+            msgs0
+        );
+        let (_c, msgs2) = check_warn("fn main() { len(1, 2); }");
+        assert!(
+            msgs2
+                .iter()
+                .any(|m| m.message().contains("len expects 1 argument")),
+            "expected arity diagnostic for len(1, 2), got: {:?}",
+            msgs2
+        );
+    }
+
+    #[test]
     fn len_rejects_non_array() {
         let src = "fn main() { let x = 1; len(x); }";
         let (_c, msgs) = check_warn(src);
