@@ -28,4 +28,4 @@ Codegen / IL / match / `STORE` rules and typechecker limitations: `.cursor/skill
 
 ## Cloud agents
 
-Pre-installed: `poop`, `valgrind`, `heaptrack`, `hyperfine`, `lua` (`.cursor/Dockerfile`). Use `--release` for benchmarks/`poop`; debug builds print heap alloc traces.
+Pre-installed: `poop`, `valgrind`, `heaptrack`, `hyperfine`, `lua` (`.cursor/Dockerfile`). Use `--release` for benchmarks/`poop`.

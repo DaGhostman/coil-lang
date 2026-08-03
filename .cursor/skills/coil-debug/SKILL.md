@@ -25,7 +25,7 @@ cargo run --quiet -- debug path/to/prog.hy
 cargo run --quiet -- debug path/to/prog.hy -x /tmp/coil_dbg.txt --batch
 ```
 
-Use `--release` when alloc/debug traces obscure program output.
+Use `coil dissect` for bytecode/IL/AST dumps; use `--release` for faster runs.
 
 ## Command cheat sheet
 

@@ -1394,9 +1394,6 @@ impl<const S: usize> Machine<S> {
     fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
         let _active_guard = crate::thread::HostStateGuard::enter(self);
 
-        #[cfg(debug_assertions)]
-        let frame_no = self.frames.len();
-
         let mut ip: usize = start_ip;
         let mut sp = self.frames.get_mut().get();
 
@@ -1417,19 +1414,6 @@ impl<const S: usize> Machine<S> {
             promise!(ip < code.len());
             let opcode = unsafe { code.get_unchecked(ip) };
             ip += 1;
-
-            #[cfg(debug_assertions)]
-            {
-                eprintln!(
-                    "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
-                    frame_no,
-                    ip,
-                    *opcode.bytecode() as u8,
-                    opcode.operand_u16(0),
-                    opcode.operand_u16(1),
-                    self.stack.as_slice()
-                );
-            }
 
             let bc = opcode.bytecode();
             // Release-only optimizer hint: must track the LAST `Instruction`

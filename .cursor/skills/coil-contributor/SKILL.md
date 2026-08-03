@@ -75,8 +75,6 @@ rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default r
 | Perf | `poop` on `examples/fib_bench.hy`; prefer alloc reduction over new opcodes |
 | Debug info | `coil debug`, `coil dissect` |
 
-Debug builds print heap alloc traces — use `--release` for clean benchmark output.
-
 ## Feature work workflow
 
 1. Draft plan for large language changes (do not edit attached plan files during impl).

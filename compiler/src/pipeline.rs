@@ -1046,8 +1046,6 @@ impl Pipeline {
         // immediately so concurrent enqueues from
         // `discover_all` don't re-add it.
         if self.processed.contains(&file) {
-            #[cfg(debug_assertions)]
-            eprintln!("[pipeline]   already loaded {}", file.display());
             return;
         }
         let ns = self.manifest.namespace_of(&self.project_root, &file);
@@ -1056,12 +1054,6 @@ impl Pipeline {
             file: file.clone(),
             namespace: ns.clone(),
         });
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline]   enqueued {} (namespace={})",
-            file.display(),
-            ns.as_deref().unwrap_or("<none>")
-        );
     }
 
     /// Read the source text for `file`, populating the
@@ -1086,14 +1078,10 @@ impl Pipeline {
             self.source_cache.resize(id + 1, None);
         }
         if let Some(cached) = self.source_cache[id].as_ref() {
-            #[cfg(debug_assertions)]
-            eprintln!("[pipeline]   cache hit for {}", file.display());
             return Some(cached.clone());
         }
         match std::fs::read_to_string(file) {
             Ok(s) => {
-                #[cfg(debug_assertions)]
-                eprintln!("[pipeline]   loaded {} ({} bytes)", file.display(), s.len());
                 self.source_cache[id] = Some(s.clone());
                 Some(s)
             }
@@ -1112,11 +1100,6 @@ impl Pipeline {
     /// (so the same file isn't discovered twice). The
     /// `failed` flag is set if any file fails to parse.
     fn discover_all(&mut self) {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] scanning for files (entry={:?})",
-            self.entry_file
-        );
         // Walk the worklist from the front, parsing each
         // file to find its `use`/`mod` declarations.
         // `enqueue_file` adds new dependencies to the back
@@ -1145,8 +1128,6 @@ impl Pipeline {
         // practice O(N) for tree-shaped dependency
         // graphs.
         let mut already_scanned: Vec<PathBuf> = Vec::new();
-        #[cfg(debug_assertions)]
-        let mut depth = 0usize;
         loop {
             let item = match self.worklist.pop_front() {
                 Some(i) => i,
@@ -1165,11 +1146,6 @@ impl Pipeline {
                     break;
                 }
                 continue;
-            }
-            #[cfg(debug_assertions)]
-            {
-                eprintln!("[pipeline]   scanning {} (depth {})", file.display(), depth);
-                depth += 1;
             }
             already_scanned.push(file.clone());
             // Read the source (cached after the first
@@ -1217,11 +1193,6 @@ impl Pipeline {
                 break;
             }
         }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] scanning complete, {} file(s) in worklist",
-            self.worklist.len()
-        );
     }
 
     /// Compile a single file: parse, enqueue uses, and
@@ -1245,13 +1216,6 @@ impl Pipeline {
                     .to_string()
             })
         };
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] compiling {} (namespace={:?}, entry={})",
-            file.display(),
-            namespace,
-            is_entry
-        );
 
         let src = match self.read_source(&file) {
             Some(s) => s,
@@ -1295,13 +1259,6 @@ impl Pipeline {
         // `Compiler::compile_module` for the operand
         // adjustment details.
         let bytecode = self.compiler.compile_module(namespace.as_str(), &mut ast);
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline]   compiled {} → {} bytes (total: {})",
-            file.display(),
-            bytecode.len(),
-            self.bytecode.len()
-        );
 
         // Append this file's bytecode to the running
         // output. Each file's bytecode is independent;
@@ -1344,11 +1301,6 @@ impl Pipeline {
         // that when a file's `use foo::bar;` looks
         // up `foo::bar` in `self.functions`, the
         // function is already there.
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] compiling worklist ({} files, LIFO)",
-            self.worklist.len()
-        );
         while let Some(item) = self.worklist.pop_back() {
             let is_entry = self
                 .entry_file
@@ -1474,11 +1426,6 @@ impl Pipeline {
 
         // Discovery + LIFO compile (see `compile`).
         self.discover_all();
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] compiling worklist ({} files, LIFO)",
-            self.worklist.len()
-        );
         while let Some(item) = self.worklist.pop_back() {
             let is_entry = self
                 .entry_file
@@ -1532,11 +1479,6 @@ impl Pipeline {
         self.enqueue_file(entry);
 
         self.discover_all();
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[pipeline] dissect compiling worklist ({} files, LIFO)",
-            self.worklist.len()
-        );
         while let Some(item) = self.worklist.pop_back() {
             let is_entry = self
                 .entry_file

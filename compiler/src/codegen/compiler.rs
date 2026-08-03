@@ -10751,8 +10751,6 @@ impl Compiler {
                     span.into_range(),
                 ));
                 self.messages.push(message);
-                #[cfg(debug_assertions)]
-                dbg!(_expr);
             }
         }
 

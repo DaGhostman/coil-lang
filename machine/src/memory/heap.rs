@@ -72,13 +72,6 @@ impl Heap {
         self.alloc_bytes += size;
         self.addr_index.insert(object.addr(), object);
 
-        #[cfg(debug_assertions)]
-        println!(
-            "0x{:x} alloc {object} ({size} bytes) [{}]",
-            object.addr(),
-            self.alloc_bytes
-        );
-
         (object, content)
     }
 
@@ -198,13 +191,6 @@ impl Heap {
     unsafe fn dealloc(&mut self, object: Object) {
         let size = object.size();
         self.alloc_bytes -= size;
-
-        #[cfg(debug_assertions)]
-        println!(
-            "0x{:x} free {object} ({size} bytes) [{}]",
-            object.addr(),
-            self.alloc_bytes
-        );
 
         match object {
             Object::String(s) => {
