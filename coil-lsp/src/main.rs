@@ -2110,4 +2110,56 @@ fn fib(
         assert!(value.contains("n: int"), "condition hover was: {value}");
         assert!(!value.contains("never"), "condition hover was: {value}");
     }
+
+    #[test]
+    fn document_symbols_cover_top_level_decls() {
+        let source = "\
+use io::stdout as out;
+type Id = int;
+static let hits = 0;
+enum Color { Red, Green }
+class Point { pub x: int, pub y: int }
+fn add(int a, int b) -> int { return a + b; }
+";
+        let symbols = document_symbols(source);
+        let by_name: std::collections::HashMap<_, _> = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect();
+        assert_eq!(by_name.get("out"), Some(&lsp_types::SymbolKind::NAMESPACE));
+        assert_eq!(
+            by_name.get("Id"),
+            Some(&lsp_types::SymbolKind::TYPE_PARAMETER)
+        );
+        assert_eq!(by_name.get("hits"), Some(&lsp_types::SymbolKind::VARIABLE));
+        assert_eq!(by_name.get("Color"), Some(&lsp_types::SymbolKind::ENUM));
+        assert_eq!(by_name.get("Point"), Some(&lsp_types::SymbolKind::CLASS));
+        assert_eq!(by_name.get("add"), Some(&lsp_types::SymbolKind::FUNCTION));
+    }
+
+    #[test]
+    fn signature_help_reports_active_parameter() {
+        let source = "\
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    add(1, 
+}
+";
+        let help = signature_help(
+            source,
+            Position {
+                line: 2,
+                character: 11,
+            },
+        )
+        .expect("signature help");
+        assert_eq!(help.active_parameter, Some(1));
+        let sig = &help.signatures[0];
+        assert!(
+            sig.label.contains("add"),
+            "expected add signature, got {}",
+            sig.label
+        );
+        assert_eq!(sig.parameters.as_ref().map(|p| p.len()), Some(2));
+    }
 }
