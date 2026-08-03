@@ -20,7 +20,7 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 
 ## Invariants (do not break)
 
-- **Append-only opcodes** in `common/src/opcode.rs` (`#[repr(u8)]` discriminants). New variants at the end only — then bump `ARCHIVE_VERSION` (`common/src/archive.rs`), `promise!` ceiling in `machine/src/vm.rs`, and `instruction_from_u8_covers_last_appended_variant`.
+- **Append-only opcodes** in `common/src/opcode.rs` (`#[repr(u8)]` discriminants). New variants at the end only — then bump archive **minor** (`ARCHIVE_MINOR` in `common/src/archive.rs`), `promise!` ceiling in `machine/src/vm.rs`, and `instruction_from_u8_covers_last_appended_variant`. Incompatible ABI/layout changes bump **major** (reset minor). Load check: same major and archive minor ≤ runtime minor.
 - **Virtual-module natives** via `HostInvoke` — not new opcodes for `io` / `thread` / etc.
 - **Lint gate**: `cargo check --workspace` (not clippy — pre-existing `Gc::payload_mut` deny).
 

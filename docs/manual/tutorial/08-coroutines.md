@@ -199,7 +199,7 @@ rm -f out.hyc
 cargo run -- examples/coro_send.hy
 ```
 
-Bump `ARCHIVE_VERSION` whenever bytecode changes incompatibly (see
+Bump the archive **minor** for additive bytecode changes, or the **major** for incompatible layout (see
 `common/src/archive.rs`).
 
 ## Related
