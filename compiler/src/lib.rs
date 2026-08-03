@@ -12782,22 +12782,43 @@ use string::{format, to_bytes};
             }
             "#,
         );
-        // Key cached once; second GetField CSE'd to DUPLICATE (see ops tail).
-        let strings = bc
+        // Key cached once in Point::twice_x; ignore STRING ops in later
+        // default Show/String / builtin thunks.
+        let first_get = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::GetField))
+            .expect("expected GetField in twice_x");
+        let region_start = bc[..first_get]
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::RETURN))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let region_end = bc[first_get..]
+            .iter()
+            .position(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::RETURN | Instruction::BinReturn
+                )
+            })
+            .map(|i| first_get + i)
+            .unwrap_or(bc.len() - 1);
+        let region = &bc[region_start..=region_end];
+        let strings = region
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STRING))
             .count();
-        let get_fields = bc
+        let get_fields = region
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::GetField))
             .count();
-        let has_dup = bc
+        let has_dup = region
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
         assert!(
             strings <= 1 && get_fields >= 1 && (get_fields >= 2 || has_dup),
             "expected ≤1 STRING for repeated .x plus GetField/Dup; strings={strings} gets={get_fields} dup={has_dup}; ops={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            region.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -13937,11 +13958,13 @@ fn main() { for x in counter() { if x == 1 { break; } } }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Choice { Empty, Value(int), Maybe(int) } \
+ fn main() { \
  match Choice::Value(1) { \
  Choice::Empty() => 0, \
  Choice::Value(v) => v, \
  Choice::Maybe(w) => w, \
- };",
+ }; \
+ }",
         );
 
         // 3 arms → 2 non-first arms → 2 JMP-to-end
@@ -15773,10 +15796,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
+ fn main() { \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { v }) => v, \
- };",
+ }; \
+ }",
         );
 
         // The OUTER Result::Ok is the last arm (Err is first),
@@ -15807,10 +15832,12 @@ fn main() {
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
  enum Wrap { Good { x: Inner }, Bad(string) } \
+ fn main() { \
  match Wrap::Good { x: Inner::I { v: 42 } } { \
  Wrap::Bad(_) => 0, \
  Wrap::Good { x: Inner::I { v } } => v, \
- };",
+ }; \
+ }",
         );
 
         // Outer UNPACK + inner walk; Binding `v` emits no STORE.
@@ -15834,9 +15861,11 @@ fn main() {
         let (bc, _pool) = compile_src(
             "enum Inner { I { x: int, y: int } } \
  enum Wrap { W { inner: Inner, name: int } } \
+ fn main() { \
  match Wrap::W { inner: Inner::I { x: 1, y: 2 }, name: 3 } { \
  Wrap::W { inner: Inner::I { x, y }, name } => x + y + name, \
- };",
+ }; \
+ }",
         );
 
         let unpack_at: Vec<_> = bc
@@ -15889,10 +15918,12 @@ fn main() {
             "enum W { W { v: int } } \
  enum Baz { Qux { a: W } } \
  enum Foo { Bar(Baz), Other } \
+ fn main() { \
  match Foo::Bar(Baz::Qux { a: W::W { v: 99 } }) { \
  Foo::Other => 0, \
  Foo::Bar(Baz::Qux { a: W::W { v } }) => v, \
- };",
+ }; \
+ }",
         );
 
         // Innermost Binding `v` needs no STORE; require nested unpack
@@ -15917,10 +15948,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
+ fn main() { \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { }) => 99, \
- };",
+ }; \
+ }",
         );
 
         // The pattern omits the `v` field. The codegen walks

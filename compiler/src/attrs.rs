@@ -2069,6 +2069,11 @@ fn expand_class<'a>(
 
 /// Auto-generate FQN-only `Show`/`String` when neither derive nor an explicit
 /// `impl` covers the type. Bodies return `typeof self`.
+///
+/// Inserted beside the type so typecheck sees the instance before later
+/// `fn main` / statements. Script-style top-level match/expr after the type
+/// should use `fn main` — these impls bind function entries and would
+/// otherwise steal `program_start_offset` (DCE then drops the match body).
 fn push_default_display_impls<'a>(
     span: SimpleSpan,
     name: &'a str,
