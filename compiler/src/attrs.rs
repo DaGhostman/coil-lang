@@ -572,6 +572,7 @@ fn collect_free_idents<'a>(
         | Expression::ImplicitReturn(inner)
         | Expression::Raise(inner)
         | Expression::Panic(inner)
+        | Expression::TypeOf(inner)
         | Expression::Yield(inner)
         | Expression::YieldFrom(inner)
         | Expression::Try(inner)
@@ -993,6 +994,7 @@ fn rewrite_expr_inline<'a>(
         | Expression::ImplicitReturn(inner)
         | Expression::Raise(inner)
         | Expression::Panic(inner)
+        | Expression::TypeOf(inner)
         | Expression::Yield(inner)
         | Expression::YieldFrom(inner)
         | Expression::Try(inner)
@@ -1464,6 +1466,7 @@ fn clone_unary<'a>(kind: &Expression<'a>, inner: Output<'a>) -> Expression<'a> {
         Expression::ImplicitReturn(_) => Expression::ImplicitReturn(inner),
         Expression::Raise(_) => Expression::Raise(inner),
         Expression::Panic(_) => Expression::Panic(inner),
+        Expression::TypeOf(_) => Expression::TypeOf(inner),
         Expression::Yield(_) => Expression::Yield(inner),
         Expression::YieldFrom(_) => Expression::YieldFrom(inner),
         Expression::Try(_) => Expression::Try(inner),
@@ -1836,17 +1839,13 @@ fn expand_decls<'a>(
             } => {
                 validate_attrs(attrs, "enum", user_attrs, &mut messages, span, false);
                 let derives = derive_traits_from_attrs(attrs);
-                if derives.is_empty() {
-                    None
-                } else {
-                    Some(Job::Enum {
-                        name,
-                        generic: !type_params.is_empty(),
-                        derives,
-                        variants: variant_metas(variants),
-                        variant_nodes: variants.clone(),
-                    })
-                }
+                Some(Job::Enum {
+                    name,
+                    generic: !type_params.is_empty(),
+                    derives,
+                    variants: variant_metas(variants),
+                    variant_nodes: variants.clone(),
+                })
             }
             Expression::Class {
                 name,
@@ -1856,16 +1855,12 @@ fn expand_decls<'a>(
             } => {
                 validate_attrs(attrs, "class", user_attrs, &mut messages, span, false);
                 let derives = derive_traits_from_attrs(attrs);
-                if derives.is_empty() {
-                    None
-                } else {
-                    Some(Job::Class {
-                        name,
-                        generic: !type_params.is_empty(),
-                        derives,
-                        fields: class_field_names(fields),
-                    })
-                }
+                Some(Job::Class {
+                    name,
+                    generic: !type_params.is_empty(),
+                    derives,
+                    fields: class_field_names(fields),
+                })
             }
             _ => None,
         };
@@ -1933,6 +1928,7 @@ fn expand_decls<'a>(
                 &derives,
                 &variants,
                 &variant_nodes,
+                &decls,
                 &mut messages,
             )),
             Some(Job::Class {
@@ -1946,6 +1942,7 @@ fn expand_decls<'a>(
                 generic,
                 &derives,
                 &fields,
+                &decls,
                 &mut messages,
             )),
             None => None,
@@ -1984,17 +1981,20 @@ fn expand_enum<'a>(
     derives: &[&'a str],
     variants: &[VariantMeta<'a>],
     _variant_nodes: &[Output<'a>],
+    decls: &[Output<'a>],
     messages: &mut Vec<Message>,
 ) -> Vec<Output<'a>> {
     if generic {
-        messages.push(Message::error(
-            ErrorCode::GenericTypeError,
-            format!(
-                "Cannot derive traits for generic enum `{}`; write an explicit `impl`",
-                name
-            ),
-            span.into_range(),
-        ));
+        if !derives.is_empty() {
+            messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Cannot derive traits for generic enum `{}`; write an explicit `impl`",
+                    name
+                ),
+                span.into_range(),
+            ));
+        }
         return Vec::new();
     }
 
@@ -2017,6 +2017,7 @@ fn expand_enum<'a>(
             _ => unreachable!(),
         }
     }
+    push_default_display_impls(span, name, derives, decls, &mut out);
     out
 }
 
@@ -2026,17 +2027,20 @@ fn expand_class<'a>(
     generic: bool,
     derives: &[&'a str],
     field_names: &[&'a str],
+    decls: &[Output<'a>],
     messages: &mut Vec<Message>,
 ) -> Vec<Output<'a>> {
     if generic {
-        messages.push(Message::error(
-            ErrorCode::GenericTypeError,
-            format!(
-                "Cannot derive traits for generic class `{}`; write an explicit `impl`",
-                name
-            ),
-            span.into_range(),
-        ));
+        if !derives.is_empty() {
+            messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Cannot derive traits for generic class `{}`; write an explicit `impl`",
+                    name
+                ),
+                span.into_range(),
+            ));
+        }
         return Vec::new();
     }
 
@@ -2059,7 +2063,67 @@ fn expand_class<'a>(
             _ => unreachable!(),
         }
     }
+    push_default_display_impls(span, name, derives, decls, &mut out);
     out
+}
+
+/// Auto-generate FQN-only `Show`/`String` when neither derive nor an explicit
+/// `impl` covers the type. Bodies return `typeof self`.
+fn push_default_display_impls<'a>(
+    span: SimpleSpan,
+    name: &'a str,
+    derives: &[&str],
+    decls: &[Output<'a>],
+    out: &mut Vec<Output<'a>>,
+) {
+    if !derives.iter().any(|t| *t == "Show") && !has_explicit_impl(decls, "Show", name) {
+        out.push(synth_show_typeof(span, name));
+    }
+    if !derives.iter().any(|t| *t == "String") && !has_explicit_impl(decls, "String", name) {
+        out.push(synth_string_typeof(span, name));
+    }
+}
+
+fn has_explicit_impl(decls: &[Output<'_>], class: &str, ty_name: &str) -> bool {
+    decls.iter().any(|d| {
+        matches!(
+            d.1.as_ref(),
+            Expression::TypeClassImpl {
+                class: c,
+                args,
+                ..
+            } if *c == class
+                && args.first().is_some_and(|a| {
+                    matches!(a.1.as_ref(), Expression::Type(n) | Expression::Identifier(n) if *n == ty_name)
+                })
+        )
+    })
+}
+
+fn synth_show_typeof<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
+    let p = leak(format!("__show_{}", name));
+    let body = at(span, Expression::TypeOf(ident(span, p)));
+    let show_m = method_fn(
+        span,
+        "show",
+        vec![arg(span, name, p)],
+        "string",
+        block_return(span, body),
+    );
+    typeclass_impl(span, "Show", name, vec![show_m])
+}
+
+fn synth_string_typeof<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
+    let p = leak(format!("__str_{}", name));
+    let body = at(span, Expression::TypeOf(ident(span, p)));
+    let m = method_fn(
+        span,
+        "to_string",
+        vec![arg(span, name, p)],
+        "string",
+        block_return(span, body),
+    );
+    typeclass_impl(span, "String", name, vec![m])
 }
 
 fn check_derivable(trait_name: &str, span: SimpleSpan) -> Option<Message> {
@@ -3441,6 +3505,33 @@ mod tests {
                     if *class == "Sensitive" && args.len() == 1 && methods.is_empty()
             )),
             "expected empty Sensitive instance"
+        );
+    }
+
+    #[test]
+    fn default_show_string_use_typeof_when_no_derive() {
+        let (_exp, decls) = expand_src("class Point { x: int, y: int } fn main() {}");
+        assert!(
+            impl_method_names(&decls, "Show").contains(&"show".to_string()),
+            "expected default Show::show"
+        );
+        assert!(
+            impl_method_names(&decls, "String").contains(&"to_string".to_string()),
+            "expected default String::to_string"
+        );
+        let show_dbg = decls
+            .iter()
+            .find(|n| {
+                matches!(
+                    n.1.as_ref(),
+                    Expression::TypeClassImpl { class, .. } if *class == "Show"
+                )
+            })
+            .map(|n| format!("{:?}", n.1))
+            .unwrap_or_default();
+        assert!(
+            show_dbg.contains("TypeOf"),
+            "default Show should return typeof self, got: {show_dbg}"
         );
     }
 }
