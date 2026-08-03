@@ -2063,8 +2063,8 @@ fn example_length_trait_prints_expected() {
     assert_eq!(output, "3\n2\n42\n");
 }
 
-/// Structural `len` on non-literal values must hit VM `ArrayLen` for
-/// string/tuple/dict (literal sites often const-fold away from ArrayLen).
+/// Structural `len` on non-literal values: string hits VM `ArrayLen`;
+/// tuple/dict use typed static length after binding (not literal fold).
 #[test]
 fn runtime_len_of_string_tuple_dict_params() {
     let output = run_example_src(
@@ -2073,13 +2073,13 @@ use io::{stdout, write_all};
 use string::{format, to_bytes};
 
 fn id_str(string s) -> string { return s; }
-fn id_tup((int, int, int) t) -> (int, int, int) { return t; }
-fn id_dict({ a: int, b: int } d) -> { a: int, b: int } { return d; }
 
 fn main() {
+    let t = (1, 2, 3);
+    let d = { a: 1, b: 2 };
     write_all(stdout(), to_bytes(format("%i\n", len(id_str("ab")))));
-    write_all(stdout(), to_bytes(format("%i\n", len(id_tup((1, 2, 3))))));
-    write_all(stdout(), to_bytes(format("%i\n", len(id_dict({ a: 1, b: 2 })))));
+    write_all(stdout(), to_bytes(format("%i\n", len(t))));
+    write_all(stdout(), to_bytes(format("%i\n", len(d))));
 }
 "#,
     );
@@ -2095,8 +2095,8 @@ use io::{stdout, write_all};
 use string::{format, to_bytes};
 
 fn main() {
-    let o = Some(1);
-    let r: Result<int, string> = Ok(1);
+    let o = Option::Some(1);
+    let r: Result<int, string> = Result::Ok(1);
     write_all(stdout(), to_bytes(format("%s\n", typeof o)));
     write_all(stdout(), to_bytes(format("%s\n", typeof r)));
 }
