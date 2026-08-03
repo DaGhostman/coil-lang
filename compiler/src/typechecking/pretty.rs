@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::subst::{Subst, apply_ty_prune};
-use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty, TyVarId};
+use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty, TyVarId, ftv_ty};
 
 /// Format a type for user-facing diagnostics.
 ///
@@ -16,6 +16,145 @@ pub fn format_ty_for_diag(subst: &Subst, ty: &Ty) -> String {
     let mut rename = HashMap::new();
     let mut next = 0u32;
     format_ty_renamed(&pruned, &mut rename, &mut next)
+}
+
+/// Format a ground type as a fully-qualified name for `typeof`.
+///
+/// Returns `None` when the type still contains free variables, `never`,
+/// or a forall binder — those are not resolvable to a stable string.
+///
+/// Nominal heads are qualified with their defining module when known and
+/// non-empty (`prelude::Option<int>`, `math::Point`). Entry-file / empty
+/// modules stay bare (`Point`).
+pub fn format_ty_fqn(ty: &Ty, nominal_modules: &HashMap<String, String>) -> Option<String> {
+    if !ftv_ty(ty).is_empty() {
+        return None;
+    }
+    format_ty_fqn_inner(ty, nominal_modules)
+}
+
+fn qualify_nominal(name: &str, nominal_modules: &HashMap<String, String>) -> String {
+    match nominal_modules.get(name) {
+        Some(module) if !module.is_empty() => format!("{}::{}", module, name),
+        _ => name.to_string(),
+    }
+}
+
+fn format_ty_fqn_inner(ty: &Ty, nominal_modules: &HashMap<String, String>) -> Option<String> {
+    match ty {
+        Ty::Var(_) | Ty::Never | Ty::Forall { .. } => None,
+        Ty::Con(name) => Some(qualify_nominal(name, nominal_modules)),
+        Ty::Existential { class } => Some(class.clone()),
+        Ty::Fun(a, b) => {
+            let left = format_ty_fqn_inner(a, nominal_modules)?;
+            let right = format_ty_fqn_inner(b, nominal_modules)?;
+            if needs_paren(a) {
+                Some(format!("({}) -> {}", left, right))
+            } else {
+                Some(format!("{} -> {}", left, right))
+            }
+        }
+        Ty::App(c, args) => {
+            if args.is_empty() {
+                return format_ty_fqn_inner(c, nominal_modules);
+            }
+            let head = match c.as_ref() {
+                Ty::Con(name) => qualify_nominal(name, nominal_modules),
+                other => format_ty_fqn_inner(other, nominal_modules)?,
+            };
+            if let Ty::Con(name) = c.as_ref()
+                && name == "coroutine"
+                && args.len() == 2
+            {
+                let y = format_ty_fqn_inner(&args[0], nominal_modules)?;
+                if matches!(&args[1], Ty::Con(n) if n == "unit") {
+                    return Some(format!("coroutine<{}>", y));
+                }
+                let s = format_ty_fqn_inner(&args[1], nominal_modules)?;
+                return Some(format!("coroutine<{}, {}>", y, s));
+            }
+            let inner = args
+                .iter()
+                .map(|t| format_ty_fqn_inner(t, nominal_modules))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("{}<{}>", head, inner))
+        }
+        Ty::List(inner) => Some(format!("[{}]", format_ty_fqn_inner(inner, nominal_modules)?)),
+        Ty::Sum { name, variants } => {
+            let head = qualify_nominal(name, nominal_modules);
+            if name == common::BUILTIN_OPTION_ENUM {
+                let inner = variants
+                    .iter()
+                    .find(|(n, _)| n == "Some")
+                    .and_then(|(_, p)| match p {
+                        EnumVariantPayloadTy::Tuple(tys) => tys.first(),
+                        _ => None,
+                    })?;
+                return Some(format!(
+                    "{}<{}>",
+                    head,
+                    format_ty_fqn_inner(inner, nominal_modules)?
+                ));
+            }
+            if name == common::BUILTIN_RESULT_ENUM {
+                let ok = variants
+                    .iter()
+                    .find(|(n, _)| n == "Ok")
+                    .and_then(|(_, p)| match p {
+                        EnumVariantPayloadTy::Tuple(tys) => tys.first(),
+                        _ => None,
+                    })?;
+                let err = variants
+                    .iter()
+                    .find(|(n, _)| n == "Err")
+                    .and_then(|(_, p)| match p {
+                        EnumVariantPayloadTy::Tuple(tys) => tys.first(),
+                        _ => None,
+                    })?;
+                return Some(format!(
+                    "{}<{}, {}>",
+                    head,
+                    format_ty_fqn_inner(ok, nominal_modules)?,
+                    format_ty_fqn_inner(err, nominal_modules)?
+                ));
+            }
+            // User generic enums stored as Sum: recover args from the first
+            // non-unit payload field types when they look like type params.
+            Some(head)
+        }
+        Ty::Constructor { owner, .. } => format_ty_fqn_inner(owner, nominal_modules),
+        Ty::Tuple(tys) => {
+            let inner = tys
+                .iter()
+                .map(|t| format_ty_fqn_inner(t, nominal_modules))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("({})", inner))
+        }
+        Ty::Array { element, length } => {
+            let elem = format_ty_fqn_inner(element, nominal_modules)?;
+            match length {
+                ArrayLength::Static(n) => Some(format!("[{}; {}]", elem, n)),
+                ArrayLength::Dynamic => Some(format!("[{}]", elem)),
+            }
+        }
+        Ty::Record { fields } => {
+            let inner = fields
+                .iter()
+                .map(|(name, ty)| {
+                    format_ty_fqn_inner(ty, nominal_modules)
+                        .map(|t| format!("{}: {}", name, t))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("{{ {} }}", inner))
+        }
+        Ty::Readonly(inner) => Some(format!(
+            "readonly {}",
+            format_ty_fqn_inner(inner, nominal_modules)?
+        )),
+    }
 }
 
 fn fresh_diag_name(next: &mut u32) -> String {
@@ -367,7 +506,7 @@ impl fmt::Display for Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{TyVarId, float, int, list, string};
+    use crate::typechecking::ty::{TyVarId, float, int, list, option_ty, string};
 
     #[test]
     fn display_var() {
@@ -570,5 +709,32 @@ mod tests {
             arity: 1,
         };
         assert_eq!(format!("{}", ctor), "enum Option { None, Some(int) }::v1");
+    }
+
+    #[test]
+    fn format_ty_fqn_primitives_and_option() {
+        let modules = HashMap::from([(
+            common::BUILTIN_OPTION_ENUM.to_string(),
+            "prelude".to_string(),
+        )]);
+        assert_eq!(format_ty_fqn(&int(), &modules).as_deref(), Some("int"));
+        assert_eq!(
+            format_ty_fqn(&string(), &modules).as_deref(),
+            Some("string")
+        );
+        let opt = Ty::App(
+            Box::new(Ty::Con(common::BUILTIN_OPTION_ENUM.into())),
+            vec![int()],
+        );
+        assert_eq!(
+            format_ty_fqn(&opt, &modules).as_deref(),
+            Some("prelude::Option<int>")
+        );
+        let sum = option_ty(int());
+        assert_eq!(
+            format_ty_fqn(&sum, &modules).as_deref(),
+            Some("prelude::Option<int>")
+        );
+        assert!(format_ty_fqn(&Ty::Var(TyVarId(0)), &modules).is_none());
     }
 }
