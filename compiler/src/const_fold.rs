@@ -826,4 +826,69 @@ mod tests {
             Some(ConstValue::Int(3))
         );
     }
+
+    #[test]
+    fn len_folds_dict_escapes_grouped_and_env_string() {
+        let call = |arg: Output<'static>| -> Output<'static> {
+            (
+                SimpleSpan::from(0..8),
+                Box::new(Expression::Call {
+                    name: (
+                        SimpleSpan::from(0..3),
+                        Box::new(Expression::Identifier("len")),
+                    ),
+                    args: Some(vec![arg]),
+                }),
+            )
+        };
+        let env = HashMap::new();
+        let dict = (
+            SimpleSpan::from(0..9),
+            Box::new(Expression::Dict(vec![
+                parser::ast::RecordFieldValue {
+                    name: "a",
+                    value: int_expr(1),
+                },
+                parser::ast::RecordFieldValue {
+                    name: "b",
+                    value: int_expr(2),
+                },
+            ])),
+        );
+        assert_eq!(eval_expr(&call(dict), &env), Some(ConstValue::Int(2)));
+
+        assert_eq!(
+            eval_expr(
+                &call((
+                    SimpleSpan::from(0..4),
+                    Box::new(Expression::String("a\\nb")),
+                )),
+                &env
+            ),
+            Some(ConstValue::Int(3)),
+            "escape sequences count as one byte each after unescape"
+        );
+
+        let grouped = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Group((
+                SimpleSpan::from(0..3),
+                Box::new(Expression::String("hi")),
+            ))),
+        );
+        assert_eq!(eval_expr(&call(grouped), &env), Some(ConstValue::Int(2)));
+
+        let mut env = HashMap::new();
+        env.insert("s".into(), ConstValue::Str("xyz".into()));
+        assert_eq!(
+            eval_expr(&call(id_expr("s")), &env),
+            Some(ConstValue::Int(3))
+        );
+        env.insert("n".into(), ConstValue::Int(9));
+        assert_eq!(
+            eval_expr(&call(id_expr("n")), &env),
+            None,
+            "non-string const bindings must not fold"
+        );
+    }
 }
