@@ -15533,6 +15533,60 @@ let n = len(a); \
         );
     }
 
+    /// Literal `len("…")` must const-fold to an immediate, not `ArrayLen`.
+    #[test]
+    fn len_of_string_literal_folds_without_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let n = len("abc");
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "literal len(string) should fold away ArrayLen; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+            "expected folded CONST for len(\"abc\")"
+        );
+    }
+
+    /// Custom `Length` instances lower to a call, not structural `ArrayLen`.
+    #[test]
+    fn custom_length_impl_emits_call_not_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+class Box { value: int }
+impl Length for Box {
+    fn len(Box b) -> int { return 7; }
+}
+fn main() {
+    let n = len(new Box(0));
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "custom Length must not use structural ArrayLen; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::CALL | Instruction::CallIndirect
+            )),
+            "expected a call to Length::len; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     // ============================================================
     // chained field-access codegen tests
     // ============================================================

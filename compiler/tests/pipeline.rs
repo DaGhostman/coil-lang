@@ -2063,6 +2063,51 @@ fn example_length_trait_prints_expected() {
     assert_eq!(output, "3\n2\n42\n");
 }
 
+/// Structural `len` on non-literal values must hit VM `ArrayLen` for
+/// string/tuple/dict (literal sites often const-fold away from ArrayLen).
+#[test]
+fn runtime_len_of_string_tuple_dict_params() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+fn id_str(string s) -> string { return s; }
+fn id_tup((int, int, int) t) -> (int, int, int) { return t; }
+fn id_dict({ a: int, b: int } d) -> { a: int, b: int } { return d; }
+
+fn main() {
+    write_all(stdout(), to_bytes(format("%i\n", len(id_str("ab")))));
+    write_all(stdout(), to_bytes(format("%i\n", len(id_tup((1, 2, 3))))));
+    write_all(stdout(), to_bytes(format("%i\n", len(id_dict({ a: 1, b: 2 })))));
+}
+"#,
+    );
+    assert_eq!(output, "2\n3\n2\n");
+}
+
+/// `typeof` of prelude Option/Result must print the module-qualified FQN.
+#[test]
+fn typeof_option_prints_prelude_fqn() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    let o = Some(1);
+    let r: Result<int, string> = Ok(1);
+    write_all(stdout(), to_bytes(format("%s\n", typeof o)));
+    write_all(stdout(), to_bytes(format("%s\n", typeof r)));
+}
+"#,
+    );
+    assert_eq!(
+        output,
+        "prelude::Option<int>\nprelude::Result<int, string>\n"
+    );
+}
+
 /// Regression: derived `Serialize::serialize` must typecheck (`[byte]` return,
 /// payload fields cast to `byte`).
 #[test]
