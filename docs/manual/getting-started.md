@@ -117,6 +117,7 @@ The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it
 | `coil dissect <file.hy> [--fn pat] [--il] [--ast]` | Re-execs `coil-dissect`: in-memory compile and dump filtered bytecode (optional pre-opt IL / entry AST); never writes `out.hyc` |
 | `coil debug <file.hy> [-x script] [--batch]` | Re-execs `coil-debug`: GDB-style debugger (REPL; optional script / batch mode); never writes `out.hyc` |
 | `coil fmt [--check] <file.hy\|dir>...` | Re-execs `coil-fmt`: pretty-print `.hy` sources (in place; `--check` exits non-zero if changes needed). Preserves `//` and `///` docs. |
+| `coil lsp` | Re-execs `coil-lsp`: start the Coil language server over stdin/stdout. |
 
 Sibling binaries (install next to `coil`):
 
@@ -125,6 +126,7 @@ Sibling binaries (install next to `coil`):
 | `coil-debug` | Debugger implementation (`coil debug` dispatches here) |
 | `coil-dissect` | Bytecode / IL / AST dump (`coil dissect` dispatches here) |
 | `coil-fmt` | Source formatter (`coil fmt` dispatches here) |
+| `coil-lsp` | LSP server (`coil lsp` dispatches here) |
 | `coil-embed` | VM-only runner template for `coil package` (no compiler) |
 
 Examples:

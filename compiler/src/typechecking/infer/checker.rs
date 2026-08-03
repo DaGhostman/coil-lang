@@ -2171,7 +2171,7 @@ impl Checker {
                         items
                             .iter()
                             .filter_map(|item| {
-                                if let Expression::Argument(ty, _, _) = item.1.as_ref() {
+                                if let Expression::Argument { ty, .. } = item.1.as_ref() {
                                     ty.as_ref().map(|t| self.parse_type_name(t))
                                 } else {
                                     None
@@ -2206,7 +2206,7 @@ impl Checker {
                                 items
                                     .iter()
                                     .filter_map(|item| {
-                                        if let Expression::Argument(_, name, _) = item.1.as_ref() {
+                                        if let Expression::Argument { name, .. } = item.1.as_ref() {
                                             Some(name.to_string())
                                         } else {
                                             None
@@ -4067,7 +4067,7 @@ impl Checker {
                 self.pop_type_params_for_type_parsing(pushed);
                 unit_ty()
             }
-            Expression::Argument(ty, _name, is_rest) => {
+            Expression::Argument { ty, is_rest, .. } => {
                 if *is_rest {
                     match ty {
                         None => Ty::Var(self.counter.fresh()),
@@ -10166,11 +10166,11 @@ impl Checker {
         );
         let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
         if children.last().is_some_and(|c| {
-            matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+            matches!(c.1.as_ref(), Expression::Argument { is_rest: true, .. })
         }));
         let has_tuple_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
         if children.last().is_some_and(|c| {
-            matches!(c.1.as_ref(), Expression::Argument(None, _, true))
+            matches!(c.1.as_ref(), Expression::Argument { ty: None, is_rest: true, .. })
         }));
         self.fn_has_rest.insert(name.to_string(), has_rest);
         self.fn_tuple_rest.insert(name.to_string(), has_tuple_rest);
@@ -10571,7 +10571,12 @@ impl Checker {
         // Sole bare `...args` in a fn type: opaque callable unified at spread calls.
         if let Expression::Fragment(children) = params.1.as_ref() {
             if children.len() == 1 {
-                if let Expression::Argument(None, _, true) = children[0].1.as_ref() {
+                if let Expression::Argument {
+                    ty: None,
+                    is_rest: true,
+                    ..
+                } = children[0].1.as_ref()
+                {
                     return Ty::Var(self.counter.fresh());
                 }
             }
@@ -10589,7 +10594,12 @@ impl Checker {
         if let Expression::Fragment(children) = args.1.as_ref() {
             if children
                 .last()
-                .is_some_and(|c| matches!(c.1.as_ref(), Expression::Argument(None, _, true)))
+                .is_some_and(|c| {
+                    matches!(
+                        c.1.as_ref(),
+                        Expression::Argument { ty: None, is_rest: true, .. }
+                    )
+                })
             {
                 return Some(Ty::Var(counter.fresh()));
             }
@@ -10676,7 +10686,7 @@ impl Checker {
                     }
                     let id = self.ids.ids()[self.next_id_idx];
                     self.next_id_idx += 1;
-                    let ty = if let Expression::Argument(..) = child.1.as_ref() {
+                    let ty = if let Expression::Argument { .. } = child.1.as_ref() {
                         let t = arg_tys
                             .get(ty_idx)
                             .map(|(_, t)| t.clone())
@@ -10714,7 +10724,13 @@ impl Checker {
         if let Expression::Fragment(children) = args.1.as_ref() {
             let n = children.len();
             for (i, child) in children.iter().enumerate() {
-                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref() {
+                if let Expression::Argument {
+                    ty,
+                    name,
+                    is_rest,
+                    ..
+                } = child.1.as_ref()
+                {
                     if *is_rest {
                         if i + 1 != n {
                             let mut msg = Message::error(
@@ -11514,7 +11530,7 @@ impl Checker {
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
             | Expression::Constant(_, _)
-            | Expression::Argument(_, _, _)
+            | Expression::Argument { .. }
             | Expression::Field { .. }
             | Expression::QualifiedAccess { .. }
             | Expression::ExternBlock { .. }

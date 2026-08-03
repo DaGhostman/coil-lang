@@ -53,6 +53,8 @@ enum Command {
     },
     /// Re-exec `coil-fmt` (paths / `--check` forwarded via argv).
     Fmt,
+    /// Re-exec `coil-lsp` (LSP transport runs over stdin/stdout).
+    Lsp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,7 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] dissect <file.hy> [--fn <pat>] [--il] [--ast]\n\
          \x20 coil [--log-json | --log-lsp] debug <file.hy> [-x <script>] [--batch]\n\
          \x20 coil fmt [--check] <file.hy|dir>...\n\
+         \x20 coil lsp\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.hy> (or `[entry].file` from coil.toml) in memory and run it\n\
@@ -85,6 +88,7 @@ fn print_help() {
          \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no archive file)\n\
          \x20 debug      GDB-style debugger (REPL; optional -x script / --batch)\n\
          \x20 fmt        Format `.hy` sources (re-execs `coil-fmt`; preserves `//` and `///`)\n\
+         \x20 lsp        Start the Coil language server over stdin/stdout\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` or packaged binary for `package`\n\
@@ -131,6 +135,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         match arg.as_str() {
             "--log-json" => log_json = true,
             "--log-lsp" => log_lsp = true,
+            "--stdio" => {}
             "--fail-fast" => fail_fast = true,
             "--include-tests" => include_tests = true,
             "--check-native" => check_native = true,
@@ -194,7 +199,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
             s if s.starts_with('-') => {
                 return Err(
-                    "unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, --check, -o/--output, or a command/file)",
+                    "unrecognized flag (expected --log-json, --log-lsp, --stdio, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, --fn, --il, --ast, -x, --batch, --check, -o/--output, or a command/file)",
                 );
             }
             _ => positionals.push(arg.clone()),
@@ -207,6 +212,23 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let has_fmt_flags = check;
 
     let command = match positionals.as_slice() {
+        [cmd] if cmd == "lsp" => {
+            if output.is_some()
+                || fail_fast
+                || include_tests
+                || log_json
+                || log_lsp
+                || check_native
+                || strip_debug
+                || runner.is_some()
+                || has_dissect_flags
+                || has_debug_flags
+                || has_fmt_flags
+            {
+                return Err("flags other than --stdio are not valid with `lsp`");
+            }
+            Command::Lsp
+        }
         [cmd, rest @ ..] if cmd == "fmt" => {
             if rest.is_empty() {
                 return Err("fmt requires at least one file or directory");
@@ -313,6 +335,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || path == "dissect"
                 || path == "debug"
                 || path == "fmt"
+                || path == "lsp"
             {
                 return Err("test path must be a directory");
             }
@@ -357,6 +380,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "dissect"
                 || filename == "debug"
                 || filename == "fmt"
+                || filename == "lsp"
             {
                 return Err("package requires an entry file");
             }
@@ -398,6 +422,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "dissect"
                 || filename == "debug"
                 || filename == "fmt"
+                || filename == "lsp"
             {
                 return Err("debug requires an entry .hy file");
             }
@@ -432,6 +457,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "dissect"
                 || filename == "debug"
                 || filename == "fmt"
+                || filename == "lsp"
             {
                 return Err("dissect requires an entry .hy file");
             }
@@ -470,6 +496,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 || filename == "dissect"
                 || filename == "debug"
                 || filename == "fmt"
+                || filename == "lsp"
             {
                 return Err("compile requires an entry file");
             }
@@ -1146,6 +1173,7 @@ fn main() {
         Command::Dissect { .. } => dispatch_helper("dissect"),
         Command::Debug { .. } => dispatch_helper("debug"),
         Command::Fmt => dispatch_helper("fmt"),
+        Command::Lsp => dispatch_helper("lsp"),
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
@@ -1179,7 +1207,8 @@ fn main() {
                 Command::Test { .. }
                 | Command::Dissect { .. }
                 | Command::Debug { .. }
-                | Command::Fmt => {
+                | Command::Fmt
+                | Command::Lsp => {
                     unreachable!()
                 }
             }
@@ -1189,11 +1218,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::archive_staleness::{
         archive_is_stale, archive_mtime, archive_source_mtime, same_source_path,
         source_newer_than_archive,
     };
+    use super::*;
 
     fn args(parts: &[&str]) -> Vec<String> {
         std::iter::once("coil".to_string())
@@ -1211,6 +1240,12 @@ mod tests {
     fn parse_fmt_with_check() {
         let cli = parse_args(&args(&["fmt", "--check", "a.hy"])).unwrap();
         assert_eq!(cli.command, Command::Fmt);
+    }
+
+    #[test]
+    fn parse_lsp_with_stdio() {
+        let cli = parse_args(&args(&["--stdio", "lsp"])).unwrap();
+        assert_eq!(cli.command, Command::Lsp);
     }
 
     #[test]

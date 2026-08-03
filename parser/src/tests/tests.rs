@@ -992,7 +992,14 @@
         let found = match func {
             Expression::Function { args, .. } => match args.1.as_ref() {
                 Expression::Fragment(items) => {
-                    matches!(items[0].1.as_ref(), Expression::Argument(_, "xs", true))
+                    matches!(
+                        items[0].1.as_ref(),
+                        Expression::Argument {
+                            name: "xs",
+                            is_rest: true,
+                            ..
+                        }
+                    )
                 }
                 _ => false,
             },
@@ -1005,6 +1012,26 @@
             "display should show rest syntax, got {}",
             func
         );
+    }
+
+    #[test]
+    fn parameter_docs_attach_to_arguments() {
+        let src = "fn sum(\n/// Values to add.\nint... xs,\n) -> int { return 0; }";
+        let ast = Pratt::default().parse(src).expect("parse");
+        let Expression::Program(items) = ast.1.as_ref() else {
+            panic!("expected program");
+        };
+        let Expression::Function { args, .. } = items[0].1.as_ref() else {
+            panic!("expected function");
+        };
+        let Expression::Fragment(params) = args.1.as_ref() else {
+            panic!("expected params");
+        };
+        let Expression::Argument { docs, name, .. } = params[0].1.as_ref() else {
+            panic!("expected argument");
+        };
+        assert_eq!(*name, "xs");
+        assert_eq!(docs, &["Values to add."]);
     }
 
     #[test]

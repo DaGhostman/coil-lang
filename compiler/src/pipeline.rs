@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -68,6 +68,8 @@ pub struct Pipeline {
     /// Parsed-source cache: avoids re-reading files between discovery and compile.
     source_interner: common::Interner<PathBuf>,
     source_cache: Vec<Option<String>>,
+    /// Unsaved editor buffers keyed by their normalized path.
+    overlays: HashMap<PathBuf, String>,
     /// When true, harness tests are compiled into the program (see `--include-tests`).
     include_tests: bool,
     compiler: Compiler,
@@ -92,6 +94,15 @@ impl Default for Pipeline {
 }
 
 impl Pipeline {
+    /// Override a source file with in-memory text until [`Self::clear_file_text`].
+    pub fn set_file_text(&mut self, file: PathBuf, text: String) {
+        self.overlays.insert(file, text);
+    }
+
+    /// Remove an in-memory source override.
+    pub fn clear_file_text(&mut self, file: &Path) {
+        self.overlays.remove(file);
+    }
     /// Register a host native with an explicit [`FfiSignature`]
     /// and Rust closure. The signature is forwarded to the HM
     /// typechecker; the closure is stored for
@@ -187,6 +198,60 @@ impl Pipeline {
         self.compiler.get_messages()
     }
 
+    /// Typecheck an entry and its discovered modules without generating
+    /// bytecode. Each result is associated with the source file that was
+    /// checked, which makes this suitable for editor diagnostics.
+    pub fn typecheck_project(&mut self, file: &Path) -> Vec<(PathBuf, Vec<Message>)> {
+        let root = Self::find_project_root(file);
+        if root != self.project_root {
+            self.project_root = root.clone();
+            self.manifest = Manifest::load(&root).unwrap_or_default();
+            machine::env::set_allow_exec(self.manifest.allow_exec);
+        }
+        self.failed = false;
+        self.processed.clear();
+        self.worklist.clear();
+        self.entry_file = Some(file.to_path_buf());
+        self.enqueue_file(file.to_path_buf());
+        self.discover_all();
+
+        let mut results = Vec::new();
+        while let Some(item) = self.worklist.pop_back() {
+            let source = match self.read_source(&item.file) {
+                Some(source) => source,
+                None => continue,
+            };
+            let ast = match Pratt::default().parse(source.as_str()) {
+                Ok(ast) => ast,
+                Err(message) => {
+                    results.push((item.file, vec![message]));
+                    continue;
+                }
+            };
+            let namespace = if self.entry_file.as_ref() == Some(&item.file) {
+                String::new()
+            } else {
+                item.namespace
+                    .or_else(|| self.manifest.namespace_of(&self.project_root, &item.file))
+                    .unwrap_or_default()
+            };
+            let before = self.compiler.get_messages().len();
+            self.compiler.typecheck_module(&namespace, &ast);
+            let messages = self.compiler.get_messages()[before..].to_vec();
+            results.push((item.file, messages));
+        }
+        results
+    }
+
+    /// Typecheck one source file through the project-aware pipeline.
+    pub fn typecheck_src_from_file(&mut self, file: &str) -> Vec<Message> {
+        self.typecheck_project(Path::new(file))
+            .into_iter()
+            .find(|(path, _)| path == Path::new(file))
+            .map(|(_, messages)| messages)
+            .unwrap_or_default()
+    }
+
     /// Project root (directory containing `coil.toml`, or cwd).
     pub fn project_root(&self) -> &Path {
         &self.project_root
@@ -245,7 +310,7 @@ impl Pipeline {
 
     /// Walk up from `start` looking for a directory that contains
     /// `coil.toml`. Falls back to the process cwd when none is found.
-    fn find_project_root(start: &Path) -> PathBuf {
+    pub fn find_project_root(start: &Path) -> PathBuf {
         let mut dir = if start.is_file() {
             start
                 .parent()
@@ -302,6 +367,7 @@ impl Pipeline {
             entry_file: None,
             source_interner: common::Interner::default(),
             source_cache: Vec::new(),
+            overlays: HashMap::new(),
             include_tests: false,
             compiler: Compiler::default(),
             sink,
@@ -557,6 +623,9 @@ impl Pipeline {
     /// the file can't be read; the caller records the
     /// error and bails.
     fn read_source(&mut self, file: &Path) -> Option<String> {
+        if let Some(text) = self.overlays.get(file) {
+            return Some(text.clone());
+        }
         // Intern the path. Repeated calls with the same
         // path return the same id; new paths extend the
         // interner's storage. The id is a `u32` (Copy),

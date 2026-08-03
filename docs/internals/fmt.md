@@ -35,10 +35,18 @@ Short forms stay on one line (except 1-tuples, which always keep `(x,)`).
 
 Class and enum bodies are always multiline when non-empty and use trailing commas after each field/variant.
 
+Adjacent `use` statements are kept together without blank separator lines.
+Imports with the same namespace are grouped, such as
+`use io::{stdout, write_all};`. Different nested namespaces are grouped only
+when each import has more than three path segments.
+
 ## Comments and docs
 
 - `//` line comments are preserved (AST `Expression::Comment`).
 - `///` doc comments attach to the following declaration (`fn`, `class`, `field`, `trait`, `enum`, …) as `docs: Vec<&str>`. Read them later via [`parser::item_docs`](../../parser/src/ast.rs).
+- `///` lines immediately inside a function parameter list attach to that
+  parameter; documented parameter lists are formatted one item per line with
+  trailing commas.
 - Orphan `///` (not immediately before a documentable item) is a **parse error**.
 - Attributes may follow docs: `/// …` then `#[…]` then the keyword.
 

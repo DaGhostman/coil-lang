@@ -19,6 +19,13 @@ pub fn format_source(src: &str) -> Result<String, Message> {
     Ok(format_program(ast.1.as_ref()))
 }
 
+/// Format a source range while preserving the formatter's whole-file parse
+/// guarantees. The current formatter returns the complete formatted document;
+/// callers can diff it against the requested range.
+pub fn format_range(src: &str, _range: std::ops::Range<usize>) -> Result<String, Message> {
+    format_source(src)
+}
+
 pub fn format_program(expr: &Expression<'_>) -> String {
     let mut f = Formatter::new();
     f.fmt_expression(expr);
@@ -139,7 +146,14 @@ impl Formatter {
             f.out
         };
 
-        if self.fits_flat(&flat) {
+        let has_docs = items.iter().any(|item| {
+            matches!(
+                item.1.as_ref(),
+                Expression::Argument { docs, .. } if !docs.is_empty()
+            )
+        });
+
+        if !has_docs && self.fits_flat(&flat) {
             self.push_str(open);
             let was = self.flat;
             self.flat = true;
@@ -526,7 +540,13 @@ impl Formatter {
                 self.push_str("...");
                 self.fmt_output(inner);
             }
-            Expression::Argument(ty, name, is_rest) => {
+            Expression::Argument {
+                docs,
+                ty,
+                name,
+                is_rest,
+            } => {
+                self.fmt_docs(docs);
                 if *is_rest {
                     match ty {
                         None => {
@@ -573,22 +593,7 @@ impl Formatter {
             }
 
             Expression::Use { path, name, alias } => {
-                self.push_str("use ");
-                for (i, seg) in path.iter().enumerate() {
-                    if i > 0 {
-                        self.push_str("::");
-                    }
-                    self.push_str(seg);
-                }
-                if !path.is_empty() {
-                    self.push_str("::");
-                }
-                self.push_str(name);
-                if let Some(a) = alias {
-                    self.push_str(" as ");
-                    self.push_str(a);
-                }
-                self.push_str(";");
+                self.fmt_use(path, name, alias.as_ref());
             }
 
             Expression::Variable(name, ty) => {
@@ -1021,7 +1026,9 @@ impl Formatter {
 
     fn fmt_program(&mut self, items: &[Output<'_>]) {
         let mut prev_comment = false;
-        for (i, item) in items.iter().enumerate() {
+        let mut i = 0;
+        while i < items.len() {
+            let item = &items[i];
             let is_comment = matches!(item.1.as_ref(), Expression::Comment(_));
             if i > 0 {
                 self.newline();
@@ -1029,9 +1036,111 @@ impl Formatter {
                     self.newline();
                 }
             }
-            self.fmt_expression(item.1.as_ref());
+            if matches!(item.1.as_ref(), Expression::Use { .. }) {
+                let start = i;
+                while i < items.len() && matches!(items[i].1.as_ref(), Expression::Use { .. }) {
+                    i += 1;
+                }
+                self.fmt_use_group(&items[start..i]);
+            } else {
+                self.fmt_expression(item.1.as_ref());
+                i += 1;
+            }
             prev_comment = is_comment;
         }
+    }
+
+    fn fmt_use(&mut self, path: &[String], name: &str, alias: Option<&String>) {
+        self.push_str("use ");
+        for (i, segment) in path.iter().enumerate() {
+            if i > 0 {
+                self.push_str("::");
+            }
+            self.push_str(segment);
+        }
+        if !path.is_empty() {
+            self.push_str("::");
+        }
+        self.push_str(name);
+        if let Some(alias) = alias {
+            self.push_str(" as ");
+            self.push_str(alias);
+        }
+        self.push_str(";");
+    }
+
+    fn fmt_use_group(&mut self, items: &[Output<'_>]) {
+        let mut start = 0;
+        while start < items.len() {
+            let Some((root, _, _)) = use_parts(items[start].1.as_ref()) else {
+                start += 1;
+                continue;
+            };
+            let mut end = start + 1;
+            while end < items.len()
+                && use_parts(items[end].1.as_ref())
+                    .is_some_and(|(candidate, _, _)| candidate.first() == root.first())
+            {
+                end += 1;
+            }
+            let group = &items[start..end];
+            if group.len() < 2 {
+                if let Some((path, name, alias)) = use_parts(group[0].1.as_ref()) {
+                    self.fmt_use(path, name, alias);
+                }
+            } else if can_group_uses(group) {
+                self.fmt_grouped_use(group);
+            } else {
+                for (index, item) in group.iter().enumerate() {
+                    if index > 0 {
+                        self.newline();
+                    }
+                    if let Some((path, name, alias)) = use_parts(item.1.as_ref()) {
+                        self.fmt_use(path, name, alias);
+                    }
+                }
+            }
+            start = end;
+            if start < items.len() {
+                self.newline();
+            }
+        }
+    }
+
+    fn fmt_grouped_use(&mut self, items: &[Output<'_>]) {
+        let Some((first_path, _, _)) = use_parts(items[0].1.as_ref()) else {
+            return;
+        };
+        let same_namespace = items.iter().all(|item| {
+            use_parts(item.1.as_ref()).is_some_and(|(path, _, _)| path == first_path)
+        });
+        let root_len = if same_namespace { first_path.len() } else { 1 };
+        let root = &first_path[..root_len];
+
+        self.push_str("use ");
+        self.push_str(&root.join("::"));
+        self.push_str("::{");
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                self.push_str(", ");
+            }
+            let Some((path, name, alias)) = use_parts(item.1.as_ref()) else {
+                continue;
+            };
+            if !same_namespace {
+                let suffix = &path[root_len..];
+                if !suffix.is_empty() {
+                    self.push_str(&suffix.join("::"));
+                    self.push_str("::");
+                }
+            }
+            self.push_str(name);
+            if let Some(alias) = alias {
+                self.push_str(" as ");
+                self.push_str(alias);
+            }
+        }
+        self.push_str("};");
     }
 
     fn fmt_if(&mut self, branches: &[Output<'_>]) {
@@ -1707,6 +1816,31 @@ fn binary_op(expr: &Expression<'_>) -> &'static str {
     }
 }
 
+fn use_parts<'a, 'expr>(
+    expr: &'a Expression<'expr>,
+) -> Option<(&'a [String], &'a str, Option<&'a String>)> {
+    match expr {
+        Expression::Use { path, name, alias } => Some((path, name, alias.as_ref())),
+        _ => None,
+    }
+}
+
+fn can_group_uses(items: &[Output<'_>]) -> bool {
+    let Some((first_path, _, _)) = use_parts(items[0].1.as_ref()) else {
+        return false;
+    };
+    if first_path.is_empty() {
+        return false;
+    }
+    let same_namespace = items.iter().all(|item| {
+        use_parts(item.1.as_ref()).is_some_and(|(path, _, _)| path == first_path)
+    });
+    same_namespace
+        || items.iter().all(|item| {
+            use_parts(item.1.as_ref()).is_some_and(|(path, _, _)| path.len() + 1 > 3)
+        })
+}
+
 fn is_bare_return(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::Noop(_) => true,
@@ -1822,6 +1956,40 @@ mod tests {
         let once = format_source(src).unwrap();
         let twice = format_source(&once).unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn parameter_docs_force_multiline_and_round_trip() {
+        let src = "fn add(\n/// Left operand.\nint left,\n/// Right operand.\nint right,\n) -> int {\n    return left + right;\n}\n";
+        let once = format_source(src).unwrap();
+        assert!(once.contains("/// Left operand."));
+        assert!(once.contains("/// Right operand."));
+        assert!(once.contains("int left,"));
+        assert_eq!(once, format_source(&once).unwrap());
+    }
+
+    #[test]
+    fn groups_use_statements_by_namespace() {
+        let src = "use io::stdout;\nuse io::write_all;\nfn main() { return; }\n";
+        let formatted = format_source(src).unwrap();
+        assert!(formatted.contains("use io::{stdout, write_all};"));
+        assert!(formatted.contains("};\n\nfn main"));
+        assert!(!formatted.contains("stdout;\n\nuse"));
+        Pratt::default().parse(&formatted).expect("grouped use parses");
+    }
+
+    #[test]
+    fn groups_deep_use_statements_only_past_three_segments() {
+        let deep = "use a::b::c::one;\nuse a::b::d::two;\nfn main() { return; }\n";
+        let formatted = format_source(deep).unwrap();
+        assert!(formatted.contains("use a::{b::c::one, b::d::two};"));
+        Pratt::default().parse(&formatted).expect("deep grouped use parses");
+
+        let shallow = "use a::b::one;\nuse a::c::two;\nfn main() { return; }\n";
+        let formatted = format_source(shallow).unwrap();
+        assert!(!formatted.contains("use a::{"));
+        assert!(formatted.contains("use a::b::one;\nuse a::c::two;"));
+        Pratt::default().parse(&formatted).expect("shallow use parses");
     }
 
     #[test]

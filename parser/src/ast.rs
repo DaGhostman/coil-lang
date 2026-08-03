@@ -158,7 +158,13 @@ pub enum Expression<'expr> {
 
     /// Function parameter `T name`, homogeneous rest `T... name`, or tuple
     /// rest `... name` (`ty` is `None` for bare tuple rest).
-    Argument(Option<Output<'expr>>, &'expr str, bool),
+    Argument {
+        /// Leading `///` documentation lines for this parameter.
+        docs: Vec<&'expr str>,
+        ty: Option<Output<'expr>>,
+        name: &'expr str,
+        is_rest: bool,
+    },
 
     /// Call-site spread: `f(...expr)`.
     Spread(Output<'expr>),
@@ -1058,7 +1064,13 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
-            Self::Argument(ty, name, is_rest) => {
+            Self::Argument {
+                docs,
+                ty,
+                name,
+                is_rest,
+            } => {
+                write!(f, "{}", fmt_docs(docs))?;
                 if *is_rest {
                     match ty {
                         None => write!(f, "... {}", name),

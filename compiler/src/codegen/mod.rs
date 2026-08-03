@@ -625,10 +625,12 @@ fn fn_arity_from_args(args: &Output<'_>) -> (usize, bool) {
         Expression::Fragment(children) => {
             let has_rest = children
                 .last()
-                .is_some_and(|c| matches!(c.1.as_ref(), Expression::Argument(_, _, true)));
+                .is_some_and(|c| {
+                    matches!(c.1.as_ref(), Expression::Argument { is_rest: true, .. })
+                });
             let n = children
                 .iter()
-                .filter(|c| matches!(c.1.as_ref(), Expression::Argument(..)))
+                .filter(|c| matches!(c.1.as_ref(), Expression::Argument { .. }))
                 .count();
             if has_rest {
                 (n.saturating_sub(1), true)

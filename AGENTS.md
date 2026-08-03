@@ -17,8 +17,9 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 - Language features: draft plans first; full HM integration; update `docs/`; minimal runnable example with expected output.
 - Granular conventional commits; stage only related files.
 - Prefer compiler virtual modules over userland for core machinery.
-- Dev install: `cargo build` at the repo root builds `coil`, `coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed` side-by-side (`coil debug` / `coil dissect` / `coil fmt` re-exec helpers; `coil package` defaults to `coil-embed`).
+- Dev install: `cargo build` at the repo root builds `coil`, `coil-debug`, `coil-dissect`, `coil-fmt`, `coil-lsp`, and `coil-embed` side-by-side (`coil debug` / `coil dissect` / `coil fmt` / `coil lsp` dispatch helpers; `coil package` defaults to `coil-embed`).
 - Prefer `coil dissect` for IL/bytecode inspection; do not reintroduce verbose debug-build dumps now that dissect covers that.
+- `coil fmt`: preserve `//` comments and `///` docblocks (for docs/LSP); wrap long conditions, call chains, and args/tuples/arrays/dicts; trailing commas on multi-line lists.
 
 ## Invariants (do not break)
 

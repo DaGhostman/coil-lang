@@ -8,6 +8,34 @@ type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
 type FinalizeIlOut = ();
 
 impl Compiler {
+    /// Expose inferred state to language tooling after a module is checked.
+    pub fn checker(&self) -> &crate::typechecking::Checker {
+        &self.checker
+    }
+
+    pub fn checker_mut(&mut self) -> &mut crate::typechecking::Checker {
+        &mut self.checker
+    }
+
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+
+    pub fn module_items(&self) -> &HashMap<String, Vec<String>> {
+        &self.module_items
+    }
+
+    /// Run HM inference for a module without emitting bytecode.
+    pub fn typecheck_module<'compiler>(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) {
+        self.checker.set_current_module(module);
+        let _ = self.checker.check_program(ast);
+        self.messages.extend(self.checker.take_messages());
+    }
+
     pub fn constants(&self) -> &[u64] {
         &self.constants
     }
@@ -4804,7 +4832,12 @@ impl Compiler {
         let mut overrides = HashMap::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
-                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref()
+                if let Expression::Argument {
+                    ty,
+                    name,
+                    is_rest,
+                    ..
+                } = child.1.as_ref()
                     && let Some(ty) = ty
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
@@ -8572,7 +8605,7 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(ty, n, _is_rest) => {
+            Expression::Argument { ty, name: n, .. } => {
                 let slot = self.context.variables.intern(n.to_string()) as u32;
                 self.record_debug_local(n, slot);
                 if ty
@@ -9652,7 +9685,7 @@ impl Compiler {
                     let nfixed = if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         items
                             .iter()
-                            .filter(|a| matches!(a.1.as_ref(), Expression::Argument(..)))
+                            .filter(|a| matches!(a.1.as_ref(), Expression::Argument { .. }))
                             .count()
                     } else {
                         0
@@ -9683,7 +9716,10 @@ impl Compiler {
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref()
+                            if let Expression::Argument {
+                                ty: type_expr,
+                                ..
+                            } = arg.1.as_ref()
                                 && let Some(type_expr) = type_expr
                             {
                                 if let Some((tag, aux)) =

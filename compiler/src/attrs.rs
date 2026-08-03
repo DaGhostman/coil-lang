@@ -290,7 +290,13 @@ fn fn_param_nodes<'a>(args: &'a Output<'a>) -> Vec<(Option<Output<'a>>, &'static
     let mut out = Vec::new();
     if let Expression::Fragment(children) = args.1.as_ref() {
         for child in children {
-            if let Expression::Argument(ty, name, is_rest) = child.1.as_ref() {
+            if let Expression::Argument {
+                ty,
+                name,
+                is_rest,
+                ..
+            } = child.1.as_ref()
+            {
                 out.push((ty.clone(), leak((*name).to_string()), *is_rest));
             }
         }
@@ -480,7 +486,7 @@ fn collect_free_idents<'a>(
             }
             if let Expression::Fragment(children) = args.1.as_ref() {
                 for child in children {
-                    if let Expression::Argument(_, name, _) = child.1.as_ref() {
+                    if let Expression::Argument { name, .. } = child.1.as_ref() {
                         inner_bound.insert(leak((*name).to_string()));
                     }
                 }
@@ -705,7 +711,7 @@ fn collect_free_idents<'a>(
             collect_free_idents(lhs, bound, free);
             collect_free_idents(rhs, bound, free);
         }
-        Expression::Argument(ty, _, _) => {
+        Expression::Argument { ty, .. } => {
             if let Some(t) = ty {
                 collect_free_idents(t, bound, free);
             }
@@ -1192,9 +1198,19 @@ fn rewrite_expr_inline<'a>(
                 rhs: rw(rhs),
             },
         ),
-        Expression::Argument(ty, name, rest) => at(
+        Expression::Argument {
+            docs,
+            ty,
+            name,
+            is_rest: rest,
+        } => at(
             span,
-            Expression::Argument(ty.as_ref().map(|t| rw(t)), *name, *rest),
+            Expression::Argument {
+                docs: docs.clone(),
+                ty: ty.as_ref().map(|t| rw(t)),
+                name: *name,
+                is_rest: *rest,
+            },
         ),
         Expression::TypeFnSig { params, ret } => at(
             span,
@@ -1648,7 +1664,12 @@ fn synthesize_class_ctor<'a>(
             if let Expression::Identifier(name) = name_expr.1.as_ref() {
                 args.push(at(
                     span,
-                    Expression::Argument(Some(ty_expr.clone()), name, false),
+                    Expression::Argument {
+                        docs: Vec::new(),
+                        ty: Some(ty_expr.clone()),
+                        name,
+                        is_rest: false,
+                    },
                 ));
                 call_args.push(ident(span, name));
             }
@@ -2327,7 +2348,12 @@ fn method_fn<'a>(
 fn arg<'a>(span: SimpleSpan, ty: &'a str, name: &'a str) -> Output<'a> {
     at(
         span,
-        Expression::Argument(Some(ty_ret(span, ty)), name, false),
+        Expression::Argument {
+            docs: Vec::new(),
+            ty: Some(ty_ret(span, ty)),
+            name,
+            is_rest: false,
+        },
     )
 }
 

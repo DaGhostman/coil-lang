@@ -17,7 +17,7 @@ fn main() {
 Run any program from the repository root:
 
 ```bash
-cargo build   # coil + coil-debug + coil-dissect + coil-fmt + coil-embed
+cargo build   # coil + coil-debug + coil-dissect + coil-fmt + coil-lsp + coil-embed
 cargo run -- examples/print_literal.hy
 ```
 
@@ -138,6 +138,7 @@ cargo run --release -- examples/fib.hy
 | `run <file.hyc>` | Execute a compiled archive |
 | `package <file.hy> [-o path] [--check-native]` | Single executable (embeds `.hyc` into `coil-embed` by default) |
 | `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.hy` (default `./tests`); continue after failures unless `--fail-fast` |
+| `lsp` | Start the Coil language server over stdin/stdout |
 
 For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](manual/getting-started.md).
 

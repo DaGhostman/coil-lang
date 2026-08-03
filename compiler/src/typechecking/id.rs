@@ -72,7 +72,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Field { .. }
         | Expression::QualifiedAccess { .. } => {}
 
-        Expression::Argument(ty, _, _) => {
+        Expression::Argument { ty, .. } => {
             if let Some(t) = ty {
                 pre_walk(t, table);
             }

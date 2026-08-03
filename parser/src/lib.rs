@@ -69,7 +69,7 @@ pub mod ast;
 pub mod fmt;
 
 pub use ast::item_docs;
-pub use fmt::{format_program, format_source};
+pub use fmt::{format_program, format_range, format_source};
 
 #[derive(Default)]
 pub struct Pratt<'pratt> {
@@ -704,26 +704,51 @@ impl<'pratt> Pratt<'pratt> {
             + 'pratt,
     {
         // `... name` (tuple rest), `T... name` (homogeneous rest), or `T name` (fixed).
-        let tuple_rest_arg = op!("...")
-            .ignore_then(text::ident().padded())
-            .map_with(|name, e| (e.span(), Box::new(Expression::Argument(None, name, true))));
-        let rest_arg = ty_parser
-            .clone()
-            .then_ignore(just("...").padded())
-            .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
+        let tuple_rest_arg = self
+            .docs_prefix()
+            .then(op!("...").ignore_then(text::ident().padded()))
+            .map_with(|(docs, name), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, true)),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: None,
+                        name,
+                        is_rest: true,
+                    }),
                 )
             });
-        let fixed_arg = ty_parser
+        let rest_arg = self
+            .docs_prefix()
+            .then(ty_parser
             .clone()
-            .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded()))
+            .map_with(|(docs, (ty, name)), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, false)),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: Some(ty),
+                        name,
+                        is_rest: true,
+                    }),
+                )
+            });
+        let fixed_arg = self
+            .docs_prefix()
+            .then(ty_parser
+            .clone()
+            .then(text::ident().padded()))
+            .map_with(|(docs, (ty, name)), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: Some(ty),
+                        name,
+                        is_rest: false,
+                    }),
                 )
             });
         let arg = tuple_rest_arg.or(rest_arg).or(fixed_arg);
@@ -1462,16 +1487,27 @@ impl<'pratt> Pratt<'pratt> {
     {
         let segment = text::ident().padded();
 
-        // One item inside `{ … }`: `name` or `name as alias`.
+        // One item inside `{ … }`: `name`, `path::name`, or either with `as`.
         let brace_item = text::ident()
             .padded()
+            .then(
+                op!("::")
+                    .ignore_then(text::ident().padded().map(|s: &str| s.to_string()))
+                    .repeated()
+                    .collect::<Vec<String>>(),
+            )
             .then(
                 keyword!("as")
                     .ignore_then(text::ident().padded())
                     .map(|s: &str| s.to_string())
                     .or_not(),
             )
-            .map(|(name, alias): (&str, Option<String>)| (name.to_string(), alias));
+            .map(
+                |((first, mut rest), alias): ((&str, Vec<String>), Option<String>)| {
+                    rest.insert(0, first.to_string());
+                    (rest, alias)
+                },
+            );
 
         // Empty `{ }` is a parse error (silent no-op would hide typos).
         let brace_group = just('{')
@@ -1494,7 +1530,7 @@ impl<'pratt> Pratt<'pratt> {
 
         #[derive(Clone)]
         enum EndKind {
-            Brace(Vec<(String, Option<String>)>),
+            Brace(Vec<(Vec<String>, Option<String>)>),
             Glob,
             Concrete(Option<String>),
         }
@@ -1524,24 +1560,27 @@ impl<'pratt> Pratt<'pratt> {
                             let mut path = Vec::with_capacity(1 + middle.len());
                             path.push(first.to_string());
                             path.extend(middle);
-                            if items.len() == 1 {
-                                let (name, alias) = items.into_iter().next().unwrap();
-                                return (span, Box::new(Expression::Use { path, name, alias }));
-                            }
                             let children: Vec<Output<'pratt>> = items
                                 .into_iter()
-                                .map(|(name, alias)| {
+                                .map(|(mut item_path, alias)| {
+                                    let name = item_path.pop().expect("brace item has a name");
+                                    let mut child_path = path.clone();
+                                    child_path.extend(item_path);
                                     (
                                         span,
                                         Box::new(Expression::Use {
-                                            path: path.clone(),
+                                            path: child_path,
                                             name,
                                             alias,
                                         }),
                                     )
                                 })
                                 .collect();
-                            (span, Box::new(Expression::Fragment(children)))
+                            if children.len() == 1 {
+                                children.into_iter().next().unwrap()
+                            } else {
+                                (span, Box::new(Expression::Fragment(children)))
+                            }
                         }
                         EndKind::Glob => {
                             let mut path = Vec::with_capacity(1 + middle.len());
@@ -1658,7 +1697,12 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(ty, name), e| {
                 ExternArg::Fixed((
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, false)),
+                    Box::new(Expression::Argument {
+                        docs: Vec::new(),
+                        ty: Some(ty),
+                        name,
+                        is_rest: false,
+                    }),
                 ))
             });
         // Prefer illegal-rest so `int... xs` is recognized (then rejected).

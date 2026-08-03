@@ -11,10 +11,11 @@ members = [
     "coil-debug",
     "coil-dissect",
     "coil-fmt",
+    "coil-lsp",
 ]
 # Plain `cargo build` / `cargo test` at the repo root builds all CLI binaries
 # (coil + helpers), not only the root package.
-default-members = [".", "coil-embed", "coil-debug", "coil-dissect", "coil-fmt"]
+default-members = [".", "coil-embed", "coil-debug", "coil-dissect", "coil-fmt", "coil-lsp"]
 
 [package]
 name = "coil"
