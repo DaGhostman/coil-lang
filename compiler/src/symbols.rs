@@ -141,3 +141,90 @@ impl SymbolIndex {
         visit(self, file, &expression.1, expression.0.start..expression.0.end);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn index(source: &str) -> SymbolIndex {
+        SymbolIndex::from_source(PathBuf::from("test.hy"), source)
+    }
+
+    #[test]
+    fn indexes_top_level_definition_kinds() {
+        let source = "\
+use io::stdout as out;
+type Id = int;
+static let hits = 0;
+enum Color { Red, Green }
+class Point { pub x: int, pub y: int }
+fn add(int a, int b) -> int { return a + b; }
+";
+        let idx = index(source);
+
+        let out = idx.definitions("out");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, SymbolKind::Namespace);
+
+        let id = idx.definitions("Id");
+        assert_eq!(id.len(), 1);
+        assert_eq!(id[0].kind, SymbolKind::TypeAlias);
+
+        let hits = idx.definitions("hits");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, SymbolKind::Variable);
+
+        let color = idx.definitions("Color");
+        assert_eq!(color.len(), 1);
+        assert_eq!(color[0].kind, SymbolKind::Enum);
+
+        let point = idx.definitions("Point");
+        assert_eq!(point.len(), 1);
+        assert_eq!(point[0].kind, SymbolKind::Class);
+
+        let add = idx.definitions("add");
+        assert_eq!(add.len(), 1);
+        assert_eq!(add[0].kind, SymbolKind::Function);
+        assert_eq!(&source[add[0].name_range.clone()], "add");
+    }
+
+    #[test]
+    fn indexes_call_identifier_references() {
+        let source = "\
+fn fib(int n) -> int {
+    return fib(n - 1);
+}
+fn main() {
+    fib(10);
+    return;
+}
+";
+        let idx = index(source);
+        assert_eq!(idx.definitions("fib").len(), 1);
+        let refs = idx.references("fib");
+        assert!(
+            refs.len() >= 2,
+            "expected recursive + main call sites, got {refs:?}"
+        );
+        for site in refs {
+            assert_eq!(&source[site.range.clone()], "fib");
+        }
+    }
+
+    #[test]
+    fn parse_failure_yields_empty_index() {
+        let idx = index("fn {{{");
+        assert!(idx.all_definitions().next().is_none());
+        assert!(idx.definitions("anything").is_empty());
+        assert!(idx.references("anything").is_empty());
+    }
+
+    #[test]
+    fn use_without_alias_keeps_imported_name() {
+        let idx = index("use io::stdout;\nfn main() { return; }\n");
+        let defs = idx.definitions("stdout");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, SymbolKind::Namespace);
+    }
+}
