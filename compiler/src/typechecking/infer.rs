@@ -4000,6 +4000,29 @@ impl Checker {
                 }
             }
 
+            Expression::TypeOf(inner) => {
+                let inner_ty = self.infer(inner);
+                let resolved = apply_ty_prune(&self.subst, &inner_ty);
+                match crate::typechecking::pretty::format_ty_fqn(
+                    &resolved,
+                    &self.generics.nominal_type_modules,
+                ) {
+                    Some(_) => string(),
+                    None => self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`typeof` requires a ground type, found `{}`",
+                            crate::typechecking::pretty::format_ty_for_diag(&self.subst, &resolved)
+                        ),
+                        inner.0.into_range(),
+                        Some(
+                            "specialize generic parameters or annotate the expression so its type is fully known"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+
             Expression::Coalesce(lhs, rhs) => {
                 let lhs_ty = self.infer(lhs);
                 let resolved = apply_ty_prune(&self.subst, &lhs_ty);
@@ -6840,7 +6863,7 @@ impl Checker {
                 ErrorCode::ConstructorArity,
                 format!("len expects 1 argument, got {}", args.len()),
                 range,
-                Some("use `len(array)`".to_string()),
+                Some("use `len(value)`".to_string()),
             );
         }
 
@@ -6848,6 +6871,9 @@ impl Checker {
         let resolved = apply_ty_prune(&self.subst, &target_ty);
         match strip_readonly(&resolved) {
             Ty::Array { .. } => int(),
+            Ty::Tuple(_) => int(),
+            Ty::Record { .. } => int(),
+            Ty::Con(name) if name == "string" || name == crate::typechecking::ty::STRING => int(),
             Ty::Var(v) => {
                 let elem = Ty::Var(self.counter.fresh());
                 self.unify(
@@ -6860,9 +6886,12 @@ impl Checker {
             }
             other => self.error_with_help(
                 ErrorCode::ConstructorArity,
-                "len expects an array".to_string(),
+                "len expects an array, string, tuple, or dict".to_string(),
                 args[0].0.into_range(),
-                Some(format!("found `{}`; use `len(array)`", other)),
+                Some(format!(
+                    "found `{}`; use `len(array)`, `len(string)`, `len(tuple)`, or `len(dict)`",
+                    other
+                )),
             ),
         }
     }
@@ -11886,8 +11915,9 @@ impl Checker {
             | Expression::ExprStatement(e)
             | Expression::Return(e)
             | Expression::ImplicitReturn(e)
-            | Expression::Raise(e)
+            |             Expression::Raise(e)
             | Expression::Panic(e)
+            | Expression::TypeOf(e)
             | Expression::Try(e)
             | Expression::Yield(e)
             | Expression::YieldFrom(e)
@@ -17220,12 +17250,26 @@ fn main() {
     }
 
     #[test]
+    fn len_of_string_tuple_dict_returns_int() {
+        assert_ok(r#"len("foo")"#, int());
+        assert_ok("len((1, 2, 3))", int());
+        assert_ok("len({ a: 1, b: 2 })", int());
+    }
+
+    #[test]
+    fn typeof_literal_returns_string() {
+        assert_ok("typeof 1", string());
+        assert_ok(r#"typeof "hi""#, string());
+        assert_ok("typeof (1, 2)", string());
+    }
+
+    #[test]
     fn len_rejects_non_array() {
         let src = "fn main() { let x = 1; len(x); }";
         let (_c, msgs) = check_warn(src);
         let found = msgs
             .iter()
-            .any(|m| m.message().contains("len expects an array"));
+            .any(|m| m.message().contains("len expects an array, string, tuple, or dict"));
         assert!(found, "expected len non-array diagnostic, got: {:?}", msgs);
     }
 

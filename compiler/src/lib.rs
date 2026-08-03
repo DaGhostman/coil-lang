@@ -3401,7 +3401,8 @@ impl Compiler {
             | Expression::Float(_)
             | Expression::String(_)
             | Expression::Bool(_)
-            | Expression::Default(_) => true,
+            | Expression::Default(_)
+            | Expression::TypeOf(_) => true,
             Expression::Identifier(_) => false,
             Expression::Negate(e)
             | Expression::Not(e)
@@ -6809,6 +6810,22 @@ impl Compiler {
         )
     }
 
+    /// Static length from a value's type (fixed arrays, tuples, records).
+    fn static_len_of(&self, node: &Output) -> Option<usize> {
+        use crate::typechecking::ty::{ArrayLength, strip_readonly};
+        let ty = self.codegen_expr_ty(node)?;
+        let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+        match strip_readonly(&pruned) {
+            Ty::Array {
+                length: ArrayLength::Static(n),
+                ..
+            } => Some(*n),
+            Ty::Tuple(elems) => Some(elems.len()),
+            Ty::Record { fields } => Some(fields.len()),
+            _ => None,
+        }
+    }
+
     /// Resolve an `impl Class<…>` type argument to a [`Ty`] for FQN mangling.
     /// Mirrors the typechecker's `parse_instance_head` so `Option<int>`
     /// becomes `App(Option, [int])`, not `unknown`.
@@ -9214,6 +9231,29 @@ impl Compiler {
                             if let Some(items) = args
                                 && items.len() == 1
                             {
+                                // Prefer compile-time length when known from
+                                // literals / static types.
+                                if let Some(ConstValue::Int(n)) =
+                                    const_fold::eval_expr(ast, self.const_env())
+                                {
+                                    self.discard_compile(&items[0]);
+                                    self.emit_const_value(
+                                        &ConstValue::Int(n),
+                                        &mut bytecode,
+                                    );
+                                    return bytecode;
+                                }
+                                if let Some(n) = self.static_len_of(&items[0]) {
+                                    // Evaluate for side effects, then replace
+                                    // with the known length.
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    bytecode.push_pop();
+                                    self.emit_const_value(
+                                        &ConstValue::Int(n as i64),
+                                        &mut bytecode,
+                                    );
+                                    return bytecode;
+                                }
                                 bytecode.append(&mut self.do_compile(&items[0]));
                                 bytecode.push(Byte::new(Instruction::ArrayLen));
                             } else {
@@ -11625,6 +11665,35 @@ impl Compiler {
                 let expr_bc = self.do_compile(expr);
                 self.emit_bytes(*span, &expr_bc);
                 self.emit_byte(*span, Byte::new(Instruction::Panic));
+            }
+            Expression::TypeOf(inner) => {
+                // Advance emit_idx through the operand without evaluating it.
+                self.discard_compile(inner);
+                match self.codegen_expr_ty(inner).and_then(|ty| {
+                    let pruned =
+                        crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+                    crate::typechecking::pretty::format_ty_fqn(
+                        &pruned,
+                        &self.checker.generics().nominal_type_modules,
+                    )
+                }) {
+                    Some(fqn) => {
+                        self.emit_raw_string_literal(&mut bytecode, &fqn);
+                    }
+                    None => {
+                        let mut message = Message::error(
+                            ErrorCode::GenericTypeError,
+                            "`typeof` requires a ground type".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            "type is not fully known at compile time".to_string(),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                        self.emit_raw_string_literal(&mut bytecode, "<unknown>");
+                    }
+                }
             }
             Expression::Try(inner) => {
                 // `e?` → if Ok/Some, leave payload; else RETURN the failure.

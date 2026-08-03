@@ -593,6 +593,7 @@ where
         | Expression::ImplicitReturn(e)
         | Expression::Raise(e)
         | Expression::Panic(e)
+        | Expression::TypeOf(e)
         | Expression::Try(e)
         | Expression::Yield(e)
         | Expression::YieldFrom(e)
