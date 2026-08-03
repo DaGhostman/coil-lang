@@ -15533,7 +15533,8 @@ let n = len(a); \
         );
     }
 
-    /// Literal `len("…")` must const-fold to an immediate, not `ArrayLen`.
+    /// Literal `len("…")` must const-fold to an immediate; the only
+    /// `ArrayLen` in the program is the built-in `Length__string__len` thunk.
     #[test]
     fn len_of_string_literal_folds_without_array_len() {
         use common::Instruction;
@@ -15544,10 +15545,13 @@ fn main() {
 }
 "#,
         );
-        assert!(
-            !bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
-            "literal len(string) should fold away ArrayLen; ops={:?}",
+        let array_lens = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .count();
+        assert_eq!(
+            array_lens, 1,
+            "literal len(string) should fold; only Length__string__len thunk keeps ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -15556,7 +15560,7 @@ fn main() {
         );
     }
 
-    /// Custom `Length` instances lower to a call, not structural `ArrayLen`.
+    /// Custom `Length` instances lower via `CallIndirect`, not structural `ArrayLen`.
     #[test]
     fn custom_length_impl_emits_call_not_array_len() {
         use common::Instruction;
@@ -15571,18 +15575,19 @@ fn main() {
 }
 "#,
         );
-        assert!(
-            !bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
-            "custom Length must not use structural ArrayLen; ops={:?}",
+        let array_lens = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .count();
+        assert_eq!(
+            array_lens, 1,
+            "custom Length must not add structural ArrayLen beyond string thunk; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
-            bc.iter().any(|b| matches!(
-                b.bytecode(),
-                Instruction::CALL | Instruction::CallIndirect
-            )),
-            "expected a call to Length::len; ops={:?}",
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect to Length::len; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
