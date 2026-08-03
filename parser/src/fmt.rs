@@ -2076,6 +2076,36 @@ fn main() {
     }
 
     #[test]
+    fn wraps_long_or_and_null_coalesce_chains() {
+        let or_src = "\
+fn main() {
+    if (object.veryLongPropertyName == other.notSoLongName || object.shortName == other.somewhatLongerNameButStillGrowing || object.extraFlag == other.anotherFlag) {
+        return;
+    }
+}
+";
+        let or_fmt = format_source(or_src).unwrap();
+        assert!(
+            or_fmt.contains("||\n"),
+            "expected soft wrap before || continuation:\n{or_fmt}"
+        );
+        assert_eq!(or_fmt, format_source(&or_fmt).unwrap());
+
+        let coalesce_src = "\
+fn main() {
+    let x = object.veryLongOptionalProperty ?? other.alsoQuiteLongFallbackValue ?? yetAnotherFallbackValue;
+    return;
+}
+";
+        let coalesce_fmt = format_source(coalesce_src).unwrap();
+        assert!(
+            coalesce_fmt.contains("??\n"),
+            "expected soft wrap before ?? continuation:\n{coalesce_fmt}"
+        );
+        assert_eq!(coalesce_fmt, format_source(&coalesce_fmt).unwrap());
+    }
+
+    #[test]
     fn wraps_long_call_args_with_trailing_commas() {
         let src = "\
 fn main() {
