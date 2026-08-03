@@ -5387,6 +5387,18 @@ impl Compiler {
             self.bytecode.push_return();
         }
 
+        // Length__string__len: unbox (dict ABI) then ArrayLen (byte length).
+        {
+            let fqn = Generics::builtin_instance_fqn("Length", "string", "len");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode.push_unbox_value(ValueTag::String as u32);
+                self.bytecode.push(Byte::new(Instruction::ArrayLen));
+                self.bytecode.push_return();
+            }
+        }
+
         // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
         // after unbox; float returns the float `Value` bits read via
         // `Value::as_int()` (IEEE bit pattern in the current Value encoding);
@@ -9244,8 +9256,6 @@ impl Compiler {
                                     return bytecode;
                                 }
                                 if let Some(n) = self.static_len_of(&items[0]) {
-                                    // Evaluate for side effects, then replace
-                                    // with the known length.
                                     bytecode.append(&mut self.do_compile(&items[0]));
                                     bytecode.push_pop();
                                     self.emit_const_value(
@@ -9254,8 +9264,40 @@ impl Compiler {
                                     );
                                     return bytecode;
                                 }
-                                bytecode.append(&mut self.do_compile(&items[0]));
-                                bytecode.push(Byte::new(Instruction::ArrayLen));
+                                // Structural aggregates → ArrayLen. Custom types
+                                // with `Length` use the instance method below.
+                                let arg_ty = self.codegen_expr_ty(&items[0]).map(|ty| {
+                                    crate::typechecking::subst::apply_ty_prune(
+                                        self.checker.subst(),
+                                        &ty,
+                                    )
+                                });
+                                let structural = arg_ty.as_ref().is_some_and(|ty| {
+                                    Checker::is_structural_len_ty_for_codegen(ty)
+                                });
+                                if structural || arg_ty.is_none() {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    bytecode.push(Byte::new(Instruction::ArrayLen));
+                                    return bytecode;
+                                }
+                                if let Some(ty) = arg_ty.as_ref()
+                                    && let Some(fqn) = self
+                                        .checker
+                                        .instance_method_fqn("Length", std::slice::from_ref(ty), "len")
+                                        .map(str::to_string)
+                                    && let Some(&offset) = self.functions.get(&fqn)
+                                {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    Self::emit_call_indirect(
+                                        &mut bytecode,
+                                        offset as u32,
+                                        1,
+                                    );
+                                    return bytecode;
+                                }
+                                // Bound Length calls are handled earlier via
+                                // BoundMethodCall; if we get here without an
+                                // instance, fall through to report unknown fn.
                             } else {
                                 let mut message = Message::error(
                                     ErrorCode::TooManyArguments,
@@ -9267,8 +9309,8 @@ impl Compiler {
                                     span.into_range(),
                                 ));
                                 self.messages.push(message);
+                                return bytecode;
                             }
-                            return bytecode;
                         }
                     }
 
