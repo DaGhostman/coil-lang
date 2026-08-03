@@ -209,6 +209,8 @@ pub enum Expression<'expr> {
     Coalesce(Output<'expr>, Output<'expr>),
     /// `expr as Ty` — primitive cast (`int` / `float` / `byte` / `bool`).
     Cast(Output<'expr>, Output<'expr>),
+    /// `typeof expr` — compile-time fully-qualified type name as `string`.
+    TypeOf(Output<'expr>),
     /// `expr?.field` — optional field access on `Option`.
     OptionalAccess(Output<'expr>, &'expr str),
     Negate(Output<'expr>),
@@ -1215,6 +1217,7 @@ impl<'a> Display for Expression<'a> {
             Self::Try(inner) => write!(f, "{}?", inner.1),
             Self::Coalesce(lhs, rhs) => write!(f, "{} ?? {}", lhs.1, rhs.1),
             Self::Cast(expr, ty) => write!(f, "{} as {}", expr.1, ty.1),
+            Self::TypeOf(inner) => write!(f, "typeof {}", inner.1),
             Self::Raise(inner) => write!(f, "raise {}", inner.1),
             Self::Panic(inner) => write!(f, "panic {}", inner.1),
             Self::Yield(inner) => write!(f, "yield {}", inner.1),

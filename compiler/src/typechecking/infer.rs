@@ -2288,6 +2288,19 @@ impl Checker {
             ),
         );
 
+        // Length::len : ∀T. Length T => T → int
+        {
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Length".to_string(), "len".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Length", var)],
+                    Ty::Fun(Box::new(Ty::Var(var)), Box::new(int())),
+                ),
+            );
+        }
+
         // Into::into : ∀Self T. Into<Self, T> => Self → T
         {
             let self_v = self.counter.fresh();
@@ -3377,10 +3390,10 @@ impl Checker {
                             ErrorCode::GenericTypeError,
                             "Named arguments are not supported on `len`".to_string(),
                             range,
-                            Some("use positional arguments: `len(arr)`".to_string()),
+                            Some("use positional arguments: `len(value)`".to_string()),
                         );
                     }
-                    return self.infer_array_len(args.as_deref(), range);
+                    return self.infer_len_call(args.as_deref(), id, range);
                 }
                 if let Some(kind) = self.string_fn_for_call(&ident) {
                     if has_named {
@@ -3996,6 +4009,29 @@ impl Checker {
                             .to_string(),
                         ty_ann.0.into_range(),
                         None,
+                    ),
+                }
+            }
+
+            Expression::TypeOf(inner) => {
+                let inner_ty = self.infer(inner);
+                let resolved = apply_ty_prune(&self.subst, &inner_ty);
+                match crate::typechecking::pretty::format_ty_fqn(
+                    &resolved,
+                    &self.generics.nominal_type_modules,
+                ) {
+                    Some(_) => string(),
+                    None => self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`typeof` requires a ground type, found `{}`",
+                            crate::typechecking::pretty::format_ty_for_diag(&self.subst, &resolved)
+                        ),
+                        inner.0.into_range(),
+                        Some(
+                            "specialize generic parameters or annotate the expression so its type is fully known"
+                                .to_string(),
+                        ),
                     ),
                 }
             }
@@ -6830,7 +6866,14 @@ impl Checker {
         list(first_ty)
     }
 
-    fn infer_array_len(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
+    /// `len(x)` — structural length for arrays/tuples/dicts/strings, otherwise
+    /// `Length::len` typeclass dispatch (active bound or concrete instance).
+    fn infer_len_call(
+        &mut self,
+        args: Option<&[Output]>,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
         let args = args.unwrap_or(&[]);
         if args.len() != 1 {
             for arg in args {
@@ -6840,31 +6883,118 @@ impl Checker {
                 ErrorCode::ConstructorArity,
                 format!("len expects 1 argument, got {}", args.len()),
                 range,
-                Some("use `len(array)`".to_string()),
+                Some("use `len(value)`".to_string()),
             );
         }
 
         let target_ty = self.infer(&args[0]);
         let resolved = apply_ty_prune(&self.subst, &target_ty);
-        match strip_readonly(&resolved) {
-            Ty::Array { .. } => int(),
-            Ty::Var(v) => {
-                let elem = Ty::Var(self.counter.fresh());
-                self.unify(
-                    &Ty::Var(*v),
-                    &array(elem),
-                    &args[0].0.into_range(),
-                    "len array",
-                );
-                int()
-            }
-            other => self.error_with_help(
-                ErrorCode::ConstructorArity,
-                "len expects an array".to_string(),
-                args[0].0.into_range(),
-                Some(format!("found `{}`; use `len(array)`", other)),
-            ),
+        if Self::is_structural_len_ty(&resolved) {
+            return int();
         }
+        // Open vars: prefer Length (custom / generic) over forcing an array.
+        if matches!(&resolved, Ty::Var(_)) {
+            return self.infer_length_method_call(&target_ty, args, id, range);
+        }
+        self.infer_length_method_call(&target_ty, args, id, range)
+    }
+
+    fn is_structural_len_ty(ty: &Ty) -> bool {
+        match strip_readonly(ty) {
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Record { .. } => true,
+            Ty::Con(name) if name == "string" || name == crate::typechecking::ty::STRING => true,
+            _ => false,
+        }
+    }
+
+    /// Codegen helper: same structural `len` shapes as typechecking.
+    pub fn is_structural_len_ty_for_codegen(ty: &Ty) -> bool {
+        Self::is_structural_len_ty(ty)
+    }
+
+    /// Resolve `len(x)` via the `Length` typeclass (bound or ground instance).
+    fn infer_length_method_call(
+        &mut self,
+        target_ty: &Ty,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        let resolved = apply_ty_prune(&self.subst, target_ty);
+        let receiver_var = Self::constraint_var_of_ty(&resolved);
+        let candidates = self.bound_method_candidates("len", receiver_var);
+        if !candidates.is_empty() {
+            if let Some((dict_index, dict_class, class, method_slot, scheme)) =
+                self.select_bound_method(candidates, "len", &range)
+            {
+                self.bind_matching_abstract_constraints(receiver_var, &dict_class);
+                let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&scheme);
+                let hint = BoundMethodCall {
+                    dict_index,
+                    method_slot,
+                    arity: 1,
+                    has_receiver: false,
+                };
+                if let Some(call_id) = id {
+                    self.bound_method_calls.insert(call_id, hint.clone());
+                }
+                self.bound_method_calls_by_span
+                    .insert((range.start, range.end), hint);
+                let arg_tys = vec![target_ty.clone()];
+                let result = self.apply_function(
+                    Some(&format!("{}::len", class)),
+                    &fun_ty,
+                    &arg_tys,
+                    Some(args),
+                    id,
+                    range.clone(),
+                );
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                    self.pin_assoc_after_discharge(
+                        &class,
+                        &constraints,
+                        Some(&scheme),
+                        &mapping,
+                        &range,
+                    );
+                }
+                return result;
+            }
+        }
+
+        let Some(scheme) = self
+            .typeclass_method_schemes
+            .get(&("Length".to_string(), "len".to_string()))
+            .cloned()
+        else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "`len` requires a `Length` instance, found `{}`",
+                    crate::typechecking::pretty::format_ty_for_diag(&self.subst, &resolved)
+                ),
+                args[0].0.into_range(),
+                Some("implement `impl Length for T { fn len(T x) -> int { ... } }`".to_string()),
+            );
+        };
+
+        let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&scheme);
+        let arg_tys = vec![target_ty.clone()];
+        let result = self.apply_function(
+            Some("Length::len"),
+            &fun_ty,
+            &arg_tys,
+            Some(args),
+            id,
+            range.clone(),
+        );
+        if !constraints.is_empty() {
+            self.discharge_constraints(id, &constraints, &range);
+            self.pin_assoc_after_discharge("Length", &constraints, Some(&scheme), &mapping, &range);
+        }
+        // If discharge failed (no instance), a diagnostic is already recorded.
+        apply_ty_prune(&self.subst, &result)
     }
 
     /// `assert(bool)` / `assert(bool, string)` → `Result<(), string>`.
@@ -11886,8 +12016,9 @@ impl Checker {
             | Expression::ExprStatement(e)
             | Expression::Return(e)
             | Expression::ImplicitReturn(e)
-            | Expression::Raise(e)
+            |             Expression::Raise(e)
             | Expression::Panic(e)
+            | Expression::TypeOf(e)
             | Expression::Try(e)
             | Expression::Yield(e)
             | Expression::YieldFrom(e)
@@ -14711,6 +14842,7 @@ impl Checker {
                 | "Ord"
                 | "Eq"
                 | "Show"
+                | "Length"
         )
     }
 
@@ -17220,13 +17352,102 @@ fn main() {
     }
 
     #[test]
-    fn len_rejects_non_array() {
-        let src = "fn main() { let x = 1; len(x); }";
+    fn len_of_string_tuple_dict_returns_int() {
+        assert_ok(r#"len("foo")"#, int());
+        assert_ok("len((1, 2, 3))", int());
+        assert_ok("len({ a: 1, b: 2 })", int());
+    }
+
+    #[test]
+    fn typeof_literal_returns_string() {
+        assert_ok("typeof 1", string());
+        assert_ok(r#"typeof "hi""#, string());
+        assert_ok("typeof (1, 2)", string());
+    }
+
+    #[test]
+    fn typeof_rejects_open_type_parameter() {
+        let src = r#"
+fn name_of<T>(T x) -> string { return typeof x; }
+fn main() { name_of(1); }
+"#;
         let (_c, msgs) = check_warn(src);
         let found = msgs
             .iter()
-            .any(|m| m.message().contains("len expects an array"));
-        assert!(found, "expected len non-array diagnostic, got: {:?}", msgs);
+            .any(|m| m.message().contains("`typeof` requires a ground type"));
+        assert!(
+            found,
+            "expected ground-type diagnostic for typeof on open T, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_rejects_wrong_arity() {
+        let (_c, msgs0) = check_warn("fn main() { len(); }");
+        assert!(
+            msgs0
+                .iter()
+                .any(|m| m.message().contains("len expects 1 argument")),
+            "expected arity diagnostic for len(), got: {:?}",
+            msgs0
+        );
+        let (_c, msgs2) = check_warn("fn main() { len(1, 2); }");
+        assert!(
+            msgs2
+                .iter()
+                .any(|m| m.message().contains("len expects 1 argument")),
+            "expected arity diagnostic for len(1, 2), got: {:?}",
+            msgs2
+        );
+    }
+
+    #[test]
+    fn len_rejects_non_array() {
+        let src = "fn main() { let x = 1; len(x); }";
+        let (_c, msgs) = check_warn(src);
+        let found = msgs.iter().any(|m| {
+            m.message().contains("No instance for `Length")
+                || m.message().contains("Length")
+        });
+        assert!(
+            found,
+            "expected Length instance diagnostic for len(int), got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_accepts_custom_length_impl() {
+        let src = r#"
+class Box { value: int }
+impl Length for Box {
+    fn len(Box b) -> int { return 1; }
+}
+fn main() { len(new Box(0)); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected len(Box) with Length impl to typecheck, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_generic_length_bound() {
+        let src = r#"
+fn size_of<T: Length>(T x) -> int { return len(x); }
+fn main() { size_of("hi"); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected generic Length bound len() to typecheck, got: {:?}",
+            msgs
+        );
     }
 
     #[test]

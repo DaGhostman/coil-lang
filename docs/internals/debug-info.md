@@ -21,7 +21,7 @@ Debug locs are attached to IL ops and carried through `il::lower` fuse-select
 
 ## Archive version
 
-`ARCHIVE_VERSION` is **35**. Older `.hyc` files without `strings`,
+Archive version is packed `major.minor`. Older `.hyc` files without `strings`,
 `source_files`, or `debug_locs` are rejected at load time.
 
 ## Runtime `panic` output

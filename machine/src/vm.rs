@@ -2547,6 +2547,11 @@ impl<const S: usize> Machine<S> {
                     let target_addr = target_val.raw() as u64;
                     let len = match Self::find_object_by_addr(&self.heap, target_addr) {
                         Some(crate::memory::Object::Array(gc)) => gc.as_ref().elements.len(),
+                        Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.len(),
+                        Some(crate::memory::Object::String(gc)) => gc.as_ref().data.len(),
+                        Some(crate::memory::Object::Instance(gc)) => {
+                            gc.as_ref().iter_fields().count()
+                        }
                         _ => 0,
                     };
                     self.stack.push(Value::from(len as i64));
@@ -3611,6 +3616,42 @@ mod tests {
             Byte::new(Instruction::HALT),
         ]);
         assert_eq!(vm.pop().as_int(), 3);
+    }
+
+    /// `ArrayLen` must report string/tuple/dict lengths (structural `len`).
+    #[test]
+    fn array_len_reports_string_tuple_and_dict_sizes() {
+        let mut strings = Vec::new();
+        let mut code = string_lit(&mut strings, "abcd");
+        code.push(Byte::new(Instruction::ArrayLen));
+        code.push(Byte::new(Instruction::HALT));
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        assert_eq!(vm.pop().as_int(), 4, "string ArrayLen");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 3, "tuple ArrayLen");
+
+        let mut strings = Vec::new();
+        let mut code = Vec::new();
+        code.push(const_int(10));
+        code.extend(string_lit(&mut strings, "a"));
+        code.push(const_int(20));
+        code.extend(string_lit(&mut strings, "b"));
+        code.push(Byte::new(Instruction::MakeDict).with_operand_u32(2));
+        code.push(Byte::new(Instruction::ArrayLen));
+        code.push(Byte::new(Instruction::HALT));
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        assert_eq!(vm.pop().as_int(), 2, "dict ArrayLen");
     }
 
     /// Emit a STRING opcode that pushes an interned heap string.

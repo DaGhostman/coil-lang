@@ -643,6 +643,7 @@ impl VirtualModules {
                 BuiltinExport::TypeClass { name: "Gt" },
                 BuiltinExport::TypeClass { name: "Ge" },
                 BuiltinExport::TypeClass { name: "Show" },
+                BuiltinExport::TypeClass { name: "Length" },
                 BuiltinExport::TypeClass { name: "Into" },
             ],
         );

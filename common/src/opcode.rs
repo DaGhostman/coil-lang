@@ -163,7 +163,7 @@ pub enum Instruction {
     DoneCoro,
 
     /// ArrayPush: stack `array, value` (TOS = value) -> same array after in-place append.
-    /// ArrayLen: stack `array` -> int length.
+    /// ArrayLen: stack `array|string|tuple|dict` -> int length.
     ArrayPush,
     ArrayLen,
 

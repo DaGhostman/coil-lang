@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use common::{ARCHIVE_VERSION, ArchivedProgram, Byte, ProgramDebug};
+use common::{ARCHIVE_VERSION, ArchivedProgram, Byte, ProgramDebug, format_archive_version};
 use compiler::Pipeline;
 use machine::Machine;
 use reporting::{ErrorCode, ReportConfig, ReportFormat};
@@ -784,8 +784,9 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
             pipeline,
             ErrorCode::IoError,
             format!(
-                "Bytecode archive version {v} does not match compiler version {}. Please recompile from source.",
-                ARCHIVE_VERSION
+                "Bytecode archive version {} is not compatible with runtime {}. Please recompile from source.",
+                format_archive_version(v),
+                format_archive_version(ARCHIVE_VERSION)
             ),
         ),
     };
@@ -1476,7 +1477,8 @@ mod tests {
         let _ = std::fs::remove_file(&corrupt);
 
         let stale = unique_tmp("stale");
-        let stale_version = if ARCHIVE_VERSION == 1 { 2 } else { 1 };
+        // Newer minor than this runtime must be rejected.
+        let stale_version = common::pack_archive_version(0, 1);
         let bytes = rkyv::to_bytes::<Error>(&ArchivedProgram {
             version: stale_version,
             static_slot_count: 0,

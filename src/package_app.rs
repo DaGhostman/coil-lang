@@ -6,8 +6,9 @@ use std::process::exit;
 
 use common::{
     ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, PACKAGE_FLAG_USES_FFI,
-    ProgramDebug, append_package_payload, bytecode_uses_ffi, embedded_archive_slice,
-    ffi_library_names_from_bytecode, is_packaged_executable, read_package_trailer,
+    ProgramDebug, append_package_payload, archive_version_compatible, bytecode_uses_ffi,
+    embedded_archive_slice, ffi_library_names_from_bytecode, format_archive_version,
+    is_packaged_executable, read_package_trailer,
 };
 use compiler::Pipeline;
 use machine::{check_native_libraries, packaged_app_ffi_startup_check};
@@ -23,7 +24,7 @@ pub fn load_archive_bytes(
     let archived =
         rkyv::access::<ArchivedArchivedProgram, Error>(buffer).map_err(|_| LoadErr::Corrupt)?;
     let version = u32::from(archived.version);
-    if version != ARCHIVE_VERSION {
+    if !archive_version_compatible(version, ARCHIVE_VERSION) {
         return Err(LoadErr::Version(version));
     }
     let bytecode =
@@ -103,10 +104,11 @@ pub fn try_run_embedded() -> Option<bool> {
     let trailer = read_package_trailer(&data)?;
     let archive = embedded_archive_slice(&data, trailer)?;
 
-    if trailer.archive_version != ARCHIVE_VERSION {
+    if !archive_version_compatible(trailer.archive_version, ARCHIVE_VERSION) {
         eprintln!(
             "embedded bytecode version {} does not match this runner ({}); rebuild with `coil package`",
-            trailer.archive_version, ARCHIVE_VERSION
+            format_archive_version(trailer.archive_version),
+            format_archive_version(ARCHIVE_VERSION)
         );
         exit(1);
     }
@@ -115,7 +117,9 @@ pub fn try_run_embedded() -> Option<bool> {
         Ok(ok) => ok,
         Err(LoadErr::Version(v)) => {
             eprintln!(
-                "embedded archive version {v} does not match compiler version {ARCHIVE_VERSION}"
+                "embedded archive version {} is not compatible with runner {}",
+                format_archive_version(v),
+                format_archive_version(ARCHIVE_VERSION)
             );
             exit(1);
         }
@@ -270,8 +274,9 @@ mod tests {
 
     #[test]
     fn load_archive_bytes_rejects_version() {
-        let program = ArchivedProgram {
-            version: ARCHIVE_VERSION.wrapping_sub(1),
+        // Newer minor than this runtime must be rejected.
+        let too_new = ArchivedProgram {
+            version: common::pack_archive_version(0, 1),
             static_slot_count: 0,
             constants: vec![],
             strings: vec![],
@@ -279,7 +284,23 @@ mod tests {
             source_files: vec![],
             debug_locs: vec![],
         };
-        let bytes = rkyv::to_bytes::<Error>(&program).unwrap();
+        let bytes = rkyv::to_bytes::<Error>(&too_new).unwrap();
+        assert!(matches!(
+            load_archive_bytes(bytes.as_slice()),
+            Err(LoadErr::Version(_))
+        ));
+
+        // Different major is never compatible.
+        let other_major = ArchivedProgram {
+            version: common::pack_archive_version(1, 0),
+            static_slot_count: 0,
+            constants: vec![],
+            strings: vec![],
+            bytecode: vec![Byte::new(common::Instruction::HALT)],
+            source_files: vec![],
+            debug_locs: vec![],
+        };
+        let bytes = rkyv::to_bytes::<Error>(&other_major).unwrap();
         assert!(matches!(
             load_archive_bytes(bytes.as_slice()),
             Err(LoadErr::Version(_))

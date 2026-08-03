@@ -46,9 +46,10 @@ Single compilation path: stack codegen in `compiler/src/lib.rs` — no register 
 ## Hard invariants (never skip)
 
 1. **Append-only opcodes** — new `Instruction` variants only at end of enum (`#[repr(u8)]`). Then bump:
-   - `ARCHIVE_VERSION` in `common/src/archive.rs`
+   - archive **minor** (`ARCHIVE_MINOR` / packed `ARCHIVE_VERSION` in `common/src/archive.rs`)
    - `promise!` ceiling in `machine/src/vm.rs`
    - `instruction_from_u8_covers_last_appended_variant` test
+   Incompatible ABI/layout changes bump archive **major** (reset minor). Loaders accept same major with archive minor ≤ runtime minor.
 2. **Virtual module natives** — use `HostInvoke`, not new opcodes for `io`/`thread`/etc.
 3. **Reject benchmark-shaped opcodes** unless pattern is universal (see AGENTS.md user preferences).
 4. **New language features** — full HM integration + `docs/` updates + minimal runnable example.
@@ -84,7 +85,7 @@ Debug builds print heap alloc traces — use `--release` for clean benchmark out
 4. Codegen — `BlockBuilder` / `IlBuilder`; extend IL opts only when justified.
 5. VM only if new opcode (rare) or runtime behavior.
 6. `docs/manual/` or `docs/references/` + example in `examples/` or `tests/`.
-7. Bump `ARCHIVE_VERSION` if bytecode/tag/opcode incompatible.
+7. Bump archive **minor** for additive bytecode; bump **major** if bytecode/tag/opcode incompatible.
 8. Granular conventional commits; stage only related files.
 
 ## Virtual modules (compiler-provided)

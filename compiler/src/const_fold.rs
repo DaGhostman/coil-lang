@@ -83,6 +83,53 @@ pub fn eval_expr<'a>(
         Expression::Neq(lhs, rhs) => {
             eval_eq(lhs, rhs, env).map(|b| ConstValue::Bool(!matches!(b, ConstValue::Bool(true))))
         }
+        Expression::Call { name, args } => eval_len_call(name, args.as_deref(), env),
+        Expression::TypeOf(_) => None,
+        _ => None,
+    }
+}
+
+/// Fold `len(...)` when the operand's length is known from a literal shape
+/// or a const string binding.
+fn eval_len_call<'a>(
+    name: &Output<'a>,
+    args: Option<&[Output<'a>]>,
+    env: &HashMap<String, ConstValue>,
+) -> Option<ConstValue> {
+    let Expression::Identifier("len") = name.1.as_ref() else {
+        return None;
+    };
+    let args = args?;
+    if args.len() != 1 {
+        return None;
+    }
+    eval_len_operand(&args[0], env)
+}
+
+fn eval_len_operand<'a>(
+    ast: &Output<'a>,
+    env: &HashMap<String, ConstValue>,
+) -> Option<ConstValue> {
+    match ast.1.as_ref() {
+        Expression::String(s) => {
+            let unescaped = s
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace("\\0", "\0");
+            Some(ConstValue::Int(unescaped.len() as i64))
+        }
+        Expression::Array(items) | Expression::Tuple(items) => {
+            Some(ConstValue::Int(items.len() as i64))
+        }
+        Expression::Dict(fields) => Some(ConstValue::Int(fields.len() as i64)),
+        Expression::Group(inner) | Expression::Expr(inner) | Expression::Statement(inner) => {
+            eval_len_operand(inner, env)
+        }
+        Expression::Identifier(name) => match env.get(*name)? {
+            ConstValue::Str(s) => Some(ConstValue::Int(s.len() as i64)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -729,6 +776,119 @@ mod tests {
         assert_eq!(
             eval_string_add(&lhs, &rhs, &env),
             Some(ConstValue::Str("hello".into()))
+        );
+    }
+
+    #[test]
+    fn len_folds_string_array_tuple_literals() {
+        let env = HashMap::new();
+        let call = |arg: Output<'static>| -> Output<'static> {
+            (
+                SimpleSpan::from(0..8),
+                Box::new(Expression::Call {
+                    name: (
+                        SimpleSpan::from(0..3),
+                        Box::new(Expression::Identifier("len")),
+                    ),
+                    args: Some(vec![arg]),
+                }),
+            )
+        };
+        assert_eq!(
+            eval_expr(
+                &call((SimpleSpan::from(0..3), Box::new(Expression::String("foo")))),
+                &env
+            ),
+            Some(ConstValue::Int(3))
+        );
+        assert_eq!(
+            eval_expr(
+                &call((
+                    SimpleSpan::from(0..5),
+                    Box::new(Expression::Array(vec![int_expr(1), int_expr(2)])),
+                )),
+                &env
+            ),
+            Some(ConstValue::Int(2))
+        );
+        assert_eq!(
+            eval_expr(
+                &call((
+                    SimpleSpan::from(0..5),
+                    Box::new(Expression::Tuple(vec![
+                        int_expr(1),
+                        int_expr(2),
+                        int_expr(3)
+                    ])),
+                )),
+                &env
+            ),
+            Some(ConstValue::Int(3))
+        );
+    }
+
+    #[test]
+    fn len_folds_dict_escapes_grouped_and_env_string() {
+        let call = |arg: Output<'static>| -> Output<'static> {
+            (
+                SimpleSpan::from(0..8),
+                Box::new(Expression::Call {
+                    name: (
+                        SimpleSpan::from(0..3),
+                        Box::new(Expression::Identifier("len")),
+                    ),
+                    args: Some(vec![arg]),
+                }),
+            )
+        };
+        let env = HashMap::new();
+        let dict = (
+            SimpleSpan::from(0..9),
+            Box::new(Expression::Dict(vec![
+                parser::ast::RecordFieldValue {
+                    name: "a",
+                    value: int_expr(1),
+                },
+                parser::ast::RecordFieldValue {
+                    name: "b",
+                    value: int_expr(2),
+                },
+            ])),
+        );
+        assert_eq!(eval_expr(&call(dict), &env), Some(ConstValue::Int(2)));
+
+        assert_eq!(
+            eval_expr(
+                &call((
+                    SimpleSpan::from(0..4),
+                    Box::new(Expression::String("a\\nb")),
+                )),
+                &env
+            ),
+            Some(ConstValue::Int(3)),
+            "escape sequences count as one byte each after unescape"
+        );
+
+        let grouped = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Group((
+                SimpleSpan::from(0..3),
+                Box::new(Expression::String("hi")),
+            ))),
+        );
+        assert_eq!(eval_expr(&call(grouped), &env), Some(ConstValue::Int(2)));
+
+        let mut env = HashMap::new();
+        env.insert("s".into(), ConstValue::Str("xyz".into()));
+        assert_eq!(
+            eval_expr(&call(id_expr("s")), &env),
+            Some(ConstValue::Int(3))
+        );
+        env.insert("n".into(), ConstValue::Int(9));
+        assert_eq!(
+            eval_expr(&call(id_expr("n")), &env),
+            None,
+            "non-string const bindings must not fold"
         );
     }
 }

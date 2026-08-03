@@ -185,7 +185,7 @@ rm -f out.hyc
 cargo run -- examples/fib.hy
 ```
 
-The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, **older than any source file recorded in the archive** (entry *and* imported modules), or was built for a **different entry** than the one you are running (the shared `out.hyc` path is not per-file). The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
+The CLI recompiles automatically when the archive is missing, corrupt, incompatible with this runtime (different major, or archive minor newer than the runtime), **older than any source file recorded in the archive** (entry *and* imported modules), or was built for a **different entry** than the one you are running (the shared `out.hyc` path is not per-file). The dedicated `compile` command always recompiles; `run` never recompiles (it rejects an incompatible archive and asks you to rebuild from source).
 
 If worker/`use` modules change and prints or behavior look “stuck” or intermittent across runs, stale `out.hyc` is a common false lead — `join` always waits for the worker to finish.
 
@@ -264,7 +264,7 @@ coil uses **AST → stack IL (symbolic labels) → lower/fuse → bytecode**. Th
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
 3. **Codegen (IL)** — walks the AST into a stack IL (`compiler/src/il`) with symbolic jump labels. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`**; tiny callees may be inlined at call sites.
 4. **Lower** — after link, `finalize_bytecode` runs IL opts then fuse-select (`BinSlotImm`, `CmpJmpf`, …), assigns PCs once, and emits `Vec<Byte>`. Label binds act as fusion barriers.
-5. **Archive** — bytecode, constant pool, and string table are wrapped in `ArchivedProgram { version, bytecode, constants, strings }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **35**) must match at load time.
+5. **Archive** — bytecode, constant pool, and string table are wrapped in `ArchivedProgram { version, bytecode, constants, strings }` and serialized with rkyv. `version` is packed `major.minor`. A runtime loads an archive when majors match and the archive minor is ≤ the runtime minor.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention
@@ -278,7 +278,7 @@ Every program must define `fn main()`. The compiler emits a short prologue (`CAL
 | `.hy` | Coil source (`.hy` = **henry**, the SI unit of inductance) |
 | `.hyc` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
 
-The default CLI writes `out.hyc` in the working directory. Treat archives as **compiler-version-specific** — stale archives are rejected when `ARCHIVE_VERSION` changes.
+The default CLI writes `out.hyc` in the working directory. Treat archives as **ABI-versioned** — rejected when the major differs or the archive minor is newer than the runtime. Older archives on a newer minor runtime of the same major still load.
 
 ## What you can write today
 

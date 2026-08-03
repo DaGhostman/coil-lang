@@ -3401,7 +3401,8 @@ impl Compiler {
             | Expression::Float(_)
             | Expression::String(_)
             | Expression::Bool(_)
-            | Expression::Default(_) => true,
+            | Expression::Default(_)
+            | Expression::TypeOf(_) => true,
             Expression::Identifier(_) => false,
             Expression::Negate(e)
             | Expression::Not(e)
@@ -3544,6 +3545,30 @@ impl Compiler {
             }
         }
         self.checker.codegen_var_type(name).cloned()
+    }
+
+    /// Identifier type for codegen: mono arm overrides, then span cache, then
+    /// the flat name map. Preferring span avoids later functions' `let x`
+    /// overwriting earlier `x` entries used by `static_len_of` / arith.
+    fn codegen_ident_ty(&self, node: &Output) -> Option<Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        let Expression::Identifier(name) = node.1.as_ref() else {
+            return None;
+        };
+        for frame in self.mono_codegen_var_types.iter().rev() {
+            if let Some(ty) = frame.get(*name) {
+                return Some(apply_ty_prune(self.checker.subst(), ty));
+            }
+        }
+        if let Some(ty) = self
+            .checker
+            .lookup_for_codegen_span(node.0.start, node.0.end)
+        {
+            return Some(ty);
+        }
+        self.checker
+            .codegen_var_type(name)
+            .map(|t| apply_ty_prune(self.checker.subst(), t))
     }
 
     fn mono_ty_from_name(name: &str) -> Ty {
@@ -4198,7 +4223,7 @@ impl Compiler {
 
     fn expr_codegen_ty(&self, expr: &Output) -> Option<Ty> {
         match expr.1.as_ref() {
-            Expression::Identifier(name) => self.codegen_var_type_for(name),
+            Expression::Identifier(_) => self.codegen_ident_ty(expr),
             Expression::Integer(_) => Some(Ty::Con("int".into())),
             Expression::Float(_) => Some(Ty::Con("float".into())),
             Expression::Tuple(items) => {
@@ -5386,6 +5411,18 @@ impl Compiler {
             self.bytecode.push_return();
         }
 
+        // Length__string__len: unbox (dict ABI) then ArrayLen (byte length).
+        {
+            let fqn = Generics::builtin_instance_fqn("Length", "string", "len");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode.push_unbox_value(ValueTag::String as u32);
+                self.bytecode.push(Byte::new(Instruction::ArrayLen));
+                self.bytecode.push_return();
+            }
+        }
+
         // Hash thunks: boxed receiver at slot 0 → int. int/byte/bool identity
         // after unbox; float returns the float `Value` bits read via
         // `Value::as_int()` (IEEE bit pattern in the current Value encoding);
@@ -6106,19 +6143,14 @@ impl Compiler {
     /// Return `true` when `operand` resolves to an open type variable — i.e.
     /// the operand is a generic type parameter that is not yet concrete.
     ///
-    /// Handles `Expression::Identifier` via the `codegen_var_types` side-table
-    /// (which is reliable inside function bodies even when the ID cache is
-    /// misaligned). All other expression shapes return `false` conservatively;
-    /// they are either concrete literals or sub-expressions whose containing
-    /// `Identifier` was already flagged on the inner call.
+    /// Handles `Expression::Identifier` via span-preferring [`Self::codegen_ident_ty`].
+    /// All other expression shapes return `false` conservatively; they are either
+    /// concrete literals or sub-expressions whose containing `Identifier` was
+    /// already flagged on the inner call.
     fn operand_is_open_ty(&self, operand: &Output) -> bool {
-        use crate::typechecking::subst::apply_ty_prune;
         match operand.1.as_ref() {
-            Expression::Identifier(name) => match self.codegen_var_type_for(name) {
-                Some(ty) => {
-                    let pruned = apply_ty_prune(self.checker.subst(), &ty);
-                    matches!(pruned, Ty::Var(_))
-                }
+            Expression::Identifier(_) => match self.codegen_ident_ty(operand) {
+                Some(ty) => matches!(ty, Ty::Var(_)),
                 None => false,
             },
             _ => false,
@@ -6783,13 +6815,11 @@ impl Compiler {
     }
 
     fn is_float_ty(&self, _node: &Output) -> bool {
-        if let Expression::Identifier(name) = _node.1.as_ref()
-            && matches!(
-                self.codegen_var_type_for(name),
-                Some(crate::typechecking::ty::Ty::Con(ref ty))
-                    if ty == crate::typechecking::ty::FLOAT
-            )
-        {
+        if matches!(
+            self.codegen_ident_ty(_node),
+            Some(crate::typechecking::ty::Ty::Con(ref ty))
+                if ty == crate::typechecking::ty::FLOAT
+        ) {
             return true;
         }
         let Some(id) = self.checker.id_table().ids().get(self.emit_idx).copied() else {
@@ -6807,6 +6837,22 @@ impl Compiler {
             self.codegen_expr_ty(node),
             Some(Ty::Con(ref name)) if name == crate::typechecking::ty::STRING
         )
+    }
+
+    /// Static length from a value's type (fixed arrays, tuples, records).
+    fn static_len_of(&self, node: &Output) -> Option<usize> {
+        use crate::typechecking::ty::{ArrayLength, strip_readonly};
+        let ty = self.codegen_expr_ty(node)?;
+        let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+        match strip_readonly(&pruned) {
+            Ty::Array {
+                length: ArrayLength::Static(n),
+                ..
+            } => Some(*n),
+            Ty::Tuple(elems) => Some(elems.len()),
+            Ty::Record { fields } => Some(fields.len()),
+            _ => None,
+        }
     }
 
     /// Resolve an `impl Class<…>` type argument to a [`Ty`] for FQN mangling.
@@ -6866,9 +6912,7 @@ impl Compiler {
                 tys.sort_by(|a, b| a.0.cmp(&b.0));
                 Some(Ty::Record { fields: tys })
             }
-            Expression::Identifier(name) => self
-                .codegen_var_type_for(name)
-                .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
+            Expression::Identifier(_) => self.codegen_ident_ty(node),
             // `Construct` / `Instantiate` must NOT collapse to a bare
             // `Ty::Con(name)`: generic apps like `Option::Some(42)` are
             // `Option<int>` (`Ty::App`), and call-site dictionary emission
@@ -7270,12 +7314,7 @@ impl Compiler {
             | Expression::Group(inner)
             | Expression::Statement(inner)
             | Expression::ExprStatement(inner) => self.receiver_type(inner),
-            Expression::Identifier(name) => {
-                self.codegen_var_type_for(name).map(|t| {
-                    // Apply substitution so inferred record types resolve fully.
-                    crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
-                })
-            }
+            Expression::Identifier(_) => self.codegen_ident_ty(receiver),
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
                 if let Some(name) = Checker::class_name_of_ty(&inner_ty) {
@@ -9214,8 +9253,61 @@ impl Compiler {
                             if let Some(items) = args
                                 && items.len() == 1
                             {
-                                bytecode.append(&mut self.do_compile(&items[0]));
-                                bytecode.push(Byte::new(Instruction::ArrayLen));
+                                // Prefer compile-time length when known from
+                                // literals / static types.
+                                if let Some(ConstValue::Int(n)) =
+                                    const_fold::eval_expr(ast, self.const_env())
+                                {
+                                    self.discard_compile(&items[0]);
+                                    self.emit_const_value(
+                                        &ConstValue::Int(n),
+                                        &mut bytecode,
+                                    );
+                                    return bytecode;
+                                }
+                                if let Some(n) = self.static_len_of(&items[0]) {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    bytecode.push_pop();
+                                    self.emit_const_value(
+                                        &ConstValue::Int(n as i64),
+                                        &mut bytecode,
+                                    );
+                                    return bytecode;
+                                }
+                                // Structural aggregates → ArrayLen. Custom types
+                                // with `Length` use the instance method below.
+                                let arg_ty = self.codegen_expr_ty(&items[0]).map(|ty| {
+                                    crate::typechecking::subst::apply_ty_prune(
+                                        self.checker.subst(),
+                                        &ty,
+                                    )
+                                });
+                                let structural = arg_ty.as_ref().is_some_and(|ty| {
+                                    Checker::is_structural_len_ty_for_codegen(ty)
+                                });
+                                if structural || arg_ty.is_none() {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    bytecode.push(Byte::new(Instruction::ArrayLen));
+                                    return bytecode;
+                                }
+                                if let Some(ty) = arg_ty.as_ref()
+                                    && let Some(fqn) = self
+                                        .checker
+                                        .instance_method_fqn("Length", std::slice::from_ref(ty), "len")
+                                        .map(str::to_string)
+                                    && let Some(&offset) = self.functions.get(&fqn)
+                                {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    Self::emit_call_indirect(
+                                        &mut bytecode,
+                                        offset as u32,
+                                        1,
+                                    );
+                                    return bytecode;
+                                }
+                                // Bound Length calls are handled earlier via
+                                // BoundMethodCall; if we get here without an
+                                // instance, fall through to report unknown fn.
                             } else {
                                 let mut message = Message::error(
                                     ErrorCode::TooManyArguments,
@@ -9227,8 +9319,8 @@ impl Compiler {
                                     span.into_range(),
                                 ));
                                 self.messages.push(message);
+                                return bytecode;
                             }
-                            return bytecode;
                         }
                     }
 
@@ -11626,6 +11718,35 @@ impl Compiler {
                 self.emit_bytes(*span, &expr_bc);
                 self.emit_byte(*span, Byte::new(Instruction::Panic));
             }
+            Expression::TypeOf(inner) => {
+                // Advance emit_idx through the operand without evaluating it.
+                self.discard_compile(inner);
+                match self.codegen_expr_ty(inner).and_then(|ty| {
+                    let pruned =
+                        crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+                    crate::typechecking::pretty::format_ty_fqn(
+                        &pruned,
+                        &self.checker.generics().nominal_type_modules,
+                    )
+                }) {
+                    Some(fqn) => {
+                        self.emit_raw_string_literal(&mut bytecode, &fqn);
+                    }
+                    None => {
+                        let mut message = Message::error(
+                            ErrorCode::GenericTypeError,
+                            "`typeof` requires a ground type".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            "type is not fully known at compile time".to_string(),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                        self.emit_raw_string_literal(&mut bytecode, "<unknown>");
+                    }
+                }
+            }
             Expression::Try(inner) => {
                 // `e?` → if Ok/Some, leave payload; else RETURN the failure.
                 let is_option = self.expr_is_option(inner);
@@ -12671,22 +12792,43 @@ use string::{format, to_bytes};
             }
             "#,
         );
-        // Key cached once; second GetField CSE'd to DUPLICATE (see ops tail).
-        let strings = bc
+        // Key cached once in Point::twice_x; ignore STRING ops in later
+        // default Show/String / builtin thunks.
+        let first_get = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::GetField))
+            .expect("expected GetField in twice_x");
+        let region_start = bc[..first_get]
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::RETURN))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let region_end = bc[first_get..]
+            .iter()
+            .position(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::RETURN | Instruction::BinReturn
+                )
+            })
+            .map(|i| first_get + i)
+            .unwrap_or(bc.len() - 1);
+        let region = &bc[region_start..=region_end];
+        let strings = region
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STRING))
             .count();
-        let get_fields = bc
+        let get_fields = region
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::GetField))
             .count();
-        let has_dup = bc
+        let has_dup = region
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
         assert!(
             strings <= 1 && get_fields >= 1 && (get_fields >= 2 || has_dup),
             "expected ≤1 STRING for repeated .x plus GetField/Dup; strings={strings} gets={get_fields} dup={has_dup}; ops={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            region.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -13826,11 +13968,13 @@ fn main() { for x in counter() { if x == 1 { break; } } }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Choice { Empty, Value(int), Maybe(int) } \
+ fn main() { \
  match Choice::Value(1) { \
  Choice::Empty() => 0, \
  Choice::Value(v) => v, \
  Choice::Maybe(w) => w, \
- };",
+ }; \
+ }",
         );
 
         // 3 arms → 2 non-first arms → 2 JMP-to-end
@@ -15422,6 +15566,65 @@ let n = len(a); \
         );
     }
 
+    /// Literal `len("…")` must const-fold to an immediate; the only
+    /// `ArrayLen` in the program is the built-in `Length__string__len` thunk.
+    #[test]
+    fn len_of_string_literal_folds_without_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let n = len("abc");
+}
+"#,
+        );
+        let array_lens = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .count();
+        assert_eq!(
+            array_lens, 1,
+            "literal len(string) should fold; only Length__string__len thunk keeps ArrayLen; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+            "expected folded CONST for len(\"abc\")"
+        );
+    }
+
+    /// Custom `Length` instances lower via `CallIndirect`, not structural `ArrayLen`.
+    #[test]
+    fn custom_length_impl_emits_call_not_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+class Box { value: int }
+impl Length for Box {
+    fn len(Box b) -> int { return 7; }
+}
+fn main() {
+    let n = len(new Box(0));
+}
+"#,
+        );
+        let array_lens = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
+            .count();
+        assert_eq!(
+            array_lens, 1,
+            "custom Length must not add structural ArrayLen beyond string thunk; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect to Length::len; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     // ============================================================
     // chained field-access codegen tests
     // ============================================================
@@ -15603,10 +15806,12 @@ let n = len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
+ fn main() { \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { v }) => v, \
- };",
+ }; \
+ }",
         );
 
         // The OUTER Result::Ok is the last arm (Err is first),
@@ -15637,10 +15842,12 @@ let n = len(a); \
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
  enum Wrap { Good { x: Inner }, Bad(string) } \
+ fn main() { \
  match Wrap::Good { x: Inner::I { v: 42 } } { \
  Wrap::Bad(_) => 0, \
  Wrap::Good { x: Inner::I { v } } => v, \
- };",
+ }; \
+ }",
         );
 
         // Outer UNPACK + inner walk; Binding `v` emits no STORE.
@@ -15664,9 +15871,11 @@ let n = len(a); \
         let (bc, _pool) = compile_src(
             "enum Inner { I { x: int, y: int } } \
  enum Wrap { W { inner: Inner, name: int } } \
+ fn main() { \
  match Wrap::W { inner: Inner::I { x: 1, y: 2 }, name: 3 } { \
  Wrap::W { inner: Inner::I { x, y }, name } => x + y + name, \
- };",
+ }; \
+ }",
         );
 
         let unpack_at: Vec<_> = bc
@@ -15719,10 +15928,12 @@ let n = len(a); \
             "enum W { W { v: int } } \
  enum Baz { Qux { a: W } } \
  enum Foo { Bar(Baz), Other } \
+ fn main() { \
  match Foo::Bar(Baz::Qux { a: W::W { v: 99 } }) { \
  Foo::Other => 0, \
  Foo::Bar(Baz::Qux { a: W::W { v } }) => v, \
- };",
+ }; \
+ }",
         );
 
         // Innermost Binding `v` needs no STORE; require nested unpack
@@ -15747,10 +15958,12 @@ let n = len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
+ fn main() { \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { }) => 99, \
- };",
+ }; \
+ }",
         );
 
         // The pattern omits the `v` field. The codegen walks

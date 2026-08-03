@@ -5,7 +5,7 @@
 | File | Role |
 |------|------|
 | `common/src/opcode.rs` | `Instruction` enum — append-only |
-| `common/src/archive.rs` | `ARCHIVE_VERSION`, archive envelope |
+| `common/src/archive.rs` | Packed `ARCHIVE_MAJOR`/`ARCHIVE_MINOR`, archive envelope |
 | `machine/src/vm.rs` | Main dispatch loop, `promise!` opcode ceiling |
 | `compiler/src/lib.rs` | Codegen driver, `finalize_bytecode` |
 | `compiler/src/il/` | IL ops, lower, fuse-select, opts |
@@ -42,14 +42,21 @@
 - Unreachable code `E0118`; defer in infinite loop `E0123`.
 - Unit/open-var fall-through may emit `CONST 0; RETURN` (Result-mode Ok-wraps unit only).
 
-## ARCHIVE_VERSION bump triggers
+## Archive version bump triggers
 
-- New or reordered opcode discriminants
-- Incompatible bytecode encoding
-- Tag layout changes
-- Archive envelope field changes
+`ArchivedProgram::version` is packed `major.minor` (`u16`/`u16` in a `u32`).
 
-Current version: check `common/src/archive.rs`.
+Load rule: same major and archive minor ≤ runtime minor (older archives run on newer minor runtimes; majors never cross-load).
+
+| Change | Bump |
+|--------|------|
+| New append-only opcode discriminants | **minor** |
+| Additive optional archive data old archives lack | **minor** |
+| Incompatible bytecode encoding / `Byte` layout | **major** (reset minor) |
+| Tag layout changes | **major** |
+| Required envelope field changes | **major** |
+
+Current version: check `ARCHIVE_MAJOR` / `ARCHIVE_MINOR` in `common/src/archive.rs`.
 
 ## Perf philosophy
 

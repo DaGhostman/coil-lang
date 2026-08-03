@@ -545,6 +545,25 @@ impl Generics {
             },
         );
 
+        // ---- Length ----
+        // `len(x)` resolves through this trait for custom types; arrays,
+        // tuples, and dicts keep a structural fast path in the checker.
+        self.typeclasses.insert(
+            "Length".into(),
+            TypeClassDef {
+                name: "Length".into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "len".into(),
+                    has_default: false,
+                }],
+            },
+        );
+
         // ---- Default / Hash / Serialize / Deserialize / Send / String / Sensitive ----
         // (#[derive] targets; see compiler/src/attrs.rs)
         self.typeclasses.insert(
@@ -797,6 +816,14 @@ impl Generics {
             range: 0..0,
             args: vec![string()],
             method_fqns: make_fqns("Show", "string", &["show"]),
+            assoc_tys: HashMap::new(),
+        });
+        self.instances.push(InstanceDef {
+            class: "Length".into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
+            range: 0..0,
+            args: vec![string()],
+            method_fqns: make_fqns("Length", "string", &["len"]),
             assoc_tys: HashMap::new(),
         });
 
