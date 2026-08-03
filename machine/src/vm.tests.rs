@@ -1482,6 +1482,126 @@
         Byte::new(Instruction::MakeCoro).with_call_packed(arity, target)
     }
 
+    /// Create → resume → yield returns the yielded value to the resumer.
+    #[test]
+    fn coroutine_resume_yields_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 3),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            // 3: coroutine body
+            const_int(42),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Resuming a completed coroutine pushes 0 (MVP done protocol).
+    #[test]
+    fn coroutine_resume_after_done_returns_zero() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 9),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            const_int(7),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+        assert_eq!(vm.pop().as_int(), 7);
+    }
+
+    /// Resume with send + binding yield: second resume returns the sent value.
+    #[test]
+    fn coroutine_resume_with_send_binding_yield() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 8),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            const_int(200),
+            load(0),
+            Byte::new(Instruction::ResumeCoro).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            // 8: coroutine body — yield out, receive send, yield received value
+            const_int(100),
+            Byte::new(Instruction::YieldCoro),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 200);
+        assert_eq!(vm.pop().as_int(), 100);
+    }
+
+    #[test]
+    fn log_not_bool_and_int() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::LogNot),
+            const_int(0),
+            Byte::new(Instruction::LogNot),
+            const_int(42),
+            Byte::new(Instruction::LogNot),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_bool(), false);
+        assert_eq!(vm.pop().as_bool(), true);
+        assert_eq!(vm.pop().as_bool(), false);
+    }
+
+    #[test]
+    fn inc_prefix_returns_new_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::INC).with_inc_dec(0, true, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 6);
+        assert_eq!(vm.stack[0].as_int(), 6);
+    }
+
+    #[test]
+    fn inc_postfix_returns_old_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::INC).with_inc_dec(0, false, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 5);
+        assert_eq!(vm.stack[0].as_int(), 6);
+    }
+
+    #[test]
+    fn dec_prefix_and_postfix() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::DEC).with_inc_dec(0, false, false),
+            Byte::new(Instruction::DEC).with_inc_dec(0, true, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 3);
+        assert_eq!(vm.stack[0].as_int(), 3);
+    }
+
     /// Coroutine handle + saved stack survive an automatic GC cycle.
     #[test]
     fn coroutine_handle_survives_gc() {
