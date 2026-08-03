@@ -2547,6 +2547,11 @@ impl<const S: usize> Machine<S> {
                     let target_addr = target_val.raw() as u64;
                     let len = match Self::find_object_by_addr(&self.heap, target_addr) {
                         Some(crate::memory::Object::Array(gc)) => gc.as_ref().elements.len(),
+                        Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.len(),
+                        Some(crate::memory::Object::String(gc)) => gc.as_ref().data.len(),
+                        Some(crate::memory::Object::Instance(gc)) => {
+                            gc.as_ref().iter_fields().count()
+                        }
                         _ => 0,
                     };
                     self.stack.push(Value::from(len as i64));
