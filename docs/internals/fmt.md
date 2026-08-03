@@ -21,6 +21,17 @@ coil-fmt --check examples/fib.hy
 
 Directories are walked recursively for `*.hy`. Non-`.hy` files given explicitly are rejected.
 
+## Line wrapping
+
+Soft wraps kick in when a construct would exceed **100** columns:
+
+| Construct | Break style |
+|-----------|-------------|
+| `&&` / `\|\|` / `??` chains | Operator stays at end of the previous line; continuation hangs under the first operand |
+| `.` / `?.` member and method chains | Each `.name` / `.name(args)` on its own line at +1 indent |
+
+Short chains stay on one line.
+
 ## Comments and docs
 
 - `//` line comments are preserved (AST `Expression::Comment`).

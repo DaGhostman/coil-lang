@@ -11,6 +11,8 @@ use crate::Pratt;
 use reporting::Message;
 
 const INDENT: &str = "    ";
+/// Soft line-wrap budget (characters from start of line).
+const MAX_WIDTH: usize = 100;
 
 pub fn format_source(src: &str) -> Result<String, Message> {
     let ast = Pratt::default().parse(src)?;
@@ -29,6 +31,8 @@ pub fn format_program(expr: &Expression<'_>) -> String {
 struct Formatter {
     indent: usize,
     out: String,
+    /// When true, never insert soft wraps (used to measure flat width).
+    flat: bool,
 }
 
 impl Formatter {
@@ -36,6 +40,7 @@ impl Formatter {
         Self {
             indent: 0,
             out: String::new(),
+            flat: false,
         }
     }
 
@@ -53,10 +58,41 @@ impl Formatter {
         }
     }
 
+    fn current_col(&self) -> usize {
+        match self.out.rfind('\n') {
+            Some(i) => self.out.len() - i - 1,
+            None => self.out.len(),
+        }
+    }
+
+    fn pad_to_col(&mut self, col: usize) {
+        let cur = self.current_col();
+        if col > cur {
+            for _ in 0..(col - cur) {
+                self.out.push(' ');
+            }
+        }
+    }
+
     fn with_indent(&mut self, f: impl FnOnce(&mut Self)) {
         self.indent += 1;
         f(self);
         self.indent -= 1;
+    }
+
+    /// Render `expr` with soft wraps disabled (single-line preference).
+    fn render_flat(&self, expr: &Expression<'_>) -> String {
+        let mut f = Formatter {
+            indent: self.indent,
+            out: String::new(),
+            flat: true,
+        };
+        f.fmt_expression(expr);
+        f.out
+    }
+
+    fn fits_flat(&self, flat: &str) -> bool {
+        self.flat || self.current_col().saturating_add(flat.len()) <= MAX_WIDTH
     }
 
     fn fmt_output(&mut self, output: &Output<'_>) {
@@ -189,6 +225,10 @@ impl Formatter {
                 self.fmt_output(inner);
             }
 
+            Expression::And(lhs, rhs) => self.fmt_logic_chain(expr, lhs, rhs, "&&"),
+            Expression::Or(lhs, rhs) => self.fmt_logic_chain(expr, lhs, rhs, "||"),
+            Expression::Coalesce(lhs, rhs) => self.fmt_logic_chain(expr, lhs, rhs, "??"),
+
             Expression::Add(lhs, rhs)
             | Expression::Sub(lhs, rhs)
             | Expression::Mul(lhs, rhs)
@@ -198,9 +238,7 @@ impl Formatter {
             | Expression::Shl(lhs, rhs)
             | Expression::Shr(lhs, rhs)
             | Expression::Xor(lhs, rhs)
-            | Expression::And(lhs, rhs)
             | Expression::BitAnd(lhs, rhs)
-            | Expression::Or(lhs, rhs)
             | Expression::BitOr(lhs, rhs)
             | Expression::Eq(lhs, rhs)
             | Expression::Neq(lhs, rhs)
@@ -212,11 +250,6 @@ impl Formatter {
                 self.push_str(" ");
                 self.push_str(binary_op(expr));
                 self.push_str(" ");
-                self.fmt_output(rhs);
-            }
-            Expression::Coalesce(lhs, rhs) => {
-                self.fmt_output(lhs);
-                self.push_str(" ?? ");
                 self.fmt_output(rhs);
             }
             Expression::Cast(expr, ty) => {
@@ -282,15 +315,12 @@ impl Formatter {
                 }
                 self.push_str("]");
             }
-            Expression::Access(receiver, field) => {
-                self.fmt_output(receiver);
-                self.push_str(".");
-                self.push_str(field);
-            }
-            Expression::OptionalAccess(receiver, field) => {
-                self.fmt_output(receiver);
-                self.push_str("?.");
-                self.push_str(field);
+            Expression::Access(_, _) | Expression::OptionalAccess(_, _) | Expression::Call { .. } => {
+                if let Some(parts) = collect_member_chain(expr) {
+                    self.fmt_member_chain(&parts);
+                } else {
+                    self.fmt_member_or_call_atom(expr);
+                }
             }
             Expression::QualifiedAccess { owner, member } => {
                 self.push_str(owner);
@@ -299,14 +329,6 @@ impl Formatter {
             }
             Expression::Member(inner) => self.fmt_output(inner),
 
-            Expression::Call { name, args } => {
-                self.fmt_output(name);
-                self.push_str("(");
-                if let Some(args) = args {
-                    self.fmt_outputs_comma(args);
-                }
-                self.push_str(")");
-            }
             Expression::NamedArg(name, value) => {
                 self.push_str(name);
                 self.push_str(": ");
@@ -1050,6 +1072,151 @@ impl Formatter {
         }
     }
 
+    fn fmt_logic_chain(
+        &mut self,
+        root: &Expression<'_>,
+        _lhs: &Output<'_>,
+        _rhs: &Output<'_>,
+        op: &str,
+    ) {
+        let operands = flatten_logic(root, op);
+        if operands.len() <= 1 {
+            if let Some(e) = operands.first() {
+                self.fmt_expression(e);
+            }
+            return;
+        }
+
+        let mut flat = String::new();
+        for (i, operand) in operands.iter().enumerate() {
+            if i > 0 {
+                flat.push(' ');
+                flat.push_str(op);
+                flat.push(' ');
+            }
+            flat.push_str(&self.render_flat(operand));
+        }
+
+        if self.fits_flat(&flat) {
+            for (i, operand) in operands.iter().enumerate() {
+                if i > 0 {
+                    self.push_str(" ");
+                    self.push_str(op);
+                    self.push_str(" ");
+                }
+                let was_flat = self.flat;
+                self.flat = true;
+                self.fmt_expression(operand);
+                self.flat = was_flat;
+            }
+            return;
+        }
+
+        let hang = self.current_col();
+        for (i, operand) in operands.iter().enumerate() {
+            if i > 0 {
+                self.push_str(" ");
+                self.push_str(op);
+                self.newline();
+                self.pad_to_col(hang);
+            }
+            self.fmt_expression(operand);
+        }
+    }
+
+    fn fmt_member_or_call_atom(&mut self, expr: &Expression<'_>) {
+        match expr {
+            Expression::Access(receiver, field) => {
+                self.fmt_output(receiver);
+                self.push_str(".");
+                self.push_str(field);
+            }
+            Expression::OptionalAccess(receiver, field) => {
+                self.fmt_output(receiver);
+                self.push_str("?.");
+                self.push_str(field);
+            }
+            Expression::Call { name, args } => {
+                self.fmt_output(name);
+                self.push_str("(");
+                if let Some(args) = args {
+                    self.fmt_outputs_comma(args);
+                }
+                self.push_str(")");
+            }
+            other => self.fmt_expression(other),
+        }
+    }
+
+    fn fmt_member_chain(&mut self, parts: &[ChainPart<'_>]) {
+        let flat = {
+            let mut f = Formatter {
+                indent: self.indent,
+                out: String::new(),
+                flat: true,
+            };
+            f.emit_member_chain_flat(parts);
+            f.out
+        };
+        if self.fits_flat(&flat) {
+            self.emit_member_chain_flat(parts);
+            return;
+        }
+
+        match &parts[0] {
+            ChainPart::Root(expr) => self.fmt_expression(expr),
+            ChainPart::Field { .. } => unreachable!("member chain must start with root"),
+        }
+        self.with_indent(|f| {
+            for part in &parts[1..] {
+                f.newline();
+                f.write_indent();
+                f.emit_chain_field(part);
+            }
+        });
+    }
+
+    fn emit_chain_field(&mut self, part: &ChainPart<'_>) {
+        match part {
+            ChainPart::Root(_) => unreachable!(),
+            ChainPart::Field {
+                optional,
+                name,
+                call_args,
+            } => {
+                if *optional {
+                    self.push_str("?.");
+                } else {
+                    self.push_str(".");
+                }
+                self.push_str(name);
+                if let Some(args) = call_args {
+                    self.push_str("(");
+                    self.fmt_outputs_comma(args);
+                    self.push_str(")");
+                }
+            }
+        }
+    }
+
+    fn emit_member_chain_flat(&mut self, parts: &[ChainPart<'_>]) {
+        match &parts[0] {
+            ChainPart::Root(expr) => {
+                let was = self.flat;
+                self.flat = true;
+                self.fmt_expression(expr);
+                self.flat = was;
+            }
+            ChainPart::Field { .. } => unreachable!("member chain must start with root"),
+        }
+        for part in &parts[1..] {
+            let was = self.flat;
+            self.flat = true;
+            self.emit_chain_field(part);
+            self.flat = was;
+        }
+    }
+
     fn fmt_docs(&mut self, docs: &[&str]) {
         if docs.is_empty() {
             return;
@@ -1173,6 +1340,102 @@ impl Formatter {
     fn fmt_let_pattern(&mut self, pattern: &LetPattern<'_>) {
         self.push_str(&pattern.to_string());
     }
+}
+
+enum ChainPart<'a> {
+    Root(&'a Expression<'a>),
+    Field {
+        optional: bool,
+        name: &'a str,
+        call_args: Option<&'a [Output<'a>]>,
+    },
+}
+
+/// Flatten a left-associative `&&` / `||` / `??` tree into operand expressions.
+fn flatten_logic<'a>(expr: &'a Expression<'a>, op: &str) -> Vec<&'a Expression<'a>> {
+    match (expr, op) {
+        (Expression::And(lhs, rhs), "&&") => {
+            let mut out = flatten_logic(lhs.1.as_ref(), op);
+            out.extend(flatten_logic(rhs.1.as_ref(), op));
+            out
+        }
+        (Expression::Or(lhs, rhs), "||") => {
+            let mut out = flatten_logic(lhs.1.as_ref(), op);
+            out.extend(flatten_logic(rhs.1.as_ref(), op));
+            out
+        }
+        (Expression::Coalesce(lhs, rhs), "??") => {
+            let mut out = flatten_logic(lhs.1.as_ref(), op);
+            out.extend(flatten_logic(rhs.1.as_ref(), op));
+            out
+        }
+        (other, _) => vec![other],
+    }
+}
+
+/// Collect `recv.field`, `recv?.field`, and `recv.method(args)` into a chain.
+///
+/// Returns `None` when `expr` is not a multi-part member/call chain.
+fn collect_member_chain<'a>(expr: &'a Expression<'a>) -> Option<Vec<ChainPart<'a>>> {
+    let mut rev: Vec<ChainPart<'a>> = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expression::Call { name, args } => match name.1.as_ref() {
+                Expression::Access(recv, field) => {
+                    rev.push(ChainPart::Field {
+                        optional: false,
+                        name: field,
+                        call_args: args.as_deref(),
+                    });
+                    cur = recv.1.as_ref();
+                }
+                Expression::OptionalAccess(recv, field) => {
+                    rev.push(ChainPart::Field {
+                        optional: true,
+                        name: field,
+                        call_args: args.as_deref(),
+                    });
+                    cur = recv.1.as_ref();
+                }
+                _ => {
+                    if rev.is_empty() {
+                        return None;
+                    }
+                    rev.push(ChainPart::Root(cur));
+                    break;
+                }
+            },
+            Expression::Access(recv, field) => {
+                rev.push(ChainPart::Field {
+                    optional: false,
+                    name: field,
+                    call_args: None,
+                });
+                cur = recv.1.as_ref();
+            }
+            Expression::OptionalAccess(recv, field) => {
+                rev.push(ChainPart::Field {
+                    optional: true,
+                    name: field,
+                    call_args: None,
+                });
+                cur = recv.1.as_ref();
+            }
+            other => {
+                if rev.is_empty() {
+                    return None;
+                }
+                rev.push(ChainPart::Root(other));
+                break;
+            }
+        }
+    }
+    rev.reverse();
+    if rev.len() < 2 {
+        return None;
+    }
+    Some(rev)
 }
 
 fn binary_op(expr: &Expression<'_>) -> &'static str {
@@ -1339,5 +1602,64 @@ mod tests {
         };
         let docs = item_docs(items[0].1.as_ref()).expect("docs");
         assert_eq!(docs, ["Hello", "World"]);
+    }
+
+    #[test]
+    fn wraps_long_and_chain_with_hanging_indent() {
+        let src = "\
+fn main() {
+    if (object.veryLongPropertyName == other.notSoLongName && object.shortName == other.somewhatLongerNameButStillGrowing && object.extraFlag == other.anotherFlag) {
+        return;
+    }
+}
+";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("&&\n"),
+            "expected soft wrap before continuation:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("object.veryLongPropertyName == other.notSoLongName &&"),
+            "&& should trail the previous line:\n{formatted}"
+        );
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn wraps_long_method_chain() {
+        let src = "\
+fn main() {
+    let x = builder.withVeryLongConfigurationOption(1).withAnotherQuiteLongOption(2).withYetAnotherOption(3).build();
+    return;
+}
+";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("\n") && formatted.contains(".with"),
+            "expected wrapped method chain:\n{formatted}"
+        );
+        assert!(
+            formatted.lines().any(|l| l.trim_start().starts_with('.')),
+            "continuation lines should start with '.':\n{formatted}"
+        );
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn keeps_short_and_on_one_line() {
+        let src = "fn main() {\n    if (a == 1 && b == 2) {\n        return;\n    }\n}\n";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("a == 1 && b == 2"),
+            "short condition should stay flat:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("&&\n"),
+            "should not wrap short &&:\n{formatted}"
+        );
     }
 }
