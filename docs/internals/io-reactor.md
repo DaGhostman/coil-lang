@@ -16,8 +16,8 @@ They share a lifecycle (cloned onto pool workers) but **never** put blocking IO 
 | L0 `read` / `write` / `accept` | Always non-blocking; `WouldBlock` when not ready |
 | `await_readable` / `await_writable` | Park the VM (`PendingIoWait`) until ready; CPU help-steals |
 | `drive()` | `poll_once` on registered async waiters |
-| Convenience `write_all` / `read_exact` / … | Host loops L0 + reactor wait (same IO reactor) |
 | **`block_on(coro)`** (prelude) | Resume a coroutine until `done`; returns the completion value |
+| Userland `io::sync::*` | Coil loops over L0 + `await_*` (`stdlib/io/sync.hy`) |
 
 Preferred DX — async work, sync boundary:
 
@@ -35,13 +35,13 @@ fn main() {
 only the final `return` value is kept. IO `await_*` inside the coroutine still
 parks via the IO reactor between resumes.
 
-## Sync convenience adapters
+## Waiting on readiness
 
-`read_exact`, `read_to_end`, `write_all`, `accept_wait`, UDP `recv_from_wait`, and TLS
-handshake waits call [`IoReactor::wait_fd`](../../machine/src/io_reactor.rs) (via
-[`reactor_wait_fd`](../../machine/src/io.rs)). They are **not** a second IO API —
-they are helpers that wait on the same reactor. Prefer `block_on` + `async fn`
-when structuring concurrent / overlapping work.
+TLS handshake waits and `await_*` call
+[`IoReactor::wait_fd`](../../machine/src/io_reactor.rs) (via
+[`reactor_wait_fd`](../../machine/src/io.rs)). Userland sync adapters
+(`write_all`, …) reach the same reactor through `await_readable` /
+`await_writable`.
 
 When a CPU reactor is bound (`HostStateGuard`), waits use
 [`wait_fd_helping`](../../machine/src/io_reactor.rs): short poll slices interleaved with

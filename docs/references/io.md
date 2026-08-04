@@ -4,6 +4,7 @@ Non-blocking file / stdio / TCP / UDP streams. **Not** auto-imported:
 
 ```coil
 use io::*;
+use io::sync::*;   // optional blocking adapters (userland)
 ```
 
 | Export | Kind | Notes |
@@ -13,25 +14,39 @@ use io::*;
 | `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
-| `read_exact` / `read_to_end` / `write_all` | Convenience adapters | Wait on the [IO reactor](../internals/io-reactor.md); prefer `async fn` + prelude `block_on` for structured async |
 | `await_readable` / `await_writable` | Async await | Park VM until fd ready; see [io-reactor](../internals/io-reactor.md) |
 | `drive` | `() -> int` | Poll async waiters once |
 | `block_on` | Prelude | `block_on(coro) -> Y` — auto-imported; drives `async fn` to completion |
-| `set_read_timeout` / `set_write_timeout` | Sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
 | `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
-| `io::net::tcp::{connect,connect_timeout,listen,accept,accept_wait,accept_wait_timeout}` | TCP | Nested module — `use io::net::tcp::*;`; timeout `ms <= 0` waits forever |
+| `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::*`; timeout `ms <= 0` waits forever |
 | `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
-| `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
+| `io::net::udp::{bind,connect,send_to,recv_from,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
 | `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS with required opts |
 | `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts, optional mTLS |
+
+## Userland sync adapters (`io::sync`)
+
+Blocking helpers live in stdlib (`stdlib/io/sync.hy`), not as host natives:
+
+| Function | Notes |
+|----------|-------|
+| `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops |
+| `accept_wait` | `accept` + `await_readable` |
+| `recv_from_wait` | `recv_from` + `await_readable` |
+
+```coil
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+```
+
+Prefer `async fn` + prelude `block_on` when structuring concurrent IO.
 
 `connect` / `connect_timeout` try **every** DNS result under one absolute
 deadline. `listen` / UDP `bind` still use the first resolved address — prefer
 an explicit IP (e.g. `127.0.0.1`) when family order matters.
 
-Socket / stream soft deadlines and OS `TimedOut` map to `IoError::TimedOut`
-(not `WouldBlock`). Call sites that previously treated timeouts as
-`WouldBlock` should match `TimedOut` instead.
+OS `TimedOut` maps to `IoError::TimedOut` (not `WouldBlock`).
 
 TLS client enable takes
 `enable(s, host, { verify: bool, ca_pem: Option<string>, ca_path: Option<string>, timeout_ms: int })`.

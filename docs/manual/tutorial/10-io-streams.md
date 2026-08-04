@@ -5,6 +5,7 @@ coil exposes non-blocking file, stdio, and TCP IO through the virtual
 
 ```coil
 use io::*;
+use io::sync::*;
 ```
 
 Buffers use the **`byte`** primitive and **`[byte]`** arrays.
@@ -19,7 +20,8 @@ Buffers use the **`byte`** primitive and **`[byte]`** arrays.
 | `[byte]` | Homogeneous byte buffer for `read` / `write`. |
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let b: byte = 255;
@@ -66,14 +68,12 @@ See `examples/io_text.hy`.
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd process stdio |
 | `open(path, mode)` | `→ Result<Stream, IoError>` | Modes: `"r"`, `"w"`, `"a"`, `"rw"` |
 | `close(s)` | `→ Result<(), IoError>` | Idempotent close on GC drop too |
-| `read(s, buf)` | `→ Result<Option<int>, IoError>` | `Ok(Some(n))`, `Ok(None)` = EOF |
-| `write(s, buf)` | `→ Result<int, IoError>` | Partial writes OK |
-| `read_exact` / `read_to_end` / `write_all` | sync adapters | Wait on the [IO reactor](../../internals/io-reactor.md) (may help-steal CPU jobs) |
+| `read` / `write` | L0 | Never busy-spin; `WouldBlock` when not ready |
 | `await_readable` / `await_writable` | async await | Park the VM until ready; overlaps CPU work via help-steal |
 | `drive` | `() -> int` | Poll registered async waiters once; returns newly-ready count |
 | `block_on` | prelude | Drive an `async fn` handle to completion (see [IO reactor](../../internals/io-reactor.md)) |
-| `set_read_timeout` / `set_write_timeout` | adapter config | Millisecond soft deadlines; `ms <= 0` clears |
-| `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, plus address / shutdown helpers |
+| `io::sync::{write_all,read_exact,read_to_end}` | userland | Blocking adapters over L0 + `await_*` |
+| `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
 | `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |
 | `io::net::tls::server::*` | TLS server | `enable` / `disable` (feature `tls`) |
@@ -105,11 +105,12 @@ you need peer addresses:
 | `connect(host, port)` | `→ Result<Stream, IoError>` | Connected peer; then `read` / `write` work |
 | `send_to(s, buf, host, port)` | `→ Result<int, IoError>` | Non-blocking `sendto` |
 | `recv_from(s, buf)` | `→ Result<(int, string, int), IoError>` | `(nbytes, peer_host, peer_port)` |
-| `recv_from_wait(s, buf)` | same | Blocks in the host via `poll` |
+| `io::sync::recv_from_wait(s, buf)` | same | Userland: `recv_from` + `await_readable` |
 
 ```coil
 use io::*;
 use io::net::udp::*;
+use io::sync::*;
 use string::*;
 
 fn main() {
@@ -136,8 +137,7 @@ See `examples/io_udp.hy`.
 | `connect_timeout(host, port, ms)` | same | Connect deadline; `ms <= 0` waits forever |
 | `listen(host, port)` | `→ Result<Stream, IoError>` | Listening socket |
 | `accept(s)` | `→ Result<Stream, IoError>` | Non-blocking; `WouldBlock` if empty |
-| `accept_wait(s)` | same | Blocks in the host via `poll` |
-| `accept_wait_timeout(s, ms)` | same | Accept deadline; `ms <= 0` waits forever |
+| `io::sync::accept_wait(s)` | same | Userland: `accept` + `await_readable` |
 | `peer_addr(s)` / `local_addr(s)` | `→ Result<(string, int), IoError>` | Connected peer / local socket address |
 | `set_nodelay(s, enabled)` | `→ Result<(), IoError>` | Toggle `TCP_NODELAY` on TCP/TLS streams |
 | `shutdown(s, how)` | `→ Result<(), IoError>` | Half-close: `0` read, `1` write, `2` both |

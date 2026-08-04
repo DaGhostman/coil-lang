@@ -41,7 +41,8 @@ Implicit imports (no `use` needed): `prelude::*`, `prelude::ops::*`, `prelude::t
 Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
