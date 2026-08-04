@@ -467,4 +467,34 @@ mod tests {
         reactor.help_once();
         assert_eq!(reactor.inflight(), 0);
     }
+
+    #[test]
+    fn ensure_operand_capacity_grows_but_not_shrinks() {
+        let mut vm = Machine::<WORKER_STACK_SLOTS>::with_operand_capacity(64);
+        assert_eq!(vm.operand_stack_capacity(), 64);
+
+        ensure_operand_capacity(&mut vm, 512);
+        assert_eq!(vm.operand_stack_capacity(), 512);
+
+        // Smaller request must leave the larger stack in place.
+        ensure_operand_capacity(&mut vm, 128);
+        assert_eq!(vm.operand_stack_capacity(), 512);
+    }
+
+    #[test]
+    fn machine_for_program_honors_operand_stack_slots() {
+        let prog = Arc::new(ThreadProgram {
+            code: Arc::new(vec![
+                Byte::new(Instruction::CONST).with_value_u32(7),
+                Byte::new(Instruction::RETURN),
+            ]),
+            constants: Arc::new(Vec::new()),
+            strings: Arc::new(Vec::new()),
+            static_slot_count: 0,
+            debug: ProgramDebug::default(),
+            operand_stack_slots: 1024,
+        });
+        let vm = machine_for_program(&prog);
+        assert_eq!(vm.operand_stack_capacity(), 1024);
+    }
 }

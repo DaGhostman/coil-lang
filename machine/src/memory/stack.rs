@@ -211,4 +211,10 @@ mod tests {
         assert_eq!(s.capacity(), 64);
         assert_eq!(s.tell(), 0);
     }
+
+    #[test]
+    fn with_capacity_zero_becomes_one() {
+        let s = Stack::<i64>::with_capacity(0);
+        assert_eq!(s.capacity(), 1);
+    }
 }
