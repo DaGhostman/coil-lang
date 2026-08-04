@@ -307,28 +307,134 @@ fn poll_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::{AsRawFd, IntoRawFd};
-    use std::net::TcpListener;
+    use std::os::fd::RawFd;
 
-    #[test]
-    fn wait_fd_accepts_listening_socket_as_writable_or_times_out() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let fd = listener.as_raw_fd();
-        let io = IoReactor::new();
-        let _ = io.wait_fd(fd, Interest::Writable, Some(Duration::from_millis(50)));
-        std::mem::forget(listener);
+    fn pipe_fds() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    fn close_fd(fd: RawFd) {
+        unsafe {
+            let _ = libc::close(fd);
+        }
     }
 
     #[test]
-    fn async_register_and_poll() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let fd = listener.as_raw_fd();
+    fn wait_fd_times_out_on_empty_pipe_read() {
+        let (r, w) = pipe_fds();
         let io = IoReactor::new();
-        let tok = io.register_wait(fd, Interest::Readable);
-        assert_eq!(io.poll_once(Some(Duration::from_millis(10))), 0);
+        let err = io
+            .wait_fd(r, Interest::Readable, Some(Duration::from_millis(20)))
+            .expect_err("empty pipe must not be readable");
+        assert_eq!(err, IoErrorTag::TimedOut);
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn wait_fd_succeeds_when_pipe_has_data() {
+        let (r, w) = pipe_fds();
+        let n = unsafe { libc::write(w, b"x".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        let io = IoReactor::new();
+        io.wait_fd(r, Interest::Readable, Some(Duration::from_millis(50)))
+            .expect("pipe with data should be readable");
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn wait_fd_helping_invokes_help_until_timeout() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let mut helps = 0usize;
+        let err = io
+            .wait_fd_helping(
+                r,
+                Interest::Readable,
+                Some(Duration::from_millis(5)),
+                || helps += 1,
+            )
+            .expect_err("must time out");
+        assert_eq!(err, IoErrorTag::TimedOut);
+        assert!(helps > 0, "help callback should run between poll slices");
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn wait_fd_helping_returns_when_ready_after_help() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let mut helps = 0usize;
+        let err = io.wait_fd_helping(r, Interest::Readable, Some(Duration::from_millis(200)), || {
+            helps += 1;
+            if helps == 1 {
+                let n = unsafe { libc::write(w, b"y".as_ptr().cast(), 1) };
+                assert_eq!(n, 1);
+            }
+        });
+        assert!(err.is_ok(), "should become readable after help writes");
+        assert!(helps >= 1);
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn register_poll_marks_ready_when_readable() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let tok = io.register_wait(r, Interest::Readable);
+        assert_eq!(io.poll_once(Some(Duration::ZERO)), 0);
+        let n = unsafe { libc::write(w, b"z".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        assert_eq!(io.poll_once(Some(Duration::ZERO)), 1);
+        // Second poll should not re-count the already-done waiter.
+        assert_eq!(io.poll_once(Some(Duration::ZERO)), 0);
+        io.wait_token(tok, Some(Duration::from_millis(10)))
+            .expect("token already ready");
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn wait_token_after_cancel_returns_other() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let tok = io.register_wait(r, Interest::Readable);
         io.cancel_wait(tok);
-        std::mem::forget(listener);
+        let err = io
+            .wait_token(tok, Some(Duration::from_millis(20)))
+            .expect_err("cancelled token");
+        assert_eq!(err, IoErrorTag::Other);
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn wait_token_times_out_when_never_ready() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let tok = io.register_wait(r, Interest::Readable);
+        let err = io
+            .wait_token(tok, Some(Duration::from_millis(30)))
+            .expect_err("must time out");
+        assert_eq!(err, IoErrorTag::TimedOut);
+        // Timed-out wait cancels the registration.
+        let err2 = io
+            .wait_token(tok, Some(Duration::from_millis(10)))
+            .expect_err("already cancelled");
+        assert_eq!(err2, IoErrorTag::Other);
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
+    fn poll_once_empty_returns_zero() {
+        let io = IoReactor::new();
+        assert_eq!(io.poll_once(Some(Duration::ZERO)), 0);
+        assert_eq!(io.poll_once(None), 0);
     }
 }
