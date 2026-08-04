@@ -1240,7 +1240,7 @@ use string::{format, to_bytes};
                 Expression::Lambda { args, .. } => {
                     if let Expression::Fragment(children) = args.1.as_ref() {
                         children.iter().find_map(|child| {
-                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                            if matches!(child.1.as_ref(), Expression::Argument { .. }) {
                                 Some((child.0.start, child.0.end))
                             } else {
                                 None
@@ -1288,7 +1288,7 @@ use string::{format, to_bytes};
                 Expression::Lambda { args, .. } => {
                     if let Expression::Fragment(children) = args.1.as_ref() {
                         for child in children {
-                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                            if matches!(child.1.as_ref(), Expression::Argument { .. }) {
                                 out.push((child.0.start, child.0.end));
                             }
                         }
@@ -1338,7 +1338,7 @@ use string::{format, to_bytes};
                 Expression::Lambda { args, body, .. } => {
                     if let Expression::Fragment(children) = args.1.as_ref() {
                         for child in children {
-                            if matches!(child.1.as_ref(), Expression::Argument(..)) {
+                            if matches!(child.1.as_ref(), Expression::Argument { .. }) {
                                 out.push((child.0.start, child.0.end));
                             }
                         }

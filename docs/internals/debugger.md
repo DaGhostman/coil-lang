@@ -1,12 +1,17 @@
 # Debugger
 
-`coil debug` is a GDB-style debugger for coil programs. It compiles the entry
-`.hy` (and module graph) **in memory** — never writes `out.hyc` — and drives the
-VM through a stop engine gated behind an attached `DebugController`.
+`coil debug` is a GDB-style debugger for coil programs. The main `coil` binary
+**re-execs** the sibling `coil-debug` helper (git-style). That helper compiles the
+entry `.hy` (and module graph) **in memory** — never writes `out.hyc` — and drives
+the VM through a stop engine gated behind an attached `DebugController`
+(`machine` feature `debugger`).
 
 ```bash
+cargo build   # coil + coil-debug (+ coil-dissect / coil-embed)
 coil debug examples/fib.hy
 coil debug examples/fib.hy -x cmds.txt --batch
+# or invoke the helper directly:
+coil-debug examples/fib.hy -x cmds.txt --batch
 ```
 
 | Flag | Effect |

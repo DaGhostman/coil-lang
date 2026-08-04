@@ -68,6 +68,13 @@ impl Frame {
             .find(|(n, _)| n == name)
             .map(|(_, s)| s)
     }
+
+    /// Iterate bindings in insertion order for tooling such as completions.
+    pub fn bindings(&self) -> impl Iterator<Item = (&str, &Scheme)> {
+        self.bindings
+            .iter()
+            .map(|(name, scheme)| (name.as_str(), scheme))
+    }
 }
 
 /// A scoped environment: a stack of frames. The most recently pushed
@@ -113,6 +120,19 @@ impl Env {
         for frame in &self.frames {
             for (n, _) in &frame.bindings {
                 names.insert(n.clone());
+            }
+        }
+        names
+    }
+
+    /// Return visible names with inner frames shadowing outer frames.
+    pub fn visible_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for frame in self.frames.iter().rev() {
+            for (name, _) in frame.bindings.iter().rev() {
+                if !names.iter().any(|seen| seen == name) {
+                    names.push(name.clone());
+                }
             }
         }
         names

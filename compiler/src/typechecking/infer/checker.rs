@@ -14,7 +14,7 @@ use crate::typechecking::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use crate::typechecking::ty::{AssocProjection, Constraint, Scheme};
 use crate::typechecking::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use crate::typechecking::ty::{
-    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
+    EnumVariantPayloadTy, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
     list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
     result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
     strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty,
@@ -2171,7 +2171,7 @@ impl Checker {
                         items
                             .iter()
                             .filter_map(|item| {
-                                if let Expression::Argument(ty, _, _) = item.1.as_ref() {
+                                if let Expression::Argument { ty, .. } = item.1.as_ref() {
                                     ty.as_ref().map(|t| self.parse_type_name(t))
                                 } else {
                                     None
@@ -2206,7 +2206,7 @@ impl Checker {
                                 items
                                     .iter()
                                     .filter_map(|item| {
-                                        if let Expression::Argument(_, name, _) = item.1.as_ref() {
+                                        if let Expression::Argument { name, .. } = item.1.as_ref() {
                                             Some(name.to_string())
                                         } else {
                                             None
@@ -3898,6 +3898,7 @@ impl Checker {
 
             // ---- Function declarations ----
             Expression::Function {
+                docs: _,
                 attrs,
                 name,
                 is_coro,
@@ -4054,6 +4055,7 @@ impl Checker {
                 unit_ty()
             }
             Expression::Class {
+                docs: _,
                 name,
                 type_params,
                 fields,
@@ -4065,7 +4067,7 @@ impl Checker {
                 self.pop_type_params_for_type_parsing(pushed);
                 unit_ty()
             }
-            Expression::Argument(ty, _name, is_rest) => {
+            Expression::Argument { ty, is_rest, .. } => {
                 if *is_rest {
                     match ty {
                         None => Ty::Var(self.counter.fresh()),
@@ -4249,6 +4251,7 @@ impl Checker {
 
             // ---- Enums / constructors / type aliases ----
             Expression::EnumDecl {
+                docs: _,
                 name,
                 type_params,
                 variants,
@@ -4259,6 +4262,7 @@ impl Checker {
                 unit_ty()
             }
             Expression::TypeAlias {
+                docs: _,
                 name,
                 type_params,
                 ty,
@@ -4346,6 +4350,7 @@ impl Checker {
 
             // ---- Generics ----
             Expression::TypeClass {
+                docs: _,
                 name,
                 type_params,
                 methods,
@@ -4382,6 +4387,7 @@ impl Checker {
                             None
                         }
                         Expression::Function {
+                            docs: _,
                             name: mname, body, ..
                         } => {
                             let has_default = body.as_ref().is_some_and(
@@ -4479,6 +4485,7 @@ impl Checker {
                 }];
                 for method in methods {
                     if let Expression::Function {
+                        docs: _,
                         name: method_name,
                         type_params: method_params,
                         args,
@@ -4786,6 +4793,7 @@ impl Checker {
                         _ => {
                             let maybe_fn = match m.1.as_ref() {
                                 Expression::Function {
+                                    docs: _,
                                     name,
                                     type_params,
                                     args,
@@ -4805,6 +4813,7 @@ impl Checker {
                                 )),
                                 Expression::Method(_, body) => match body.1.as_ref() {
                                     Expression::Function {
+                                        docs: _,
                                         name,
                                         type_params,
                                         args,
@@ -9748,6 +9757,7 @@ impl Checker {
         let mut field_info = Vec::new();
         for field in fields {
             if let Expression::Field {
+                docs: _,
                 visibility: vis,
                 modifier,
                 name: fname,
@@ -9887,6 +9897,7 @@ impl Checker {
         for method in methods {
             if let Expression::Method(vis, body) = method.1.as_ref() {
                 if let Expression::Function {
+                    docs: _,
                     name,
                     is_coro,
                     is_static,
@@ -10155,11 +10166,11 @@ impl Checker {
         );
         let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
         if children.last().is_some_and(|c| {
-            matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+            matches!(c.1.as_ref(), Expression::Argument { is_rest: true, .. })
         }));
         let has_tuple_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
         if children.last().is_some_and(|c| {
-            matches!(c.1.as_ref(), Expression::Argument(None, _, true))
+            matches!(c.1.as_ref(), Expression::Argument { ty: None, is_rest: true, .. })
         }));
         self.fn_has_rest.insert(name.to_string(), has_rest);
         self.fn_tuple_rest.insert(name.to_string(), has_tuple_rest);
@@ -10560,7 +10571,12 @@ impl Checker {
         // Sole bare `...args` in a fn type: opaque callable unified at spread calls.
         if let Expression::Fragment(children) = params.1.as_ref() {
             if children.len() == 1 {
-                if let Expression::Argument(None, _, true) = children[0].1.as_ref() {
+                if let Expression::Argument {
+                    ty: None,
+                    is_rest: true,
+                    ..
+                } = children[0].1.as_ref()
+                {
                     return Ty::Var(self.counter.fresh());
                 }
             }
@@ -10578,7 +10594,12 @@ impl Checker {
         if let Expression::Fragment(children) = args.1.as_ref() {
             if children
                 .last()
-                .is_some_and(|c| matches!(c.1.as_ref(), Expression::Argument(None, _, true)))
+                .is_some_and(|c| {
+                    matches!(
+                        c.1.as_ref(),
+                        Expression::Argument { ty: None, is_rest: true, .. }
+                    )
+                })
             {
                 return Some(Ty::Var(counter.fresh()));
             }
@@ -10665,7 +10686,7 @@ impl Checker {
                     }
                     let id = self.ids.ids()[self.next_id_idx];
                     self.next_id_idx += 1;
-                    let ty = if let Expression::Argument(..) = child.1.as_ref() {
+                    let ty = if let Expression::Argument { .. } = child.1.as_ref() {
                         let t = arg_tys
                             .get(ty_idx)
                             .map(|(_, t)| t.clone())
@@ -10703,7 +10724,13 @@ impl Checker {
         if let Expression::Fragment(children) = args.1.as_ref() {
             let n = children.len();
             for (i, child) in children.iter().enumerate() {
-                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref() {
+                if let Expression::Argument {
+                    ty,
+                    name,
+                    is_rest,
+                    ..
+                } = child.1.as_ref()
+                {
                     if *is_rest {
                         if i + 1 != n {
                             let mut msg = Message::error(
@@ -11322,6 +11349,7 @@ impl Checker {
                 self.pre_register_enums_walk(ty, errors);
             }
             Expression::EnumDecl {
+                docs: _,
                 name,
                 type_params,
                 variants,
@@ -11336,6 +11364,7 @@ impl Checker {
 
                 for v in variants {
                     if let Expression::EnumVariant {
+                        docs: _,
                         name: vname,
                         payload,
                     } = v.1.as_ref()
@@ -11501,7 +11530,7 @@ impl Checker {
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
             | Expression::Constant(_, _)
-            | Expression::Argument(_, _, _)
+            | Expression::Argument { .. }
             | Expression::Field { .. }
             | Expression::QualifiedAccess { .. }
             | Expression::ExternBlock { .. }
@@ -11769,6 +11798,7 @@ impl Checker {
                 self.pre_register_enums_walk(ret, errors);
             }
             Expression::AttrDecl {
+                docs: _,
                 args,
                 returns,
                 body,
@@ -11828,6 +11858,7 @@ impl Checker {
             let _ = self.infer(v);
 
             if let Expression::EnumVariant {
+                docs: _,
                 name: vname,
                 payload,
             } = v.1.as_ref()

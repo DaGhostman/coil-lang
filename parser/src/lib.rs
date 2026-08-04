@@ -66,6 +66,10 @@ macro_rules! output {
 }
 
 pub mod ast;
+pub mod fmt;
+
+pub use ast::item_docs;
+pub use fmt::{format_program, format_range, format_source};
 
 #[derive(Default)]
 pub struct Pratt<'pratt> {
@@ -700,26 +704,51 @@ impl<'pratt> Pratt<'pratt> {
             + 'pratt,
     {
         // `... name` (tuple rest), `T... name` (homogeneous rest), or `T name` (fixed).
-        let tuple_rest_arg = op!("...")
-            .ignore_then(text::ident().padded())
-            .map_with(|name, e| (e.span(), Box::new(Expression::Argument(None, name, true))));
-        let rest_arg = ty_parser
-            .clone()
-            .then_ignore(just("...").padded())
-            .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
+        let tuple_rest_arg = self
+            .docs_prefix()
+            .then(op!("...").ignore_then(text::ident().padded()))
+            .map_with(|(docs, name), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, true)),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: None,
+                        name,
+                        is_rest: true,
+                    }),
                 )
             });
-        let fixed_arg = ty_parser
+        let rest_arg = self
+            .docs_prefix()
+            .then(ty_parser
             .clone()
-            .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded()))
+            .map_with(|(docs, (ty, name)), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, false)),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: Some(ty),
+                        name,
+                        is_rest: true,
+                    }),
+                )
+            });
+        let fixed_arg = self
+            .docs_prefix()
+            .then(ty_parser
+            .clone()
+            .then(text::ident().padded()))
+            .map_with(|(docs, (ty, name)), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Argument {
+                        docs,
+                        ty: Some(ty),
+                        name,
+                        is_rest: false,
+                    }),
                 )
             });
         let arg = tuple_rest_arg.or(rest_arg).or(fixed_arg);
@@ -849,8 +878,8 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("async")
-            .or_not()
+        self.docs_prefix()
+            .then(keyword!("async").or_not())
             .then(keyword!("static").or_not())
             .then(keyword!("fn"))
             .then(text::ident().padded())
@@ -860,7 +889,7 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.where_clause())
             .map_with(
                 |(
-                    ((((((is_coro, is_static), _), name), type_params), args), returns),
+                    (((((((docs, is_coro), is_static), _), name), type_params), args), returns),
                     where_constraints,
                 ),
                  e| {
@@ -868,6 +897,7 @@ impl<'pratt> Pratt<'pratt> {
                     (
                         e.span(),
                         Box::new(Expression::Function {
+                            docs,
                             attrs: vec![],
                             name,
                             is_coro: is_coro.is_some(),
@@ -888,18 +918,22 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("attr")
-            .ignore_then(text::ident().padded())
-            .then(self.type_param_list())
-            .then(self.arg_list_typed(self.type_annotation()))
-            .then(op!("->").ignore_then(self.type_annotation()).or_not())
-            .then(self.where_clause())
-            .then(self.block(self.statement()))
+        self.docs_prefix()
+            .then(
+                keyword!("attr")
+                    .ignore_then(text::ident().padded())
+                    .then(self.type_param_list())
+                    .then(self.arg_list_typed(self.type_annotation()))
+                    .then(op!("->").ignore_then(self.type_annotation()).or_not())
+                    .then(self.where_clause())
+                    .then(self.block(self.statement())),
+            )
             .map_with(
-                |(((((name, type_params), args), returns), where_constraints), body), e| {
+                |(docs, (((((name, type_params), args), returns), where_constraints), body)), e| {
                     (
                         e.span(),
                         Box::new(Expression::AttrDecl {
+                            docs,
                             name,
                             type_params,
                             args,
@@ -913,6 +947,26 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn func<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.docs_prefix()
+            .then(self.func_after_docs(stmt))
+            .map_with(|(docs, mut func), e| {
+                if let Expression::Function { docs: d, .. } = func.1.as_mut() {
+                    *d = docs;
+                }
+                (e.span(), func.1)
+            })
+    }
+
+    /// `#[…] async? static? fn …` without a leading `///` prefix (docs applied by callers).
+    fn func_after_docs<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
@@ -945,6 +999,7 @@ impl<'pratt> Pratt<'pratt> {
                 (
                     e.span(),
                     Box::new(Expression::Function {
+                        docs: Vec::new(),
                         attrs,
                         name,
                         is_coro: is_coro.is_some(),
@@ -1227,9 +1282,53 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        op!("//")
-            .ignore_then(none_of('\n').repeated().to_slice().padded())
-            .map_with(output!(Comment))
+        // `//` that is not `///` — doc comments are handled by `docs_prefix`.
+        just("//")
+            .then_ignore(just('/').not())
+            .ignore_then(none_of('\n').repeated().to_slice())
+            .then_ignore(just('\n').or_not())
+            .map_with(|text: &str, e| {
+                let text = text.strip_prefix(' ').unwrap_or(text);
+                (e.span(), Box::new(Expression::Comment(text)))
+            })
+            .padded()
+    }
+
+    /// One `///` doc line; returns the body without the `///` prefix.
+    fn doc_comment_line(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, &'pratt str, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        just("///")
+            .ignore_then(none_of('\n').repeated().to_slice())
+            .then_ignore(just('\n').or_not())
+            .map(|text: &str| text.strip_prefix(' ').unwrap_or(text))
+            .padded()
+    }
+
+    /// Zero or more leading `///` lines before a declaration.
+    fn docs_prefix(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Vec<&'pratt str>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.doc_comment_line().repeated().collect()
+    }
+
+    /// Bare `///` not followed by a documentable item — hard error.
+    fn orphan_doc_comment(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.doc_comment_line()
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .try_map(|_docs, span| {
+                Err(Rich::custom(
+                    span,
+                    "doc comment (`///`) must immediately precede a declaration",
+                ))
+            })
     }
 
     fn expr_statement(
@@ -1285,6 +1384,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.defer(stmt.clone()),
                 self.expr_statement(),
                 self.comment(),
+                self.orphan_doc_comment(),
             ))
         })
         .map_with(output!(Statement))
@@ -1329,6 +1429,7 @@ impl<'pratt> Pratt<'pratt> {
             self.defer(stmt.clone()),
             self.extern_struct(),
             self.extern_block(),
+            self.orphan_doc_comment(),
             stmt.clone(),
         ))
     }
@@ -1355,16 +1456,20 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("type")
-            .ignore_then(text::ident().padded())
-            .then(self.type_param_list())
-            .then_ignore(op!("="))
-            .then(self.type_annotation())
-            .then_ignore(op!(";"))
-            .map_with(|((name, type_params), ty), e| {
+        self.docs_prefix()
+            .then(
+                keyword!("type")
+                    .ignore_then(text::ident().padded())
+                    .then(self.type_param_list())
+                    .then_ignore(op!("="))
+                    .then(self.type_annotation())
+                    .then_ignore(op!(";")),
+            )
+            .map_with(|(docs, ((name, type_params), ty)), e| {
                 (
                     e.span(),
                     Box::new(Expression::TypeAlias {
+                        docs,
                         name,
                         type_params,
                         ty: Box::new(ty),
@@ -1382,16 +1487,27 @@ impl<'pratt> Pratt<'pratt> {
     {
         let segment = text::ident().padded();
 
-        // One item inside `{ … }`: `name` or `name as alias`.
+        // One item inside `{ … }`: `name`, `path::name`, or either with `as`.
         let brace_item = text::ident()
             .padded()
+            .then(
+                op!("::")
+                    .ignore_then(text::ident().padded().map(|s: &str| s.to_string()))
+                    .repeated()
+                    .collect::<Vec<String>>(),
+            )
             .then(
                 keyword!("as")
                     .ignore_then(text::ident().padded())
                     .map(|s: &str| s.to_string())
                     .or_not(),
             )
-            .map(|(name, alias): (&str, Option<String>)| (name.to_string(), alias));
+            .map(
+                |((first, mut rest), alias): ((&str, Vec<String>), Option<String>)| {
+                    rest.insert(0, first.to_string());
+                    (rest, alias)
+                },
+            );
 
         // Empty `{ }` is a parse error (silent no-op would hide typos).
         let brace_group = just('{')
@@ -1414,7 +1530,7 @@ impl<'pratt> Pratt<'pratt> {
 
         #[derive(Clone)]
         enum EndKind {
-            Brace(Vec<(String, Option<String>)>),
+            Brace(Vec<(Vec<String>, Option<String>)>),
             Glob,
             Concrete(Option<String>),
         }
@@ -1444,24 +1560,27 @@ impl<'pratt> Pratt<'pratt> {
                             let mut path = Vec::with_capacity(1 + middle.len());
                             path.push(first.to_string());
                             path.extend(middle);
-                            if items.len() == 1 {
-                                let (name, alias) = items.into_iter().next().unwrap();
-                                return (span, Box::new(Expression::Use { path, name, alias }));
-                            }
                             let children: Vec<Output<'pratt>> = items
                                 .into_iter()
-                                .map(|(name, alias)| {
+                                .map(|(mut item_path, alias)| {
+                                    let name = item_path.pop().expect("brace item has a name");
+                                    let mut child_path = path.clone();
+                                    child_path.extend(item_path);
                                     (
                                         span,
                                         Box::new(Expression::Use {
-                                            path: path.clone(),
+                                            path: child_path,
                                             name,
                                             alias,
                                         }),
                                     )
                                 })
                                 .collect();
-                            (span, Box::new(Expression::Fragment(children)))
+                            if children.len() == 1 {
+                                children.into_iter().next().unwrap()
+                            } else {
+                                (span, Box::new(Expression::Fragment(children)))
+                            }
                         }
                         EndKind::Glob => {
                             let mut path = Vec::with_capacity(1 + middle.len());
@@ -1578,7 +1697,12 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(ty, name), e| {
                 ExternArg::Fixed((
                     e.span(),
-                    Box::new(Expression::Argument(Some(ty), name, false)),
+                    Box::new(Expression::Argument {
+                        docs: Vec::new(),
+                        ty: Some(ty),
+                        name,
+                        is_rest: false,
+                    }),
                 ))
             });
         // Prefer illegal-rest so `int... xs` is recognized (then rejected).
@@ -1769,7 +1893,8 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        self.attr_list()
+        self.docs_prefix()
+            .then(self.attr_list())
             .then(keyword!("class"))
             .then(text::ident().padded())
             .then(self.type_param_list())
@@ -1780,10 +1905,11 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|((((attrs, _), name), type_params), fields), e| {
+            .map_with(|(((((docs, attrs), _), name), type_params), fields), e| {
                 (
                     e.span(),
                     Box::new(Expression::Class {
+                        docs,
                         attrs,
                         name,
                         type_params,
@@ -1798,8 +1924,8 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("pub")
-            .or_not()
+        self.docs_prefix()
+            .then(keyword!("pub").or_not())
             .then(
                 choice((
                     just("static").padded().to(FieldModifier::Static),
@@ -1811,7 +1937,7 @@ impl<'pratt> Pratt<'pratt> {
             .then_ignore(op!(":"))
             .then(self.type_annotation())
             .then(op!("=").ignore_then(self.expr()).or_not())
-            .map_with(|((((vis, modifier), name), ty), init), e| {
+            .map_with(|(((((docs, vis), modifier), name), ty), init), e| {
                 let visibility = if vis.is_some() {
                     Visibility::Public
                 } else {
@@ -1822,6 +1948,7 @@ impl<'pratt> Pratt<'pratt> {
                 (
                     e.span(),
                     Box::new(Expression::Field {
+                        docs,
                         visibility,
                         modifier,
                         name: name_output,
@@ -1974,20 +2101,24 @@ impl<'pratt> Pratt<'pratt> {
                 )
             });
 
-        keyword!("trait")
-            .ignore_then(text::ident().padded())
-            .then(self.type_param_list())
+        self.docs_prefix()
             .then(
-                choice((assoc_decl, sig_only, default_method))
-                    .padded()
-                    .repeated()
-                    .collect::<Vec<_>>()
-                    .delimited_by(op!("{"), op!("}")),
+                keyword!("trait")
+                    .ignore_then(text::ident().padded())
+                    .then(self.type_param_list())
+                    .then(
+                        choice((assoc_decl, sig_only, default_method))
+                            .padded()
+                            .repeated()
+                            .collect::<Vec<_>>()
+                            .delimited_by(op!("{"), op!("}")),
+                    ),
             )
-            .map_with(|((name, type_params), methods), e| {
+            .map_with(|(docs, ((name, type_params), methods)), e| {
                 (
                     e.span(),
                     Box::new(Expression::TypeClass {
+                        docs,
                         name,
                         type_params,
                         methods,
@@ -2253,10 +2384,13 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("pub")
-            .or_not()
-            .then(self.func(stmt))
-            .map_with(|(vis, func), e| {
+        self.docs_prefix()
+            .then(keyword!("pub").or_not())
+            .then(self.func_after_docs(stmt))
+            .map_with(|((docs, vis), mut func), e| {
+                if let Expression::Function { docs: d, .. } = func.1.as_mut() {
+                    *d = docs;
+                }
                 let visibility = if vis.is_some() {
                     Visibility::Public
                 } else {
@@ -2882,7 +3016,8 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        self.attr_list()
+        self.docs_prefix()
+            .then(self.attr_list())
             .then(keyword!("enum"))
             .then(text::ident().padded())
             .then(self.type_param_list())
@@ -2893,10 +3028,11 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!('{'), op!('}')),
             )
-            .map_with(|((((attrs, _), name), type_params), variants), e| {
+            .map_with(|(((((docs, attrs), _), name), type_params), variants), e| {
                 (
                     e.span(),
                     Box::new(Expression::EnumDecl {
+                        docs,
                         attrs,
                         name,
                         type_params,
@@ -2945,13 +3081,17 @@ impl<'pratt> Pratt<'pratt> {
             .or_not()
             .map(|opt| opt.unwrap_or(EnumVariantPayload::Unit));
 
-        text::ident()
-            .padded()
+        self.docs_prefix()
+            .then(text::ident().padded())
             .then(payload_choice)
-            .map_with(|(name, payload), e| {
+            .map_with(|((docs, name), payload), e| {
                 (
                     e.span(),
-                    Box::new(Expression::EnumVariant { name, payload }),
+                    Box::new(Expression::EnumVariant {
+                        docs,
+                        name,
+                        payload,
+                    }),
                 )
             })
     }

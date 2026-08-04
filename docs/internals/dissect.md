@@ -1,11 +1,17 @@
 # Dissect
 
-`coil dissect` compiles a `.hy` entry (and its module graph) **in memory** — it never writes `out.hyc` — and prints a filtered view of the result for DX.
+`coil dissect` re-execs the sibling `coil-dissect` helper (git-style). That helper
+compiles a `.hy` entry (and its module graph) **in memory** — it never writes
+`out.hyc` — and prints a filtered view of the result for DX (`compiler` feature
+`dissect`).
 
 ```bash
+cargo build   # coil + coil-dissect (+ other helpers)
 coil dissect examples/fib.hy --fn fib
 coil dissect examples/fib.hy --fn fib --il
 coil dissect examples/fib.hy --ast
+# or:
+coil-dissect examples/fib.hy --fn fib --il
 ```
 
 | Flag | Effect |

@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = ["crypto", "time", "regex", "tls"]
+debugger = []
 crypto = [
     "dep:sha2",
     "dep:blake3",

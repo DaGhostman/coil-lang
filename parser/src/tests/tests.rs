@@ -107,6 +107,7 @@
         let ast = decl_ast!("fn f() { defer { write(\"x\"); } write(\"y\"); }");
         match ast {
             Expression::Function {
+                docs: _,
                 body: Some(body), ..
             } => {
                 let Expression::Block(items) = body.1.as_ref() else {
@@ -134,6 +135,7 @@
         let ast = decl_ast!("fn f() { let x = 1; defer use (x) { write(\"%i\", x); } }");
         match ast {
             Expression::Function {
+                docs: _,
                 body: Some(body), ..
             } => {
                 let Expression::Block(items) = body.1.as_ref() else {
@@ -403,7 +405,7 @@
                 assert_eq!(variants.len(), 2);
 
                 match variants[0].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "None");
                         assert!(matches!(payload, EnumVariantPayload::Unit));
                     }
@@ -411,7 +413,7 @@
                 }
 
                 match variants[1].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "Some");
                         match payload {
                             EnumVariantPayload::Tuple(parts) => {
@@ -439,7 +441,7 @@
                 assert_eq!(name, "Shape");
                 assert_eq!(variants.len(), 1);
                 match variants[0].1.as_ref() {
-                    Expression::EnumVariant { name, payload } => {
+                    Expression::EnumVariant { docs: _, name, payload } => {
                         assert_eq!(*name, "Circle");
                         match payload {
                             EnumVariantPayload::Record(fields) => {
@@ -990,7 +992,14 @@
         let found = match func {
             Expression::Function { args, .. } => match args.1.as_ref() {
                 Expression::Fragment(items) => {
-                    matches!(items[0].1.as_ref(), Expression::Argument(_, "xs", true))
+                    matches!(
+                        items[0].1.as_ref(),
+                        Expression::Argument {
+                            name: "xs",
+                            is_rest: true,
+                            ..
+                        }
+                    )
                 }
                 _ => false,
             },
@@ -1003,6 +1012,26 @@
             "display should show rest syntax, got {}",
             func
         );
+    }
+
+    #[test]
+    fn parameter_docs_attach_to_arguments() {
+        let src = "fn sum(\n/// Values to add.\nint... xs,\n) -> int { return 0; }";
+        let ast = Pratt::default().parse(src).expect("parse");
+        let Expression::Program(items) = ast.1.as_ref() else {
+            panic!("expected program");
+        };
+        let Expression::Function { args, .. } = items[0].1.as_ref() else {
+            panic!("expected function");
+        };
+        let Expression::Fragment(params) = args.1.as_ref() else {
+            panic!("expected params");
+        };
+        let Expression::Argument { docs, name, .. } = params[0].1.as_ref() else {
+            panic!("expected argument");
+        };
+        assert_eq!(*name, "xs");
+        assert_eq!(docs, &["Values to add."]);
     }
 
     #[test]

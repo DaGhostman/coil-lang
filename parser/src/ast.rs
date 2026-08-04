@@ -158,7 +158,13 @@ pub enum Expression<'expr> {
 
     /// Function parameter `T name`, homogeneous rest `T... name`, or tuple
     /// rest `... name` (`ty` is `None` for bare tuple rest).
-    Argument(Option<Output<'expr>>, &'expr str, bool),
+    Argument {
+        /// Leading `///` documentation lines for this parameter.
+        docs: Vec<&'expr str>,
+        ty: Option<Output<'expr>>,
+        name: &'expr str,
+        is_rest: bool,
+    },
 
     /// Call-site spread: `f(...expr)`.
     Spread(Output<'expr>),
@@ -171,6 +177,8 @@ pub enum Expression<'expr> {
 
     /// User-defined attribute declaration.
     AttrDecl {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
         args: Output<'expr>,
@@ -193,6 +201,7 @@ pub enum Expression<'expr> {
     },
     /// Function type annotation `A -> B`.
     TypeFun(Output<'expr>, Output<'expr>),
+    /// Line comment `// …` (body without the `//` prefix).
     Comment(&'expr str),
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
@@ -325,6 +334,8 @@ pub enum Expression<'expr> {
     },
 
     Function {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         is_coro: bool,
@@ -381,6 +392,8 @@ pub enum Expression<'expr> {
     },
 
     Class {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
@@ -394,6 +407,8 @@ pub enum Expression<'expr> {
         methods: Vec<Output<'expr>>,
     },
     Field {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         visibility: Visibility,
         modifier: FieldModifier,
         name: Output<'expr>,
@@ -401,6 +416,7 @@ pub enum Expression<'expr> {
         /// Required initializer for `static` fields.
         init: Option<Output<'expr>>,
     },
+    /// Method in an `impl` / trait body. Docs live on the inner [`Function`].
     Method(Visibility, Output<'expr>),
     Member(Output<'expr>),
     Access(Output<'expr>, &'expr str),
@@ -409,6 +425,8 @@ pub enum Expression<'expr> {
 
     /// `type Name = T;` — type alias declaration.
     TypeAlias {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
         ty: Box<Output<'expr>>,
@@ -425,6 +443,8 @@ pub enum Expression<'expr> {
 
     /// Top-level `enum` declaration.
     EnumDecl {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
@@ -436,6 +456,8 @@ pub enum Expression<'expr> {
 
     /// One variant inside an `enum` body.
     EnumVariant {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         name: &'expr str,
         payload: EnumVariantPayload<'expr>,
     },
@@ -459,6 +481,8 @@ pub enum Expression<'expr> {
 
     /// `trait Name<T> { type Elem; fn ...; fn ... { default } }`
     TypeClass {
+        /// Leading `///` doc lines (without the `///` prefix).
+        docs: Vec<&'expr str>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
         /// Body items: `AssocTypeDecl`, and `Function` nodes (empty `Block` = sig-only).
@@ -683,6 +707,45 @@ pub fn attr_test_desc<'expr>(attrs: &[Attribute<'expr>], fn_name: &str) -> Optio
         _ => fn_name.to_string(),
     };
     Some(desc)
+}
+
+/// Attached `///` documentation lines for a declaration node, if any.
+///
+/// For [`Expression::Method`], docs are taken from the wrapped [`Expression::Function`].
+pub fn item_docs<'expr>(expr: &'expr Expression<'expr>) -> Option<&'expr [&'expr str]> {
+    let docs = match expr {
+        Expression::Function { docs, .. }
+        | Expression::Class { docs, .. }
+        | Expression::Field { docs, .. }
+        | Expression::TypeAlias { docs, .. }
+        | Expression::EnumDecl { docs, .. }
+        | Expression::EnumVariant { docs, .. }
+        | Expression::TypeClass { docs, .. }
+        | Expression::AttrDecl { docs, .. } => docs.as_slice(),
+        Expression::Method(_, inner) => return item_docs(inner.1.as_ref()),
+        _ => return None,
+    };
+    if docs.is_empty() {
+        None
+    } else {
+        Some(docs)
+    }
+}
+
+fn fmt_docs(docs: &[&str]) -> String {
+    if docs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in docs {
+        out.push_str("///");
+        if !line.is_empty() {
+            out.push(' ');
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Format a `Vec<TypeParam>` as `<T, U: Num + Eq, F: * -> *>`.
@@ -930,6 +993,7 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::Function {
+                docs,
                 attrs,
                 name,
                 is_coro,
@@ -963,7 +1027,7 @@ impl<'a> Display for Expression<'a> {
                             .join(", ")
                     )
                 };
-                let attr_prefix = fmt_attrs(attrs);
+                let attr_prefix = format!("{}{}", fmt_docs(docs), fmt_attrs(attrs));
                 match body {
                     Some(b) => write!(
                         f,
@@ -1000,7 +1064,13 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
-            Self::Argument(ty, name, is_rest) => {
+            Self::Argument {
+                docs,
+                ty,
+                name,
+                is_rest,
+            } => {
+                write!(f, "{}", fmt_docs(docs))?;
                 if *is_rest {
                     match ty {
                         None => write!(f, "... {}", name),
@@ -1013,6 +1083,7 @@ impl<'a> Display for Expression<'a> {
             Self::Spread(inner) => write!(f, "...{}", inner.1),
             Self::TypeFnSig { params, ret } => write!(f, "fn{} -> {}", params.1, ret.1),
             Self::AttrDecl {
+                docs,
                 name,
                 type_params,
                 args,
@@ -1020,7 +1091,7 @@ impl<'a> Display for Expression<'a> {
                 where_constraints,
                 body,
             } => {
-                write!(f, "attr {}", name)?;
+                write!(f, "{}attr {}", fmt_docs(docs), name)?;
                 if !type_params.is_empty() {
                     write!(
                         f,
@@ -1074,10 +1145,12 @@ impl<'a> Display for Expression<'a> {
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1),
             Self::TypeAlias {
+                docs,
                 name,
                 type_params,
                 ty,
             } => {
+                write!(f, "{}", fmt_docs(docs))?;
                 if type_params.is_empty() {
                     write!(f, "type {} = {};", name, ty.1)
                 } else {
@@ -1098,6 +1171,7 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{{ {} }}", parts.join(", "))
             }
             Self::EnumDecl {
+                docs,
                 attrs,
                 name,
                 type_params,
@@ -1108,11 +1182,11 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
-                let attr_prefix = fmt_attrs(attrs);
+                let attr_prefix = format!("{}{}", fmt_docs(docs), fmt_attrs(attrs));
                 let vs = variants
                     .iter()
                     .map(|v| match v.1.as_ref() {
-                        Self::EnumVariant { name, payload } => match payload {
+                        Self::EnumVariant { name, payload, .. } => match payload {
                             EnumVariantPayload::Unit => name.to_string(),
                             EnumVariantPayload::Tuple(parts) => {
                                 if parts.is_empty() {
@@ -1143,7 +1217,9 @@ impl<'a> Display for Expression<'a> {
                     .join(", ");
                 write!(f, "{}enum {}{} {{ {} }}", attr_prefix, name, tp, vs)
             }
-            Self::EnumVariant { name, payload } => match payload {
+            Self::EnumVariant { docs, name, payload } => {
+                write!(f, "{}", fmt_docs(docs))?;
+                match payload {
                 EnumVariantPayload::Unit => write!(f, "{}", name),
                 EnumVariantPayload::Tuple(parts) => {
                     if parts.is_empty() {
@@ -1167,6 +1243,7 @@ impl<'a> Display for Expression<'a> {
                         .map(|rf| format!("{}: {}", rf.name, rf.value.1))
                         .collect();
                     write!(f, "{} {{ {} }}", name, parts.join(", "))
+                }
                 }
             },
             Self::Construct {
@@ -1261,6 +1338,7 @@ impl<'a> Display for Expression<'a> {
                 ty.1
             ),
             Self::Class {
+                docs,
                 attrs,
                 name,
                 type_params,
@@ -1271,7 +1349,7 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
-                let attr_prefix = fmt_attrs(attrs);
+                let attr_prefix = format!("{}{}", fmt_docs(docs), fmt_attrs(attrs));
                 let fs: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
                 write!(
                     f,
@@ -1320,10 +1398,12 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::TypeClass {
+                docs,
                 name,
                 type_params,
                 methods,
             } => {
+                write!(f, "{}", fmt_docs(docs))?;
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -1398,6 +1478,36 @@ impl<'a> Display for Expression<'a> {
                     write!(f, " as {}", a)?;
                 }
                 write!(f, ";")
+            }
+            Self::Comment(text) => {
+                write!(f, "//")?;
+                if !text.is_empty() {
+                    write!(f, " {}", text)?;
+                }
+                Ok(())
+            }
+            Self::Field {
+                docs,
+                visibility,
+                modifier,
+                name,
+                ty,
+                init,
+            } => {
+                write!(f, "{}", fmt_docs(docs))?;
+                if matches!(visibility, Visibility::Public) {
+                    write!(f, "pub ")?;
+                }
+                match modifier {
+                    FieldModifier::Static => write!(f, "static ")?,
+                    FieldModifier::Const => write!(f, "const ")?,
+                    FieldModifier::Instance => {}
+                }
+                write!(f, "{}: {}", name.1, ty.1)?;
+                if let Some(init) = init {
+                    write!(f, " = {}", init.1)?;
+                }
+                Ok(())
             }
             Self::Program(items) => {
                 for (i, item) in items.iter().enumerate() {

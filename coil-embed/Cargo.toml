@@ -1,0 +1,18 @@
+[package]
+name = "coil-embed"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "coil-embed"
+path = "src/main.rs"
+
+[dependencies]
+coil-cli = { path = "../coil-cli", default-features = false }
+
+[features]
+default = ["crypto", "time", "regex", "tls"]
+crypto = ["coil-cli/crypto"]
+time = ["coil-cli/time"]
+regex = ["coil-cli/regex"]
+tls = ["coil-cli/tls"]

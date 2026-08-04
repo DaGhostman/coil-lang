@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::diagnostic::{Diagnostic, Severity};
+use crate::position::byte_offset_to_lsp_position;
 use crate::sink::DiagnosticSink;
 use crate::source::{SourceId, SourceMap};
 
@@ -41,25 +42,11 @@ impl LspSink {
     }
 
     fn byte_to_position(text: &str, byte: usize) -> LspPosition {
-        let byte = byte.min(text.len());
-        let mut line: u32 = 0;
-        let mut line_start = 0usize;
-        for (idx, ch) in text.char_indices() {
-            if idx >= byte {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                line_start = idx + ch.len_utf8();
-            }
+        let position = byte_offset_to_lsp_position(text, byte);
+        LspPosition {
+            line: position.line,
+            character: position.character,
         }
-        // Character offset: count UTF-16 code units from line_start to byte.
-        let mut character: u32 = 0;
-        let slice = &text[line_start..byte.min(text.len())];
-        for ch in slice.chars() {
-            character += ch.len_utf16() as u32;
-        }
-        LspPosition { line, character }
     }
 
     fn range_for(&self, file: SourceId, range: &std::ops::Range<usize>) -> LspRange {

@@ -29,6 +29,36 @@ Line comments start with `//` and run to the end of the line:
 let x = 5; // inline comment
 ```
 
+Documentation comments use `///` and must sit immediately above a declaration
+(`fn`, `class`, field, `trait`, `enum`, …). Function parameters may also have
+their own `///` lines immediately above the parameter inside the signature.
+They are stored on the AST for docgen / LSP hover (`parser::item_docs`); the
+compiler ignores them for semantics. `coil fmt` preserves both `//` and `///`.
+
+```coil
+/// Return the next Fibonacci number.
+fn fib(int n) -> int {
+    if n <= 2 {
+        return 1;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+```
+
+Parameter documentation is shown with the function documentation in LSP
+hover:
+
+```coil
+fn fib(
+    /// Zero-based sequence index.
+    int n,
+) -> int {
+    return n;
+}
+```
+
+A bare `///` that is not followed by a declaration is a parse error.
+
 Comments are ignored by the compiler. Use them to explain *why* something is written a certain way, not to restate what the code already says.
 
 ---

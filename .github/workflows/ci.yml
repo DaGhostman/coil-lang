@@ -39,15 +39,19 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Build all CLI binaries
+        run: cargo build
+
       - name: Workspace tests
         run: |
           # macOS runners occasionally hit EAGAIN (WouldBlock) while cargo
           # lists many test binaries in parallel; one retry clears it.
-          cargo test --workspace || cargo test --workspace
+          # default-members builds coil + coil-debug/dissect/fmt/embed together.
+          cargo test || cargo test
+          cargo test -p compiler --features dissect || cargo test -p compiler --features dissect
 
       - name: Language harness (`coil test`)
         run: |
-          cargo build -q
           ./target/debug/coil test
 
       - name: Showcase project tests

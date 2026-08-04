@@ -1,8 +1,41 @@
 use super::*;
-use crate::typechecking::{CStructDef, ForInKind, IoBuiltin, ThreadBuiltin};
+use crate::typechecking::{CStructDef, ForInKind};
 use reporting::{ErrorCode, Message};
 
+#[cfg(any(test, feature = "dissect"))]
+type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
+#[cfg(not(any(test, feature = "dissect")))]
+type FinalizeIlOut = ();
+
 impl Compiler {
+    /// Expose inferred state to language tooling after a module is checked.
+    pub fn checker(&self) -> &crate::typechecking::Checker {
+        &self.checker
+    }
+
+    pub fn checker_mut(&mut self) -> &mut crate::typechecking::Checker {
+        &mut self.checker
+    }
+
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+
+    pub fn module_items(&self) -> &HashMap<String, Vec<String>> {
+        &self.module_items
+    }
+
+    /// Run HM inference for a module without emitting bytecode.
+    pub fn typecheck_module<'compiler>(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) {
+        self.checker.set_current_module(module);
+        let _ = self.checker.check_program(ast);
+        self.messages.extend(self.checker.take_messages());
+    }
+
     pub fn constants(&self) -> &[u64] {
         &self.constants
     }
@@ -4524,6 +4557,7 @@ impl Compiler {
     ) {
         let _method_id = self.next_emit_id();
         let Expression::Function {
+            docs: _,
             name,
             is_coro,
             args,
@@ -4798,7 +4832,12 @@ impl Compiler {
         let mut overrides = HashMap::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
-                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref()
+                if let Expression::Argument {
+                    ty,
+                    name,
+                    is_rest,
+                    ..
+                } = child.1.as_ref()
                     && let Some(ty) = ty
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
@@ -7014,6 +7053,7 @@ impl Compiler {
                 self.polyfn_sources = saved_polyfn_sources;
             }
             Expression::Function {
+                docs: _,
                 attrs,
                 name,
                 is_coro,
@@ -7379,6 +7419,7 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
             Expression::Class {
+                docs: _,
                 name,
                 fields: state,
                 ..
@@ -7389,6 +7430,7 @@ impl Compiler {
                 for v in state {
                     match v.1.borrow() {
                         Expression::Field {
+                            docs: _,
                             modifier,
                             name: n,
                             init,
@@ -7423,6 +7465,7 @@ impl Compiler {
                     match method_node.1.borrow() {
                         Expression::Method(_, body) => {
                             if let Expression::Function {
+                                docs: _,
                                 name, is_static, ..
                             } = body.1.borrow()
                             {
@@ -8562,7 +8605,7 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(ty, n, _is_rest) => {
+            Expression::Argument { ty, name: n, .. } => {
                 let slot = self.context.variables.intern(n.to_string()) as u32;
                 self.record_debug_local(n, slot);
                 if ty
@@ -8595,6 +8638,7 @@ impl Compiler {
                             let _ = self.do_compile(method);
                         }
                         Expression::Function {
+                            docs: _,
                             name: method_name,
                             body,
                             ..
@@ -8648,6 +8692,7 @@ impl Compiler {
                             let _ = self.do_compile(method);
                         }
                         Expression::Function {
+                            docs: _,
                             name: method_name, ..
                         } => {
                             let fqn = format!("{}__{}__{}", class, ty_part, method_name);
@@ -8659,6 +8704,7 @@ impl Compiler {
                             let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
                             self.emit_idx += 1;
                             if let Expression::Function {
+                                docs: _,
                                 name: method_name, ..
                             } = body.1.as_ref()
                             {
@@ -9639,7 +9685,7 @@ impl Compiler {
                     let nfixed = if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         items
                             .iter()
-                            .filter(|a| matches!(a.1.as_ref(), Expression::Argument(..)))
+                            .filter(|a| matches!(a.1.as_ref(), Expression::Argument { .. }))
                             .count()
                     } else {
                         0
@@ -9670,7 +9716,10 @@ impl Compiler {
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref()
+                            if let Expression::Argument {
+                                ty: type_expr,
+                                ..
+                            } = arg.1.as_ref()
                                 && let Some(type_expr) = type_expr
                             {
                                 if let Some((tag, aux)) =
@@ -9733,6 +9782,7 @@ impl Compiler {
                 }
             }
             Expression::EnumDecl {
+                docs: _,
                 name: _, variants, ..
             } => {
                 // Recurse into each variant. Each variant's
@@ -10751,8 +10801,6 @@ impl Compiler {
                     span.into_range(),
                 ));
                 self.messages.push(message);
-                #[cfg(debug_assertions)]
-                dbg!(_expr);
             }
         }
 
@@ -10844,12 +10892,13 @@ impl Compiler {
     }
 
     /// Like [`finalize_bytecode`], but also returns a pre-opt IL snapshot for dissect.
+    #[cfg(any(test, feature = "dissect"))]
     pub fn finalize_bytecode_capturing_il(&mut self) -> crate::dissect::IlSnapshot {
         self.finalize_bytecode_inner(true)
             .expect("capture_il requested")
     }
 
-    fn finalize_bytecode_inner(&mut self, capture_il: bool) -> Option<crate::dissect::IlSnapshot> {
+    fn finalize_bytecode_inner(&mut self, capture_il: bool) -> FinalizeIlOut {
         // Splice static initializers into the IL before lower — no absolute
         // target bumping required for symbolic jumps.
         let static_init_region = if !self.static_init_bytecode.is_empty() {
@@ -10913,6 +10962,7 @@ impl Compiler {
             }
         }
 
+        #[cfg(any(test, feature = "dissect"))]
         let il_snapshot = if capture_il {
             Some(crate::dissect::IlSnapshot::new(
                 self.bytecode.ops().to_vec(),
@@ -10971,10 +11021,17 @@ impl Compiler {
             "debug_locs / bytecode length mismatch after finalize"
         );
 
-        il_snapshot
+        #[cfg(any(test, feature = "dissect"))]
+        return il_snapshot;
+        #[cfg(not(any(test, feature = "dissect")))]
+        {
+            debug_assert!(!capture_il);
+            ()
+        }
     }
 
     /// Post-lower function symbols sorted by entry PC (for dissect / debug).
+    #[cfg(any(test, feature = "dissect"))]
     pub fn function_symbols(&self) -> Vec<crate::dissect::FnSym> {
         let mut syms: Vec<_> = self
             .functions

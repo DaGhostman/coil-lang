@@ -1535,7 +1535,7 @@ fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
 }
 
 /// Drop noise that lands in a process-wide stdout pipe under `cargo test`
-/// parallelism: debug heap traces and libtest harness status lines.
+/// parallelism: libtest harness status lines.
 #[cfg(unix)]
 fn clean_captured_os_stdout(output: &str) -> String {
     output
@@ -1543,10 +1543,6 @@ fn clean_captured_os_stdout(output: &str) -> String {
         .filter(|l| {
             let t = l.trim();
             if t.is_empty() {
-                return false;
-            }
-            // Debug heap: `0x… alloc …` / `0x… free …`
-            if t.contains(" alloc ") || t.contains(" free ") {
                 return false;
             }
             // libtest: `test foo::bar ... ok` (other threads finish mid-capture)

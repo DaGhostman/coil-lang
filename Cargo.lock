@@ -395,6 +395,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "coil"
 version = "0.1.0"
 dependencies = [
+ "coil-cli",
  "common",
  "compiler",
  "criterion",
@@ -402,6 +403,64 @@ dependencies = [
  "parser",
  "reporting",
  "rkyv",
+]
+
+[[package]]
+name = "coil-cli"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "machine",
+ "rkyv",
+]
+
+[[package]]
+name = "coil-debug"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+ "common",
+ "compiler",
+ "machine",
+ "reporting",
+]
+
+[[package]]
+name = "coil-dissect"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+ "common",
+ "compiler",
+ "parser",
+ "reporting",
+]
+
+[[package]]
+name = "coil-embed"
+version = "0.1.0"
+dependencies = [
+ "coil-cli",
+]
+
+[[package]]
+name = "coil-fmt"
+version = "0.1.0"
+dependencies = [
+ "parser",
+ "reporting",
+]
+
+[[package]]
+name = "coil-lsp"
+version = "0.1.0"
+dependencies = [
+ "compiler",
+ "lsp-server",
+ "lsp-types",
+ "parser",
+ "reporting",
+ "serde_json",
 ]
 
 [[package]]
@@ -520,6 +579,15 @@ checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
  "itertools",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -712,6 +780,15 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fluent-uri"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17c704e9dbe1ddd863da1e6ff3567795087b1eb201ce80d8fa81162e1516500d"
+dependencies = [
+ "bitflags 1.3.2",
+]
 
 [[package]]
 name = "fnv"
@@ -1064,6 +1141,32 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "lsp-server"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6ada348dbc2703cbe7637b2dda05cff84d3da2819c24abcb305dd613e0ba2e"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
+name = "lsp-types"
+version = "0.97.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53353550a17c04ac46c585feb189c2db82154fc84b79c7a66c96c2c644f66071"
+dependencies = [
+ "bitflags 1.3.2",
+ "fluent-uri",
+ "serde",
+ "serde_json",
+ "serde_repr",
+]
 
 [[package]]
 name = "machine"
@@ -1701,6 +1804,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

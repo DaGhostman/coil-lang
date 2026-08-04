@@ -18,6 +18,9 @@ For bytecode/IL dumps without running: `coil dissect <file.hy> --fn <pat>`.
 ## Quick start
 
 ```bash
+# Build helpers next to `coil` (required for dispatch)
+cargo build -q
+
 # Interactive
 cargo run --quiet -- debug path/to/prog.hy
 
@@ -25,7 +28,8 @@ cargo run --quiet -- debug path/to/prog.hy
 cargo run --quiet -- debug path/to/prog.hy -x /tmp/coil_dbg.txt --batch
 ```
 
-Use `--release` when alloc/debug traces obscure program output.
+Use `coil dissect` for bytecode/IL/AST dumps; use `--release` for faster runs.
+Ensure `coil-debug` / `coil-dissect` / `coil-fmt` were built into the same `target/*/`.
 
 ## Command cheat sheet
 

@@ -9,6 +9,7 @@ How coil is structured for contributors and embedders. End-user language docs li
 | [Opcodes](opcodes.md) | Selected bytecode ops behind builtins |
 | [Dissect](dissect.md) | `coil dissect` — in-memory bytecode / IL / AST dump |
 | [Debugger](debugger.md) | `coil debug` — GDB-style REPL / batch debugger |
+| [Formatter](fmt.md) | `coil fmt` — AST pretty-printer for `.hy` |
 | [Test health report](test-health-report.md) | Historical flaky/broken-test notes |
 | [Grammar](grammar/) | tree-sitter grammar sources |
 

@@ -5,10 +5,12 @@ pub mod char_ord;
 pub mod crypto;
 #[cfg(feature = "crypto")]
 mod crypto_hasher_state;
+#[cfg(any(test, feature = "debugger"))]
 pub mod debug;
 pub mod env;
 mod ffi;
 pub mod fs;
+pub mod host_natives;
 pub mod io;
 mod memory;
 mod opcode;
@@ -26,10 +28,12 @@ mod vm;
 
 #[cfg(feature = "crypto")]
 pub use crypto::{CRYPTO_WIRING, CryptoErrorTag};
+#[cfg(any(test, feature = "debugger"))]
 pub use debug::{DebugController, StepMode, StopReason};
 pub use env::ENV_WIRING;
 pub use ffi::*;
 pub use fs::FS_WIRING;
+pub use host_natives::{build_standard_host_natives, wire_standard_host_natives};
 pub use memory::*;
 pub use opcode::*;
 pub use packed_la::{

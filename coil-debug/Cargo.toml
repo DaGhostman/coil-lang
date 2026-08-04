@@ -1,0 +1,22 @@
+[package]
+name = "coil-debug"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "coil-debug"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+machine = { path = "../machine", default-features = false, features = ["debugger"] }
+compiler = { path = "../compiler", default-features = false, features = ["dissect"] }
+reporting = { path = "../reporting" }
+coil-cli = { path = "../coil-cli", default-features = false }
+
+[features]
+default = ["crypto", "time", "regex", "tls"]
+crypto = ["machine/crypto", "compiler/crypto", "coil-cli/crypto"]
+time = ["machine/time", "compiler/time", "coil-cli/time"]
+regex = ["machine/regex", "compiler/regex", "coil-cli/regex"]
+tls = ["machine/tls", "compiler/tls", "coil-cli/tls"]

@@ -1,0 +1,101 @@
+//! `coil-dissect` — in-memory compile + filtered bytecode / IL / AST dump.
+
+mod dissect;
+
+use std::io::Write;
+use std::process::exit;
+
+use compiler::Pipeline;
+use dissect::{DissectArgs, cmd_dissect};
+use reporting::{ErrorCode, ReportConfig, ReportFormat};
+
+fn writer_for(format: ReportFormat) -> Box<dyn Write + Send> {
+    match format {
+        ReportFormat::Pretty => Box::new(std::io::stderr()),
+        ReportFormat::Sarif | ReportFormat::Lsp => Box::new(std::io::stdout()),
+    }
+}
+
+fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: impl Into<String>) -> ! {
+    pipeline.emit_spanless_error(code, message);
+    let _ = pipeline.finish_reporting();
+    exit(1);
+}
+
+fn print_help() {
+    eprintln!(
+        "Usage:\n\
+         \x20 coil-dissect [--log-json | --log-lsp] <file.hy> [--fn <pat>] [--il] [--ast]\n\
+         \n\
+         Options:\n\
+         \x20 --fn <pat>    Filter functions by FQN substring / trailing name\n\
+         \x20 --il          Also print pre-opt stack IL\n\
+         \x20 --ast         Also print the entry-file AST\n\
+         \x20 --log-json    Emit SARIF 2.1 diagnostics on stdout\n\
+         \x20 --log-lsp     Emit LSP Diagnostic NDJSON on stdout\n\
+         \x20 -h, --help    Show this help"
+    );
+}
+
+fn parse_args(args: &[String]) -> Result<(ReportConfig, DissectArgs), String> {
+    let mut log_json = false;
+    let mut log_lsp = false;
+    let mut show_il = false;
+    let mut show_ast = false;
+    let mut fn_pat: Option<String> = None;
+    let mut filename: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                exit(0);
+            }
+            "--log-json" => log_json = true,
+            "--log-lsp" => log_lsp = true,
+            "--il" => show_il = true,
+            "--ast" => show_ast = true,
+            "--fn" => {
+                i += 1;
+                let pat = args
+                    .get(i)
+                    .ok_or_else(|| "missing pattern after --fn".to_string())?;
+                fn_pat = Some(pat.clone());
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("unrecognized flag `{s}`"));
+            }
+            _ => {
+                if filename.is_some() {
+                    return Err("unexpected extra argument".into());
+                }
+                filename = Some(a.clone());
+            }
+        }
+        i += 1;
+    }
+    let filename = filename.ok_or_else(|| "dissect requires an entry .hy file".to_string())?;
+    let config = ReportConfig::from_cli_flags(log_json, log_lsp).map_err(|e| e.to_string())?;
+    Ok((
+        config,
+        DissectArgs {
+            filename,
+            fn_pat,
+            show_il,
+            show_ast,
+        },
+    ))
+}
+
+fn main() {
+    let raw: Vec<String> = std::env::args().collect();
+    match parse_args(&raw) {
+        Ok((config, args)) => cmd_dissect(config, args),
+        Err(msg) => {
+            eprintln!("coil-dissect: {msg}");
+            print_help();
+            exit(1);
+        }
+    }
+}
