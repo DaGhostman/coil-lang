@@ -558,6 +558,49 @@ fn main() { return; }
         assert!(!set.contains("main"));
     }
 
+    fn parse_ast(src: &str) -> parser::ast::Output<'static> {
+        let owned = Box::leak(src.to_string().into_boxed_str());
+        Pratt::default().parse(owned).expect("parse")
+    }
+
+    #[test]
+    fn analyze_recursive_fns_detects_mutual_cycle() {
+        let ast = parse_ast(
+            r#"
+fn ping(int n) -> int { return pong(n); }
+fn pong(int n) -> int { return ping(n); }
+fn main() { return; }
+"#,
+        );
+        let rec = analyze_recursive_fns(&ast);
+        assert!(rec.contains("ping") && rec.contains("pong"), "{rec:?}");
+        assert!(!rec.contains("main"));
+    }
+
+    #[test]
+    fn analyze_recursive_fns_skips_impl_methods() {
+        // Identifier `join` inside an impl method must not invent a self-cycle
+        // on the method name (see analyze_recursive_fns docs).
+        let ast = parse_ast(
+            r#"
+class T {
+    x: int,
+}
+impl T {
+    fn join() -> int {
+        return join(self);
+    }
+}
+fn main() { return; }
+"#,
+        );
+        let rec = analyze_recursive_fns(&ast);
+        assert!(
+            !rec.contains("join"),
+            "impl methods must be excluded from recursion SCC: {rec:?}"
+        );
+    }
+
     #[test]
     fn io_fn_is_not_pure() {
         let set = pure_set(
