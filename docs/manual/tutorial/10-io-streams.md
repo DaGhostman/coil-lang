@@ -69,8 +69,9 @@ See `examples/io_text.hy`.
 | `open(path, mode)` | `→ Result<Stream, IoError>` | Modes: `"r"`, `"w"`, `"a"`, `"rw"` |
 | `close(s)` | `→ Result<(), IoError>` | Idempotent close on GC drop too |
 | `read` / `write` | L0 | Never busy-spin; `WouldBlock` when not ready |
-| `await_readable` / `await_writable` | async await | Park the VM until ready; overlaps CPU work via help-steal |
+| `await_readable` / `await_writable` | async await | Top-level parks; inside a coro yields + registers for batch poll |
 | `drive` | `() -> int` | Poll registered async waiters once; returns newly-ready count |
+| `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready (multiplex) |
 | `block_on` | prelude | Drive an `async fn` handle to completion (see [IO reactor](../../internals/io-reactor.md)) |
 | `io::sync::{write_all,read_exact,read_to_end}` | userland | Blocking adapters over L0 + `await_*` |
 | `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |

@@ -14,8 +14,9 @@ use io::sync::*;   // optional blocking adapters (userland)
 | `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
-| `await_readable` / `await_writable` | Async await | Park VM until fd ready; see [io-reactor](../internals/io-reactor.md) |
-| `drive` | `() -> int` | Poll async waiters once |
+| `await_readable` / `await_writable` | Async await | Top-level parks VM; inside a coro registers + yields (batch via `wait_ready`) |
+| `drive` | `() -> int` | Poll async waiters once (non-blocking) |
+| `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready |
 | `block_on` | Prelude | `block_on(coro) -> Y` — auto-imported; drives `async fn` to completion |
 | `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
 | `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::*`; timeout `ms <= 0` waits forever |

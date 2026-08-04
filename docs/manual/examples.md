@@ -1734,6 +1734,17 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/io_wait_ready.hy`
+
+**Demonstrates:** cooperative `await_*` + `wait_ready` multiplexing two coroutines without per-op `block_on`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_wait_ready.hy` |
+| **Output** | `ok` |
+
+---
+
 ## OS threads
 
 Native threads via `use thread::*;` — each worker runs on its own VM. See [Tutorial 11 — OS threads](tutorial/11-threads.md).
