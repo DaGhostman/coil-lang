@@ -3620,6 +3620,27 @@ fn main() {
     assert_eq!(output, "55");
 }
 
+/// Auto-par fork-join of pure recursive `fib(n-1)+fib(n-2)` must stay correct.
+#[test]
+fn auto_par_fib_still_correct() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    write_all(stdout(), to_bytes(format("%i", fib(12))));
+}
+"#,
+    );
+    assert_eq!(output, "144");
+}
+
 /// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not
 /// turn StorePop;Load into Dup;Store when the store extends tell past TOS
 /// (shared-stack CmpJmpf would eat the local — broke http `parse_url`).

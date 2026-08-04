@@ -4255,6 +4255,182 @@ impl Compiler {
         self.emit_host_native_invoke(kind.native_name(), args);
     }
 
+    /// Match `f(arg)` where `f` is a unary recursive-pure function.
+    fn match_unary_recursive_pure_call<'a>(
+        &self,
+        expr: &'a Output<'a>,
+    ) -> Option<(String, &'a Output<'a>)> {
+        if self.recursive_pure.is_empty() {
+            return None;
+        }
+        let expr = unwrap_expr_output(expr);
+        let Expression::Call {
+            name,
+            args: Some(args),
+        } = expr.1.as_ref()
+        else {
+            return None;
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        let callee = match unwrap_expr_output(name).1.as_ref() {
+            Expression::Identifier(n) => *n,
+            _ => return None,
+        };
+        let resolved = self
+            .aliases
+            .get(callee)
+            .cloned()
+            .unwrap_or_else(|| callee.to_string());
+        let short = strip_overload_key(&resolved);
+        if !self.recursive_pure.contains(callee)
+            && !self.recursive_pure.contains(short)
+            && !self.recursive_pure.contains(&resolved)
+        {
+            return None;
+        }
+        if let Some(ty) = self.codegen_expr_ty(&args[0]) {
+            let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+            if !self.checker.is_thread_sendable_ty(&pruned) {
+                return None;
+            }
+        }
+        Some((resolved, &args[0]))
+    }
+
+    /// Auto fork-join: `f(a) ⊕ f(b)` for recursive-pure unary `f`.
+    ///
+    /// Tries `thread_spawn(f, a)`; on `Ok` runs `f(b)` inline then `join`;
+    /// on `WouldBlock` / other Err falls back to sequential `f(a) ⊕ f(b)`.
+    /// Writes directly to [`Self::bytecode`] (control-flow labels).
+    fn try_emit_auto_par_binop(
+        &mut self,
+        lhs: &Output<'_>,
+        rhs: &Output<'_>,
+        int_op: Instruction,
+        float_op: Instruction,
+    ) -> bool {
+        let Some((fname, arg_l)) = self.match_unary_recursive_pure_call(lhs) else {
+            return false;
+        };
+        let Some((fname_r, _arg_r)) = self.match_unary_recursive_pure_call(rhs) else {
+            return false;
+        };
+        if fname != fname_r {
+            return false;
+        }
+        let entry_key = self
+            .fn_arities
+            .keys()
+            .find(|k| strip_overload_key(k) == strip_overload_key(&fname) || *k == &fname)
+            .cloned()
+            .unwrap_or_else(|| fname.clone());
+        let (fa, is_rest) = self
+            .fn_arities
+            .get(&entry_key)
+            .or_else(|| self.fn_arities.get(&fname))
+            .copied()
+            .unwrap_or((1, false));
+        if fa != 1 || is_rest {
+            return false;
+        }
+        let Some(&entry_offset) = self
+            .functions
+            .get(&entry_key)
+            .or_else(|| self.functions.get(&fname))
+        else {
+            return false;
+        };
+        let Some(spawn_id) = self.native_id("thread_spawn") else {
+            return false;
+        };
+        let Some(join_id) = self.native_id("thread_join") else {
+            return false;
+        };
+
+        let is_float = self
+            .codegen_expr_ty(lhs)
+            .map(|t| {
+                let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t);
+                matches!(
+                    pruned,
+                    crate::typechecking::Ty::Con(ref n) if n == "float"
+                )
+            })
+            .unwrap_or(false);
+        let bin_op = if is_float { float_op } else { int_op };
+
+        // MakeFn for the recursive callee.
+        self.bytecode.push_const(0);
+        self.bytecode.push(
+            Byte::new(Instruction::CodePtr).with_operand_u32(entry_offset as u32),
+        );
+        self.bytecode.push(
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(0, 0, 1, false)),
+        );
+        let fn_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(fn_tmp);
+
+        let mut arg_l_bc = self.do_compile(arg_l);
+        self.bytecode.append(&mut arg_l_bc);
+        let arg_l_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(arg_l_tmp);
+
+        // thread_spawn(fn, arg_l) → Result<Thread, Error>
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
+        self.bytecode.push_load(fn_tmp);
+        self.bytecode.push_load(arg_l_tmp);
+        self.bytecode.push_make_tuple(2);
+        self.bytecode.push_host_invoke(2);
+
+        let mut bb = BlockBuilder::new();
+        let have_handle = bb.fresh_label(self.bytecode.il_mut());
+        let done = bb.fresh_label(self.bytecode.il_mut());
+        bb.emit_jump_to(
+            have_handle,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+
+        // Capacity / spawn failure: discard Err, run both calls sequentially.
+        self.bytecode.push_pop();
+        let mut lhs_bc = self.do_compile(lhs);
+        self.bytecode.append(&mut lhs_bc);
+        let mut rhs_bc = self.do_compile(rhs);
+        self.bytecode.append(&mut rhs_bc);
+        self.bytecode.push(Byte::new(bin_op));
+        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(have_handle, self.bytecode.il_mut());
+        // Ok payload (Thread handle) on stack.
+        let handle_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(handle_tmp);
+
+        // Inline the other arm on this thread.
+        let mut rhs_inline = self.do_compile(rhs);
+        self.bytecode.append(&mut rhs_inline);
+        let right_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(right_tmp);
+
+        // join(handle) → Result<T, Error>
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
+        self.bytecode.push_load(handle_tmp);
+        self.bytecode.push_make_tuple(1);
+        self.bytecode.push_host_invoke(1);
+        self.emit_result_unwrap_or_panic();
+
+        self.bytecode.push_load(right_tmp);
+        self.bytecode.push(Byte::new(bin_op));
+
+        bb.bind_label(done, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: auto-par labels bound");
+        true
+    }
+
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
     fn emit_host_native_invoke(&mut self, native_name: &str, args: &[Output]) {
         let Some(native_id) = self.native_id(native_name) else {
@@ -9277,6 +9453,13 @@ impl Compiler {
                 if self.try_emit_folded_expr(ast, &mut bytecode, true) {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
+                } else if self.try_emit_auto_par_binop(
+                    lhs,
+                    rhs,
+                    Instruction::ADD,
+                    Instruction::ADDF,
+                ) {
+                    // Wrote fork-join control flow to self.bytecode.
                 } else if self.try_emit_matrix_op(
                     &mut bytecode,
                     self_id,
@@ -9330,7 +9513,14 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                if self.try_emit_matrix_op(
+                if self.try_emit_auto_par_binop(
+                    lhs,
+                    rhs,
+                    Instruction::SUB,
+                    Instruction::SUBF,
+                ) {
+                    // Wrote fork-join control flow to self.bytecode.
+                } else if self.try_emit_matrix_op(
                     &mut bytecode,
                     self_id,
                     span.start,
@@ -9390,6 +9580,13 @@ impl Compiler {
                 ) {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
+                } else if self.try_emit_auto_par_binop(
+                    lhs,
+                    rhs,
+                    Instruction::MUL,
+                    Instruction::MULF,
+                ) {
+                    // Wrote fork-join control flow to self.bytecode.
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -10980,6 +11177,11 @@ impl Compiler {
         self.decorated_class_ctors
             .extend(expand.decorated_class_ctors);
         let _program_ty = self.checker.check_program(ast);
+        self.recursive_pure = if auto_par_enabled() {
+            crate::typechecking::analyze_recursive_pure(ast)
+        } else {
+            HashSet::new()
+        };
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the
         // prologue and before user code. Keep `program_start_offset`
