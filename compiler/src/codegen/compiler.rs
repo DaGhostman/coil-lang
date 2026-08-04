@@ -7098,8 +7098,9 @@ impl Compiler {
 
     /// Drive `block_on(coro)`: resume until `done`, leave completion value on stack.
     ///
-    /// Intermediate yields are discarded. IO `await_*` inside the coroutine still
-    /// parks via PendingIoWait / the IO reactor between resumes.
+    /// Intermediate yields are discarded. Between resumes, `wait_ready` parks on
+    /// any registered IO waiters so cooperative `await_*` inside the coroutine
+    /// can batch instead of busy-spinning.
     fn emit_block_on(&mut self, args: &[Output]) {
         let Some(coro_expr) = args.first() else {
             return;
@@ -7112,6 +7113,7 @@ impl Compiler {
 
         let mut bb = BlockBuilder::new();
         let top = bb.fresh_label(self.bytecode.il_mut());
+        let done_exit = bb.fresh_label(self.bytecode.il_mut());
         bb.bind_label(top, self.bytecode.il_mut());
 
         self.bytecode.push_load(handle_slot);
@@ -7121,8 +7123,14 @@ impl Compiler {
 
         self.bytecode.push_load(handle_slot);
         self.bytecode.push(Byte::new(Instruction::DoneCoro));
-        // Not done → loop (discard yield); done → fall through with value.
-        bb.emit_jump_to(top, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+        // Done → fall through to exit; not done → wait for batched IO then loop.
+        bb.emit_jump_to(done_exit, BbJumpKind::JumpIfTrue, self.bytecode.il_mut());
+        if self.native_id("wait_ready").is_some() {
+            self.emit_host_native_invoke("wait_ready", &[]);
+            self.bytecode.push(Byte::new(Instruction::POP));
+        }
+        bb.emit_jump_to(top, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(done_exit, self.bytecode.il_mut());
         self.bytecode.push_load(value_slot);
         bb.finalize()
             .expect("BlockBuilder::finalize: block_on labels bound");

@@ -1105,9 +1105,10 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
                 .into()
         }
         ("io", "write") => "Writes bytes to a stream and reports the number written.".into(),
-        ("io", "await_readable") => "Parks until the stream is readable.".into(),
-        ("io", "await_writable") => "Parks until the stream is writable.".into(),
+        ("io", "await_readable") => "Parks until the stream is readable (yields inside a coroutine).".into(),
+        ("io", "await_writable") => "Parks until the stream is writable (yields inside a coroutine).".into(),
         ("io", "drive") => "Polls async IO waiters once; returns newly-ready count.".into(),
+        ("io", "wait_ready") => "Blocks until any registered async IO waiter is ready; returns newly-ready count.".into(),
         ("io", "from_bytes") | ("string", "from_bytes") => {
             "Decodes UTF-8 bytes into a string.".into()
         }

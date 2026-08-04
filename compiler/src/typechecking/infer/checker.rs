@@ -596,7 +596,7 @@ impl Checker {
             IoBuiltin::Read => fun(&[stream, bytes], res_opt_int),
             IoBuiltin::Write => fun(&[stream, bytes], res_int),
             IoBuiltin::AwaitReadable | IoBuiltin::AwaitWritable => fun(&[stream], res_unit),
-            IoBuiltin::Drive => fun(&[], int()),
+            IoBuiltin::Drive | IoBuiltin::WaitReady => fun(&[], int()),
             IoBuiltin::FromBytes => fun(&[bytes], res_string),
             IoBuiltin::ToBytes => fun(&[string()], bytes),
             IoBuiltin::TcpConnect | IoBuiltin::TcpListen => fun(&[string(), int()], res_stream),

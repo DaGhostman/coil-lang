@@ -159,6 +159,8 @@ pub enum IoBuiltin {
     AwaitReadable,
     AwaitWritable,
     Drive,
+    /// Block until any registered async waiter is ready (`() -> int`).
+    WaitReady,
     /// Decode `[byte]` as UTF-8 → `Result<string, IoError>`.
     FromBytes,
     /// Encode `string` → `[byte]` (UTF-8).
@@ -209,6 +211,7 @@ impl IoBuiltin {
             Self::AwaitReadable => "await_readable",
             Self::AwaitWritable => "await_writable",
             Self::Drive => "drive",
+            Self::WaitReady => "wait_ready",
             Self::FromBytes => "from_bytes",
             Self::ToBytes => "to_bytes",
             Self::TcpConnect => "connect",
@@ -244,6 +247,7 @@ impl IoBuiltin {
             | Self::AwaitReadable
             | Self::AwaitWritable
             | Self::Drive
+            | Self::WaitReady
             | Self::FromBytes
             | Self::ToBytes => self.as_str(),
             Self::TcpConnect => "tcp_connect",
@@ -283,6 +287,7 @@ impl IoBuiltin {
             Self::AwaitReadable,
             Self::AwaitWritable,
             Self::Drive,
+            Self::WaitReady,
             Self::FromBytes,
             Self::ToBytes,
         ]
@@ -372,6 +377,10 @@ impl IoBuiltin {
             Self::TlsServerEnable,
             #[cfg(feature = "tls")]
             Self::TlsServerDisable,
+            // Appended after TLS so historical `IoBuiltin::all` positions stay
+            // stable for any tooling that indexes this list; HostInvoke ids for
+            // `wait_ready` come from `build_standard_host_natives` (append-only).
+            Self::WaitReady,
         ]
     }
 }
@@ -1216,6 +1225,7 @@ mod tests {
         assert!(exports.iter().any(|e| e.short_name() == "open"));
         assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
         assert!(exports.iter().any(|e| e.short_name() == "await_readable"));
+        assert!(exports.iter().any(|e| e.short_name() == "wait_ready"));
         assert!(!exports.iter().any(|e| e.short_name() == "write_all"));
         assert!(!exports.iter().any(|e| e.short_name() == "set_read_timeout"));
         assert!(!exports.iter().any(|e| e.short_name() == "set_write_timeout"));
