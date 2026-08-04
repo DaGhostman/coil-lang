@@ -1,8 +1,13 @@
 # Recursion stack bounds
 
-The VM pre-allocates a fixed operand stack (`8192` slots). Locals and expression
-temps share that buffer with call frames, so unbounded recursion is unsafe
-(release builds treat overflow as UB via `promise!`).
+The VM pre-allocates an operand stack sized from this analysis:
+
+- non-recursive programs → [`DEFAULT_OPERAND_STACK_SLOTS`](../../compiler/src/typechecking/stack_bound.rs) (256)
+- proven / attributed recursion → `max_frames × 16 + 16` (clamped to
+  [`MAX_OPERAND_STACK_SLOTS`](../../machine/src/lib.rs))
+
+[`Machine::with_operand_capacity`](../../machine/src/vm.rs) builds the VM; reactor
+workers resize when a job needs a larger stack.
 
 ## Analysis
 

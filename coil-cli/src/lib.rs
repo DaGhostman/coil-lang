@@ -78,7 +78,7 @@ pub fn execute_archived_program(
     debug: ProgramDebug,
     entry: Option<&Path>,
 ) -> bool {
-    let mut machine = Machine::<256>::default();
+    let mut machine = Machine::<256>::with_operand_capacity(machine::DEFAULT_OPERAND_STACK_SLOTS);
     wire_standard_host_natives(&mut machine);
 
     let base_dir = entry.and_then(|p| p.parent()).map(PathBuf::from);
@@ -90,6 +90,7 @@ pub fn execute_archived_program(
         strings: Arc::from(strings.to_vec()),
         static_slot_count: static_slots,
         debug: debug.clone(),
+        operand_stack_slots: machine::DEFAULT_OPERAND_STACK_SLOTS as u32,
     }));
     machine.set_program_debug(debug);
     machine.run_raw(bytecode, constants, strings, static_slots);
