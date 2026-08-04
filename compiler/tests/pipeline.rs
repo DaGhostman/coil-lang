@@ -299,7 +299,8 @@ fn example_readonly_seal_prints_322() {
 fn static_const_reads_via_load_static() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 static const VERSION = 42;
 
@@ -316,7 +317,8 @@ fn main() {
 fn const_class_field_reads_after_construction() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     const x: int,
@@ -382,7 +384,8 @@ fn method_named_send_can_call_thread_send_on_self_channel() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 class ThreadWrapper {
@@ -419,7 +422,8 @@ fn grouped_self_field_passes_sender_to_send() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 class Worker {
@@ -452,7 +456,8 @@ fn inline_new_field_passes_sender_to_send() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 class Worker {
@@ -474,7 +479,8 @@ fn main() {
 fn inline_new_method_call_works() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,
@@ -501,7 +507,8 @@ fn main() {
 fn defer_runs_on_early_return() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f(int n) -> int {
     defer { write_all(stdout(), to_bytes("d")); }
@@ -610,7 +617,8 @@ fn example_into_prints_32() {
 #[test]
 fn inline_into_receiver_prints_32() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Celsius { c: int }
 class Fahrenheit { f: int }
@@ -632,7 +640,8 @@ fn main() {
 #[test]
 fn return_into_pins_target_prints_32() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Celsius { c: int }
 class Fahrenheit { f: int }
@@ -691,7 +700,8 @@ fn example_gat_pointer_prints_42() {
 #[test]
 fn shuffled_record_pattern_binds_declaration_order_field() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         enum E { Foo { x: int, y: int, z: int } }
         fn main() {
@@ -709,7 +719,8 @@ use string::{format, to_bytes};
 #[test]
 fn generic_print_open_bound_uses_show_dictionary() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn show_it<T: Show>(T x) {
             write_all(stdout(), to_bytes(format("%v,", x)));
@@ -726,7 +737,8 @@ use string::{format, to_bytes};
 #[test]
 fn format_percent_v_parity_with_print() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let s = format("%v-%v", 1, "x");
@@ -741,7 +753,8 @@ use string::{format, to_bytes};
 #[test]
 fn polyfn_captured_dict_survives_return() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         trait Describable<T> {
             fn describe_val(T x) -> int;
@@ -798,7 +811,8 @@ use string::{format, to_bytes};
 #[test]
 fn polyfn_block_shadow_does_not_box_outer_mono_fn() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         trait Describable<T> {
             fn describe_val(T x) -> int;
@@ -830,7 +844,8 @@ use string::{format, to_bytes};
 #[test]
 fn polyfn_multiparam_capture_survives_return() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         trait Convert<A, B> {
             fn cast(A x) -> B;
@@ -864,7 +879,8 @@ use string::{format, to_bytes};
 fn polyfn_with_fib_keeps_fused_superinstructions() {
     use common::Instruction;
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn id<T>(T x) -> T { return x; }
         fn fib(int n) -> int {
@@ -904,7 +920,8 @@ use string::{format, to_bytes};
 #[test]
 fn monomorphized_generic_add_prints_3() {
     let output = run_example_src(
-        r#"use io::{stdout, write_all};
+        r#"use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add<T: Num>(T a, T b) -> T {
             return a + b;
@@ -932,7 +949,8 @@ fn string_fmt_example_prints_concatenated_and_formatted_strings() {
 #[test]
 fn string_plus_equal_updates_binding() {
     let output = run_example_src(
-        r#"use io::{stdout, write_all};
+        r#"use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
             let s = "a";
@@ -1020,7 +1038,8 @@ fn let_binding_emits_store_pop_in_bytecode() {
     use common::Instruction;
     let mut pipeline = Pipeline::new();
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let x = 5;
@@ -1067,7 +1086,8 @@ fn example_named_args_prints_ada36_grace40() {
 fn named_args_shuffled_order_prints_correct_values() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn greet(string name, int age) {
     write_all(stdout(), to_bytes(format("%s", name)));
@@ -1088,7 +1108,8 @@ fn main() {
 fn rest_after_named_fixed_prefix_packs_trailing() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f(int a, int... xs) -> int {
     return a + len(xs);
@@ -1114,7 +1135,8 @@ fn example_let_destructure_prints_12342() {
 fn let_nested_tuple_destructure_binds_in_order() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let (a, (b, c)) = (1, (2, 3));
@@ -1139,7 +1161,8 @@ fn example_variadic_prints_60_hi() {
 #[test]
 fn let_match_binds_arm_value() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let x = match Option::None {
@@ -1163,7 +1186,8 @@ use string::{format, to_bytes};
 #[test]
 fn dict_string_field_round_trips() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let d = { name: "hi", n: 9 };
@@ -1179,7 +1203,8 @@ use string::{format, to_bytes};
 #[test]
 fn dict_mutation_round_trips() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let d = { foo: 1, name: "a" };
@@ -1200,7 +1225,8 @@ fn example_let_chained_bindings_works() {
         .expect("compiler crate must have a parent (workspace root)");
 
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let x = 5;
@@ -1290,7 +1316,8 @@ fn example_nested_records_prints_99() {
 fn nested_multifield_record_pattern_preserves_sibling() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     I { x: int, y: int },
@@ -1322,7 +1349,8 @@ fn main() {
 fn nested_two_multifield_records_preserve_both() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     I { x: int, y: int },
@@ -1600,7 +1628,8 @@ fn example_ffi_printf_prints_hello_42() {
 #[test]
 fn extern_missing_library_panics_with_message() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 extern "this_library_definitely_does_not_exist_xyzzy" {
     fn noop() -> int;
@@ -1641,7 +1670,8 @@ fn main() {
 fn userland_dload_missing_library_returns_err() {
     let src = r#"
 use ffi::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let r = dload("this_library_definitely_does_not_exist_xyzzy");
@@ -1740,7 +1770,8 @@ fn example_range_prints_01234012356() {
 fn let_destructure_block_shadow_preserves_outer_binding() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum A { A { z: int, x: int }, }
 enum B { B { y: int }, }
@@ -1760,7 +1791,8 @@ fn main() {
 fn generic_rest_only_show_call_emits_dict_and_prints() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn show_all<T: Show>(T... xs) {
     write_all(stdout(), to_bytes(format("%v", xs[0])));
@@ -1778,7 +1810,8 @@ fn main() {
 fn generic_rest_only_num_call_monomorphizes_and_prints() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; }
 fn main() { write_all(stdout(), to_bytes(format("%i", twice_first(21)))); }
@@ -1792,7 +1825,8 @@ fn main() { write_all(stdout(), to_bytes(format("%i", twice_first(21)))); }
 fn block_shadow_of_param_restores_access_field_type() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum A { A { z: int, x: int }, }
 enum B { B { y: int }, }
@@ -1811,7 +1845,8 @@ fn main() { foo(A::A { z: 10, x: 42 }); }
 fn range_half_open_excludes_end_inclusive_includes_end() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     for x in 0..1 {
@@ -1837,7 +1872,8 @@ fn main() {
 #[test]
 fn inline_resume_in_print_does_not_corrupt_stack() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         async fn counter() {
             yield 0;
@@ -1865,7 +1901,8 @@ use string::{format, to_bytes};
 #[test]
 fn parameterized_interleaved_coroutines_inline_resume_stay_independent() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         async fn counter(int base) {
             yield base;
@@ -1897,7 +1934,8 @@ use string::{format, to_bytes};
 #[test]
 fn coroutine_return_value_propagates_to_resume() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         async fn counter() {
             yield 1;
@@ -1924,7 +1962,8 @@ use string::{format, to_bytes};
 #[test]
 fn resume_after_done_returns_default_not_last_return_value() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         async fn counter() {
             return 42;
@@ -2013,7 +2052,8 @@ fn example_operators_prints_expected() {
 fn example_while_loop_accumulates_correctly() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
         fn main() {
             let acc = 0;
@@ -2065,7 +2105,8 @@ fn example_length_trait_prints_expected() {
 fn runtime_len_of_string_tuple_dict_params() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn id_str(string s) -> string { return s; }
@@ -2087,7 +2128,8 @@ fn main() {
 fn typeof_option_prints_prelude_fqn() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -2129,7 +2171,8 @@ fn main() {}
 #[test]
 fn derive_ord_unit_variants_compare_by_declaration_order() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(Ord)]
 enum Color {
@@ -2160,7 +2203,8 @@ fn main() {
 #[test]
 fn derive_ord_record_payload_lexicographic_compare() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(Ord)]
 enum Pair {
@@ -2209,7 +2253,8 @@ fn example_attr_class_decorates_constructor() {
 #[test]
 fn attr_method_forwards_self() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
     write_all(stdout(), to_bytes(format("%s", message)));
@@ -2327,18 +2372,17 @@ fn example_io_udp_prints_2() {
 }
 
 #[test]
-fn io_timeout_and_tcp_helper_hostinvokes_are_wired() {
+fn io_tcp_helper_hostinvokes_are_wired() {
     let output = run_example_src(
         r#"
 use io::*;
-use io::net::tcp::{accept_wait_timeout, connect_timeout, listen, local_addr, set_nodelay, shutdown};
+use io::sync::*;
+use io::net::tcp::{accept, connect_timeout, listen, local_addr, set_nodelay, shutdown};
 use string::*;
 
 fn main() {
     let path = "/tmp/coil_io_timeout_tcp_helpers.bin";
     let file = open(path, "w")?;
-    set_read_timeout(file, 1)?;
-    set_write_timeout(file, 1)?;
 
     let local_on_file = match local_addr(file) {
         Result::Ok(_) => 0,
@@ -2355,7 +2399,7 @@ fn main() {
 
     let listener = listen("127.0.0.1", 0)?;
     let addr = local_addr(listener)?;
-    let accept_code = match accept_wait_timeout(listener, 1) {
+    let accept_code = match accept(listener) {
         Result::Ok(_) => 0,
         Result::Err(_) => 1,
     };
@@ -2399,6 +2443,7 @@ fn while_accept_match_write_handles_two_connections() {
     const PORT: i64 = 41_299;
     let src = r#"
 use io::*;
+use io::sync::*;
 use io::net::tcp::*;
 use string::*;
 
@@ -2458,7 +2503,8 @@ fn main() {
 fn while_let_result_ok_panic_match_preserves_locals() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let i = 0;
@@ -2483,7 +2529,8 @@ fn main() {
 fn for_in_let_match_preserves_accumulator() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let items: [int] = [1, 2, 3];
@@ -2509,7 +2556,8 @@ fn let_result_ok_panic_match_err_path_panics() {
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = match Result::Err(1) {
@@ -2542,7 +2590,8 @@ fn main() {
 fn while_assignment_match_preserves_locals() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let i = 0;
@@ -2691,7 +2740,8 @@ test("after") { assert(true)?; }
 fn match_arm_reused_binding_name_field_access_uses_arm_type() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Point {
     Point { x: int, y: int },
@@ -2730,7 +2780,8 @@ fn main() {
 fn match_poly_payload_field_access_uses_instantiated_type() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Point {
     Point { x: int, y: int },
@@ -2768,7 +2819,8 @@ fn main() {
 fn store_pop_early_flag_sticks_with_later_locals() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let got = 0;
@@ -2793,7 +2845,8 @@ fn main() {
 fn empty_array_append_and_index_round_trip() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let arr: [int] = [];
@@ -2821,7 +2874,8 @@ fn main() {
 fn array_index_store_round_trip() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let arr = [0, 0, 0];
@@ -2840,7 +2894,8 @@ fn main() {
 fn return_negative_one_works() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn neg() -> int { return -1; }
 fn main() {
@@ -2857,7 +2912,8 @@ fn main() {
 fn nested_match_ok_arms_before_err_dispatches() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
@@ -2881,7 +2937,8 @@ fn main() {
 fn class_enum_field_access_round_trip() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Status {
     Ready,
@@ -2923,7 +2980,8 @@ fn main() {
 fn match_bound_enum_field_access_uses_correct_index() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Info {
     Info { kind: int, code: int },
@@ -2980,7 +3038,8 @@ fn example_lambda_prints_42() {
 fn nested_typed_lambdas_print_sum() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let add = fn (int x) => fn (int y) use (x) => x + y;
@@ -3004,7 +3063,8 @@ fn example_method_overload_prints_1116() {
 fn named_partial_application_completes_and_prints_3() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int { return a + b; }
 fn main() {
@@ -3022,7 +3082,8 @@ fn main() {
 fn nested_partial_application_prints_6() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add3(int a, int b, int c) -> int { return a + b + c; }
 fn main() {
@@ -3041,7 +3102,8 @@ fn main() {
 fn fixed_vs_rest_overload_dispatches_at_runtime() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f(int x) -> int { return x * 10; }
 fn f(int x, int y, int... xs) -> int { return x + y + len(xs); }
@@ -3063,7 +3125,8 @@ fn production_compile_strips_harness_declarations() {
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[test]
 fn hidden() { assert(false)?; }
@@ -3098,7 +3161,8 @@ test("via block") { assert(true)?; }
 fn attr_decorator_with_overloaded_functions_forwards_each_arity() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
     write_all(stdout(), to_bytes(format("%s", message)));
@@ -3124,7 +3188,8 @@ fn main() {
 fn spread_with_partial_application_forwards_remaining_args() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add3(int a, int b, int c) -> int { return a + b + c; }
 fn main() {
@@ -3140,7 +3205,8 @@ fn main() {
 fn named_call_args_on_overloaded_functions_dispatch_correctly() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn greet(string name) -> string { return name; }
 fn greet(string name, int age) -> string { return format("%s:%i", name, age); }
@@ -3158,7 +3224,8 @@ fn attr_on_async_fn_rejected_at_compile_time() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
     return target(...args);
@@ -3183,7 +3250,8 @@ fn main() {
 fn rest_overload_with_attr_logging_forwards_pack() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
     write_all(stdout(), to_bytes(format("%s", message)));
@@ -3210,7 +3278,8 @@ fn main() {
 fn spread_mixed_prefix_and_pack_prints_6() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add3(int a, int b, int c) -> int { return a + b + c; }
 fn main() {
@@ -3227,7 +3296,8 @@ fn main() {
 fn spread_let_bound_tuple_prints_6() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add3(int a, int b, int c) -> int { return a + b + c; }
 fn main() {
@@ -3245,7 +3315,8 @@ fn main() {
 fn attr_positional_extra_forwards_literal() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
     write_all(stdout(), to_bytes(format("%s", message)));
@@ -3269,7 +3340,8 @@ fn main() {
 fn stacked_attrs_apply_outer_first() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr outer<T>(fn(...args) -> T target, ...args) -> T {
     write_all(stdout(), to_bytes("O"));
@@ -3296,7 +3368,8 @@ fn main() {
 fn attr_inlining_rewrites_target_in_all_expression_contexts() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 attr wrap_if<T>(fn(...args) -> T target, ...args) -> T {
     if true {
@@ -3352,7 +3425,8 @@ fn main() {
 fn tail_recursive_sum_to_prints_15() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sum_to(int n, int acc) -> int {
     if n <= 0 { return acc; }
@@ -3371,7 +3445,8 @@ fn main() {
 fn const_if_strict_lt_equality_prints_else() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     if 5 < 5 {
@@ -3390,7 +3465,8 @@ fn main() {
 fn const_while_false_skips_body() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     while false {
@@ -3409,7 +3485,8 @@ fn main() {
 fn const_for_unroll_prints_sum() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let s = 0;
@@ -3428,7 +3505,8 @@ fn main() {
 fn const_for_unroll_leq_advances_induction() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let s = 0;
@@ -3447,7 +3525,8 @@ fn main() {
 fn const_range_for_in_unroll_prints() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let s = 0;
@@ -3466,7 +3545,8 @@ fn main() {
 fn for_with_break_still_stops_early() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let s = 0;
@@ -3486,7 +3566,8 @@ fn main() {
 fn tiny_add_inlined_prints_7() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int { return a + b; }
 fn main() {
@@ -3503,7 +3584,8 @@ fn main() {
 fn mul_strength_reduce_to_shl_prints_correct_values() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn scale_rhs(int x) -> int { return x * 8; }
 fn scale_lhs(int x) -> int { return 4 * x; }
@@ -3533,7 +3615,8 @@ fn main() {
 fn early_return_callee_both_arms_correct() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn early(int n, int is_neg) -> int {
     if is_neg == 1 {
@@ -3556,7 +3639,8 @@ fn main() {
 fn pure_arg_reorder_preserves_order_and_effects() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn effect() -> int {
     write_all(stdout(), to_bytes(format("%i,", 7)));
@@ -3579,7 +3663,8 @@ fn main() {
 fn predicate_peel_base_and_recursive_paths() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn other(int n) -> int {
     return n;
@@ -3604,7 +3689,8 @@ fn main() {
 fn self_unroll_fib_still_correct() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 1 {
@@ -3625,7 +3711,8 @@ fn main() {
 fn auto_par_fib_still_correct() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 1 {
@@ -3645,7 +3732,8 @@ fn main() {
 #[test]
 fn auto_par_fib_above_threshold_emits_spec_and_runs() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 1 {
@@ -3682,7 +3770,8 @@ fn main() {
 #[test]
 fn impure_recursive_binop_skips_par_specialization() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn leaf(int n) -> int {
     write_all(stdout(), to_bytes(format("%i", n)));
@@ -3714,6 +3803,7 @@ fn mem_fwd_post_call_store_compare_does_not_hang() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use string::*;
 fn find_bytes([byte] hay, [byte] needle) -> int {
     let hn = len(hay);
@@ -3766,7 +3856,8 @@ fn main() {
 fn fused_assign_and_packed_call_runtime() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add3(int a, int b, int c) -> int {
     if a < 0 {
@@ -3831,7 +3922,8 @@ fn thread_main_exits_without_join_still_runs_worker_recv() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn worker(Receiver rx) {
@@ -3857,7 +3949,8 @@ fn nested_spawn_joins_via_shared_root_registry() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn leaf() {
@@ -3889,7 +3982,8 @@ fn thread_channel_close_try_recv_is_disconnected() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -3916,7 +4010,8 @@ fn thread_try_recv_empty_open_channel_would_block() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -3941,7 +4036,8 @@ fn thread_rwlock_with_write_then_read() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -3960,7 +4056,8 @@ fn thread_detach_then_join_fails() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn work() -> int {
@@ -4002,7 +4099,8 @@ fn packed_vec_arith_runtime_neg_div_and_scalar_left() {
     // on the N≥8 HostInvoke path (mul/broadcast already covered by the example).
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -4025,7 +4123,8 @@ fn aggregate_float_negate_uses_mulf_not_int_neg() {
     // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let d = -(1.5, 2.0);
@@ -4040,7 +4139,8 @@ fn main() {
 fn aggregate_dynamic_array_broadcast_adds_scalar() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add1([int] xs) -> [int] {
     return xs + 1;
@@ -4089,7 +4189,8 @@ fn example_matrix_mul_prints_product_and_hadamard_add() {
 fn matrix_compound_add_assign_updates_cells() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let m = matrix([[1, 2], [3, 4]]);
@@ -4106,7 +4207,8 @@ fn matrix_sub_and_neg_packed_path_values() {
     // End-to-end: Matrix `-` (PackedMatrixZip Sub) and unary `-` (PackedMatrixNeg).
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[5, 7], [9, 11]]);
@@ -4125,7 +4227,8 @@ fn main() {
 fn float_dot_packed_path_value() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%f", dot([1.5, 2.0], [2.5, 4.0]))));
@@ -4140,7 +4243,8 @@ fn matmul_tuple_of_tuples_rebuilds_correct_product() {
     // Exercises outer_is_tuple + row_is_tuple packing flags end-to-end.
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = ((1, 2), (3, 4));
@@ -4157,7 +4261,8 @@ fn main() {
 fn aggregate_compound_assign_updates_tuple() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let v = (1, 2);
@@ -4195,7 +4300,8 @@ fn crypto_sha256_empty_digest_len_via_host_invoke() {
     let output = run_example_src(
         r#"
 use crypto::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn digest_len() -> int {
@@ -4220,7 +4326,8 @@ fn fs_exists_dot_ok_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::fs::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn dot_ok() -> int {
@@ -4244,7 +4351,8 @@ fn env_var_round_trip_via_host_invoke() {
     let output = run_example_src(
         r#"
 use env::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn round_trip() -> string {
@@ -4284,6 +4392,7 @@ fn tls_client_enable_non_tcp_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 use string::*;
 
@@ -4326,6 +4435,7 @@ fn tls_client_disable_on_file_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 use string::*;
 
@@ -4356,6 +4466,7 @@ fn tls_client_enable_two_arg_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 
 fn main() {
@@ -4379,6 +4490,7 @@ fn tls_client_enable_non_record_opts_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 
 fn main() {
@@ -4399,6 +4511,7 @@ fn tls_client_enable_empty_opts_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 
 fn main() {
@@ -4422,6 +4535,7 @@ fn tls_server_enable_non_tcp_is_err_via_host_invoke() {
     let src = format!(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 use string::*;
 
@@ -4465,6 +4579,7 @@ fn tls_server_disable_on_file_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 use string::*;
 
@@ -4492,6 +4607,7 @@ fn tls_server_enable_non_record_opts_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4512,6 +4628,7 @@ fn tls_server_enable_empty_opts_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4532,6 +4649,7 @@ fn tls_flat_parent_enable_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::*;
 
 fn main() {
@@ -4552,6 +4670,7 @@ fn tls_legacy_server_encrypt_decrypt_do_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4569,6 +4688,7 @@ fn main() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4592,6 +4712,7 @@ fn tls_client_opts_on_server_enable_do_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4614,6 +4735,7 @@ fn tls_client_and_server_enable_both_invalid_input_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::enable as client_enable;
 use io::net::tls::server::enable as server_enable;
 use string::*;
@@ -4662,6 +4784,7 @@ fn tls_server_enable_empty_pem_is_invalid_input_via_host_invoke() {
     let output = run_example_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 use string::*;
 
@@ -4705,6 +4828,7 @@ fn tls_server_enable_non_string_pem_fields_do_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4727,6 +4851,7 @@ fn tls_client_enable_unknown_opts_key_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::client::*;
 
 fn main() {
@@ -4749,6 +4874,7 @@ fn tls_server_enable_unknown_opts_key_does_not_compile() {
     let err = pipeline.compile_src(
         r#"
 use io::*;
+use io::sync::*;
 use io::net::tls::server::*;
 
 fn main() {
@@ -4784,7 +4910,8 @@ fn regex_compile_error_is_err_via_host_invoke() {
     let output = run_example_src(
         r#"
 use regex::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn bad() -> int {
@@ -4812,7 +4939,8 @@ fn main() {
 fn derive_string_to_string_prints_variant() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(String)]
 enum Color {
@@ -4839,7 +4967,8 @@ fn example_derive_hash_prints_true_true_true_true() {
 fn hash_primitives_and_nested_differ_when_payloads_differ() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(Hash)]
 enum Box {
@@ -4865,7 +4994,8 @@ fn fallthrough_string_return_requires_explicit_return() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn bad() -> string {
     // no return
@@ -4893,7 +5023,8 @@ fn main() {
 fn fallthrough_unit_allows_implicit_epilogue() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unitish() {
     let x = 1;
@@ -4913,7 +5044,8 @@ fn fallthrough_int_requires_explicit_return() {
     let mut pipeline = Pipeline::new();
     let err = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn answer() -> int {
     // no return
@@ -5009,7 +5141,8 @@ fn main() {
 fn fallthrough_result_unit_ok_allows_epilogue() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn ok_unit() -> Result<(), string> {}
 
@@ -5077,7 +5210,8 @@ fn main() {
 fn bare_return_semi_exits_unit_fn() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn early(int n) {
     if n == 0 {
@@ -5127,7 +5261,8 @@ fn unreachable_after_return_is_warning() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f() -> int {
     return 1;
@@ -5154,7 +5289,8 @@ fn unreachable_after_while_true_is_warning() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f() -> int {
     while true {
@@ -5182,7 +5318,8 @@ fn defer_dominated_by_while_true_warns_e0123() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f() -> int {
     defer { write_all(stdout(), to_bytes("d")); }
@@ -5215,7 +5352,8 @@ fn defer_inside_while_true_warns_e0123() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f() -> int {
     while true {
@@ -5401,7 +5539,8 @@ fn if_else_returns_satisfy_non_unit_return() {
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f(bool b) -> int {
     if b {
@@ -5432,7 +5571,8 @@ fn main() {
 fn never_join_match_panic_arm_types_as_int() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap(Option<int> o) -> int {
     return match o {
@@ -5481,7 +5621,8 @@ fn main() {
 fn unit_fallthrough_still_runs_defers() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn f() {
     defer { write_all(stdout(), to_bytes("d")); }
@@ -5505,7 +5646,8 @@ fn main() {
 fn nested_multifield_record_after_sibling_preserves_bindings() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     I { x: int, y: int },
@@ -5535,7 +5677,8 @@ fn main() {
 fn int_pow_strength_reduce_prints_correct_values() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 5;
@@ -5555,7 +5698,8 @@ fn main() {
 #[test]
 fn invert_not_if_else_preserves_arm_semantics() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn pick(bool c) -> int {
     if !c {
@@ -5586,7 +5730,8 @@ fn main() {
 #[test]
 fn set_field_and_store_index_statements_pop_value() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,
@@ -5634,7 +5779,8 @@ fn main() {
 #[test]
 fn repeated_field_key_reuses_prologue_temp() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,
@@ -5683,7 +5829,8 @@ fn main() {
 #[test]
 fn for_in_array_hoists_array_len_once() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2, 3];
@@ -5723,7 +5870,8 @@ fn example_perf_field_hot_prints_expected() {
 fn option_unwrap_both_arms_correct_after_return_clone() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
@@ -5748,7 +5896,8 @@ fn string_table_archive_round_trip_preserves_literals() {
     use rkyv::rancor::Error;
 
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%s-%i", "archive", 35)));
@@ -5820,7 +5969,8 @@ fn worker_write_all_loop_captures_via_shared_print() {
     let output = run_example_src(
         r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn worker() -> int {
@@ -5846,7 +5996,8 @@ fn main() {
 fn qualified_string_helpers_without_glob_import() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 
 fn main() {
     write_all(stdout(), string::to_bytes(string::format("%s", "ok")));
@@ -5862,7 +6013,8 @@ fn main() {
 fn nested_host_invoke_call_args_stage_without_clobber() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn concat_bytes([byte] a, [byte] b) -> [byte] {
@@ -5893,7 +6045,8 @@ fn main() {
 fn variable_string_add_concatenates() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 fn main() {
@@ -5909,7 +6062,8 @@ fn main() {
 #[test]
 fn variable_string_add_in_test_harness() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 test("add") {
@@ -5928,7 +6082,8 @@ test("add") {
 fn nested_string_concat_chain_prints_full_content() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 fn main() {
@@ -5948,7 +6103,8 @@ fn main() {
 fn string_plus_equal_loop_builds_header_block() {
     let output = run_example_src(
         r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 fn main() {
@@ -5972,7 +6128,8 @@ fn main() {
 #[test]
 fn nested_string_concat_keeps_multiple_pct_s_string_ops() {
     let src = r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 fn main() {

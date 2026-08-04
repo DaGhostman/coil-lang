@@ -577,7 +577,6 @@ impl Checker {
         let res_int = result_app_ty(int(), io_err.clone());
         let res_unit = result_app_ty(unit_ty(), io_err.clone());
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
-        let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
         let res_string = result_app_ty(string(), io_err.clone());
         let addr_ty = tuple(vec![string(), int()]);
         let res_addr = result_app_ty(addr_ty, io_err.clone());
@@ -594,21 +593,15 @@ impl Checker {
             IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => stream,
             IoBuiltin::Open => fun(&[string(), string()], res_stream),
             IoBuiltin::Close => fun(&[stream], res_unit),
-            IoBuiltin::Read | IoBuiltin::ReadExact => fun(&[stream, bytes], res_opt_int),
+            IoBuiltin::Read => fun(&[stream, bytes], res_opt_int),
             IoBuiltin::Write => fun(&[stream, bytes], res_int),
-            IoBuiltin::ReadToEnd => fun(&[stream], res_bytes),
-            IoBuiltin::WriteAll => fun(&[stream, bytes], res_unit),
             IoBuiltin::AwaitReadable | IoBuiltin::AwaitWritable => fun(&[stream], res_unit),
             IoBuiltin::Drive => fun(&[], int()),
-            IoBuiltin::SetReadTimeout | IoBuiltin::SetWriteTimeout => {
-                fun(&[stream, int()], res_unit)
-            }
             IoBuiltin::FromBytes => fun(&[bytes], res_string),
             IoBuiltin::ToBytes => fun(&[string()], bytes),
             IoBuiltin::TcpConnect | IoBuiltin::TcpListen => fun(&[string(), int()], res_stream),
             IoBuiltin::TcpConnectTimeout => fun(&[string(), int(), int()], res_stream),
-            IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
-            IoBuiltin::TcpAcceptWaitTimeout => fun(&[stream, int()], res_stream),
+            IoBuiltin::TcpAccept => fun(&[stream], res_stream),
             IoBuiltin::TcpPeerAddr | IoBuiltin::TcpLocalAddr => fun(&[stream], res_addr),
             IoBuiltin::TcpSetNodelay => fun(&[stream, boolean()], res_unit),
             IoBuiltin::TcpShutdown => fun(&[stream, int()], res_unit),
@@ -639,7 +632,7 @@ impl Checker {
             IoBuiltin::TlsServerDisable => fun(&[stream], res_stream),
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => fun(&[string(), int()], res_stream),
             IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
-            IoBuiltin::UdpRecvFrom | IoBuiltin::UdpRecvFromWait => {
+            IoBuiltin::UdpRecvFrom => {
                 fun(&[stream, bytes], res_recv_from)
             }
             IoBuiltin::UdpLocalPort => fun(&[stream], res_int),

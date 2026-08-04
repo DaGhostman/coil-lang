@@ -1,9 +1,9 @@
 //! IO readiness reactor — sibling of the CPU work-stealing [`crate::reactor::Reactor`].
 //!
-//! Sync adapters (`read_exact`, `write_all`, …) and TLS handshake waits block here
-//! via single-fd `poll` (works for sockets, pipes, and regular files). Async waiters
-//! register interest and are woken when [`IoReactor::poll_once`] observes readiness
-//! (Phase 2 cooperative / help-steal paths).
+//! `await_*` and TLS handshake waits block here via single-fd `poll` (works for
+//! sockets, pipes, and regular files). Userland sync adapters reach the same path
+//! through `await_readable` / `await_writable`. Async waiters register interest and
+//! are woken when [`IoReactor::poll_once`] observes readiness.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};

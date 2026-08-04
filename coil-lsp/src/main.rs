@@ -1105,11 +1105,9 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
                 .into()
         }
         ("io", "write") => "Writes bytes to a stream and reports the number written.".into(),
-        ("io", "read_exact") => "Reads exactly the requested number of bytes.".into(),
-        ("io", "read_to_end") => "Reads a stream to EOF, returning all received bytes.".into(),
-        ("io", "write_all") => "Writes the complete byte array, waiting when the stream would block.".into(),
-        ("io", "set_read_timeout") => "Sets or clears the stream read deadline in milliseconds.".into(),
-        ("io", "set_write_timeout") => "Sets or clears the stream write deadline in milliseconds.".into(),
+        ("io", "await_readable") => "Parks until the stream is readable.".into(),
+        ("io", "await_writable") => "Parks until the stream is writable.".into(),
+        ("io", "drive") => "Polls async IO waiters once; returns newly-ready count.".into(),
         ("io", "from_bytes") | ("string", "from_bytes") => {
             "Decodes UTF-8 bytes into a string.".into()
         }
@@ -1125,10 +1123,6 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
         }
         ("io::net::tcp", "listen") => "Creates a TCP listener on an address.".into(),
         ("io::net::tcp", "accept") => "Accepts the next pending TCP connection.".into(),
-        ("io::net::tcp", "accept_wait") => "Waits for and accepts a TCP connection.".into(),
-        ("io::net::tcp", "accept_wait_timeout") => {
-            "Waits for a TCP connection until the timeout expires.".into()
-        }
         ("io::net::tcp", "peer_addr") => "Returns the remote TCP address.".into(),
         ("io::net::tcp", "local_addr") => "Returns the local TCP address.".into(),
         ("io::net::tcp", "set_nodelay") => "Enables or disables TCP_NODELAY.".into(),
@@ -1137,7 +1131,6 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
         ("io::net::udp", "connect") => "Creates a UDP socket connected to a peer.".into(),
         ("io::net::udp", "send_to") => "Sends a datagram to an explicit UDP peer.".into(),
         ("io::net::udp", "recv_from") => "Receives a UDP datagram without waiting.".into(),
-        ("io::net::udp", "recv_from_wait") => "Waits for and receives a UDP datagram.".into(),
         ("io::net::udp", "local_port") => "Returns the local UDP port.".into(),
         ("prelude::test", "assert") => "Checks a condition and returns a result instead of aborting.".into(),
         ("prelude", "ord") => "Returns the first UTF-8 code unit of a string.".into(),

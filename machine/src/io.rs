@@ -1,8 +1,8 @@
 //! Host-backed non-blocking IO streams (files, stdio, TCP).
 //!
-//! Streams are always non-blocking at the OS level. Sync helpers
-//! (`read_exact`, `read_to_end`, `write_all`, …) wait on the
-//! [`crate::io_reactor::IoReactor`] (never busy-spin on `WouldBlock`).
+//! Streams are always non-blocking at the OS level. Blocking adapters are
+//! Coil userland (`stdlib/io/sync.hy`) over L0 + `await_*`. TLS handshake
+//! waits still use the [`crate::io_reactor::IoReactor`] internally.
 
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
