@@ -1,4 +1,8 @@
 // Dynamic recursive entry cannot be measured — requires #[max_depth(N)].
+fn noise() -> int {
+    return 10;
+}
+
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -7,6 +11,5 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    let k = 10;
-    let _ = fib(k);
+    let _ = fib(noise());
 }

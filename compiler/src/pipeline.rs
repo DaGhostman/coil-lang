@@ -1386,13 +1386,13 @@ fn main() {
         let mut pipeline = Pipeline::new();
         let err = pipeline.compile_src(
             r#"
+fn noise() -> int { return 10; }
 fn fib(int n) -> int {
     if n <= 2 { return 1; }
     return fib(n - 1) + fib(n - 2);
 }
 fn main() {
-    let k = 10;
-    let x = fib(k);
+    let x = fib(noise());
     return;
 }
 "#,
