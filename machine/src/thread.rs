@@ -3,7 +3,8 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 
@@ -11,6 +12,70 @@ use std::thread;
 /// [`ThreadSpawnContext`]). Process-global storage was wrong: parallel tests /
 /// multiple `Machine`s would steal each other's joins via `mem::take`.
 pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
+
+/// Per-root-VM bound on concurrent OS workers from [`host_spawn`].
+///
+/// Caps deep auto-parallel recursion without a work-stealing pool. Override
+/// with `COIL_MAX_WORKER_THREADS` (clamped to 1..=512). Default is
+/// `2 * available_parallelism` (minimum 2). Shared with nested workers so the
+/// whole spawn tree under one root VM shares one budget.
+#[derive(Debug)]
+pub struct WorkerCap {
+    live: AtomicUsize,
+    max: usize,
+}
+
+impl WorkerCap {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            max: max_worker_threads(),
+        })
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    fn try_acquire(&self) -> bool {
+        loop {
+            let cur = self.live.load(Ordering::SeqCst);
+            if cur >= self.max {
+                return false;
+            }
+            if self
+                .live
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn max_worker_threads() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        if let Ok(raw) = std::env::var("COIL_MAX_WORKER_THREADS") {
+            if let Ok(n) = raw.parse::<usize>() {
+                return n.clamp(1, 512);
+            }
+        }
+        thread::available_parallelism()
+            .map(|n| n.get().saturating_mul(2).max(2))
+            .unwrap_or(8)
+            .min(512)
+    })
+}
 
 pub fn new_live_thread_registry() -> LiveThreadRegistry {
     Arc::new(Mutex::new(Vec::new()))
@@ -651,6 +716,7 @@ struct WorkerCtx {
     state: Arc<JoinState>,
     shared_print: Option<Arc<Mutex<Vec<u8>>>>,
     live_threads: LiveThreadRegistry,
+    worker_cap: Arc<WorkerCap>,
 }
 
 fn run_worker(ctx: WorkerCtx) {
@@ -662,7 +728,18 @@ fn run_worker(ctx: WorkerCtx) {
         state,
         shared_print,
         live_threads,
+        worker_cap,
     } = ctx;
+    // Always release the concurrency slot when the OS thread finishes —
+    // including panics — so auto-par fallback / later spawns can proceed.
+    struct WorkerSlotGuard(Arc<WorkerCap>);
+    impl Drop for WorkerSlotGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let _slot = WorkerSlotGuard(Arc::clone(&worker_cap));
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
         vm.install_natives(&natives);
@@ -671,6 +748,7 @@ fn run_worker(ctx: WorkerCtx) {
         // Nested `spawn` from a worker registers on the root VM's list so the
         // root's `run_with_pool` join still waits for them.
         vm.set_live_threads(Arc::clone(&live_threads));
+        vm.set_worker_cap(Arc::clone(&worker_cap));
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
             vm.with_output(SharedPrintWriter(Arc::clone(buf)));
@@ -706,6 +784,7 @@ pub struct ThreadSpawnContext {
     pub natives: Natives,
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
     pub live_threads: LiveThreadRegistry,
+    pub worker_cap: Arc<WorkerCap>,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -715,6 +794,7 @@ impl Clone for ThreadSpawnContext {
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
             live_threads: Arc::clone(&self.live_threads),
+            worker_cap: Arc::clone(&self.worker_cap),
         }
     }
 }
@@ -738,7 +818,14 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
             .collect::<Result<_, _>>()?
     };
     let ctx = host_spawn_context()?;
+    // Acquire before `thread::spawn` so deep recursive auto-par hits
+    // `WouldBlock` instead of exhausting the host. Slot is released in
+    // `run_worker` when the OS thread finishes.
+    if !ctx.worker_cap.try_acquire() {
+        return Err(ThreadErrorTag::WouldBlock);
+    }
     let live_threads = Arc::clone(&ctx.live_threads);
+    let worker_cap = Arc::clone(&ctx.worker_cap);
     let state = Arc::new(JoinState::new());
     let worker = WorkerCtx {
         program: ctx.program,
@@ -748,8 +835,17 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
         state: Arc::clone(&state),
         shared_print: ctx.shared_print,
         live_threads: Arc::clone(&live_threads),
+        worker_cap: Arc::clone(&worker_cap),
     };
-    let handle = thread::spawn(move || run_worker(worker));
+    let handle = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        thread::spawn(move || run_worker(worker))
+    })) {
+        Ok(handle) => handle,
+        Err(_) => {
+            worker_cap.release();
+            return Err(ThreadErrorTag::Other);
+        }
+    };
     *state.join_handle.lock().unwrap() = Some(handle);
     register_live_thread(&live_threads, Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
@@ -1454,6 +1550,24 @@ mod tests {
             result_err_tag(&heap, recv_err),
             ThreadErrorTag::Disconnected
         );
+    }
+
+    #[test]
+    fn worker_cap_rejects_when_full() {
+        let cap = WorkerCap::new();
+        let max = cap.max();
+        for _ in 0..max {
+            assert!(cap.try_acquire());
+        }
+        assert!(!cap.try_acquire());
+        assert_eq!(cap.live(), max);
+        cap.release();
+        assert!(cap.try_acquire());
+        // Drain so Drop of Arc doesn't leave a misleading live count for
+        // other assertions in this process (cap is not process-global).
+        while cap.live() > 0 {
+            cap.release();
+        }
     }
 
     #[test]
