@@ -2415,14 +2415,7 @@ impl<const S: usize> Machine<S> {
                     let live_before = self.heap.live_object_count();
                     match self.natives.get_by_id(fn_id) {
                         Some(native) => match native.invoke(&mut self.heap, args) {
-                            Ok(Some(v)) => {
-                                // Cooperative await left a waiter on the coro;
-                                // drop it once the probe completed.
-                                if !self.resume_stack.is_empty() {
-                                    self.clear_current_coro_io_wait();
-                                }
-                                self.stack.push(v);
-                            }
+                            Ok(Some(v)) => self.stack.push(v),
                             Ok(None) => {
                                 if let Some(req) = crate::io::take_pending_io_park() {
                                     if !self.resume_stack.is_empty() {
