@@ -464,6 +464,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "coil-simd"
+version = "0.1.0"
+
+[[package]]
 name = "common"
 version = "0.1.0"
 dependencies = [
@@ -1177,6 +1181,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "chrono",
+ "coil-simd",
  "common",
  "ed25519-dalek",
  "getrandom 0.4.3",
