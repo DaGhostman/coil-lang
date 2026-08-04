@@ -13,7 +13,8 @@
 // recursing at unbounded depth.
 //
 // Output: `99` (the value of `v`).
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     I { v: int },

@@ -1,8 +1,8 @@
 //! Host-backed non-blocking IO streams (files, stdio, TCP).
 //!
-//! Streams are always non-blocking at the OS level. Sync helpers
-//! (`read_exact`, `read_to_end`, `write_all`, …) may block in Rust
-//! via `poll`, but never busy-spin on `WouldBlock`.
+//! Streams are always non-blocking at the OS level. Blocking adapters are
+//! Coil userland (`stdlib/io/sync.hy`) over L0 + `await_*`. TLS handshake
+//! waits still use the [`crate::io_reactor::IoReactor`] internally.
 
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
@@ -12,14 +12,32 @@ use std::time::{Duration, Instant};
 
 use common::{BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
+use crate::io_reactor::Interest;
 use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
 
 type OutputRedirect = *mut (dyn Write + Send);
 
+/// Request to park the VM until an fd is ready (set by `await_*` natives).
+#[derive(Debug, Clone)]
+pub struct IoParkRequest {
+    pub fd: RawFd,
+    pub interest: Interest,
+    pub timeout: Option<Duration>,
+}
+
 thread_local! {
+    static PENDING_IO_PARK: RefCell<Option<IoParkRequest>> = const { RefCell::new(None) };
     static OUTPUT_REDIRECT: RefCell<Option<OutputRedirect>> = RefCell::new(None);
     static SHARED_PRINT: RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>> =
         RefCell::new(None);
+}
+
+pub(crate) fn take_pending_io_park() -> Option<IoParkRequest> {
+    PENDING_IO_PARK.with(|c| c.borrow_mut().take())
+}
+
+fn request_io_park(req: IoParkRequest) {
+    PENDING_IO_PARK.with(|c| *c.borrow_mut() = Some(req));
 }
 
 pub fn set_output_redirect(sink: Option<OutputRedirect>) -> Option<OutputRedirect> {
@@ -147,33 +165,6 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn poll_fd(fd: RawFd, for_read: bool, timeout: Option<Duration>) -> io::Result<bool> {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: if for_read {
-            libc::POLLIN
-        } else {
-            libc::POLLOUT
-        },
-        revents: 0,
-    };
-    let timeout_ms = match timeout {
-        None => -1,
-        Some(d) => d.as_millis().min(i32::MAX as u128) as i32,
-    };
-    loop {
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        return Ok(rc > 0);
-    }
-}
-
 /// Convert coil millisecond timeout: `<= 0` clears / means wait forever.
 pub fn duration_from_timeout_ms(ms: i64) -> Option<Duration> {
     if ms <= 0 {
@@ -215,12 +206,22 @@ pub fn stream_set_write_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Resu
     })?
 }
 
+/// Wait for fd readiness via the VM's [`IoReactor`] (help-steals CPU work when available).
+pub fn reactor_wait_fd(
+    fd: RawFd,
+    interest: Interest,
+    timeout: Option<Duration>,
+) -> Result<(), IoErrorTag> {
+    crate::thread::host_io_wait(fd, interest, timeout)
+}
+
 fn poll_ready(fd: RawFd, for_read: bool, timeout: Option<Duration>) -> Result<(), IoErrorTag> {
-    match poll_fd(fd, for_read, timeout) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(IoErrorTag::TimedOut),
-        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-    }
+    let interest = if for_read {
+        Interest::Readable
+    } else {
+        Interest::Writable
+    };
+    reactor_wait_fd(fd, interest, timeout)
 }
 
 /// Wrap an owned fd as a heap `Stream` (always non-blocking).
@@ -588,6 +589,71 @@ fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
     }
     let fd = stream_raw_fd(heap, stream)?;
     poll_ready(fd, false, timeout)
+}
+
+/// Non-blocking readiness probe; parks the VM via [`IoParkRequest`] when not ready.
+///
+/// Returns `Ok(None)` when a park was requested (caller must not push a value).
+/// Returns `Ok(Some(Result::Ok(())))` when already ready.
+pub fn stream_await_readable(
+    heap: &mut Heap,
+    stream: Value,
+) -> Result<Option<Value>, IoErrorTag> {
+    stream_await_interest(heap, stream, Interest::Readable)
+}
+
+/// Like [`stream_await_readable`] for writability.
+pub fn stream_await_writable(
+    heap: &mut Heap,
+    stream: Value,
+) -> Result<Option<Value>, IoErrorTag> {
+    stream_await_interest(heap, stream, Interest::Writable)
+}
+
+fn stream_await_interest(
+    heap: &mut Heap,
+    stream: Value,
+    interest: Interest,
+) -> Result<Option<Value>, IoErrorTag> {
+    let timeout = match interest {
+        Interest::Readable => stream_read_timeout(heap, stream)?,
+        Interest::Writable => stream_write_timeout(heap, stream)?,
+    };
+    #[cfg(feature = "tls")]
+    if interest == Interest::Readable {
+        let skip = with_stream_mut(heap, stream, |s| {
+            s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.has_buffered_plaintext())
+        })?;
+        if skip {
+            return Ok(Some(as_result_unit(heap, Ok(()))));
+        }
+    }
+    let fd = stream_raw_fd(heap, stream)?;
+    // Already ready?
+    match reactor_wait_fd(fd, interest, Some(Duration::ZERO)) {
+        Ok(()) => Ok(Some(as_result_unit(heap, Ok(())))),
+        Err(IoErrorTag::TimedOut) => {
+            request_io_park(IoParkRequest {
+                fd,
+                interest,
+                timeout,
+            });
+            Ok(None)
+        }
+        Err(e) => Ok(Some(as_result_unit(heap, Err(e)))),
+    }
+}
+
+/// Drive registered async waiters once (cooperative).
+pub fn io_drive(_heap: &mut Heap) -> Value {
+    let n = crate::thread::host_io_drive();
+    Value::from(n as i64)
+}
+
+/// Block until any registered async waiter is ready; returns newly-ready count.
+pub fn io_wait_ready(_heap: &mut Heap) -> Value {
+    let n = crate::thread::host_io_wait_ready();
+    Value::from(n as i64)
 }
 
 fn stream_raw_fd(heap: &mut Heap, stream: Value) -> Result<RawFd, IoErrorTag> {
@@ -1610,5 +1676,128 @@ mod tests {
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS.len(), 12);
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS[8], "TimedOut");
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS[11], "Handshake");
+    }
+
+    fn pipe_stream_pair(heap: &mut Heap) -> (Value, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let stream = alloc_stream(heap, read, StreamKind::File).expect("alloc read end");
+        (stream, write)
+    }
+
+    #[test]
+    fn await_readable_returns_ok_when_already_ready() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        let n = unsafe { libc::write(write.as_raw_fd(), b"a".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        let _ = take_pending_io_park();
+        let v = stream_await_readable(&mut heap, stream)
+            .expect("await")
+            .expect("already ready should not park");
+        assert_eq!(enum_tag(&heap, v), Some(0));
+        assert!(take_pending_io_park().is_none());
+        stream_close(&mut heap, stream).unwrap();
+        drop(write);
+    }
+
+    #[test]
+    fn await_readable_parks_when_not_ready() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        stream_set_read_timeout(&mut heap, stream, 123).unwrap();
+        let _ = take_pending_io_park();
+        let parked = stream_await_readable(&mut heap, stream).expect("await");
+        assert!(parked.is_none(), "empty pipe must park the VM");
+        let req = take_pending_io_park().expect("park request");
+        assert_eq!(req.interest, Interest::Readable);
+        assert_eq!(req.timeout, Some(Duration::from_millis(123)));
+        assert_eq!(req.fd, stream_raw_fd(&mut heap, stream).unwrap());
+        stream_close(&mut heap, stream).unwrap();
+        drop(write);
+    }
+
+    #[test]
+    fn await_writable_returns_ok_for_empty_pipe_write_end() {
+        let mut heap = Heap::default();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let stream = alloc_stream(&mut heap, write, StreamKind::File).expect("alloc write end");
+        let _ = take_pending_io_park();
+        let v = stream_await_writable(&mut heap, stream)
+            .expect("await")
+            .expect("empty pipe write end is writable");
+        assert_eq!(enum_tag(&heap, v), Some(0));
+        assert!(take_pending_io_park().is_none());
+        stream_close(&mut heap, stream).unwrap();
+        drop(read);
+    }
+
+    #[test]
+    fn await_readable_on_closed_stream_errors() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        stream_close(&mut heap, stream).unwrap();
+        let err = stream_await_readable(&mut heap, stream).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        drop(write);
+    }
+
+    #[test]
+    fn io_drive_without_host_state_returns_zero() {
+        let mut heap = Heap::default();
+        assert_eq!(io_drive(&mut heap).as_int(), 0);
+    }
+
+    #[test]
+    fn io_drive_with_host_state_counts_ready_waiters() {
+        let mut vm = crate::Machine::<64>::default();
+        let io = std::sync::Arc::clone(vm.io_reactor());
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let tok = io.register_wait(r, Interest::Readable);
+        let _guard = crate::thread::HostStateGuard::enter(&mut vm);
+        let mut heap = Heap::default();
+        assert_eq!(io_drive(&mut heap).as_int(), 0);
+        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        assert_eq!(io_drive(&mut heap).as_int(), 1);
+        io.cancel_wait(tok);
+        unsafe {
+            let _ = libc::close(r);
+            let _ = libc::close(w);
+        }
+    }
+
+    #[test]
+    fn io_wait_ready_without_host_state_returns_zero() {
+        let mut heap = Heap::default();
+        assert_eq!(io_wait_ready(&mut heap).as_int(), 0);
+    }
+
+    #[test]
+    fn io_wait_ready_blocks_until_waiter_ready() {
+        let mut vm = crate::Machine::<64>::default();
+        let io = std::sync::Arc::clone(vm.io_reactor());
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let tok = io.register_wait(r, Interest::Readable);
+        let _guard = crate::thread::HostStateGuard::enter(&mut vm);
+        let mut heap = Heap::default();
+        // Make readable before wait so we don't hang the unit test.
+        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        assert!(io_wait_ready(&mut heap).as_int() >= 1);
+        io.cancel_wait(tok);
+        unsafe {
+            let _ = libc::close(r);
+            let _ = libc::close(w);
+        }
     }
 }

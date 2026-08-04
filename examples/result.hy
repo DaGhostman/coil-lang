@@ -1,7 +1,8 @@
 // Built-in Result + Option — nested match with two Ok arms
 // (inner Some vs None) plus Err. Exercises Phase 18A inner-pattern
 // dispatch. Output: 420-1
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {

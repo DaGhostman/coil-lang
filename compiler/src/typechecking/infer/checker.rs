@@ -577,7 +577,6 @@ impl Checker {
         let res_int = result_app_ty(int(), io_err.clone());
         let res_unit = result_app_ty(unit_ty(), io_err.clone());
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
-        let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
         let res_string = result_app_ty(string(), io_err.clone());
         let addr_ty = tuple(vec![string(), int()]);
         let res_addr = result_app_ty(addr_ty, io_err.clone());
@@ -594,19 +593,15 @@ impl Checker {
             IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => stream,
             IoBuiltin::Open => fun(&[string(), string()], res_stream),
             IoBuiltin::Close => fun(&[stream], res_unit),
-            IoBuiltin::Read | IoBuiltin::ReadExact => fun(&[stream, bytes], res_opt_int),
+            IoBuiltin::Read => fun(&[stream, bytes], res_opt_int),
             IoBuiltin::Write => fun(&[stream, bytes], res_int),
-            IoBuiltin::ReadToEnd => fun(&[stream], res_bytes),
-            IoBuiltin::WriteAll => fun(&[stream, bytes], res_unit),
-            IoBuiltin::SetReadTimeout | IoBuiltin::SetWriteTimeout => {
-                fun(&[stream, int()], res_unit)
-            }
+            IoBuiltin::AwaitReadable | IoBuiltin::AwaitWritable => fun(&[stream], res_unit),
+            IoBuiltin::Drive | IoBuiltin::WaitReady => fun(&[], int()),
             IoBuiltin::FromBytes => fun(&[bytes], res_string),
             IoBuiltin::ToBytes => fun(&[string()], bytes),
             IoBuiltin::TcpConnect | IoBuiltin::TcpListen => fun(&[string(), int()], res_stream),
             IoBuiltin::TcpConnectTimeout => fun(&[string(), int(), int()], res_stream),
-            IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
-            IoBuiltin::TcpAcceptWaitTimeout => fun(&[stream, int()], res_stream),
+            IoBuiltin::TcpAccept => fun(&[stream], res_stream),
             IoBuiltin::TcpPeerAddr | IoBuiltin::TcpLocalAddr => fun(&[stream], res_addr),
             IoBuiltin::TcpSetNodelay => fun(&[stream, boolean()], res_unit),
             IoBuiltin::TcpShutdown => fun(&[stream, int()], res_unit),
@@ -637,7 +632,7 @@ impl Checker {
             IoBuiltin::TlsServerDisable => fun(&[stream], res_stream),
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => fun(&[string(), int()], res_stream),
             IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
-            IoBuiltin::UdpRecvFrom | IoBuiltin::UdpRecvFromWait => {
+            IoBuiltin::UdpRecvFrom => {
                 fun(&[stream, bytes], res_recv_from)
             }
             IoBuiltin::UdpLocalPort => fun(&[stream], res_int),
@@ -2944,6 +2939,7 @@ impl Checker {
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                        PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
                         PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
                         PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
                         PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
@@ -6531,6 +6527,35 @@ impl Checker {
             self.unify(&msg_ty, &string(), &msg.0.into_range(), "assert message");
         }
         result_app_ty(unit_ty(), string())
+    }
+
+    /// `block_on(coro)` — drive `coroutine<Y>` / `coroutine<Y, unit>` to completion → `Y`.
+    fn infer_block_on(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("block_on expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `block_on(async_fn_call())`".to_string()),
+            );
+        }
+        let handle_ty = self.infer(&args[0]);
+        let y_var = Ty::Var(self.counter.fresh());
+        let s_var = Ty::Var(self.counter.fresh());
+        let coro_ty = self.coroutine_type(y_var.clone(), s_var.clone());
+        self.unify(
+            &handle_ty,
+            &coro_ty,
+            &args[0].0.into_range(),
+            "block_on argument",
+        );
+        // Prefer unit send; free send vars unify with unit.
+        let unit = unit_ty();
+        let _ = self.unify(&s_var, &unit, &range, "block_on coroutine send type");
+        apply_ty_prune(&self.subst, &y_var)
     }
 
     fn primitive_cast_name(ty: &Ty) -> Option<&'static str> {

@@ -6,7 +6,8 @@
 //   5  — p.x after set_x(5)
 //   8  — p.sum() after mutation
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,

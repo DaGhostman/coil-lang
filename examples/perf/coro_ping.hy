@@ -1,5 +1,6 @@
 // CPU: coroutine resume/yield traffic.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn ping(int n) {
     let i = 0;

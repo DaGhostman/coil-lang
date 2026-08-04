@@ -3,7 +3,8 @@
 // hard type error (see diagnostics tests).
 // Expected output: 46,45,18
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2] + [3, 4];

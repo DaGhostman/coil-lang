@@ -1,6 +1,7 @@
 // Expected output: 424.0424242
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Describable<T> {
     fn describe_val(T x) -> int;

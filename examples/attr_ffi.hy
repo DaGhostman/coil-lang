@@ -2,7 +2,8 @@
 //
 // Expected output: `5` (strlen of "hello").
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;

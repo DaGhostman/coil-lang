@@ -6,7 +6,8 @@
 //
 // Expected output: `alice:30bob:25total:55`
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Row = (string, int);
 type Table = [Row];

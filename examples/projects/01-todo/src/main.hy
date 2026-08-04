@@ -4,7 +4,8 @@
 //   board:3 done:1 | 1:write tests [Doing] | 2:ship demo [Todo] | 3:nap [Done] |
 
 use board::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn print_task(Task t) {

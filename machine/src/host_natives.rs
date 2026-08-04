@@ -41,6 +41,8 @@ pub fn build_standard_host_natives(
     push_prelude_char_ord(&mut out, &mut register_id);
     push_thread_natives(&mut out, &mut register_id);
     push_packed_la(&mut out, &mut register_id);
+    // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
+    push_io_wait_ready(&mut out, &mut register_id);
     out
 }
 
@@ -139,6 +141,19 @@ fn push_packed_la(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut
     )));
 }
 
+fn push_io_wait_ready(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    let sig = FfiSignature::from_parts("wait_ready".to_string(), vec![], FfiType::Int)
+        .expect("wait_ready signature");
+    let id = out.len();
+    register_id("wait_ready", id);
+    out.push(Arc::new(HostClosureFn::new(sig, |heap, _args| {
+        Ok(Some(crate::io::io_wait_ready(heap)))
+    })));
+}
+
 #[derive(Clone, Copy)]
 enum IoKind {
     Stdin,
@@ -148,19 +163,15 @@ enum IoKind {
     Close,
     Read,
     Write,
-    ReadExact,
-    ReadToEnd,
-    WriteAll,
-    SetReadTimeout,
-    SetWriteTimeout,
+    AwaitReadable,
+    AwaitWritable,
+    Drive,
     FromBytes,
     ToBytes,
     TcpConnect,
     TcpConnectTimeout,
     TcpListen,
     TcpAccept,
-    TcpAcceptWait,
-    TcpAcceptWaitTimeout,
     TcpPeerAddr,
     TcpLocalAddr,
     TcpSetNodelay,
@@ -169,7 +180,6 @@ enum IoKind {
     UdpConnect,
     UdpSendTo,
     UdpRecvFrom,
-    UdpRecvFromWait,
     UdpLocalPort,
     #[cfg(feature = "tls")]
     TlsClientEnable,
@@ -191,19 +201,15 @@ impl IoKind {
             Self::Close,
             Self::Read,
             Self::Write,
-            Self::ReadExact,
-            Self::ReadToEnd,
-            Self::WriteAll,
-            Self::SetReadTimeout,
-            Self::SetWriteTimeout,
+            Self::AwaitReadable,
+            Self::AwaitWritable,
+            Self::Drive,
             Self::FromBytes,
             Self::ToBytes,
             Self::TcpConnect,
             Self::TcpConnectTimeout,
             Self::TcpListen,
             Self::TcpAccept,
-            Self::TcpAcceptWait,
-            Self::TcpAcceptWaitTimeout,
             Self::TcpPeerAddr,
             Self::TcpLocalAddr,
             Self::TcpSetNodelay,
@@ -212,7 +218,6 @@ impl IoKind {
             Self::UdpConnect,
             Self::UdpSendTo,
             Self::UdpRecvFrom,
-            Self::UdpRecvFromWait,
             Self::UdpLocalPort,
             #[cfg(feature = "tls")]
             Self::TlsClientEnable,
@@ -234,19 +239,15 @@ impl IoKind {
             Self::Close => "close",
             Self::Read => "read",
             Self::Write => "write",
-            Self::ReadExact => "read_exact",
-            Self::ReadToEnd => "read_to_end",
-            Self::WriteAll => "write_all",
-            Self::SetReadTimeout => "set_read_timeout",
-            Self::SetWriteTimeout => "set_write_timeout",
+            Self::AwaitReadable => "await_readable",
+            Self::AwaitWritable => "await_writable",
+            Self::Drive => "drive",
             Self::FromBytes => "from_bytes",
             Self::ToBytes => "to_bytes",
             Self::TcpConnect => "tcp_connect",
             Self::TcpConnectTimeout => "tcp_connect_timeout",
             Self::TcpListen => "tcp_listen",
             Self::TcpAccept => "tcp_accept",
-            Self::TcpAcceptWait => "tcp_accept_wait",
-            Self::TcpAcceptWaitTimeout => "tcp_accept_wait_timeout",
             Self::TcpPeerAddr => "tcp_peer_addr",
             Self::TcpLocalAddr => "tcp_local_addr",
             Self::TcpSetNodelay => "tcp_set_nodelay",
@@ -255,7 +256,6 @@ impl IoKind {
             Self::UdpConnect => "udp_connect",
             Self::UdpSendTo => "udp_send_to",
             Self::UdpRecvFrom => "udp_recv_from",
-            Self::UdpRecvFromWait => "udp_recv_from_wait",
             Self::UdpLocalPort => "udp_local_port",
             #[cfg(feature = "tls")]
             Self::TlsClientEnable => "tls_client_enable",
@@ -270,32 +270,26 @@ impl IoKind {
 
     fn arity(self) -> usize {
         match self {
-            Self::Stdin | Self::Stdout | Self::Stderr => 0,
+            Self::Stdin | Self::Stdout | Self::Stderr | Self::Drive => 0,
             Self::Close
-            | Self::ReadToEnd
+            | Self::AwaitReadable
+            | Self::AwaitWritable
             | Self::FromBytes
             | Self::ToBytes
             | Self::TcpAccept
-            | Self::TcpAcceptWait
             | Self::TcpPeerAddr
             | Self::TcpLocalAddr
             | Self::UdpLocalPort => 1,
             Self::Open
             | Self::Read
             | Self::Write
-            | Self::ReadExact
-            | Self::WriteAll
-            | Self::SetReadTimeout
-            | Self::SetWriteTimeout
             | Self::TcpConnect
             | Self::TcpListen
-            | Self::TcpAcceptWaitTimeout
             | Self::TcpSetNodelay
             | Self::TcpShutdown
             | Self::UdpBind
             | Self::UdpConnect
-            | Self::UdpRecvFrom
-            | Self::UdpRecvFromWait => 2,
+            | Self::UdpRecvFrom => 2,
             Self::TcpConnectTimeout => 3,
             #[cfg(feature = "tls")]
             Self::TlsClientEnable => 3,
@@ -311,12 +305,11 @@ impl IoKind {
 fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut(&str, usize)) {
     use crate::io::{
         as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
-        stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
-        stream_set_read_timeout, stream_set_write_timeout, stream_stderr, stream_stdin,
-        stream_stdout, stream_write, stream_write_all, tcp_accept, tcp_accept_wait,
-        tcp_accept_wait_timeout, tcp_connect, tcp_connect_timeout, tcp_listen, tcp_local_addr,
-        tcp_peer_addr, tcp_set_nodelay, tcp_shutdown, to_bytes, udp_bind, udp_connect,
-        udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
+        io_drive, stream_await_readable, stream_await_writable, stream_close, stream_open,
+        stream_read, stream_stderr, stream_stdin, stream_stdout, stream_write, tcp_accept,
+        tcp_connect, tcp_connect_timeout, tcp_listen, tcp_local_addr, tcp_peer_addr,
+        tcp_set_nodelay, tcp_shutdown, to_bytes, udp_bind, udp_connect, udp_local_port,
+        udp_recv_from, udp_send_to, value_as_string,
     };
     #[cfg(feature = "tls")]
     use crate::tls::{
@@ -365,26 +358,19 @@ fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMu
                                 let r = stream_write(heap, args[0], args[1]);
                                 as_result_int(heap, r)
                             }
-                            IoKind::ReadExact => {
-                                let r = stream_read_exact(heap, args[0], args[1]);
-                                as_result_option_int(heap, r)
+                            IoKind::AwaitReadable => {
+                                match stream_await_readable(heap, args[0]) {
+                                    Ok(v) => return Ok(v),
+                                    Err(tag) => as_result_unit(heap, Err(tag)),
+                                }
                             }
-                            IoKind::ReadToEnd => {
-                                let r = stream_read_to_end(heap, args[0]);
-                                as_result_value(heap, r)
+                            IoKind::AwaitWritable => {
+                                match stream_await_writable(heap, args[0]) {
+                                    Ok(v) => return Ok(v),
+                                    Err(tag) => as_result_unit(heap, Err(tag)),
+                                }
                             }
-                            IoKind::WriteAll => {
-                                let r = stream_write_all(heap, args[0], args[1]);
-                                as_result_unit(heap, r)
-                            }
-                            IoKind::SetReadTimeout => {
-                                let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
-                                as_result_unit(heap, r)
-                            }
-                            IoKind::SetWriteTimeout => {
-                                let r = stream_set_write_timeout(heap, args[0], args[1].as_int());
-                                as_result_unit(heap, r)
-                            }
+                            IoKind::Drive => return Ok(Some(io_drive(heap))),
                             IoKind::FromBytes => {
                                 let r = from_bytes(heap, args[0]);
                                 as_result_value(heap, r)
@@ -427,14 +413,6 @@ fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMu
                             }
                             IoKind::TcpAccept => {
                                 let r = tcp_accept(heap, args[0]);
-                                as_result_value(heap, r)
-                            }
-                            IoKind::TcpAcceptWait => {
-                                let r = tcp_accept_wait(heap, args[0]);
-                                as_result_value(heap, r)
-                            }
-                            IoKind::TcpAcceptWaitTimeout => {
-                                let r = tcp_accept_wait_timeout(heap, args[0], args[1].as_int());
                                 as_result_value(heap, r)
                             }
                             IoKind::TcpPeerAddr => {
@@ -486,10 +464,6 @@ fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMu
                             }
                             IoKind::UdpRecvFrom => {
                                 let r = udp_recv_from(heap, args[0], args[1]);
-                                as_result_value(heap, r)
-                            }
-                            IoKind::UdpRecvFromWait => {
-                                let r = udp_recv_from_wait(heap, args[0], args[1]);
                                 as_result_value(heap, r)
                             }
                             IoKind::UdpLocalPort => {

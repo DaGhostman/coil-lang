@@ -8,7 +8,8 @@
             || src.contains("to_bytes(")
             || src.contains("format(");
         if needs_io && !src.contains("use io::") && !src.contains("use io::*") {
-            owned.push_str("use io::{stdout, write_all};\n");
+            owned.push_str("use io::{stdout};
+use io::sync::{write_all};\n");
         }
         if needs_io && !src.contains("use string::") && !src.contains("use string::*") {
             owned.push_str("use string::{format, to_bytes};\n");
@@ -322,7 +323,8 @@ test("two") { assert(true)?; }
     fn let_match_omits_fusion_barrier() {
         let (bc, _pool) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn foo() -> Result<int, int> { return Result::Ok(0); }
@@ -395,7 +397,8 @@ fn foo() -> int {
     fn assignment_match_omits_fusion_barrier() {
         let (bc, _pool) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn main() {
@@ -520,7 +523,8 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
             fn main() {
                 let d = { x: 0, y: 0 };
@@ -4299,7 +4303,7 @@ fn main() {
         assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
     }
 
-    /// Nested IO HostInvoke (`read_to_end(stdin())`) stages args before pushing
+    /// Nested IO HostInvoke (`read(stdin(), buf)`) stages args before pushing
     /// the outer native id, so temp slots from nested calls cannot sit between
     /// the id and the tuple that HostInvoke consumes.
     #[test]
@@ -4308,14 +4312,15 @@ fn main() {
         let src = "\
 use io::*; \
 fn main() { \
-  let _ = read_to_end(stdin()); \
+  let buf: [byte] = [0]; \
+  let _ = read(stdin(), buf); \
 }";
         let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
         // Stable ids matching Pipeline::register_io_natives order is not
         // required — only the relative nesting shape is asserted.
         compiler.register_native_id("stdin", 1);
-        compiler.register_native_id("read_to_end", 2);
+        compiler.register_native_id("read", 2);
         let bc = compiler.compile("", &mut ast);
 
         let host_idxs: Vec<usize> = bc
@@ -4326,7 +4331,7 @@ fn main() { \
             .collect();
         assert!(
             host_idxs.len() >= 2,
-            "expected nested HostInvoke (stdin + read_to_end); got {}",
+            "expected nested HostInvoke (stdin + read); got {}",
             host_idxs.len()
         );
         let outer_host = *host_idxs.last().expect("outer HostInvoke");
@@ -4335,7 +4340,7 @@ fn main() { \
         let outer_const = bc[..outer_host]
             .iter()
             .rposition(|b| matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 2)
-            .expect("outer read_to_end CONST(id=2) before outer HostInvoke");
+            .expect("outer read CONST(id=2) before outer HostInvoke");
         let inner_host = host_idxs
             .iter()
             .copied()
@@ -4671,7 +4676,8 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let (a, b) = (1, 2);
@@ -4781,7 +4787,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let y = 10;
@@ -4813,7 +4820,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = (1, 1) + (1, 1);
@@ -4930,7 +4938,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
@@ -4972,7 +4981,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
@@ -4998,7 +5008,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[5, 7], [9, 11]]);
@@ -5027,7 +5038,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
@@ -5050,7 +5062,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let c = cross((1, 0, 0), (0, 1, 0));
@@ -5227,7 +5240,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 3.5 as int;

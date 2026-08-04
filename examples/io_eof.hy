@@ -1,5 +1,6 @@
 // EOF is Ok(None) from a non-blocking `read` on an empty file.
 use io::*;
+use io::sync::*;
 use string::*;
 
 fn make_empty(string path) {

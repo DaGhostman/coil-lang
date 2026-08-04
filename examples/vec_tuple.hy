@@ -1,7 +1,8 @@
 // Numeric tower — homogeneous tuple zip / broadcast / negate.
 // Expected output: 22,23,24,-1-2
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = (1, 1) + (1, 1);

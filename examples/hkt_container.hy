@@ -1,7 +1,8 @@
 // Unary higher-kinded trait: Container<F: * -> *>.
 // Expected output: 42
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Container<F: * -> *> {
     fn first<A>(F<A> xs) -> A;

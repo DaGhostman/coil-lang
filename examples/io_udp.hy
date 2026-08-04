@@ -2,6 +2,7 @@
 // Server binds ephemeral port; client send_to; server recv_from_wait.
 use io::*;
 use io::net::udp::*;
+use io::sync::*;
 use string::*;
 
 fn echo_once() {

@@ -2248,6 +2248,7 @@ impl Compiler {
                             crate::typechecking::PreludeFn::Ord
                                 | crate::typechecking::PreludeFn::Char
                                 | crate::typechecking::PreludeFn::Assert
+                                | crate::typechecking::PreludeFn::BlockOn
                         );
                     }
                     if self.checker.ffi_fn_in_scope(fname).is_some() {
@@ -7095,6 +7096,46 @@ impl Compiler {
             .expect("BlockBuilder::finalize: assert labels bound");
     }
 
+    /// Drive `block_on(coro)`: resume until `done`, leave completion value on stack.
+    ///
+    /// Intermediate yields are discarded. Between resumes, `wait_ready` parks on
+    /// any registered IO waiters so cooperative `await_*` inside the coroutine
+    /// can batch instead of busy-spinning.
+    fn emit_block_on(&mut self, args: &[Output]) {
+        let Some(coro_expr) = args.first() else {
+            return;
+        };
+        let handle_slot = self.alloc_temp_slot();
+        let value_slot = self.alloc_temp_slot();
+        let coro_bc = self.do_compile(coro_expr);
+        self.bytecode.extend(coro_bc);
+        self.bytecode.push_store_pop(handle_slot);
+
+        let mut bb = BlockBuilder::new();
+        let top = bb.fresh_label(self.bytecode.il_mut());
+        let done_exit = bb.fresh_label(self.bytecode.il_mut());
+        bb.bind_label(top, self.bytecode.il_mut());
+
+        self.bytecode.push_load(handle_slot);
+        self.bytecode
+            .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
+        self.bytecode.push_store_pop(value_slot);
+
+        self.bytecode.push_load(handle_slot);
+        self.bytecode.push(Byte::new(Instruction::DoneCoro));
+        // Done → fall through to exit; not done → wait for batched IO then loop.
+        bb.emit_jump_to(done_exit, BbJumpKind::JumpIfTrue, self.bytecode.il_mut());
+        if self.native_id("wait_ready").is_some() {
+            self.emit_host_native_invoke("wait_ready", &[]);
+            self.bytecode.push(Byte::new(Instruction::POP));
+        }
+        bb.emit_jump_to(top, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(done_exit, self.bytecode.il_mut());
+        self.bytecode.push_load(value_slot);
+        bb.finalize()
+            .expect("BlockBuilder::finalize: block_on labels bound");
+    }
+
     /// Emit a synthetic `main` that runs every harness test case in one VM
     /// (standalone `cargo run -- tests/foo.hy`). Prints
     /// `> Test "<name>" failed` on soft failures and panics with
@@ -8189,6 +8230,9 @@ impl Compiler {
                     match kind {
                         crate::typechecking::PreludeFn::Assert => {
                             self.emit_assert(arg_slice);
+                        }
+                        crate::typechecking::PreludeFn::BlockOn => {
+                            self.emit_block_on(arg_slice);
                         }
                         crate::typechecking::PreludeFn::Matrix => {
                             // Zero-cost wrap: runtime is the nested data.

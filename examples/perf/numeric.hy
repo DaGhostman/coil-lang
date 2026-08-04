@@ -1,5 +1,6 @@
 // CPU: iterative arithmetic + control flow (while, compound assign).
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let acc = 0;
