@@ -1,5 +1,5 @@
 // CPU / dispatch regression bench (release `poop` / perf_metrics).
-// Uses fib(10) so the recursion shape is exercised without long wall time.
+// fib(32) exercises auto-par const specialization when enabled.
 use io::{stdout, write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
@@ -11,5 +11,5 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    write_all(stdout(), to_bytes(format("%i", fib(10))));
+    write_all(stdout(), to_bytes(format("%i", fib(32))));
 }

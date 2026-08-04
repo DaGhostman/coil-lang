@@ -23,20 +23,25 @@ over the AST:
 
 Disable the transform with `COIL_AUTO_PAR=0` (or `false` / `off` / `no`).
 
-## Codegen shape
+## Static profitability (no runtime threshold checks)
 
-For `f(a) ⊕ f(b)` where `f` is unary recursive-pure and `a` is structurally
-sendable:
+[`par_profit`](../../compiler/src/typechecking/par_profit.rs) detects the unary
+shape `f(n - a) ⊕ f(n - b)` on recursive-pure functions and collects **constant**
+call-site arguments (`fib(32)`, …).
 
-1. If `a` is an `int`/`byte` and `a <= COIL_PAR_THRESHOLD` (default **20**),
-   evaluate sequentially (avoids drowning the pool in tiny leaf tasks).
-2. Otherwise `MakeFn` of `f`, then `thread_spawn(f, a)` (`HostInvoke`) into the
-   **work-stealing reactor**.
-3. On `Ok(handle)`: evaluate `f(b)` on the current thread, `join(handle)`
-   (join **help-steals** while waiting), apply `⊕`.
-4. On `Err`: fall back to sequential `f(a) ⊕ f(b)`.
+For each demanded `N > COIL_PAR_THRESHOLD` (default **20**), codegen emits a
+nullary specialization `__coil_par_{f}_{N}` that **always** forks:
 
-Only one arm is submitted per binop so recursion does not double work per level.
+1. `MakeFn` of `__coil_par_f_{N-a}` when that level is also specialized,
+   otherwise `MakeFn` of the original `f` with constant arg `N-a`.
+2. `thread_spawn` into the work-stealing reactor (no `GT` gate).
+3. On `Ok(handle)`: evaluate the other arm (spec or `f(N-b)`), `join`
+   (help-steals), apply `⊕`.
+4. On `Err`: sequential fallback of both arms.
+
+Call sites `f(N)` rewrite to `CALL __coil_par_f_N`. Levels at or below the
+threshold stay on the original sequential `f`. Dynamic `f(n)` with unknown `n`
+is **not** auto-parallelized (correctness-preserving; no runtime check tax).
 
 ## Work-stealing reactor
 
@@ -50,4 +55,4 @@ idle workers steal. `thread::spawn` / auto-par share this pool — no per-call
 |-----|--------|
 | `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2). |
 | `COIL_AUTO_PAR` | `0` / `false` / `off` / `no` disables auto fork-join codegen. |
-| `COIL_PAR_THRESHOLD` | Int arg ceiling for sequential fallback (default 20). |
+| `COIL_PAR_THRESHOLD` | Compile-time profitability cutoff for specialization (default 20). |
