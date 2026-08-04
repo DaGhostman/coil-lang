@@ -356,3 +356,75 @@ pub fn job_from_spawn_context(
         reactor: ctx.reactor,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{Byte, Instruction, ProgramDebug};
+
+    fn const_return_program(imm: i32) -> Arc<ThreadProgram> {
+        let code = vec![
+            Byte::new(Instruction::CONST).with_value_u32(imm as u32),
+            Byte::new(Instruction::RETURN),
+        ];
+        Arc::new(ThreadProgram {
+            code: Arc::new(code),
+            constants: Arc::new(Vec::new()),
+            strings: Arc::new(Vec::new()),
+            static_slot_count: 0,
+            debug: ProgramDebug::default(),
+        })
+    }
+
+    fn submit_const_job(reactor: &Arc<Reactor>, imm: i32) -> Arc<JoinState> {
+        let state = Arc::new(JoinState::new());
+        let job = Job {
+            entry: 0,
+            args: Vec::new(),
+            state: Arc::clone(&state),
+            program: const_return_program(imm),
+            natives: Natives::new(),
+            shared_print: None,
+            live_threads: crate::thread::new_live_thread_registry(),
+            reactor: Arc::clone(reactor),
+        };
+        reactor.submit(job);
+        state
+    }
+
+    #[test]
+    fn worker_count_clamps_zero_to_one() {
+        let r = Reactor::new(0);
+        assert_eq!(r.worker_count(), 1);
+    }
+
+    #[test]
+    fn submit_join_returns_immediate_and_clears_inflight() {
+        let reactor = Reactor::new(2);
+        let state = submit_const_job(&reactor, 42);
+        let pv = reactor
+            .wait_join(&state)
+            .expect("job should complete");
+        assert_eq!(pv, PortableValue::Immediate(42));
+        // Allow a brief drain window if notify races the atomic.
+        for _ in 0..50 {
+            if reactor.inflight() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(reactor.inflight(), 0);
+    }
+
+    #[test]
+    fn nested_submit_while_joining_does_not_deadlock() {
+        // Root waits on A while help-stealing B (same path auto-par join uses).
+        let reactor = Reactor::new(1);
+        let a = submit_const_job(&reactor, 1);
+        let b = submit_const_job(&reactor, 2);
+        let ra = reactor.wait_join(&a).expect("A");
+        let rb = reactor.wait_join(&b).expect("B");
+        assert_eq!(ra, PortableValue::Immediate(1));
+        assert_eq!(rb, PortableValue::Immediate(2));
+    }
+}

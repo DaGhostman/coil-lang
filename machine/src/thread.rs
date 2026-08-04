@@ -243,7 +243,7 @@ pub(crate) struct JoinStateInner {
 }
 
 impl JoinState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(JoinStateInner { result: None }),
             finished: Condvar::new(),
