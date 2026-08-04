@@ -178,12 +178,18 @@ pub struct Machine<const S: usize> {
     shared_print: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
     /// Undetached spawns owned by this VM (joined at end of `run_with_pool`).
     live_threads: crate::thread::LiveThreadRegistry,
+    /// Shared concurrent OS-worker budget for this root VM (and its workers).
+    worker_cap: std::sync::Arc<crate::thread::WorkerCap>,
+    /// Work-stealing pool sized by [`Self::worker_cap`].
+    reactor: std::sync::Arc<crate::reactor::Reactor>,
 }
 
 impl<const S: usize> Default for Machine<S> {
     fn default() -> Self {
         let mut frames = ArrayVec::default();
         frames.consume();
+        let worker_cap = crate::thread::WorkerCap::new();
+        let reactor = crate::reactor::Reactor::new(worker_cap.max());
         Self {
             frames,
             heap: Heap::default(),
@@ -216,6 +222,8 @@ impl<const S: usize> Default for Machine<S> {
             thread_program: None,
             shared_print: None,
             live_threads: crate::thread::new_live_thread_registry(),
+            worker_cap,
+            reactor,
         }
     }
 }
@@ -830,6 +838,24 @@ impl<const S: usize> Machine<S> {
         &self.live_threads
     }
 
+    /// Share the root VM's worker-thread budget with nested workers.
+    pub fn set_worker_cap(&mut self, cap: std::sync::Arc<crate::thread::WorkerCap>) {
+        self.worker_cap = cap;
+    }
+
+    pub fn worker_cap(&self) -> &std::sync::Arc<crate::thread::WorkerCap> {
+        &self.worker_cap
+    }
+
+    /// Share the root VM's work-stealing reactor with nested workers.
+    pub fn set_reactor(&mut self, reactor: std::sync::Arc<crate::reactor::Reactor>) {
+        self.reactor = reactor;
+    }
+
+    pub fn reactor(&self) -> &std::sync::Arc<crate::reactor::Reactor> {
+        &self.reactor
+    }
+
     /// Allocate global static slots without running bytecode.
     pub fn init_static_slots(&mut self, static_slots: u32) {
         self.statics = vec![Value::default(); static_slots as usize];
@@ -847,6 +873,8 @@ impl<const S: usize> Machine<S> {
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
             live_threads: std::sync::Arc::clone(&self.live_threads),
+            worker_cap: std::sync::Arc::clone(&self.worker_cap),
+            reactor: std::sync::Arc::clone(&self.reactor),
         })
     }
 

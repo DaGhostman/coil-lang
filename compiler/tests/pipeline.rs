@@ -3620,6 +3620,92 @@ fn main() {
     assert_eq!(output, "55");
 }
 
+/// Auto-par fork-join of pure recursive `fib(n-1)+fib(n-2)` must stay correct.
+#[test]
+fn auto_par_fib_still_correct() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    write_all(stdout(), to_bytes(format("%i", fib(12))));
+}
+"#,
+    );
+    assert_eq!(output, "144");
+}
+
+/// Constant sites above `COIL_PAR_THRESHOLD` must emit `__coil_par_*` and stay correct.
+#[test]
+fn auto_par_fib_above_threshold_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    write_all(stdout(), to_bytes(format("%i", fib(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par fib should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_fib_22").is_some(),
+        "expected static specialization for fib(22)"
+    );
+    assert!(
+        pipeline.function_offset("__coil_par_fib_21").is_some(),
+        "expected chain specialization for fib(21)"
+    );
+    // Default threshold is 20 — exact threshold stays sequential.
+    assert!(
+        pipeline.function_offset("__coil_par_fib_20").is_none(),
+        "fib(20) must not get a parallel specialization"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "17711");
+}
+
+/// Impure recursive binops must not grow `__coil_par_*` clones.
+#[test]
+fn impure_recursive_binop_skips_par_specialization() {
+    let src = r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn leaf(int n) -> int {
+    write_all(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn rec(int n) -> int {
+    if n <= 1 { return leaf(n); }
+    return rec(n - 1) + rec(n - 2);
+}
+fn main() {
+    write_all(stdout(), to_bytes(format("%i", rec(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let _ = pipeline
+        .compile_src(src)
+        .expect("impure rec should still compile");
+    assert!(
+        pipeline.function_offset("__coil_par_rec_22").is_none(),
+        "impure recursion must not emit auto-par specializations"
+    );
+}
+
 /// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not
 /// turn StorePop;Load into Dup;Store when the store extends tell past TOS
 /// (shared-stack CmpJmpf would eat the local — broke http `parse_url`).

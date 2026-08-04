@@ -4255,6 +4255,225 @@ impl Compiler {
         self.emit_host_native_invoke(kind.native_name(), args);
     }
 
+    /// Resolve the bare recursive-pure name used in [`par_shapes`].
+    fn par_shape_key(fname: &str) -> &str {
+        let short = strip_overload_key(fname);
+        short.rsplit("::").next().unwrap_or(short)
+    }
+
+    /// Rewrite `f(N)` to `CALL __coil_par_f_N` when a specialization exists.
+    fn try_emit_par_specialized_call(
+        &mut self,
+        fname: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let Some(args) = args else {
+            return false;
+        };
+        if args.len() != 1 {
+            return false;
+        }
+        let Expression::Integer(n) = unwrap_expr_output(&args[0]).1.as_ref() else {
+            return false;
+        };
+        if !crate::typechecking::const_arg_worth_parallel(*n) {
+            return false;
+        }
+        let key = Self::par_shape_key(fname);
+        let spec = crate::typechecking::par_specialization_name(key, *n);
+        let Some(&offset) = self.functions.get(&spec) else {
+            return false;
+        };
+        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(0, offset as u32));
+        true
+    }
+
+    /// Emit nullary `__coil_par_{fn}_{n}` clones that always fork (no RT threshold).
+    fn emit_par_specializations_for(
+        &mut self,
+        bare_name: &str,
+        table_key: &str,
+    ) {
+        let Some(shape) = self.par_shapes.get(bare_name).cloned() else {
+            return;
+        };
+        let Some(ns) = self.par_spec_args.get(bare_name).cloned() else {
+            return;
+        };
+        let Some(&orig_offset) = self
+            .functions
+            .get(table_key)
+            .or_else(|| self.functions.get(bare_name))
+        else {
+            return;
+        };
+        let thresh = crate::typechecking::par_int_threshold();
+        let bin_op = match shape.op {
+            crate::typechecking::ParBinOp::Add => Instruction::ADD,
+            crate::typechecking::ParBinOp::Sub => Instruction::SUB,
+            crate::typechecking::ParBinOp::Mul => Instruction::MUL,
+        };
+        for n in ns {
+            self.emit_one_par_specialization(
+                &shape,
+                n,
+                orig_offset as u32,
+                thresh,
+                bin_op,
+            );
+        }
+    }
+
+    fn emit_one_par_specialization(
+        &mut self,
+        shape: &crate::typechecking::RecParShape,
+        n: i64,
+        orig_offset: u32,
+        thresh: i64,
+        bin_op: Instruction,
+    ) {
+        let spec_name = crate::typechecking::par_specialization_name(&shape.fn_name, n);
+        if self.functions.contains_key(&spec_name) {
+            return;
+        }
+        let Some(spawn_id) = self.native_id("thread_spawn") else {
+            return;
+        };
+        let Some(join_id) = self.native_id("thread_join") else {
+            return;
+        };
+
+        let (fn_offset, _) = self.bind_function_entry(spec_name.clone());
+        let _ = fn_offset;
+        self.fn_arities.insert(spec_name.clone(), (0, false));
+
+        let prev_fn_vars = std::mem::take(&mut self.context.variables);
+        let prev_fn_table_key = self.current_function_table_key.take();
+        self.current_function_table_key = Some(spec_name.clone());
+        self.context.variables = Interner::default();
+        let entry_sp = 0u32;
+
+        let body_start = self.bytecode.len();
+        let left_n = n - shape.left_sub;
+        let right_n = n - shape.right_sub;
+
+        // MakeFn for the left arm (nullary spec or unary original).
+        let (left_entry, left_arity, left_has_arg) =
+            self.par_arm_callable(shape, left_n, orig_offset, thresh);
+        self.bytecode.push_const(0);
+        self.bytecode.push(
+            Byte::new(Instruction::CodePtr).with_operand_u32(left_entry),
+        );
+        self.bytecode.push(
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
+                0,
+                0,
+                left_arity,
+                false,
+            )),
+        );
+        let fn_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(fn_tmp);
+
+        let mut bb = BlockBuilder::new();
+        let have_handle = bb.fresh_label(self.bytecode.il_mut());
+        let seq = bb.fresh_label(self.bytecode.il_mut());
+        let done = bb.fresh_label(self.bytecode.il_mut());
+
+        // AlwaysPar: thread_spawn(fn[, left_n])
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
+        self.bytecode.push_load(fn_tmp);
+        let spawn_arity = if left_has_arg {
+            self.bytecode.push_const(left_n as i32);
+            2
+        } else {
+            1
+        };
+        self.bytecode.push_make_tuple(spawn_arity);
+        self.bytecode.push_host_invoke(spawn_arity);
+
+        bb.emit_jump_to(
+            have_handle,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(have_handle, self.bytecode.il_mut());
+        let handle_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(handle_tmp);
+
+        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
+        let right_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(right_tmp);
+
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
+        self.bytecode.push_load(handle_tmp);
+        self.bytecode.push_make_tuple(1);
+        self.bytecode.push_host_invoke(1);
+        self.emit_result_unwrap_or_panic();
+
+        self.bytecode.push_load(right_tmp);
+        self.bytecode.push(Byte::new(bin_op));
+        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(seq, self.bytecode.il_mut());
+        self.emit_par_arm_call(shape, left_n, orig_offset, thresh);
+        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
+        self.bytecode.push(Byte::new(bin_op));
+
+        bb.bind_label(done, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: par-spec labels bound");
+
+        self.bytecode.push_return();
+
+        let body_end = self.bytecode.len();
+        self.fn_bytecode_spans
+            .insert(spec_name.clone(), (body_start, body_end));
+        let entry = self.fn_entry_labels.get(&spec_name).copied();
+        self.bytecode
+            .record_func_with_sp(spec_name, entry, body_start, body_end, entry_sp);
+        self.current_function_table_key = prev_fn_table_key;
+        self.context.variables = prev_fn_vars;
+    }
+
+    /// Callable for one recursive arm: `(entry, arity, needs_int_arg)`.
+    fn par_arm_callable(
+        &self,
+        shape: &crate::typechecking::RecParShape,
+        child_n: i64,
+        orig_offset: u32,
+        thresh: i64,
+    ) -> (u32, u32, bool) {
+        if child_n > thresh {
+            let spec = crate::typechecking::par_specialization_name(&shape.fn_name, child_n);
+            if let Some(&off) = self.functions.get(&spec) {
+                return (off as u32, 0, false);
+            }
+        }
+        (orig_offset, 1, true)
+    }
+
+    fn emit_par_arm_call(
+        &mut self,
+        shape: &crate::typechecking::RecParShape,
+        child_n: i64,
+        orig_offset: u32,
+        thresh: i64,
+    ) {
+        let (entry, arity, needs_arg) = self.par_arm_callable(shape, child_n, orig_offset, thresh);
+        if needs_arg {
+            self.bytecode.push_const(child_n as i32);
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::CALL).with_call_packed(arity, entry));
+    }
+
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
     fn emit_host_native_invoke(&mut self, native_name: &str, args: &[Output]) {
         let Some(native_id) = self.native_id(native_name) else {
@@ -7291,7 +7510,7 @@ impl Compiler {
                     .insert(table_key.clone(), (body_start, body_end));
                 let entry = self.fn_entry_labels.get(&table_key).copied();
                 self.bytecode
-                    .record_func_with_sp(table_key, entry, body_start, body_end, entry_sp);
+                    .record_func_with_sp(table_key.clone(), entry, body_start, body_end, entry_sp);
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
@@ -7303,6 +7522,7 @@ impl Compiler {
                     Some(body),
                     name,
                 );
+                self.emit_par_specializations_for(name, &table_key);
             }
             Expression::Lambda {
                 args,
@@ -8465,6 +8685,10 @@ impl Compiler {
                         let arg_slice = args.as_deref().unwrap_or(&[]);
                         self.consume_spread_emit_ids(arg_slice);
                         let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
+
+                        if self.try_emit_par_specialized_call(&n, Some(arg_slice), &mut bytecode) {
+                            return bytecode;
+                        }
 
                         if !is_generic
                             && !self.coroutine_fns.contains(&n)
@@ -10980,6 +11204,20 @@ impl Compiler {
         self.decorated_class_ctors
             .extend(expand.decorated_class_ctors);
         let _program_ty = self.checker.check_program(ast);
+        self.recursive_pure = if auto_par_enabled() {
+            crate::typechecking::analyze_recursive_pure(ast)
+        } else {
+            HashSet::new()
+        };
+        if auto_par_enabled() && !self.recursive_pure.is_empty() {
+            self.par_shapes =
+                crate::typechecking::analyze_rec_par_shapes(ast, &self.recursive_pure);
+            self.par_spec_args =
+                crate::typechecking::collect_par_specialization_args(ast, &self.par_shapes);
+        } else {
+            self.par_shapes.clear();
+            self.par_spec_args.clear();
+        }
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the
         // prologue and before user code. Keep `program_start_offset`

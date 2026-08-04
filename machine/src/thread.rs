@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
@@ -11,6 +12,51 @@ use std::thread;
 /// [`ThreadSpawnContext`]). Process-global storage was wrong: parallel tests /
 /// multiple `Machine`s would steal each other's joins via `mem::take`.
 pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
+
+/// Per-root-VM bound on concurrent OS **pool** threads for the work-stealing
+/// reactor (see [`crate::reactor::Reactor`]).
+///
+/// Caps host threads used for `spawn` / auto-par. Override with
+/// `COIL_MAX_WORKER_THREADS` (clamped to 1..=512). Default is
+/// `available_parallelism` (minimum 2).
+#[derive(Debug)]
+pub struct WorkerCap {
+    max: usize,
+}
+
+impl WorkerCap {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            max: max_worker_threads(),
+        })
+    }
+
+    /// Build a cap with an explicit pool size (reactor workers).
+    pub fn from_count(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max: n.clamp(1, 512),
+        })
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+}
+
+fn max_worker_threads() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        if let Ok(raw) = std::env::var("COIL_MAX_WORKER_THREADS") {
+            if let Ok(n) = raw.parse::<usize>() {
+                return n.clamp(1, 512);
+            }
+        }
+        thread::available_parallelism()
+            .map(|n| n.get().max(2))
+            .unwrap_or(8)
+            .min(512)
+    })
+}
 
 pub fn new_live_thread_registry() -> LiveThreadRegistry {
     Arc::new(Mutex::new(Vec::new()))
@@ -191,12 +237,13 @@ pub struct JoinState {
     joined: AtomicBool,
 }
 
-struct JoinStateInner {
-    result: Option<Result<PortableValue, ThreadErrorTag>>,
+/// Join-state payload (reactor timed waits).
+pub(crate) struct JoinStateInner {
+    pub result: Option<Result<PortableValue, ThreadErrorTag>>,
 }
 
 impl JoinState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(JoinStateInner { result: None }),
             finished: Condvar::new(),
@@ -206,7 +253,7 @@ impl JoinState {
         }
     }
 
-    fn store_result(&self, result: Result<PortableValue, ThreadErrorTag>) {
+    pub(crate) fn store_result(&self, result: Result<PortableValue, ThreadErrorTag>) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.result = Some(result);
         self.finished.notify_all();
@@ -218,6 +265,20 @@ impl JoinState {
             g = self.finished.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         g.result.take().unwrap_or(Err(ThreadErrorTag::JoinFailed))
+    }
+
+    /// Non-blocking take when the worker has finished.
+    pub(crate) fn try_take_result(&self) -> Option<Result<PortableValue, ThreadErrorTag>> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.result.take()
+    }
+
+    pub(crate) fn inner_lock(&self) -> MutexGuard<'_, JoinStateInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn finished_cvar(&self) -> &Condvar {
+        &self.finished
     }
 }
 
@@ -596,7 +657,7 @@ pub fn value_to_spawn_arg(heap: &Heap, v: Value) -> Result<SpawnArg, ThreadError
     Ok(SpawnArg::Value(value_to_portable(heap, v)?))
 }
 
-fn spawn_arg_to_value(heap: &mut Heap, arg: SpawnArg) -> Result<Value, ThreadErrorTag> {
+pub(crate) fn spawn_arg_to_value(heap: &mut Heap, arg: SpawnArg) -> Result<Value, ThreadErrorTag> {
     match arg {
         SpawnArg::Value(pv) => portable_to_value(heap, pv),
         SpawnArg::Sender(inner) => {
@@ -629,7 +690,7 @@ fn fn_entry_from_value(heap: &Heap, v: Value) -> Result<(u32, u32), ThreadErrorT
     Ok((f.entry, f.arity))
 }
 
-struct SharedPrintWriter(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct SharedPrintWriter(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedPrintWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -643,69 +704,14 @@ impl Write for SharedPrintWriter {
     }
 }
 
-struct WorkerCtx {
-    program: Arc<ThreadProgram>,
-    natives: Natives,
-    entry: u32,
-    args: Vec<SpawnArg>,
-    state: Arc<JoinState>,
-    shared_print: Option<Arc<Mutex<Vec<u8>>>>,
-    live_threads: LiveThreadRegistry,
-}
-
-fn run_worker(ctx: WorkerCtx) {
-    let WorkerCtx {
-        program,
-        natives,
-        entry,
-        args,
-        state,
-        shared_print,
-        live_threads,
-    } = ctx;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
-        vm.install_natives(&natives);
-        vm.set_thread_program(Arc::clone(&program));
-        vm.set_program_debug(program.debug.clone());
-        // Nested `spawn` from a worker registers on the root VM's list so the
-        // root's `run_with_pool` join still waits for them.
-        vm.set_live_threads(Arc::clone(&live_threads));
-        if let Some(buf) = &shared_print {
-            vm.set_shared_print(Arc::clone(buf));
-            vm.with_output(SharedPrintWriter(Arc::clone(buf)));
-            crate::io::set_shared_print_redirect(Some(Arc::clone(buf)));
-        }
-        vm.load_program(
-            program.code.as_slice(),
-            program.constants.as_slice(),
-            program.strings.as_slice(),
-        );
-        vm.init_static_slots(program.static_slot_count);
-        let mut child_args = Vec::new();
-        for a in args {
-            child_args.push(spawn_arg_to_value(vm.heap_mut(), a)?);
-        }
-        let ret = vm.call_function(entry, &child_args);
-        if vm.panicked() {
-            return Err(ThreadErrorTag::JoinFailed);
-        }
-        value_to_portable(vm.heap(), ret)
-    }));
-    let stored = match result {
-        Ok(Ok(pv)) => Ok(pv),
-        Ok(Err(tag)) => Err(tag),
-        Err(_) => Err(ThreadErrorTag::JoinFailed),
-    };
-    state.store_result(stored);
-}
-
 /// Context copied from the parent `Machine` when spawning.
 pub struct ThreadSpawnContext {
     pub program: Arc<ThreadProgram>,
     pub natives: Natives,
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
     pub live_threads: LiveThreadRegistry,
+    pub worker_cap: Arc<WorkerCap>,
+    pub reactor: Arc<crate::reactor::Reactor>,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -715,6 +721,8 @@ impl Clone for ThreadSpawnContext {
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
             live_threads: Arc::clone(&self.live_threads),
+            worker_cap: Arc::clone(&self.worker_cap),
+            reactor: Arc::clone(&self.reactor),
         }
     }
 }
@@ -739,18 +747,15 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
     };
     let ctx = host_spawn_context()?;
     let live_threads = Arc::clone(&ctx.live_threads);
+    let reactor = Arc::clone(&ctx.reactor);
     let state = Arc::new(JoinState::new());
-    let worker = WorkerCtx {
-        program: ctx.program,
-        natives: ctx.natives,
+    let job = crate::reactor::job_from_spawn_context(
+        ctx,
         entry,
-        args: spawn_args,
-        state: Arc::clone(&state),
-        shared_print: ctx.shared_print,
-        live_threads: Arc::clone(&live_threads),
-    };
-    let handle = thread::spawn(move || run_worker(worker));
-    *state.join_handle.lock().unwrap() = Some(handle);
+        spawn_args,
+        Arc::clone(&state),
+    );
+    reactor.submit(job);
     register_live_thread(&live_threads, Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
     Ok(Value::from(obj.addr()))
@@ -772,7 +777,10 @@ fn try_host_join(heap: &mut Heap, handle: Value) -> Result<Value, ThreadErrorTag
     if state.detached.load(Ordering::SeqCst) {
         return Err(ThreadErrorTag::JoinFailed);
     }
-    let portable = state.wait_result()?;
+    let portable = match host_spawn_context() {
+        Ok(ctx) => ctx.reactor.wait_join(&state)?,
+        Err(_) => state.wait_result()?,
+    };
     if let Some(h) = state.join_handle.lock().unwrap().take() {
         let _ = h.join();
     }
@@ -1454,6 +1462,16 @@ mod tests {
             result_err_tag(&heap, recv_err),
             ThreadErrorTag::Disconnected
         );
+    }
+
+    #[test]
+    fn worker_cap_respects_env_bounds() {
+        let cap = WorkerCap::from_count(4);
+        assert_eq!(cap.max(), 4);
+        let capped = WorkerCap::from_count(0);
+        assert_eq!(capped.max(), 1);
+        let high = WorkerCap::from_count(10_000);
+        assert_eq!(high.max(), 512);
     }
 
     #[test]

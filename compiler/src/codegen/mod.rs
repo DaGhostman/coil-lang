@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
 };
 
 use common::{
@@ -832,6 +832,13 @@ pub struct Compiler {
     /// fusion barrier. Set while compiling a match whose value is consumed
     /// immediately by `StorePop` / `StoreStatic` (e.g. `let x = match …`).
     suppress_match_fusion_barrier: bool,
+
+    /// Self-recursive pure function names eligible for auto fork-join.
+    recursive_pure: HashSet<String>,
+    /// Detected `f(n-a) ⊕ f(n-b)` shapes for recursive-pure fns.
+    par_shapes: HashMap<String, crate::typechecking::RecParShape>,
+    /// Concrete int args requiring `__coil_par_*` specializations.
+    par_spec_args: HashMap<String, BTreeSet<i64>>,
 }
 
 impl Default for Compiler {
@@ -898,6 +905,9 @@ impl Default for Compiler {
             fn_bytecode_spans: HashMap::new(),
             fn_debug_locals: HashMap::new(),
             suppress_match_fusion_barrier: false,
+            recursive_pure: HashSet::new(),
+            par_shapes: HashMap::new(),
+            par_spec_args: HashMap::new(),
         }
     }
 }
@@ -1142,6 +1152,14 @@ fn unwrap_expr_output<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
         // Parenthesized conditions often parse as a one-element Fragment.
         Expression::Fragment(items) if items.len() == 1 => unwrap_expr_output(&items[0]),
         _ => expr,
+    }
+}
+
+/// `COIL_AUTO_PAR=0` disables automatic fork-join of pure recursive binops.
+fn auto_par_enabled() -> bool {
+    match std::env::var("COIL_AUTO_PAR") {
+        Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => true,
     }
 }
 

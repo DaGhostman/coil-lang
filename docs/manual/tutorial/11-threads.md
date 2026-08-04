@@ -33,6 +33,16 @@ fn main() {
 
 `join(t)` blocks until the worker finishes and returns its result value. `detach(t)` lets the thread run without a join (errors if you later `join` the same handle).
 
+### Spawn capacity
+
+`spawn` submits work to a fixed **work-stealing reactor** (default one OS
+worker per CPU, override with `COIL_MAX_WORKER_THREADS`) instead of creating a
+new OS thread per call. Pure recursive helpers such as `fib(n-1) + fib(n-2)`
+may be auto-parallelized at **constant** call sites (`fib(32)`), via specialized
+nullary clones that always fork; `COIL_PAR_THRESHOLD` (default 20) is a
+compile-time cutoff for those specializations (see
+[internals: auto-par](../../internals/auto-par.md)).
+
 ## Channels
 
 `channel()` returns `(Sender, Receiver)` as a two-tuple. `send` / `recv` move values between threads; `close` drops the sender side.
