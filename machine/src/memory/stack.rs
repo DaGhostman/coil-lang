@@ -1,41 +1,52 @@
-//! Fixed-size operand stack with an explicit cursor (`tell` / `seek`).
+//! Capacity-backed operand stack with an explicit cursor (`tell` / `seek`).
+//!
+//! Capacity is chosen per program from recursion-depth analysis (see
+//! `compiler::typechecking::stack_bound`). Slots are pre-filled so hot-path
+//! indexing stays `promise!` + `get_unchecked`, matching the old fixed array.
 
 use std::ops::{Index, IndexMut, Range};
 
 use common::promise;
 
-pub struct Stack<T: Default, const N: usize> {
-    stack: [T; N],
+pub struct Stack<T: Default> {
+    stack: Vec<T>,
     cursor: usize,
 }
 
-impl<T: Default + Copy, const N: usize> Default for Stack<T, N> {
+impl<T: Default + Copy> Default for Stack<T> {
     fn default() -> Self {
-        Self::new()
+        Self::with_capacity(crate::DEFAULT_OPERAND_STACK_SLOTS)
     }
 }
 
-impl<T: Default + Copy, const N: usize> Stack<T, N> {
+impl<T: Default + Copy> Stack<T> {
+    /// Pre-allocate `cap` slots (minimum 1).
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(1);
         Self {
-            stack: std::array::from_fn(|_| T::default()),
+            stack: std::iter::repeat_with(T::default).take(cap).collect(),
             cursor: 0,
         }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.stack.len()
     }
 
     #[inline]
     pub fn pop(&mut self) -> T {
         promise!(self.cursor > 0);
         self.cursor -= 1;
-        // SAFETY: cursor was in `1..=N` before decrement.
+        // SAFETY: cursor was in `1..=capacity` before decrement.
         unsafe { *self.stack.get_unchecked(self.cursor) }
     }
 
     #[inline]
     pub fn push(&mut self, value: T) {
-        promise!(self.cursor < N);
-        // SAFETY: promise! guarantees cursor < N.
+        promise!(self.cursor < self.stack.len());
+        // SAFETY: promise! guarantees cursor < capacity.
         unsafe {
             *self.stack.get_unchecked_mut(self.cursor) = value;
         }
@@ -45,20 +56,20 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     #[inline]
     pub fn peek(&self) -> &T {
         promise!(self.cursor > 0);
-        // SAFETY: cursor > 0 and ≤ N.
+        // SAFETY: cursor > 0 and ≤ capacity.
         unsafe { self.stack.get_unchecked(self.cursor - 1) }
     }
 
     #[inline]
     pub fn seek(&mut self, idx: usize) {
-        promise!(idx <= N);
+        promise!(idx <= self.stack.len());
         self.cursor = idx;
     }
 
     #[inline]
     pub fn top(&mut self) -> &mut T {
         promise!(self.cursor > 0);
-        // SAFETY: cursor > 0 and ≤ N.
+        // SAFETY: cursor > 0 and ≤ capacity.
         unsafe { self.stack.get_unchecked_mut(self.cursor - 1) }
     }
 
@@ -66,7 +77,7 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     #[inline]
     pub fn duplicate(&mut self) {
         promise!(self.cursor > 0);
-        promise!(self.cursor < N);
+        promise!(self.cursor < self.stack.len());
         // SAFETY: both indices are in-bounds by the promises above.
         unsafe {
             let v = *self.stack.get_unchecked(self.cursor - 1);
@@ -78,12 +89,13 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     /// Copy `len` values from `src` to `dst` (forward; caller ensures non-overlap or `dst <= src`).
     #[inline]
     pub fn copy_slots(&mut self, dst: usize, src: usize, len: usize) {
-        promise!(dst + len <= N);
-        promise!(src + len <= N);
+        let cap = self.stack.len();
+        promise!(dst + len <= cap);
+        promise!(src + len <= cap);
         if dst == src || len == 0 {
             return;
         }
-        // SAFETY: ranges fit in the fixed buffer.
+        // SAFETY: ranges fit in the buffer.
         unsafe {
             let ptr = self.stack.as_mut_ptr();
             std::ptr::copy(ptr.add(src), ptr.add(dst), len);
@@ -108,45 +120,36 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     }
 }
 
-impl<T: Default, const N: usize> Index<Range<usize>> for Stack<T, N> {
+impl<T: Default> Index<Range<usize>> for Stack<T> {
     type Output = [T];
 
     fn index(&self, index: Range<usize>) -> &Self::Output {
-        promise!(index.end <= N);
+        promise!(index.end <= self.stack.len());
         promise!(index.start <= index.end);
-        // SAFETY: range is within the fixed buffer.
+        // SAFETY: range is within the buffer.
         unsafe { self.stack.get_unchecked(index) }
     }
 }
 
-impl<T: Default + Copy, const N: usize> IntoIterator for Stack<T, N> {
-    type Item = T;
-    type IntoIter = std::array::IntoIter<T, N>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.stack.into_iter()
-    }
-}
-
-impl<T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
+impl<T: Default + Copy> Index<usize> for Stack<T> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
-        promise!(index < N);
-        // SAFETY: promise! guarantees index < N.
+        promise!(index < self.stack.len());
+        // SAFETY: promise! guarantees index < capacity.
         unsafe { self.stack.get_unchecked(index) }
     }
 }
 
-impl<T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
+impl<T: Default + Copy> IndexMut<usize> for Stack<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        promise!(index < N);
-        // SAFETY: promise! guarantees index < N.
+        promise!(index < self.stack.len());
+        // SAFETY: promise! guarantees index < capacity.
         unsafe { self.stack.get_unchecked_mut(index) }
     }
 }
 
 #[cfg(debug_assertions)]
-impl<T: Default + std::fmt::Debug, const N: usize> std::fmt::Debug for Stack<T, N> {
+impl<T: Default + std::fmt::Debug> std::fmt::Debug for Stack<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", &self.stack[..self.cursor])
     }
@@ -158,7 +161,7 @@ mod tests {
 
     #[test]
     fn duplicate_copies_tos_without_changing_original() {
-        let mut s = Stack::<i64, 8>::new();
+        let mut s = Stack::<i64>::with_capacity(8);
         s.push(7);
         s.duplicate();
         assert_eq!(s.tell(), 2);
@@ -168,12 +171,11 @@ mod tests {
 
     #[test]
     fn copy_slots_moves_args_toward_frame_base() {
-        let mut s = Stack::<i64, 8>::new();
+        let mut s = Stack::<i64>::with_capacity(8);
         s.push(10);
         s.push(20);
         s.push(30);
         s.push(40);
-        // TailCall-shaped: frame base 0, args at [2, 3).
         s.copy_slots(0, 2, 2);
         assert_eq!(s[0], 30);
         assert_eq!(s[1], 40);
@@ -183,7 +185,7 @@ mod tests {
 
     #[test]
     fn copy_slots_noop_when_dst_equals_src_or_len_zero() {
-        let mut s = Stack::<i64, 8>::new();
+        let mut s = Stack::<i64>::with_capacity(8);
         s.push(1);
         s.push(2);
         s.copy_slots(0, 0, 2);
@@ -194,13 +196,19 @@ mod tests {
 
     #[test]
     fn as_slice_excludes_slots_past_cursor_after_pop() {
-        let mut s = Stack::<i64, 8>::new();
+        let mut s = Stack::<i64>::with_capacity(8);
         s.push(11);
         s.push(22);
         assert_eq!(s.as_slice(), &[11, 22]);
         let _ = s.pop();
         assert_eq!(s.as_slice(), &[11]);
-        // Full buffer still holds the stale TOS for GC live-slice contrast.
         assert_eq!(s.buffer()[1], 22);
+    }
+
+    #[test]
+    fn with_capacity_sets_backing_len() {
+        let s = Stack::<i64>::with_capacity(64);
+        assert_eq!(s.capacity(), 64);
+        assert_eq!(s.tell(), 0);
     }
 }

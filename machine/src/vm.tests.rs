@@ -2357,7 +2357,7 @@
     }
 
     /// Live-slice GC must not treat POP'd slots past `tell` as roots.
-    /// Rooting the full 8192 buffer would keep the tag-99 enum alive forever.
+    /// Rooting the full operand-stack buffer would keep the tag-99 enum alive forever.
     #[test]
     fn gc_does_not_root_stale_slots_past_tell() {
         use crate::memory::Object;

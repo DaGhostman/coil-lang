@@ -51,3 +51,9 @@ pub use thread::{
 #[cfg(feature = "time")]
 pub use time::TIME_WIRING;
 pub use vm::*;
+
+/// Default operand-stack capacity when analysis does not request more.
+pub const DEFAULT_OPERAND_STACK_SLOTS: usize = 256;
+
+/// Hard ceiling for analysis-driven stack sizing (guards absurd `#[max_depth]`).
+pub const MAX_OPERAND_STACK_SLOTS: usize = 1_048_576;
