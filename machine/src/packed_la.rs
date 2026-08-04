@@ -226,11 +226,170 @@ pub fn packed_matrix_neg(heap: &mut Heap, args: &[Value]) -> Value {
     alloc_nested_matrix(heap, c, m, n, outer_is_tuple, row_is_tuple)
 }
 
+/// Zip / broadcast / negate for 1-D aggregates (`[T; N]` / `(T,…)`).
+///
+/// Meta bitfield:
+/// - bits 0..15: length
+/// - bits 16..23: op — 0=add, 1=sub, 2=mul, 3=div, 4=neg
+/// - bit 24: float elements
+/// - bit 25: result is tuple (else array)
+/// - bit 26: broadcast mode (`args[1]` is scalar; ignored for neg)
+/// - bit 27: scalar is on the left (broadcast only; matters for sub/div)
+pub fn packed_vec_arith(heap: &mut Heap, args: &[Value]) -> Value {
+    if args.len() < 2 {
+        return Value::default();
+    }
+    let ops = args[args.len() - 1].as_int() as u32;
+    let len = (ops & 0xFFFF) as usize;
+    let op = ((ops >> 16) & 0xFF) as u8;
+    let is_float = (ops & (1 << 24)) != 0;
+    let is_tuple = (ops & (1 << 25)) != 0;
+    let broadcast = (ops & (1 << 26)) != 0;
+    let scalar_left = (ops & (1 << 27)) != 0;
+
+    if op == 4 {
+        // Unary neg: args = [vec, meta]
+        let cells = aggregate_elements(heap, args[0])
+            .unwrap_or_else(|| vec![Value::default(); len]);
+        let n = len.min(cells.len());
+        let out = if is_float {
+            let a = values_to_f64(&cells[..n]);
+            let mut o = vec![0.0; a.len()];
+            coil_simd::zip_neg_f64(&a, &mut o);
+            while o.len() < len {
+                o.push(0.0);
+            }
+            f64_to_values(&o[..len])
+        } else {
+            let a = values_to_i64(&cells[..n]);
+            let mut o = vec![0_i64; a.len()];
+            coil_simd::zip_neg_i64(&a, &mut o);
+            while o.len() < len {
+                o.push(0);
+            }
+            i64_to_values(&o[..len])
+        };
+        return alloc_aggregate(heap, out, is_tuple);
+    }
+
+    if args.len() < 3 {
+        return Value::default();
+    }
+    let lhs = args[0];
+    let rhs = args[1];
+
+    if broadcast {
+        let (vec_v, sc_v) = if scalar_left {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        let cells = aggregate_elements(heap, vec_v)
+            .unwrap_or_else(|| vec![Value::default(); len]);
+        let n = len.min(cells.len());
+        let out = if is_float {
+            let a = values_to_f64(&cells[..n]);
+            let s = sc_v.as_float();
+            let mut o = vec![0.0; a.len()];
+            match op {
+                2 if !scalar_left => coil_simd::scale_f64(&a, s, &mut o),
+                2 => coil_simd::scale_f64(&a, s, &mut o), // mul commutative
+                _ => {
+                    let b = vec![s; a.len()];
+                    match op {
+                        0 if !scalar_left => coil_simd::zip_add_f64(&a, &b, &mut o),
+                        0 => coil_simd::zip_add_f64(&b, &a, &mut o),
+                        1 if !scalar_left => coil_simd::zip_sub_f64(&a, &b, &mut o),
+                        1 => coil_simd::zip_sub_f64(&b, &a, &mut o),
+                        3 if !scalar_left => coil_simd::zip_div_f64(&a, &b, &mut o),
+                        3 => coil_simd::zip_div_f64(&b, &a, &mut o),
+                        _ => coil_simd::zip_add_f64(&a, &b, &mut o),
+                    }
+                }
+            }
+            while o.len() < len {
+                o.push(0.0);
+            }
+            f64_to_values(&o[..len])
+        } else {
+            let a = values_to_i64(&cells[..n]);
+            let s = sc_v.as_int();
+            let mut o = vec![0_i64; a.len()];
+            match op {
+                2 => coil_simd::scale_i64(&a, s, &mut o),
+                _ => {
+                    let b = vec![s; a.len()];
+                    match op {
+                        0 => coil_simd::zip_add_i64(&a, &b, &mut o),
+                        1 if !scalar_left => coil_simd::zip_sub_i64(&a, &b, &mut o),
+                        1 => coil_simd::zip_sub_i64(&b, &a, &mut o),
+                        3 if !scalar_left => {
+                            for i in 0..a.len() {
+                                o[i] = a[i] / b[i];
+                            }
+                        }
+                        3 => {
+                            for i in 0..a.len() {
+                                o[i] = b[i] / a[i];
+                            }
+                        }
+                        _ => coil_simd::zip_add_i64(&a, &b, &mut o),
+                    }
+                }
+            }
+            while o.len() < len {
+                o.push(0);
+            }
+            i64_to_values(&o[..len])
+        };
+        return alloc_aggregate(heap, out, is_tuple);
+    }
+
+    let av = aggregate_elements(heap, lhs).unwrap_or_else(|| vec![Value::default(); len]);
+    let bv = aggregate_elements(heap, rhs).unwrap_or_else(|| vec![Value::default(); len]);
+    let n = len.min(av.len()).min(bv.len());
+    let out = if is_float {
+        let a = values_to_f64(&av[..n]);
+        let b = values_to_f64(&bv[..n]);
+        let mut o = vec![0.0; a.len().min(b.len())];
+        match op {
+            1 => coil_simd::zip_sub_f64(&a, &b, &mut o),
+            2 => coil_simd::zip_mul_f64(&a, &b, &mut o),
+            3 => coil_simd::zip_div_f64(&a, &b, &mut o),
+            _ => coil_simd::zip_add_f64(&a, &b, &mut o),
+        }
+        while o.len() < len {
+            o.push(0.0);
+        }
+        f64_to_values(&o[..len])
+    } else {
+        let a = values_to_i64(&av[..n]);
+        let b = values_to_i64(&bv[..n]);
+        let mut o = vec![0_i64; a.len().min(b.len())];
+        match op {
+            1 => coil_simd::zip_sub_i64(&a, &b, &mut o),
+            2 => coil_simd::zip_mul_i64(&a, &b, &mut o),
+            3 => {
+                for i in 0..o.len() {
+                    o[i] = a[i] / b[i];
+                }
+            }
+            _ => coil_simd::zip_add_i64(&a, &b, &mut o),
+        }
+        while o.len() < len {
+            o.push(0);
+        }
+        i64_to_values(&o[..len])
+    };
+    alloc_aggregate(heap, out, is_tuple)
+}
+
 /// Stable host-native names (also used by codegen `native_id` lookup).
 pub const PACKED_DOT: &str = "packed_dot";
 pub const PACKED_MATMUL: &str = "packed_matmul";
 pub const PACKED_MATRIX_ZIP: &str = "packed_matrix_zip";
 pub const PACKED_MATRIX_NEG: &str = "packed_matrix_neg";
+pub const PACKED_VEC_ARITH: &str = "packed_vec_arith";
 
 #[cfg(test)]
 mod tests {
@@ -329,5 +488,25 @@ mod tests {
         let nrows = aggregate_elements(&heap, neg).expect("nrows");
         let n0 = aggregate_elements(&heap, nrows[0]).expect("n0");
         assert_eq!(n0[0].as_int(), -1);
+    }
+
+    #[test]
+    fn packed_vec_arith_zip_mul_and_broadcast() {
+        let mut heap = Heap::default();
+        let a = alloc_array(&mut heap, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let b = alloc_array(&mut heap, vec![2, 2, 2, 2, 2, 2, 2, 2]);
+        // len=8, op=mul(2), int, array
+        let mul_meta = Value::from((8 | (2 << 16)) as i64);
+        let prod = packed_vec_arith(&mut heap, &[a, b, mul_meta]);
+        let elems = aggregate_elements(&heap, prod).expect("prod");
+        assert_eq!(elems[0].as_int(), 2);
+        assert_eq!(elems[7].as_int(), 16);
+
+        // broadcast mul: vec * 3
+        let scale_meta = Value::from((8 | (2 << 16) | (1 << 26)) as i64);
+        let scaled = packed_vec_arith(&mut heap, &[a, Value::from(3_i64), scale_meta]);
+        let se = aggregate_elements(&heap, scaled).expect("scaled");
+        assert_eq!(se[0].as_int(), 3);
+        assert_eq!(se[7].as_int(), 24);
     }
 }

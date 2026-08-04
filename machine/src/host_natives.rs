@@ -9,8 +9,8 @@ use common::Value;
 
 use crate::{
     ENV_WIRING, FS_WIRING, FfiSignature, FfiType, HostClosureFn, NativeFn, PACKED_DOT,
-    PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot, packed_matmul,
-    packed_matrix_neg, packed_matrix_zip,
+    PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, PACKED_VEC_ARITH, packed_dot,
+    packed_matmul, packed_matrix_neg, packed_matrix_zip, packed_vec_arith,
 };
 
 #[cfg(feature = "crypto")]
@@ -121,6 +121,22 @@ fn push_packed_la(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut
             Ok(Some(kernel(heap, args)))
         })));
     }
+
+    // Zip/broadcast use 3 args; unary neg uses 2 (vec + meta).
+    let vec_sig = FfiSignature::from_parts(
+        PACKED_VEC_ARITH.to_string(),
+        vec![FfiType::Int; 3],
+        FfiType::Int,
+    )
+    .expect("packed_vec_arith signature");
+    let vec_id = out.len();
+    register_id(PACKED_VEC_ARITH, vec_id);
+    out.push(Arc::new(HostClosureFn::new_with_arity_range(
+        vec_sig,
+        2,
+        3,
+        |heap, args| Ok(Some(packed_vec_arith(heap, args))),
+    )));
 }
 
 #[derive(Clone, Copy)]
