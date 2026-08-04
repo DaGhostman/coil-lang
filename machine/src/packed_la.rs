@@ -509,4 +509,72 @@ mod tests {
         assert_eq!(se[0].as_int(), 3);
         assert_eq!(se[7].as_int(), 24);
     }
+
+    #[test]
+    fn packed_vec_arith_neg_and_float_div() {
+        let mut heap = Heap::default();
+        let a = alloc_array(&mut heap, vec![1, -2, 3, -4, 5, -6, 7, -8]);
+        // unary neg: args = [vec, meta]; op=4
+        let neg_meta = Value::from((8 | (4 << 16) | (1 << 25)) as i64); // tuple result
+        let neg = packed_vec_arith(&mut heap, &[a, neg_meta]);
+        let ne = aggregate_elements(&heap, neg).expect("neg");
+        assert_eq!(ne.len(), 8);
+        assert_eq!(ne[0].as_int(), -1);
+        assert_eq!(ne[7].as_int(), 8);
+
+        let fa = alloc_array_f(
+            &mut heap,
+            vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0],
+        );
+        let fb = alloc_array_f(&mut heap, vec![2.0; 8]);
+        let div_meta = Value::from((8 | (3 << 16) | (1 << 24)) as i64); // div + float
+        let quot = packed_vec_arith(&mut heap, &[fa, fb, div_meta]);
+        let qe = aggregate_elements(&heap, quot).expect("quot");
+        assert!((qe[0].as_float() - 1.0).abs() < 1e-12);
+        assert!((qe[7].as_float() - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn packed_vec_arith_broadcast_scalar_left_sub() {
+        let mut heap = Heap::default();
+        let v = alloc_array(&mut heap, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        // 10 - v  (broadcast + scalar_left + sub)
+        let meta = Value::from((8 | (1 << 16) | (1 << 26) | (1 << 27)) as i64);
+        let out = packed_vec_arith(&mut heap, &[Value::from(10_i64), v, meta]);
+        let elems = aggregate_elements(&heap, out).expect("sub");
+        assert_eq!(elems[0].as_int(), 9);
+        assert_eq!(elems[7].as_int(), 2);
+    }
+
+    #[test]
+    fn packed_vec_arith_short_args_and_bad_handle_are_silent() {
+        let mut heap = Heap::default();
+        assert_eq!(packed_vec_arith(&mut heap, &[]).as_int(), 0);
+        // Unary path with too-few args still needs meta; binary needs 3.
+        assert_eq!(
+            packed_vec_arith(&mut heap, &[Value::from(1_i64)]).as_int(),
+            0
+        );
+        let meta = Value::from((8 | (2 << 16)) as i64); // zip mul
+        let missing = packed_vec_arith(
+            &mut heap,
+            &[Value::from(0_i64), Value::from(0_i64), meta],
+        );
+        let elems = aggregate_elements(&heap, missing).expect("zero-filled");
+        assert_eq!(elems.len(), 8);
+        assert!(elems.iter().all(|v| v.as_int() == 0));
+    }
+
+    #[test]
+    fn packed_matrix_zip_sub_float() {
+        let mut heap = Heap::default();
+        let a = alloc_matrix2_f(&mut heap, [[5.0, 7.0], [9.0, 11.0]]);
+        let b = alloc_matrix2_f(&mut heap, [[1.0, 2.0], [3.0, 4.0]]);
+        let meta = Value::from((2 | (2 << 8) | (1 << 16) | (1 << 24)) as i64); // sub + float
+        let diff = packed_matrix_zip(&mut heap, &[a, b, meta]);
+        let rows = aggregate_elements(&heap, diff).expect("rows");
+        let r0 = aggregate_elements(&heap, rows[0]).expect("r0");
+        assert!((r0[0].as_float() - 4.0).abs() < 1e-12);
+        assert!((r0[1].as_float() - 5.0).abs() < 1e-12);
+    }
 }
