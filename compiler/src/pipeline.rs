@@ -951,8 +951,20 @@ impl Pipeline {
             }
         };
 
+        // Discover disk modules (`stdlib/io/sync.hy`, …) referenced by `use`
+        // before compiling the in-memory entry — same dependency order as
+        // `compile_src_from_file`, without requiring a temp file.
+        self.enqueue_uses(path, src, &ast);
+        self.discover_all();
+        while let Some(item) = self.worklist.pop_back() {
+            self.compile_file(item, false);
+        }
+        if self.failed || self.had_errors() {
+            return Err(());
+        }
+
         self.compiler.set_source_file(path);
-        let mut bytecode = self.compiler.compile("", &mut ast);
+        self.compiler.compile_module("", &mut ast);
 
         // Register source and drain typecheck / codegen diagnostics via the sink.
         let file_id = self.sink.register_source(path, src);
@@ -961,9 +973,16 @@ impl Pipeline {
             return Err(());
         }
 
+        self.compiler.finalize_bytecode();
+        let mut bytecode = self.compiler.bytecode_vec();
+
         if let Some(byte) = bytecode.get_mut(1) {
             *byte =
                 Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+        }
+
+        if !self.compiler.get_messages().is_empty() {
+            return Err(());
         }
 
         Ok((bytecode, self.compiler.constants().to_vec()))
