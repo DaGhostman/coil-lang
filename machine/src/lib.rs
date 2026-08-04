@@ -12,6 +12,7 @@ mod ffi;
 pub mod fs;
 pub mod host_natives;
 pub mod io;
+pub mod io_reactor;
 mod memory;
 mod opcode;
 pub mod packed_la;
