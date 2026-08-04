@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 
@@ -13,52 +13,33 @@ use std::thread;
 /// multiple `Machine`s would steal each other's joins via `mem::take`.
 pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
 
-/// Per-root-VM bound on concurrent OS workers from [`host_spawn`].
+/// Per-root-VM bound on concurrent OS **pool** threads for the work-stealing
+/// reactor (see [`crate::reactor::Reactor`]).
 ///
-/// Caps deep auto-parallel recursion without a work-stealing pool. Override
-/// with `COIL_MAX_WORKER_THREADS` (clamped to 1..=512). Default is
-/// `2 * available_parallelism` (minimum 2). Shared with nested workers so the
-/// whole spawn tree under one root VM shares one budget.
+/// Caps host threads used for `spawn` / auto-par. Override with
+/// `COIL_MAX_WORKER_THREADS` (clamped to 1..=512). Default is
+/// `available_parallelism` (minimum 2).
 #[derive(Debug)]
 pub struct WorkerCap {
-    live: AtomicUsize,
     max: usize,
 }
 
 impl WorkerCap {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            live: AtomicUsize::new(0),
             max: max_worker_threads(),
+        })
+    }
+
+    /// Build a cap with an explicit pool size (reactor workers).
+    pub fn from_count(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max: n.clamp(1, 512),
         })
     }
 
     pub fn max(&self) -> usize {
         self.max
-    }
-
-    pub fn live(&self) -> usize {
-        self.live.load(Ordering::SeqCst)
-    }
-
-    fn try_acquire(&self) -> bool {
-        loop {
-            let cur = self.live.load(Ordering::SeqCst);
-            if cur >= self.max {
-                return false;
-            }
-            if self
-                .live
-                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    fn release(&self) {
-        self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -71,7 +52,7 @@ fn max_worker_threads() -> usize {
             }
         }
         thread::available_parallelism()
-            .map(|n| n.get().saturating_mul(2).max(2))
+            .map(|n| n.get().max(2))
             .unwrap_or(8)
             .min(512)
     })
@@ -256,8 +237,9 @@ pub struct JoinState {
     joined: AtomicBool,
 }
 
-struct JoinStateInner {
-    result: Option<Result<PortableValue, ThreadErrorTag>>,
+/// Join-state payload (reactor timed waits).
+pub(crate) struct JoinStateInner {
+    pub result: Option<Result<PortableValue, ThreadErrorTag>>,
 }
 
 impl JoinState {
@@ -271,7 +253,7 @@ impl JoinState {
         }
     }
 
-    fn store_result(&self, result: Result<PortableValue, ThreadErrorTag>) {
+    pub(crate) fn store_result(&self, result: Result<PortableValue, ThreadErrorTag>) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.result = Some(result);
         self.finished.notify_all();
@@ -283,6 +265,20 @@ impl JoinState {
             g = self.finished.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         g.result.take().unwrap_or(Err(ThreadErrorTag::JoinFailed))
+    }
+
+    /// Non-blocking take when the worker has finished.
+    pub(crate) fn try_take_result(&self) -> Option<Result<PortableValue, ThreadErrorTag>> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.result.take()
+    }
+
+    pub(crate) fn inner_lock(&self) -> MutexGuard<'_, JoinStateInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn finished_cvar(&self) -> &Condvar {
+        &self.finished
     }
 }
 
@@ -661,7 +657,7 @@ pub fn value_to_spawn_arg(heap: &Heap, v: Value) -> Result<SpawnArg, ThreadError
     Ok(SpawnArg::Value(value_to_portable(heap, v)?))
 }
 
-fn spawn_arg_to_value(heap: &mut Heap, arg: SpawnArg) -> Result<Value, ThreadErrorTag> {
+pub(crate) fn spawn_arg_to_value(heap: &mut Heap, arg: SpawnArg) -> Result<Value, ThreadErrorTag> {
     match arg {
         SpawnArg::Value(pv) => portable_to_value(heap, pv),
         SpawnArg::Sender(inner) => {
@@ -694,7 +690,7 @@ fn fn_entry_from_value(heap: &Heap, v: Value) -> Result<(u32, u32), ThreadErrorT
     Ok((f.entry, f.arity))
 }
 
-struct SharedPrintWriter(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct SharedPrintWriter(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedPrintWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -708,76 +704,6 @@ impl Write for SharedPrintWriter {
     }
 }
 
-struct WorkerCtx {
-    program: Arc<ThreadProgram>,
-    natives: Natives,
-    entry: u32,
-    args: Vec<SpawnArg>,
-    state: Arc<JoinState>,
-    shared_print: Option<Arc<Mutex<Vec<u8>>>>,
-    live_threads: LiveThreadRegistry,
-    worker_cap: Arc<WorkerCap>,
-}
-
-fn run_worker(ctx: WorkerCtx) {
-    let WorkerCtx {
-        program,
-        natives,
-        entry,
-        args,
-        state,
-        shared_print,
-        live_threads,
-        worker_cap,
-    } = ctx;
-    // Always release the concurrency slot when the OS thread finishes —
-    // including panics — so auto-par fallback / later spawns can proceed.
-    struct WorkerSlotGuard(Arc<WorkerCap>);
-    impl Drop for WorkerSlotGuard {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-    let _slot = WorkerSlotGuard(Arc::clone(&worker_cap));
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
-        vm.install_natives(&natives);
-        vm.set_thread_program(Arc::clone(&program));
-        vm.set_program_debug(program.debug.clone());
-        // Nested `spawn` from a worker registers on the root VM's list so the
-        // root's `run_with_pool` join still waits for them.
-        vm.set_live_threads(Arc::clone(&live_threads));
-        vm.set_worker_cap(Arc::clone(&worker_cap));
-        if let Some(buf) = &shared_print {
-            vm.set_shared_print(Arc::clone(buf));
-            vm.with_output(SharedPrintWriter(Arc::clone(buf)));
-            crate::io::set_shared_print_redirect(Some(Arc::clone(buf)));
-        }
-        vm.load_program(
-            program.code.as_slice(),
-            program.constants.as_slice(),
-            program.strings.as_slice(),
-        );
-        vm.init_static_slots(program.static_slot_count);
-        let mut child_args = Vec::new();
-        for a in args {
-            child_args.push(spawn_arg_to_value(vm.heap_mut(), a)?);
-        }
-        let ret = vm.call_function(entry, &child_args);
-        if vm.panicked() {
-            return Err(ThreadErrorTag::JoinFailed);
-        }
-        value_to_portable(vm.heap(), ret)
-    }));
-    let stored = match result {
-        Ok(Ok(pv)) => Ok(pv),
-        Ok(Err(tag)) => Err(tag),
-        Err(_) => Err(ThreadErrorTag::JoinFailed),
-    };
-    state.store_result(stored);
-}
-
 /// Context copied from the parent `Machine` when spawning.
 pub struct ThreadSpawnContext {
     pub program: Arc<ThreadProgram>,
@@ -785,6 +711,7 @@ pub struct ThreadSpawnContext {
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
     pub live_threads: LiveThreadRegistry,
     pub worker_cap: Arc<WorkerCap>,
+    pub reactor: Arc<crate::reactor::Reactor>,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -795,6 +722,7 @@ impl Clone for ThreadSpawnContext {
             shared_print: self.shared_print.clone(),
             live_threads: Arc::clone(&self.live_threads),
             worker_cap: Arc::clone(&self.worker_cap),
+            reactor: Arc::clone(&self.reactor),
         }
     }
 }
@@ -818,35 +746,16 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
             .collect::<Result<_, _>>()?
     };
     let ctx = host_spawn_context()?;
-    // Acquire before `thread::spawn` so deep recursive auto-par hits
-    // `WouldBlock` instead of exhausting the host. Slot is released in
-    // `run_worker` when the OS thread finishes.
-    if !ctx.worker_cap.try_acquire() {
-        return Err(ThreadErrorTag::WouldBlock);
-    }
     let live_threads = Arc::clone(&ctx.live_threads);
-    let worker_cap = Arc::clone(&ctx.worker_cap);
+    let reactor = Arc::clone(&ctx.reactor);
     let state = Arc::new(JoinState::new());
-    let worker = WorkerCtx {
-        program: ctx.program,
-        natives: ctx.natives,
+    let job = crate::reactor::job_from_spawn_context(
+        ctx,
         entry,
-        args: spawn_args,
-        state: Arc::clone(&state),
-        shared_print: ctx.shared_print,
-        live_threads: Arc::clone(&live_threads),
-        worker_cap: Arc::clone(&worker_cap),
-    };
-    let handle = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        thread::spawn(move || run_worker(worker))
-    })) {
-        Ok(handle) => handle,
-        Err(_) => {
-            worker_cap.release();
-            return Err(ThreadErrorTag::Other);
-        }
-    };
-    *state.join_handle.lock().unwrap() = Some(handle);
+        spawn_args,
+        Arc::clone(&state),
+    );
+    reactor.submit(job);
     register_live_thread(&live_threads, Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
     Ok(Value::from(obj.addr()))
@@ -868,7 +777,10 @@ fn try_host_join(heap: &mut Heap, handle: Value) -> Result<Value, ThreadErrorTag
     if state.detached.load(Ordering::SeqCst) {
         return Err(ThreadErrorTag::JoinFailed);
     }
-    let portable = state.wait_result()?;
+    let portable = match host_spawn_context() {
+        Ok(ctx) => ctx.reactor.wait_join(&state)?,
+        Err(_) => state.wait_result()?,
+    };
     if let Some(h) = state.join_handle.lock().unwrap().take() {
         let _ = h.join();
     }
@@ -1553,21 +1465,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_cap_rejects_when_full() {
-        let cap = WorkerCap::new();
-        let max = cap.max();
-        for _ in 0..max {
-            assert!(cap.try_acquire());
-        }
-        assert!(!cap.try_acquire());
-        assert_eq!(cap.live(), max);
-        cap.release();
-        assert!(cap.try_acquire());
-        // Drain so Drop of Arc doesn't leave a misleading live count for
-        // other assertions in this process (cap is not process-global).
-        while cap.live() > 0 {
-            cap.release();
-        }
+    fn worker_cap_respects_env_bounds() {
+        let cap = WorkerCap::from_count(4);
+        assert_eq!(cap.max(), 4);
+        let capped = WorkerCap::from_count(0);
+        assert_eq!(capped.max(), 1);
+        let high = WorkerCap::from_count(10_000);
+        assert_eq!(high.max(), 512);
     }
 
     #[test]

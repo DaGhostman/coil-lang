@@ -1186,6 +1186,7 @@ dependencies = [
  "chrono",
  "coil-simd",
  "common",
+ "crossbeam-deque",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hmac",

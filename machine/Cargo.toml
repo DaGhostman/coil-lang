@@ -27,6 +27,7 @@ vm_profile = []
 [dependencies]
 common = { path = "../common" }
 coil-simd = { path = "../coil-simd" }
+crossbeam-deque = "0.8"
 rkyv = "0.8.12"
 libloading = "0.9"
 libffi = "5.1.1"
