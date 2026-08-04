@@ -33,6 +33,15 @@ fn main() {
 
 `join(t)` blocks until the worker finishes and returns its result value. `detach(t)` lets the thread run without a join (errors if you later `join` the same handle).
 
+### Spawn capacity
+
+Each program VM allows only a bounded number of concurrent OS workers (default
+`2 ×` CPU count, override with `COIL_MAX_WORKER_THREADS`). When the budget is
+exhausted, `spawn` returns `Err(WouldBlock)` instead of creating another
+thread. Pure recursive helpers such as `fib(n-1) + fib(n-2)` may be
+auto-parallelized by the compiler; they use the same budget and fall back to
+sequential evaluation on `WouldBlock` (see [internals: auto-par](../../internals/auto-par.md)).
+
 ## Channels
 
 `channel()` returns `(Sender, Receiver)` as a two-tuple. `send` / `recv` move values between threads; `close` drops the sender side.
