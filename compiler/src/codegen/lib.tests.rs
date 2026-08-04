@@ -24,6 +24,7 @@
         compiler.register_native_id(machine::PACKED_MATMUL, 9002);
         compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
         compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
+        compiler.register_native_id(machine::PACKED_VEC_ARITH, 9005);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
@@ -5092,6 +5093,125 @@ fn main() {
             0,
             "float packed_dot meta must set is_float bit"
         );
+    }
+
+    /// Static aggregate length ≥ 8 lowers to `packed_vec_arith` HostInvoke.
+    #[test]
+    fn aggregate_zip_len8_emits_packed_vec_arith() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = [1, 2, 3, 4, 5, 6, 7, 8];
+    let b = [2, 2, 2, 2, 2, 2, 2, 2];
+    let _ = a * b;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for N=8 zip mul; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        assert!(
+            mul_count < 8,
+            "packed vec path should not unroll 8 MULs; got {mul_count}"
+        );
+        let ops = packed_host_meta(&bc);
+        assert_eq!(ops & 0xFFFF, 8, "len");
+        assert_eq!((ops >> 16) & 0xFF, 2, "op=mul");
+        assert_eq!(ops & (1 << 24), 0, "int elements");
+        assert_eq!(ops & (1 << 25), 0, "array result");
+        assert_eq!(ops & (1 << 26), 0, "zip (not broadcast)");
+        // native id CONST then MakeTuple(3) then HostInvoke
+        let hi = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::HostInvoke))
+            .unwrap();
+        assert_eq!(bc[hi - 1].operand_u32(), 3, "binary arity MakeTuple(3)");
+    }
+
+    /// N < 8 stays on scalar unroll — packed path must not fire.
+    #[test]
+    fn aggregate_zip_len7_does_not_emit_packed_vec_arith() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = [1, 2, 3, 4, 5, 6, 7];
+    let b = [1, 1, 1, 1, 1, 1, 1];
+    let _ = a * b;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "N=7 must stay on scalar unroll"
+        );
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        assert!(
+            mul_count >= 7,
+            "expected scalar unroll (≥7 MUL); got {mul_count}"
+        );
+    }
+
+    /// Broadcast / float / scalar-left / neg meta bits for packed_vec_arith.
+    #[test]
+    fn aggregate_packed_vec_arith_meta_flags() {
+        use common::Instruction;
+
+        let (bc_bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let _ = 10.0 - a;
+}
+"#,
+        );
+        assert!(
+            bc_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for float broadcast sub"
+        );
+        let ops = packed_host_meta(&bc_bc);
+        assert_eq!(ops & 0xFFFF, 8, "len");
+        assert_eq!((ops >> 16) & 0xFF, 1, "op=sub");
+        assert_ne!(ops & (1 << 24), 0, "float");
+        assert_ne!(ops & (1 << 26), 0, "broadcast");
+        assert_ne!(ops & (1 << 27), 0, "scalar_left");
+
+        let (bc_neg, _) = compile_src(
+            r#"
+fn main() {
+    let a = (1, 2, 3, 4, 5, 6, 7, 8);
+    let _ = -a;
+}
+"#,
+        );
+        assert!(
+            bc_neg
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for N=8 tuple neg"
+        );
+        let neg_ops = packed_host_meta(&bc_neg);
+        assert_eq!((neg_ops >> 16) & 0xFF, 4, "op=neg");
+        assert_ne!(neg_ops & (1 << 25), 0, "tuple result");
+        let hi = bc_neg
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::HostInvoke))
+            .unwrap();
+        assert_eq!(bc_neg[hi - 1].operand_u32(), 2, "unary MakeTuple(2)");
     }
 
     #[test]

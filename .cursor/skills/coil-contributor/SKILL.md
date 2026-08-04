@@ -21,6 +21,7 @@ coil/
 ├── parser/       # Pratt parser, AST
 ├── compiler/     # HM typechecker, stack IL (compiler/src/il/), pipeline
 ├── machine/      # VM, heap/GC, FFI, host natives (HostInvoke)
+├── coil-simd/    # Stable std::arch SIMD kernels (packed LA, bytes)
 ├── src/main.rs   # CLI: run, compile, test, debug, dissect
 ├── examples/     # Runnable .hy demos
 ├── tests/        # Integration .hy tests (coil test)

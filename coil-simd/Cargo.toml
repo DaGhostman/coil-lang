@@ -1,0 +1,17 @@
+[package]
+name = "coil-simd"
+version = "0.1.0"
+edition = "2024"
+description = "Stable-Rust SIMD helpers over std::arch for coil numeric kernels"
+license = "MIT"
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+
+[dev-dependencies]
+criterion = { version = "^0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "simd_vs_scalar"
+harness = false

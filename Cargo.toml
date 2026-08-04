@@ -12,6 +12,7 @@ members = [
     "coil-dissect",
     "coil-fmt",
     "coil-lsp",
+    "coil-simd",
 ]
 # Plain `cargo build` / `cargo test` at the repo root builds all CLI binaries
 # (coil + helpers), not only the root package.

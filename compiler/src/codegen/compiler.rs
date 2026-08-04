@@ -2569,6 +2569,10 @@ impl Compiler {
             return false;
         };
 
+        if self.try_emit_packed_aggregate_arith(bytecode, &info, lhs, rhs) {
+            return true;
+        }
+
         let scalar_instr = |op: AggregateOp, is_float: bool| -> Instruction {
             match (op, is_float) {
                 (AggregateOp::Add, false) => Instruction::ADD,
@@ -2812,6 +2816,121 @@ impl Compiler {
                 true
             }
         }
+    }
+
+    /// HostInvoke packed path for 1-D aggregate zip / broadcast / neg.
+    ///
+    /// Used when static length ≥ 8 so SIMD kernels amortize HostInvoke cost;
+    /// smaller shapes keep the existing scalar unroll.
+    fn try_emit_packed_aggregate_arith(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        info: &crate::typechecking::AggregateArithInfo,
+        lhs: &Output,
+        rhs: Option<&Output>,
+    ) -> bool {
+        use crate::typechecking::{AggregateArithKind, AggregateOp, ScalarSide};
+
+        const MIN_PACKED: usize = 8;
+
+        let op_code: u32 = match info.op {
+            AggregateOp::Add => 0,
+            AggregateOp::Sub => 1,
+            AggregateOp::Mul => 2,
+            AggregateOp::Div => 3,
+            AggregateOp::Neg => 4,
+            AggregateOp::Mod | AggregateOp::Pow => return false,
+        };
+
+        let (len, is_tuple, elem_is_float, broadcast, scalar_left) = match &info.kind {
+            AggregateArithKind::ZipTuple {
+                arity,
+                elem_is_float,
+            } => (*arity, true, *elem_is_float, false, false),
+            AggregateArithKind::ZipArray {
+                length,
+                elem_is_float,
+            } => (*length, false, *elem_is_float, false, false),
+            AggregateArithKind::BroadcastTuple {
+                arity,
+                scalar_on,
+                elem_is_float,
+            } => (
+                *arity,
+                true,
+                *elem_is_float,
+                true,
+                matches!(scalar_on, ScalarSide::Left),
+            ),
+            AggregateArithKind::BroadcastArray {
+                length: Some(n),
+                scalar_on,
+                elem_is_float,
+            } => (
+                *n,
+                false,
+                *elem_is_float,
+                true,
+                matches!(scalar_on, ScalarSide::Left),
+            ),
+            AggregateArithKind::NegTuple {
+                arity,
+                elem_is_float,
+            } => (*arity, true, *elem_is_float, false, false),
+            AggregateArithKind::NegArray {
+                length: Some(n),
+                elem_is_float,
+            } => (*n, false, *elem_is_float, false, false),
+            AggregateArithKind::BroadcastArray { length: None, .. }
+            | AggregateArithKind::NegArray { length: None, .. } => return false,
+        };
+
+        if len < MIN_PACKED || len > u16::MAX as usize {
+            return false;
+        }
+
+        let is_neg = matches!(info.op, AggregateOp::Neg);
+        if !is_neg && rhs.is_none() {
+            return false;
+        }
+
+        let Some(native_id) = self.native_id(machine::PACKED_VEC_ARITH) else {
+            return false;
+        };
+
+        let mut meta = (len as u32) & 0xFFFF;
+        meta |= op_code << 16;
+        if elem_is_float {
+            meta |= 1 << 24;
+        }
+        if is_tuple {
+            meta |= 1 << 25;
+        }
+        if broadcast {
+            meta |= 1 << 26;
+        }
+        if scalar_left {
+            meta |= 1 << 27;
+        }
+
+        let depth_on_entry = self.expr_depth;
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(native_id as u32));
+        self.expr_depth = depth_on_entry + 1;
+        bytecode.append(&mut self.do_compile(lhs));
+        self.expr_depth += 1;
+        let arity = if is_neg {
+            2 // vec + meta
+        } else {
+            bytecode.append(&mut self.do_compile(rhs.unwrap()));
+            self.expr_depth += 1;
+            3 // lhs + rhs + meta
+        };
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
+        self.expr_depth += 1;
+        bytecode.push_make_tuple(arity as u32);
+        bytecode.push_host_invoke(arity as u32);
+        self.expr_depth = depth_on_entry;
+        true
     }
 
     /// Negate TOS: int via `NEG`; float via `MULF` by −1 (no `NEGF` opcode).

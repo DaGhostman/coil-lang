@@ -12,14 +12,15 @@
 | `compiler/src/il/` | IL ops, lower, fuse-select, opts |
 | `compiler/src/typechecking/infer/` | HM `Checker` (`mod.rs` types + `checker.rs` impl) |
 | `parser/src/` | Pratt parser |
-| `machine/src/packed_la.rs` | LA ops via HostInvoke (no LA opcodes) |
+| `machine/src/packed_la.rs` | LA ops via HostInvoke (no LA opcodes); uses `coil-simd` |
+| `coil-simd/` | Stable `std::arch` SIMD (dot/matmul/zip, `bytes::eq`) |
 
 ## Codegen / VM invariants
 
 - **`STORE`**: pops TOS into slot(s); `cursor = max(cursor, slot + 1)`. Match bindings skip store (`UNPACK` / `JUMP_IF_MATCH`). `StorePop` is deprecated alias — compiler never emits. Packed multi-slot `LOAD`/`STORE`: `[31:24]=n` (1..=3), three slot bytes; `n==0` → wide single slot in low 24 bits.
 - **Stack IL**: symbolic labels until `finalize_bytecode` → per-body opts + **single** `il::lower` after concat. Nested fused returns must `capture_nested_return`.
 - **Type aliases**: scoped; same-frame duplicates are errors; inner may shadow outer.
-- Packed LA (`dot`/`matmul`/`Matrix`) → `HostInvoke` in `machine/src/packed_la.rs` (no LA opcodes).
+- Packed LA (`dot`/`matmul`/`Matrix`) → `HostInvoke` in `machine/src/packed_la.rs` (no LA opcodes); kernels go through `coil-simd`.
 
 ## Codegen notes
 

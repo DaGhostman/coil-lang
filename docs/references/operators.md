@@ -81,8 +81,9 @@ parameter).
 negates each element. Compound assign (`+=`, `**=`, …) follows the same
 rules with the LHS shape fixed.
 
-Static-length zip/broadcast fully unrolls at compile time (including large
-`[T; N]`); bytecode size scales with `N`.
+Static-length zip/broadcast uses a packed HostInvoke SIMD kernel when the
+fixed length is ≥ 8 (`packed_vec_arith`); smaller shapes still unroll to
+scalar opcodes (bytecode size scales with `N` in that case).
 
 For **dot product**, **cross product**, and bare-array **matrix multiply**,
 use the named helpers `dot`, `cross`, and `matmul`. For matmul via `*`
@@ -101,7 +102,7 @@ a + a;             // element-wise
 ```
 
 See `examples/vec_tuple.hy`, `examples/vec_array.hy`,
-`examples/vec_generic.hy`, `examples/vec_dot.hy`,
+`examples/vec_generic.hy`, `examples/vec_packed_mul.hy`, `examples/vec_dot.hy`,
 `examples/vec_matmul.hy`, and `examples/matrix_mul.hy`.
 
 String concatenation uses `+`:

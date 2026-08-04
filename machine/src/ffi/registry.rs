@@ -154,4 +154,43 @@ mod tests {
         assert!(reg.get("a").is_some());
         assert_eq!(reg.get_by_id(1).unwrap().name(), "b");
     }
+
+    #[test]
+    fn arity_range_accepts_min_through_max() {
+        let sig = FfiSignature::from_parts("packed_like", vec![FfiType::Int; 3], FfiType::Int)
+            .unwrap();
+        let native = HostClosureFn::new_with_arity_range(sig, 2, 3, |_heap, args| {
+            Ok(Some(Value::from(args.len() as i64)))
+        });
+        let mut heap = Heap::default();
+        assert_eq!(
+            native
+                .invoke(&mut heap, &[Value::from(1_i64), Value::from(2_i64)])
+                .unwrap()
+                .unwrap()
+                .as_int(),
+            2
+        );
+        assert_eq!(
+            native
+                .invoke(
+                    &mut heap,
+                    &[Value::from(1_i64), Value::from(2_i64), Value::from(3_i64)]
+                )
+                .unwrap()
+                .unwrap()
+                .as_int(),
+            3
+        );
+        let err = native
+            .invoke(&mut heap, &[Value::from(1_i64)])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FfiError::ArityMismatch {
+                expected: 3,
+                got: 1
+            }
+        ));
+    }
 }
