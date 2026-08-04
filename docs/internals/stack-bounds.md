@@ -15,18 +15,29 @@ After typecheck, [`analyze_stack_bounds`](../../compiler/src/typechecking/stack_
 walks the AST:
 
 1. Build the user-function call graph and find **cycles** (self or mutual).
-2. For each recursive function, try to prove a finite **frame depth**:
+2. For each self-recursive function, try to prove a finite **frame depth** via a
+   unified **measure shape**:
+   - Among `int`/`byte` parameters, pick the first `p` that has a recognizable
+     base case (`if p <= K` / `p < K` / `p == K`) **and** every self-call of `f`
+     passes `p - k` (`k > 0`) in that argument slot. Other arguments are ignored
+     for depth.
+   - Walk the whole body: surrounding operators (`+`, `/`, `%`, nested `let`s,
+     …) do not matter once self-calls are collected. `min_step` is the minimum
+     positive `k` across those calls.
+   - Depth ≈ `((max_entry - base) / min_step) + 1`.
    - **Tail-only** self-calls (`return f(...)`) → depth `1` (matches `TailCall`).
-   - **Binary measure** (same shape as auto-par): `f(n-a) ⊕ f(n-b)` with
-     `if n <= K` / `n < K`, and **every** entry call site is a constant int
-     (`fib(10)`, `fib(32)`). Depth ≈ `((max_n - K) / min(a,b)) + 1`.
-   - **Unary measure**: `f(n-k)` (or `n * f(n-k)`, …) with the same base-case
-     pattern and constant entries.
-3. If depth is unprovable, require `#[max_depth(N)]` on that function.
+3. Entry measure values may be:
+   - integer literals (`fib(32)`);
+   - intra-procedural const bindings via `const_fold::eval_expr`
+     (`let n = 30; fib(n)`, `const N = 10; fib(N)`, `fib(10 + 20)`);
+   - shallow interprocedural wrappers: non-recursive helpers whose params are
+     constant at every call site propagate into recursive callees
+     (`main → helper(32) → fib(n)`).
+4. If depth is unprovable, require `#[max_depth(N)]` on that function.
 
-Dynamic arguments (`fib(k)`), FFI / opaque callees, mutual recursion without a
-self-measure, and unrecognized shapes are **unprovable** — not rejected
-blindly when a bound *can* be shown.
+Assignments to a traced name kill the binding (fail closed). Opaque / dynamic
+arguments (`fib(noise())`), mutual recursion without a self-measure, and shapes
+where some self-call does not decrease the measure are **unprovable**.
 
 ## Attribute
 
@@ -42,6 +53,8 @@ recursive function. Valid only on `fn` (see [Syntax — Attributes](../reference
 
 ## Relation to auto-par
 
-[`par_profit`](../../compiler/src/typechecking/par_profit.rs) reuses the same
-binary shape detector for fork-join specialization. Stack-bound analysis runs
-even when `COIL_AUTO_PAR=0`, and applies to impure recursive functions too.
+[`par_profit`](../../compiler/src/typechecking/par_profit.rs) still uses its own
+unary-int + binary `⊕` fork detector for auto-par profitability. Stack-bound
+analysis is the more general path (multi-arg measures, any number of decreasing
+self-calls, const tracing) and runs even when `COIL_AUTO_PAR=0`, including for
+impure recursive functions.
