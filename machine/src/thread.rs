@@ -344,6 +344,8 @@ pub(crate) struct MachineHostState {
     raw: *mut (),
     call_function: unsafe fn(*mut (), u32, &[Value]) -> Value,
     spawn_context: Option<ThreadSpawnContext>,
+    io_reactor: Option<std::sync::Arc<crate::io_reactor::IoReactor>>,
+    cpu_reactor: Option<std::sync::Arc<crate::reactor::Reactor>>,
 }
 
 thread_local! {
@@ -358,11 +360,15 @@ impl HostStateGuard {
     pub fn enter<const N: usize>(vm: &mut Machine<N>) -> Self {
         let prev = HOST_STATE.with(|c| c.borrow_mut().take());
         let spawn_context = vm.thread_spawn_context();
+        let io_reactor = Some(std::sync::Arc::clone(vm.io_reactor()));
+        let cpu_reactor = Some(std::sync::Arc::clone(vm.reactor()));
         HOST_STATE.with(|c| {
             *c.borrow_mut() = Some(MachineHostState {
                 raw: (vm as *mut Machine<N>).cast(),
                 call_function: Self::call::<N>,
                 spawn_context,
+                io_reactor,
+                cpu_reactor,
             });
         });
         Self { prev }
@@ -396,6 +402,39 @@ fn host_spawn_context() -> Result<ThreadSpawnContext, ThreadErrorTag> {
             .as_ref()
             .and_then(|s| s.spawn_context.clone())
             .ok_or(ThreadErrorTag::Other)
+    })
+}
+
+/// Block on IO readiness using the bound VM's reactors (CPU help-steal when present).
+pub(crate) fn host_io_wait(
+    fd: std::os::fd::RawFd,
+    interest: crate::io_reactor::Interest,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), crate::io::IoErrorTag> {
+    use crate::io_reactor::IoReactor;
+
+    let (io, cpu) = HOST_STATE.with(|c| {
+        let state = c.borrow();
+        match state.as_ref() {
+            Some(s) => (s.io_reactor.clone(), s.cpu_reactor.clone()),
+            None => (None, None),
+        }
+    });
+    match (io, cpu) {
+        (Some(io), Some(cpu)) => io.wait_fd_helping(fd, interest, timeout, || cpu.help_once()),
+        (Some(io), None) => io.wait_fd(fd, interest, timeout),
+        (None, _) => IoReactor::new().wait_fd(fd, interest, timeout),
+    }
+}
+
+/// Poll async waiters once on the bound IO reactor.
+pub(crate) fn host_io_drive() -> usize {
+    HOST_STATE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|s| s.io_reactor.as_ref())
+            .map(|io| io.poll_once(Some(std::time::Duration::ZERO)))
+            .unwrap_or(0)
     })
 }
 
@@ -712,6 +751,7 @@ pub struct ThreadSpawnContext {
     pub live_threads: LiveThreadRegistry,
     pub worker_cap: Arc<WorkerCap>,
     pub reactor: Arc<crate::reactor::Reactor>,
+    pub io_reactor: Arc<crate::io_reactor::IoReactor>,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -723,6 +763,7 @@ impl Clone for ThreadSpawnContext {
             live_threads: Arc::clone(&self.live_threads),
             worker_cap: Arc::clone(&self.worker_cap),
             reactor: Arc::clone(&self.reactor),
+            io_reactor: Arc::clone(&self.io_reactor),
         }
     }
 }
