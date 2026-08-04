@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
 };
 
 use common::{
@@ -835,6 +835,10 @@ pub struct Compiler {
 
     /// Self-recursive pure function names eligible for auto fork-join.
     recursive_pure: HashSet<String>,
+    /// Detected `f(n-a) ⊕ f(n-b)` shapes for recursive-pure fns.
+    par_shapes: HashMap<String, crate::typechecking::RecParShape>,
+    /// Concrete int args requiring `__coil_par_*` specializations.
+    par_spec_args: HashMap<String, BTreeSet<i64>>,
 }
 
 impl Default for Compiler {
@@ -902,6 +906,8 @@ impl Default for Compiler {
             fn_debug_locals: HashMap::new(),
             suppress_match_fusion_barrier: false,
             recursive_pure: HashSet::new(),
+            par_shapes: HashMap::new(),
+            par_spec_args: HashMap::new(),
         }
     }
 }
@@ -1155,18 +1161,6 @@ fn auto_par_enabled() -> bool {
         Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => false,
         _ => true,
     }
-}
-
-/// Skip auto-par spawn when a unary int argument is at or below this value
-/// (`COIL_PAR_THRESHOLD`, default 20). Tiny recursive work stays sequential.
-fn auto_par_int_threshold() -> i64 {
-    static T: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("COIL_PAR_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20)
-    })
 }
 
 fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
