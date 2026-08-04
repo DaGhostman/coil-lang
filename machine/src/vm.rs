@@ -125,6 +125,13 @@ struct PendingFfiInvoke {
     resume_sp: usize,
 }
 
+/// Parked HostInvoke waiting on IO readiness (`await_readable` / `await_writable`).
+struct PendingIoWait {
+    request: crate::io::IoParkRequest,
+    resume_ip: usize,
+    resume_sp: usize,
+}
+
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
@@ -158,6 +165,8 @@ pub struct Machine<const S: usize> {
     nested_return: Option<Value>,
     /// Set when `execute` pauses before a native FFI call that may reenter the VM.
     pending_ffi: Option<PendingFfiInvoke>,
+    /// Set when `await_*` parks until fd readiness (CPU help-steals meanwhile).
+    pending_io: Option<PendingIoWait>,
     /// Set when a language-level `panic` aborts the VM.
     panicked: bool,
     /// Global static slots (`LoadStatic` / `StoreStatic`).
@@ -182,6 +191,8 @@ pub struct Machine<const S: usize> {
     worker_cap: std::sync::Arc<crate::thread::WorkerCap>,
     /// Work-stealing pool sized by [`Self::worker_cap`].
     reactor: std::sync::Arc<crate::reactor::Reactor>,
+    /// IO readiness reactor (sync adapters + async waiters).
+    io_reactor: std::sync::Arc<crate::io_reactor::IoReactor>,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -211,6 +222,7 @@ impl<const S: usize> Default for Machine<S> {
             nested_frame_depths: Vec::new(),
             nested_return: None,
             pending_ffi: None,
+            pending_io: None,
             panicked: false,
             statics: Vec::new(),
             program_debug: ProgramDebug::default(),
@@ -224,6 +236,7 @@ impl<const S: usize> Default for Machine<S> {
             live_threads: crate::thread::new_live_thread_registry(),
             worker_cap,
             reactor,
+            io_reactor: crate::io_reactor::IoReactor::new(),
         }
     }
 }
@@ -361,6 +374,7 @@ impl<const S: usize> Machine<S> {
         self.frames.consume();
         self.panicked = false;
         self.pending_ffi = None;
+        self.pending_io = None;
         self.pending_debug_stop = None;
         self.nested_depth = 0;
         self.nested_frame_depths.clear();
@@ -412,6 +426,12 @@ impl<const S: usize> Machine<S> {
             if let Some(pending) = self.pending_ffi.take() {
                 let resume_ip = pending.resume_ip;
                 self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if let Some(pending) = self.pending_io.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_io_wait(pending);
                 ip = resume_ip;
                 continue;
             }
@@ -856,6 +876,15 @@ impl<const S: usize> Machine<S> {
         &self.reactor
     }
 
+    /// Share the root VM's IO reactor with nested workers.
+    pub fn set_io_reactor(&mut self, io: std::sync::Arc<crate::io_reactor::IoReactor>) {
+        self.io_reactor = io;
+    }
+
+    pub fn io_reactor(&self) -> &std::sync::Arc<crate::io_reactor::IoReactor> {
+        &self.io_reactor
+    }
+
     /// Allocate global static slots without running bytecode.
     pub fn init_static_slots(&mut self, static_slots: u32) {
         self.statics = vec![Value::default(); static_slots as usize];
@@ -875,6 +904,7 @@ impl<const S: usize> Machine<S> {
             live_threads: std::sync::Arc::clone(&self.live_threads),
             worker_cap: std::sync::Arc::clone(&self.worker_cap),
             reactor: std::sync::Arc::clone(&self.reactor),
+            io_reactor: std::sync::Arc::clone(&self.io_reactor),
         })
     }
 
@@ -1252,6 +1282,12 @@ impl<const S: usize> Machine<S> {
                 ip = resume_ip;
                 continue;
             }
+            if let Some(pending) = self.pending_io.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_io_wait(pending);
+                ip = resume_ip;
+                continue;
+            }
             if !paused {
                 break;
             }
@@ -1261,6 +1297,14 @@ impl<const S: usize> Machine<S> {
         // which looks like "recv never blocks" and "nothing after recv runs".
         // Only joins *this* Machine's registry (not a process-global list).
         crate::thread::join_undetached_threads(&self.live_threads);
+    }
+
+    fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
+        self.frames.get_mut().set(pending.resume_sp);
+        let req = pending.request;
+        let wait = crate::thread::host_io_wait(req.fd, req.interest, req.timeout);
+        let v = crate::io::as_result_unit(&mut self.heap, wait);
+        self.stack.push(v);
     }
 
     fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {
@@ -1369,6 +1413,12 @@ impl<const S: usize> Machine<S> {
             if let Some(pending) = self.pending_ffi.take() {
                 let resume_ip = pending.resume_ip;
                 self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if let Some(pending) = self.pending_io.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_io_wait(pending);
                 ip = resume_ip;
                 continue;
             }
@@ -2296,7 +2346,17 @@ impl<const S: usize> Machine<S> {
                     match self.natives.get_by_id(fn_id) {
                         Some(native) => match native.invoke(&mut self.heap, args) {
                             Ok(Some(v)) => self.stack.push(v),
-                            Ok(None) => {}
+                            Ok(None) => {
+                                if let Some(req) = crate::io::take_pending_io_park() {
+                                    self.frames.get_mut().set(sp);
+                                    self.pending_io = Some(PendingIoWait {
+                                        request: req,
+                                        resume_ip: ip,
+                                        resume_sp: sp,
+                                    });
+                                    return true;
+                                }
+                            }
                             #[cfg(debug_assertions)]
                             Err(e) => eprintln!("HostInvoke failed for `{}`: {e}", native.name()),
                             #[cfg(not(debug_assertions))]

@@ -30,6 +30,7 @@ pub struct Job {
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
     pub live_threads: LiveThreadRegistry,
     pub reactor: Arc<Reactor>,
+    pub io_reactor: Arc<crate::io_reactor::IoReactor>,
 }
 
 /// Per-root-VM work-stealing reactor.
@@ -113,6 +114,14 @@ impl Reactor {
 
     fn steal_job(&self) -> Option<Job> {
         steal_from_injector(&self.injector).or_else(|| steal_from_peers(&self.stealers))
+    }
+
+    /// Run at most one stolen job on a fresh helper VM (IO wait overlap).
+    pub fn help_once(self: &Arc<Self>) {
+        if let Some(job) = self.steal_job() {
+            let mut vm = Box::new(Machine::<WORKER_STACK_SLOTS>::default());
+            run_job_on_vm(&mut vm, job);
+        }
     }
 
     /// Block until `state` completes, helping run stolen jobs meanwhile.
@@ -295,6 +304,7 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         shared_print,
         live_threads,
         reactor,
+        io_reactor,
     } = job;
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -303,6 +313,7 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         vm.set_program_debug(program.debug.clone());
         vm.set_live_threads(Arc::clone(&live_threads));
         vm.set_reactor(Arc::clone(&reactor));
+        vm.set_io_reactor(Arc::clone(&io_reactor));
         vm.set_worker_cap(crate::thread::WorkerCap::from_count(reactor.worker_count()));
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
@@ -354,6 +365,7 @@ pub fn job_from_spawn_context(
         shared_print: ctx.shared_print,
         live_threads: ctx.live_threads,
         reactor: ctx.reactor,
+        io_reactor: ctx.io_reactor,
     }
 }
 

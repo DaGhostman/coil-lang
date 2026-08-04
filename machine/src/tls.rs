@@ -303,33 +303,12 @@ fn wait_fd_deadline(
             Some(end - now)
         }
     };
-    let mut pfd = libc::pollfd {
-        fd,
-        events: if for_read {
-            libc::POLLIN
-        } else {
-            libc::POLLOUT
-        },
-        revents: 0,
+    let interest = if for_read {
+        crate::io_reactor::Interest::Readable
+    } else {
+        crate::io_reactor::Interest::Writable
     };
-    let timeout_ms = match timeout {
-        None => -1,
-        Some(d) => d.as_millis().min(i32::MAX as u128) as i32,
-    };
-    loop {
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(IoErrorTag::from_kind(err.kind()));
-        }
-        if rc == 0 {
-            return Err(IoErrorTag::TimedOut);
-        }
-        return Ok(());
-    }
+    crate::io::reactor_wait_fd(fd, interest, timeout)
 }
 
 /// Run handshake while keeping the socket non-blocking; honor optional deadline.
