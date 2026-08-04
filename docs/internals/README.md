@@ -5,6 +5,7 @@ How coil is structured for contributors and embedders. End-user language docs li
 | Document | Contents |
 |----------|----------|
 | [Pipeline](pipeline.md) | Parse → typecheck → codegen → archive → execute |
+| [SIMD](simd.md) | `coil-simd` — stable `std::arch` kernels for packed LA |
 | [Debug line table](debug-info.md) | `source_files` / `debug_locs` in `.hyc` |
 | [Opcodes](opcodes.md) | Selected bytecode ops behind builtins |
 | [Dissect](dissect.md) | `coil dissect` — in-memory bytecode / IL / AST dump |
@@ -21,3 +22,4 @@ How coil is structured for contributors and embedders. End-user language docs li
 | `compiler` | HM typechecker, stack IL codegen, pipeline |
 | `machine` | VM, heap/GC, FFI (libffi), host natives |
 | `common` | Opcodes, values, archive format |
+| `coil-simd` | Stable SIMD helpers (`std::arch`) for numeric / byte kernels |

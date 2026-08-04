@@ -36,6 +36,10 @@ let d = a + a;   // element-wise
 
 See `examples/vec_dot.hy`, `examples/vec_matmul.hy`, and `examples/matrix_mul.hy`.
 
+Packed kernels (`packed_dot` / `packed_matmul` / matrix zip) run as HostInvoke
+natives and use the workspace `coil-simd` crate (stable `std::arch`, runtime
+AVX2/NEON dispatch) — see [internals/simd.md](../internals/simd.md).
+
 ---
 
 ## Related
