@@ -508,4 +508,72 @@ fn main() {
         assert!(set.contains(&21)); // chain toward threshold
         assert!(!set.contains(&20));
     }
+
+    #[test]
+    fn detects_mul_rec_par_shape() {
+        let ast = parse(
+            r#"
+fn tree(int n) -> int {
+    if n <= 1 { return 1; }
+    return tree(n - 1) * tree(n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        let pure = analyze_recursive_pure(&ast);
+        let shapes = analyze_rec_par_shapes(&ast, &pure);
+        let tree = shapes.get("tree").expect("tree shape");
+        assert_eq!(tree.op, ParBinOp::Mul);
+        assert_eq!(tree.left_sub, 1);
+        assert_eq!(tree.right_sub, 2);
+    }
+
+    #[test]
+    fn rejects_non_dual_recursive_binop() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + (n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        let pure = analyze_recursive_pure(&ast);
+        assert!(pure.contains("fib"));
+        let shapes = analyze_rec_par_shapes(&ast, &pure);
+        assert!(
+            !shapes.contains_key("fib"),
+            "single recursive arm must not be a par shape: {shapes:?}"
+        );
+    }
+
+    #[test]
+    fn below_threshold_and_dynamic_args_do_not_demand_specs() {
+        let t = par_int_threshold();
+        let ast = parse(&format!(
+            r#"
+fn fib(int n) -> int {{
+    if n <= 1 {{ return n; }}
+    return fib(n - 1) + fib(n - 2);
+}}
+fn main() {{
+    let k = {t};
+    let a = fib({t});
+    let b = fib(k);
+    return;
+}}
+"#
+        ));
+        let pure = analyze_recursive_pure(&ast);
+        let shapes = analyze_rec_par_shapes(&ast, &pure);
+        let demanded = collect_par_specialization_args(&ast, &shapes);
+        assert!(
+            demanded.get("fib").is_none(),
+            "arg == threshold and dynamic args must not demand specs: {demanded:?}"
+        );
+        assert!(!const_arg_worth_parallel(t));
+        assert!(const_arg_worth_parallel(t + 1));
+        assert_eq!(par_specialization_name("fib", t + 1), format!("__coil_par_fib_{}", t + 1));
+    }
 }
