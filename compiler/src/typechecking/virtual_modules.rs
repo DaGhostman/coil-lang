@@ -109,6 +109,8 @@ pub enum PreludeFn {
     Char,
     /// First code unit of a `string` as `Result<byte, string>`.
     Ord,
+    /// Drive a coroutine to completion: `block_on(coro) -> Y`.
+    BlockOn,
 }
 
 impl PreludeFn {
@@ -121,6 +123,7 @@ impl PreludeFn {
             Self::Matrix => "matrix",
             Self::Char => "char",
             Self::Ord => "ord",
+            Self::BlockOn => "block_on",
         }
     }
 
@@ -133,6 +136,7 @@ impl PreludeFn {
             "matrix" => Some(Self::Matrix),
             "char" => Some(Self::Char),
             "ord" => Some(Self::Ord),
+            "block_on" => Some(Self::BlockOn),
             _ => None,
         }
     }
@@ -639,6 +643,9 @@ impl VirtualModules {
                 },
                 BuiltinExport::Fn {
                     kind: PreludeFn::Char,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::BlockOn,
                 },
             ],
         );

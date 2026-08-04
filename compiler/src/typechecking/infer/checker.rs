@@ -2946,6 +2946,7 @@ impl Checker {
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                        PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
                         PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
                         PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
                         PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
@@ -6533,6 +6534,35 @@ impl Checker {
             self.unify(&msg_ty, &string(), &msg.0.into_range(), "assert message");
         }
         result_app_ty(unit_ty(), string())
+    }
+
+    /// `block_on(coro)` — drive `coroutine<Y>` / `coroutine<Y, unit>` to completion → `Y`.
+    fn infer_block_on(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("block_on expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `block_on(async_fn_call())`".to_string()),
+            );
+        }
+        let handle_ty = self.infer(&args[0]);
+        let y_var = Ty::Var(self.counter.fresh());
+        let s_var = Ty::Var(self.counter.fresh());
+        let coro_ty = self.coroutine_type(y_var.clone(), s_var.clone());
+        self.unify(
+            &handle_ty,
+            &coro_ty,
+            &args[0].0.into_range(),
+            "block_on argument",
+        );
+        // Prefer unit send; free send vars unify with unit.
+        let unit = unit_ty();
+        let _ = self.unify(&s_var, &unit, &range, "block_on coroutine send type");
+        apply_ty_prune(&self.subst, &y_var)
     }
 
     fn primitive_cast_name(ty: &Ty) -> Option<&'static str> {
