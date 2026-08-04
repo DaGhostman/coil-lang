@@ -28,26 +28,26 @@ Disable the transform with `COIL_AUTO_PAR=0` (or `false` / `off` / `no`).
 For `f(a) ⊕ f(b)` where `f` is unary recursive-pure and `a` is structurally
 sendable:
 
-1. `MakeFn` of `f`, then `thread_spawn(f, a)` (`HostInvoke`).
-2. On `Ok(handle)`: evaluate `f(b)` on the current thread, `join(handle)`,
-   apply `⊕`.
-3. On `Err` (including `WouldBlock` when the worker cap is full): fall back to
-   sequential `f(a) ⊕ f(b)`.
+1. If `a` is an `int`/`byte` and `a <= COIL_PAR_THRESHOLD` (default **20**),
+   evaluate sequentially (avoids drowning the pool in tiny leaf tasks).
+2. Otherwise `MakeFn` of `f`, then `thread_spawn(f, a)` (`HostInvoke`) into the
+   **work-stealing reactor**.
+3. On `Ok(handle)`: evaluate `f(b)` on the current thread, `join(handle)`
+   (join **help-steals** while waiting), apply `⊕`.
+4. On `Err`: fall back to sequential `f(a) ⊕ f(b)`.
 
-Only one arm is spawned so recursion depth does not double the thread count
-per level. There is **no** work-stealing reactor.
+Only one arm is submitted per binop so recursion does not double work per level.
 
-## Worker cap
+## Work-stealing reactor
 
-Each root `Machine` owns a [`WorkerCap`](../../machine/src/thread.rs) shared
-with nested workers. `thread_spawn` try-acquires a slot; on failure it returns
-`thread::Error::WouldBlock`. The slot is released when the OS worker finishes
-(not only when `join` returns).
+[`machine/src/reactor.rs`](../../machine/src/reactor.rs) owns a fixed pool of OS
+threads (size = [`WorkerCap`](../../machine/src/thread.rs), default
+`available_parallelism`). Jobs land on a crossbeam injector / local deques;
+idle workers steal. `thread::spawn` / auto-par share this pool — no per-call
+`std::thread::spawn`.
 
 | Env | Effect |
 |-----|--------|
-| `COIL_MAX_WORKER_THREADS` | Max concurrent OS workers for that VM (1..=512). Default `2 * available_parallelism` (min 2). |
+| `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2). |
 | `COIL_AUTO_PAR` | `0` / `false` / `off` / `no` disables auto fork-join codegen. |
-
-Explicit `spawn` uses the same cap. Auto-par treats `WouldBlock` as a soft
-signal to stay sequential.
+| `COIL_PAR_THRESHOLD` | Int arg ceiling for sequential fallback (default 20). |

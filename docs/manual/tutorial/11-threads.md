@@ -35,12 +35,12 @@ fn main() {
 
 ### Spawn capacity
 
-Each program VM allows only a bounded number of concurrent OS workers (default
-`2 ×` CPU count, override with `COIL_MAX_WORKER_THREADS`). When the budget is
-exhausted, `spawn` returns `Err(WouldBlock)` instead of creating another
-thread. Pure recursive helpers such as `fib(n-1) + fib(n-2)` may be
-auto-parallelized by the compiler; they use the same budget and fall back to
-sequential evaluation on `WouldBlock` (see [internals: auto-par](../../internals/auto-par.md)).
+`spawn` submits work to a fixed **work-stealing reactor** (default one OS
+worker per CPU, override with `COIL_MAX_WORKER_THREADS`) instead of creating a
+new OS thread per call. Pure recursive helpers such as `fib(n-1) + fib(n-2)`
+may be auto-parallelized by the compiler; tiny int arguments at or below
+`COIL_PAR_THRESHOLD` (default 20) stay sequential (see
+[internals: auto-par](../../internals/auto-par.md)).
 
 ## Channels
 
