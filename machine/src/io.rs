@@ -1671,4 +1671,100 @@ mod tests {
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS[8], "TimedOut");
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS[11], "Handshake");
     }
+
+    fn pipe_stream_pair(heap: &mut Heap) -> (Value, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let stream = alloc_stream(heap, read, StreamKind::File).expect("alloc read end");
+        (stream, write)
+    }
+
+    #[test]
+    fn await_readable_returns_ok_when_already_ready() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        let n = unsafe { libc::write(write.as_raw_fd(), b"a".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        let _ = take_pending_io_park();
+        let v = stream_await_readable(&mut heap, stream)
+            .expect("await")
+            .expect("already ready should not park");
+        assert_eq!(enum_tag(&heap, v), Some(0));
+        assert!(take_pending_io_park().is_none());
+        stream_close(&mut heap, stream).unwrap();
+        drop(write);
+    }
+
+    #[test]
+    fn await_readable_parks_when_not_ready() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        stream_set_read_timeout(&mut heap, stream, 123).unwrap();
+        let _ = take_pending_io_park();
+        let parked = stream_await_readable(&mut heap, stream).expect("await");
+        assert!(parked.is_none(), "empty pipe must park the VM");
+        let req = take_pending_io_park().expect("park request");
+        assert_eq!(req.interest, Interest::Readable);
+        assert_eq!(req.timeout, Some(Duration::from_millis(123)));
+        assert_eq!(req.fd, stream_raw_fd(&mut heap, stream).unwrap());
+        stream_close(&mut heap, stream).unwrap();
+        drop(write);
+    }
+
+    #[test]
+    fn await_writable_returns_ok_for_empty_pipe_write_end() {
+        let mut heap = Heap::default();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let stream = alloc_stream(&mut heap, write, StreamKind::File).expect("alloc write end");
+        let _ = take_pending_io_park();
+        let v = stream_await_writable(&mut heap, stream)
+            .expect("await")
+            .expect("empty pipe write end is writable");
+        assert_eq!(enum_tag(&heap, v), Some(0));
+        assert!(take_pending_io_park().is_none());
+        stream_close(&mut heap, stream).unwrap();
+        drop(read);
+    }
+
+    #[test]
+    fn await_readable_on_closed_stream_errors() {
+        let mut heap = Heap::default();
+        let (stream, write) = pipe_stream_pair(&mut heap);
+        stream_close(&mut heap, stream).unwrap();
+        let err = stream_await_readable(&mut heap, stream).unwrap_err();
+        assert_eq!(err, IoErrorTag::AlreadyClosed);
+        drop(write);
+    }
+
+    #[test]
+    fn io_drive_without_host_state_returns_zero() {
+        let mut heap = Heap::default();
+        assert_eq!(io_drive(&mut heap).as_int(), 0);
+    }
+
+    #[test]
+    fn io_drive_with_host_state_counts_ready_waiters() {
+        let mut vm = crate::Machine::<64>::default();
+        let io = std::sync::Arc::clone(vm.io_reactor());
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let tok = io.register_wait(r, Interest::Readable);
+        let _guard = crate::thread::HostStateGuard::enter(&mut vm);
+        let mut heap = Heap::default();
+        assert_eq!(io_drive(&mut heap).as_int(), 0);
+        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        assert_eq!(io_drive(&mut heap).as_int(), 1);
+        io.cancel_wait(tok);
+        unsafe {
+            let _ = libc::close(r);
+            let _ = libc::close(w);
+        }
+    }
 }

@@ -440,4 +440,13 @@ mod tests {
         assert_eq!(ra, PortableValue::Immediate(1));
         assert_eq!(rb, PortableValue::Immediate(2));
     }
+
+    #[test]
+    fn help_once_is_noop_when_idle() {
+        let reactor = Reactor::new(1);
+        // Must not panic or hang when the injector/stealers are empty.
+        reactor.help_once();
+        reactor.help_once();
+        assert_eq!(reactor.inflight(), 0);
+    }
 }
