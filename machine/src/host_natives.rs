@@ -151,6 +151,9 @@ enum IoKind {
     ReadExact,
     ReadToEnd,
     WriteAll,
+    AwaitReadable,
+    AwaitWritable,
+    Drive,
     SetReadTimeout,
     SetWriteTimeout,
     FromBytes,
@@ -194,6 +197,9 @@ impl IoKind {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::AwaitReadable,
+            Self::AwaitWritable,
+            Self::Drive,
             Self::SetReadTimeout,
             Self::SetWriteTimeout,
             Self::FromBytes,
@@ -237,6 +243,9 @@ impl IoKind {
             Self::ReadExact => "read_exact",
             Self::ReadToEnd => "read_to_end",
             Self::WriteAll => "write_all",
+            Self::AwaitReadable => "await_readable",
+            Self::AwaitWritable => "await_writable",
+            Self::Drive => "drive",
             Self::SetReadTimeout => "set_read_timeout",
             Self::SetWriteTimeout => "set_write_timeout",
             Self::FromBytes => "from_bytes",
@@ -270,9 +279,11 @@ impl IoKind {
 
     fn arity(self) -> usize {
         match self {
-            Self::Stdin | Self::Stdout | Self::Stderr => 0,
+            Self::Stdin | Self::Stdout | Self::Stderr | Self::Drive => 0,
             Self::Close
             | Self::ReadToEnd
+            | Self::AwaitReadable
+            | Self::AwaitWritable
             | Self::FromBytes
             | Self::ToBytes
             | Self::TcpAccept
@@ -311,12 +322,13 @@ impl IoKind {
 fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut(&str, usize)) {
     use crate::io::{
         as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
-        stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
-        stream_set_read_timeout, stream_set_write_timeout, stream_stderr, stream_stdin,
-        stream_stdout, stream_write, stream_write_all, tcp_accept, tcp_accept_wait,
-        tcp_accept_wait_timeout, tcp_connect, tcp_connect_timeout, tcp_listen, tcp_local_addr,
-        tcp_peer_addr, tcp_set_nodelay, tcp_shutdown, to_bytes, udp_bind, udp_connect,
-        udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
+        io_drive, stream_await_readable, stream_await_writable, stream_close, stream_open,
+        stream_read, stream_read_exact, stream_read_to_end, stream_set_read_timeout,
+        stream_set_write_timeout, stream_stderr, stream_stdin, stream_stdout, stream_write,
+        stream_write_all, tcp_accept, tcp_accept_wait, tcp_accept_wait_timeout, tcp_connect,
+        tcp_connect_timeout, tcp_listen, tcp_local_addr, tcp_peer_addr, tcp_set_nodelay,
+        tcp_shutdown, to_bytes, udp_bind, udp_connect, udp_local_port, udp_recv_from,
+        udp_recv_from_wait, udp_send_to, value_as_string,
     };
     #[cfg(feature = "tls")]
     use crate::tls::{
@@ -377,6 +389,19 @@ fn push_io_natives(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMu
                                 let r = stream_write_all(heap, args[0], args[1]);
                                 as_result_unit(heap, r)
                             }
+                            IoKind::AwaitReadable => {
+                                match stream_await_readable(heap, args[0]) {
+                                    Ok(v) => return Ok(v),
+                                    Err(tag) => as_result_unit(heap, Err(tag)),
+                                }
+                            }
+                            IoKind::AwaitWritable => {
+                                match stream_await_writable(heap, args[0]) {
+                                    Ok(v) => return Ok(v),
+                                    Err(tag) => as_result_unit(heap, Err(tag)),
+                                }
+                            }
+                            IoKind::Drive => return Ok(Some(io_drive(heap))),
                             IoKind::SetReadTimeout => {
                                 let r = stream_set_read_timeout(heap, args[0], args[1].as_int());
                                 as_result_unit(heap, r)

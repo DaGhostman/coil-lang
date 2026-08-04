@@ -155,6 +155,9 @@ pub enum IoBuiltin {
     ReadExact,
     ReadToEnd,
     WriteAll,
+    AwaitReadable,
+    AwaitWritable,
+    Drive,
     SetReadTimeout,
     SetWriteTimeout,
     /// Decode `[byte]` as UTF-8 → `Result<string, IoError>`.
@@ -211,6 +214,9 @@ impl IoBuiltin {
             Self::ReadExact => "read_exact",
             Self::ReadToEnd => "read_to_end",
             Self::WriteAll => "write_all",
+            Self::AwaitReadable => "await_readable",
+            Self::AwaitWritable => "await_writable",
+            Self::Drive => "drive",
             Self::SetReadTimeout => "set_read_timeout",
             Self::SetWriteTimeout => "set_write_timeout",
             Self::FromBytes => "from_bytes",
@@ -251,6 +257,9 @@ impl IoBuiltin {
             | Self::ReadExact
             | Self::ReadToEnd
             | Self::WriteAll
+            | Self::AwaitReadable
+            | Self::AwaitWritable
+            | Self::Drive
             | Self::SetReadTimeout
             | Self::SetWriteTimeout
             | Self::FromBytes
@@ -295,6 +304,9 @@ impl IoBuiltin {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::AwaitReadable,
+            Self::AwaitWritable,
+            Self::Drive,
             Self::SetReadTimeout,
             Self::SetWriteTimeout,
             Self::FromBytes,
@@ -366,6 +378,9 @@ impl IoBuiltin {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::AwaitReadable,
+            Self::AwaitWritable,
+            Self::Drive,
             Self::SetReadTimeout,
             Self::SetWriteTimeout,
             Self::FromBytes,
