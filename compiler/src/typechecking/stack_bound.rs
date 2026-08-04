@@ -568,6 +568,7 @@ fn walk_self_calls<'a>(
             walk_self_calls(a, fn_name, out);
             walk_self_calls(b, fn_name, out);
         }
+        Expression::Adjust { target, .. } => walk_self_calls(target, fn_name, out),
         Expression::Match { scrutinee, arms } => {
             walk_self_calls(scrutinee, fn_name, out);
             for arm in arms {
@@ -876,9 +877,16 @@ fn walk_gather_calls(
         }
         Expression::Assignment(lhs, rhs) => {
             walk_gather_calls(rhs, inside, wrapper_consts, env, out);
-            if let Expression::Identifier(n) = peel(lhs).1.as_ref() {
-                env.remove(*n);
-            }
+            kill_binding(lhs, env);
+        }
+        Expression::CompoundAssign(lhs, _, rhs) => {
+            walk_gather_calls(lhs, inside, wrapper_consts, env, out);
+            walk_gather_calls(rhs, inside, wrapper_consts, env, out);
+            kill_binding(lhs, env);
+        }
+        Expression::Adjust { target, .. } => {
+            walk_gather_calls(target, inside, wrapper_consts, env, out);
+            kill_binding(target, env);
         }
         Expression::Add(a, b)
         | Expression::Sub(a, b)
@@ -1130,9 +1138,43 @@ fn walk_entry_sites(
                 consts,
                 dynamic,
             );
-            if let Expression::Identifier(n) = peel(lhs).1.as_ref() {
-                env.remove(*n);
-            }
+            kill_binding(lhs, env);
+        }
+        Expression::CompoundAssign(lhs, _, rhs) => {
+            walk_entry_sites(
+                lhs,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            walk_entry_sites(
+                rhs,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            kill_binding(lhs, env);
+        }
+        Expression::Adjust { target, .. } => {
+            walk_entry_sites(
+                target,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            kill_binding(target, env);
         }
         Expression::Call { name, args } => {
             walk_entry_sites(
@@ -1442,10 +1484,13 @@ fn walk_all_calls(ast: &Output<'_>, f: &mut dyn FnMut(&str, Option<i64>)) {
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
         | Expression::Div(a, b)
-        | Expression::Mod(a, b) => {
+        | Expression::Mod(a, b)
+        | Expression::Assignment(a, b)
+        | Expression::CompoundAssign(a, _, b) => {
             walk_all_calls(a, f);
             walk_all_calls(b, f);
         }
+        Expression::Adjust { target, .. } => walk_all_calls(target, f),
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {
                 walk_all_calls(c, f);
@@ -1497,6 +1542,13 @@ fn match_param_minus_const(expr: &Output<'_>, param: &str) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+/// Drop a const-env binding when its name is assigned / adjusted.
+fn kill_binding(target: &Output<'_>, env: &mut HashMap<String, ConstValue>) {
+    if let Expression::Identifier(n) = peel(target).1.as_ref() {
+        env.remove(*n);
     }
 }
 
@@ -1754,6 +1806,106 @@ fn main() {
             "{:?}",
             report.messages
         );
+    }
+
+    #[test]
+    fn compound_assign_kills_traced_const() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    k += 1;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.message().contains("max_depth")),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn inc_dec_kills_traced_const() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    k++;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.message().contains("max_depth")),
+            "{:?}",
+            report.messages
+        );
+
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    --k;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.message().contains("max_depth")),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn call_inside_compound_assign_is_entry() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let acc = 0;
+    acc += fib(8);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 7);
     }
 
     #[test]

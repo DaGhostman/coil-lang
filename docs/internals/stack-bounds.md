@@ -35,7 +35,8 @@ walks the AST:
      (`main → helper(32) → fib(n)`).
 4. If depth is unprovable, require `#[max_depth(N)]` on that function.
 
-Assignments to a traced name kill the binding (fail closed). Opaque / dynamic
+Assignments to a traced name kill the binding (fail closed), including plain
+`=`, compound `+=` / `-=` / …, and `++` / `--`. Opaque / dynamic
 arguments (`fib(noise())`), mutual recursion without a self-measure, and shapes
 where some self-call does not decrease the measure are **unprovable**.
 
