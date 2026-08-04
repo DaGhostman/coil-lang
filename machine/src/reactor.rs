@@ -399,6 +399,7 @@ mod tests {
             shared_print: None,
             live_threads: crate::thread::new_live_thread_registry(),
             reactor: Arc::clone(reactor),
+            io_reactor: crate::io_reactor::IoReactor::new(),
         };
         reactor.submit(job);
         state
