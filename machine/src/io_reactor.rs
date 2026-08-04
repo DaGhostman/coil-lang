@@ -490,6 +490,26 @@ mod tests {
     }
 
     #[test]
+    fn wait_any_times_out_with_unready_waiter() {
+        let (r, w) = pipe_fds();
+        let io = IoReactor::new();
+        let tok = io.register_wait(r, Interest::Readable);
+        assert!(io.has_waiters());
+        assert_eq!(
+            io.wait_any(Some(Duration::from_millis(30))),
+            0,
+            "empty pipe must not become readable within timeout"
+        );
+        assert!(
+            io.has_waiters(),
+            "timed-out wait_any must leave the waiter registered"
+        );
+        io.cancel_wait(tok);
+        close_fd(r);
+        close_fd(w);
+    }
+
+    #[test]
     fn wait_any_batches_two_pipe_waiters() {
         let (r1, w1) = pipe_fds();
         let (r2, w2) = pipe_fds();

@@ -41,13 +41,10 @@ impl Write for SharedBuf {
 }
 
 fn run_example(path: &str) -> String {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join(path);
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-    run_example_src_with_entry(&src, Some(full.as_path()))
+    // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
+    // compile of the text alone used to miss those until `compile_src` gained
+    // discovery — prefer the multifile path so entry paths/debug stay accurate.
+    run_example_multifile(path)
 }
 
 /// Compile and run in-memory source.
@@ -2431,7 +2428,28 @@ fn example_io_nested_write_prints_2() {
     assert_eq!(output, "2");
 }
 
-/// `let server = match accept_wait(listener) { … }` inside a loop must handle
+/// Prelude `block_on` drives a coroutine to its completion value.
+#[test]
+fn example_block_on_io_prints_2() {
+    let output = run_example("examples/block_on_io.hy");
+    assert_eq!(output, "2");
+}
+
+/// Top-level `drive` with no waiters returns 0 (smoke for host wiring).
+#[test]
+fn example_io_await_drive_prints_0() {
+    let output = run_example("examples/io_await.hy");
+    assert_eq!(output, "0");
+}
+
+/// Cooperative `await_*` inside coroutines + `wait_ready` batch poll.
+#[test]
+fn example_io_wait_ready_prints_ok() {
+    let output = run_example("examples/io_wait_ready.hy");
+    assert_eq!(output, "ok");
+}
+
+/// Nested `let server = match accept_wait(listener) { … }` inside a loop must handle
 /// multiple connections (binding matches omit the fusion barrier).
 #[test]
 fn while_accept_match_write_handles_two_connections() {
