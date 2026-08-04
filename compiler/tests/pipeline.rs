@@ -3911,6 +3911,29 @@ fn example_vec_packed_mul_uses_hostinvoke_path() {
 }
 
 #[test]
+fn packed_vec_arith_runtime_neg_div_and_scalar_left() {
+    // Covers unary neg, float zip div, and non-commutative scalar-left sub
+    // on the N≥8 HostInvoke path (mul/broadcast already covered by the example).
+    let output = run_example_src(
+        r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn main() {
+    let a = [1, 2, 3, 4, 5, 6, 7, 8];
+    let n = -a;
+    write_all(stdout(), to_bytes(format("%i%i,", n[0], n[7])));
+    let f = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
+    let d = f / [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
+    write_all(stdout(), to_bytes(format("%f%f,", d[0], d[7])));
+    let s = 10 - a;
+    write_all(stdout(), to_bytes(format("%i%i", s[0], s[7])));
+}
+"#,
+    );
+    assert_eq!(output, "-1-8,1.08.0,92");
+}
+
+#[test]
 fn aggregate_float_negate_uses_mulf_not_int_neg() {
     // Regression: float aggregate unary `-` must not emit int `NEG`
     // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
