@@ -1157,6 +1157,18 @@ fn auto_par_enabled() -> bool {
     }
 }
 
+/// Skip auto-par spawn when a unary int argument is at or below this value
+/// (`COIL_PAR_THRESHOLD`, default 20). Tiny recursive work stays sequential.
+fn auto_par_int_threshold() -> i64 {
+    static T: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("COIL_PAR_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20)
+    })
+}
+
 fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
     match unwrap_expr_output(expr).1.as_ref() {
         Expression::Identifier(name) => Some(name),

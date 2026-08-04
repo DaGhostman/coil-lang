@@ -4359,6 +4359,16 @@ impl Compiler {
                 )
             })
             .unwrap_or(false);
+        let is_int = self
+            .codegen_expr_ty(arg_l)
+            .map(|t| {
+                let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t);
+                matches!(
+                    pruned,
+                    crate::typechecking::Ty::Con(ref n) if n == "int" || n == "byte"
+                )
+            })
+            .unwrap_or(false);
         let bin_op = if is_float { float_op } else { int_op };
 
         // MakeFn for the recursive callee.
@@ -4377,6 +4387,21 @@ impl Compiler {
         let arg_l_tmp = self.alloc_temp_slot();
         self.bytecode.push_store_pop(arg_l_tmp);
 
+        let mut bb = BlockBuilder::new();
+        let have_handle = bb.fresh_label(self.bytecode.il_mut());
+        let seq = bb.fresh_label(self.bytecode.il_mut());
+        let done = bb.fresh_label(self.bytecode.il_mut());
+
+        // Int granularity gate: tiny `n` stays sequential (reactor still pays
+        // encode/queue costs that dominate fib leaves).
+        if is_int && !is_float {
+            let thresh = auto_par_int_threshold();
+            self.bytecode.push_load(arg_l_tmp);
+            self.bytecode.push_const(thresh as i32);
+            self.bytecode.push(Byte::new(Instruction::GT));
+            bb.emit_jump_to(seq, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+        }
+
         // thread_spawn(fn, arg_l) → Result<Thread, Error>
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
@@ -4385,23 +4410,15 @@ impl Compiler {
         self.bytecode.push_make_tuple(2);
         self.bytecode.push_host_invoke(2);
 
-        let mut bb = BlockBuilder::new();
-        let have_handle = bb.fresh_label(self.bytecode.il_mut());
-        let done = bb.fresh_label(self.bytecode.il_mut());
         bb.emit_jump_to(
             have_handle,
             BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             self.bytecode.il_mut(),
         );
 
-        // Capacity / spawn failure: discard Err, run both calls sequentially.
+        // Spawn failure: discard Err, run both calls sequentially.
         self.bytecode.push_pop();
-        let mut lhs_bc = self.do_compile(lhs);
-        self.bytecode.append(&mut lhs_bc);
-        let mut rhs_bc = self.do_compile(rhs);
-        self.bytecode.append(&mut rhs_bc);
-        self.bytecode.push(Byte::new(bin_op));
-        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
 
         bb.bind_label(have_handle, self.bytecode.il_mut());
         // Ok payload (Thread handle) on stack.
@@ -4423,6 +4440,14 @@ impl Compiler {
         self.emit_result_unwrap_or_panic();
 
         self.bytecode.push_load(right_tmp);
+        self.bytecode.push(Byte::new(bin_op));
+        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(seq, self.bytecode.il_mut());
+        let mut lhs_bc = self.do_compile(lhs);
+        self.bytecode.append(&mut lhs_bc);
+        let mut rhs_bc = self.do_compile(rhs);
+        self.bytecode.append(&mut rhs_bc);
         self.bytecode.push(Byte::new(bin_op));
 
         bb.bind_label(done, self.bytecode.il_mut());
