@@ -1122,4 +1122,297 @@ fn main() {
         assert_eq!(measure_depth(10, 2, 1), 9);
         assert_eq!(measure_depth(32, 2, 1), 31);
     }
+
+    #[test]
+    fn mutual_recursion_requires_max_depth() {
+        let ast = parse(
+            r#"
+fn ping(int n) -> int {
+    if n <= 0 { return 0; }
+    return pong(n - 1);
+}
+fn pong(int n) -> int {
+    if n <= 0 { return 1; }
+    return ping(n - 1);
+}
+fn main() {
+    let x = ping(3);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::UnboundedRecursion)
+                    && m.message().contains("mutual")),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_with_max_depth_ok() {
+        let ast = parse(
+            r#"
+#[max_depth(8)]
+fn ping(int n) -> int {
+    if n <= 0 { return 0; }
+    return pong(n - 1);
+}
+#[max_depth(8)]
+fn pong(int n) -> int {
+    if n <= 0 { return 1; }
+    return ping(n - 1);
+}
+fn main() {
+    let x = ping(3);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        assert!(
+            report
+                .bounds
+                .iter()
+                .any(|b| b.fn_name == "ping" && b.source == BoundSource::Attribute && b.max_frames == 8)
+        );
+    }
+
+    #[test]
+    fn unary_fact_const_entry_is_proven() {
+        let ast = parse(
+            r#"
+fn fact(int n) -> int {
+    if n <= 1 { return 1; }
+    return n * fact(n - 1);
+}
+fn main() {
+    let x = fact(5);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fact").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        // (5 - 1) / 1 + 1 = 5
+        assert_eq!(b.max_frames, 5);
+    }
+
+    #[test]
+    fn base_case_lt_and_eq_shapes_are_proven() {
+        let lt = parse(
+            r#"
+fn f(int n) -> int {
+    if n < 3 { return 1; }
+    return f(n - 1) + f(n - 2);
+}
+fn main() { let x = f(5); return; }
+"#,
+        );
+        let lt_report = analyze_stack_bounds(&lt);
+        assert!(lt_report.messages.is_empty(), "{:?}", lt_report.messages);
+        // base_bound for n < 3 is 2; (5-2)/1+1 = 4
+        assert_eq!(
+            lt_report.bounds.iter().find(|b| b.fn_name == "f").unwrap().max_frames,
+            4
+        );
+
+        let eq = parse(
+            r#"
+fn g(int n) -> int {
+    if n == 0 { return 1; }
+    return g(n - 1) + 1;
+}
+fn main() { let x = g(4); return; }
+"#,
+        );
+        let eq_report = analyze_stack_bounds(&eq);
+        assert!(eq_report.messages.is_empty(), "{:?}", eq_report.messages);
+        // base 0; (4-0)/1+1 = 5
+        assert_eq!(
+            eq_report.bounds.iter().find(|b| b.fn_name == "g").unwrap().max_frames,
+            5
+        );
+    }
+
+    #[test]
+    fn missing_base_case_requires_max_depth() {
+        let ast = parse(
+            r#"
+fn f(int n) -> int {
+    return 1 + f(n - 1);
+}
+fn main() {
+    let x = f(3);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report.messages.iter().any(|m| {
+                m.code() == Some(ErrorCode::UnboundedRecursion)
+                    && m.message().contains("base case")
+            }),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn unrecognized_shape_requires_max_depth() {
+        let ast = parse(
+            r#"
+fn boom(int n) -> int {
+    return boom(n + 1) + 1;
+}
+fn main() {
+    let x = boom(1);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report.messages.iter().any(|m| {
+                m.code() == Some(ErrorCode::UnboundedRecursion)
+                    && m.message().contains("analyzable decreasing measure")
+            }),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn invalid_max_depth_attr_rejected() {
+        let ast = parse(
+            r#"
+#[max_depth(0)]
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.message().contains("positive integer")),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn absurd_max_depth_emits_stack_depth_exceeded() {
+        // frames*16+16 > MAX ⇒ frames > 65535
+        let ast = parse(
+            r#"
+#[max_depth(65536)]
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::StackDepthExceeded)),
+            "{:?}",
+            report.messages
+        );
+        assert_eq!(report.operand_slots_needed, MAX_OPERAND_STACK_SLOTS);
+    }
+
+    #[test]
+    fn attr_larger_than_proven_wins_source() {
+        let ast = parse(
+            r#"
+#[max_depth(20)]
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let x = fib(10);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.max_frames, 20);
+        assert_eq!(b.source, BoundSource::Attribute);
+    }
+
+    #[test]
+    fn attr_smaller_than_proven_still_uses_proven_frames() {
+        let ast = parse(
+            r#"
+#[max_depth(5)]
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let x = fib(10);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        // Proven depth 9 > attributed 5 → keep proven frames.
+        assert_eq!(b.max_frames, 9);
+        assert_eq!(b.source, BoundSource::Proven);
+    }
+
+    #[test]
+    fn operand_slots_for_frames_clamps_and_floors() {
+        assert_eq!(operand_slots_for_frames(1), DEFAULT_OPERAND_STACK_SLOTS);
+        assert_eq!(operand_slots_for_frames(9), DEFAULT_OPERAND_STACK_SLOTS); // 9*16+16=160
+        assert_eq!(operand_slots_for_frames(31), 512);
+        assert_eq!(
+            operand_slots_for_frames(u32::MAX),
+            MAX_OPERAND_STACK_SLOTS
+        );
+    }
+
+    #[test]
+    fn non_recursive_program_keeps_default_slots() {
+        let ast = parse(
+            r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() { let x = add(1, 2); return; }
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty());
+        assert!(report.bounds.is_empty());
+        assert_eq!(report.operand_slots_needed, DEFAULT_OPERAND_STACK_SLOTS);
+    }
 }
