@@ -32,7 +32,7 @@ impl Interest {
 
 /// Token identifying an async waiter registered with the reactor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WaitToken(u64);
+pub struct WaitToken(pub u64);
 
 /// One async readiness subscription.
 struct AsyncWait {
@@ -258,6 +258,58 @@ impl IoReactor {
         }
         n
     }
+
+    /// True when at least one async waiter is still registered.
+    pub fn has_waiters(&self) -> bool {
+        !self
+            .inner
+            .waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Block until at least one registered waiter is ready (or `timeout`).
+    ///
+    /// Returns newly-ready count. Returns `0` immediately when nothing is
+    /// registered — callers interleaving CPU yields can loop without parking.
+    pub fn wait_any(&self, timeout: Option<Duration>) -> usize {
+        if !self.has_waiters() {
+            return 0;
+        }
+        let deadline = timeout.map(|d| Instant::now() + d);
+        const SLICE: Duration = Duration::from_millis(50);
+        loop {
+            {
+                let ready = self.inner.ready.lock().unwrap_or_else(|e| e.into_inner());
+                if !ready.is_empty() {
+                    return ready.len();
+                }
+            }
+            let slice = match deadline {
+                None => Some(SLICE),
+                Some(end) => {
+                    let now = Instant::now();
+                    if now >= end {
+                        return 0;
+                    }
+                    Some((end - now).min(SLICE))
+                }
+            };
+            let n = self.poll_once(slice);
+            if n > 0 {
+                return n;
+            }
+            if !self.has_waiters() {
+                return 0;
+            }
+            if let Some(end) = deadline
+                && Instant::now() >= end
+            {
+                return 0;
+            }
+        }
+    }
 }
 
 impl Default for IoReactor {
@@ -429,6 +481,32 @@ mod tests {
         assert_eq!(err2, IoErrorTag::Other);
         close_fd(r);
         close_fd(w);
+    }
+
+    #[test]
+    fn wait_any_returns_zero_without_waiters() {
+        let io = IoReactor::new();
+        assert_eq!(io.wait_any(Some(Duration::from_millis(5))), 0);
+    }
+
+    #[test]
+    fn wait_any_batches_two_pipe_waiters() {
+        let (r1, w1) = pipe_fds();
+        let (r2, w2) = pipe_fds();
+        let io = IoReactor::new();
+        let _t1 = io.register_wait(r1, Interest::Readable);
+        let _t2 = io.register_wait(r2, Interest::Readable);
+        assert_eq!(io.poll_once(Some(Duration::ZERO)), 0);
+        let n = unsafe { libc::write(w1, b"a".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        let n = unsafe { libc::write(w2, b"b".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        let ready = io.wait_any(Some(Duration::from_millis(100)));
+        assert!(ready >= 1, "expected at least one ready waiter, got {ready}");
+        close_fd(r1);
+        close_fd(w1);
+        close_fd(r2);
+        close_fd(w2);
     }
 
     #[test]

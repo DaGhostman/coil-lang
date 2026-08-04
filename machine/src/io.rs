@@ -650,6 +650,12 @@ pub fn io_drive(_heap: &mut Heap) -> Value {
     Value::from(n as i64)
 }
 
+/// Block until any registered async waiter is ready; returns newly-ready count.
+pub fn io_wait_ready(_heap: &mut Heap) -> Value {
+    let n = crate::thread::host_io_wait_ready();
+    Value::from(n as i64)
+}
+
 fn stream_raw_fd(heap: &mut Heap, stream: Value) -> Result<RawFd, IoErrorTag> {
     with_stream_mut(heap, stream, |s| {
         if s.closed || s.fd.is_none() {
@@ -1761,6 +1767,33 @@ mod tests {
         let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
         assert_eq!(n, 1);
         assert_eq!(io_drive(&mut heap).as_int(), 1);
+        io.cancel_wait(tok);
+        unsafe {
+            let _ = libc::close(r);
+            let _ = libc::close(w);
+        }
+    }
+
+    #[test]
+    fn io_wait_ready_without_host_state_returns_zero() {
+        let mut heap = Heap::default();
+        assert_eq!(io_wait_ready(&mut heap).as_int(), 0);
+    }
+
+    #[test]
+    fn io_wait_ready_blocks_until_waiter_ready() {
+        let mut vm = crate::Machine::<64>::default();
+        let io = std::sync::Arc::clone(vm.io_reactor());
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let tok = io.register_wait(r, Interest::Readable);
+        let _guard = crate::thread::HostStateGuard::enter(&mut vm);
+        let mut heap = Heap::default();
+        // Make readable before wait so we don't hang the unit test.
+        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        assert!(io_wait_ready(&mut heap).as_int() >= 1);
         io.cancel_wait(tok);
         unsafe {
             let _ = libc::close(r);

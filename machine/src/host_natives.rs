@@ -41,6 +41,8 @@ pub fn build_standard_host_natives(
     push_prelude_char_ord(&mut out, &mut register_id);
     push_thread_natives(&mut out, &mut register_id);
     push_packed_la(&mut out, &mut register_id);
+    // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
+    push_io_wait_ready(&mut out, &mut register_id);
     out
 }
 
@@ -137,6 +139,19 @@ fn push_packed_la(out: &mut Vec<Arc<dyn NativeFn>>, register_id: &mut impl FnMut
         3,
         |heap, args| Ok(Some(packed_vec_arith(heap, args))),
     )));
+}
+
+fn push_io_wait_ready(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    let sig = FfiSignature::from_parts("wait_ready".to_string(), vec![], FfiType::Int)
+        .expect("wait_ready signature");
+    let id = out.len();
+    register_id("wait_ready", id);
+    out.push(Arc::new(HostClosureFn::new(sig, |heap, _args| {
+        Ok(Some(crate::io::io_wait_ready(heap)))
+    })));
 }
 
 #[derive(Clone, Copy)]

@@ -1038,14 +1038,76 @@ impl<const S: usize> Machine<S> {
             && let Some(ctx) = self.resume_stack.last()
             && self.frames.len() <= ctx.frame_depth
         {
-            self.with_coroutine_mut(ctx.coro.as_ptr() as u64, |coro| {
-                coro.state = CoroState::Done;
-                coro.saved_stack.clear();
-                coro.saved_frames.clear();
-                coro.yield_from = None;
-            });
+            let coro_ptr = ctx.coro.as_ptr() as u64;
+            let old_wait = {
+                let mut taken = None;
+                self.with_coroutine_mut(coro_ptr, |coro| {
+                    taken = coro.io_wait.take();
+                    coro.state = CoroState::Done;
+                    coro.saved_stack.clear();
+                    coro.saved_frames.clear();
+                    coro.yield_from = None;
+                });
+                taken
+            };
+            if let Some(tok) = old_wait {
+                self.io_reactor.cancel_wait(tok);
+            }
             self.resume_stack.pop();
         }
+    }
+
+    fn clear_current_coro_io_wait(&mut self) {
+        let Some(ctx) = self.resume_stack.last() else {
+            return;
+        };
+        let coro_ptr = ctx.coro.as_ptr() as u64;
+        let old = {
+            let mut taken = None;
+            self.with_coroutine_mut(coro_ptr, |c| {
+                taken = c.io_wait.take();
+            });
+            taken
+        };
+        if let Some(tok) = old {
+            self.io_reactor.cancel_wait(tok);
+        }
+    }
+
+    /// Register fd interest and yield so other coros / `wait_ready` can batch.
+    ///
+    /// Pushes `Ok(())` onto the coroutine stack before yielding so resume
+    /// continues after `HostInvoke` as if the await completed. Callers must
+    /// `wait_ready` (or tolerate L0 `WouldBlock`) before the next resume.
+    fn cooperative_io_await_yield(
+        &mut self,
+        ip: &mut usize,
+        sp: &mut usize,
+        req: crate::io::IoParkRequest,
+    ) {
+        let token = self
+            .io_reactor
+            .register_wait(req.fd, req.interest);
+        let coro_ptr = self
+            .resume_stack
+            .last()
+            .expect("cooperative await requires an active coroutine")
+            .coro
+            .as_ptr() as u64;
+        let old = {
+            let mut taken = None;
+            self.with_coroutine_mut(coro_ptr, |c| {
+                taken = c.io_wait.replace(token);
+            });
+            taken
+        };
+        if let Some(old) = old {
+            self.io_reactor.cancel_wait(old);
+        }
+        let ok = crate::io::as_result_unit(&mut self.heap, Ok(()));
+        self.stack.push(ok);
+        // Yield value is discarded by `block_on`; multiplex loops ignore it.
+        self.yield_coroutine(ip, sp, Value::from(0_i64));
     }
 
     fn resume_coroutine(
@@ -1063,9 +1125,17 @@ impl<const S: usize> Machine<S> {
 
         self.frames.get_mut().seek(return_ip);
 
-        self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
-            c.pending_send = send_val;
-        });
+        let old_wait = {
+            let mut taken = None;
+            self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
+                taken = c.io_wait.take();
+                c.pending_send = send_val;
+            });
+            taken
+        };
+        if let Some(tok) = old_wait {
+            self.io_reactor.cancel_wait(tok);
+        }
 
         self.resume_stack.push(ResumeCtx {
             coro: gc,
@@ -2345,16 +2415,31 @@ impl<const S: usize> Machine<S> {
                     let live_before = self.heap.live_object_count();
                     match self.natives.get_by_id(fn_id) {
                         Some(native) => match native.invoke(&mut self.heap, args) {
-                            Ok(Some(v)) => self.stack.push(v),
+                            Ok(Some(v)) => {
+                                // Cooperative await left a waiter on the coro;
+                                // drop it once the probe completed.
+                                if !self.resume_stack.is_empty() {
+                                    self.clear_current_coro_io_wait();
+                                }
+                                self.stack.push(v);
+                            }
                             Ok(None) => {
                                 if let Some(req) = crate::io::take_pending_io_park() {
-                                    self.frames.get_mut().set(sp);
-                                    self.pending_io = Some(PendingIoWait {
-                                        request: req,
-                                        resume_ip: ip,
-                                        resume_sp: sp,
-                                    });
-                                    return true;
+                                    if !self.resume_stack.is_empty() {
+                                        // Inside a coroutine: register for batch
+                                        // poll and yield (do not park the VM).
+                                        self.cooperative_io_await_yield(
+                                            &mut ip, &mut sp, req,
+                                        );
+                                    } else {
+                                        self.frames.get_mut().set(sp);
+                                        self.pending_io = Some(PendingIoWait {
+                                            request: req,
+                                            resume_ip: ip,
+                                            resume_sp: sp,
+                                        });
+                                        return true;
+                                    }
                                 }
                             }
                             #[cfg(debug_assertions)]
@@ -2860,6 +2945,7 @@ impl<const S: usize> Machine<S> {
                         pending_send: Value::from(0_i64),
                         yield_from: None,
                         yield_from_resume_ip: 0,
+                        io_wait: None,
                     };
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 

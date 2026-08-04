@@ -438,6 +438,17 @@ pub(crate) fn host_io_drive() -> usize {
     })
 }
 
+/// Block until any registered async waiter is ready (batch poll).
+pub(crate) fn host_io_wait_ready() -> usize {
+    HOST_STATE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|s| s.io_reactor.as_ref())
+            .map(|io| io.wait_any(None))
+            .unwrap_or(0)
+    })
+}
+
 /// Allocate `ThreadError` variant on the heap.
 pub fn alloc_thread_error(heap: &mut Heap, tag: ThreadErrorTag) -> Value {
     let _ = BUILTIN_THREAD_ERROR_VARIANTS;
