@@ -12,6 +12,8 @@ pub fn dot_f64(a: &[f64], b: &[f64]) -> f64 {
     }
     match detect() {
         #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::dot_f64(a, b) },
+        #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { crate::x86_64::avx2::dot_f64(a, b) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Sse2 => unsafe { crate::x86_64::sse2::dot_f64(a, b) },
@@ -24,8 +26,15 @@ pub fn dot_f64(a: &[f64], b: &[f64]) -> f64 {
 /// Wrapping integer dot product.
 #[inline]
 pub fn dot_i64(a: &[i64], b: &[i64]) -> i64 {
-    // i64 multiply is scalar on current ISAs; keep one path.
-    scalar::dot_i64(a, b)
+    if a.len().min(b.len()) < 8 {
+        return scalar::dot_i64(a, b);
+    }
+    match detect() {
+        // AVX-512DQ provides `mullo` for 64-bit integers.
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::dot_i64(a, b) },
+        _ => scalar::dot_i64(a, b),
+    }
 }
 
 #[inline]
@@ -44,6 +53,8 @@ pub fn zip_neg_f64(a: &[f64], out: &mut [f64]) {
         return scalar::zip_neg_f64(a, out);
     }
     match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::zip_neg_f64(a, out) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { crate::x86_64::avx2::zip_neg_f64(a, out) },
         #[cfg(target_arch = "x86_64")]
@@ -71,6 +82,8 @@ pub fn zip_neg_i64(a: &[i64], out: &mut [i64]) {
     }
     match detect() {
         #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::zip_neg_i64(a, out) },
+        #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { crate::x86_64::avx2::zip_neg_i64(a, out) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Sse2 => unsafe { crate::x86_64::sse2::zip_neg_i64(a, out) },
@@ -89,6 +102,8 @@ pub fn matmul_f64(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: us
     }
     match detect() {
         #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::matmul_f64(a, b, c, m, k, n) },
+        #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { crate::x86_64::avx2::matmul_f64(a, b, c, m, k, n) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Sse2 => unsafe { crate::x86_64::sse2::matmul_f64(a, b, c, m, k, n) },
@@ -101,8 +116,9 @@ pub fn matmul_f64(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: us
 /// Row-major wrapping `i64` matmul.
 #[inline]
 pub fn matmul_i64(a: &[i64], b: &[i64], c: &mut [i64], m: usize, k: usize, n: usize) {
-    // Multiply stays scalar; still useful to share the saxpy-shaped loop.
     match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { crate::x86_64::avx512::matmul_i64(a, b, c, m, k, n) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { crate::x86_64::avx2::matmul_i64(a, b, c, m, k, n) },
         #[cfg(target_arch = "x86_64")]
@@ -126,7 +142,9 @@ fn dispatch_zip_f64(
     }
     match detect() {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        SimdLevel::Avx2 | SimdLevel::Sse2 | SimdLevel::Neon => unsafe { simd_fn(a, b, out) },
+        SimdLevel::Avx512 | SimdLevel::Avx2 | SimdLevel::Sse2 | SimdLevel::Neon => unsafe {
+            simd_fn(a, b, out)
+        },
         _ => scalar_fn(a, b, out),
     }
 }
@@ -144,7 +162,9 @@ fn dispatch_zip_i64(
     }
     match detect() {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        SimdLevel::Avx2 | SimdLevel::Sse2 | SimdLevel::Neon => unsafe { simd_fn(a, b, out) },
+        SimdLevel::Avx512 | SimdLevel::Avx2 | SimdLevel::Sse2 | SimdLevel::Neon => unsafe {
+            simd_fn(a, b, out)
+        },
         _ => scalar_fn(a, b, out),
     }
 }
@@ -152,6 +172,7 @@ fn dispatch_zip_i64(
 #[cfg(target_arch = "x86_64")]
 unsafe fn zip_add_f64_simd(a: &[f64], b: &[f64], out: &mut [f64]) {
     match detect() {
+        SimdLevel::Avx512 => crate::x86_64::avx512::zip_add_f64(a, b, out),
         SimdLevel::Avx2 => crate::x86_64::avx2::zip_add_f64(a, b, out),
         _ => crate::x86_64::sse2::zip_add_f64(a, b, out),
     }
@@ -160,6 +181,7 @@ unsafe fn zip_add_f64_simd(a: &[f64], b: &[f64], out: &mut [f64]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn zip_sub_f64_simd(a: &[f64], b: &[f64], out: &mut [f64]) {
     match detect() {
+        SimdLevel::Avx512 => crate::x86_64::avx512::zip_sub_f64(a, b, out),
         SimdLevel::Avx2 => crate::x86_64::avx2::zip_sub_f64(a, b, out),
         _ => crate::x86_64::sse2::zip_sub_f64(a, b, out),
     }
@@ -168,6 +190,7 @@ unsafe fn zip_sub_f64_simd(a: &[f64], b: &[f64], out: &mut [f64]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn zip_add_i64_simd(a: &[i64], b: &[i64], out: &mut [i64]) {
     match detect() {
+        SimdLevel::Avx512 => crate::x86_64::avx512::zip_add_i64(a, b, out),
         SimdLevel::Avx2 => crate::x86_64::avx2::zip_add_i64(a, b, out),
         _ => crate::x86_64::sse2::zip_add_i64(a, b, out),
     }
@@ -176,6 +199,7 @@ unsafe fn zip_add_i64_simd(a: &[i64], b: &[i64], out: &mut [i64]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn zip_sub_i64_simd(a: &[i64], b: &[i64], out: &mut [i64]) {
     match detect() {
+        SimdLevel::Avx512 => crate::x86_64::avx512::zip_sub_i64(a, b, out),
         SimdLevel::Avx2 => crate::x86_64::avx2::zip_sub_i64(a, b, out),
         _ => crate::x86_64::sse2::zip_sub_i64(a, b, out),
     }
@@ -233,6 +257,13 @@ mod tests {
         let got = dot_f64(&a, &b);
         let expect = scalar::dot_f64(&a, &b);
         assert!((got - expect).abs() < 1e-9, "{got} vs {expect}");
+    }
+
+    #[test]
+    fn dot_i64_matches_scalar() {
+        let a: Vec<i64> = (0..64).map(|i| i as i64 - 20).collect();
+        let b: Vec<i64> = (0..64).map(|i| (i as i64 % 9) - 4).collect();
+        assert_eq!(dot_i64(&a, &b), scalar::dot_i64(&a, &b));
     }
 
     #[test]

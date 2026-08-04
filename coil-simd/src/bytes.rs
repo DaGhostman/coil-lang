@@ -16,6 +16,8 @@ pub fn eq(a: &[u8], b: &[u8]) -> bool {
     }
     match detect() {
         #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { eq_avx512(a, b) },
+        #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { eq_avx2(a, b) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Sse2 => unsafe { eq_sse2(a, b) },
@@ -33,6 +35,8 @@ pub fn xor(a: &[u8], b: &[u8], out: &mut [u8]) {
         return scalar_xor(a, b, out, n);
     }
     match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => unsafe { xor_avx512(a, b, out, n) },
         #[cfg(target_arch = "x86_64")]
         SimdLevel::Avx2 => unsafe { xor_avx2(a, b, out, n) },
         #[cfg(target_arch = "x86_64")]
@@ -125,6 +129,43 @@ unsafe fn xor_avx2(a: &[u8], b: &[u8], out: &mut [u8], n: usize) {
             _mm256_xor_si256(va, vb),
         );
         i += 32;
+    }
+    while i < n {
+        *out.get_unchecked_mut(i) = *a.get_unchecked(i) ^ *b.get_unchecked(i);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
+unsafe fn eq_avx512(a: &[u8], b: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let mut i = 0;
+    while i + 64 <= n {
+        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+        if _mm512_cmpeq_epi8_mask(va, vb) != !0u64 {
+            return false;
+        }
+        i += 64;
+    }
+    a.get_unchecked(i..) == b.get_unchecked(i..)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_avx512(a: &[u8], b: &[u8], out: &mut [u8], n: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    while i + 64 <= n {
+        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+        _mm512_storeu_si512(
+            out.as_mut_ptr().add(i) as *mut __m512i,
+            _mm512_xor_si512(va, vb),
+        );
+        i += 64;
     }
     while i < n {
         *out.get_unchecked_mut(i) = *a.get_unchecked(i) ^ *b.get_unchecked(i);

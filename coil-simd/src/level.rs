@@ -11,6 +11,8 @@ pub enum SimdLevel {
     Sse2,
     /// x86_64 AVX2 (+FMA when available) — 4×`f64` / 4×`i64`.
     Avx2,
+    /// x86_64 AVX-512F/DQ/BW — 8×`f64` / 8×`i64` (incl. `i64` mullo).
+    Avx512,
     /// aarch64 NEON — 2×`f64` / 2×`i64`.
     Neon,
 }
@@ -25,6 +27,13 @@ pub fn detect() -> SimdLevel {
 fn probe() -> SimdLevel {
     #[cfg(target_arch = "x86_64")]
     {
+        // Require F+DQ+BW together so numeric and byte kernels share one level.
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512bw")
+        {
+            return SimdLevel::Avx512;
+        }
         if is_x86_feature_detected!("avx2") {
             return SimdLevel::Avx2;
         }
@@ -52,11 +61,25 @@ mod tests {
         assert_eq!(a, b);
         #[cfg(target_arch = "x86_64")]
         {
-            assert!(matches!(a, SimdLevel::Sse2 | SimdLevel::Avx2));
+            assert!(matches!(
+                a,
+                SimdLevel::Sse2 | SimdLevel::Avx2 | SimdLevel::Avx512
+            ));
         }
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(a, SimdLevel::Neon);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn selects_avx512_when_f_dq_bw_present() {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512bw")
+        {
+            assert_eq!(detect(), SimdLevel::Avx512);
         }
     }
 }

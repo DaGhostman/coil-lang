@@ -16,7 +16,7 @@ safe API:
 
 | API | Role |
 |-----|------|
-| `detect()` / `SimdLevel` | Cached runtime probe (`SSE2` / `AVX2` / `NEON` / scalar) |
+| `detect()` / `SimdLevel` | Cached runtime probe (`SSE2` / `AVX2` / `AVX-512` / `NEON` / scalar) |
 | `dot_f64` / `dot_i64` | Dot products |
 | `matmul_f64` / `matmul_i64` | Row-major GEMM (`C = A·B`) |
 | `zip_{add,sub,neg}_{f64,i64}` | Element-wise matrix zip / negate |
@@ -24,14 +24,15 @@ safe API:
 
 ## Dispatch
 
-- **x86_64:** SSE2 is ABI baseline; AVX2 (+FMA when present) is selected at
-  runtime via `is_x86_feature_detected!` — no `RUSTFLAGS=-C target-cpu=…`
-  required for correctness.
+- **x86_64:** SSE2 is ABI baseline; AVX2 (+FMA when present) and AVX-512
+  (`avx512f` + `avx512dq` + `avx512bw`) are selected at runtime via
+  `is_x86_feature_detected!` — no `RUSTFLAGS=-C target-cpu=…` required for
+  correctness. Partial AVX-512 (missing DQ/BW) falls back to AVX2.
 - **aarch64:** NEON.
 - Tiny inputs fall back to scalar to avoid call overhead.
 
-`i64` multiply stays scalar on SSE2/AVX2 (no general 64-bit `mullo` until
-AVX-512); zip add/sub/neg still vectorize.
+`i64` multiply stays scalar on SSE2/AVX2 (no general 64-bit `mullo`); AVX-512DQ
+enables vectorized `i64` dot / matmul. Zip add/sub/neg vectorize on all levels.
 
 ## Callers today
 

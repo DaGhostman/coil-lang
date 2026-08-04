@@ -7,9 +7,9 @@
 //! # Feature selection
 //!
 //! [`detect`] probes the host once and caches the best available
-//! [`SimdLevel`]. Kernels then pick an SSE2 / AVX2 / NEON path or a scalar
-//! fallback. Callers never need `RUSTFLAGS` target-cpu flags for correctness;
-//! AVX2 is used when present at runtime.
+//! [`SimdLevel`]. Kernels then pick an SSE2 / AVX2 / AVX-512 / NEON path or a
+//! scalar fallback. Callers never need `RUSTFLAGS` target-cpu flags for
+//! correctness; wider ISAs are used only when present at runtime.
 
 mod kernels;
 mod level;
