@@ -5,6 +5,9 @@
 //! prediction on some CPUs). Dims / flags are packed into a meta `u32`
 //! argument — same bit layout as the former packed opcodes.
 //!
+//! Numeric work is forwarded to [`coil_simd`] after packing nested
+//! aggregates into contiguous `f64` / `i64` buffers.
+//!
 //! **Defensive posture:** malformed handles / shape mismatches do **not**
 //! trap. Missing aggregates yield `0` (dot) or zero-filled cells
 //! (matmul/zip/neg) so the VM stays aligned with other silent-fallback
@@ -71,6 +74,22 @@ fn alloc_nested_matrix(
     alloc_aggregate(heap, rows, outer_is_tuple)
 }
 
+fn values_to_f64(cells: &[Value]) -> Vec<f64> {
+    cells.iter().map(|v| v.as_float()).collect()
+}
+
+fn values_to_i64(cells: &[Value]) -> Vec<i64> {
+    cells.iter().map(|v| v.as_int()).collect()
+}
+
+fn f64_to_values(cells: &[f64]) -> Vec<Value> {
+    cells.iter().copied().map(Value::from).collect()
+}
+
+fn i64_to_values(cells: &[i64]) -> Vec<Value> {
+    cells.iter().copied().map(Value::from).collect()
+}
+
 /// `packed_dot(a, b, meta)` — `meta` bits match former `PackedDot` operands.
 pub fn packed_dot(heap: &mut Heap, args: &[Value]) -> Value {
     if args.len() < 3 {
@@ -85,17 +104,13 @@ pub fn packed_dot(heap: &mut Heap, args: &[Value]) -> Value {
     let bv = aggregate_elements(heap, b).unwrap_or_default();
     let n = len.min(av.len()).min(bv.len());
     if is_float {
-        let mut sum = 0.0_f64;
-        for i in 0..n {
-            sum += av[i].as_float() * bv[i].as_float();
-        }
-        Value::from(sum)
+        let a = values_to_f64(&av[..n]);
+        let b = values_to_f64(&bv[..n]);
+        Value::from(coil_simd::dot_f64(&a, &b))
     } else {
-        let mut sum = 0_i64;
-        for i in 0..n {
-            sum = sum.wrapping_add(av[i].as_int().wrapping_mul(bv[i].as_int()));
-        }
-        Value::from(sum)
+        let a = values_to_i64(&av[..n]);
+        let b = values_to_i64(&bv[..n]);
+        Value::from(coil_simd::dot_i64(&a, &b))
     }
 }
 
@@ -117,32 +132,19 @@ pub fn packed_matmul(heap: &mut Heap, args: &[Value]) -> Value {
         .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(k)]);
     let b_cells = extract_matrix_row_major(heap, b, k, n)
         .unwrap_or_else(|| vec![Value::default(); k.saturating_mul(n)]);
-    let mut c = vec![Value::default(); m.saturating_mul(n)];
-    if is_float {
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0_f64;
-                for t in 0..k {
-                    acc += a_cells[i * k + t].as_float() * b_cells[t * n + j].as_float();
-                }
-                c[i * n + j] = Value::from(acc);
-            }
-        }
+    let c = if is_float {
+        let a = values_to_f64(&a_cells);
+        let b = values_to_f64(&b_cells);
+        let mut c = vec![0.0; m.saturating_mul(n)];
+        coil_simd::matmul_f64(&a, &b, &mut c, m, k, n);
+        f64_to_values(&c)
     } else {
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0_i64;
-                for t in 0..k {
-                    acc = acc.wrapping_add(
-                        a_cells[i * k + t]
-                            .as_int()
-                            .wrapping_mul(b_cells[t * n + j].as_int()),
-                    );
-                }
-                c[i * n + j] = Value::from(acc);
-            }
-        }
-    }
+        let a = values_to_i64(&a_cells);
+        let b = values_to_i64(&b_cells);
+        let mut c = vec![0_i64; m.saturating_mul(n)];
+        coil_simd::matmul_i64(&a, &b, &mut c, m, k, n);
+        i64_to_values(&c)
+    };
     alloc_nested_matrix(heap, c, m, n, outer_is_tuple, row_is_tuple)
 }
 
@@ -164,23 +166,35 @@ pub fn packed_matrix_zip(heap: &mut Heap, args: &[Value]) -> Value {
         .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
     let b_cells = extract_matrix_row_major(heap, b, m, n)
         .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
-    let mut c = Vec::with_capacity(m.saturating_mul(n));
-    for i in 0..m.saturating_mul(n) {
-        let cell = if is_float {
-            let av = a_cells[i].as_float();
-            let bv = b_cells[i].as_float();
-            Value::from(if zip_kind == 1 { av - bv } else { av + bv })
+    let len = m.saturating_mul(n);
+    let c = if is_float {
+        let a = values_to_f64(&a_cells[..len.min(a_cells.len())]);
+        let b = values_to_f64(&b_cells[..len.min(b_cells.len())]);
+        let mut out = vec![0.0; a.len().min(b.len())];
+        if zip_kind == 1 {
+            coil_simd::zip_sub_f64(&a, &b, &mut out);
         } else {
-            let av = a_cells[i].as_int();
-            let bv = b_cells[i].as_int();
-            Value::from(if zip_kind == 1 {
-                av.wrapping_sub(bv)
-            } else {
-                av.wrapping_add(bv)
-            })
-        };
-        c.push(cell);
-    }
+            coil_simd::zip_add_f64(&a, &b, &mut out);
+        }
+        // Pad if extract was short (defensive zero fill already in a_cells path).
+        while out.len() < len {
+            out.push(0.0);
+        }
+        f64_to_values(&out[..len])
+    } else {
+        let a = values_to_i64(&a_cells[..len.min(a_cells.len())]);
+        let b = values_to_i64(&b_cells[..len.min(b_cells.len())]);
+        let mut out = vec![0_i64; a.len().min(b.len())];
+        if zip_kind == 1 {
+            coil_simd::zip_sub_i64(&a, &b, &mut out);
+        } else {
+            coil_simd::zip_add_i64(&a, &b, &mut out);
+        }
+        while out.len() < len {
+            out.push(0);
+        }
+        i64_to_values(&out[..len])
+    };
     alloc_nested_matrix(heap, c, m, n, outer_is_tuple, row_is_tuple)
 }
 
@@ -198,14 +212,17 @@ pub fn packed_matrix_neg(heap: &mut Heap, args: &[Value]) -> Value {
     let row_is_tuple = (ops & (1 << 18)) != 0;
     let a_cells = extract_matrix_row_major(heap, a, m, n)
         .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
-    let mut c = Vec::with_capacity(a_cells.len());
-    for cell in a_cells {
-        c.push(if is_float {
-            Value::from(-cell.as_float())
-        } else {
-            Value::from(cell.as_int().wrapping_neg())
-        });
-    }
+    let c = if is_float {
+        let a = values_to_f64(&a_cells);
+        let mut out = vec![0.0; a.len()];
+        coil_simd::zip_neg_f64(&a, &mut out);
+        f64_to_values(&out)
+    } else {
+        let a = values_to_i64(&a_cells);
+        let mut out = vec![0_i64; a.len()];
+        coil_simd::zip_neg_i64(&a, &mut out);
+        i64_to_values(&out)
+    };
     alloc_nested_matrix(heap, c, m, n, outer_is_tuple, row_is_tuple)
 }
 
@@ -231,6 +248,17 @@ mod tests {
         alloc_aggregate(heap, vec![r0, r1], false)
     }
 
+    fn alloc_array_f(heap: &mut Heap, elems: Vec<f64>) -> Value {
+        let values: Vec<Value> = elems.into_iter().map(Value::from).collect();
+        alloc_aggregate(heap, values, false)
+    }
+
+    fn alloc_matrix2_f(heap: &mut Heap, rows: [[f64; 2]; 2]) -> Value {
+        let r0 = alloc_array_f(heap, vec![rows[0][0], rows[0][1]]);
+        let r1 = alloc_array_f(heap, vec![rows[1][0], rows[1][1]]);
+        alloc_aggregate(heap, vec![r0, r1], false)
+    }
+
     #[test]
     fn packed_dot_int_sums_products() {
         let mut heap = Heap::default();
@@ -239,6 +267,19 @@ mod tests {
         let meta = Value::from(3_i64); // length=3, int
         let out = packed_dot(&mut heap, &[a, b, meta]);
         assert_eq!(out.as_int(), 32); // 1*4+2*5+3*6
+    }
+
+    #[test]
+    fn packed_dot_float_long() {
+        let mut heap = Heap::default();
+        let a_vals: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let b_vals: Vec<f64> = (0..64).map(|i| (i as f64) * 0.5).collect();
+        let expect: f64 = a_vals.iter().zip(&b_vals).map(|(x, y)| x * y).sum();
+        let a = alloc_array_f(&mut heap, a_vals);
+        let b = alloc_array_f(&mut heap, b_vals);
+        let meta = Value::from((64_i64) | (1 << 16));
+        let out = packed_dot(&mut heap, &[a, b, meta]);
+        assert!((out.as_float() - expect).abs() < 1e-6);
     }
 
     #[test]
@@ -257,6 +298,19 @@ mod tests {
         assert_eq!(r0[1].as_int(), 22);
         assert_eq!(r1[0].as_int(), 43);
         assert_eq!(r1[1].as_int(), 50);
+    }
+
+    #[test]
+    fn packed_matmul_2x2_float() {
+        let mut heap = Heap::default();
+        let a = alloc_matrix2_f(&mut heap, [[1.0, 2.0], [3.0, 4.0]]);
+        let b = alloc_matrix2_f(&mut heap, [[5.0, 6.0], [7.0, 8.0]]);
+        let meta = Value::from((2 | (2 << 8) | (2 << 16) | (1 << 24)) as i64);
+        let out = packed_matmul(&mut heap, &[a, b, meta]);
+        let rows = aggregate_elements(&heap, out).expect("rows");
+        let r0 = aggregate_elements(&heap, rows[0]).expect("r0");
+        assert!((r0[0].as_float() - 19.0).abs() < 1e-9);
+        assert!((r0[1].as_float() - 22.0).abs() < 1e-9);
     }
 
     #[test]

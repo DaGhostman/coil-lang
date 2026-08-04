@@ -1576,7 +1576,7 @@ impl<V> Store<V> {
             let entry = unsafe { entry_ptr.as_ref() };
             match entry {
                 Entry::Free => return None,
-                Entry::Live(entry) if entry.key.as_ref().data == s => {
+                Entry::Live(entry) if coil_simd::bytes::eq(entry.key.as_ref().data.as_bytes(), s.as_bytes()) => {
                     return Some(entry.key);
                 }
                 _ => {}
