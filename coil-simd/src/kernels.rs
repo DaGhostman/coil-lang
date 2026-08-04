@@ -402,6 +402,36 @@ mod tests {
     }
 
     #[test]
+    fn zip_div_f64_matches_scalar() {
+        let a: Vec<f64> = (0..32).map(|i| (i as f64) + 1.0).collect();
+        let b: Vec<f64> = (0..32).map(|i| (i as f64) * 0.25 + 0.5).collect();
+        let mut got = vec![0.0; 32];
+        let mut expect = vec![0.0; 32];
+        zip_div_f64(&a, &b, &mut got);
+        scalar::zip_div_f64(&a, &b, &mut expect);
+        for i in 0..32 {
+            assert!((got[i] - expect[i]).abs() < 1e-12, "div mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn scale_i64_and_short_zip_mul() {
+        let a: Vec<i64> = (0..16).map(|i| i as i64 - 4).collect();
+        let mut scaled = vec![0; 16];
+        scale_i64(&a, 7, &mut scaled);
+        for i in 0..16 {
+            assert_eq!(scaled[i], a[i].wrapping_mul(7));
+        }
+
+        // Length < 8 must still be correct via the scalar fast path.
+        let short_a = [1_i64, 2, 3, 4];
+        let short_b = [5_i64, 6, 7, 8];
+        let mut short_out = [0_i64; 4];
+        zip_mul_i64(&short_a, &short_b, &mut short_out);
+        assert_eq!(short_out, [5, 12, 21, 32]);
+    }
+
+    #[test]
     fn matmul_f64_matches_scalar_large() {
         let m = 8usize;
         let k = 8usize;
