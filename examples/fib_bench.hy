@@ -1,6 +1,7 @@
 // CPU / dispatch regression bench (release `poop` / perf_metrics).
 // fib(32) exercises auto-par const specialization when enabled.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {

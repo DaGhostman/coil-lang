@@ -1,6 +1,7 @@
 // PCRE2 virtual module: compile flags, find_all, split, replace_all.
 use regex::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn must_re(Result r) -> Regex {

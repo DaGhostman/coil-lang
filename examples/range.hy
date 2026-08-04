@@ -4,7 +4,8 @@
 // values, byte/float bounds. Decreasing ranges are empty (Rust-like).
 // Iteration steps by +1 / +1.0 for int/byte/float.
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     // Half-open: 0..5 → 0,1,2,3,4

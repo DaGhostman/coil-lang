@@ -6,7 +6,8 @@
 // Open projection `C::Elem` under `C: Collect` is pinned to `int` when
 // `take_head` is applied at a ground `Option<int>` call site.
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Collect<C> {
     type Elem;

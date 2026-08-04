@@ -9,6 +9,7 @@
 //     timeout 10s ./target/release/coil examples/projects/02-adventure/src/main.hy
 
 use io::*;
+use io::sync::*;
 use world::*;
 use commands::*;
 use save::*;

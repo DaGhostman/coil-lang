@@ -7,6 +7,7 @@
 
 use io::*;
 use io::net::tcp::*;
+use io::sync::*;
 use protocol::*;
 use server::*;
 use client::*;

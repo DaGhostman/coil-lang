@@ -4,7 +4,8 @@
 // target type must be local (strict orphan rule — builtin heads like `int`
 // are not allowed as instance arguments for foreign traits).
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Celsius {
     c: int,

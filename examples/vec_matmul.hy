@@ -1,7 +1,8 @@
 // Named helper — `matmul` on nested fixed-length matrices (row-major).
 // Expected output: 19,22,43,50
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [[1, 2], [3, 4]];

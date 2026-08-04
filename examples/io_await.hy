@@ -1,5 +1,6 @@
 // Exercise io::drive and await_* registration (no hung wait).
-use io::{stdout, write_all, drive};
+use io::{stdout, drive};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {

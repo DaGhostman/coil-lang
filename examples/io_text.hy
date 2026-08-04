@@ -1,5 +1,6 @@
 // Decode `[byte]` → string with `from_bytes`, encode with `to_bytes`.
 use io::*;
+use io::sync::*;
 use string::*;
 
 fn main() {

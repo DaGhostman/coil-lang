@@ -4,6 +4,7 @@
 use io::*;
 use io::net::tcp::connect as tcp_connect;
 use io::net::tls::client::enable as tls_enable;
+use io::sync::*;
 use http::url::*;
 
 fn open_stream(Url u) -> Result<Stream, HttpError> {

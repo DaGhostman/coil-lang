@@ -3,7 +3,8 @@
 // User trait dictionaries are consumed inside generic bodies and
 // forwarded through nested generic calls.
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Describable<T> {
     fn describe_val(T x) -> int;

@@ -4,6 +4,7 @@
 // client can finish write_all without a connection reset.
 use io::*;
 use io::net::tcp::*;
+use io::sync::*;
 
 fn fixed_response() -> [byte] {
     return to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok");

@@ -6,7 +6,8 @@
 // - Calling `lt_val` binds `c` to Ordered.
 // - Calling `eq_val` then uses Ordered's Equal superclass slot.
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Equal<T> {
     fn eq_val(T a, T b) -> bool;

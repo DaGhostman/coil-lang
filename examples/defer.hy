@@ -1,6 +1,7 @@
 // `defer` runs on function exit (`return` / `return;`), LIFO.
 // Outer locals must be listed in `use (…)` — same capture rule as lambdas.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn with_cleanup() {
     defer {

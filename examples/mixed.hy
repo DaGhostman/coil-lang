@@ -8,7 +8,8 @@
 // its own slot via the Interner.
 //
 // Expected output: 0, 25, 12, 2 (one line per shape).
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Shape {
     Empty,

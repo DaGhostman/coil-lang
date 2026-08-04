@@ -2,7 +2,8 @@
 //
 // Output: Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(Show, Eq, Ord)]
 enum Color {

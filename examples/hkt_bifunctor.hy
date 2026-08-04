@@ -1,7 +1,8 @@
 // Binary higher-kinded trait: Bifunctor<F: * -> * -> *>.
 // Expected output: 42
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 trait Bifunctor<F: * -> * -> *> {
     fn tag<A, B>(F<A, B> xs) -> int;

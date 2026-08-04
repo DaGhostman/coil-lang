@@ -1,5 +1,6 @@
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 // Request/reply: pass both channel ends to the worker as one tuple.

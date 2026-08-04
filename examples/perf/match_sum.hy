@@ -1,6 +1,7 @@
 // CPU: enum construction + match dispatch in a loop.
 // Variant names must not collide with builtin Option::None / Option::Some.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Opt {
     Empty,

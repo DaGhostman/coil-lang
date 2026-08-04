@@ -1,5 +1,6 @@
 // Dense smoke coverage: many small independent syntax shapes in one file.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Tiny {
     A,

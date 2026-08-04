@@ -1,5 +1,6 @@
 // Hot GetField path: repeated reads of the same class fields.
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,

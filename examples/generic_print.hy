@@ -3,7 +3,8 @@
 // `%v` displays values through the `Show` trait. Builtin instances
 // cover int/float/string/bool/unit; user types can `impl Show for T`.
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Point {
     Point { x: int, y: int },

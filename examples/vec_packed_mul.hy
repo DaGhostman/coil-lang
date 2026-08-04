@@ -1,7 +1,8 @@
 // Packed aggregate SIMD path — static length ≥ 8 uses HostInvoke.
 // Expected output: 246810121416,3691215182124
 
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2, 3, 4, 5, 6, 7, 8];
