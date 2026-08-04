@@ -8,6 +8,7 @@ How coil is structured for contributors and embedders. End-user language docs li
 | [SIMD](simd.md) | `coil-simd` — stable `std::arch` kernels for packed LA |
 | [Auto-par](auto-par.md) | Purity analysis + capped fork-join for recursive binops |
 | [IO reactor](io-reactor.md) | Sync adapter waits + async `await_*` / CPU help-steal |
+| [Stack bounds](stack-bounds.md) | Recursion depth analysis and `#[max_depth]` |
 | [Debug line table](debug-info.md) | `source_files` / `debug_locs` in `.hyc` |
 | [Opcodes](opcodes.md) | Selected bytecode ops behind builtins |
 | [Dissect](dissect.md) | `coil dissect` — in-memory bytecode / IL / AST dump |

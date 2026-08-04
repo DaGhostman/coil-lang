@@ -63,6 +63,7 @@ class Point { x: int, y: int }
 | `#[derive(Trait, …)]` | `enum` / `class` | Synthesizes structural trait instances (`Show`, `Eq`, `Ord`, …). Without derive, non-generic types still get a default `Show`/`String` that returns the type name string. |
 | `#[test]` / `#[test("desc")]` | `fn` with body | Registers a `coil test` harness case (Result mode) |
 | `#[ffi(lib = "…", name = "…", variadic = true)]` | signature-only `fn …;` | Desugars to compile-time `extern` lowering |
+| `#[max_depth(N)]` | recursive `fn` | Required when call-frame depth cannot be proven (dynamic args, mutual recursion, non-measure shapes). Optional when the compiler already proves a bound (e.g. `fib(10)`). |
 | User `attr` names | `fn`, methods, `class` | Expands to a wrapper that receives the decoratee callable, attribute extras, and forwarded call arguments (`...args`); class attrs wrap the constructor |
 
 User-defined attributes must end with a bare tuple-rest parameter `...args` and call `target(...args)` to forward runtime arguments. Stacking order is Python-style: the first listed attribute is outermost. User attrs cannot be applied to FFI bindings.
