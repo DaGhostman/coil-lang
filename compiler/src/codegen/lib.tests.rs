@@ -24,6 +24,7 @@
         compiler.register_native_id(machine::PACKED_MATMUL, 9002);
         compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
         compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
+        compiler.register_native_id(machine::PACKED_VEC_ARITH, 9005);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }

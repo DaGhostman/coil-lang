@@ -3905,6 +3905,12 @@ fn example_vec_tuple_prints_zip_broadcast_negate() {
 }
 
 #[test]
+fn example_vec_packed_mul_uses_hostinvoke_path() {
+    let output = run_example("examples/vec_packed_mul.hy");
+    assert_eq!(output, "246810121416,3691215182124");
+}
+
+#[test]
 fn aggregate_float_negate_uses_mulf_not_int_neg() {
     // Regression: float aggregate unary `-` must not emit int `NEG`
     // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
