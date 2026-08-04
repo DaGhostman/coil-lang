@@ -1,18 +1,18 @@
 //! Static recursion-depth / operand-stack bound analysis.
 //!
-//! For self-recursive functions with a proven decreasing int measure and a
-//! base-case branch (`if n <= K`) plus **constant** entry call sites (e.g.
-//! `fib(10)` / `fib(32)`), the maximum call-frame depth is computed and no
-//! attribute is required. When depth cannot be proven (dynamic args, FFI-shaped
-//! recursion, mutual cycles without a measure, …), `#[max_depth(N)]` is
-//! required on the recursive function.
+//! Proves call-frame depth when a recursive function has a decreasing int/byte
+//! **measure** parameter (possibly among multiple args), a recognizable base
+//! case, and **known** entry measure values (literals, intra-proc const bindings,
+//! or shallow interprocedural wrappers). When unprovable, `#[max_depth(N)]` is
+//! required.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use parser::ast::{AttrArgs, AttrLit, Attribute, Expression, Output};
 use reporting::{ErrorCode, Message};
 
-use super::par_profit::{RecParShape, analyze_rec_par_shapes};
+use crate::const_fold::{ConstValue, eval_expr};
+
 use super::purity::analyze_recursive_fns;
 
 /// Default / minimum operand-stack capacity for programs without deep recursion.
@@ -35,7 +35,7 @@ pub fn operand_slots_for_frames(max_frames: u32) -> u32 {
 
 /// Proven or attributed max live frames for one recursive function.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by pipeline / future sizing; fields read in tests
+#[allow(dead_code)]
 pub struct FnStackBound {
     pub fn_name: String,
     /// Maximum simultaneous frames of this function (and its SCC peers).
@@ -46,7 +46,7 @@ pub struct FnStackBound {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundSource {
-    /// Decreasing measure + constant entry args.
+    /// Decreasing measure + known entry args.
     Proven,
     /// User `#[max_depth(N)]`.
     Attribute,
@@ -63,6 +63,19 @@ pub struct StackBoundReport {
     pub operand_slots_needed: u32,
 }
 
+/// Unified decreasing-measure shape for stack-bound proofs.
+#[derive(Debug, Clone)]
+struct RecMeasureShape {
+    #[allow(dead_code)]
+    measure_param: String,
+    measure_index: usize,
+    base_bound: Option<i64>,
+    /// Minimum positive decrease across all self-calls.
+    min_step: i64,
+    #[allow(dead_code)]
+    self_calls: usize,
+}
+
 /// Analyze recursion depth bounds; emit errors when `#[max_depth]` is required.
 pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
     let mut report = StackBoundReport {
@@ -75,16 +88,23 @@ pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
         return report;
     }
 
-    // Binary `f(n-a)⊕f(n-b)` shapes (same detector as auto-par).
-    let bin_shapes = analyze_rec_par_shapes(ast, &recursive);
-    let mut unary_shapes: HashMap<String, UnaryRecShape> = HashMap::new();
+    let mut measure_shapes: HashMap<String, RecMeasureShape> = HashMap::new();
     let mut tail_only: HashSet<String> = HashSet::new();
     let mut fn_meta: HashMap<String, FnMeta<'_>> = HashMap::new();
-    collect_fn_meta(ast, &recursive, &mut fn_meta, &mut unary_shapes, &mut tail_only);
+    collect_fn_meta(ast, &recursive, &mut fn_meta, &mut measure_shapes, &mut tail_only);
 
+    // Wrapper / entry const params (interprocedural), then entry sites.
+    let wrapper_consts = propagate_const_args(ast, &recursive);
     let mut const_args: HashMap<String, BTreeSet<i64>> = HashMap::new();
     let mut dynamic_calls: HashSet<String> = HashSet::new();
-    collect_rec_call_sites(ast, &recursive, &mut const_args, &mut dynamic_calls);
+    collect_rec_entry_sites(
+        ast,
+        &recursive,
+        &measure_shapes,
+        &wrapper_consts,
+        &mut const_args,
+        &mut dynamic_calls,
+    );
 
     let mut max_frames_any: u32 = 1;
 
@@ -100,7 +120,6 @@ pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
             continue;
         }
 
-        // Mutual recursion without a self-measure: require attribute.
         let is_self = fn_meta.get(name).map(|m| m.self_recursive).unwrap_or(false);
         if !is_self {
             match attr_depth {
@@ -142,17 +161,12 @@ pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
         let has_dynamic = dynamic_calls.contains(name);
         let consts = const_args.get(name);
         let has_const_entry = consts.is_some_and(|s| !s.is_empty());
-        // No entry call sites in this unit (e.g. `test(...)` stripped for a
-        // normal run): nothing to bound and no runtime depth risk here.
         if !has_dynamic && !has_const_entry {
             continue;
         }
 
-        // Prefer binary shape, then unary.
-        let proven = if let Some(shape) = bin_shapes.get(name) {
-            prove_bin_depth(shape, consts, has_dynamic)
-        } else if let Some(shape) = unary_shapes.get(name) {
-            prove_unary_depth(shape, consts, has_dynamic)
+        let proven = if let Some(shape) = measure_shapes.get(name) {
+            prove_measure_depth(shape, consts, has_dynamic)
         } else {
             DepthProof::Unprovable
         };
@@ -181,12 +195,13 @@ pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
             }
             (DepthProof::Unprovable, None) => {
                 let reason = if has_dynamic {
-                    "is called with a non-constant argument"
-                } else if bin_shapes.get(name).is_some_and(|s| s.base_bound.is_none())
-                    || unary_shapes.get(name).is_some_and(|s| s.base_bound.is_none())
+                    "is called with a non-constant measure argument"
+                } else if measure_shapes
+                    .get(name)
+                    .is_some_and(|s| s.base_bound.is_none())
                 {
                     "needs a recognizable base case (`if n <= K` / `n < K` / `n == K`)"
-                } else if bin_shapes.contains_key(name) || unary_shapes.contains_key(name) {
+                } else if measure_shapes.contains_key(name) {
                     "has no constant entry call site to bound its measure"
                 } else {
                     "has no analyzable decreasing measure / base-case shape"
@@ -227,15 +242,6 @@ enum DepthProof {
     Unprovable,
 }
 
-#[derive(Debug, Clone)]
-struct UnaryRecShape {
-    #[allow(dead_code)]
-    param: String,
-    /// `f(n - sub)`.
-    sub: i64,
-    base_bound: Option<i64>,
-}
-
 struct FnMeta<'a> {
     span: std::ops::Range<usize>,
     max_depth: Option<u32>,
@@ -245,8 +251,8 @@ struct FnMeta<'a> {
     attrs: &'a [Attribute<'a>],
 }
 
-fn prove_bin_depth(
-    shape: &RecParShape,
+fn prove_measure_depth(
+    shape: &RecMeasureShape,
     consts: Option<&BTreeSet<i64>>,
     has_dynamic: bool,
 ) -> DepthProof {
@@ -262,32 +268,7 @@ fn prove_bin_depth(
     let Some(base) = shape.base_bound else {
         return DepthProof::Unprovable;
     };
-    let step = shape.left_sub.min(shape.right_sub).max(1);
-    let mut max_d = 1u32;
-    for &n in set {
-        max_d = max_d.max(measure_depth(n, base, step));
-    }
-    DepthProof::Frames(max_d)
-}
-
-fn prove_unary_depth(
-    shape: &UnaryRecShape,
-    consts: Option<&BTreeSet<i64>>,
-    has_dynamic: bool,
-) -> DepthProof {
-    if has_dynamic {
-        return DepthProof::Unprovable;
-    }
-    let Some(set) = consts else {
-        return DepthProof::Unprovable;
-    };
-    if set.is_empty() {
-        return DepthProof::Unprovable;
-    }
-    let Some(base) = shape.base_bound else {
-        return DepthProof::Unprovable;
-    };
-    let step = shape.sub.max(1);
+    let step = shape.min_step.max(1);
     let mut max_d = 1u32;
     for &n in set {
         max_d = max_d.max(measure_depth(n, base, step));
@@ -353,20 +334,20 @@ fn collect_fn_meta<'a>(
     ast: &'a Output<'a>,
     recursive: &HashSet<String>,
     out: &mut HashMap<String, FnMeta<'a>>,
-    unary: &mut HashMap<String, UnaryRecShape>,
+    shapes: &mut HashMap<String, RecMeasureShape>,
     tail_only: &mut HashSet<String>,
 ) {
     match ast.1.as_ref() {
         Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
             for item in items {
-                collect_fn_meta(item, recursive, out, unary, tail_only);
+                collect_fn_meta(item, recursive, out, shapes, tail_only);
             }
         }
-        Expression::Module(_, body) => collect_fn_meta(body, recursive, out, unary, tail_only),
+        Expression::Module(_, body) => collect_fn_meta(body, recursive, out, shapes, tail_only),
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
-        | Expression::Group(inner) => collect_fn_meta(inner, recursive, out, unary, tail_only),
+        | Expression::Group(inner) => collect_fn_meta(inner, recursive, out, shapes, tail_only),
         Expression::Function {
             attrs,
             name,
@@ -387,24 +368,24 @@ fn collect_fn_meta<'a>(
                     attrs,
                 },
             );
-            if let Some(shape) = detect_unary_shape(name, args, body) {
-                unary.insert((*name).to_string(), shape);
+            if let Some(shape) = detect_measure_shape(name, args, body) {
+                shapes.insert((*name).to_string(), shape);
             }
             if is_tail_only_recursive(body, name) {
                 tail_only.insert((*name).to_string());
             }
-            collect_fn_meta(body, recursive, out, unary, tail_only);
+            collect_fn_meta(body, recursive, out, shapes, tail_only);
         }
         Expression::Function {
             body: Some(body), ..
-        } => collect_fn_meta(body, recursive, out, unary, tail_only),
+        } => collect_fn_meta(body, recursive, out, shapes, tail_only),
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                collect_fn_meta(m, recursive, out, unary, tail_only);
+                collect_fn_meta(m, recursive, out, shapes, tail_only);
             }
         }
         Expression::Method(_, inner) | Expression::Member(inner) => {
-            collect_fn_meta(inner, recursive, out, unary, tail_only);
+            collect_fn_meta(inner, recursive, out, shapes, tail_only);
         }
         _ => {}
     }
@@ -412,7 +393,7 @@ fn collect_fn_meta<'a>(
 
 fn body_calls_self(body: &Output<'_>, name: &str) -> bool {
     let mut found = false;
-    walk_calls(body, &mut |callee, _| {
+    walk_all_calls(body, &mut |callee, _| {
         if callee == name {
             found = true;
         }
@@ -420,50 +401,233 @@ fn body_calls_self(body: &Output<'_>, name: &str) -> bool {
     found
 }
 
-fn detect_unary_shape(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<UnaryRecShape> {
-    let param = single_int_param(args)?;
-    let mut base = None;
-    let mut sub = None;
-    walk_unary_shape(body, name, &param, &mut base, &mut sub);
-    let sub = sub?;
-    if sub <= 0 {
+/// Pick the first int/byte param that has a base case and decreases on every self-call.
+fn detect_measure_shape(
+    name: &str,
+    args: &Output<'_>,
+    body: &Output<'_>,
+) -> Option<RecMeasureShape> {
+    let params = int_like_params(args);
+    if params.is_empty() {
         return None;
     }
-    // Dual recursive binop is handled by RecParShape; skip if both arms recurse.
-    if looks_like_dual_rec(body, name) {
+    let self_calls = collect_self_calls(body, name);
+    if self_calls.is_empty() {
         return None;
     }
-    Some(UnaryRecShape {
-        param,
-        sub,
-        base_bound: base,
-    })
-}
 
-fn looks_like_dual_rec(body: &Output<'_>, name: &str) -> bool {
-    let mut count = 0;
-    walk_calls(body, &mut |callee, _| {
-        if callee == name {
-            count += 1;
+    for (measure_index, measure_param) in params.iter().enumerate() {
+        let base_bound = find_base_bound(body, measure_param);
+        let mut min_step: Option<i64> = None;
+        let mut ok = true;
+        for call_args in &self_calls {
+            let Some(arg) = call_args.get(measure_index) else {
+                ok = false;
+                break;
+            };
+            let Some(step) = match_param_minus_const(peel(arg), measure_param) else {
+                ok = false;
+                break;
+            };
+            min_step = Some(match min_step {
+                Some(m) => m.min(step),
+                None => step,
+            });
         }
-    });
-    count >= 2
+        if !ok {
+            continue;
+        }
+        let Some(min_step) = min_step else {
+            continue;
+        };
+        if min_step <= 0 {
+            continue;
+        }
+        // Accept shape even without base_bound so diagnostics can ask for a base case.
+        return Some(RecMeasureShape {
+            measure_param: measure_param.clone(),
+            measure_index,
+            base_bound,
+            min_step,
+            self_calls: self_calls.len(),
+        });
+    }
+    None
 }
 
-fn walk_unary_shape(
-    ast: &Output<'_>,
+fn int_like_params(args: &Output<'_>) -> Vec<String> {
+    let items = match args.1.as_ref() {
+        Expression::Fragment(items) | Expression::Block(items) => items.as_slice(),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let arg = peel(item);
+        let Expression::Argument { name, ty, .. } = arg.1.as_ref() else {
+            continue;
+        };
+        let Some(ty) = ty else {
+            continue;
+        };
+        let ty_name = match peel(ty).1.as_ref() {
+            Expression::Type(t) | Expression::Identifier(t) => *t,
+            _ => continue,
+        };
+        if matches!(ty_name, "int" | "byte") {
+            out.push((*name).to_string());
+        }
+    }
+    out
+}
+
+/// All self-call argument lists in `body` (order of discovery).
+fn collect_self_calls<'a>(body: &'a Output<'a>, fn_name: &str) -> Vec<&'a [Output<'a>]> {
+    let mut out = Vec::new();
+    walk_self_calls(body, fn_name, &mut out);
+    out
+}
+
+fn walk_self_calls<'a>(
+    ast: &'a Output<'a>,
     fn_name: &str,
-    param: &str,
-    base: &mut Option<i64>,
-    sub: &mut Option<i64>,
+    out: &mut Vec<&'a [Output<'a>]>,
 ) {
+    match ast.1.as_ref() {
+        Expression::Program(items)
+        | Expression::Block(items)
+        | Expression::Fragment(items)
+        | Expression::List(items)
+        | Expression::Array(items)
+        | Expression::Tuple(items)
+        | Expression::If(items) => {
+            for item in items {
+                walk_self_calls(item, fn_name, out);
+            }
+        }
+        Expression::Branch(cond, body) => {
+            if let Some(c) = cond {
+                walk_self_calls(c, fn_name, out);
+            }
+            walk_self_calls(body, fn_name, out);
+        }
+        Expression::Call { name, args } => {
+            let callee = match peel(name).1.as_ref() {
+                Expression::Identifier(n) => Some(*n),
+                _ => None,
+            };
+            if let Some(args) = args {
+                for a in args {
+                    walk_self_calls(a, fn_name, out);
+                }
+                if callee == Some(fn_name) {
+                    out.push(args.as_slice());
+                }
+            }
+            walk_self_calls(name, fn_name, out);
+        }
+        Expression::Statement(inner)
+        | Expression::Expr(inner)
+        | Expression::ExprStatement(inner)
+        | Expression::Group(inner)
+        | Expression::Return(inner)
+        | Expression::ImplicitReturn(inner)
+        | Expression::Negate(inner)
+        | Expression::Not(inner)
+        | Expression::LogicalNot(inner)
+        | Expression::Positive(inner)
+        | Expression::Cast(inner, _)
+        | Expression::Try(inner)
+        | Expression::Readonly(inner)
+        | Expression::Panic(inner)
+        | Expression::Raise(inner)
+        | Expression::Yield(inner)
+        | Expression::YieldFrom(inner)
+        | Expression::TypeOf(inner) => walk_self_calls(inner, fn_name, out),
+        Expression::Add(a, b)
+        | Expression::Sub(a, b)
+        | Expression::Mul(a, b)
+        | Expression::Div(a, b)
+        | Expression::Mod(a, b)
+        | Expression::Pow(a, b)
+        | Expression::Shl(a, b)
+        | Expression::Shr(a, b)
+        | Expression::Xor(a, b)
+        | Expression::And(a, b)
+        | Expression::BitAnd(a, b)
+        | Expression::Or(a, b)
+        | Expression::BitOr(a, b)
+        | Expression::Eq(a, b)
+        | Expression::Neq(a, b)
+        | Expression::Le(a, b)
+        | Expression::Gt(a, b)
+        | Expression::Leq(a, b)
+        | Expression::Geq(a, b)
+        | Expression::Coalesce(a, b)
+        | Expression::Assignment(a, b)
+        | Expression::CompoundAssign(a, _, b) => {
+            walk_self_calls(a, fn_name, out);
+            walk_self_calls(b, fn_name, out);
+        }
+        Expression::Match { scrutinee, arms } => {
+            walk_self_calls(scrutinee, fn_name, out);
+            for arm in arms {
+                walk_self_calls(&arm.body, fn_name, out);
+            }
+        }
+        Expression::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(i) = init {
+                walk_self_calls(i, fn_name, out);
+            }
+            walk_self_calls(cond, fn_name, out);
+            if let Some(s) = step {
+                walk_self_calls(s, fn_name, out);
+            }
+            walk_self_calls(body, fn_name, out);
+        }
+        Expression::Loop {
+            identifier,
+            iterable,
+            body,
+        } => {
+            if let Some(id) = identifier {
+                walk_self_calls(id, fn_name, out);
+            }
+            walk_self_calls(iterable, fn_name, out);
+            walk_self_calls(body, fn_name, out);
+        }
+        Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
+            walk_self_calls(init, fn_name, out);
+        }
+        Expression::Function {
+            body: Some(body), ..
+        }
+        | Expression::Lambda { body, .. }
+        | Expression::Defer { body, .. }
+        | Expression::TestCase { body, .. } => walk_self_calls(body, fn_name, out),
+        Expression::NamedArg(_, v) => walk_self_calls(v, fn_name, out),
+        _ => {}
+    }
+}
+
+fn find_base_bound(body: &Output<'_>, param: &str) -> Option<i64> {
+    let mut base = None;
+    walk_base_bound(body, param, &mut base);
+    base
+}
+
+fn walk_base_bound(ast: &Output<'_>, param: &str, base: &mut Option<i64>) {
     match ast.1.as_ref() {
         Expression::Program(items)
         | Expression::Block(items)
         | Expression::Fragment(items)
         | Expression::If(items) => {
             for item in items {
-                walk_unary_shape(item, fn_name, param, base, sub);
+                walk_base_bound(item, param, base);
             }
         }
         Expression::Branch(cond, body) => {
@@ -472,53 +636,16 @@ fn walk_unary_shape(
             {
                 *base = Some(b);
             }
-            walk_unary_shape(body, fn_name, param, base, sub);
+            walk_base_bound(body, param, base);
         }
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
         | Expression::Group(inner)
         | Expression::Return(inner)
-        | Expression::ImplicitReturn(inner) => {
-            if let Some(s) = match_unary_rec_call(inner, fn_name, param) {
-                *sub = Some(s);
-            }
-            walk_unary_shape(inner, fn_name, param, base, sub);
-        }
-        Expression::Mul(a, b) | Expression::Add(a, b) | Expression::Sub(a, b) => {
-            if let Some(s) = match_unary_rec_call(a, fn_name, param) {
-                *sub = Some(s);
-            }
-            if let Some(s) = match_unary_rec_call(b, fn_name, param) {
-                *sub = Some(s);
-            }
-            walk_unary_shape(a, fn_name, param, base, sub);
-            walk_unary_shape(b, fn_name, param, base, sub);
-        }
+        | Expression::ImplicitReturn(inner) => walk_base_bound(inner, param, base),
         _ => {}
     }
-}
-
-fn match_unary_rec_call(expr: &Output<'_>, fn_name: &str, param: &str) -> Option<i64> {
-    let expr = peel(expr);
-    let Expression::Call {
-        name,
-        args: Some(args),
-    } = expr.1.as_ref()
-    else {
-        return None;
-    };
-    if args.len() != 1 {
-        return None;
-    }
-    let callee = match peel(name).1.as_ref() {
-        Expression::Identifier(n) => *n,
-        _ => return None,
-    };
-    if callee != fn_name {
-        return None;
-    }
-    match_param_minus_const(peel(&args[0]), param)
 }
 
 fn is_tail_only_recursive(body: &Output<'_>, name: &str) -> bool {
@@ -559,7 +686,8 @@ fn walk_tail_rec(
             name: callee,
             args,
         } => {
-            let is_self = matches!(peel(callee).1.as_ref(), Expression::Identifier(n) if *n == name);
+            let is_self =
+                matches!(peel(callee).1.as_ref(), Expression::Identifier(n) if *n == name);
             if is_self {
                 *self_calls += 1;
                 if !tail_ctx {
@@ -576,7 +704,11 @@ fn walk_tail_rec(
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
         | Expression::Div(a, b)
-        | Expression::Mod(a, b) => {
+        | Expression::Mod(a, b)
+        | Expression::Pow(a, b)
+        | Expression::BitAnd(a, b)
+        | Expression::BitOr(a, b)
+        | Expression::Xor(a, b) => {
             walk_tail_rec(a, name, false, self_calls, non_tail);
             walk_tail_rec(b, name, false, self_calls, non_tail);
         }
@@ -584,34 +716,336 @@ fn walk_tail_rec(
     }
 }
 
-fn collect_rec_call_sites(
+// ---------------------------------------------------------------------------
+// Entry sites + const environments
+// ---------------------------------------------------------------------------
+
+/// Param-slot constants known for each function (from all agreeing call sites).
+type FnConstParams = HashMap<String, Vec<Option<i64>>>;
+
+/// Shallow interprocedural: if every call site into `g` agrees on constant
+/// values for some param slots, record those for use inside `g`.
+fn propagate_const_args(ast: &Output<'_>, recursive: &HashSet<String>) -> FnConstParams {
+    let mut fn_params: HashMap<String, usize> = HashMap::new();
+    collect_fn_arities(ast, &mut fn_params);
+
+    // Gather raw call-site arg vectors (evaluated with empty/local env only first).
+    let mut site_args: HashMap<String, Vec<Vec<Option<i64>>>> = HashMap::new();
+    gather_call_site_args(ast, None, &HashMap::new(), &mut site_args);
+
+    // Fixed-point: refine wrapper consts, then re-gather with those envs.
+    let mut wrapper: FnConstParams = HashMap::new();
+    for _ in 0..8 {
+        let mut next: FnConstParams = HashMap::new();
+        for (name, sites) in &site_args {
+            if recursive.contains(name) {
+                continue; // only wrappers
+            }
+            let arity = fn_params.get(name).copied().unwrap_or(0);
+            if arity == 0 || sites.is_empty() {
+                continue;
+            }
+            let mut slots = vec![None; arity];
+            for i in 0..arity {
+                let mut agreed: Option<Option<i64>> = None;
+                for site in sites {
+                    let v = site.get(i).copied().flatten();
+                    match agreed {
+                        None => agreed = Some(v),
+                        Some(prev) if prev == v => {}
+                        Some(_) => {
+                            agreed = Some(None);
+                            break;
+                        }
+                    }
+                }
+                if let Some(Some(c)) = agreed {
+                    slots[i] = Some(c);
+                }
+            }
+            if slots.iter().any(|s| s.is_some()) {
+                next.insert(name.clone(), slots);
+            }
+        }
+        if next == wrapper {
+            break;
+        }
+        wrapper = next;
+        site_args.clear();
+        gather_call_site_args(ast, None, &wrapper, &mut site_args);
+    }
+    wrapper
+}
+
+fn collect_fn_arities(ast: &Output<'_>, out: &mut HashMap<String, usize>) {
+    match ast.1.as_ref() {
+        Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
+            for item in items {
+                collect_fn_arities(item, out);
+            }
+        }
+        Expression::Module(_, body) => collect_fn_arities(body, out),
+        Expression::Function {
+            name,
+            args,
+            body: Some(body),
+            ..
+        } => {
+            out.insert((*name).to_string(), count_params(args));
+            collect_fn_arities(body, out);
+        }
+        Expression::TestCase { body, .. } => collect_fn_arities(body, out),
+        _ => {}
+    }
+}
+
+fn count_params(args: &Output<'_>) -> usize {
+    let items = match args.1.as_ref() {
+        Expression::Fragment(items) | Expression::Block(items) => items.as_slice(),
+        _ => return 0,
+    };
+    items
+        .iter()
+        .filter(|i| matches!(peel(i).1.as_ref(), Expression::Argument { .. }))
+        .count()
+}
+
+fn gather_call_site_args(
+    ast: &Output<'_>,
+    inside: Option<&str>,
+    wrapper_consts: &FnConstParams,
+    out: &mut HashMap<String, Vec<Vec<Option<i64>>>>,
+) {
+    let mut env = HashMap::new();
+    if let Some(name) = inside
+        && let Some(slots) = wrapper_consts.get(name)
+    {
+        // Bind formal names from wrapper const params when available.
+        // Formal names are recovered only inside Function — here we just
+        // keep slot values for eval via a synthetic env filled by callers.
+        let _ = slots;
+    }
+    walk_gather_calls(ast, inside, wrapper_consts, &mut env, out);
+}
+
+fn walk_gather_calls(
+    ast: &Output<'_>,
+    inside: Option<&str>,
+    wrapper_consts: &FnConstParams,
+    env: &mut HashMap<String, ConstValue>,
+    out: &mut HashMap<String, Vec<Vec<Option<i64>>>>,
+) {
+    match ast.1.as_ref() {
+        Expression::Program(items) | Expression::Block(items) | Expression::If(items) => {
+            for item in items {
+                walk_gather_calls(item, inside, wrapper_consts, env, out);
+            }
+        }
+        Expression::Fragment(items) => {
+            if let Some((name, init)) = let_const_binding(items) {
+                walk_gather_calls(init, inside, wrapper_consts, env, out);
+                match eval_expr(init, env) {
+                    Some(v) => {
+                        env.insert(name.to_string(), v);
+                    }
+                    None => {
+                        env.remove(name);
+                    }
+                }
+            } else {
+                for item in items {
+                    walk_gather_calls(item, inside, wrapper_consts, env, out);
+                }
+            }
+        }
+        Expression::Module(_, body)
+        | Expression::Statement(body)
+        | Expression::Expr(body)
+        | Expression::ExprStatement(body)
+        | Expression::Group(body)
+        | Expression::Return(body)
+        | Expression::ImplicitReturn(body)
+        | Expression::Try(body) => {
+            walk_gather_calls(body, inside, wrapper_consts, env, out);
+        }
+        Expression::Branch(cond, body) => {
+            if let Some(c) = cond {
+                walk_gather_calls(c, inside, wrapper_consts, env, out);
+            }
+            walk_gather_calls(body, inside, wrapper_consts, env, out);
+        }
+        Expression::Assignment(lhs, rhs) => {
+            walk_gather_calls(rhs, inside, wrapper_consts, env, out);
+            if let Expression::Identifier(n) = peel(lhs).1.as_ref() {
+                env.remove(*n);
+            }
+        }
+        Expression::Add(a, b)
+        | Expression::Sub(a, b)
+        | Expression::Mul(a, b)
+        | Expression::Div(a, b)
+        | Expression::Mod(a, b)
+        | Expression::Eq(a, b)
+        | Expression::Neq(a, b)
+        | Expression::Le(a, b)
+        | Expression::Gt(a, b)
+        | Expression::Leq(a, b)
+        | Expression::Geq(a, b)
+        | Expression::Coalesce(a, b) => {
+            walk_gather_calls(a, inside, wrapper_consts, env, out);
+            walk_gather_calls(b, inside, wrapper_consts, env, out);
+        }
+        Expression::Call { name, args } => {
+            walk_gather_calls(name, inside, wrapper_consts, env, out);
+            let callee = match peel(name).1.as_ref() {
+                Expression::Identifier(n) => Some(*n),
+                _ => None,
+            };
+            let mut slot_vals = Vec::new();
+            if let Some(args) = args {
+                for a in args {
+                    walk_gather_calls(a, inside, wrapper_consts, env, out);
+                    slot_vals.push(eval_expr(a, env).and_then(|v| match v {
+                        ConstValue::Int(i) => Some(i),
+                        _ => None,
+                    }));
+                }
+            }
+            if let Some(cname) = callee {
+                out.entry(cname.to_string()).or_default().push(slot_vals);
+            }
+        }
+        Expression::Function {
+            name,
+            args,
+            body: Some(body),
+            ..
+        } => {
+            let mut inner = HashMap::new();
+            // Seed formals from wrapper const params.
+            if let Some(slots) = wrapper_consts.get(*name) {
+                seed_formals(args, slots, &mut inner);
+            }
+            walk_gather_calls(body, Some(*name), wrapper_consts, &mut inner, out);
+        }
+        Expression::TestCase { body, .. } => {
+            let mut inner = HashMap::new();
+            walk_gather_calls(body, None, wrapper_consts, &mut inner, out);
+        }
+        Expression::Lambda { body, .. } | Expression::Defer { body, .. } => {
+            walk_gather_calls(body, inside, wrapper_consts, env, out);
+        }
+        Expression::Match { scrutinee, arms } => {
+            walk_gather_calls(scrutinee, inside, wrapper_consts, env, out);
+            for arm in arms {
+                walk_gather_calls(&arm.body, inside, wrapper_consts, env, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn seed_formals(
+    args: &Output<'_>,
+    slots: &[Option<i64>],
+    env: &mut HashMap<String, ConstValue>,
+) {
+    let items = match args.1.as_ref() {
+        Expression::Fragment(items) | Expression::Block(items) => items.as_slice(),
+        _ => return,
+    };
+    let mut i = 0;
+    for item in items {
+        let arg = peel(item);
+        let Expression::Argument { name, .. } = arg.1.as_ref() else {
+            continue;
+        };
+        if let Some(Some(v)) = slots.get(i) {
+            env.insert((*name).to_string(), ConstValue::Int(*v));
+        }
+        i += 1;
+    }
+}
+
+fn collect_rec_entry_sites(
     ast: &Output<'_>,
     recursive: &HashSet<String>,
+    shapes: &HashMap<String, RecMeasureShape>,
+    wrapper_consts: &FnConstParams,
     consts: &mut HashMap<String, BTreeSet<i64>>,
     dynamic: &mut HashSet<String>,
 ) {
-    walk_entry_calls(ast, recursive, None, consts, dynamic);
+    let mut env = HashMap::new();
+    walk_entry_sites(
+        ast,
+        None,
+        recursive,
+        shapes,
+        wrapper_consts,
+        &mut env,
+        consts,
+        dynamic,
+    );
 }
 
-/// Collect *entry* call sites (calls from outside a function into a recursive
-/// function). Self-calls inside the body (`fib(n - 1)`) are not entries.
-fn walk_entry_calls(
+fn walk_entry_sites(
     ast: &Output<'_>,
-    recursive: &HashSet<String>,
     inside: Option<&str>,
+    recursive: &HashSet<String>,
+    shapes: &HashMap<String, RecMeasureShape>,
+    wrapper_consts: &FnConstParams,
+    env: &mut HashMap<String, ConstValue>,
     consts: &mut HashMap<String, BTreeSet<i64>>,
     dynamic: &mut HashSet<String>,
 ) {
     match ast.1.as_ref() {
-        Expression::Program(items)
-        | Expression::Block(items)
-        | Expression::Fragment(items)
-        | Expression::List(items)
-        | Expression::Array(items)
-        | Expression::Tuple(items)
-        | Expression::If(items) => {
+        Expression::Program(items) | Expression::Block(items) | Expression::If(items) => {
             for item in items {
-                walk_entry_calls(item, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    item,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
+            }
+        }
+        Expression::Fragment(items) => {
+            if let Some((name, init)) = let_const_binding(items) {
+                walk_entry_sites(
+                    init,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
+                match eval_expr(init, env) {
+                    Some(v) => {
+                        env.insert(name.to_string(), v);
+                    }
+                    None => {
+                        env.remove(name);
+                    }
+                }
+            } else {
+                for item in items {
+                    walk_entry_sites(
+                        item,
+                        inside,
+                        recursive,
+                        shapes,
+                        wrapper_consts,
+                        env,
+                        consts,
+                        dynamic,
+                    );
+                }
             }
         }
         Expression::Module(_, body)
@@ -633,14 +1067,30 @@ fn walk_entry_calls(
         | Expression::Yield(body)
         | Expression::YieldFrom(body)
         | Expression::TypeOf(body) => {
-            walk_entry_calls(body, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                body,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         Expression::Add(a, b)
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
         | Expression::Div(a, b)
         | Expression::Mod(a, b)
-        | Expression::Assignment(a, b)
+        | Expression::Pow(a, b)
+        | Expression::Shl(a, b)
+        | Expression::Shr(a, b)
+        | Expression::Xor(a, b)
+        | Expression::And(a, b)
+        | Expression::BitAnd(a, b)
+        | Expression::Or(a, b)
+        | Expression::BitOr(a, b)
         | Expression::Eq(a, b)
         | Expression::Neq(a, b)
         | Expression::Le(a, b)
@@ -648,18 +1098,69 @@ fn walk_entry_calls(
         | Expression::Leq(a, b)
         | Expression::Geq(a, b)
         | Expression::Coalesce(a, b) => {
-            walk_entry_calls(a, recursive, inside, consts, dynamic);
-            walk_entry_calls(b, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                a,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            walk_entry_sites(
+                b,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+        }
+        Expression::Assignment(lhs, rhs) => {
+            walk_entry_sites(
+                rhs,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            if let Expression::Identifier(n) = peel(lhs).1.as_ref() {
+                env.remove(*n);
+            }
         }
         Expression::Call { name, args } => {
-            walk_entry_calls(name, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                name,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
             let callee = match peel(name).1.as_ref() {
                 Expression::Identifier(n) => Some(*n),
                 _ => None,
             };
             if let Some(args) = args {
                 for a in args {
-                    walk_entry_calls(a, recursive, inside, consts, dynamic);
+                    walk_entry_sites(
+                        a,
+                        inside,
+                        recursive,
+                        shapes,
+                        wrapper_consts,
+                        env,
+                        consts,
+                        dynamic,
+                    );
                 }
             }
             let Some(cname) = callee else {
@@ -672,12 +1173,16 @@ fn walk_entry_calls(
             if inside == Some(cname) {
                 return;
             }
+            let measure_idx = shapes.get(cname).map(|s| s.measure_index).unwrap_or(0);
             match args {
-                Some(args) if args.len() == 1 => {
-                    if let Expression::Integer(n) = peel(&args[0]).1.as_ref() {
-                        consts.entry(cname.to_string()).or_default().insert(*n);
-                    } else {
-                        dynamic.insert(cname.to_string());
+                Some(args) if measure_idx < args.len() => {
+                    match eval_expr(&args[measure_idx], env) {
+                        Some(ConstValue::Int(n)) => {
+                            consts.entry(cname.to_string()).or_default().insert(n);
+                        }
+                        _ => {
+                            dynamic.insert(cname.to_string());
+                        }
                     }
                 }
                 _ => {
@@ -687,14 +1192,50 @@ fn walk_entry_calls(
         }
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {
-                walk_entry_calls(c, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    c,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
-            walk_entry_calls(body, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                body,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         Expression::Match { scrutinee, arms } => {
-            walk_entry_calls(scrutinee, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                scrutinee,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
             for arm in arms {
-                walk_entry_calls(&arm.body, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    &arm.body,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
         }
         Expression::For {
@@ -704,13 +1245,49 @@ fn walk_entry_calls(
             body,
         } => {
             if let Some(i) = init {
-                walk_entry_calls(i, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    i,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
-            walk_entry_calls(cond, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                cond,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
             if let Some(s) = step {
-                walk_entry_calls(s, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    s,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
-            walk_entry_calls(body, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                body,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         Expression::Loop {
             identifier,
@@ -718,192 +1295,165 @@ fn walk_entry_calls(
             body,
         } => {
             if let Some(id) = identifier {
-                walk_entry_calls(id, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    id,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
-            walk_entry_calls(iterable, recursive, inside, consts, dynamic);
-            walk_entry_calls(body, recursive, inside, consts, dynamic);
-        }
-        Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
-            walk_entry_calls(init, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                iterable,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
+            walk_entry_sites(
+                body,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         Expression::Function {
             name,
+            args,
             body: Some(body),
             ..
         } => {
-            walk_entry_calls(body, recursive, Some(*name), consts, dynamic);
+            let mut inner = HashMap::new();
+            if let Some(slots) = wrapper_consts.get(*name) {
+                seed_formals(args, slots, &mut inner);
+            }
+            walk_entry_sites(
+                body,
+                Some(*name),
+                recursive,
+                shapes,
+                wrapper_consts,
+                &mut inner,
+                consts,
+                dynamic,
+            );
         }
         Expression::Lambda { body, .. } | Expression::Defer { body, .. } => {
-            walk_entry_calls(body, recursive, inside, consts, dynamic);
+            walk_entry_sites(
+                body,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         Expression::TestCase { body, .. } => {
-            // Harness cases are entry contexts (not inside the recursive fn).
-            walk_entry_calls(body, recursive, None, consts, dynamic);
+            let mut inner = HashMap::new();
+            walk_entry_sites(
+                body,
+                None,
+                recursive,
+                shapes,
+                wrapper_consts,
+                &mut inner,
+                consts,
+                dynamic,
+            );
         }
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                walk_entry_calls(m, recursive, inside, consts, dynamic);
+                walk_entry_sites(
+                    m,
+                    inside,
+                    recursive,
+                    shapes,
+                    wrapper_consts,
+                    env,
+                    consts,
+                    dynamic,
+                );
             }
         }
-        Expression::Method(_, inner) | Expression::Member(inner) => {
-            walk_entry_calls(inner, recursive, inside, consts, dynamic);
+        Expression::Method(_, inner) | Expression::Member(inner) | Expression::NamedArg(_, inner) => {
+            walk_entry_sites(
+                inner,
+                inside,
+                recursive,
+                shapes,
+                wrapper_consts,
+                env,
+                consts,
+                dynamic,
+            );
         }
         _ => {}
     }
 }
 
-fn walk_calls(ast: &Output<'_>, f: &mut dyn FnMut(&str, Option<i64>)) {
+fn walk_all_calls(ast: &Output<'_>, f: &mut dyn FnMut(&str, Option<i64>)) {
     match ast.1.as_ref() {
         Expression::Program(items)
         | Expression::Block(items)
         | Expression::Fragment(items)
-        | Expression::List(items)
-        | Expression::Array(items)
-        | Expression::Tuple(items)
         | Expression::If(items) => {
             for item in items {
-                walk_calls(item, f);
+                walk_all_calls(item, f);
             }
         }
-        Expression::Module(_, body)
-        | Expression::Statement(body)
-        | Expression::Expr(body)
-        | Expression::ExprStatement(body)
-        | Expression::Group(body)
-        | Expression::Return(body)
-        | Expression::ImplicitReturn(body)
-        | Expression::Negate(body)
-        | Expression::Not(body)
-        | Expression::LogicalNot(body)
-        | Expression::Positive(body)
-        | Expression::Cast(body, _)
-        | Expression::Try(body)
-        | Expression::Readonly(body) => walk_calls(body, f),
-        Expression::Add(a, b)
-        | Expression::Sub(a, b)
-        | Expression::Mul(a, b)
-        | Expression::Div(a, b)
-        | Expression::Mod(a, b)
-        | Expression::Assignment(a, b)
-        | Expression::Eq(a, b)
-        | Expression::Neq(a, b)
-        | Expression::Le(a, b)
-        | Expression::Gt(a, b)
-        | Expression::Leq(a, b)
-        | Expression::Geq(a, b)
-        | Expression::Coalesce(a, b) => {
-            walk_calls(a, f);
-            walk_calls(b, f);
-        }
         Expression::Call { name, args } => {
-            walk_calls(name, f);
             let callee = match peel(name).1.as_ref() {
                 Expression::Identifier(n) => Some(*n),
                 _ => None,
             };
             if let Some(args) = args {
                 for a in args {
-                    walk_calls(a, f);
+                    walk_all_calls(a, f);
                 }
-                if let Some(cname) = callee {
-                    if args.len() == 1 {
-                        if let Expression::Integer(n) = peel(&args[0]).1.as_ref() {
-                            f(cname, Some(*n));
-                        } else {
-                            f(cname, None);
-                        }
-                    } else {
-                        f(cname, None);
-                    }
-                }
-            } else if let Some(cname) = callee {
-                f(cname, None);
             }
-        }
-        Expression::Branch(cond, body) => {
-            if let Some(c) = cond {
-                walk_calls(c, f);
+            if let Some(c) = callee {
+                f(c, None);
             }
-            walk_calls(body, f);
-        }
-        Expression::Match { scrutinee, arms } => {
-            walk_calls(scrutinee, f);
-            for arm in arms {
-                walk_calls(&arm.body, f);
-            }
-        }
-        Expression::For {
-            init,
-            cond,
-            step,
-            body,
-        } => {
-            if let Some(i) = init {
-                walk_calls(i, f);
-            }
-            walk_calls(cond, f);
-            if let Some(s) = step {
-                walk_calls(s, f);
-            }
-            walk_calls(body, f);
-        }
-        Expression::Loop {
-            identifier,
-            iterable,
-            body,
-        } => {
-            if let Some(id) = identifier {
-                walk_calls(id, f);
-            }
-            walk_calls(iterable, f);
-            walk_calls(body, f);
-        }
-        Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
-            walk_calls(init, f);
         }
         Expression::Function {
             body: Some(body), ..
         }
+        | Expression::TestCase { body, .. }
         | Expression::Lambda { body, .. }
         | Expression::Defer { body, .. }
-        | Expression::TestCase { body, .. } => walk_calls(body, f),
-        Expression::Implementation { methods, .. } => {
-            for m in methods {
-                walk_calls(m, f);
-            }
+        | Expression::Return(body)
+        | Expression::ImplicitReturn(body)
+        | Expression::Statement(body)
+        | Expression::Expr(body)
+        | Expression::Group(body) => walk_all_calls(body, f),
+        Expression::Add(a, b)
+        | Expression::Sub(a, b)
+        | Expression::Mul(a, b)
+        | Expression::Div(a, b)
+        | Expression::Mod(a, b) => {
+            walk_all_calls(a, f);
+            walk_all_calls(b, f);
         }
-        Expression::Method(_, inner) | Expression::Member(inner) => walk_calls(inner, f),
+        Expression::Branch(cond, body) => {
+            if let Some(c) = cond {
+                walk_all_calls(c, f);
+            }
+            walk_all_calls(body, f);
+        }
         _ => {}
     }
-}
-
-fn single_int_param(args: &Output<'_>) -> Option<String> {
-    let items = match args.1.as_ref() {
-        Expression::Fragment(items) | Expression::Block(items) => items.as_slice(),
-        _ => return None,
-    };
-    let mut found = None;
-    for item in items {
-        let arg = peel(item);
-        let Expression::Argument { name, ty, .. } = arg.1.as_ref() else {
-            continue;
-        };
-        let Some(ty) = ty else {
-            return None;
-        };
-        let ty_name = match peel(ty).1.as_ref() {
-            Expression::Type(t) | Expression::Identifier(t) => *t,
-            _ => continue,
-        };
-        if !matches!(ty_name, "int" | "byte") {
-            return None;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some((*name).to_string());
-    }
-    found
 }
 
 fn match_base_bound(cond: &Output<'_>, param: &str) -> Option<i64> {
@@ -946,6 +1496,22 @@ fn match_param_minus_const(expr: &Output<'_>, param: &str) -> Option<i64> {
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+/// `let x = e` / `const x = e` parse as `Fragment([Variable|Constant, e])`.
+/// The second field of Variable/Constant is a type annotation, not the initializer.
+fn let_const_binding<'a>(items: &'a [Output<'a>]) -> Option<(&'a str, &'a Output<'a>)> {
+    if items.len() != 2 {
+        return None;
+    }
+    match peel(&items[0]).1.as_ref() {
+        Expression::Variable(n, _) => Some((*n, &items[1])),
+        Expression::Constant(name_e, _) => match peel(name_e).1.as_ref() {
+            Expression::Identifier(n) => Some((*n, &items[1])),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -997,7 +1563,6 @@ fn main() {
             .find(|b| b.fn_name == "fib")
             .expect("fib bound");
         assert_eq!(b.source, BoundSource::Proven);
-        // (10 - 2) / 1 + 1 = 9
         assert_eq!(b.max_frames, 9);
     }
 
@@ -1018,11 +1583,11 @@ fn main() {
         let report = analyze_stack_bounds(&ast);
         assert!(report.messages.is_empty(), "{:?}", report.messages);
         let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
-        assert_eq!(b.max_frames, 31); // (32-2)/1 + 1
+        assert_eq!(b.max_frames, 31);
     }
 
     #[test]
-    fn dynamic_rec_requires_max_depth() {
+    fn traced_local_const_is_proven() {
         let ast = parse(
             r#"
 fn fib(int n) -> int {
@@ -1032,6 +1597,28 @@ fn fib(int n) -> int {
 fn main() {
     let k = 10;
     let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 9);
+    }
+
+    #[test]
+    fn dynamic_rec_requires_max_depth() {
+        let ast = parse(
+            r#"
+fn noise() -> int { return 10; }
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let x = fib(noise());
     return;
 }
 "#,
@@ -1056,9 +1643,9 @@ fn fib(int n) -> int {
     if n <= 2 { return 1; }
     return fib(n - 1) + fib(n - 2);
 }
+fn noise() -> int { return 10; }
 fn main() {
-    let k = 10;
-    let x = fib(k);
+    let x = fib(noise());
     return;
 }
 "#,
@@ -1068,6 +1655,152 @@ fn main() {
         let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
         assert_eq!(b.max_frames, 64);
         assert_eq!(b.source, BoundSource::Attribute);
+    }
+
+    #[test]
+    fn wrapper_const_propagates_to_fib() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn helper(int n) -> int {
+    return fib(n);
+}
+fn main() {
+    let x = helper(32);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 31);
+    }
+
+    #[test]
+    fn wrapper_traced_local_propagates_to_fib() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn helper(int n) -> int {
+    return fib(n);
+}
+fn main() {
+    let n = 30;
+    let x = helper(n);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 29);
+    }
+
+    #[test]
+    fn const_binding_entry_is_proven() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    const N = 10;
+    let x = fib(N);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 9);
+    }
+
+    #[test]
+    fn assignment_kills_traced_const() {
+        let ast = parse(
+            r#"
+fn noise() -> int { return 10; }
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    k = noise();
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|m| m.message().contains("max_depth")),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    #[test]
+    fn multi_arg_measure_is_proven() {
+        let ast = parse(
+            r#"
+fn go(int n, string s) -> int {
+    if n <= 0 { return 0; }
+    return go(n - 1, s) + 1;
+}
+fn main() {
+    let x = go(10, "hi");
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "go").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        // (10 - 0) / 1 + 1 = 11
+        assert_eq!(b.max_frames, 11);
+    }
+
+    #[test]
+    fn multi_call_body_with_div_mod_is_proven() {
+        let ast = parse(
+            r#"
+fn f(int n) -> int {
+    if n <= 1 { return 1; }
+    let a = f(n - 1);
+    let b = f(n - 2);
+    let c = f(n - 3);
+    return (a + b) / (c % 2 + 1);
+}
+fn main() {
+    let x = f(8);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "f").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        // min_step=1, base=1 → (8-1)/1+1 = 8
+        assert_eq!(b.max_frames, 8);
     }
 
     #[test]
@@ -1111,7 +1844,6 @@ fn main() {
         );
         let report = analyze_stack_bounds(&ast);
         assert!(report.messages.is_empty(), "{:?}", report.messages);
-        // (32-2)/1+1 = 31 frames → 31*16+16 = 512
         assert_eq!(report.operand_slots_needed, 512);
         assert!(report.operand_slots_needed > DEFAULT_OPERAND_STACK_SLOTS);
     }
@@ -1143,11 +1875,9 @@ fn main() {
         );
         let report = analyze_stack_bounds(&ast);
         assert!(
-            report
-                .messages
-                .iter()
-                .any(|m| m.code() == Some(ErrorCode::UnboundedRecursion)
-                    && m.message().contains("mutual")),
+            report.messages.iter().any(|m| {
+                m.code() == Some(ErrorCode::UnboundedRecursion) && m.message().contains("mutual")
+            }),
             "{:?}",
             report.messages
         );
@@ -1175,12 +1905,9 @@ fn main() {
         );
         let report = analyze_stack_bounds(&ast);
         assert!(report.messages.is_empty(), "{:?}", report.messages);
-        assert!(
-            report
-                .bounds
-                .iter()
-                .any(|b| b.fn_name == "ping" && b.source == BoundSource::Attribute && b.max_frames == 8)
-        );
+        assert!(report.bounds.iter().any(|b| {
+            b.fn_name == "ping" && b.source == BoundSource::Attribute && b.max_frames == 8
+        }));
     }
 
     #[test]
@@ -1201,7 +1928,6 @@ fn main() {
         assert!(report.messages.is_empty(), "{:?}", report.messages);
         let b = report.bounds.iter().find(|b| b.fn_name == "fact").unwrap();
         assert_eq!(b.source, BoundSource::Proven);
-        // (5 - 1) / 1 + 1 = 5
         assert_eq!(b.max_frames, 5);
     }
 
@@ -1218,9 +1944,13 @@ fn main() { let x = f(5); return; }
         );
         let lt_report = analyze_stack_bounds(&lt);
         assert!(lt_report.messages.is_empty(), "{:?}", lt_report.messages);
-        // base_bound for n < 3 is 2; (5-2)/1+1 = 4
         assert_eq!(
-            lt_report.bounds.iter().find(|b| b.fn_name == "f").unwrap().max_frames,
+            lt_report
+                .bounds
+                .iter()
+                .find(|b| b.fn_name == "f")
+                .unwrap()
+                .max_frames,
             4
         );
 
@@ -1235,9 +1965,13 @@ fn main() { let x = g(4); return; }
         );
         let eq_report = analyze_stack_bounds(&eq);
         assert!(eq_report.messages.is_empty(), "{:?}", eq_report.messages);
-        // base 0; (4-0)/1+1 = 5
         assert_eq!(
-            eq_report.bounds.iter().find(|b| b.fn_name == "g").unwrap().max_frames,
+            eq_report
+                .bounds
+                .iter()
+                .find(|b| b.fn_name == "g")
+                .unwrap()
+                .max_frames,
             5
         );
     }
@@ -1299,9 +2033,9 @@ fn fib(int n) -> int {
     if n <= 2 { return 1; }
     return fib(n - 1) + fib(n - 2);
 }
+fn noise() -> int { return 10; }
 fn main() {
-    let k = 10;
-    let x = fib(k);
+    let x = fib(noise());
     return;
 }
 "#,
@@ -1319,7 +2053,6 @@ fn main() {
 
     #[test]
     fn absurd_max_depth_emits_stack_depth_exceeded() {
-        // frames*16+16 > MAX ⇒ frames > 65535
         let ast = parse(
             r#"
 #[max_depth(65536)]
@@ -1327,9 +2060,9 @@ fn fib(int n) -> int {
     if n <= 2 { return 1; }
     return fib(n - 1) + fib(n - 2);
 }
+fn noise() -> int { return 10; }
 fn main() {
-    let k = 10;
-    let x = fib(k);
+    let x = fib(noise());
     return;
 }
 "#,
@@ -1386,7 +2119,6 @@ fn main() {
         let report = analyze_stack_bounds(&ast);
         assert!(report.messages.is_empty(), "{:?}", report.messages);
         let b = report.bounds.iter().find(|b| b.fn_name == "fib").unwrap();
-        // Proven depth 9 > attributed 5 → keep proven frames.
         assert_eq!(b.max_frames, 9);
         assert_eq!(b.source, BoundSource::Proven);
     }
@@ -1394,7 +2126,7 @@ fn main() {
     #[test]
     fn operand_slots_for_frames_clamps_and_floors() {
         assert_eq!(operand_slots_for_frames(1), DEFAULT_OPERAND_STACK_SLOTS);
-        assert_eq!(operand_slots_for_frames(9), DEFAULT_OPERAND_STACK_SLOTS); // 9*16+16=160
+        assert_eq!(operand_slots_for_frames(9), DEFAULT_OPERAND_STACK_SLOTS);
         assert_eq!(operand_slots_for_frames(31), 512);
         assert_eq!(
             operand_slots_for_frames(u32::MAX),
