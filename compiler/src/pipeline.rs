@@ -172,6 +172,7 @@ impl Pipeline {
             strings: Arc::from(strings.to_vec()),
             static_slot_count: self.static_slot_count(),
             debug: self.program_debug(),
+            operand_stack_slots: self.operand_stack_slots(),
         }));
     }
 
@@ -1132,6 +1133,11 @@ impl Pipeline {
 
     pub fn strings(&self) -> &[String] {
         self.compiler.strings()
+    }
+
+    /// Operand-stack capacity from the last compile's recursion-depth analysis.
+    pub fn operand_stack_slots(&self) -> u32 {
+        self.compiler.operand_stack_slots()
     }
 
     pub fn static_slot_count(&self) -> u32 {

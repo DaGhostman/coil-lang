@@ -37,7 +37,8 @@ pub use par_profit::{
 pub use purity::{RecursivePureSet, analyze_recursive_fns, analyze_recursive_pure};
 #[allow(unused_imports)] // public API re-export
 pub use stack_bound::{
-    BoundSource, FnStackBound, StackBoundReport, VM_OPERAND_STACK_SLOTS, analyze_stack_bounds,
+    BoundSource, DEFAULT_OPERAND_STACK_SLOTS, FnStackBound, MAX_OPERAND_STACK_SLOTS, StackBoundReport,
+    analyze_stack_bounds, operand_slots_for_frames,
 };
 pub use ty::Ty;
 pub use virtual_modules::{

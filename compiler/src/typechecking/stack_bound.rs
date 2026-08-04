@@ -15,11 +15,23 @@ use reporting::{ErrorCode, Message};
 use super::par_profit::{RecParShape, analyze_rec_par_shapes};
 use super::purity::analyze_recursive_fns;
 
-/// Default operand-stack capacity the VM pre-allocates (`Stack<Value, 8192>`).
-pub const VM_OPERAND_STACK_SLOTS: u32 = 8192;
+/// Default / minimum operand-stack capacity for programs without deep recursion.
+pub const DEFAULT_OPERAND_STACK_SLOTS: u32 = 256;
+
+/// Hard ceiling matching [`machine::MAX_OPERAND_STACK_SLOTS`].
+pub const MAX_OPERAND_STACK_SLOTS: u32 = 1_048_576;
 
 /// Conservative per-frame slot estimate when IL footprints are not yet known.
 const DEFAULT_FRAME_SLOTS: u32 = 16;
+
+/// Compute operand-stack slots from a max live-frame count.
+pub fn operand_slots_for_frames(max_frames: u32) -> u32 {
+    let need = max_frames
+        .saturating_mul(DEFAULT_FRAME_SLOTS)
+        .saturating_add(DEFAULT_FRAME_SLOTS);
+    need.max(DEFAULT_OPERAND_STACK_SLOTS)
+        .min(MAX_OPERAND_STACK_SLOTS)
+}
 
 /// Proven or attributed max live frames for one recursive function.
 #[derive(Debug, Clone)]
@@ -54,7 +66,7 @@ pub struct StackBoundReport {
 /// Analyze recursion depth bounds; emit errors when `#[max_depth]` is required.
 pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
     let mut report = StackBoundReport {
-        operand_slots_needed: DEFAULT_FRAME_SLOTS,
+        operand_slots_needed: DEFAULT_OPERAND_STACK_SLOTS,
         ..StackBoundReport::default()
     };
 
@@ -191,15 +203,16 @@ pub fn analyze_stack_bounds(ast: &Output<'_>) -> StackBoundReport {
         }
     }
 
-    report.operand_slots_needed = max_frames_any
+    report.operand_slots_needed = operand_slots_for_frames(max_frames_any);
+    if max_frames_any
         .saturating_mul(DEFAULT_FRAME_SLOTS)
-        .saturating_add(DEFAULT_FRAME_SLOTS) // main / callers
-        .min(VM_OPERAND_STACK_SLOTS);
-    if max_frames_any.saturating_mul(DEFAULT_FRAME_SLOTS) > VM_OPERAND_STACK_SLOTS {
+        .saturating_add(DEFAULT_FRAME_SLOTS)
+        > MAX_OPERAND_STACK_SLOTS
+    {
         report.messages.push(Message::error(
             ErrorCode::StackDepthExceeded,
             format!(
-                "estimated operand stack need exceeds the VM limit of {VM_OPERAND_STACK_SLOTS} slots"
+                "estimated operand stack need exceeds the VM limit of {MAX_OPERAND_STACK_SLOTS} slots"
             ),
             0..0,
         ));
@@ -1080,6 +1093,27 @@ fn main() {
             .unwrap();
         assert_eq!(b.source, BoundSource::TailOnly);
         assert_eq!(b.max_frames, 1);
+    }
+
+    #[test]
+    fn fib_bench_sizes_operand_stack_above_default() {
+        let ast = parse(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let x = fib(32);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        // (32-2)/1+1 = 31 frames → 31*16+16 = 512
+        assert_eq!(report.operand_slots_needed, 512);
+        assert!(report.operand_slots_needed > DEFAULT_OPERAND_STACK_SLOTS);
     }
 
     #[test]
