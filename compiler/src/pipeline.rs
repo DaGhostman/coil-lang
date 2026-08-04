@@ -1340,4 +1340,64 @@ fn main() { write_all(stdout(), to_bytes(format("%i", missing))); }"#;
         );
         assert!(pipeline.had_errors());
     }
+
+    #[test]
+    fn fib32_compile_sets_operand_stack_slots_above_default() {
+        let mut pipeline = Pipeline::new();
+        pipeline
+            .compile_src(
+                r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let x = fib(32);
+    return;
+}
+"#,
+            )
+            .expect("fib(32) must compile");
+        assert_eq!(pipeline.operand_stack_slots(), 512);
+    }
+
+    #[test]
+    fn non_recursive_compile_keeps_default_operand_stack_slots() {
+        let mut pipeline = Pipeline::new();
+        pipeline
+            .compile_src(
+                r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    let x = add(1, 2);
+    return;
+}
+"#,
+            )
+            .expect("compile");
+        assert_eq!(
+            pipeline.operand_stack_slots(),
+            crate::typechecking::DEFAULT_OPERAND_STACK_SLOTS
+        );
+    }
+
+    #[test]
+    fn dynamic_recursion_without_max_depth_fails_compile() {
+        let mut pipeline = Pipeline::new();
+        let err = pipeline.compile_src(
+            r#"
+fn fib(int n) -> int {
+    if n <= 2 { return 1; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let k = 10;
+    let x = fib(k);
+    return;
+}
+"#,
+        );
+        assert!(err.is_err());
+        assert!(pipeline.had_errors());
+    }
 }
