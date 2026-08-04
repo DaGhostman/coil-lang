@@ -59,10 +59,13 @@ beat Rust/`memcmp` slice equality.
 ## Callers today
 
 - `machine::packed_la` — `packed_dot` / `packed_matmul` / `packed_matrix_zip` /
-  `packed_matrix_neg` pack nested `Value` aggregates, call `coil-simd`, then
-  rebuild matrices.
+  `packed_matrix_neg` / **`packed_vec_arith`** (1-D aggregate `+ - * /` zip,
+  broadcast, and unary `-` when static length ≥ 8; smaller shapes still unroll)
 - String intern table lookup (`Heap` hash map) uses `bytes::eq` for key
   compares.
+
+Matrix `*` remains matmul; Hadamard `*` on bare tuples/arrays uses
+`packed_vec_arith`.
 
 ## Extending
 
