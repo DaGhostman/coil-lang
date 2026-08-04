@@ -13,8 +13,8 @@
 
 mod kernels;
 mod level;
-mod scalar;
 pub mod bytes;
+pub mod scalar;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;

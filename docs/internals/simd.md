@@ -34,6 +34,27 @@ safe API:
 `i64` multiply stays scalar on SSE2/AVX2 (no general 64-bit `mullo`); AVX-512DQ
 enables vectorized `i64` dot / matmul. Zip add/sub/neg vectorize on all levels.
 
+## Measuring SIMD vs scalar
+
+```bash
+cargo run -p coil-simd --release --example simd_report
+cargo bench -p coil-simd --bench simd_vs_scalar
+```
+
+`simd_report` compares public runtime-dispatched kernels against `coil_simd::scalar`
+on the host ISA (`SimdLevel`). Release builds often auto-vectorize the scalar
+loops; for a stricter non-SIMD baseline:
+
+```bash
+RUSTFLAGS="-C llvm-args=-vectorize-loops=false -C llvm-args=-vectorize-slp=false" \
+  cargo run -p coil-simd --release --example simd_report
+```
+
+On an AVX-512 host (Ryzen 7 7700), representative speedups with auto-vec
+**disabled** were roughly: `dot_f64` **~4–8×**, `matmul_f64` **~1.6–3.7×**,
+`matmul_i64` **~2.4–3.8×**, `zip_add_f64` **~1.5–3.4×**. `bytes::eq` does not
+beat Rust/`memcmp` slice equality.
+
 ## Callers today
 
 - `machine::packed_la` — `packed_dot` / `packed_matmul` / `packed_matrix_zip` /
