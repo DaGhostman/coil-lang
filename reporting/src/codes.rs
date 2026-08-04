@@ -77,6 +77,10 @@ pub enum ErrorCode {
     // --- Codegen (E08xx) ---
     UnknownExpression,
     CodegenError,
+    /// Recursive function depth cannot be proven; `#[max_depth(N)]` required.
+    UnboundedRecursion,
+    /// Proven / attributed recursion depth exceeds the VM operand-stack capacity.
+    StackDepthExceeded,
 
     // --- CLI / I/O (E09xx) ---
     IoError,
@@ -136,6 +140,8 @@ impl ErrorCode {
             Self::InvokeArity => "E0405",
             Self::UnknownExpression => "E0800",
             Self::CodegenError => "E0801",
+            Self::UnboundedRecursion => "E0802",
+            Self::StackDepthExceeded => "E0803",
             Self::IoError => "E0900",
             Self::ArchiveVersionMismatch => "E0901",
             Self::InvalidCliFlags => "E0902",
@@ -199,6 +205,8 @@ impl ErrorCode {
             Self::InvokeArity => "invoke argument mismatch",
             Self::UnknownExpression => "unknown expression in codegen",
             Self::CodegenError => "codegen error",
+            Self::UnboundedRecursion => "unbounded recursion depth",
+            Self::StackDepthExceeded => "stack depth exceeds VM limit",
             Self::IoError => "I/O error",
             Self::ArchiveVersionMismatch => "bytecode archive version mismatch",
             Self::InvalidCliFlags => "invalid CLI flags",
@@ -270,6 +278,8 @@ mod tests {
             | InvokeArity
             | UnknownExpression
             | CodegenError
+            | UnboundedRecursion
+            | StackDepthExceeded
             | IoError
             | ArchiveVersionMismatch
             | InvalidCliFlags
@@ -324,6 +334,8 @@ mod tests {
             InvokeArity,
             UnknownExpression,
             CodegenError,
+            UnboundedRecursion,
+            StackDepthExceeded,
             IoError,
             ArchiveVersionMismatch,
             InvalidCliFlags,
