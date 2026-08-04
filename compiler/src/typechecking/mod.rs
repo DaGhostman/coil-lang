@@ -12,6 +12,7 @@ pub mod id;
 pub mod infer;
 pub mod kind;
 pub mod pretty;
+pub mod purity;
 pub mod subst;
 pub mod ty;
 pub mod unify;
@@ -25,6 +26,8 @@ pub use aggregate_arith::{is_matrix_ty, unwrap_matrix_ty, wrap_matrix_ty};
 pub use infer::{CStructDef, CallbackSigDef, Checker, ForInInfo, ForInKind};
 #[allow(unused_imports)] // public API for kind-aware callers / tests
 pub use kind::Kind;
+#[allow(unused_imports)] // public API re-export
+pub use purity::{RecursivePureSet, analyze_recursive_pure};
 pub use ty::Ty;
 pub use virtual_modules::{
     BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,
