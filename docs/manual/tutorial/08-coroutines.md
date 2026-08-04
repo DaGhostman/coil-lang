@@ -133,6 +133,27 @@ fn main() {
 
 Output: `01` (from `examples/coro_yield_from.hy`).
 
+## `block_on` (drive to completion)
+
+Prelude `block_on(coro)` resumes until `done(coro)`, returning the **completion**
+value and discarding intermediate yields. Use it as the sync boundary for
+async IO work (see [IO reactor](../../internals/io-reactor.md)):
+
+```coil
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+
+async fn greet() -> int {
+    yield 1;
+    return 2;
+}
+
+fn main() {
+    let n = block_on(greet());
+    write_all(stdout(), to_bytes(format("%i", n)));  // 2
+}
+```
+
 ## Interleaving
 
 Two handles are independent — resuming one does not advance the other, even when both handles come from the same (possibly parameterized) `async fn`:

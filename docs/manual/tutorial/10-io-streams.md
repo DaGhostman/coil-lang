@@ -71,7 +71,8 @@ See `examples/io_text.hy`.
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | Wait on the [IO reactor](../../internals/io-reactor.md) (may help-steal CPU jobs) |
 | `await_readable` / `await_writable` | async await | Park the VM until ready; overlaps CPU work via help-steal |
 | `drive` | `() -> int` | Poll registered async waiters once; returns newly-ready count |
-| `set_read_timeout` / `set_write_timeout` | sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
+| `block_on` | prelude | Drive an `async fn` handle to completion (see [IO reactor](../../internals/io-reactor.md)) |
+| `set_read_timeout` / `set_write_timeout` | adapter config | Millisecond soft deadlines; `ms <= 0` clears |
 | `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, plus address / shutdown helpers |
 | `io::net::udp::*` | UDP | Datagram sockets; see below |
 | `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |

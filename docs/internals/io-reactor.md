@@ -9,41 +9,43 @@ coil keeps two runtime facets on each root [`Machine`](../../machine/src/vm.rs):
 
 They share a lifecycle (cloned onto pool workers) but **never** put blocking IO onto stealable CPU jobs.
 
-## Phase 1 — sync adapters
+## Async-first model
 
-`read_exact`, `read_to_end`, `write_all`, `accept_wait`, UDP `recv_from_wait`, and TLS
-handshake waits call [`IoReactor::wait_fd`](../../machine/src/io_reactor.rs) (via
-[`reactor_wait_fd`](../../machine/src/io.rs) / host TLS). Single-fd `poll` is used so
-regular files, pipes, and sockets all work.
+| Surface | Behavior |
+|---------|----------|
+| L0 `read` / `write` / `accept` | Always non-blocking; `WouldBlock` when not ready |
+| `await_readable` / `await_writable` | Park the VM (`PendingIoWait`) until ready; CPU help-steals |
+| `drive()` | `poll_once` on registered async waiters |
+| Convenience `write_all` / `read_exact` / … | Host loops L0 + reactor wait (same IO reactor) |
+| **`block_on(coro)`** (prelude) | Resume a coroutine until `done`; returns the completion value |
 
-When a CPU reactor is bound (`HostStateGuard`), waits use
-[`wait_fd_helping`](../../machine/src/io_reactor.rs): short poll slices interleaved with
-[`Reactor::help_once`](../../machine/src/reactor.rs) so fork-join work can progress
-during IO.
-
-## Phase 2 — true async await
-
-| Native | Behavior |
-|--------|----------|
-| `await_readable(s)` / `await_writable(s)` | If already ready → `Ok(())`. Else park the VM (`PendingIoWait`, like deferred FFI), help-steal until ready, then push `Ok(())`. |
-| `drive()` | `poll_once` on registered async waiters; returns newly-ready count. |
-
-L0 `read` / `write` stay non-blocking (`WouldBlock`). Prefer:
+Preferred DX — async work, sync boundary:
 
 ```coil
 use io::*;
-fn read_fully(Stream s, [byte] buf) -> Result<(), IoError> {
-    loop {
-        match read(s, buf)? {
-            Option::Some(_) => return Ok(()),
-            Option::None => return Ok(()), // EOF — adjust as needed
-        }
-        // WouldBlock path uses `?` → Err; match WouldBlock then await:
-    }
+async fn copy(Stream a, Stream b) -> Result<(), IoError> {
+    // L0 + await_* …
+}
+fn main() {
+    block_on(copy(in, out))?;
 }
 ```
 
-Or call `await_readable(s)?` before retrying L0 `read` after `WouldBlock`.
+`block_on` is auto-imported from `prelude`. Intermediate `yield`s are discarded;
+only the final `return` value is kept. IO `await_*` inside the coroutine still
+parks via the IO reactor between resumes.
+
+## Sync convenience adapters
+
+`read_exact`, `read_to_end`, `write_all`, `accept_wait`, UDP `recv_from_wait`, and TLS
+handshake waits call [`IoReactor::wait_fd`](../../machine/src/io_reactor.rs) (via
+[`reactor_wait_fd`](../../machine/src/io.rs)). They are **not** a second IO API —
+they are helpers that wait on the same reactor. Prefer `block_on` + `async fn`
+when structuring concurrent / overlapping work.
+
+When a CPU reactor is bound (`HostStateGuard`), waits use
+[`wait_fd_helping`](../../machine/src/io_reactor.rs): short poll slices interleaved with
+[`Reactor::help_once`](../../machine/src/reactor.rs).
 
 ## Env / knobs
 

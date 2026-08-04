@@ -13,9 +13,10 @@ use io::*;
 | `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
-| `read_exact` / `read_to_end` / `write_all` | Sync adapters | Wait on the [IO reactor](../internals/io-reactor.md) (CPU help-steal while blocked) |
+| `read_exact` / `read_to_end` / `write_all` | Convenience adapters | Wait on the [IO reactor](../internals/io-reactor.md); prefer `async fn` + prelude `block_on` for structured async |
 | `await_readable` / `await_writable` | Async await | Park VM until fd ready; see [io-reactor](../internals/io-reactor.md) |
 | `drive` | `() -> int` | Poll async waiters once |
+| `block_on` | Prelude | `block_on(coro) -> Y` — auto-imported; drives `async fn` to completion |
 | `set_read_timeout` / `set_write_timeout` | Sync adapter config | Millisecond soft deadlines; `ms <= 0` clears |
 | `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
 | `io::net::tcp::{connect,connect_timeout,listen,accept,accept_wait,accept_wait_timeout}` | TCP | Nested module — `use io::net::tcp::*;`; timeout `ms <= 0` waits forever |
