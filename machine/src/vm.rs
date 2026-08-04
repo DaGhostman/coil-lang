@@ -1057,23 +1057,6 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    fn clear_current_coro_io_wait(&mut self) {
-        let Some(ctx) = self.resume_stack.last() else {
-            return;
-        };
-        let coro_ptr = ctx.coro.as_ptr() as u64;
-        let old = {
-            let mut taken = None;
-            self.with_coroutine_mut(coro_ptr, |c| {
-                taken = c.io_wait.take();
-            });
-            taken
-        };
-        if let Some(tok) = old {
-            self.io_reactor.cancel_wait(tok);
-        }
-    }
-
     /// Register fd interest and yield so other coros / `wait_ready` can batch.
     ///
     /// Pushes `Ok(())` onto the coroutine stack before yielding so resume
