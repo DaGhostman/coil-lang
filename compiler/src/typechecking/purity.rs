@@ -476,4 +476,68 @@ fn main() { return; }
         );
         assert!(!set.contains("add"));
     }
+
+    #[test]
+    fn impurity_propagates_through_callees() {
+        let set = pure_set(
+            r#"
+use io::{stdout, write_all};
+use string::{format, to_bytes};
+fn leaf(int n) -> int {
+    write_all(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn rec(int n) -> int {
+    if n <= 1 { return leaf(n); }
+    return rec(n - 1) + rec(n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(!set.contains("leaf"), "leaf uses IO: {set:?}");
+        assert!(
+            !set.contains("rec"),
+            "rec must not be recursive-pure when it reaches impure leaf: {set:?}"
+        );
+    }
+
+    #[test]
+    fn index_store_marks_function_impure() {
+        let set = pure_set(
+            r#"
+fn bump(int n) -> int {
+    let a: [int] = [0];
+    a[0] = n;
+    if n <= 1 { return a[0]; }
+    return bump(n - 1) + bump(n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            !set.contains("bump"),
+            "index assignment is a side effect: {set:?}"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_without_self_call_excluded() {
+        let set = pure_set(
+            r#"
+fn a(int n) -> int {
+    if n <= 0 { return 0; }
+    return b(n - 1);
+}
+fn b(int n) -> int {
+    if n <= 0 { return 1; }
+    return a(n - 1);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            !set.contains("a") && !set.contains("b"),
+            "only self-recursive pure fns are auto-par candidates: {set:?}"
+        );
+    }
 }
