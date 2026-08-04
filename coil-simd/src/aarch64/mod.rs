@@ -35,6 +35,32 @@ pub unsafe fn zip_sub_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
 }
 
 #[target_feature(enable = "neon")]
+pub unsafe fn zip_mul_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| vmulq_f64(x, y), |x, y| x * y);
+}
+
+#[target_feature(enable = "neon")]
+pub unsafe fn zip_div_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| vdivq_f64(x, y), |x, y| x / y);
+}
+
+#[target_feature(enable = "neon")]
+pub unsafe fn scale_f64(a: &[f64], scalar: f64, out: &mut [f64]) {
+    let n = a.len().min(out.len());
+    let mut i = 0;
+    let vs = vdupq_n_f64(scalar);
+    while i + 2 <= n {
+        let va = vld1q_f64(a.as_ptr().add(i));
+        vst1q_f64(out.as_mut_ptr().add(i), vmulq_f64(va, vs));
+        i += 2;
+    }
+    while i < n {
+        *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
+        i += 1;
+    }
+}
+
+#[target_feature(enable = "neon")]
 pub unsafe fn zip_neg_f64(a: &[f64], out: &mut [f64]) {
     let n = a.len().min(out.len());
     let mut i = 0;

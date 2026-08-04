@@ -68,6 +68,48 @@ pub fn zip_neg_i64(a: &[i64], out: &mut [i64]) {
     }
 }
 
+#[inline]
+pub fn zip_mul_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    let n = a.len().min(b.len()).min(out.len());
+    for i in 0..n {
+        out[i] = a[i] * b[i];
+    }
+}
+
+#[inline]
+pub fn zip_mul_i64(a: &[i64], b: &[i64], out: &mut [i64]) {
+    let n = a.len().min(b.len()).min(out.len());
+    for i in 0..n {
+        out[i] = a[i].wrapping_mul(b[i]);
+    }
+}
+
+#[inline]
+pub fn zip_div_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    let n = a.len().min(b.len()).min(out.len());
+    for i in 0..n {
+        out[i] = a[i] / b[i];
+    }
+}
+
+/// `out[i] = a[i] * scalar` (broadcast multiply).
+#[inline]
+pub fn scale_f64(a: &[f64], scalar: f64, out: &mut [f64]) {
+    let n = a.len().min(out.len());
+    for i in 0..n {
+        out[i] = a[i] * scalar;
+    }
+}
+
+/// Wrapping `out[i] = a[i] * scalar`.
+#[inline]
+pub fn scale_i64(a: &[i64], scalar: i64, out: &mut [i64]) {
+    let n = a.len().min(out.len());
+    for i in 0..n {
+        out[i] = a[i].wrapping_mul(scalar);
+    }
+}
+
 /// Row-major C = A(m×k) * B(k×n). Accumulates with wrapping for `i64`.
 #[inline]
 pub fn matmul_f64(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: usize) {

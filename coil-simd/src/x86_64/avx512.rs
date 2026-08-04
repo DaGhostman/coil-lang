@@ -56,6 +56,32 @@ pub unsafe fn zip_sub_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
 }
 
 #[target_feature(enable = "avx512f")]
+pub unsafe fn zip_mul_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| _mm512_mul_pd(x, y), |x, y| x * y);
+}
+
+#[target_feature(enable = "avx512f")]
+pub unsafe fn zip_div_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| _mm512_div_pd(x, y), |x, y| x / y);
+}
+
+#[target_feature(enable = "avx512f")]
+pub unsafe fn scale_f64(a: &[f64], scalar: f64, out: &mut [f64]) {
+    let n = a.len().min(out.len());
+    let mut i = 0;
+    let vs = _mm512_set1_pd(scalar);
+    while i + 8 <= n {
+        let va = _mm512_loadu_pd(a.as_ptr().add(i));
+        _mm512_storeu_pd(out.as_mut_ptr().add(i), _mm512_mul_pd(va, vs));
+        i += 8;
+    }
+    while i < n {
+        *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
+        i += 1;
+    }
+}
+
+#[target_feature(enable = "avx512f")]
 pub unsafe fn zip_neg_f64(a: &[f64], out: &mut [f64]) {
     let n = a.len().min(out.len());
     let mut i = 0;
@@ -79,6 +105,30 @@ pub unsafe fn zip_add_i64(a: &[i64], b: &[i64], out: &mut [i64]) {
 #[target_feature(enable = "avx512f")]
 pub unsafe fn zip_sub_i64(a: &[i64], b: &[i64], out: &mut [i64]) {
     zip_binop_i64(a, b, out, |x, y| _mm512_sub_epi64(x, y), i64::wrapping_sub);
+}
+
+#[target_feature(enable = "avx512f", enable = "avx512dq")]
+pub unsafe fn zip_mul_i64(a: &[i64], b: &[i64], out: &mut [i64]) {
+    zip_binop_i64(a, b, out, |x, y| _mm512_mullo_epi64(x, y), i64::wrapping_mul);
+}
+
+#[target_feature(enable = "avx512f", enable = "avx512dq")]
+pub unsafe fn scale_i64(a: &[i64], scalar: i64, out: &mut [i64]) {
+    let n = a.len().min(out.len());
+    let mut i = 0;
+    let vs = _mm512_set1_epi64(scalar);
+    while i + 8 <= n {
+        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+        _mm512_storeu_si512(
+            out.as_mut_ptr().add(i) as *mut __m512i,
+            _mm512_mullo_epi64(va, vs),
+        );
+        i += 8;
+    }
+    while i < n {
+        *out.get_unchecked_mut(i) = (*a.get_unchecked(i)).wrapping_mul(scalar);
+        i += 1;
+    }
 }
 
 #[target_feature(enable = "avx512f")]

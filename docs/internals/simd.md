@@ -19,7 +19,8 @@ safe API:
 | `detect()` / `SimdLevel` | Cached runtime probe (`SSE2` / `AVX2` / `AVX-512` / `NEON` / scalar) |
 | `dot_f64` / `dot_i64` | Dot products |
 | `matmul_f64` / `matmul_i64` | Row-major GEMM (`C = A·B`) |
-| `zip_{add,sub,neg}_{f64,i64}` | Element-wise matrix zip / negate |
+| `zip_{add,sub,mul,neg}_{f64,i64}` | Element-wise zip / negate (`zip_div_f64` too) |
+| `scale_f64` / `scale_i64` | Broadcast multiply (`out[i] = a[i] * s`) |
 | `bytes::eq` / `bytes::xor` | Byte equality and XOR |
 
 ## Dispatch

@@ -69,6 +69,68 @@ fn bench_zip_add_f64(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_zip_add_i64(c: &mut Criterion) {
+    let mut group = c.benchmark_group("zip_add_i64");
+    for &n in &[64usize, 256, 1024, 4096, 16384] {
+        let a = fill_i64(n, 7);
+        let b = fill_i64(n, 3);
+        let mut out_s = vec![0; n];
+        let mut out_v = vec![0; n];
+        group.bench_function(format!("scalar/{n}"), |ben| {
+            ben.iter(|| {
+                scalar::zip_add_i64(black_box(&a), black_box(&b), black_box(&mut out_s));
+                black_box(&out_s);
+            })
+        });
+        group.bench_function(format!("simd/{n}"), |ben| {
+            ben.iter(|| {
+                coil_simd::zip_add_i64(black_box(&a), black_box(&b), black_box(&mut out_v));
+                black_box(&out_v);
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_zip_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("zip_mul");
+    for &n in &[256usize, 4096] {
+        let af = fill_f64(n, 0.5);
+        let bf = fill_f64(n, 0.3);
+        let ai = fill_i64(n, 7);
+        let bi = fill_i64(n, 3);
+        let mut of_s = vec![0.0; n];
+        let mut of_v = vec![0.0; n];
+        let mut oi_s = vec![0; n];
+        let mut oi_v = vec![0; n];
+        group.bench_function(format!("f64/scalar/{n}"), |ben| {
+            ben.iter(|| {
+                scalar::zip_mul_f64(black_box(&af), black_box(&bf), black_box(&mut of_s));
+                black_box(&of_s);
+            })
+        });
+        group.bench_function(format!("f64/simd/{n}"), |ben| {
+            ben.iter(|| {
+                coil_simd::zip_mul_f64(black_box(&af), black_box(&bf), black_box(&mut of_v));
+                black_box(&of_v);
+            })
+        });
+        group.bench_function(format!("i64/scalar/{n}"), |ben| {
+            ben.iter(|| {
+                scalar::zip_mul_i64(black_box(&ai), black_box(&bi), black_box(&mut oi_s));
+                black_box(&oi_s);
+            })
+        });
+        group.bench_function(format!("i64/simd/{n}"), |ben| {
+            ben.iter(|| {
+                coil_simd::zip_mul_i64(black_box(&ai), black_box(&bi), black_box(&mut oi_v));
+                black_box(&oi_v);
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_matmul_f64(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul_f64");
     for &dim in &[16usize, 32, 64, 128] {
@@ -171,6 +233,8 @@ criterion_group!(
     bench_dot_f64,
     bench_dot_i64,
     bench_zip_add_f64,
+    bench_zip_add_i64,
+    bench_zip_mul,
     bench_matmul_f64,
     bench_matmul_i64,
     bench_bytes_eq

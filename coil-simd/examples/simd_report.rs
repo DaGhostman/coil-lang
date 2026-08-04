@@ -110,6 +110,97 @@ fn main() {
         row(&format!("zip_add_f64/{n}"), s, v);
     }
 
+    for &n in &[64usize, 256, 1024, 4096, 16384] {
+        let a = fill_i64(n, 7);
+        let b = fill_i64(n, 3);
+        let mut out_s = vec![0; n];
+        let mut out_v = vec![0; n];
+        let iters = if n <= 256 {
+            100_000
+        } else if n <= 4096 {
+            30_000
+        } else {
+            8_000
+        };
+        let s = time_ns(iters, || {
+            scalar::zip_add_i64(black_box(&a), black_box(&b), black_box(&mut out_s));
+            black_box(&out_s);
+        });
+        let v = time_ns(iters, || {
+            coil_simd::zip_add_i64(black_box(&a), black_box(&b), black_box(&mut out_v));
+            black_box(&out_v);
+        });
+        row(&format!("zip_add_i64/{n}"), s, v);
+    }
+
+    for &n in &[64usize, 256, 1024, 4096, 16384] {
+        let a = fill_f64(n, 0.5);
+        let b = fill_f64(n, 0.3);
+        let mut out_s = vec![0.0; n];
+        let mut out_v = vec![0.0; n];
+        let iters = if n <= 256 {
+            100_000
+        } else if n <= 4096 {
+            30_000
+        } else {
+            8_000
+        };
+        let s = time_ns(iters, || {
+            scalar::zip_mul_f64(black_box(&a), black_box(&b), black_box(&mut out_s));
+            black_box(&out_s);
+        });
+        let v = time_ns(iters, || {
+            coil_simd::zip_mul_f64(black_box(&a), black_box(&b), black_box(&mut out_v));
+            black_box(&out_v);
+        });
+        row(&format!("zip_mul_f64/{n}"), s, v);
+    }
+
+    for &n in &[64usize, 256, 1024, 4096, 16384] {
+        let a = fill_i64(n, 7);
+        let b = fill_i64(n, 3);
+        let mut out_s = vec![0; n];
+        let mut out_v = vec![0; n];
+        let iters = if n <= 256 {
+            100_000
+        } else if n <= 4096 {
+            30_000
+        } else {
+            8_000
+        };
+        let s = time_ns(iters, || {
+            scalar::zip_mul_i64(black_box(&a), black_box(&b), black_box(&mut out_s));
+            black_box(&out_s);
+        });
+        let v = time_ns(iters, || {
+            coil_simd::zip_mul_i64(black_box(&a), black_box(&b), black_box(&mut out_v));
+            black_box(&out_v);
+        });
+        row(&format!("zip_mul_i64/{n}"), s, v);
+    }
+
+    for &n in &[64usize, 256, 1024, 4096, 16384] {
+        let a = fill_f64(n, 0.5);
+        let mut out_s = vec![0.0; n];
+        let mut out_v = vec![0.0; n];
+        let iters = if n <= 256 {
+            100_000
+        } else if n <= 4096 {
+            30_000
+        } else {
+            8_000
+        };
+        let s = time_ns(iters, || {
+            scalar::scale_f64(black_box(&a), black_box(2.5), black_box(&mut out_s));
+            black_box(&out_s);
+        });
+        let v = time_ns(iters, || {
+            coil_simd::scale_f64(black_box(&a), black_box(2.5), black_box(&mut out_v));
+            black_box(&out_v);
+        });
+        row(&format!("scale_f64/{n}"), s, v);
+    }
+
     for &dim in &[16usize, 32, 64, 128] {
         let m = dim;
         let k = dim;

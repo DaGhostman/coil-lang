@@ -57,6 +57,32 @@ pub unsafe fn zip_sub_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
 }
 
 #[target_feature(enable = "avx2")]
+pub unsafe fn zip_mul_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| _mm256_mul_pd(x, y), |x, y| x * y);
+}
+
+#[target_feature(enable = "avx2")]
+pub unsafe fn zip_div_f64(a: &[f64], b: &[f64], out: &mut [f64]) {
+    zip_binop_f64(a, b, out, |x, y| _mm256_div_pd(x, y), |x, y| x / y);
+}
+
+#[target_feature(enable = "avx2")]
+pub unsafe fn scale_f64(a: &[f64], scalar: f64, out: &mut [f64]) {
+    let n = a.len().min(out.len());
+    let mut i = 0;
+    let vs = _mm256_set1_pd(scalar);
+    while i + 4 <= n {
+        let va = _mm256_loadu_pd(a.as_ptr().add(i));
+        _mm256_storeu_pd(out.as_mut_ptr().add(i), _mm256_mul_pd(va, vs));
+        i += 4;
+    }
+    while i < n {
+        *out.get_unchecked_mut(i) = *a.get_unchecked(i) * scalar;
+        i += 1;
+    }
+}
+
+#[target_feature(enable = "avx2")]
 pub unsafe fn zip_neg_f64(a: &[f64], out: &mut [f64]) {
     let n = a.len().min(out.len());
     let mut i = 0;
