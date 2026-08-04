@@ -119,7 +119,7 @@ impl Reactor {
     /// Run at most one stolen job on a fresh helper VM (IO wait overlap).
     pub fn help_once(self: &Arc<Self>) {
         if let Some(job) = self.steal_job() {
-            let mut vm = Box::new(Machine::<WORKER_STACK_SLOTS>::default());
+            let mut vm = machine_for_program(&job.program);
             run_job_on_vm(&mut vm, job);
         }
     }
@@ -141,7 +141,7 @@ impl Reactor {
                 return r;
             }
             if let Some(job) = self.steal_job() {
-                let mut vm = Box::new(Machine::<WORKER_STACK_SLOTS>::default());
+                let mut vm = machine_for_program(&job.program);
                 run_job_on_vm(&mut vm, job);
                 continue;
             }
@@ -221,6 +221,19 @@ fn try_push_local(job: Job) -> Result<(), Job> {
     })
 }
 
+fn machine_for_program(program: &ThreadProgram) -> Box<Machine<WORKER_STACK_SLOTS>> {
+    Box::new(Machine::with_operand_capacity(
+        program.operand_stack_slots as usize,
+    ))
+}
+
+fn ensure_operand_capacity(vm: &mut Machine<WORKER_STACK_SLOTS>, slots: u32) {
+    let need = (slots as usize).max(1);
+    if vm.operand_stack_capacity() < need {
+        *vm = Machine::with_operand_capacity(need);
+    }
+}
+
 fn worker_loop(reactor: Arc<Reactor>) {
     let local = Worker::new_fifo();
     reactor.register_stealer(local.stealer());
@@ -241,7 +254,11 @@ fn worker_loop(reactor: Arc<Reactor>) {
             reactor.find_job(local_ref)
         });
         match job {
-            Some(job) => run_job_on_vm(&mut vm, job),
+            Some(job) => {
+                ensure_operand_capacity(&mut vm, job.program.operand_stack_slots);
+                vm.set_reactor(Arc::clone(&reactor));
+                run_job_on_vm(&mut vm, job);
+            }
             None => {
                 let g = reactor.sleep.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = reactor
@@ -271,7 +288,7 @@ fn wait_join_on_worker(
         if let Some(job) = job {
             // Heap-allocate the help VM so nested join-help does not blow the
             // OS stack with stacked `Machine` values.
-            let mut vm = Box::new(Machine::<WORKER_STACK_SLOTS>::default());
+            let mut vm = machine_for_program(&job.program);
             run_job_on_vm(&mut vm, job);
             continue;
         }
@@ -385,6 +402,7 @@ mod tests {
             strings: Arc::new(Vec::new()),
             static_slot_count: 0,
             debug: ProgramDebug::default(),
+            operand_stack_slots: crate::DEFAULT_OPERAND_STACK_SLOTS as u32,
         })
     }
 
