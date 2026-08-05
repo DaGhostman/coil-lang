@@ -342,18 +342,9 @@ impl Checker {
 
     /// Apply a `use` against virtual modules. Returns `true` when handled
     /// (caller should not treat it as a disk-module function import).
+    ///
+    /// Wildcard `use …::*` is rejected in `infer` (`E0124`) before this runs.
     pub fn apply_virtual_use(&mut self, path: &[String], name: &str, alias: Option<&str>) -> bool {
-        if name == "*" {
-            let Some(exports) = self.virtual_modules.resolve_glob(path) else {
-                return false;
-            };
-            let exports: Vec<_> = exports.to_vec();
-            for export in exports {
-                let local = export.short_name().to_string();
-                self.bind_virtual_export(local, export);
-            }
-            return true;
-        }
         let Some(export) = self.virtual_modules.resolve_item(path, name) else {
             return false;
         };
@@ -15003,13 +14994,10 @@ impl Checker {
 
     /// Whether `name` is a generic function (has type params).
     pub fn is_generic_fn(&self, name: &str) -> bool {
-        if self.generics.generic_fns.contains(name) {
-            return true;
-        }
-        // Cross-module: defining file registered `module::name`; importers
-        // call the bare alias after `use`.
-        let suffix = format!("::{name}");
-        self.generics.generic_fns.iter().any(|k| k.ends_with(&suffix))
+        // Exact keys only: defining modules register bare + FQN; importers get
+        // the local alias via [`Self::reexport_module_item`]. A `::{name}`
+        // suffix scan would mis-tag when another module exports the same local.
+        self.generics.generic_fns.contains(name)
     }
 
     /// Bind `local` to the defining module's scheme for `fqn` when known;
@@ -15022,17 +15010,18 @@ impl Checker {
             self.env
                 .insert_top(local.to_string(), Scheme::mono(Ty::Var(self.counter.fresh())));
         }
-        if self.generics.generic_fns.contains(fqn)
-            || self
-                .generics
-                .generic_fns
-                .iter()
-                .any(|k| k.ends_with(&format!("::{local}")) && k != local)
-        {
+        // Only the exact defining FQN — never a `::{local}` suffix heuristic
+        // (another module's generic with the same short name would mis-tag).
+        if self.generics.generic_fns.contains(fqn) {
             self.generics.generic_fns.insert(local.to_string());
-        }
-        if let Some(arity) = self.fn_dict_arity.get(fqn).copied() {
-            self.fn_dict_arity.insert(local.to_string(), arity);
+            self.generic_fns.insert(local.to_string());
+            if let Some(arity) = self.fn_dict_arity.get(fqn).copied() {
+                self.fn_dict_arity.insert(local.to_string(), arity);
+            }
+        } else {
+            self.generics.generic_fns.remove(local);
+            self.generic_fns.remove(local);
+            self.fn_dict_arity.remove(local);
         }
     }
 
@@ -15040,17 +15029,9 @@ impl Checker {
     /// function.  Returns 0 for non-generic functions or functions whose
     /// constraints are all built-in classes (Num / Ord / Eq / Show).
     pub fn dict_arity_for(&self, fn_name: &str) -> usize {
-        self.fn_dict_arity
-            .get(fn_name)
-            .copied()
-            .or_else(|| {
-                let suffix = format!("::{fn_name}");
-                self.fn_dict_arity
-                    .iter()
-                    .find(|(k, _)| k.ends_with(&suffix))
-                    .map(|(_, v)| *v)
-            })
-            .unwrap_or(0)
+        // Exact key only (see [`Self::is_generic_fn`]); re-export copies arity
+        // under the local alias when the defining FQN is generic.
+        self.fn_dict_arity.get(fn_name).copied().unwrap_or(0)
     }
 
     /// True for compiler-built-in typeclasses (Num / Ord / Eq / Show).

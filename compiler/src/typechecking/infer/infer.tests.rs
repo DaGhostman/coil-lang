@@ -5596,3 +5596,54 @@ fn main() {
             scheme
         );
     }
+
+    /// `reexport_module_item` must not mark a local alias generic just because
+    /// some *other* module registered `…::{same_local}` as generic.
+    #[test]
+    fn reexport_generic_mark_ignores_other_module_suffix() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("gen");
+        let gen_src = r#"
+fn foo<T: Ord>(T a, T b) -> T {
+    if a < b { return a; }
+    return b;
+}
+"#;
+        let ast = parser.parse(gen_src).expect("parse gen");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(c.is_generic_fn("gen::foo"));
+
+        c.set_current_module("plain");
+        let plain_src = r#"
+fn foo(int a) -> int {
+    return a;
+}
+"#;
+        let ast = parser.parse(plain_src).expect("parse plain");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(!c.is_generic_fn("plain::foo"));
+
+        c.set_current_module("");
+        let importer = r#"
+use plain::{foo};
+fn main() {
+    let x = foo(1);
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(
+            !c.is_generic_fn("foo"),
+            "importing non-generic plain::foo must not inherit gen::foo's generic tag"
+        );
+        assert_eq!(c.dict_arity_for("foo"), 0);
+        assert!(
+            c.is_generic_fn("gen::foo"),
+            "defining FQN must remain generic for other importers"
+        );
+    }
