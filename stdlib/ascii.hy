@@ -10,6 +10,17 @@ fn is_digit(byte c) -> bool {
     return c >= "0" && c <= "9";
 }
 
+/// True for an ASCII hex digit (`0`-`9`, `a`-`f`, `A`-`F`).
+fn is_hex(byte c) -> bool {
+    if is_digit(c) {
+        return true;
+    }
+    if c >= "a" && c <= "f" {
+        return true;
+    }
+    return c >= "A" && c <= "F";
+}
+
 /// True for an ASCII letter (`A` through `Z` or `a` through `z`).
 fn is_alpha(byte c) -> bool {
     if c >= "A" && c <= "Z" {
@@ -24,6 +35,33 @@ fn digit_val(byte c) -> int {
         return -1;
     }
     return (c as int) - (("0" as byte) as int);
+}
+
+/// Numeric value of an ASCII hex digit, or `-1` for another byte.
+fn hex_val(byte c) -> int {
+    let d = digit_val(c);
+    if d >= 0 {
+        return d;
+    }
+    if c >= "a" && c <= "f" {
+        return (c as int) - (("a" as byte) as int) + 10;
+    }
+    if c >= "A" && c <= "F" {
+        return (c as int) - (("A" as byte) as int) + 10;
+    }
+    return -1;
+}
+
+/// Lowercase hex digit for `0..=15`.
+fn hex_digit(int n) -> byte {
+    let zero: int = ("0" as byte) as int;
+    let a: int = ("a" as byte) as int;
+    if n < 10 {
+        let code = zero + n;
+        return code as byte;
+    }
+    let code = a + (n - 10);
+    return code as byte;
 }
 
 /// Decimal digit as a one-byte string. Callers must pass `0..=9`.
