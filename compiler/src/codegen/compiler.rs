@@ -3522,7 +3522,7 @@ impl Compiler {
                     args_tuple.0.into_range(),
                 );
                 m.push(DiagLabel::new(
-                    "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                    "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::{Int, Float, …}`"
                         .to_string(),
                     args_tuple.0.into_range(),
                 ));
@@ -8306,7 +8306,7 @@ impl Compiler {
                     }
                     return bytecode;
                 }
-                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
                 {
@@ -8328,7 +8328,7 @@ impl Compiler {
                     }
                     return bytecode;
                 }
-                // `open` / `read` / … after `use io::*` (or `use io::read as …`).
+                // `open` / `read` / … after `use io::{…}` (or `use io::read as …`).
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.io_fn_in_scope(fname)
                 {
@@ -10201,7 +10201,7 @@ impl Compiler {
                                             arg.0.into_range(),
                                         );
                                         m.push(DiagLabel::new(
-                                            "use Int/Ptr after `use ffi::types::*;`, a bare type name, [T], (T, U), or an extern struct".to_string(),
+                                            "use Int/Ptr after `use ffi::types::{Int, Ptr, …}`, a bare type name, [T], (T, U), or an extern struct".to_string(),
                                             arg.0.into_range(),
                                         ));
                                         m

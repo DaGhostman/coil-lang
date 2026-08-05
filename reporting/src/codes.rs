@@ -42,7 +42,7 @@ pub enum ErrorCode {
     /// A function name used in value position is ambiguous among overloads.
     AmbiguousOverload,
 
-    /// `use path::*` for a userland (disk) module — virtual modules may still glob.
+    /// `use path::*` — wildcards are banned; prelude is auto-imported instead.
     WildcardImport,
 
     /// Code after a diverging statement (`return` / `raise` / `panic` / infinite loop).
@@ -184,7 +184,7 @@ impl ErrorCode {
             Self::WrongArity => "no matching overload for argument count",
             Self::DuplicateOverload => "duplicate overload: conflicting arities",
             Self::AmbiguousOverload => "ambiguous overload in value position",
-            Self::WildcardImport => "wildcard import of userland module",
+            Self::WildcardImport => "wildcard import is not allowed",
             Self::UnreachableCode => "unreachable code",
             Self::DeferNeverRuns => "defer will never run on function exit",
             Self::DuplicateEnum => "duplicate enum",

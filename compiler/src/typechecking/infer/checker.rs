@@ -574,7 +574,7 @@ impl Checker {
         self.enum_arities.insert(name, arities);
     }
 
-    /// Scheme for a virtual `io` host native (inserted on `use io::*`).
+    /// Scheme for a virtual `io` host native (inserted on `use io::{…}`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
         #[cfg(feature = "tls")]
         use crate::typechecking::ty::record;
@@ -688,7 +688,7 @@ impl Checker {
         }
     }
 
-    /// Scheme for a virtual `thread` host native (inserted on `use thread::*`).
+    /// Scheme for a virtual `thread` host native (inserted on `use thread::{…}`).
     pub fn thread_fn_scheme(&mut self, kind: ThreadBuiltin) -> Scheme {
         use crate::typechecking::ty::{
             mutex_ty, receiver_ty, rwlock_ty, sender_ty, thread_ty, tuple,
@@ -817,7 +817,7 @@ impl Checker {
         }
     }
 
-    /// Scheme for a virtual `gc` host native (inserted on `use gc::*`).
+    /// Scheme for a virtual `gc` host native (inserted on `use gc::{…}`).
     pub fn gc_fn_scheme(&mut self, kind: GcBuiltin) -> Scheme {
         use crate::typechecking::ty::{root_app_ty, weak_app_ty};
         let fun = |params: &[Ty], ret: Ty| {
@@ -2185,6 +2185,25 @@ impl Checker {
             Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
             Expression::Use { path, name, alias } => {
+                let module_ns = path.join("::");
+                if name == "*" {
+                    // Prelude is injected automatically; every other module —
+                    // virtual or userland — requires explicit imports.
+                    let mod_label = if module_ns.is_empty() {
+                        "<entry>".to_string()
+                    } else {
+                        module_ns.clone()
+                    };
+                    return self.error_with_help(
+                        ErrorCode::WildcardImport,
+                        format!("wildcard import `use {}::*` is not allowed", mod_label),
+                        range,
+                        Some(format!(
+                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
+                            mod_label
+                        )),
+                    );
+                }
                 if self.apply_virtual_use(path, name, alias.as_deref()) {
                     // Bind FFI callables into the value env so Call sites
                     // resolve; enums/traits/tags are scope-only.
@@ -2213,29 +2232,6 @@ impl Checker {
                         }
                     }
                     return unit_ty();
-                }
-                let module_ns = path.join("::");
-                if name == "*" {
-                    // Userland (disk) modules require explicit imports.
-                    // Virtual modules (including prelude) still allow `::*`
-                    // via `apply_virtual_use` above.
-                    let mod_label = if module_ns.is_empty() {
-                        "<entry>".to_string()
-                    } else {
-                        module_ns.clone()
-                    };
-                    return self.error_with_help(
-                        ErrorCode::WildcardImport,
-                        format!(
-                            "wildcard import `use {}::*` is not allowed for userland modules",
-                            mod_label
-                        ),
-                        range,
-                        Some(format!(
-                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; `::*` is only for virtual modules (prelude is auto-imported)",
-                            mod_label
-                        )),
-                    );
                 }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
                 let fqn = if module_ns.is_empty() {
@@ -3067,7 +3063,7 @@ impl Checker {
                         | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
                     };
                 }
-                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
                     if has_named {
                         return self.error_with_help(
@@ -3089,10 +3085,9 @@ impl Checker {
                         ErrorCode::UnknownValue,
                         format!("Cannot find value `{}` in this scope", ident),
                         range,
-                        Some(format!(
-                            "import it with `use ffi::{};` or `use ffi::*;`",
-                            ident
-                        )),
+                        Some(
+                            "import it with `use ffi::{dload, declare, invoke}`".to_string(),
+                        ),
                     );
                 }
 
@@ -3761,7 +3756,7 @@ impl Checker {
 
             // ---- Userland FFI builtins ----
             //
-            // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::*`.
+            // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::{…}`.
             Expression::Dload(path) => self.infer_ffi_dload(std::slice::from_ref(path), range),
             // `done(h)` — true when coroutine handle `h` is Done.
             Expression::Done(handle) => {
@@ -9845,7 +9840,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `dload` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::dload;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{dload}`".to_string()),
             );
         }
         if let Some(path) = args.first() {
@@ -9868,7 +9863,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `declare` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::declare;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{declare}`".to_string()),
             );
         }
         if args.len() == 4 || args.len() == 5 {
@@ -9886,7 +9881,7 @@ impl Checker {
                         args[2].0.into_range(),
                     );
                     m.push(Label::new(
-                        "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                        "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::{Int, Float, …}`"
                             .to_string(),
                         args[2].0.into_range(),
                     ));
@@ -9929,7 +9924,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `invoke` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::invoke;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{invoke}`".to_string()),
             );
         }
         let mut ret_ty = int();
@@ -10033,7 +10028,7 @@ impl Checker {
                 if let Some(id) = self.c_struct_id(name) {
                     return Some((tag::STRUCT, id));
                 }
-                // In-scope `use ffi::types::*` tags (`Int`, `Ptr`, …).
+                // In-scope `use ffi::types::{…}` tags (`Int`, `Ptr`, …).
                 if self.ffi_tag_in_scope(name) {
                     return tag_from_variant_name(name).map(|t| (t, 0));
                 }
@@ -10079,7 +10074,7 @@ impl Checker {
             expr.0.into_range(),
         );
         m.push(Label::new(
-            "use `Int`/`Ptr` after `use ffi::types::*;`, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
+            "use `Int`/`Ptr` after `use ffi::types::{Int, Ptr, …}`, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
         ));
         self.messages.push(m);
@@ -10520,7 +10515,7 @@ impl Checker {
         self_ty: Option<&Ty>,
         is_coro: bool,
         // When set, this is an inherent `impl` method. Bare `name` must
-        // not shadow imports (`use thread::*;` → `send`); recursion uses
+        // not shadow imports (`use thread::{send}` → `send`); recursion uses
         // `self.name(...)` / `Owner::name(...)` instead.
         method_owner: Option<&str>,
         is_static_method: bool,
@@ -10645,7 +10640,7 @@ impl Checker {
 
         // Monomorphic recursion: bind a fresh α so the body can call this
         // function. Inherent methods bind `Owner::name` only — never the
-        // bare name — so `use thread::*;`/`send` is not shadowed by
+        // bare name — so `use thread::{send}` is not shadowed by
         // `impl Foo { fn send(...) { send(...) } }`.
         let alpha = self.counter.fresh();
 
@@ -12566,7 +12561,7 @@ impl Checker {
                     format!("Cannot find enum `{}` in this scope", enum_name),
                     range,
                     Some(
-                        "import tags with `use ffi::types::*;` (or write `ffi::types::Int`)"
+                        "import tags with `use ffi::types::{Int, Ptr, …}` (or write `ffi::types::Int`)"
                             .to_string(),
                     ),
                 );
