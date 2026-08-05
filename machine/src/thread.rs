@@ -1431,6 +1431,23 @@ mod tests {
     }
 
     #[test]
+    fn portable_rejects_root_and_weak_handles() {
+        use crate::gc_handles::{host_gc_root, host_gc_weak};
+
+        let mut heap = Heap::default();
+        let root = host_gc_root(&mut heap, &[Value::from(1_i64)]);
+        assert_eq!(
+            value_to_portable(&heap, root),
+            Err(ThreadErrorTag::NotSendable)
+        );
+        let weak = host_gc_weak(&mut heap, &[Value::from(2_i64)]);
+        assert_eq!(
+            value_to_portable(&heap, weak),
+            Err(ThreadErrorTag::NotSendable)
+        );
+    }
+
+    #[test]
     fn portable_round_trips_channel_and_lock_handles() {
         let mut heap = Heap::default();
         let (tx, rx) = channel_pair(&mut heap);
