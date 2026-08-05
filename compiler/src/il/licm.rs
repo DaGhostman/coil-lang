@@ -41,9 +41,11 @@ fn licm_stack_producers(ops: &mut Vec<IlOp>) {
                 IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } => {
                     hoist.push((i, ops[i].clone()));
                 }
-                IlOp::Load { slot, .. } if !stored.contains(slot) => {
-                    hoist.push((i, ops[i].clone()));
-                }
+                // Do not hoist bare `Load`: even when the slot is unchanged,
+                // the push is needed every iteration (e.g. `while len(a) < n`
+                // → LOAD; ArrayLen). Hoisting leaves the back-edge without a
+                // producer and empties the stack under ArrayLen.
+                IlOp::Load { .. } => {}
                 IlOp::BinSlotImm { slot, .. } if !stored.contains(&(*slot as u32)) => {
                     hoist.push((i, ops[i].clone()));
                 }
@@ -522,7 +524,56 @@ mod tests {
     }
 
     #[test]
-    fn hoists_load_when_slot_not_stored() {
+    fn refuses_load_hoist_needed_as_stack_producer() {
+        // `while len(a) < n` shape: LOAD must re-push every iteration for ArrayLen.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Byte {
+                byte: common::Byte::new(common::Instruction::ArrayLen),
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Byte {
+                byte: common::Byte::new(common::Instruction::LE),
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Halt { loc: loc() },
+        ];
+        let before_len = ops.len();
+        licm(&mut ops);
+        assert_eq!(ops.len(), before_len);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::Load { slot: 1, .. })),
+            "LOAD feeding ArrayLen must remain"
+        );
+    }
+
+    #[test]
+    fn does_not_hoist_load_when_slot_not_stored() {
         let mut ops = vec![
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
@@ -542,23 +593,18 @@ mod tests {
             },
             IlOp::Halt { loc: loc() },
         ];
+        let before_len = ops.len();
         licm(&mut ops);
+        assert_eq!(ops.len(), before_len);
         let header = ops
             .iter()
             .position(|op| matches!(op, IlOp::Label(Label(0))))
             .unwrap();
         assert!(
-            ops[..header]
+            ops[header + 1..]
                 .iter()
                 .any(|op| matches!(op, IlOp::Load { slot: 2, .. })),
-            "invariant Load should hoist to preheader"
-        );
-        assert!(
-            !ops[header + 1..]
-                .iter()
-                .take_while(|op| !matches!(op, IlOp::Jump { .. }))
-                .any(|op| matches!(op, IlOp::Load { slot: 2, .. })),
-            "Load should leave the loop body"
+            "bare Load stack producers must stay in the loop body"
         );
     }
 
