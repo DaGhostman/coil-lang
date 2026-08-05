@@ -1,10 +1,11 @@
-// Scalar numeric helpers not provided by auto-imported `prelude::math`.
+// Scalar numeric helpers layered on auto-imported `prelude::math`.
 // Named `num` so workspace `examples/src/math.hy` does not shadow this module.
 //
 // `abs` stays type-overloaded (numeric / negation, not Ord).
 // `min` / `max` / `clamp` are generic over `Ord` (int, float, and derived orders).
-// Integer power stays `pow_int` until prelude `pow(float, float)` joins the
-// same overload family (prelude still special-cases bare `pow`).
+// `pow` is userland: float wraps virtual `prelude::math::pow`; int is iterative.
+
+use prelude::math::{pow as float_pow};
 
 fn abs(int x) -> int {
     if x < 0 {
@@ -49,8 +50,13 @@ fn clamp<T: Ord>(T x, T lo, T hi) -> T {
     return min(max(x, lo), hi);
 }
 
+/// Float power via libm (`base ** exp` IEEE semantics).
+fn pow(float a, float b) -> float {
+    return float_pow(a, b);
+}
+
 /// Integer power `base ** exp` for `exp >= 0`.
-fn pow_int(int base, int exp) -> int {
+fn pow(int base, int exp) -> int {
     let r = 1;
     let i = 0;
     while i < exp {

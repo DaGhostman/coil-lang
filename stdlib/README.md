@@ -14,7 +14,7 @@ virtual modules alike. Prelude is auto-injected.
 | `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / replace / pad / eq |
 | `text` | `use text::{trim, split, …};` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::{sort, …};` | `sort` / `reverse` / `collect_ints` (range → array) |
-| `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`, `pow_int`) |
+| `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
 | `random` | `use random::{u64, range, …};` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::{join, dirname, …};` | `join` / `dirname` / `basename` / `extension` |
 | `json` | `use json::{parse, stringify, …};` | Minimal JSON parse / stringify |
@@ -30,8 +30,9 @@ virtual modules alike. Prelude is auto-injected.
 - `json` enum constructors are globally unique (`JsonNull`, …); prefer `json_int` /
   `json_object` helpers. Import functions explicitly; construct via helpers.
 - `num` is named so workspace `examples/src/math.hy` does not shadow it.
-- IEEE float math (`sin`, `cos`, `tan`, `sqrt`, `floor`, `ceil`, `exp`, `ln`,
-  `pow`) is auto-imported from virtual `prelude::math`; it is not defined by `num`.
+- IEEE float math (`sin`, `cos`, `tan`, `sqrt`, `floor`, `ceil`, `exp`, `ln`)
+  is auto-imported from virtual `prelude::math`. `pow` is userland in `num`
+  (float wraps the virtual native; int is iterative) so both overloads share one name.
 
 Tests: `tests/stdlib/` (run via `coil test tests/stdlib` from the repo root, or
 per-file under a temp project that points `roots` at this `stdlib/`).

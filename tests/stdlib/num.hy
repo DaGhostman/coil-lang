@@ -1,5 +1,6 @@
-use num::{abs, min, max, clamp, round, pow_int};
+use num::{abs, min, max, clamp, round, pow};
 
+<<<<<<< HEAD
 test("abs min max") {
     assert(abs(0 - 5) == 5)?;
     assert(abs(0) == 0)?;
@@ -20,4 +21,19 @@ test("pow_int clamp round") {
     assert(clamp(5.0, 0.0, 3.0) == 3.0)?;
     assert(round(3.6) == 4.0)?;
     assert(round(0.0 - 3.6) == 0.0 - 4.0)?;
+=======
+test("abs overloads") {
+    assert(abs(0 - 3) == 3)?;
+    assert(abs(0.0 - 2.5) == 2.5)?;
+}
+
+test("pow clamp round") {
+    assert(pow(2, 8) == 256)?;
+    assert(pow(2.0, 10.0) == 1024.0)?;
+    assert(clamp(5, 0, 3) == 3)?;
+    assert(round(1.4) == 1.0)?;
+    assert(round(1.6) == 2.0)?;
+    assert(min(1, 2) == 1)?;
+    assert(max(1.0, 2.0) == 2.0)?;
+>>>>>>> 5f5805c (refactor(stdlib): move pow into num with int/float overloads)
 }

@@ -1079,6 +1079,9 @@ impl VirtualModules {
 
     /// Exports injected into every file (implicit
     /// `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`).
+    ///
+    /// `pow` stays on virtual `prelude::math` for an explicit import, but is
+    /// **not** auto-injected so userland `num::pow` overloads can own the bare name.
     pub fn prelude_exports(&self) -> Vec<BuiltinExport> {
         let mut out = Vec::new();
         if let Some(e) = self.modules.get(PRELUDE_MODULE) {
@@ -1091,7 +1094,14 @@ impl VirtualModules {
             out.extend(e.iter().cloned());
         }
         if let Some(e) = self.modules.get(PRELUDE_MATH_MODULE) {
-            out.extend(e.iter().cloned());
+            out.extend(e.iter().cloned().filter(|export| {
+                !matches!(
+                    export,
+                    BuiltinExport::Fn {
+                        kind: PreludeFn::Pow
+                    }
+                )
+            }));
         }
         out
     }
@@ -1177,7 +1187,6 @@ mod tests {
             PreludeFn::Ceil,
             PreludeFn::Exp,
             PreludeFn::Ln,
-            PreludeFn::Pow,
         ] {
             assert!(
                 exports
@@ -1188,6 +1197,23 @@ mod tests {
             );
             assert!(kind.math_native_name().is_some());
         }
+        assert!(
+            !exports.iter().any(|e| matches!(
+                e,
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Pow
+                }
+            )),
+            "pow must not be auto-injected (lives in userland num)"
+        );
+        assert!(
+            vm.resolve_item(
+                &["prelude".to_string(), "math".to_string()],
+                "pow",
+            )
+                .is_some(),
+            "pow remains importable from prelude::math"
+        );
         assert!(
             !exports
                 .iter()
