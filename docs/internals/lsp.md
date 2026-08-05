@@ -16,7 +16,8 @@ The initial server supports:
 - folding and selection ranges;
 - document highlights and references;
 - same-workspace definition lookup and rename;
-- syntactic semantic tokens.
+- syntactic semantic tokens (lexical comments/strings/numbers/operators plus
+  AST-based declaration and reference classification via `SymbolIndex`).
 
 The server is deliberately synchronous and uses `lsp-server` with
 `lsp-types`. It keeps open documents in memory and does not write editor

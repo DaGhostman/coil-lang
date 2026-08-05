@@ -1,10 +1,10 @@
 //! Coil language server. The transport is standard LSP JSON-RPC over stdio.
 #![allow(deprecated)]
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, path::PathBuf};
 
 use compiler::{
-    BuiltinExport, Checker, Pipeline, SymbolIndex, VirtualModules, format_ty_for_diag,
+    BuiltinExport, Checker, Pipeline, SymbolIndex, SymbolKind, VirtualModules, format_ty_for_diag,
 };
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -17,7 +17,7 @@ use lsp_types::{
     Range as LspRange,
     ReferenceParams, SelectionRange, SelectionRangeParams, SemanticToken, SemanticTokenType,
     SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-    SemanticTokensParams, ServerCapabilities, SignatureHelp, SignatureInformation,
+    SemanticTokensParams, SemanticTokensRangeParams, ServerCapabilities, SignatureHelp, SignatureInformation,
     SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
     WorkspaceSymbolParams,
 };
@@ -91,6 +91,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         SemanticTokenType::FUNCTION,
                         SemanticTokenType::TYPE,
                         SemanticTokenType::VARIABLE,
+                        SemanticTokenType::COMMENT,
+                        SemanticTokenType::STRING,
+                        SemanticTokenType::NUMBER,
+                        SemanticTokenType::NAMESPACE,
+                        SemanticTokenType::OPERATOR,
                     ],
                     token_modifiers: Vec::new(),
                 },
@@ -405,12 +410,34 @@ fn handle_request(
                 .unwrap_or_default();
             Some(serde_json::to_value(locations)?)
         }
-        "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" => {
+        "textDocument/semanticTokens/full" => {
             let params: SemanticTokensParams = serde_json::from_value(request.params.clone())?;
             let tokens = state
                 .documents
                 .get(&params.text_document.uri)
-                .map(|document| semantic_tokens(&document.text))
+                .map(|document| {
+                    semantic_tokens(&document.text, uri_path(&params.text_document.uri), None)
+                })
+                .unwrap_or_default();
+            Some(serde_json::to_value(Some(SemanticTokens {
+                result_id: None,
+                data: tokens,
+            }))?)
+        }
+        "textDocument/semanticTokens/range" => {
+            let params: SemanticTokensRangeParams =
+                serde_json::from_value(request.params.clone())?;
+            let tokens = state
+                .documents
+                .get(&params.text_document.uri)
+                .and_then(|document| {
+                    let byte_range = lsp_range_to_byte_range(&document.text, params.range)?;
+                    Some(semantic_tokens(
+                        &document.text,
+                        uri_path(&params.text_document.uri),
+                        Some(byte_range),
+                    ))
+                })
                 .unwrap_or_default();
             Some(serde_json::to_value(Some(SemanticTokens {
                 result_id: None,
@@ -760,15 +787,11 @@ fn completions(document: &Document, position: Position) -> Vec<CompletionItem> {
         .unwrap_or_default();
 
     let mut by_label: HashMap<String, CompletionCandidate> = HashMap::new();
-    for keyword in [
-        "fn", "let", "const", "class", "enum", "type", "if", "else", "for", "loop", "match",
-        "return", "true", "false", "use", "mod", "pub", "static", "async", "defer", "raise",
-        "panic", "yield", "break", "continue", "where", "impl", "trait", "extern", "test",
-    ] {
+    for keyword in coil_keywords() {
         by_label.insert(
-            keyword.into(),
+            (*keyword).into(),
             CompletionCandidate {
-                label: keyword.into(),
+                label: (*keyword).into(),
                 kind: CompletionItemKind::KEYWORD,
                 detail: Some("keyword".into()),
                 documentation: None,
@@ -1802,45 +1825,319 @@ fn occurrences(source: &str, word: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-fn semantic_tokens(source: &str) -> Vec<SemanticToken> {
-    let keywords = [
-        "fn", "let", "const", "class", "enum", "type", "if", "else", "for", "loop", "match",
-        "return", "use", "mod", "pub", "static",
-    ];
+fn coil_keywords() -> &'static [&'static str] {
+    &[
+        "fn", "let", "const", "class", "enum", "type", "if", "else", "for", "while", "in",
+        "match", "return", "true", "false", "use", "mod", "pub", "static", "async", "defer",
+        "raise", "panic", "yield", "break", "continue", "where", "impl", "trait", "extern", "as",
+        "readonly", "new", "default", "typeof", "resume", "with", "done",
+    ]
+}
+
+const TOKEN_KEYWORD: u32 = 0;
+const TOKEN_FUNCTION: u32 = 1;
+const TOKEN_TYPE: u32 = 2;
+const TOKEN_VARIABLE: u32 = 3;
+const TOKEN_COMMENT: u32 = 4;
+const TOKEN_STRING: u32 = 5;
+const TOKEN_NUMBER: u32 = 6;
+const TOKEN_NAMESPACE: u32 = 7;
+const TOKEN_OPERATOR: u32 = 8;
+
+#[derive(Clone)]
+struct SpannedToken {
+    range: Range<usize>,
+    token_type: u32,
+    priority: u8,
+}
+
+fn lsp_range_to_byte_range(source: &str, range: LspRange) -> Option<Range<usize>> {
+    let start = position_to_byte(source, range.start)?;
+    let end = position_to_byte(source, range.end)?;
+    Some(start..end.max(start))
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn range_intersects(filter: &Range<usize>, token: &Range<usize>) -> bool {
+    ranges_overlap(filter, token)
+}
+
+fn merge_spanned_tokens(mut tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
+    tokens.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then(right.priority.cmp(&left.priority))
+            .then(right.range.end.cmp(&left.range.end))
+    });
+    let mut accepted: Vec<SpannedToken> = Vec::new();
+    'next: for token in tokens {
+        for kept in &accepted {
+            if ranges_overlap(&kept.range, &token.range) {
+                continue 'next;
+            }
+        }
+        accepted.push(token);
+    }
+    accepted.sort_by_key(|token| token.range.start);
+    accepted
+}
+
+fn symbol_kind_to_token_type(kind: SymbolKind) -> u32 {
+    match kind {
+        SymbolKind::Function | SymbolKind::Method => TOKEN_FUNCTION,
+        SymbolKind::Class | SymbolKind::Enum | SymbolKind::TypeAlias => TOKEN_TYPE,
+        SymbolKind::Namespace => TOKEN_NAMESPACE,
+        SymbolKind::Variable => TOKEN_VARIABLE,
+    }
+}
+
+fn reference_token_type(index: &SymbolIndex, name: &str) -> u32 {
+    index
+        .definitions(name)
+        .first()
+        .map(|definition| symbol_kind_to_token_type(definition.kind))
+        .unwrap_or(TOKEN_VARIABLE)
+}
+
+fn ast_semantic_tokens(source: &str, file: &PathBuf) -> Vec<SpannedToken> {
+    let index = SymbolIndex::from_source(file.clone(), source);
     let mut tokens = Vec::new();
-    let mut previous_line = 0;
-    let mut previous_start = 0;
+    for definition in index.all_definitions() {
+        if definition.file != *file {
+            continue;
+        }
+        tokens.push(SpannedToken {
+            range: definition.name_range.clone(),
+            token_type: symbol_kind_to_token_type(definition.kind),
+            priority: 4,
+        });
+    }
+    for site in index.all_reference_sites() {
+        if site.file != *file {
+            continue;
+        }
+        tokens.push(SpannedToken {
+            range: site.range.clone(),
+            token_type: reference_token_type(&index, &site.name),
+            priority: 4,
+        });
+    }
+    tokens
+}
+
+fn scan_lexical_tokens(source: &str) -> Vec<SpannedToken> {
     let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if !is_ident(bytes[index]) {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
             index += 1;
             continue;
         }
-        let start = index;
-        while index < bytes.len() && is_ident(bytes[index]) {
+        if byte == b'"' {
+            let start = index;
             index += 1;
+            while index < bytes.len() && bytes[index] != b'"' {
+                index += 1;
+            }
+            if index < bytes.len() {
+                index += 1;
+            }
+            tokens.push(SpannedToken {
+                range: start..index,
+                token_type: TOKEN_STRING,
+                priority: 5,
+            });
+            continue;
         }
-        let word = &source[start..index];
-        let position = byte_position(source, start);
-        let token_type = if keywords.contains(&word) { 0 } else { 3 };
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let start = index;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            tokens.push(SpannedToken {
+                range: start..index,
+                token_type: TOKEN_COMMENT,
+                priority: 5,
+            });
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            let start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'.') && bytes.get(index + 1).is_some_and(|b| b.is_ascii_digit())
+            {
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    index += 1;
+                }
+            }
+            tokens.push(SpannedToken {
+                range: start..index,
+                token_type: TOKEN_NUMBER,
+                priority: 2,
+            });
+            continue;
+        }
+        if let Some((range, token_type)) = scan_operator(source, index) {
+            tokens.push(SpannedToken {
+                range: range.clone(),
+                token_type,
+                priority: 1,
+            });
+            index = range.end;
+            continue;
+        }
+        if is_ident(byte) {
+            let start = index;
+            while index < bytes.len() && is_ident(bytes[index]) {
+                index += 1;
+            }
+            let word = &source[start..index];
+            if coil_keywords().contains(&word) {
+                tokens.push(SpannedToken {
+                    range: start..index,
+                    token_type: TOKEN_KEYWORD,
+                    priority: 3,
+                });
+            } else if word == "from" && is_yield_from_keyword(source, start) {
+                tokens.push(SpannedToken {
+                    range: start..index,
+                    token_type: TOKEN_KEYWORD,
+                    priority: 3,
+                });
+            } else if word == "with" && is_resume_with_keyword(source, start) {
+                tokens.push(SpannedToken {
+                    range: start..index,
+                    token_type: TOKEN_KEYWORD,
+                    priority: 3,
+                });
+            } else {
+                let token_type = if is_type_like_ident(word) {
+                    TOKEN_TYPE
+                } else {
+                    TOKEN_VARIABLE
+                };
+                tokens.push(SpannedToken {
+                    range: start..index,
+                    token_type,
+                    priority: if token_type == TOKEN_TYPE { 3 } else { 1 },
+                });
+            }
+            continue;
+        }
+        index += 1;
+    }
+    tokens
+}
+
+fn scan_operator(source: &str, index: usize) -> Option<(Range<usize>, u32)> {
+    let bytes = source.as_bytes();
+    let remaining = &bytes[index..];
+    const MULTI: &[(&[u8], u32)] = &[
+        (b"->", TOKEN_OPERATOR),
+        (b"::", TOKEN_OPERATOR),
+        (b"==", TOKEN_OPERATOR),
+        (b"!=", TOKEN_OPERATOR),
+        (b"<=", TOKEN_OPERATOR),
+        (b">=", TOKEN_OPERATOR),
+        (b"&&", TOKEN_OPERATOR),
+        (b"||", TOKEN_OPERATOR),
+        (b"**", TOKEN_OPERATOR),
+        (b"<<", TOKEN_OPERATOR),
+        (b">>", TOKEN_OPERATOR),
+        (b"..", TOKEN_OPERATOR),
+        (b"+=", TOKEN_OPERATOR),
+        (b"-=", TOKEN_OPERATOR),
+        (b"*=", TOKEN_OPERATOR),
+        (b"/=", TOKEN_OPERATOR),
+        (b"%=", TOKEN_OPERATOR),
+        (b"^=", TOKEN_OPERATOR),
+        (b"|=", TOKEN_OPERATOR),
+        (b"&=", TOKEN_OPERATOR),
+    ];
+    for (pattern, token_type) in MULTI {
+        if remaining.starts_with(pattern) {
+            return Some((index..index + pattern.len(), *token_type));
+        }
+    }
+    matches!(
+        remaining[0],
+        b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=' | b'!' | b'&' | b'|' | b'^' | b'~'
+            | b'.' | b',' | b';' | b':' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'@'
+    )
+    .then_some((index..index + 1, TOKEN_OPERATOR))
+}
+
+fn is_type_like_ident(word: &str) -> bool {
+    matches!(word, "int" | "float" | "string" | "bool" | "void" | "unit")
+        || word.chars().next().is_some_and(|character| character.is_uppercase())
+}
+
+fn is_yield_from_keyword(source: &str, from_start: usize) -> bool {
+    let before = source[..from_start].trim_end();
+    before.ends_with("yield")
+}
+
+fn is_resume_with_keyword(source: &str, with_start: usize) -> bool {
+    let before = source[..with_start].trim_end();
+    before.ends_with("resume")
+}
+
+fn encode_semantic_tokens(source: &str, tokens: &[SpannedToken]) -> Vec<SemanticToken> {
+    let mut encoded = Vec::new();
+    let mut previous_line = 0;
+    let mut previous_start = 0;
+    for token in tokens {
+        let position = byte_position(source, token.range.start);
+        let length = source[token.range.clone()]
+            .encode_utf16()
+            .count() as u32;
         let delta_line = position.line - previous_line;
         let delta_start = if delta_line == 0 {
             position.character - previous_start
         } else {
             position.character
         };
-        tokens.push(SemanticToken {
+        encoded.push(SemanticToken {
             delta_line,
             delta_start,
-            length: word.encode_utf16().count() as u32,
-            token_type,
+            length,
+            token_type: token.token_type,
             token_modifiers_bitset: 0,
         });
         previous_line = position.line;
         previous_start = position.character;
     }
-    tokens
+    encoded
+}
+
+fn semantic_tokens(
+    source: &str,
+    file: Option<PathBuf>,
+    filter: Option<Range<usize>>,
+) -> Vec<SemanticToken> {
+    let file = file.unwrap_or_else(|| PathBuf::from("untitled.hy"));
+    let mut tokens = scan_lexical_tokens(source);
+    if Pratt::default().parse(source).is_ok() {
+        tokens.extend(ast_semantic_tokens(source, &file));
+    }
+    let merged = merge_spanned_tokens(tokens);
+    let filtered = match filter {
+        Some(filter) => merged
+            .into_iter()
+            .filter(|token| range_intersects(&filter, &token.range))
+            .collect(),
+        None => merged,
+    };
+    encode_semantic_tokens(source, &filtered)
 }
 
 #[cfg(test)]
@@ -2155,5 +2452,98 @@ fn main() {
             sig.label
         );
         assert_eq!(sig.parameters.as_ref().map(|p| p.len()), Some(2));
+    }
+
+    fn token_types_at_word(source: &str, encoded: &[SemanticToken], word: &str) -> Vec<u32> {
+        let mut line = 0u32;
+        let mut character = 0u32;
+        let mut types = Vec::new();
+        for token in encoded {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                character = token.delta_start;
+            } else {
+                character += token.delta_start;
+            }
+            let start = position_to_byte(
+                source,
+                Position {
+                    line,
+                    character,
+                },
+            )
+            .expect("token start");
+            let mut utf16 = 0u32;
+            let mut end = start;
+            for (offset, character) in source[start..].char_indices() {
+                if utf16 >= token.length {
+                    break;
+                }
+                utf16 += character.len_utf16() as u32;
+                end = start + offset + character.len_utf8();
+            }
+            if &source[start..end] == word {
+                types.push(token.token_type);
+            }
+        }
+        types
+    }
+
+    #[test]
+    fn semantic_tokens_mark_comments_strings_and_numbers() {
+        let source = "// comment\nfn main() { let x = \"hi\" + 42; return; }\n";
+        let tokens = semantic_tokens(source, None, None);
+        let types: Vec<_> = tokens.iter().map(|token| token.token_type).collect();
+        assert!(types.contains(&TOKEN_COMMENT));
+        assert!(types.contains(&TOKEN_STRING));
+        assert!(types.contains(&TOKEN_NUMBER));
+        assert!(types.contains(&TOKEN_KEYWORD));
+        assert!(types.contains(&TOKEN_OPERATOR));
+    }
+
+    #[test]
+    fn semantic_tokens_classify_function_declarations_and_calls() {
+        let source = "fn fib(int n) -> int { return fib(n); }\n";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        let fib = token_types_at_word(source, &tokens, "fib");
+        assert_eq!(fib.len(), 2);
+        assert!(fib.iter().all(|token_type| *token_type == TOKEN_FUNCTION));
+    }
+
+    #[test]
+    fn semantic_tokens_classify_type_names() {
+        let source = "type Id = int;\nclass Point { pub x: int }\nfn main() { return; }\n";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        assert!(token_types_at_word(source, &tokens, "Point").contains(&TOKEN_TYPE));
+        assert!(token_types_at_word(source, &tokens, "Id").contains(&TOKEN_TYPE));
+        assert!(token_types_at_word(source, &tokens, "int").contains(&TOKEN_TYPE));
+    }
+
+    #[test]
+    fn semantic_tokens_range_is_filtered() {
+        let source = "fn left() { return; }\nfn right() { return; }\n";
+        let full = semantic_tokens(source, None, None);
+        let right_line_start = source.find("fn right").expect("right fn");
+        let filtered = semantic_tokens(
+            source,
+            None,
+            Some(right_line_start..source.len()),
+        );
+        assert!(filtered.len() < full.len());
+        assert!(token_types_at_word(source, &filtered, "right")
+            .iter()
+            .any(|token_type| *token_type == TOKEN_FUNCTION));
+        assert!(token_types_at_word(source, &filtered, "left").is_empty());
+    }
+
+    #[test]
+    fn semantic_tokens_use_utf16_lengths() {
+        let source = "fn main() { let x = \"α\"; return; }\n";
+        let tokens = semantic_tokens(source, None, None);
+        let string_token = tokens
+            .iter()
+            .find(|token| token.token_type == TOKEN_STRING)
+            .expect("string token");
+        assert_eq!(string_token.length, 3);
     }
 }
