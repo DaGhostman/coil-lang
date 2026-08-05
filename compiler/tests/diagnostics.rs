@@ -269,6 +269,29 @@ fn main() { let a = f(1, 2, 3); }
 }
 
 #[test]
+fn type_overload_unmatched_arg_type_has_stable_wrong_arity() {
+    let msgs = check_messages(
+        r#"
+fn show(int x) -> int { return x; }
+fn show(float x) -> float { return x; }
+fn main() { let a = show(true); }
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::WrongArity)),
+        "expected WrongArity (E0120) when no type overload matches, got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter().any(|m| m.message().contains("No overload of `show`")),
+        "expected 'No overload of show' message, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn userland_wildcard_import_has_stable_error_code() {
     let msgs = check_messages("use foo::*;\nfn main() {}\n");
     assert!(
