@@ -111,6 +111,17 @@ pub struct OverloadCandidate {
     pub param_names: Vec<String>,
 }
 
+/// Result of selecting among same-name overload candidates.
+#[derive(Clone, Copy, Debug)]
+pub enum OverloadSelect<'a> {
+    /// Exactly one candidate fits.
+    Selected(&'a OverloadCandidate),
+    /// No candidate accepts this arity / argument types.
+    NoMatch,
+    /// Two or more candidates still fit after filtering.
+    Ambiguous,
+}
+
 /// A parametric type alias (`type Pair<T> = (T, T)`).
 #[derive(Clone, Debug)]
 struct GenericAliasDef {
@@ -226,7 +237,7 @@ pub struct Checker {
     /// Populated at the end of each `infer_function` call.  When a name has
     /// exactly one candidate this is functionally equivalent to the legacy
     /// `fn_param_names` / `fn_has_rest` path; when there are multiple
-    /// candidates, call-site resolution uses [`Checker::select_overload`].
+    /// candidates, call-site resolution uses [`Checker::select_overload_for_args`].
     overload_sets: std::collections::HashMap<String, Vec<OverloadCandidate>>,
 
     /// Call-site selection results keyed by source span `(start, end)`.

@@ -2611,15 +2611,38 @@ impl Checker {
                             let fqn = format!("{}::{}", owner, method);
                             let user_argc = method_args.len();
                             let scheme = if self.is_overloaded(&fqn) {
-                                match self.select_overload(&fqn, user_argc).cloned() {
-                                    Some(c) => {
+                                let prelim_tys: Vec<Ty> = method_args
+                                    .iter()
+                                    .map(|a| {
+                                        let value = match a.1.as_ref() {
+                                            Expression::NamedArg(_, v) => v,
+                                            _ => a,
+                                        };
+                                        let ty = self.infer(value);
+                                        apply_ty_prune(&self.subst, &ty)
+                                    })
+                                    .collect();
+                                match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                                    OverloadSelect::Selected(c) => {
+                                        let c = c.clone();
                                         self.selected_overloads_by_span.insert(
                                             (range.start, range.end),
                                             (c.fixed_arity, c.is_rest, c.id),
                                         );
                                         c.scheme
                                     }
-                                    None => {
+                                    OverloadSelect::Ambiguous => {
+                                        return self.error_with_help(
+                                            ErrorCode::AmbiguousOverload,
+                                            format!(
+                                                "Ambiguous overload: call to `{}` matches multiple candidates",
+                                                fqn
+                                            ),
+                                            range,
+                                            Some(self.ambiguous_overload_help(&fqn)),
+                                        );
+                                    }
+                                    OverloadSelect::NoMatch => {
                                         return self.error(
                                             ErrorCode::WrongArity,
                                             format!(
@@ -2782,15 +2805,38 @@ impl Checker {
                         let fqn = format!("{}::{}", owner, method);
                         let user_argc = method_args.len();
                         let (scheme, selected) = if self.is_overloaded(&fqn) {
-                            match self.select_overload(&fqn, user_argc).cloned() {
-                                Some(c) => {
+                            let prelim_tys: Vec<Ty> = method_args
+                                .iter()
+                                .map(|a| {
+                                    let value = match a.1.as_ref() {
+                                        Expression::NamedArg(_, v) => v,
+                                        _ => a,
+                                    };
+                                    let ty = self.infer(value);
+                                    apply_ty_prune(&self.subst, &ty)
+                                })
+                                .collect();
+                            match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                                OverloadSelect::Selected(c) => {
+                                    let c = c.clone();
                                     self.selected_overloads_by_span.insert(
                                         (range.start, range.end),
                                         (c.fixed_arity, c.is_rest, c.id),
                                     );
                                     (c.scheme, true)
                                 }
-                                None => {
+                                OverloadSelect::Ambiguous => {
+                                    return self.error_with_help(
+                                        ErrorCode::AmbiguousOverload,
+                                        format!(
+                                            "Ambiguous overload: call to `{}` matches multiple candidates",
+                                            fqn
+                                        ),
+                                        range,
+                                        Some(self.ambiguous_overload_help(&fqn)),
+                                    );
+                                }
+                                OverloadSelect::NoMatch => {
                                     let available: Vec<String> = self
                                         .overload_sets
                                         .get(&fqn)
@@ -3111,10 +3157,9 @@ impl Checker {
                         })
                         .collect();
                     let candidate_opt = self
-                        .select_overload_for_args(&ident, argc, &prelim_tys)
-                        .cloned();
+                        .select_overload_for_args(&ident, argc, &prelim_tys);
                     match candidate_opt {
-                        None => {
+                        OverloadSelect::NoMatch => {
                             // No candidate accepts this arity/types — emit a
                             // "no overload" error listing the available arities.
                             let available: Vec<String> = self
@@ -3135,7 +3180,19 @@ impl Checker {
                                 Some(format!("available overloads: {}", available.join(", "))),
                             );
                         }
-                        Some(candidate) => {
+                        OverloadSelect::Ambiguous => {
+                            return self.error_with_help(
+                                ErrorCode::AmbiguousOverload,
+                                format!(
+                                    "Ambiguous overload: call to `{}` matches multiple candidates",
+                                    ident
+                                ),
+                                range,
+                                Some(self.ambiguous_overload_help(&ident)),
+                            );
+                        }
+                        OverloadSelect::Selected(candidate) => {
+                            let candidate = candidate.clone();
                             // Record the selection for codegen.
                             self.selected_overloads_by_span.insert(
                                 (range.start, range.end),
@@ -11312,28 +11369,30 @@ impl Checker {
             .map_or(false, |v| v.len() > 1)
     }
 
-    /// Select the best overload candidate for a call with `argc` arguments
-    /// and (optional) preliminary argument types.
+    /// Select an overload by arity only (no argument types).
     ///
-    /// Resolution order:
-    /// 1. Candidates that accept `argc` (exact fixed, else rest).
-    /// 2. If several share that arity, prefer those whose parameters unify
-    ///    with `arg_tys` (when provided and non-empty).
-    /// 3. If still several, prefer monomorphic / concrete params over vars.
-    /// 4. `None` when nothing fits.
+    /// Returns [`None`] on no match **or** ambiguity — callers that need to
+    /// distinguish those cases should use [`Self::select_overload_for_args`].
     pub fn select_overload(&self, fn_name: &str, argc: usize) -> Option<&OverloadCandidate> {
-        self.select_overload_for_args(fn_name, argc, &[])
+        match self.select_overload_for_args(fn_name, argc, &[]) {
+            OverloadSelect::Selected(c) => Some(c),
+            OverloadSelect::NoMatch | OverloadSelect::Ambiguous => None,
+        }
     }
 
     /// Like [`Self::select_overload`], but disambiguate same-arity candidates
     /// with `arg_tys` (left-to-right parameter positions).
+    ///
+    /// Empty `arg_tys` only succeeds when a single candidate matches `argc`.
     pub fn select_overload_for_args(
         &self,
         fn_name: &str,
         argc: usize,
         arg_tys: &[Ty],
-    ) -> Option<&OverloadCandidate> {
-        let candidates = self.overload_candidates(fn_name)?;
+    ) -> OverloadSelect<'_> {
+        let Some(candidates) = self.overload_candidates(fn_name) else {
+            return OverloadSelect::NoMatch;
+        };
         let arity_ok: Vec<&OverloadCandidate> = candidates
             .iter()
             .filter(|c| {
@@ -11345,7 +11404,7 @@ impl Checker {
             })
             .collect();
         if arity_ok.is_empty() {
-            return None;
+            return OverloadSelect::NoMatch;
         }
         let fixed: Vec<&OverloadCandidate> =
             arity_ok.iter().copied().filter(|c| !c.is_rest).collect();
@@ -11355,11 +11414,10 @@ impl Checker {
             arity_ok
         };
         if pool.len() == 1 {
-            return Some(pool[0]);
+            return OverloadSelect::Selected(pool[0]);
         }
         if arg_tys.is_empty() {
-            // No type info: keep legacy behaviour (first fixed / first rest).
-            return Some(pool[0]);
+            return OverloadSelect::Ambiguous;
         }
         let empty = crate::typechecking::subst::Subst::default();
         let mut matches: Vec<&OverloadCandidate> = Vec::new();
@@ -11374,10 +11432,10 @@ impl Checker {
             }
         }
         match matches.len() {
-            0 => None,
-            1 => Some(matches[0]),
+            0 => OverloadSelect::NoMatch,
+            1 => OverloadSelect::Selected(matches[0]),
             _ => {
-                // Prefer candidates whose params are all concrete constructors.
+                // Prefer a unique all-concrete candidate over generics.
                 let concrete: Vec<_> = matches
                     .iter()
                     .copied()
@@ -11388,13 +11446,23 @@ impl Checker {
                     })
                     .collect();
                 if concrete.len() == 1 {
-                    Some(concrete[0])
+                    OverloadSelect::Selected(concrete[0])
                 } else {
-                    // Ambiguous — caller may re-check; pick first for recovery.
-                    Some(matches[0])
+                    OverloadSelect::Ambiguous
                 }
             }
         }
+    }
+
+    fn ambiguous_overload_help(&self, fn_name: &str) -> String {
+        let available: Vec<String> = self
+            .overload_candidates(fn_name)
+            .map(|cs| cs.iter().map(|c| Self::overload_sig_label(c)).collect())
+            .unwrap_or_default();
+        format!(
+            "available overloads: {}; arguments do not uniquely select one",
+            available.join(", ")
+        )
     }
 
     /// The call-site selection result for the call spanning `(start, end)`.

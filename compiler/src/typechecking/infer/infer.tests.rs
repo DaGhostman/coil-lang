@@ -5260,6 +5260,27 @@ fn main() { let f = add; }
         );
     }
 
+    /// Same-arity overloads that both unify with a polymorphic argument → AmbiguousOverload.
+    #[test]
+    fn ambiguous_overload_at_call_site() {
+        let msgs = assert_messages(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(float x) -> float { return x; }
+fn g<T>(T x) -> int {
+    return f(x);
+}
+fn main() {}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::AmbiguousOverload)),
+            "expected AmbiguousOverload at call site, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     /// Lambda bodies cannot close over outer locals unless listed in `use`.
     #[test]
     fn lambda_uncaptured_outer_is_error() {
