@@ -5,8 +5,6 @@
 // Float stringify uses fixed 6 fractional digits (trailing zeros trimmed).
 // Objects are parallel key/value arrays — use `object_get` for lookup.
 // Nesting capped by `#[max_depth(256)]` on parse/stringify.
-// Known limit: full `parse_number` under deep array recursion is flaky — pure
-// ints use a lightweight digit scan; floats still call `parse_number`.
 use string::{to_bytes, from_bytes};
 use bytes::{slice as bytes_slice};
 use ascii::{is_space, digit_val, hex_val, hex_digit};
@@ -527,34 +525,7 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
     }
     if c >= "0" {
         if c <= "9" {
-            // Scan digits first; only enter full parse_number when a float
-            // marker follows (`.`, `e`, `E`). Pure ints stay on the lightweight
-            // path — full parse_number under array recursion has been flaky.
-            let start = i;
-            while i < len(b) {
-                if digit_val(b[i]) < 0 {
-                    break;
-                }
-                i = i + 1;
-            }
-            let is_float = 0;
-            if i < len(b) {
-                let nc = b[i];
-                if nc == "." {
-                    is_float = 1;
-                }
-                if nc == "e" {
-                    is_float = 1;
-                }
-                if nc == "E" {
-                    is_float = 1;
-                }
-            }
-            if is_float == 1 {
-                return parse_number(b, start)?;
-            }
-            let n = parse_int_bytes(bytes_slice(b, start, i))?;
-            return (Json::JsonInt(n), i);
+            return parse_number(b, i)?;
         }
     }
     if c == lbr {

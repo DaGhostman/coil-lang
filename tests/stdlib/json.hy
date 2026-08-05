@@ -80,6 +80,32 @@ test("array bools") {
     assert(s == "[true,false]")?;
 }
 
+// Mixed ints + bool under a cold heap used to flake: stringify's result-mode
+// Ok wrap (MakeEnum) could GC before the fresh enum was stacked.
+test("array mixed int bool") {
+    let v = match parse("[1,2,true]") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse mixed",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify mixed",
+    };
+    assert(s == "[1,2,true]")?;
+}
+
+test("array mixed null") {
+    let v = match parse("[1,2,null]") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse null mix",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify null mix",
+    };
+    assert(s == "[1,2,null]")?;
+}
+
 test("string escapes roundtrip") {
     let v = match parse("\"a\\\"b\\\\c\"") {
         Result::Ok(x) => x,
