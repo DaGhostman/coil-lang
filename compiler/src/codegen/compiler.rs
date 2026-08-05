@@ -4793,7 +4793,10 @@ impl Compiler {
                 UNIT => Some(ValueTag::Unit),
                 _ => Some(ValueTag::Instance), // user-defined class / enum
             },
-            Ty::Sum { .. } => Some(ValueTag::Enum),
+            // Same carrier ABI as `Con(enum)` — trait methods unbox Instance.
+            Ty::Sum { .. } => Some(ValueTag::Instance),
+            // Variant refinements box like their owning enum.
+            Ty::Constructor { owner, .. } => Self::ty_to_value_tag(owner),
             Ty::Tuple(_) => Some(ValueTag::Tuple),
             Ty::Array { .. } => Some(ValueTag::Array),
             Ty::Record { .. } => Some(ValueTag::Record),
