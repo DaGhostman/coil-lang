@@ -1,6 +1,31 @@
-# Linear algebra (`dot` / `matmul` / `cross` / `Matrix`)
+# Math (`sin` / `sqrt` / `pow` / linear algebra)
 
 Auto-imported from virtual `prelude::math` (implicit `use prelude::math::*;`).
+
+## Scalar float math
+
+These functions accept and return `float` values:
+
+| Function | Type | Meaning |
+|----------|------|---------|
+| `sin`, `cos`, `tan` | `float -> float` | Trigonometric functions (radians) |
+| `sqrt` | `float -> float` | Square root |
+| `floor`, `ceil` | `float -> float` | Round toward negative / positive infinity |
+| `exp` | `float -> float` | `e` raised to the argument |
+| `ln` | `float -> float` | Natural logarithm |
+| `pow` | `(float, float) -> float` | `pow(base, exponent)` |
+
+They use Rust `f64` operations through `HostInvoke` and preserve IEEE-754
+behavior: for example, `sqrt(-1.0)` and `ln(-1.0)` produce NaN,
+`ln(0.0)` produces negative infinity, and overflow produces infinity.
+They do not clamp exceptional inputs to `0.0`.
+
+```coil
+let radius = sqrt(pow(3.0, 2.0) + pow(4.0, 2.0)); // 5.0
+let wave = sin(3.141592653589793 / 2.0);            // 1.0
+```
+
+## Linear algebra
 
 **Named helpers** do **not** overload `*` / `**` on bare tuples or arrays
 (those stay element-wise; see [Operators](operators.md)).

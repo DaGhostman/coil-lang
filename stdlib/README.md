@@ -9,7 +9,7 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 | `bytes` | `use bytes::*;` | `[byte]` slice / concat / find / eq / affixes |
 | `text` | `use text::*;` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::*;` | `sort` / `reverse` / `collect_ints` (range → array) |
-| `num` | `use num::*;` | Scalar math (`abs`, `floor`/`ceil`, `sqrt`, `sin`/`cos`, …) |
+| `num` | `use num::*;` | Numeric conveniences (`abs`, min/max, clamp, `round`, `pow_int`) |
 | `random` | `use random::*;` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::*;` | `join` / `dirname` / `basename` / `extension` |
 | `json` | `use json::*;` | Minimal JSON parse / stringify |
@@ -25,6 +25,8 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 - `json` enum constructors are globally unique (`JsonNull`, …); prefer `json_int` /
   `json_object` helpers. Glob `use json::*` imports functions; construct via helpers.
 - `num` is named so workspace `examples/src/math.hy` does not shadow it.
+- IEEE float math (`sin`, `cos`, `tan`, `sqrt`, `floor`, `ceil`, `exp`, `ln`,
+  `pow`) is auto-imported from virtual `prelude::math`; it is not defined by `num`.
 
 Tests: `tests/stdlib/` (run via `coil test tests/stdlib` from the repo root, or
 per-file under a temp project that points `roots` at this `stdlib/`).
