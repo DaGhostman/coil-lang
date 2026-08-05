@@ -644,19 +644,15 @@ impl<'pratt> Pratt<'pratt> {
                     self.params(expr.clone()),
                     |lhs, args, e| (e.span(), Box::new(Expression::Call { name: lhs, args })),
                 ),
+                // `as` binds tighter than `*`/`+` and assignment so
+                // `c = m as byte` is `c = (m as byte)`, not `(c = m) as byte`.
+                postfix(
+                    Precedence::Unary as u16,
+                    op!("as").ignore_then(self.type_annotation()),
+                    |lhs, ty, e| (e.span(), Box::new(Expression::Cast(lhs, ty))),
+                ),
             ));
             pratt_expr
-                .then(
-                    op!("as")
-                        .ignore_then(self.type_annotation())
-                        .repeated()
-                        .collect::<Vec<_>>(),
-                )
-                .map(|(base, casts)| {
-                    casts
-                        .into_iter()
-                        .fold(base, |lhs, ty| (lhs.0, Box::new(Expression::Cast(lhs, ty))))
-                })
         })
         .map_with(output!(Expr))
     }

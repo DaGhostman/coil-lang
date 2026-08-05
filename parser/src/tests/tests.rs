@@ -2037,3 +2037,59 @@
             "display should retain test name: {displayed}"
         );
     }
+
+    #[test]
+    fn assign_cast_byte_parses_cast_on_rhs() {
+        let e = expr_ast!("c = m as byte");
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Assignment(_, value) => {
+                let rhs = match value.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    matches!(rhs, Expression::Cast(_, _)),
+                    "expected Cast on RHS, got {rhs:?}"
+                );
+            }
+            Expression::Cast(expr, _) => {
+                let inner = match expr.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    !matches!(inner, Expression::Assignment(_, _)),
+                    "cast bound to whole assign, not RHS"
+                );
+                panic!("unexpected top-level Cast");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_binds_tighter_than_add() {
+        let e = expr_ast!("1 + 2 as float");
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Add(_, rhs) => {
+                let rhs = match rhs.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    matches!(rhs, Expression::Cast(_, _)),
+                    "expected 1 + (2 as float), got rhs={rhs:?}"
+                );
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
