@@ -4,8 +4,8 @@ Compiler virtual modules cover systems primitives (`io`, `string`, `thread`, …
 This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 `[module].roots` (the workspace manifest already does).
 
-Import **explicitly** (no `use mod::*` for userland disks). Virtual modules such
-as `io` / `string` / `ffi` may still use `::*`; prelude is auto-imported.
+Import **explicitly** — `use path::*` is banned (`E0124`) for userland and
+virtual modules alike. Prelude is auto-injected.
 
 | Module | Import | Role |
 |--------|--------|------|

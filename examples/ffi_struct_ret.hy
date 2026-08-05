@@ -2,8 +2,8 @@
 //
 // Output: 34  (Point { x: 3, y: 4 } fields)
 
-use ffi::*;
-use ffi::types::*;
+use ffi::{Error, declare, dload, invoke};
+use ffi::types::{Int32};
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};

@@ -1,4 +1,4 @@
-use thread::*;
+use thread::{Sender, Thread, channel, join, send, spawn};
 use pool::worker::run_jobs;
 
 class Worker {

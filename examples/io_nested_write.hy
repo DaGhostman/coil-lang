@@ -1,9 +1,9 @@
 // Nested IO HostInvoke as the first of two args: `write_all(open(...), buf)`.
 // Regression for emit_io_host_invoke when outer arity > 1.
-use io::*;
+use io::{close, open, stdout};
 use io::sync::{read_to_end, write_all};
 
-use string::*;
+use string::{format, to_bytes};
 
 fn main() {
     let path = "/tmp/coil_io_nested_write.bin";

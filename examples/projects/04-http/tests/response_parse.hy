@@ -1,5 +1,5 @@
 // Pure unit tests: response parse (no sockets).
-use io::*;
+use string::{to_bytes};
 use http::url::{
     find_bytes,
     header_count,

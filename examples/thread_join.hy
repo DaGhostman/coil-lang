@@ -1,4 +1,4 @@
-use thread::*;
+use thread::{join, spawn};
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};

@@ -1,4 +1,4 @@
-use io::*;
+use string::{to_bytes};
 use http::url::{
     build_request_head,
     build_request_head_extras,

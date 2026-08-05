@@ -1,5 +1,5 @@
 // URL parse for the HTTP client (byte-scan; no string slice/index).
-use io::*;
+use io::{Stream, from_bytes, to_bytes};
 use conv::{int_to_dec};
 
 enum HttpError {

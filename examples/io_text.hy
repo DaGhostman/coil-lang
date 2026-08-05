@@ -1,8 +1,8 @@
 // Decode `[byte]` → string with `from_bytes`, encode with `to_bytes`.
-use io::*;
+use io::{stdout};
 use io::sync::{write_all};
 
-use string::*;
+use string::{format, from_bytes, to_bytes};
 
 fn main() {
     // "hello" as ASCII bytes

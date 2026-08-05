@@ -1,7 +1,7 @@
 // C calls back into coil via ffi::types::Callback. Expected output: `42`.
 
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare, dload, invoke};
+use ffi::types::{Callback, Int};
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};

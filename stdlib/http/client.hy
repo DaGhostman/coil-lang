@@ -1,7 +1,7 @@
 // HTTP/1.1 client: get / post / request.
 // Depends only on `http::url` (request/response impls live there) to avoid
 // multi-glob import bugs across sibling http::* modules.
-use io::*;
+use io::{Stream, close};
 use io::net::tcp::connect as tcp_connect;
 use io::net::tls::client::enable as tls_enable;
 use io::sync::{read_to_end, write_all};
