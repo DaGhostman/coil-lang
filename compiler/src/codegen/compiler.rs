@@ -7284,29 +7284,8 @@ impl Compiler {
                 if self.checker.virtual_modules().resolves_use(p, name) {
                     // Scope already populated by check_program.
                 } else if name == "*" {
-                    let module_ns = p.join("::");
-                    let prefix = if module_ns.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{}::", module_ns)
-                    };
-                    let fqns: Vec<String> = self
-                        .functions
-                        .keys()
-                        .filter(|fqn| {
-                            fqn.starts_with(&prefix)
-                                && !fqn[prefix.len()..].contains("::")
-                                && !fqn[prefix.len()..].is_empty()
-                        })
-                        .cloned()
-                        .collect();
-                    for fqn in fqns {
-                        let rest = &fqn[prefix.len()..];
-                        // `num::abs#1.0` → local `abs` → family `num::abs`.
-                        let base = strip_overload_key(rest);
-                        let family = format!("{prefix}{base}");
-                        self.aliases.insert(base.to_string(), family);
-                    }
+                    // Disk-module wildcards are rejected in typecheck
+                    // (`ErrorCode::WildcardImport`); leave aliases unchanged.
                 } else {
                     // Prefer the FQN that actually exists in the function
                     // table so both conventions work:

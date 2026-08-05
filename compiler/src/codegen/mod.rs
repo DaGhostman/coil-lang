@@ -716,7 +716,7 @@ pub struct Compiler {
     /// imported names (e.g. `spawn(run_jobs, …)` after `use pool::worker::run_jobs`)
     /// still packs the real arity.
     fn_arities: HashMap<String, (u32, bool)>,
-    /// Top-level items per namespace (for `use foo::*` glob expansion).
+    /// Top-level items per namespace (legacy; disk `::*` no longer expands).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
     /// Let-slot holding each extern library handle.

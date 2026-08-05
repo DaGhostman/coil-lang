@@ -2216,36 +2216,26 @@ impl Checker {
                 }
                 let module_ns = path.join("::");
                 if name == "*" {
-                    // Bind each exported overload family / item under its base name.
-                    let prefix = if module_ns.is_empty() {
-                        String::new()
+                    // Userland (disk) modules require explicit imports.
+                    // Virtual modules (including prelude) still allow `::*`
+                    // via `apply_virtual_use` above.
+                    let mod_label = if module_ns.is_empty() {
+                        "<entry>".to_string()
                     } else {
-                        format!("{module_ns}::")
+                        module_ns.clone()
                     };
-                    let mut keys: Vec<String> = self
-                        .overload_sets
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains("::"))
-                        .cloned()
-                        .collect();
-                    // Also re-export module-qualified generics (`num::min`).
-                    for g in &self.generics.generic_fns {
-                        if g.starts_with(&prefix) && !g[prefix.len()..].contains("::") {
-                            keys.push(g.clone());
-                        }
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    for fqn in keys {
-                        let base = fqn[prefix.len()..].to_string();
-                        if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
-                            if cands.len() > 1 {
-                                self.overload_sets.insert(base.clone(), cands);
-                            }
-                        }
-                        self.reexport_module_item(&fqn, &base);
-                    }
-                    return unit_ty();
+                    return self.error_with_help(
+                        ErrorCode::WildcardImport,
+                        format!(
+                            "wildcard import `use {}::*` is not allowed for userland modules",
+                            mod_label
+                        ),
+                        range,
+                        Some(format!(
+                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; `::*` is only for virtual modules (prelude is auto-imported)",
+                            mod_label
+                        )),
+                    );
                 }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
                 let fqn = if module_ns.is_empty() {
