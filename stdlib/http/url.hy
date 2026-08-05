@@ -187,15 +187,15 @@ fn request_line_ok([byte] head) -> int {
                 let needle: [byte] = [72, 84, 84, 80, 47, 49, 46, 49];
                 let j = 0;
                 while j + 8 <= i {
-                    let ok = 1;
+                    let ok = true;
                     let k = 0;
                     while k < 8 {
                         if head[j + k] != needle[k] {
-                            ok = 0;
+                            ok = false;
                         }
                         k = k + 1;
                     }
-                    if ok == 1 {
+                    if ok {
                         return 1;
                     }
                     j = j + 1;
