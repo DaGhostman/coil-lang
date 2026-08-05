@@ -178,14 +178,9 @@ fn lines(string s) -> Result<[string], string> {
     let out: [string] = [];
     let start = 0;
     let i = 0;
-    while i <= len(b) {
-        let at_separator = i == len(b);
-        if i < len(b) {
-            if b[i] == "\n" {
-                at_separator = true;
-            }
-        }
-        if at_separator {
+    let n = len(b);
+    while i < n {
+        if b[i] == "\n" {
             let end = i;
             if end > start {
                 if b[end - 1] == "\r" {
@@ -196,6 +191,16 @@ fn lines(string s) -> Result<[string], string> {
             start = i + 1;
         }
         i = i + 1;
+    }
+    // Trailing segment (including empty after a final LF).
+    let end = n;
+    if end > start {
+        if b[end - 1] == "\r" {
+            end = end - 1;
+        }
+    }
+    if start <= n {
+        out[] = utf8_ok(bytes_slice(b, start, end))?;
     }
     return out;
 }
