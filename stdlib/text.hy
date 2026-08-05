@@ -108,16 +108,16 @@ fn split(string s, string sep) -> Result<[string], string> {
         return out;
     }
     let start = 0;
-    let done = 0;
-    while done == 0 {
+    let done = false;
+    while !done {
         let rest = bytes_slice(hay, start, len(hay));
         let rel = bytes_find(rest, needle);
-        if rel == (0 - 1) {
+        if rel < 0 {
             let part = utf8_ok(rest)?;
             out[] = part;
-            done = 1;
+            done = true;
         }
-        if rel != (0 - 1) {
+        if rel >= 0 {
             let part = utf8_ok(bytes_slice(hay, start, start + rel))?;
             out[] = part;
             start = start + rel + len(needle);

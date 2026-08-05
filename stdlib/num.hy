@@ -3,10 +3,8 @@
 // Trig / sqrt use iterative approximations (no libm HostInvoke).
 
 fn abs_int(int x) -> int {
-    let f = x as float;
-    if f < 0.0 {
-        let y = 0 - x;
-        return y;
+    if x < 0 {
+        return 0 - x;
     }
     return x;
 }

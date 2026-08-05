@@ -5,8 +5,7 @@ use string::{to_bytes, from_bytes};
 fn slice([byte] src, int start, int end) -> [byte] {
     let out: [byte] = [];
     let i = start;
-    let sf = start as float;
-    if sf < 0.0 {
+    if i < 0 {
         i = 0;
     }
     while i < end {
@@ -57,34 +56,29 @@ fn find([byte] hay, [byte] needle) -> int {
         return 0;
     }
     if nn > hn {
-        return 0 - 1;
+        return -1;
     }
     let i = 0;
     while i + nn <= hn {
-        let ok = 1;
+        let ok = true;
         let j = 0;
         while j < nn {
             if hay[i + j] != needle[j] {
-                ok = 0;
+                ok = false;
             }
             j = j + 1;
         }
-        if ok == 1 {
-            let at = i;
-            return at;
+        if ok {
+            return i;
         }
         i = i + 1;
     }
-    return 0 - 1;
+    return -1;
 }
 
 /// True when `hay` contains `needle` as a contiguous sub-buffer.
 fn contains([byte] hay, [byte] needle) -> bool {
-    let i = find(hay, needle);
-    if i == (0 - 1) {
-        return false;
-    }
-    return true;
+    return find(hay, needle) >= 0;
 }
 
 /// True when `buf` begins with `prefix`.

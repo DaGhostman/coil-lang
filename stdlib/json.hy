@@ -65,10 +65,10 @@ fn digit_val(byte c) -> int {
     let zero: byte = 48;
     let nine: byte = 57;
     if c < zero {
-        return 0 - 1;
+        return -1;
     }
     if c > nine {
-        return 0 - 1;
+        return -1;
     }
     return (c as int) - 48;
 }
@@ -242,7 +242,7 @@ fn parse_int_bytes([byte] b) -> Result<int, JsonError> {
     let n = 0;
     while i < len(b) {
         let d = digit_val(b[i]);
-        if d == (0 - 1) {
+        if d < 0 {
             raise JsonError::JsonBadNumber;
         }
         n = n * 10 + d;
@@ -273,7 +273,7 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
     let saw = 0;
     while i < len(b) {
         let d = digit_val(b[i]);
-        if d == (0 - 1) {
+        if d < 0 {
             break;
         }
         int_part = int_part * 10.0 + (d as float);
@@ -287,7 +287,7 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
             i = i + 1;
             while i < len(b) {
                 let d = digit_val(b[i]);
-                if d == (0 - 1) {
+                if d < 0 {
                     break;
                 }
                 frac = frac + (d as float) * place;
@@ -320,7 +320,7 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
             }
             if i < len(b) {
                 if b[i] == minus {
-                    exp_sign = 0 - 1;
+                    exp_sign = -1;
                     i = i + 1;
                 }
             }
@@ -330,7 +330,7 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
         }
         while i < len(b) {
             let d = digit_val(b[i]);
-            if d == (0 - 1) {
+            if d < 0 {
                 break;
             }
             exp_v = exp_v * 10 + d;
@@ -365,11 +365,11 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
     if i >= len(b) {
         raise JsonError::JsonBadNumber;
     }
-    if digit_val(b[i]) == (0 - 1) {
+    if digit_val(b[i]) < 0 {
         raise JsonError::JsonBadNumber;
     }
     while i < len(b) {
-        if digit_val(b[i]) == (0 - 1) {
+        if digit_val(b[i]) < 0 {
             break;
         }
         i = i + 1;
@@ -382,11 +382,11 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
             if i >= len(b) {
                 raise JsonError::JsonBadNumber;
             }
-            if digit_val(b[i]) == (0 - 1) {
+            if digit_val(b[i]) < 0 {
                 raise JsonError::JsonBadNumber;
             }
             while i < len(b) {
-                if digit_val(b[i]) == (0 - 1) {
+                if digit_val(b[i]) < 0 {
                     break;
                 }
                 i = i + 1;
@@ -412,7 +412,7 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
                 raise JsonError::JsonBadNumber;
             }
             while i < len(b) {
-                if digit_val(b[i]) == (0 - 1) {
+                if digit_val(b[i]) < 0 {
                     break;
                 }
                 i = i + 1;
@@ -435,7 +435,7 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
                 raise JsonError::JsonBadNumber;
             }
             while i < len(b) {
-                if digit_val(b[i]) == (0 - 1) {
+                if digit_val(b[i]) < 0 {
                     break;
                 }
                 i = i + 1;
@@ -495,7 +495,7 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
             // Inline non-negative int parse (array recursion + parse_number is flaky).
             let start = i;
             while i < len(b) {
-                if digit_val(b[i]) == (0 - 1) {
+                if digit_val(b[i]) < 0 {
                     break;
                 }
                 i = i + 1;
