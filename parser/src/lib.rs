@@ -361,11 +361,12 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         recursive(|expr| {
+            let stmt = self.statement_with_expr(expr.clone());
             let atom = choice((
                 // `match` is a keyword atom — registered before
                 // `self.ident()` so the identifier parser refuses
                 // to match it.
-                self.match_expr(expr.clone()),
+                self.match_expr(expr.clone(), stmt.clone()),
                 // `done` stays a keyword builtin. `dload` / `declare` /
                 // `invoke` are ordinary calls resolved via `use ffi::*`.
                 self.done_(expr.clone()),
@@ -424,7 +425,7 @@ impl<'pratt> Pratt<'pratt> {
                     })
                     .labelled("new"),
                 // Anonymous `fn (…)` before `ident` so `fn` stays a keyword.
-                self.lambda_atom(expr.clone()),
+                self.lambda_atom(expr.clone(), stmt),
                 self.ident(),
             ));
 
@@ -707,6 +708,31 @@ impl<'pratt> Pratt<'pratt> {
             .delimited_by(op!('{'), op!('}'))
     }
 
+    /// Expression-valued brace body: statements followed by an optional bare
+    /// trailing expression. Used by match arms and long-form lambdas.
+    fn brace_body<
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: S,
+        expr: E,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        stmt.repeated()
+            .collect::<Vec<_>>()
+            .then(expr.or_not())
+            .delimited_by(op!("{"), op!("}"))
+            .map_with(|(mut statements, trailing), e| {
+                statements.extend(trailing);
+                (e.span(), Box::new(Expression::Block(statements)))
+            })
+    }
+
     fn arg_list_typed<T>(
         &self,
         ty_parser: T,
@@ -780,23 +806,28 @@ impl<'pratt> Pratt<'pratt> {
         self.arg_list_typed(self.type_annotation_no_fn())
     }
 
-    /// Anonymous lambda: `fn (T x) use (y) => expr` or `fn (T x) { expr; … }`.
+    /// Anonymous lambda: `fn (T x) use (y) => expr` or
+    /// `fn (T x) { statement; … trailing_expr }`.
     ///
     /// Distinct from named `fn name(…)` declarations (`func`): this form has
     /// no name between `fn` and `(`. Optional `use (id, …)` after the param
     /// list lists explicit captures (same `use` keyword as module imports;
     /// disambiguated by position after `fn (…)`).
     ///
-    /// Long-form bodies are a brace-delimited sequence of expressions (not
-    /// full `statement()`s) so this atom can live inside `expr()` without
-    /// re-entering `statement()` → `expr()` during parser construction.
+    /// Long-form bodies use the statement and expression handles from the
+    /// surrounding recursive expression parser, avoiding construction-time
+    /// re-entry through `statement()` → `expr()`.
     fn lambda_atom<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        expr: T,
+        expr: E,
+        stmt: S,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         let captures = keyword!("use")
@@ -812,17 +843,8 @@ impl<'pratt> Pratt<'pratt> {
             .map(|opt| opt.unwrap_or_default());
 
         let short_body = op!("=>").ignore_then(expr.clone());
-        // Brace body built from the same recursive `expr` — do NOT call
-        // `self.statement()` here (that would re-enter `expr()` while the
-        // outer `recursive(|expr| …)` is still being constructed → stack
-        // overflow at parser build / first parse).
-        let long_body = expr
-            .clone()
-            .then_ignore(op!(';').or_not())
-            .repeated()
-            .collect::<Vec<_>>()
-            .delimited_by(op!("{"), op!("}"))
-            .map_with(|children, e| (e.span(), Box::new(Expression::Block(children))));
+        // Use only handles built inside the surrounding `recursive(|expr| …)`.
+        let long_body = self.brace_body(stmt, expr);
 
         keyword!("fn")
             .ignore_then(self.arg_list())
@@ -1044,13 +1066,6 @@ impl<'pratt> Pratt<'pratt> {
         )))
     }
 
-    fn yield_(
-        &self,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        self.yield_expr_(self.expr())
-    }
-
     fn resume_<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -1100,16 +1115,20 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn while_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        stmt: T,
+        stmt: S,
+        expr: E,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("while")
-            .ignore_then(self.expr())
+            .ignore_then(expr)
             .then(self.block(stmt))
             .map_with(|(iterable, body), e| {
                 (
@@ -1124,20 +1143,24 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn for_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        stmt: T,
+        stmt: S,
+        expr: E,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         // C-style: `for (init?; cond; step?) { body }`
-        let init = choice((self.variable(), self.expr())).or_not();
-        let step = self.expr().or_not();
+        let init = choice((self.variable(expr.clone()), expr.clone())).or_not();
+        let step = expr.clone().or_not();
         let c_style = init
             .then_ignore(op!(";"))
-            .then(self.expr())
+            .then(expr.clone())
             .then_ignore(op!(";"))
             .then(step)
             .delimited_by(op!("("), op!(")"))
@@ -1159,7 +1182,7 @@ impl<'pratt> Pratt<'pratt> {
             .padded()
             .map_with(output!(Identifier))
             .then_ignore(keyword!("in"))
-            .then(self.expr())
+            .then(expr)
             .then(self.block(stmt))
             .map_with(|((identifier, iterable), body), e| {
                 (
@@ -1177,18 +1200,22 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn if_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        stmt: T,
+        stmt: S,
+        expr: E,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         // `recursive` enables `else if` to call back into this parser.
         recursive(|if_parser| {
             keyword!("if")
-                .ignore_then(self.expr())
+                .ignore_then(expr.clone())
                 .then(self.block(stmt.clone()))
                 .then(
                     keyword!("else")
@@ -1257,13 +1284,18 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    fn return_(
+    fn return_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("return")
             .labelled("return")
-            .ignore_then(self.expr().or_not())
+            .ignore_then(expr.or_not())
             .map_with(|opt, e| {
                 let span = e.span();
                 let result = opt.unwrap_or_else(|| (span, Box::new(Expression::Tuple(Vec::new()))));
@@ -1271,23 +1303,33 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    fn raise_(
+    fn raise_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("raise")
             .labelled("raise")
-            .ignore_then(self.expr())
+            .ignore_then(expr)
             .map_with(|result, e| (e.span(), Box::new(Expression::Raise(result))))
     }
 
-    fn panic_(
+    fn panic_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("panic")
             .labelled("panic")
-            .ignore_then(self.expr())
+            .ignore_then(expr)
             .map_with(|result, e| (e.span(), Box::new(Expression::Panic(result))))
     }
 
@@ -1344,12 +1386,16 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    fn expr_statement(
+    fn expr_statement<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        self.expr()
-            .then_ignore(op!(';'))
+        expr.then_ignore(op!(';'))
             .map_with(output!(ExprStatement))
     }
 
@@ -1375,27 +1421,39 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        self.statement_with_expr(self.expr())
+    }
+
+    fn statement_with_expr<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
         recursive(|stmt| {
             choice((
                 self.break_(),
                 self.continue_(),
-                self.for_(stmt.clone()),
-                self.while_(stmt.clone()),
-                self.if_(stmt.clone()),
+                self.for_(stmt.clone(), expr.clone()),
+                self.while_(stmt.clone(), expr.clone()),
+                self.if_(stmt.clone(), expr.clone()),
                 self.block(stmt.clone()),
                 self.type_alias(),
-                self.variable().then_ignore(op!(';')),
-                self.constant().then_ignore(op!(';')),
+                self.variable(expr.clone()).then_ignore(op!(';')),
+                self.constant(expr.clone()).then_ignore(op!(';')),
                 // Statement keywords before `expr_statement`: otherwise
                 // `return -1;` parses as `Sub(Identifier("return"), 1)`.
-                self.return_().then_ignore(op!(';')),
-                self.raise_().then_ignore(op!(';')),
-                self.panic_().then_ignore(op!(';')),
-                self.yield_().then_ignore(op!(';')),
+                self.return_(expr.clone()).then_ignore(op!(';')),
+                self.raise_(expr.clone()).then_ignore(op!(';')),
+                self.panic_(expr.clone()).then_ignore(op!(';')),
+                self.yield_expr_(expr.clone()).then_ignore(op!(';')),
                 // `defer { … }` before `expr_statement` so `defer` is not
                 // parsed as a bare identifier call / expression.
                 self.defer(stmt.clone()),
-                self.expr_statement(),
+                self.expr_statement(expr.clone()),
                 self.comment(),
                 self.orphan_doc_comment(),
             ))
@@ -2438,14 +2496,19 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    fn variable(
+    fn variable<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         let simple = keyword!("let")
             .ignore_then(text::ident())
             .then(op!(":").ignore_then(self.type_annotation()).or_not())
-            .then(op!("=").ignore_then(self.expr()).or_not())
+            .then(op!("=").ignore_then(expr.clone()).or_not())
             .map_with(|((name, ty), val), e| {
                 let mut result = vec![(e.span(), Box::new(Expression::Variable(name, ty)))];
                 if let Some(v) = val {
@@ -2461,7 +2524,7 @@ impl<'pratt> Pratt<'pratt> {
         let destructure = keyword!("let")
             .ignore_then(self.let_destructure_lhs())
             .then_ignore(op!("="))
-            .then(self.expr())
+            .then(expr)
             .map_with(|(pattern, rhs), e| {
                 (
                     e.span(),
@@ -2570,15 +2633,20 @@ impl<'pratt> Pratt<'pratt> {
         })
     }
 
-    fn constant(
+    fn constant<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
         &self,
+        expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("const")
             .ignore_then(text::ident().map_with(output!(Identifier)))
             .then(op!(":").ignore_then(self.type_annotation()).or_not())
             .then_ignore(op!("="))
-            .then(self.expr())
+            .then(expr)
             .map_with(|((name, ty), val), e| {
                 let result = vec![(e.span(), Box::new(Expression::Constant(name, ty))), val];
                 (e.span(), Box::new(Expression::Fragment(result)))
@@ -2857,10 +2925,10 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `match scrutinee { pat => body, ... }` — a pattern-match
-    /// expression. The body of each arm is a full `expr` (so it can
-    /// be a block, a literal, another match, etc.). Patterns are
-    /// parsed by [`Self::pattern`].
+    /// `match scrutinee { pat => body, ... }` — a pattern-match expression.
+    /// Brace bodies accept statements plus an optional trailing expression;
+    /// unbraced bodies are expressions. Patterns are parsed by
+    /// [`Self::pattern`].
     ///
     /// Takes the recursive `expr` parser as a parameter (rather than
     /// calling `self.expr()`) so nested match expressions share the
@@ -2868,18 +2936,22 @@ impl<'pratt> Pratt<'pratt> {
     /// every call — which would overflow the stack at construction
     /// time.
     fn match_expr<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        expr: T,
+        expr: E,
+        stmt: S,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("match")
             .ignore_then(expr.clone())
             .then(
-                self.arm(expr.clone())
+                self.arm(expr.clone(), stmt)
                     .separated_by(op!(','))
                     .allow_trailing()
                     .collect::<Vec<_>>()
@@ -2892,36 +2964,30 @@ impl<'pratt> Pratt<'pratt> {
 
     /// `pattern => expr` — one arm inside a `match` block.
     ///
-    /// Arm bodies may be a brace block `{ e; … }` (expression
-    /// sequence, same shape as lambda brace bodies) or any other
-    /// `expr`. The brace form is tried **before** the general
-    /// `expr` so that `{ self.foo(); x }` is a block rather than a
-    /// dict literal (dicts require `name: value` fields and would
-    /// otherwise report `found '.' expected ':'` on `self.method()`).
+    /// Arm bodies may be a brace block `{ statement; … trailing_expr }` or any
+    /// other `expr`. The brace form is tried **before** the general `expr` so
+    /// that `{ self.foo(); x }` is a block rather than a dict literal (dicts
+    /// require `name: value` fields and would otherwise report `found '.'
+    /// expected ':'` on `self.method()`).
     ///
     /// Returns a [`MatchArm`] directly (not an `Output`) because
     /// patterns are not expressions and don't carry a span.
     fn arm<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+        E: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+        S: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
     >(
         &self,
-        expr: T,
+        expr: E,
+        stmt: S,
     ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>>
     + Clone
     + 'pratt {
-        // Brace body built from the recursive `expr` — do NOT call
-        // `self.statement()` here (match lives inside `expr()`; that
-        // would re-enter `statement()` → `expr()` during parser
-        // construction and overflow the stack).
-        let brace_body = expr
-            .clone()
-            .then_ignore(op!(';').or_not())
-            .repeated()
-            .collect::<Vec<_>>()
-            .delimited_by(op!("{"), op!("}"))
-            .map_with(|children, e| (e.span(), Box::new(Expression::Block(children))));
+        // Use only handles built inside the surrounding `recursive(|expr| …)`.
+        let brace_body = self.brace_body(stmt, expr.clone());
 
         self.pattern()
             .then_ignore(op!("=>"))

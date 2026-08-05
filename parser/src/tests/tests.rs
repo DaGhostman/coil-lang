@@ -663,6 +663,56 @@
     }
 
     #[test]
+    fn match_arm_brace_body_allows_let_and_trailing_value() {
+        let ast = expr_ast!("match x { Option::Some(v) => { let y = v + 1; y }, _ => 0 }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 2);
+                    assert!(matches!(
+                        children[0].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Fragment(_))
+                    ));
+                    assert!(matches!(
+                        children[1].1.as_ref(),
+                        Expression::Identifier("y")
+                    ));
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_allows_return_statement() {
+        let ast = expr_ast!("match x { Option::Some(v) => { return v; }, _ => 0 }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 1);
+                    assert!(matches!(
+                        children[0].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Return(_))
+                    ));
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn match_arm_brace_body_allows_field_access_like_self_method() {
         // Regression: `{ self.get() }` used to parse as a dict and fail with
         // `found '.' expected ':'` because dict fields require `name: value`.
