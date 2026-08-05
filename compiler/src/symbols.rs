@@ -472,4 +472,49 @@ fn main() {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].kind, SymbolKind::Namespace);
     }
+
+    #[test]
+    fn use_alias_name_range_skips_path_substring() {
+        let source = "use io::stdout as out;\nfn main() { return; }\n";
+        let idx = index(source);
+        let defs = idx.definitions("out");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(&source[defs[0].name_range.clone()], "out");
+        assert!(
+            defs[0].name_range.start > source.find("stdout").expect("path"),
+            "alias span must not point at the `out` inside `stdout`"
+        );
+    }
+
+    #[test]
+    fn all_reference_sites_flattens_every_name() {
+        let source = "\
+fn fib(int n) -> int {
+    return fib(n - 1);
+}
+fn main() {
+    fib(10);
+    return;
+}
+";
+        let idx = index(source);
+        let per_name = idx.references("fib").len() + idx.references("n").len();
+        let flattened: Vec<_> = idx.all_reference_sites().collect();
+        assert!(
+            flattened.len() >= per_name,
+            "flattened sites should include every named reference"
+        );
+        assert_eq!(
+            flattened.iter().filter(|site| site.name == "fib").count(),
+            idx.references("fib").len()
+        );
+        assert_eq!(
+            flattened.iter().filter(|site| site.name == "n").count(),
+            idx.references("n").len()
+        );
+        assert!(
+            !flattened.is_empty(),
+            "expected reference sites from recursive + main call"
+        );
+    }
 }
