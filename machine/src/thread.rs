@@ -586,7 +586,9 @@ fn encode_value(
         | Object::Coroutine(_)
         | Object::Fn(_)
         | Object::PolyFn(_)
-        | Object::Library(_) => Err(ThreadErrorTag::NotSendable),
+        | Object::Library(_)
+        | Object::Root(_)
+        | Object::Weak(_) => Err(ThreadErrorTag::NotSendable),
         #[cfg(feature = "regex")]
         Object::Regex(_) => Err(ThreadErrorTag::NotSendable),
         #[cfg(feature = "crypto")]

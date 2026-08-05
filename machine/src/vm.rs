@@ -719,7 +719,9 @@ impl<const S: usize> Machine<S> {
             obj.mark_references(&mut gray);
         }
 
-        // SAFETY: all reachable objects were marked above.
+        heap.clear_dead_weaks();
+
+        // SAFETY: all reachable objects were marked above; dead weaks cleared.
         unsafe { heap.sweep() };
 
         heap.restore_gc_worklists(gray, root_objects);
