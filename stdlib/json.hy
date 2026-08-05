@@ -4,6 +4,8 @@
 // Variant names are globally unique (coil ctor namespace is flat).
 use string::{to_bytes, from_bytes};
 use bytes::{slice as bytes_slice, concat as bytes_concat};
+use ascii::{is_space, digit_val};
+use conv::{int_to_dec};
 
 enum JsonError {
     JsonUnexpectedEnd,
@@ -24,33 +26,13 @@ enum Json {
     JsonObject([string], [Json]),
 }
 
-fn is_ws(byte c) -> bool {
-    let sp: byte = " ";
-    let tab: byte = "\t";
-    let lf: byte = "\n";
-    let cr: byte = "\r";
-    if c == sp {
-        return true;
-    }
-    if c == tab {
-        return true;
-    }
-    if c == lf {
-        return true;
-    }
-    if c == cr {
-        return true;
-    }
-    return false;
-}
-
 fn skip_ws([byte] b, int i) -> int {
     while i < len(b) {
-        if is_ws(b[i]) {
+        if is_space(b[i]) {
             i = i + 1;
         }
         if i < len(b) {
-            if is_ws(b[i]) == false {
+            if is_space(b[i]) == false {
                 break;
             }
         }
@@ -59,53 +41,6 @@ fn skip_ws([byte] b, int i) -> int {
         }
     }
     return i;
-}
-
-fn digit_val(byte c) -> int {
-    let zero: byte = "0";
-    let nine: byte = "9";
-    if c < zero {
-        return -1;
-    }
-    if c > nine {
-        return -1;
-    }
-    return (c as int) - (zero as int);
-}
-
-fn digit_char(int d) -> string {
-    if d == 0 { return "0"; }
-    if d == 1 { return "1"; }
-    if d == 2 { return "2"; }
-    if d == 3 { return "3"; }
-    if d == 4 { return "4"; }
-    if d == 5 { return "5"; }
-    if d == 6 { return "6"; }
-    if d == 7 { return "7"; }
-    if d == 8 { return "8"; }
-    return "9";
-}
-
-fn int_to_dec(int n) -> string {
-    if n == 0 {
-        return "0";
-    }
-    let neg = 0;
-    let x = n;
-    if x < 0 {
-        neg = 1;
-        x = 0 - x;
-    }
-    let rev = "";
-    while x > 0 {
-        let d = x % 10;
-        rev = digit_char(d) + rev;
-        x = x / 10;
-    }
-    if neg == 1 {
-        return "-" + rev;
-    }
-    return rev;
 }
 
 fn int_to_dec_pad6(int n) -> string {
