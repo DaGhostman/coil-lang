@@ -7301,14 +7301,16 @@ impl Compiler {
                     } else {
                         format!("{module_ns}::{name}")
                     };
-                    let qualified = if self.functions.contains_key(&file_per_item) {
-                        file_per_item
-                    } else if self.functions.contains_key(&item_in_module) {
+                    let qualified = if self.functions.contains_key(&item_in_module) {
                         item_in_module
-                    } else {
-                        // Defensive: keep the historical one-item-per-file
-                        // shape when the dependency has not been linked yet.
+                    } else if self.functions.contains_key(&file_per_item) {
                         file_per_item
+                    } else {
+                        // Dependency not linked yet: prefer item-in-module
+                        // (`io::sync::write_all`) over one-item-per-file
+                        // (`io::sync::write_all::write_all`), which poisons
+                        // intra-module calls after a premature `use`.
+                        item_in_module
                     };
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     self.aliases.insert(local, qualified);
@@ -8656,7 +8658,7 @@ impl Compiler {
                         || self.native.contains_key(&n)
                     {
                         n
-                    } else if !self.namespace.is_empty() {
+                    } else if !self.namespace.is_empty() && !n.contains("::") {
                         let qualified = format!("{}::{}", self.namespace, n);
                         if self.functions.contains_key(&qualified)
                             || self
@@ -11321,6 +11323,9 @@ impl Compiler {
         self.current_function_qualified = None;
         self.current_function_table_key = None;
         self.fn_bytecode_spans.clear();
+        // `use` aliases are per-module; leftovers from a prior
+        // `compile_module` would otherwise redirect bare names.
+        self.aliases.clear();
         if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
             self.fn_debug_locals.clear();
         }
