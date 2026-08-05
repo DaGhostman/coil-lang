@@ -267,7 +267,7 @@ fn no_manifest_uses_default_src_root() {
 }
 
 #[test]
-fn use_glob_brings_items_into_scope() {
+fn use_brace_brings_items_into_scope() {
     let manifest = r#"
 [module]
 roots = ["./src"]
@@ -275,7 +275,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use foo::*;\nfn main() { sadge(); greet(); }\n",
+            "use foo::{sadge, greet};\nfn main() { sadge(); greet(); }\n",
         ),
         (
             "src/foo.hy",
@@ -283,19 +283,22 @@ roots = ["./src"]
              fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 200))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_glob", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_brace_items", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "100200");
 }
 
 #[test]
-fn use_glob_does_not_reach_subdirectory_files() {
+fn use_module_file_does_not_reach_subdirectory_files() {
     let manifest = r#"
 [module]
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.hy", "use foo::*;\nfn main() { top_only(); }\n"),
+        (
+            "src/main.hy",
+            "use foo::{top_only};\nfn main() { top_only(); }\n",
+        ),
         (
             "src/foo.hy",
             "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
@@ -305,9 +308,29 @@ roots = ["./src"]
             "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_module_file_subdir", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
+}
+
+#[test]
+fn disk_wildcard_import_is_rejected() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        ("src/main.hy", "use foo::*;\nfn main() {}\n"),
+        ("src/foo.hy", "fn sadge() {}\n"),
+    ];
+    let (root, entry) = build_project("disk_wildcard_reject", manifest, files, "src/main.hy");
+    let msgs = compile_project_errors(&root, &entry);
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("wildcard import") || m.contains("E0124")),
+        "expected WildcardImport diagnostic, got: {:?}",
+        msgs
+    );
 }
 
 #[test]
@@ -319,7 +342,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use iface::*;\n\
+            "use iface::{Foreign};\n\
              impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
              fn main() { }\n",
         ),
@@ -419,9 +442,9 @@ roots = ["./src"]
     assert_eq!(output, "6");
 }
 
-/// P2a: two glob imports must both resolve after discovery scans every dep.
+/// P2a: two brace imports must both resolve after discovery scans every dep.
 #[test]
-fn two_glob_imports_both_resolve() {
+fn two_brace_imports_both_resolve() {
     let manifest = r#"
 [module]
 roots = ["./src"]
@@ -429,7 +452,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use a::*;\nuse b::*;\nfn main() { from_a(); from_b(); }\n",
+            "use a::{from_a};\nuse b::{from_b};\nfn main() { from_a(); from_b(); }\n",
         ),
         (
             "src/a.hy",
@@ -440,7 +463,7 @@ roots = ["./src"]
             "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
         ),
     ];
-    let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("two_brace_imports", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "12");
 }
@@ -455,7 +478,7 @@ roots = ["./src"]
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::*;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
+            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::{public_fn};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
         ),
         (
             "src/util.hy",
@@ -557,7 +580,7 @@ fn parse_fail_dependency_emits_single_diagnostic() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.hy", "use bad::*;\nfn main() {}\n"),
+        ("src/main.hy", "mod bad;\nfn main() {}\n"),
         ("src/bad.hy", "@@@ not valid coil\n"),
     ];
     let (root, entry) = build_project("parse_fail_dep", manifest, files, "src/main.hy");
@@ -898,7 +921,7 @@ fn payload_eq(int a, int b) -> int {
         (
             "src/server.hy",
             r#"
-use protocol::*;
+use protocol::{payload_eq};
 
 fn check() -> int {
     return payload_eq(7, 7);

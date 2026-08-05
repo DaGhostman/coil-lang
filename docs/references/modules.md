@@ -21,7 +21,7 @@ Forms:
 |------|---------|
 | Concrete import | `use foo::sadge;` |
 | Aliased import | `use foo::sadge as f;` |
-| Glob import | `use foo::*;` |
+| Glob import | `use io::*;` (virtual modules only; prelude is auto-imported) |
 | Brace group | `use math::{add, mul as product};` |
 | Multi-segment | `use lib::io::read;` |
 
@@ -33,6 +33,7 @@ Rules:
 - Concrete imports and brace-group items may use `as`. Glob imports cannot be aliased.
 - A glob marker (`*`) or brace group must be the **last** segment.
 - Brace groups desugar to one concrete import per item (same module path).
+- **Userland (disk) modules must list names** (`use foo::{a, b}`). `use foo::*` is rejected (`E0124`). Glob `::*` remains valid for **virtual** modules (`io`, `ffi`, `thread`, …). Prelude modules are auto-imported.
 
 ### `mod` statement
 
@@ -110,14 +111,15 @@ Given a brace-group import `use math::{add, mul};`:
 1. Desugar to `use math::add;` + `use math::mul;` (same path, one item each).
 2. Resolve each item with the algorithm above (typically both hit the same `math.hy`).
 
-Given a glob import `use a::b::*;`:
+Given a glob import `use a::b::*;` (virtual modules only at typecheck):
 
 1. Split the path. The segment before `*` is the **module stem**.
    - For `use foo::*`: path = `["foo"]`, stem = `"foo"`
    - For `use a::b::*`: path = `["a"]`, stem = `"b"` (the last non-glob segment names the file)
 2. Pop the last segment from the path to get the directory prefix.
-3. Resolve `<project_root>/<root>/<path>/<stem>.hy` using the same root search order.
-4. Example: `use foo::*` → `<root>/foo.hy`
+3. For disk paths, discovery may still enqueue `<root>/<path>/<stem>.hy`, but
+   typechecking rejects userland `::*` with `E0124`. Virtual globs bind exports
+   without a `.hy` file.
 
 Given a `mod foo;` declaration:
 
@@ -131,7 +133,8 @@ Given a `mod foo;` declaration:
 | `use foo::sadge;` | `src/foo/sadge.hy`, else `src/foo.hy` |
 | `use math::{add, mul};` | `src/math.hy` (module-file fallback) |
 | `use lib::io::read;` | `src/lib/io/read.hy`, else `src/lib/io.hy` |
-| `use foo::*;` | `src/foo.hy` |
+| `use foo::*;` | rejected for disk (`E0124`); use brace/concrete imports |
+| `use io::*;` | virtual `io` (no `.hy`) |
 | `mod foo;` | `src/foo.hy` |
 
 With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
@@ -204,12 +207,17 @@ The FQN shape depends on **which file** path resolution loaded (see [Path resolu
 
 ## Glob semantics
 
-`use foo::*;`:
+`use path::*;` applies only to **virtual** modules (`io`, `ffi`, `string`, …).
+Userland disk modules must use concrete or brace imports (`use foo::{sadge, greet}`).
 
-1. **Discovery:** loads and compiles `foo.hy` (same as a non-glob reference to that file).
-2. **Scope:** after the dependency files compile, every top-level function whose FQN starts with `foo::` and has no further `::` segments is imported into the current scope by its bare name.
+Discovery still resolves a disk path ending in `*` to `<root>/…/stem.hy` for
+dependency loading, but typechecking rejects the import with `E0124`
+(`WildcardImport`) before names are bound.
 
-Example — `src/foo.hy`:
+Virtual glob example — `use io::*;` binds every export of the virtual `io`
+module (see the table above).
+
+Userland brace example — `src/foo.hy`:
 
 ```coil
 use io::{stdout, write_all};
@@ -218,14 +226,13 @@ fn sadge() { write_all(stdout(), to_bytes(format("%i", 100))); }
 fn greet() { write_all(stdout(), to_bytes(format("%i", 200))); }
 ```
 
-After `use foo::*;` in another file, both `sadge()` and `greet()` are callable directly.
+After `use foo::{sadge, greet};` in another file, both are callable by those
+local names. `use foo::*;` is a compile error.
 
-### Glob limitations
+### Glob limitations (virtual)
 
-- **File-scoped only.** `use foo::*` imports from `foo.hy`. It does **not** import items from `foo/bar.hy` or other files in a `foo/` directory.
-- **Top-level items only.** Nested items (if added in future versions) are not glob-imported.
-- **No aliasing.** `use foo::* as bar;` is not valid syntax.
-- **Compile order matters.** Glob expansion reads the function registry after dependency files compile. The imported file must compile before the consumer.
+- **No aliasing.** `use io::* as bar;` is not valid syntax.
+- **Virtual only.** Disk `::*` is rejected; list names or use a brace group.
 
 ---
 

@@ -178,14 +178,15 @@ Strip the matching root prefix, remove `.hy`, replace `/` with `::`:
 ./src/a/b.hy    →  namespace "a::b"     (module-file fallback)
 ```
 
-### Glob imports
+### Glob imports (virtual only)
 
-For `use foo::*;`:
+For virtual modules, `use io::*;` (and similar) binds every export of that
+virtual module. Userland disk `use foo::*;` is rejected at typecheck
+(`E0124`); use `use foo::{name, …}` or `mod foo;` for discovery without
+binding names.
 
-1. The module stem is the last non-`*` segment: `"foo"`.
-2. Directory prefix is all preceding segments (empty for `use foo::*`).
-3. Resolve `<root>/foo.hy` (not a subdirectory).
-4. Namespace of `foo.hy` is `foo`.
+Discovery still maps a path ending in `*` to `<root>/…/stem.hy` when
+scanning dependencies, but names are not imported from disk globs.
 
 ### `mod` declarations
 

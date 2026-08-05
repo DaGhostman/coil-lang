@@ -76,6 +76,9 @@ Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
 
 ## Virtual modules (explicit `use`)
 
+`::*` is allowed for virtual modules; **userland** `.hy` modules must list
+names (`use foo::{bar, baz}`). Prelude is auto-imported.
+
 | Module | Typical import | Notes |
 |--------|----------------|-------|
 | `io` | `use io::*;` | `Stream`, `[byte]`, files, TCP/UDP; non-blocking L0 |

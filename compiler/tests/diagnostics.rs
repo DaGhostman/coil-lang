@@ -269,6 +269,39 @@ fn main() { let a = f(1, 2, 3); }
 }
 
 #[test]
+fn userland_wildcard_import_has_stable_error_code() {
+    let msgs = check_messages("use foo::*;\nfn main() {}\n");
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
+        "expected WildcardImport (E0124), got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.message().contains("wildcard import") && m.message().contains("foo")),
+        "expected message mentioning wildcard import of foo, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn virtual_wildcard_import_is_still_allowed() {
+    let msgs = check_messages("use io::*;\nfn main() {}\n");
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
+        "virtual `use io::*` must not emit WildcardImport, got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn lambda_cannot_capture_without_use() {
     let msgs = check_messages(
         r#"
