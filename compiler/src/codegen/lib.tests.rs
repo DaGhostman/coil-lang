@@ -3,15 +3,15 @@
 
     fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
         let mut owned = String::new();
-        let needs_io = src.contains("write_all(")
+        let needs_io = src.contains("write(")
             || src.contains("stdout()")
             || src.contains("to_bytes(")
             || src.contains("format(");
-        if needs_io && !src.contains("use io::") && !src.contains("use io::*") {
+        if needs_io && !src.contains("use io::") {
             owned.push_str("use io::{stdout};
-use io::sync::{write_all};\n");
+\n");
         }
-        if needs_io && !src.contains("use string::") && !src.contains("use string::*") {
+        if needs_io && !src.contains("use string::") {
             owned.push_str("use string::{format, to_bytes};\n");
         }
         owned.push_str(src);
@@ -324,7 +324,7 @@ test("two") { assert(true)?; }
         let (bc, _pool) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn foo() -> Result<int, int> { return Result::Ok(0); }
@@ -333,7 +333,7 @@ fn main() {
         Result::Ok(s) => s,
         Result::Err(_) => panic "bad",
     };
-    write_all(stdout(), to_bytes(format("%i", x)));
+    write(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -398,7 +398,7 @@ fn foo() -> int {
         let (bc, _pool) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 enum Result<T, E> { Ok(T), Err(E) }
 fn main() {
@@ -407,7 +407,7 @@ fn main() {
         Result::Ok(n) => n,
         Result::Err(_) => panic "bad",
     };
-    write_all(stdout(), to_bytes(format("%i", x)));
+    write(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -524,7 +524,7 @@ fn main() {
         let (bc, _pool) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
             fn main() {
                 let d = { x: 0, y: 0 };
@@ -534,7 +534,7 @@ use string::{format, to_bytes};
                     d.y = d.y + 2;
                     i = i + 1;
                 }
-                write_all(stdout(), to_bytes(format("%i", d.x + d.y)));
+                write(stdout(), to_bytes(format("%i", d.x + d.y)));
             }
             "#,
         );
@@ -624,7 +624,7 @@ use string::{format, to_bytes};
     fn for_in_array_hoists_array_len_out_of_loop() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { for x in [1, 2, 3] { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+            "fn main() { for x in [1, 2, 3] { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
         let len_at = bc
             .iter()
@@ -1493,7 +1493,7 @@ sum = sum + i; \
     fn for_in_array_emits_array_len_index_and_back_edge() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { for x in [1, 2, 3] { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+            "fn main() { for x in [1, 2, 3] { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
         let has_len = bc
             .iter()
@@ -1517,7 +1517,7 @@ sum = sum + i; \
     fn for_in_dict_emits_dict_entries() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { let d = { a: 1, b: 2 }; for p in d { write_all(stdout(), to_bytes(format(\"%i\", p[1]))); } }",
+            "fn main() { let d = { a: 1, b: 2 }; for p in d { write(stdout(), to_bytes(format(\"%i\", p[1]))); } }",
         );
         assert!(
             bc.iter()
@@ -1543,7 +1543,7 @@ impl Iterator<Counter> { \
         return Option::None; \
     } \
 } \
-fn main() { let c = new Counter(0, 3); for x in c { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+fn main() { let c = new Counter(0, 3); for x in c { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
         let call_indirect = bc
             .iter()
@@ -1568,7 +1568,7 @@ fn main() { let c = new Counter(0, 3); for x in c { write_all(stdout(), to_bytes
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "async fn counter() { yield 0; yield 1; return 99; } \
-fn main() { for x in counter() { write_all(stdout(), to_bytes(format(\"%i\", x))); } }",
+fn main() { for x in counter() { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
 
         let resume = bc
@@ -1992,7 +1992,7 @@ fn main() {
  let v = match e { \
  E::Foo { y: _, x: a } => a, \
  }; \
- write_all(stdout(), to_bytes(format(\"%i\", v))); \
+ write(stdout(), to_bytes(format(\"%i\", v))); \
  }",
         );
         // `let e` / `let v` emit STORE; match binding `a` does not.
@@ -2495,7 +2495,7 @@ fn main() {
         let (bc, _pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
  fn get_x(Point p) -> int { return p.x; } \
- fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x(Point::Point { x: 42, y: 7 })))); }",
+ fn main() { write(stdout(), to_bytes(format(\"%i\", get_x(Point::Point { x: 42, y: 7 })))); }",
         );
 
         // Exactly 1 LoadField (in the get_x function body).
@@ -2540,8 +2540,8 @@ fn main() {
  fn x_coord(Point p) -> int { return p.x; } \
  fn y_coord(Point p) -> int { return p.y; } \
  fn main() { \
- write_all(stdout(), to_bytes(format(\"%i\", x_coord(Point::Point { x: 5, y: 12 })))); \
- write_all(stdout(), to_bytes(format(\"%i\", y_coord(Point::Point { x: 5, y: 12 })))); \
+ write(stdout(), to_bytes(format(\"%i\", x_coord(Point::Point { x: 5, y: 12 })))); \
+ write(stdout(), to_bytes(format(\"%i\", y_coord(Point::Point { x: 5, y: 12 })))); \
  }",
         );
 
@@ -2750,7 +2750,7 @@ fn main() {
     fn const_if_strict_lt_does_not_take_then_branch() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+            "fn main() { if 5 < 5 { write(stdout(), to_bytes(format(\"%i\", 1))); } else { write(stdout(), to_bytes(format(\"%i\", 0))); } }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -2763,7 +2763,7 @@ fn main() {
     fn const_if_emits_only_taken_branch() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { if 4 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+            "fn main() { if 4 < 5 { write(stdout(), to_bytes(format(\"%i\", 1))); } else { write(stdout(), to_bytes(format(\"%i\", 0))); } }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -2781,7 +2781,7 @@ fn main() {
 if n <= 0 { return acc; } \
 return sum_to(n - 1, acc + n); \
 } \
-fn main() { write_all(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
+fn main() { write(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
         );
         assert!(
             bc.iter()
@@ -2796,7 +2796,7 @@ fn main() { write_all(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn add(int a, int b) -> int { return a + b; } \
-fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
+fn main() { write(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
         );
         assert!(
             bc.iter().any(|b| {
@@ -3013,7 +3013,7 @@ fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
                if is_neg == 1 { return 99; } \
                return n * 2; \
              } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", early(4, 0)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", early(4, 0)))); }",
         );
         // Prologue may contain one CALL to main; the early() call site must not.
         let calls = bc
@@ -3097,7 +3097,7 @@ fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
                if n <= 2 { return 1; } \
                return fib(n - 1) + fib(n - 2); \
              } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", fib(5)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", fib(5)))); }",
         );
         let calls = bc
             .iter()
@@ -3222,7 +3222,7 @@ fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
             "fn main() { \
 let s = 0; \
 for (let i = 0; i < 3; i = i + 1) { s = s + i; } \
-write_all(stdout(), to_bytes(format(\"%i\", s))); \
+write(stdout(), to_bytes(format(\"%i\", s))); \
 }",
         );
         assert!(
@@ -3240,7 +3240,7 @@ write_all(stdout(), to_bytes(format(\"%i\", s))); \
     fn const_if_strict_lt_equality_takes_else() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { write_all(stdout(), to_bytes(format(\"%i\", 1))); } else { write_all(stdout(), to_bytes(format(\"%i\", 0))); } }",
+            "fn main() { if 5 < 5 { write(stdout(), to_bytes(format(\"%i\", 1))); } else { write(stdout(), to_bytes(format(\"%i\", 0))); } }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -3262,7 +3262,7 @@ write_all(stdout(), to_bytes(format(\"%i\", s))); \
     fn const_while_false_eliminates_loop() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { while false { write_all(stdout(), to_bytes(format(\"%i\", 1))); } write_all(stdout(), to_bytes(format(\"%i\", 2))); }",
+            "fn main() { while false { write(stdout(), to_bytes(format(\"%i\", 1))); } write(stdout(), to_bytes(format(\"%i\", 2))); }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -3282,7 +3282,7 @@ for (let i = 0; i < 3; i = i + 1) { \
   s = s + i; \
   break; \
 } \
-write_all(stdout(), to_bytes(format(\"%i\", s))); \
+write(stdout(), to_bytes(format(\"%i\", s))); \
 }",
         );
         // Peephole may fuse JMPF into CmpJmpf / BinSlotImmJmpf / LogNotJmpf.
@@ -3313,7 +3313,7 @@ if n <= 0 { return 0; } \
 yield n; \
 return tick(n - 1); \
 } \
-fn main() { let h = tick(2); write_all(stdout(), to_bytes(format(\"%i\", resume h))); }",
+fn main() { let h = tick(2); write(stdout(), to_bytes(format(\"%i\", resume h))); }",
         );
         assert!(
             !bc.iter()
@@ -3440,7 +3440,7 @@ fn main() {
             "enum Inner { Inner { v: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 })))); }",
+ fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.v`)
@@ -3470,7 +3470,7 @@ fn main() {
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
+ fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField in the function body.
@@ -3525,7 +3525,7 @@ fn main() {
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_w(Outer o) -> int { return o.x.w; } \
- fn main() { write_all(stdout(), to_bytes(format(\"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
+ fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.w`).
@@ -4006,7 +4006,7 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
         );
 
         // Shared body uses the dictionary ABI (CallIndirect), not DynAdd.
@@ -4310,7 +4310,7 @@ fn main() {
     fn nested_io_host_invoke_emits_outer_const_before_inner_host_invoke() {
         use common::Instruction;
         let src = "\
-use io::*; \
+use io::{stdin, read}; \
 fn main() { \
   let buf: [byte] = [0]; \
   let _ = read(stdin(), buf); \
@@ -4362,8 +4362,8 @@ fn main() { \
     fn invoke_callback_fn_arg_emits_relocatable_code_ptr() {
         use common::Instruction;
         let src = "\
-use ffi::*; \
-use ffi::types::*; \
+use ffi::{dload, declare, invoke}; \
+use ffi::types::{Callback, Int}; \
 fn doubler(int x) -> int { return x * 2; } \
 fn main() { \
   let lib = dload(\"libsum.so\"); \
@@ -4447,7 +4447,7 @@ fn main() { \
              } \
              fn main() { \
                let f = id; \
-               write_all(stdout(), to_bytes(format(\"%i\", f(fib(5))))); \
+               write(stdout(), to_bytes(format(\"%i\", f(fib(5))))); \
              }",
         );
         assert!(
@@ -4677,12 +4677,12 @@ fn main() {
         let (bc, _pool) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let (a, b) = (1, 2);
-    write_all(stdout(), to_bytes(format("%i", a)));
-    write_all(stdout(), to_bytes(format("%i", b)));
+    write(stdout(), to_bytes(format("%i", a)));
+    write(stdout(), to_bytes(format("%i", b)));
 }
 "#,
         );
@@ -4788,12 +4788,12 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let y = 10;
     let f = fn (int x) use (y) => x + y;
-    write_all(stdout(), to_bytes(format("%i", f(32))));
+    write(stdout(), to_bytes(format("%i", f(32))));
 }
 "#,
         );
@@ -4821,11 +4821,11 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let a = (1, 1) + (1, 1);
-    write_all(stdout(), to_bytes(format("%i", a[0])));
+    write(stdout(), to_bytes(format("%i", a[0])));
 }
 "#,
         );
@@ -4939,13 +4939,13 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let b = matrix([[5, 6], [7, 8]]);
     let c = a * b;
-    write_all(stdout(), to_bytes(format("%i", c[0][0])));
+    write(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -4982,12 +4982,12 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let c = a + a;
-    write_all(stdout(), to_bytes(format("%i", c[0][0])));
+    write(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -5009,13 +5009,13 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[5, 7], [9, 11]]);
     let b = matrix([[1, 2], [3, 4]]);
     let c = a - b;
-    write_all(stdout(), to_bytes(format("%i", c[0][0])));
+    write(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -5039,12 +5039,12 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let a = matrix([[1, 2], [3, 4]]);
     let c = -a;
-    write_all(stdout(), to_bytes(format("%i", c[0][0])));
+    write(stdout(), to_bytes(format("%i", c[0][0])));
 }
 "#,
         );
@@ -5063,11 +5063,11 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let c = cross((1, 0, 0), (0, 1, 0));
-    write_all(stdout(), to_bytes(format("%i", c[0])));
+    write(stdout(), to_bytes(format("%i", c[0])));
 }
 "#,
         );
@@ -5241,11 +5241,11 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 use io::{stdout};
-use io::sync::{write_all};
+
 use string::{format, to_bytes};
 fn main() {
     let x = 3.5 as int;
-    write_all(stdout(), to_bytes(format("%i", x)));
+    write(stdout(), to_bytes(format("%i", x)));
 }
 "#,
         );
@@ -5269,7 +5269,7 @@ fn main() {
                if n <= 0 { return 1; } \
                return other(n) + 1; \
              } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", base(0)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", base(0)))); }",
         );
         let bad: Vec<_> = bc
             .iter()
@@ -5290,8 +5290,9 @@ fn main() {
         use common::Instruction;
         let (bc, pool) = compile_src(
             r#"
-use io::*;
-use string::*;
+use io::{stdout};
+
+use string::{format, to_bytes};
 fn bytes_slice([byte] src, int start, int end) -> [byte] {
     let out: [byte] = [];
     let i = start;
@@ -5306,7 +5307,7 @@ fn bytes_slice([byte] src, int start, int end) -> [byte] {
 fn main() {
     let b = to_bytes("abcd");
     let s = bytes_slice(b, 0, 4);
-    write_all(stdout(), to_bytes(format("%i", len(s))));
+    write(stdout(), to_bytes(format("%i", len(s))));
 }
 "#,
         );

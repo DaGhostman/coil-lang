@@ -377,7 +377,7 @@
     #[test]
     fn write_all_with_string_bytes_ok() {
         assert_ok(
-            r#"use io::{stdout, write_all}; use string::to_bytes; write_all(stdout(), to_bytes("hello"));"#,
+            r#"use io::{stdout, write}; use string::to_bytes; write(stdout(), to_bytes("hello"));"#,
             result_app_ty(unit_ty(), Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into())),
         );
     }
@@ -535,11 +535,11 @@ fn main() {
     #[test]
     fn rank_n_param_accepts_polymorphic_id() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
             fn id<T>(T x) -> T { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { write_all(stdout(), to_bytes(format("%i", app(id, 1)))); }
+            fn main() { write(stdout(), to_bytes(format("%i", app(id, 1)))); }
         "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
@@ -549,11 +549,11 @@ use string::{format, to_bytes};
     #[test]
     fn rank_n_rejects_escaping_skolem() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
             fn inc(int x) -> int { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { write_all(stdout(), to_bytes(format("%i", app(inc, 1)))); }
+            fn main() { write(stdout(), to_bytes(format("%i", app(inc, 1)))); }
         "#;
         let msgs = assert_messages(src);
         assert!(
@@ -1775,9 +1775,9 @@ use string::{format, to_bytes};
     #[test]
     fn format_string_percent_i_requires_int() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%i", "hello")));"#,
+write(stdout(), to_bytes(format("%i", "hello")));"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("requires int")),
@@ -1852,9 +1852,9 @@ write_all(stdout(), to_bytes(format("%i", "hello")));"#,
     #[test]
     fn format_percent_v_accepts_int() {
         let (mut c, _) = check(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%v", 42)));"#,
+write(stdout(), to_bytes(format("%v", 42)));"#,
         );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -1863,9 +1863,9 @@ write_all(stdout(), to_bytes(format("%v", 42)));"#,
     #[test]
     fn format_percent_v_accepts_structural_tuple_and_record() {
         let (mut c, _) = check(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
+write(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
         );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -1874,9 +1874,9 @@ write_all(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
     #[test]
     fn format_percent_i_on_open_type_errors() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%i", x))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%i", x))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| {
@@ -1891,9 +1891,9 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%i", x))); } fn main() { b
     #[test]
     fn format_percent_v_without_show_errors() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", x))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%v", x))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
@@ -1905,9 +1905,9 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", x))); } fn main() { b
     #[test]
     fn format_percent_v_rejects_structural_tuple_with_open_type() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", (x, 1)))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%v", (x, 1)))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
@@ -1922,7 +1922,7 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", (x, 1)))); } fn main(
     fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
         // Two Result::Ok arms with different inner patterns are both reachable.
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
         fn unwrap(Result r) -> int {
             return match r {
@@ -1932,7 +1932,7 @@ use string::{format, to_bytes};
             };
         }
         fn main() {
-            write_all(stdout(), to_bytes(format("%i", unwrap(Result::Ok(Option::Some(42))))));
+            write(stdout(), to_bytes(format("%i", unwrap(Result::Ok(Option::Some(42))))));
         }
         "#;
         let (mut c, _) = check(src);
@@ -2059,13 +2059,13 @@ use string::{format, to_bytes};
         // variants share index `"0"`; match refinement must make this
         // typecheck (and `%v` must resolve Show).
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 #[derive(Show, Eq)]
 enum Box { S(string), B(bool) }
 fn main() {
-    write_all(stdout(), to_bytes(format("%v,", Box::S("x"))));
-    write_all(stdout(), to_bytes(format("%z", Box::S("x") == Box::S("x"))));
+    write(stdout(), to_bytes(format("%v,", Box::S("x"))));
+    write(stdout(), to_bytes(format("%z", Box::S("x") == Box::S("x"))));
 }
 "#;
         let mut ast = Pratt::default().parse(src).expect("parse");
@@ -3592,15 +3592,15 @@ fn main() {
     #[test]
     fn declare_struct_ret_recorded_for_invoke_typing() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 extern struct Point {
     x: int32,
     y: int32,
 };
 
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int32};
 
 fn main() -> Result<(), Error> {
     let lib = dload("sum")?;
@@ -3611,8 +3611,8 @@ fn main() -> Result<(), Error> {
         Point,
     )?;
     let p = invoke(lib, make_id, (3, 4))?;
-    write_all(stdout(), to_bytes(format("%i", p.x)));
-    write_all(stdout(), to_bytes(format("%i", p.y)));
+    write(stdout(), to_bytes(format("%i", p.x)));
+    write(stdout(), to_bytes(format("%i", p.y)));
 }
 "#;
         let (c, _) = check(src);
@@ -3726,13 +3726,13 @@ fn c() {
     #[test]
     fn coalesce_option_and_result_typecheck() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let a = Option::None ?? "bar";
     let b = Result::Err("boom") ?? 7;
-    write_all(stdout(), to_bytes(format("%s", a)));
-    write_all(stdout(), to_bytes(format("%i", b)));
+    write(stdout(), to_bytes(format("%s", a)));
+    write(stdout(), to_bytes(format("%i", b)));
 }
 "#;
         let (c, _) = check(src);
@@ -3759,12 +3759,12 @@ fn main() {
     #[test]
     fn optional_access_on_option_ok() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let o = Option::Some({ v: 1 });
     let n = o?.v;
-    write_all(stdout(), to_bytes(format("%i", n ?? 0)));
+    write(stdout(), to_bytes(format("%i", n ?? 0)));
 }
 "#;
         let (c, _) = check(src);
@@ -3793,11 +3793,11 @@ fn main() {
     #[test]
     fn prelude_injects_option_without_import() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let o = Option::Some(1);
-    write_all(stdout(), to_bytes(format("%i", match o { Option::Some(v) => v, Option::None => 0 })));
+    write(stdout(), to_bytes(format("%i", match o { Option::Some(v) => v, Option::None => 0 })));
 }
 "#;
         let (c, _) = check(src);
@@ -3909,8 +3909,8 @@ fn main() {
     #[test]
     fn use_ffi_types_glob_brings_int_tag_into_scope() {
         let src = r#"
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int};
 fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (Int, Int), Int)?;
@@ -3930,7 +3930,7 @@ fn main() -> Result<(), Error> {
     #[test]
     fn ffi_types_qualified_path_works_without_import() {
         let src = r#"
-use ffi::*;
+use ffi::{declare, dload, invoke, Error};
 fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int)?;
@@ -3948,7 +3948,7 @@ fn main() -> Result<(), Error> {
     #[test]
     fn ffi_error_kind_field_is_matchable() {
         let src = r#"
-use ffi::*;
+use ffi::{dload, Error, ErrorKind};
 fn main() {
     let r = dload("missing");
     let _ = match r {
@@ -4714,10 +4714,10 @@ fn main() {
     fn byte_return_accepts_in_range_literal_arithmetic() {
         let (mut c, _) = check(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn f() -> byte { return 1 + 1; }
-fn main() { write_all(stdout(), to_bytes(format("%i", f()))); }
+fn main() { write(stdout(), to_bytes(format("%i", f()))); }
 "#,
         );
         let msgs = c.take_messages();
@@ -4787,10 +4787,10 @@ fn f() -> byte {
     fn write_all_accepts_named_byte_array() {
         let (mut c, _) = check(
             r#"
-use io::*;
+use io::{stdin, write};
 fn main() {
     let data: [byte] = [1, 2];
-    write_all(stdin(), data);
+    write(stdin(), data);
 }
 "#,
         );
@@ -4814,7 +4814,7 @@ fn main() {
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
 
-        let (mut c, _) = check("use io::*; let e = IoError::Other;");
+        let (mut c, _) = check("use io::{IoError}; let e = IoError::Other;");
         let msgs = c.take_messages();
         assert!(
             msgs.is_empty(),
@@ -4827,10 +4827,10 @@ fn main() {
     fn write_all_rejects_unannotated_int_array_variable() {
         let msgs = assert_messages(
             r#"
-use io::*;
+use io::{stdin, write};
 fn main() {
     let data = [1, 2];
-    write_all(stdin(), data);
+    write(stdin(), data);
 }
 "#,
         );
@@ -4865,10 +4865,10 @@ test("ok") {
     fn test_case_rejects_main_alongside_cases() {
         let msgs = assert_messages(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 test("a") { assert(true)?; }
-fn main() { write_all(stdout(), to_bytes("x")); }
+fn main() { write(stdout(), to_bytes("x")); }
 "#,
         );
         assert!(
@@ -5335,7 +5335,7 @@ fn main() { let g = add(a: 1); }
     fn spawn_rejects_non_sendable_thread_argument() {
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn, Thread};
 fn noop() -> int { return 0; }
 fn work(Thread t) -> int { return 1; }
 fn main() {
@@ -5356,7 +5356,7 @@ fn main() {
     fn spawn_rejects_zero_and_too_many_arguments() {
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn};
 fn main() {
     let _ = spawn();
 }
@@ -5371,7 +5371,7 @@ fn main() {
 
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn};
 fn work(int a, int b) -> int { return a + b; }
 fn main() {
     let _ = spawn(work, 1, 2);
@@ -5390,7 +5390,7 @@ fn main() {
     fn spawn_accepts_sendable_int_argument() {
         let (mut c, _) = check(
             r#"
-use thread::*;
+use thread::{spawn};
 fn work(int n) -> int { return n + 1; }
 fn main() {
     let t = spawn(work, 41);

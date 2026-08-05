@@ -288,13 +288,13 @@ fn userland_wildcard_import_has_stable_error_code() {
 }
 
 #[test]
-fn virtual_wildcard_import_is_still_allowed() {
+fn virtual_wildcard_import_is_rejected() {
     let msgs = check_messages("use io::*;\nfn main() {}\n");
     assert!(
-        !msgs
+        msgs
             .iter()
             .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
-        "virtual `use io::*` must not emit WildcardImport, got: {:?}",
+        "virtual `use io::*` must emit WildcardImport, got: {:?}",
         msgs.iter()
             .map(|m| (m.code(), m.message()))
             .collect::<Vec<_>>()
@@ -326,11 +326,11 @@ fn main() {
 fn defer_cannot_capture_without_use() {
     let msgs = check_messages(
         r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let y = 10;
-    defer { write_all(stdout(), to_bytes(format("%i", y))); }
+    defer { write(stdout(), to_bytes(format("%i", y))); }
 }
 "#,
     );
@@ -346,10 +346,10 @@ fn main() {
 fn defer_undefined_variable_is_rejected() {
     let msgs = check_messages(
         r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
-    defer { write_all(stdout(), to_bytes(format("%i", totally_undefined_var))); }
+    defer { write(stdout(), to_bytes(format("%i", totally_undefined_var))); }
 }
 "#,
     );
@@ -1563,7 +1563,8 @@ fn ffi_dload_without_use_errors() {
 fn declare_wrong_arity_errors() {
     let msgs = check_messages(
         r#"
-        use ffi::*;
+        use ffi::{dload, declare};
+        use ffi::types::{Int};
         fn main() {
             let lib = match dload("x.so") {
                 Result::Ok(h) => h,
@@ -1587,7 +1588,7 @@ fn declare_wrong_arity_errors() {
 fn invoke_wrong_arity_errors() {
     let msgs = check_messages(
         r#"
-        use ffi::*;
+        use ffi::{dload, invoke};
         fn main() {
             let lib = match dload("x.so") {
                 Result::Ok(h) => h,
@@ -2185,7 +2186,7 @@ fn main() { let t = spawn(work); }
 fn spawn_non_sendable_argument_reports_diagnostic() {
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{spawn, Thread};
 fn noop() -> int { return 0; }
 fn work(Thread t) -> int { return 1; }
 fn main() {
@@ -2237,7 +2238,7 @@ fn primitive_cast_rejects_negative_literal_int_as_byte() {
 fn env_exec_call_emits_trusted_inputs_warning() {
     let msgs = compile_messages(
         r#"
-use env::*;
+use env::{exec};
 fn main() {
     let _ = exec("true", []);
 }
@@ -2255,7 +2256,7 @@ fn main() {
 fn env_exit_call_emits_process_termination_warning() {
     let msgs = compile_messages(
         r#"
-use env::*;
+use env::{exit};
 fn main() {
     exit(0);
 }
@@ -2361,12 +2362,12 @@ fn main() {
 #[test]
 fn method_named_send_does_not_shadow_thread_send() {
     // Regression: inherent `fn send` used to bind bare `send` for
-    // monomorphic recursion, shadowing `use thread::*;` and turning
+    // monomorphic recursion, shadowing `use thread::{send}` and turning
     // `send(self.channel, data)` into a self-type mismatch
     // (expected Sender, found Wrapper) while checking function type.
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{send, Sender, Thread};
 
 class ThreadWrapper {
     thread: Thread,
@@ -2393,7 +2394,7 @@ fn main() {}
 fn self_channel_field_passes_sender_to_thread_send() {
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{send, Sender, Thread};
 
 class ThreadWrapper {
     thread: Thread,
@@ -2420,7 +2421,7 @@ fn main() {}
 fn gc_get_rejects_weak_handle() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{get, weak};
 fn main() {
     let w = weak(1);
     let _ = get(w);
@@ -2438,7 +2439,7 @@ fn main() {
 fn gc_upgrade_rejects_root_handle() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{root, upgrade};
 fn main() {
     let r = root(1);
     let _ = upgrade(r);
@@ -2456,7 +2457,7 @@ fn main() {
 fn gc_root_get_roundtrip_typechecks() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{get, root, upgrade, weak};
 fn main() {
     let r = root(1);
     let n: int = get(r);

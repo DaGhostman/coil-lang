@@ -190,7 +190,7 @@ fn use_single_segment_resolves_in_src_root() {
     let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "use foo::sadge;\nfn main() { sadge(); }\n"),
-        ("src/foo/sadge.hy", "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
+        ("src/foo/sadge.hy", "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn sadge() { write(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
     ];
     let (root, entry) = build_project("use_single_segment", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
@@ -204,7 +204,7 @@ fn use_with_alias_renames_imported_item() {
         ("src/main.hy", "use foo::sadge as f;\nfn main() { f(); }\n"),
         (
             "src/foo/sadge.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn sadge() { write(stdout(), to_bytes(format(\"%i\", 99))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_with_alias", &manifest, files, "src/main.hy");
@@ -219,7 +219,7 @@ fn use_multi_segment_path_walks_into_nested_directory() {
         ("src/main.hy", "use lib::io::read;\nfn main() { read(); }\n"),
         (
             "src/lib/io/read.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn read() { write(stdout(), to_bytes(format(\"%i\", 7))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_multi_segment", &manifest, files, "src/main.hy");
@@ -237,11 +237,11 @@ fn multiple_roots_search_in_order() {
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn greet() { write(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
         ),
         (
             "vendor/foo/greet.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn greet() { write(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
         ),
     ];
     let (root, entry) = build_project("multiple_roots", &manifest, files, "src/main.hy");
@@ -284,8 +284,8 @@ fn use_brace_brings_items_into_scope() {
         ),
         (
             "src/foo.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
-             fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 200))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn sadge() { write(stdout(), to_bytes(format(\"%i\", 100))); }\n\
+             fn greet() { write(stdout(), to_bytes(format(\"%i\", 200))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_brace_items", &manifest, files, "src/main.hy");
@@ -303,11 +303,11 @@ fn use_module_file_does_not_reach_subdirectory_files() {
         ),
         (
             "src/foo.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn top_only() { write(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
         ),
         (
             "src/foo/bar.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn bar() { write(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
         ),
     ];
     let (root, entry) = build_project("use_module_file_subdir", &manifest, files, "src/main.hy");
@@ -366,7 +366,7 @@ fn two_module_polyfn_and_fib_fuse_and_run() {
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse util::inc;\n\
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nuse util::inc;\n\
              fn id<T>(T x) -> T { return x; }\n\
              fn fib(int n) -> int {\n\
                if n <= 2 { return 1; }\n\
@@ -374,7 +374,7 @@ fn two_module_polyfn_and_fib_fuse_and_run() {
              }\n\
              fn main() {\n\
                let f = id;\n\
-               write_all(stdout(), to_bytes(format(\"%i\", f(inc(fib(5))))));\n\
+               write(stdout(), to_bytes(format(\"%i\", f(inc(fib(5))))));\n\
              }\n",
         ),
         (
@@ -446,11 +446,11 @@ fn two_brace_imports_both_resolve() {
         ),
         (
             "src/a.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn from_a() { write(stdout(), to_bytes(format(\"%i\", 1))); }\n",
         ),
         (
             "src/b.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn from_b() { write(stdout(), to_bytes(format(\"%i\", 2))); }\n",
         ),
     ];
     let (root, entry) = build_project("two_brace_imports", &manifest, files, "src/main.hy");
@@ -465,7 +465,7 @@ fn sibling_bare_call_in_namespaced_module() {
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse util::{public_fn};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nuse util::{public_fn};\nfn main() { write(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
         ),
         (
             "src/util.hy",
@@ -485,7 +485,7 @@ fn cross_module_static_slot_init_and_mutation() {
         ("src/counter.hy", "static let n = 0;\n"),
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
         ),
     ];
     let (root, entry) = build_project("cross_module_static", &manifest, files, "src/main.hy");
@@ -499,7 +499,7 @@ fn use_brace_group_imports_from_module_file() {
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
         ),
         (
             "src/math.hy",
@@ -519,7 +519,7 @@ fn use_brace_group_as_alias_imports_from_module_file() {
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
         ),
         (
             "src/math.hy",
@@ -609,7 +609,7 @@ file = "./src/main.hy"
     );
     let files = &[(
         "src/main.hy",
-        "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+        "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn main() { write(stdout(), to_bytes(format(\"%i\", 42))); }\n",
     )];
     let (root, _entry) = build_project("manifest_entry", &manifest, files, "src/main.hy");
 
@@ -648,7 +648,7 @@ fn use_item_from_module_file_without_subdir() {
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
         ),
         (
             "src/math.hy",
@@ -671,7 +671,7 @@ fn multi_file_try_operator_pool_survives_module_link() {
         (
             "src/main.hy",
             r#"
-use thread::*;
+use thread::{channel, join, send, spawn, Sender, Thread};
 use pool::worker::run_jobs;
 
 class Worker {
@@ -703,9 +703,8 @@ fn main() {
         (
             "src/pool/worker.hy",
             r#"
-use thread::*;
-use io::{stdout};
-use io::sync::{write_all};
+use thread::{recv, Receiver};
+use io::{stdout, write};
 use string::{format, to_bytes};
 
 fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
@@ -714,7 +713,7 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
         if job == "stop" {
             break;
         }
-        write_all(stdout(), to_bytes(format("%s,", job)));
+        write(stdout(), to_bytes(format("%s,", job)));
     }
     return 0;
 }
@@ -742,22 +741,21 @@ fn multi_file_io_hostinvoke_try_in_dependency() {
         (
             "src/main.hy",
             r#"
-use io::*;
-use io::sync::{write_all};
+use io::{stdout, write};
+
 use helper::write_greeting;
-use string::*;
+use string::{to_bytes};
 
 fn main() {
     write_greeting()?;
-    write_all(stdout(), to_bytes("ok"));
+    write(stdout(), to_bytes("ok"));
 }
 "#,
         ),
         (
             "src/helper.hy",
             r#"
-use io::*;
-use io::sync::{write_all};
+use io::{close, open, write, IoError};
 
 fn write_greeting() -> Result<(), IoError> {
     let path = "greeting.bin";
@@ -766,7 +764,7 @@ fn write_greeting() -> Result<(), IoError> {
     let nl: byte = 10;
     let payload: [byte] = [h, i, nl];
     let w = open(path, "w")?;
-    write_all(w, payload)?;
+    write(w, payload)?;
     close(w)?;
     return ();
 }
@@ -797,20 +795,19 @@ fn multi_file_io_hostinvoke_try_in_nested_dependency() {
             "src/main.hy",
             r#"
 use facade::roundtrip;
-use io::{stdout};
-use io::sync::{write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 
 fn main() {
     roundtrip()?;
-    write_all(stdout(), to_bytes("ok"));
+    write(stdout(), to_bytes("ok"));
 }
 "#,
         ),
         (
             "src/facade.hy",
             r#"
-use io::*;
+use io::{IoError};
 use transport::write_then_read;
 
 fn roundtrip() -> Result<(), IoError> {
@@ -822,15 +819,15 @@ fn roundtrip() -> Result<(), IoError> {
         (
             "src/transport.hy",
             r#"
-use io::*;
-use io::sync::{write_all, read_exact};
+use io::{close, open, write, IoError};
+use io::sync::{read_exact};
 
 fn write_then_read(string path) -> Result<(), IoError> {
     let a: byte = 65;
     let b: byte = 66;
     let payload: [byte] = [a, b];
     let w = open(path, "w")?;
-    write_all(w, payload)?;
+    write(w, payload)?;
     close(w)?;
 
     let r = open(path, "r")?;
@@ -866,12 +863,11 @@ fn multi_file_sibling_use_free_fn_from_dependency() {
             "src/main.hy",
             r#"
 use server::check;
-use io::{stdout};
-use io::sync::{write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 
 fn main() {
-    write_all(stdout(), to_bytes(format("%i", check())));
+    write(stdout(), to_bytes(format("%i", check())));
 }
 "#,
         ),
