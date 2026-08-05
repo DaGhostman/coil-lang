@@ -266,4 +266,93 @@ mod tests {
         let after = host_gc_heap_bytes(&mut heap, &[]).as_int();
         assert!(after > before);
     }
+
+    #[test]
+    fn get_and_unroot_reject_non_root_handles() {
+        let mut heap = Heap::default();
+        let s = intern(&mut heap, "not-a-root");
+        assert_eq!(host_gc_get(&mut heap, &[s]).as_int(), 0);
+        assert_eq!(host_gc_unroot(&mut heap, &[s]).as_int(), 0);
+        assert_eq!(host_gc_get(&mut heap, &[Value::from(0i64)]).as_int(), 0);
+        assert_eq!(host_gc_unroot(&mut heap, &[]).as_int(), 0);
+    }
+
+    #[test]
+    fn upgrade_rejects_non_weak_handles() {
+        let mut heap = Heap::default();
+        let root = host_gc_root(&mut heap, &[Value::from(1i64)]);
+        let up = host_gc_upgrade(&mut heap, &[root]);
+        match heap.find_object_by_addr(up.raw() as u64) {
+            Some(Object::Enum(gc)) => assert_eq!(gc.as_ref().tag, 0, "expected Option::None"),
+            _ => panic!("expected Option"),
+        }
+        let empty = host_gc_upgrade(&mut heap, &[]);
+        match heap.find_object_by_addr(empty.raw() as u64) {
+            Some(Object::Enum(gc)) => assert_eq!(gc.as_ref().tag, 0),
+            _ => panic!("expected Option::None for missing arg"),
+        }
+    }
+
+    #[test]
+    fn get_after_unroot_returns_zero() {
+        let mut heap = Heap::default();
+        let root = host_gc_root(&mut heap, &[Value::from(99i64)]);
+        assert_eq!(host_gc_get(&mut heap, &[root]).as_int(), 99);
+        assert_eq!(host_gc_unroot(&mut heap, &[root]).as_int(), 99);
+        assert_eq!(host_gc_get(&mut heap, &[root]).as_int(), 0);
+        assert_eq!(host_gc_unroot(&mut heap, &[root]).as_int(), 0);
+    }
+
+    #[test]
+    fn root_of_immediate_roundtrips() {
+        let mut heap = Heap::default();
+        let root = host_gc_root(&mut heap, &[Value::from(42i64)]);
+        force_collect(&mut heap, &[root]);
+        assert_eq!(host_gc_get(&mut heap, &[root]).as_int(), 42);
+    }
+
+    /// Dead weaks are cleared after mark and before sweep so upgrades never
+    /// observe a recycled address (ABA).
+    #[test]
+    fn clear_dead_weaks_zeros_target_before_sweep() {
+        let mut heap = Heap::default();
+        let s = intern(&mut heap, "aba");
+        let w = host_gc_weak(&mut heap, &[s]);
+        // Mark only the Weak shell — Weak does not keep the string alive.
+        heap.trace(&[w.raw() as u64]);
+        heap.clear_dead_weaks();
+        match heap.find_object_by_addr(w.raw() as u64) {
+            Some(Object::Weak(gc)) => {
+                assert!(gc.as_ref().cleared.get());
+                assert_eq!(gc.as_ref().target.get().as_int(), 0);
+            }
+            _ => panic!("expected Weak handle"),
+        }
+        // Referent still allocated until sweep; clear already closed the ABA window.
+        assert!(heap.find_object_by_addr(s.raw() as u64).is_some());
+    }
+
+    #[test]
+    fn gc_wiring_names_and_arities_are_stable() {
+        assert_eq!(GC_WIRING.len(), 7);
+        let expected = [
+            ("gc_root", 1),
+            ("gc_unroot", 1),
+            ("gc_get", 1),
+            ("gc_weak", 1),
+            ("gc_upgrade", 1),
+            ("gc_heap_bytes", 0),
+            (GC_COLLECT_NATIVE, 0),
+        ];
+        for (i, (name, arity)) in expected.iter().enumerate() {
+            assert_eq!(GC_WIRING[i].0, *name);
+            assert_eq!(GC_WIRING[i].1, *arity);
+        }
+    }
+
+    #[test]
+    fn collect_stub_returns_zero_without_vm_special_case() {
+        let mut heap = Heap::default();
+        assert_eq!(host_gc_collect_stub(&mut heap, &[]).as_int(), 0);
+    }
 }
