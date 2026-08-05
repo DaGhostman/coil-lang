@@ -42,7 +42,11 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [gc](gc.md) | Virtual module | `Root` / `Weak` pins |
 | [ord / char](ord-char.md) | Prelude | Single-byte string ↔ `byte` |
 | [host natives](host-natives.md) | Embedder API | Rust closures via `HostInvoke` |
-| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs a full stdlib |
+| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins; see also [`stdlib/`](../../stdlib/) userland |
+
+Userland packages under `stdlib/` (include in `[module].roots`): `bytes`, `text`,
+`collections`, `num`, `random`, `path`, `json`, `io::sync` / `io::file`, `http`.
+See [`stdlib/README.md`](../../stdlib/README.md).
 
 ## Related
 

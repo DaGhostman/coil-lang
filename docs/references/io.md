@@ -34,6 +34,8 @@ Blocking helpers live in stdlib (`stdlib/io/sync.hy`), not as host natives:
 | `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops |
 | `accept_wait` | `accept` + `await_readable` |
 | `recv_from_wait` | `recv_from` + `await_readable` |
+| `print` / `println` / `eprintln` | UTF-8 stdout/stderr helpers |
+| `read_line` | Read until LF (strips CR); `None` on EOF with no bytes |
 
 ```coil
 use io::{stdout};
