@@ -42,6 +42,9 @@ pub enum ErrorCode {
     /// A function name used in value position is ambiguous among overloads.
     AmbiguousOverload,
 
+    /// `use path::*` for a userland (disk) module — virtual modules may still glob.
+    WildcardImport,
+
     /// Code after a diverging statement (`return` / `raise` / `panic` / infinite loop).
     UnreachableCode,
     /// `defer` that cannot run on function exit (dominated by / inside infinite loop).
@@ -115,6 +118,7 @@ impl ErrorCode {
             Self::WrongArity => "E0120",
             Self::DuplicateOverload => "E0121",
             Self::AmbiguousOverload => "E0122",
+            Self::WildcardImport => "E0124",
             Self::UnreachableCode => "E0118",
             Self::DeferNeverRuns => "E0123",
             Self::DuplicateEnum => "E0200",
@@ -180,6 +184,7 @@ impl ErrorCode {
             Self::WrongArity => "no matching overload for argument count",
             Self::DuplicateOverload => "duplicate overload: conflicting arities",
             Self::AmbiguousOverload => "ambiguous overload in value position",
+            Self::WildcardImport => "wildcard import of userland module",
             Self::UnreachableCode => "unreachable code",
             Self::DeferNeverRuns => "defer will never run on function exit",
             Self::DuplicateEnum => "duplicate enum",
@@ -253,6 +258,7 @@ mod tests {
             | WrongArity
             | DuplicateOverload
             | AmbiguousOverload
+            | WildcardImport
             | UnreachableCode
             | DeferNeverRuns
             | DuplicateEnum
