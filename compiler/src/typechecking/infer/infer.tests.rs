@@ -5484,3 +5484,94 @@ fn clamp(float x, float lo, float hi) -> float { return min(max(x, lo), hi); }
         assert_eq!(c.overload_candidates("num::min").map(|v| v.len()), Some(2));
         assert_eq!(c.overload_candidates("clamp").map(|v| v.len()), Some(2));
     }
+
+    /// Same-arity overloads with no unifying candidate report WrongArity and
+    /// list the available signatures (type mismatch is not a separate code).
+    #[test]
+    fn type_overload_no_matching_param_types_is_wrong_arity() {
+        let msgs = assert_messages(
+            r#"
+fn show(int x) -> int { return x; }
+fn show(float x) -> float { return x; }
+fn main() { let a = show(true); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+            "expected WrongArity for unmatched type overload, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("No overload of `show`")
+                    || m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("(int)") || h.contains("available overloads"))
+            }),
+            "expected overload help mentioning available signatures, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.message(), m.help().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// After checking a defining module, `use mod::{generic}` must re-bind the
+    /// real poly scheme (not a dummy Var) and mark the local alias generic.
+    #[test]
+    fn use_reexports_cross_module_generic_scheme() {
+        let mut c = Checker::new();
+        c.set_current_module("num");
+        let def = r#"
+fn min<T: Ord>(T a, T b) -> T {
+    if a < b { return a; }
+    return b;
+}
+"#;
+        let parser = Pratt::default();
+        let ast = parser.parse(def).expect("parse def");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics in def module: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_generic_fn("num::min"),
+            "defining module must register qualified generic"
+        );
+
+        c.set_current_module("");
+        let importer = r#"
+use num::{min};
+fn main() {
+    let a = min(3, 1);
+    let b = min(3.0, 1.0);
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics after use re-export: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_generic_fn("min"),
+            "imported alias must stay generic for dict-passing ABI"
+        );
+        assert!(
+            c.env().lookup("min").is_some(),
+            "imported alias must bind a real scheme"
+        );
+        let scheme = c.env().lookup("min").unwrap();
+        assert!(
+            !scheme.bounds.is_empty(),
+            "re-export must keep Ord bound, got {:?}",
+            scheme
+        );
+    }
