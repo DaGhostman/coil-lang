@@ -10860,9 +10860,24 @@ impl Compiler {
                         // positions. Cleared after the body emits.
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
-                        if let Some(map) = self.context.match_bindings.clone() {
-                            for (name, slot) in map {
-                                self.record_debug_local(&name, slot);
+                        let binding_slots: Vec<(String, u32)> = self
+                            .context
+                            .match_bindings
+                            .as_ref()
+                            .map(|m| m.iter().map(|(n, s)| (n.clone(), *s)).collect())
+                            .unwrap_or_default();
+                        let max_binding_slot = binding_slots.iter().map(|(_, s)| *s).max();
+                        for (name, slot) in &binding_slots {
+                            self.record_debug_local(name, *slot);
+                        }
+                        // JumpIfMatch/Unpack leave payloads at these slots via
+                        // stack/locals overlap. Reserve them in `variables` so
+                        // arm-body temps (`alloc_temp_slot`) cannot STORE over
+                        // the bindings.
+                        if let Some(max_slot) = max_binding_slot {
+                            while (self.context.variables.len() as u32) <= max_slot {
+                                let pad = format!("__match{}", self.context.variables.len());
+                                let _ = self.context.variables.intern(pad);
                             }
                         }
 
