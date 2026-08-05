@@ -19,10 +19,118 @@ struct FnFacts {
     callees: HashSet<String>,
 }
 
-/// Analyze top-level / nested `fn` declarations and return self-recursive pure names.
-pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
+/// Collect per-function callee sets (and local impurity) for call-graph analyses.
+fn collect_fn_facts(ast: &Output<'_>) -> HashMap<String, FnFacts> {
     let mut facts: HashMap<String, FnFacts> = HashMap::new();
     collect_fns(ast, &mut facts);
+    facts
+}
+
+/// Names of user functions that appear in a call-graph cycle (self or mutual).
+///
+/// Only **top-level / module** `fn`s are considered. Impl methods are skipped:
+/// an Identifier call equal to the method name usually resolves to an imported
+/// free function (`join(self.thread)`), not a self-call.
+pub fn analyze_recursive_fns(ast: &Output<'_>) -> HashSet<String> {
+    let mut facts: HashMap<String, FnFacts> = HashMap::new();
+    collect_toplevel_fns(ast, &mut facts);
+    let user_fns: HashSet<String> = facts.keys().cloned().collect();
+    let mut in_cycle = HashSet::new();
+
+    for (name, f) in &facts {
+        if f.callees.contains(name) {
+            in_cycle.insert(name.clone());
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color: HashMap<String, Color> =
+        user_fns.iter().map(|n| (n.clone(), Color::White)).collect();
+    let mut stack: Vec<String> = Vec::new();
+
+    fn dfs(
+        name: &str,
+        facts: &HashMap<String, FnFacts>,
+        user_fns: &HashSet<String>,
+        color: &mut HashMap<String, Color>,
+        stack: &mut Vec<String>,
+        in_cycle: &mut HashSet<String>,
+    ) {
+        color.insert(name.to_string(), Color::Gray);
+        stack.push(name.to_string());
+        if let Some(f) = facts.get(name) {
+            for c in &f.callees {
+                if !user_fns.contains(c) {
+                    continue;
+                }
+                match color.get(c).copied().unwrap_or(Color::White) {
+                    Color::White => dfs(c, facts, user_fns, color, stack, in_cycle),
+                    Color::Gray => {
+                        if let Some(start) = stack.iter().position(|n| n == c) {
+                            for n in &stack[start..] {
+                                in_cycle.insert(n.clone());
+                            }
+                        }
+                    }
+                    Color::Black => {}
+                }
+            }
+        }
+        stack.pop();
+        color.insert(name.to_string(), Color::Black);
+    }
+
+    for name in &user_fns {
+        if color.get(name) == Some(&Color::White) {
+            dfs(
+                name,
+                &facts,
+                &user_fns,
+                &mut color,
+                &mut stack,
+                &mut in_cycle,
+            );
+        }
+    }
+    in_cycle
+}
+
+fn collect_toplevel_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) {
+    match ast.1.as_ref() {
+        Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
+            for item in items {
+                collect_toplevel_fns(item, facts);
+            }
+        }
+        Expression::Module(_, body) => collect_toplevel_fns(body, facts),
+        Expression::Statement(inner)
+        | Expression::Expr(inner)
+        | Expression::ExprStatement(inner)
+        | Expression::Group(inner) => collect_toplevel_fns(inner, facts),
+        Expression::Function {
+            name,
+            body: Some(body),
+            ..
+        } => {
+            let mut f = FnFacts::default();
+            walk_body(body, &mut f);
+            facts.insert((*name).to_string(), f);
+            // Nested fns inside this body still count as top-level for recursion.
+            collect_toplevel_fns(body, facts);
+        }
+        // Skip `impl` methods — see [`analyze_recursive_fns`].
+        _ => {}
+    }
+}
+
+/// Analyze top-level / nested `fn` declarations and return self-recursive pure names.
+pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
+    let facts = collect_fn_facts(ast);
     let user_fns: HashSet<String> = facts.keys().cloned().collect();
 
     // Fixed-point: impure if local_impure or any callee is impure / non-user.
@@ -448,6 +556,49 @@ fn main() { return; }
         );
         assert!(set.contains("fib"), "fib should be recursive pure: {set:?}");
         assert!(!set.contains("main"));
+    }
+
+    fn parse_ast(src: &str) -> parser::ast::Output<'static> {
+        let owned = Box::leak(src.to_string().into_boxed_str());
+        Pratt::default().parse(owned).expect("parse")
+    }
+
+    #[test]
+    fn analyze_recursive_fns_detects_mutual_cycle() {
+        let ast = parse_ast(
+            r#"
+fn ping(int n) -> int { return pong(n); }
+fn pong(int n) -> int { return ping(n); }
+fn main() { return; }
+"#,
+        );
+        let rec = analyze_recursive_fns(&ast);
+        assert!(rec.contains("ping") && rec.contains("pong"), "{rec:?}");
+        assert!(!rec.contains("main"));
+    }
+
+    #[test]
+    fn analyze_recursive_fns_skips_impl_methods() {
+        // Identifier `join` inside an impl method must not invent a self-cycle
+        // on the method name (see analyze_recursive_fns docs).
+        let ast = parse_ast(
+            r#"
+class T {
+    x: int,
+}
+impl T {
+    fn join() -> int {
+        return join(self);
+    }
+}
+fn main() { return; }
+"#,
+        );
+        let rec = analyze_recursive_fns(&ast);
+        assert!(
+            !rec.contains("join"),
+            "impl methods must be excluded from recursion SCC: {rec:?}"
+        );
     }
 
     #[test]

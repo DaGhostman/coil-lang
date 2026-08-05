@@ -44,6 +44,11 @@ impl Compiler {
         &self.strings
     }
 
+    /// Operand-stack capacity recommended by recursion-depth analysis.
+    pub fn operand_stack_slots(&self) -> u32 {
+        self.operand_stack_slots
+    }
+
     pub fn set_source_file(&mut self, path: impl Into<std::path::PathBuf>) {
         self.current_source_file = Some(path.into());
     }
@@ -11248,6 +11253,10 @@ impl Compiler {
         self.decorated_class_ctors
             .extend(expand.decorated_class_ctors);
         let _program_ty = self.checker.check_program(ast);
+        // Recursion depth / `#[max_depth]` — independent of auto-par.
+        let stack_bound = crate::typechecking::analyze_stack_bounds(ast);
+        self.messages.extend(stack_bound.messages);
+        self.operand_stack_slots = stack_bound.operand_slots_needed;
         self.recursive_pure = if auto_par_enabled() {
             crate::typechecking::analyze_recursive_pure(ast)
         } else {

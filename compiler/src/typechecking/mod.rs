@@ -14,6 +14,7 @@ pub mod kind;
 pub mod pretty;
 pub mod par_profit;
 pub mod purity;
+pub mod stack_bound;
 pub mod subst;
 pub mod ty;
 pub mod unify;
@@ -33,7 +34,12 @@ pub use par_profit::{
     const_arg_worth_parallel, par_int_threshold, par_specialization_name,
 };
 #[allow(unused_imports)] // public API re-export
-pub use purity::{RecursivePureSet, analyze_recursive_pure};
+pub use purity::{RecursivePureSet, analyze_recursive_fns, analyze_recursive_pure};
+#[allow(unused_imports)] // public API re-export
+pub use stack_bound::{
+    BoundSource, DEFAULT_OPERAND_STACK_SLOTS, FnStackBound, MAX_OPERAND_STACK_SLOTS, StackBoundReport,
+    analyze_stack_bounds, operand_slots_for_frames,
+};
 pub use ty::Ty;
 pub use virtual_modules::{
     BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,

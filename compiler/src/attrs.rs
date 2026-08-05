@@ -30,7 +30,7 @@ const DERIVABLE: &[&str] = &[
     "Sensitive",
 ];
 
-const KNOWN_ATTRS: &[&str] = &["derive", "ffi", "test"];
+const KNOWN_ATTRS: &[&str] = &["derive", "ffi", "test", "max_depth"];
 
 /// Result of attribute expansion before typechecking.
 #[derive(Default)]
@@ -118,6 +118,13 @@ fn validate_attrs(
             messages.push(Message::error(
                 ErrorCode::GenericTypeError,
                 format!("Attribute `test` is not valid on {}", target),
+                span.into_range(),
+            ));
+        }
+        if attr.name == "max_depth" && target != "function" {
+            messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Attribute `max_depth` is not valid on {}", target),
                 span.into_range(),
             ));
         }

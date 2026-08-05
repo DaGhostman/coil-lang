@@ -56,7 +56,7 @@ All reserved words in the coil parser. Keywords cannot be used as identifiers.
 fn | enum | type | trait | use | mod | extern | class | impl | defer | async | where | attr
 ```
 
-Attributes (`#[derive(...)]`, `#[test]`, `#[ffi(...)]`, user `#[name(...)]`) are not keywords — see [Syntax — Attributes](syntax.md#attributes).
+Attributes (`#[derive(...)]`, `#[test]`, `#[ffi(...)]`, `#[max_depth(N)]`, user `#[name(...)]`) are not keywords — see [Syntax — Attributes](syntax.md#attributes).
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.
 

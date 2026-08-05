@@ -839,6 +839,9 @@ pub struct Compiler {
     par_shapes: HashMap<String, crate::typechecking::RecParShape>,
     /// Concrete int args requiring `__coil_par_*` specializations.
     par_spec_args: HashMap<String, BTreeSet<i64>>,
+
+    /// Operand-stack capacity for the VM (from recursion-depth analysis).
+    operand_stack_slots: u32,
 }
 
 impl Default for Compiler {
@@ -908,6 +911,7 @@ impl Default for Compiler {
             recursive_pure: HashSet::new(),
             par_shapes: HashMap::new(),
             par_spec_args: HashMap::new(),
+            operand_stack_slots: crate::typechecking::DEFAULT_OPERAND_STACK_SLOTS,
         }
     }
 }

@@ -134,7 +134,7 @@ struct PendingIoWait {
 
 pub struct Machine<const S: usize> {
     heap: Heap,
-    stack: Stack<Value, 8192>,
+    stack: Stack<Value>,
     frames: ArrayVec<Frame, S>,
     output: Option<OutputSink>,
     alloc_counter: usize,
@@ -197,14 +197,22 @@ pub struct Machine<const S: usize> {
 
 impl<const S: usize> Default for Machine<S> {
     fn default() -> Self {
+        Self::with_operand_capacity(crate::DEFAULT_OPERAND_STACK_SLOTS)
+    }
+}
+
+impl<const S: usize> Machine<S> {
+    /// Build a VM with a program-specific operand-stack capacity.
+    pub fn with_operand_capacity(operand_slots: usize) -> Self {
         let mut frames = ArrayVec::default();
         frames.consume();
         let worker_cap = crate::thread::WorkerCap::new();
         let reactor = crate::reactor::Reactor::new(worker_cap.max());
+        let cap = operand_slots.clamp(1, crate::MAX_OPERAND_STACK_SLOTS);
         Self {
             frames,
             heap: Heap::default(),
-            stack: Stack::new(),
+            stack: Stack::with_capacity(cap),
             output: None,
             alloc_counter: 0,
             natives: crate::ffi::Natives::new(),
@@ -239,9 +247,12 @@ impl<const S: usize> Default for Machine<S> {
             io_reactor: crate::io_reactor::IoReactor::new(),
         }
     }
-}
 
-impl<const S: usize> Machine<S> {
+    /// Current operand-stack capacity (slots).
+    pub fn operand_stack_capacity(&self) -> usize {
+        self.stack.capacity()
+    }
+
     pub fn set_ffi_paths(&mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) {
         self.base_dir = base_dir;
         self.ffi_search_paths = search_paths;
@@ -343,11 +354,12 @@ impl<const S: usize> Machine<S> {
     pub fn debug_slot(&self, frame_idx: usize, slot: usize) -> Option<Value> {
         let base = self.debug_frame_sp(frame_idx)?;
         let idx = base + slot;
-        if idx >= self.stack.tell() && idx >= 8192 {
+        let cap = self.stack.capacity();
+        if idx >= self.stack.tell() && idx >= cap {
             return None;
         }
         // Allow reading within the stack buffer even past cursor for allocated locals.
-        if idx >= 8192 {
+        if idx >= cap {
             return None;
         }
         Some(self.stack[idx])
@@ -369,7 +381,7 @@ impl<const S: usize> Machine<S> {
     /// Reset execution state for a fresh `run` (keeps natives / debug / program_debug).
     #[cfg(any(test, feature = "debugger"))]
     pub fn debug_reset(&mut self) {
-        self.stack = Stack::new();
+        self.stack = Stack::with_capacity(self.stack.capacity());
         self.frames = ArrayVec::default();
         self.frames.consume();
         self.panicked = false;
@@ -655,12 +667,12 @@ impl<const S: usize> Machine<S> {
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
     fn gc_collect(
         heap: &mut Heap,
-        stack: &Stack<Value, 8192>,
+        stack: &Stack<Value>,
         resume_stack: &[ResumeCtx],
         alloc_counter: &mut usize,
     ) {
         let mut roots = heap.take_gc_roots();
-        // Only live operand-stack slots (not the full 8192 buffer).
+        // Only live operand-stack slots (not the full capacity buffer).
         for v in stack.as_slice() {
             let addr = v.raw() as u64;
             if addr != 0 && heap.find_object_by_addr(addr).is_some() {
@@ -921,6 +933,7 @@ impl<const S: usize> Machine<S> {
             strings: std::sync::Arc::new(self.program_strings.clone()),
             static_slot_count: self.statics.len() as u32,
             debug: self.program_debug.clone(),
+            operand_stack_slots: self.stack.capacity() as u32,
         }));
     }
 
@@ -1539,6 +1552,7 @@ impl<const S: usize> Machine<S> {
 
         let mut ip: usize = start_ip;
         let mut sp = self.frames.get_mut().get();
+        let stack_cap = self.stack.capacity();
 
         while ip < code.len() {
             #[cfg(any(test, feature = "debugger"))]
@@ -1608,7 +1622,7 @@ impl<const S: usize> Machine<S> {
                     let count = opcode.load_store_count();
                     for i in 0..count {
                         let slot = opcode.load_store_slot_at(i) as usize;
-                        promise!(sp + slot < 8192);
+                        promise!(sp + slot < stack_cap);
                         self.stack.push(self.stack[sp + slot]);
                     }
                 }
@@ -1893,7 +1907,7 @@ impl<const S: usize> Machine<S> {
                 // (same shape as `BinSlotSlot`) to avoid two temp pushes.
                 Instruction::BinSlotImm => {
                     let (op, slot, imm) = opcode.bin_slot_imm_parts();
-                    promise!(sp + slot < 8192);
+                    promise!(sp + slot < stack_cap);
                     let lhs = self.stack[sp + slot];
                     let rhs = Value::from(imm);
                     let result = match Instruction::from(op) {
@@ -1966,7 +1980,7 @@ impl<const S: usize> Machine<S> {
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
                     let imm = packed as u32 as i32 as i64;
                     let target = (packed >> 32) as usize;
-                    promise!(sp + slot < 8192);
+                    promise!(sp + slot < stack_cap);
                     let lhs = self.stack[sp + slot];
                     let rhs = Value::from(imm);
                     let taken = match Instruction::from(op) {
@@ -2011,8 +2025,8 @@ impl<const S: usize> Machine<S> {
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
                     let b = (packed as u32 & 0xFF) as usize;
                     let target = (packed >> 32) as usize;
-                    promise!(sp + a < 8192);
-                    promise!(sp + b < 8192);
+                    promise!(sp + a < stack_cap);
+                    promise!(sp + b < stack_cap);
                     let va = self.stack[sp + a];
                     let vb = self.stack[sp + b];
                     let taken = match Instruction::from(op) {
@@ -2044,7 +2058,7 @@ impl<const S: usize> Machine<S> {
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
                     let imm = packed as u32 as i32 as i64;
                     let dest = (packed >> 32) as usize;
-                    promise!(sp + slot < 8192);
+                    promise!(sp + slot < stack_cap);
                     let lhs = self.stack[sp + slot];
                     let rhs = Value::from(imm);
                     let result = match Instruction::from(op) {
@@ -2082,8 +2096,8 @@ impl<const S: usize> Machine<S> {
                 // Fused `LOAD a; LOAD b; <op>; STORE dest`.
                 Instruction::BinSlotSlotStore => {
                     let (op, a, b, dest) = opcode.bin_slot_slot_store_parts();
-                    promise!(sp + a < 8192);
-                    promise!(sp + b < 8192);
+                    promise!(sp + a < stack_cap);
+                    promise!(sp + b < stack_cap);
                     let va = self.stack[sp + a];
                     let vb = self.stack[sp + b];
                     let result = match Instruction::from(op) {
@@ -2189,8 +2203,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::BinSlotSlot => {
                     let (op, a, b) = opcode.bin_slot_slot_parts();
-                    promise!(sp + a < 8192);
-                    promise!(sp + b < 8192);
+                    promise!(sp + a < stack_cap);
+                    promise!(sp + b < stack_cap);
                     let va = self.stack[sp + a];
                     let vb = self.stack[sp + b];
                     let result = match Instruction::from(op) {

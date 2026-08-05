@@ -787,7 +787,8 @@ pub(crate) fn execute_archive(
     debug: ProgramDebug,
     entry: Option<&Path>,
 ) -> bool {
-    let mut machine = Machine::<256>::default();
+    let mut machine =
+        Machine::<256>::with_operand_capacity(pipeline.operand_stack_slots() as usize);
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
     pipeline.wire_thread_program(&mut machine, bytecode, constants, strings);

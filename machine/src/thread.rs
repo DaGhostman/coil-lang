@@ -127,6 +127,8 @@ pub struct ThreadProgram {
     pub strings: Arc<Vec<String>>,
     pub static_slot_count: u32,
     pub debug: ProgramDebug,
+    /// Operand-stack capacity for worker VMs running this program.
+    pub operand_stack_slots: u32,
 }
 
 /// Tag indices for [`ThreadError`](common::BUILTIN_THREAD_ERROR_ENUM).
