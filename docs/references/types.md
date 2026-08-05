@@ -19,7 +19,11 @@ Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `in
 
 Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`).
 
-**Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\""`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce — use `to_bytes` for UTF-8 scanning. `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
+**Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\""`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce to `byte`.
+
+**String literals** also coerce to `[byte]` / `[byte; N]` (UTF-8 bytes) under an expected byte-array type, via `"…" as [byte]`, and as `[byte]` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal `string` values still need `to_bytes`.
+
+`byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
 Strings support `+` / `+=` with other strings. `string::format(...)` returns `string` and validates literal format specifiers (`%i` accepts `byte`).
 

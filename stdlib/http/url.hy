@@ -184,7 +184,7 @@ fn request_line_ok([byte] head) -> int {
     while i + 1 < n {
         if head[i] == cr {
             if head[i + 1] == lf {
-                let needle: [byte] = ["H", "T", "T", "P", "/", "1", ".", "1"];
+                let needle: [byte] = "HTTP/1.1";
                 let j = 0;
                 while j + 8 <= i {
                     let ok = true;
@@ -289,7 +289,7 @@ fn http_fail_unit() -> Result<(), HttpError> {
 
 fn parse_url(string s) -> Result<Url, HttpError> {
     let b = to_bytes(s);
-    let sep: [byte] = [":", "/", "/"];
+    let sep: [byte] = "://";
     let sep_at = find_bytes(b, sep);
     if sep_at == 999999 {
         http_err_bad_url()?;

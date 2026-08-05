@@ -20,7 +20,8 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 ## Notes
 
 - Prefer **byte offsets** for `text::slice` / `find` (mid-codepoint slices error on decode).
-- Byte constants use single-byte string literals (`"/"`, `"\n"`) under `byte` / `[byte]` expected types.
+- Byte constants use single-byte string literals (`"/"`, `"\n"`) under `byte` /
+  `[byte]` expected types; whole strings coerce to `[byte]` / `[byte; N]` too.
 - `json` enum constructors are globally unique (`JsonNull`, …); prefer `json_int` /
   `json_object` helpers. Glob `use json::*` imports functions; construct via helpers.
 - `num` is named so workspace `examples/src/math.hy` does not shadow it.
