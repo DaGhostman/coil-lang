@@ -12,10 +12,10 @@ use bytes::{
 };
 
 fn is_ascii_space(byte c) -> bool {
-    let sp: byte = 32;
-    let tab: byte = 9;
-    let lf: byte = 10;
-    let cr: byte = 13;
+    let sp: byte = " ";
+    let tab: byte = "\t";
+    let lf: byte = "\n";
+    let cr: byte = "\r";
     if c == sp {
         return true;
     }
@@ -141,8 +141,8 @@ fn to_lower(string s) -> Result<string, string> {
     let b = to_bytes(s);
     let out: [byte] = [];
     let i = 0;
-    let a_up: byte = 65;
-    let z_up: byte = 90;
+    let a_up: byte = "A";
+    let z_up: byte = "Z";
     while i < len(b) {
         let c = b[i];
         if c >= a_up {
@@ -168,8 +168,8 @@ fn to_upper(string s) -> Result<string, string> {
     let b = to_bytes(s);
     let out: [byte] = [];
     let i = 0;
-    let a_lo: byte = 97;
-    let z_lo: byte = 122;
+    let a_lo: byte = "a";
+    let z_lo: byte = "z";
     while i < len(b) {
         let c = b[i];
         if c >= a_lo {

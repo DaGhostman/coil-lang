@@ -25,10 +25,10 @@ enum Json {
 }
 
 fn is_ws(byte c) -> bool {
-    let sp: byte = 32;
-    let tab: byte = 9;
-    let lf: byte = 10;
-    let cr: byte = 13;
+    let sp: byte = " ";
+    let tab: byte = "\t";
+    let lf: byte = "\n";
+    let cr: byte = "\r";
     if c == sp {
         return true;
     }
@@ -62,15 +62,15 @@ fn skip_ws([byte] b, int i) -> int {
 }
 
 fn digit_val(byte c) -> int {
-    let zero: byte = 48;
-    let nine: byte = 57;
+    let zero: byte = "0";
+    let nine: byte = "9";
     if c < zero {
         return -1;
     }
     if c > nine {
         return -1;
     }
-    return (c as int) - 48;
+    return (c as int) - (zero as int);
 }
 
 fn digit_char(int d) -> string {
@@ -150,12 +150,12 @@ fn parse_literal([byte] b, int i, string lit, Json val) -> Result<(Json, int), J
 }
 
 fn append_escape([byte] out, byte e) -> Result<[byte], JsonError> {
-    let q: byte = 34;
-    let bs: byte = 92;
-    let sl: byte = 47;
-    let nch: byte = 110;
-    let rch: byte = 114;
-    let tch: byte = 116;
+    let q: byte = "\x22";
+    let bs: byte = "\\";
+    let sl: byte = "/";
+    let nch: byte = "n";
+    let rch: byte = "r";
+    let tch: byte = "t";
     if e == q {
         out[] = 34;
         return out;
@@ -169,23 +169,23 @@ fn append_escape([byte] out, byte e) -> Result<[byte], JsonError> {
         return out;
     }
     if e == nch {
-        out[] = 10;
+        out[] = "\n";
         return out;
     }
     if e == rch {
-        out[] = 13;
+        out[] = "\r";
         return out;
     }
     if e == tch {
-        out[] = 9;
+        out[] = "\t";
         return out;
     }
     raise JsonError::JsonBadEscape;
 }
 
 fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
-    let q: byte = 34;
-    let bs: byte = 92;
+    let q: byte = "\x22";
+    let bs: byte = "\\";
     if i >= len(b) {
         raise JsonError::JsonUnexpectedEnd;
     }
@@ -213,7 +213,7 @@ fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
         }
         if c != bs {
             if c != q {
-                let ctrl: byte = 32;
+                let ctrl: byte = " ";
                 if c < ctrl {
                     raise JsonError::JsonBadString;
                 }
@@ -226,7 +226,7 @@ fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
 }
 
 fn parse_int_bytes([byte] b) -> Result<int, JsonError> {
-    let minus: byte = 45;
+    let minus: byte = "-";
     let i = 0;
     let neg = 0;
     if len(b) == 0 {
@@ -255,11 +255,11 @@ fn parse_int_bytes([byte] b) -> Result<int, JsonError> {
 }
 
 fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
-    let minus: byte = 45;
-    let dot: byte = 46;
-    let e_lo: byte = 101;
-    let e_up: byte = 69;
-    let plus: byte = 43;
+    let minus: byte = "-";
+    let dot: byte = ".";
+    let e_lo: byte = "e";
+    let e_up: byte = "E";
+    let plus: byte = "+";
     let i = 0;
     let sign = 1.0;
     if len(b) == 0 {
@@ -351,11 +351,11 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
 }
 
 fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
-    let minus: byte = 45;
-    let dot: byte = 46;
-    let e_lo: byte = 101;
-    let e_up: byte = 69;
-    let plus: byte = 43;
+    let minus: byte = "-";
+    let dot: byte = ".";
+    let e_lo: byte = "e";
+    let e_up: byte = "E";
+    let plus: byte = "+";
     let start = i;
     if i < len(b) {
         if b[i] == minus {
@@ -454,19 +454,19 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
 /// Recursive descent entry — arrays/objects call back into this function.
 #[max_depth(256)]
 fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
-    let q: byte = 34;
-    let lbr: byte = 91;
-    let rbr: byte = 93;
-    let lbrace: byte = 123;
-    let rbrace: byte = 125;
-    let comma: byte = 44;
-    let colon: byte = 58;
-    let minus: byte = 45;
-    let nch: byte = 110;
-    let tch: byte = 116;
-    let fch: byte = 102;
-    let zero: byte = 48;
-    let nine: byte = 57;
+    let q: byte = "\x22";
+    let lbr: byte = "[";
+    let rbr: byte = "]";
+    let lbrace: byte = "{";
+    let rbrace: byte = "}";
+    let comma: byte = ",";
+    let colon: byte = ":";
+    let minus: byte = "-";
+    let nch: byte = "n";
+    let tch: byte = "t";
+    let fch: byte = "f";
+    let zero: byte = "0";
+    let nine: byte = "9";
     i = skip_ws(b, i);
     if i >= len(b) {
         raise JsonError::JsonUnexpectedEnd;
@@ -489,9 +489,8 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
     if c == minus {
         return parse_number(b, i)?;
     }
-    let ci = c as int;
-    if ci >= 48 {
-        if ci <= 57 {
+    if c >= "0" {
+        if c <= "9" {
             // Inline non-negative int parse (array recursion + parse_number is flaky).
             let start = i;
             while i < len(b) {
@@ -601,11 +600,11 @@ fn escape_string(string s) -> [byte] {
     let out: [byte] = [];
     out[] = 34;
     let i = 0;
-    let q: byte = 34;
-    let bs: byte = 92;
-    let lf: byte = 10;
-    let cr: byte = 13;
-    let tab: byte = 9;
+    let q: byte = "\x22";
+    let bs: byte = "\\";
+    let lf: byte = "\n";
+    let cr: byte = "\r";
+    let tab: byte = "\t";
     while i < len(b) {
         let c = b[i];
         let special = 0;
@@ -729,7 +728,7 @@ fn stringify_bytes(Json v) -> [byte] {
             out[] = 44;
         }
         out = bytes_concat(out, escape_string(keys[i]));
-        out[] = 58;
+        out[] = ":";
         out = bytes_concat(out, stringify_bytes(vals[i]));
         i = i + 1;
     }

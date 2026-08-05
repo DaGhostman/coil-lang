@@ -4,8 +4,8 @@ use string::{to_bytes, from_bytes};
 use bytes::{slice as bytes_slice, concat as bytes_concat};
 
 fn is_sep(byte c) -> bool {
-    let slash: byte = 47;
-    let bslash: byte = 92;
+    let slash: byte = "/";
+    let bslash: byte = "\\";
     if c == slash {
         return true;
     }
@@ -117,7 +117,7 @@ fn extension(string path) -> Result<string, IoError> {
     let i = n;
     while i > 0 {
         i = i - 1;
-        if b[i] == (46 as byte) {
+        if b[i] == "." {
             if i + 1 >= n {
                 return "";
             }
@@ -137,17 +137,16 @@ fn is_absolute(string path) -> bool {
         return true;
     }
     if len(b) >= 2 {
-        let c0 = b[0] as int;
-        if c0 >= 65 {
-            if c0 <= 90 {
-                if b[1] == (58 as byte) {
+        if b[0] >= "A" {
+            if b[0] <= "Z" {
+                if b[1] == ":" {
                     return true;
                 }
             }
         }
-        if c0 >= 97 {
-            if c0 <= 122 {
-                if b[1] == (58 as byte) {
+        if b[0] >= "a" {
+            if b[0] <= "z" {
+                if b[1] == ":" {
                     return true;
                 }
             }

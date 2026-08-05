@@ -210,7 +210,7 @@ fn recv_from_wait(Stream s, [byte] buf) -> Result<(int, string, int), IoError> {
 
 fn newline_bytes() -> [byte] {
     let nl: [byte] = [];
-    nl[] = 10;
+    nl[] = "\n";
     return nl;
 }
 
@@ -239,8 +239,8 @@ fn read_line(Stream s) -> Result<Option<string>, IoError> {
     scratch[] = 0;
     let done = 0;
     let saw = 0;
-    let lf: byte = 10;
-    let cr: byte = 13;
+    let lf: byte = "\n";
+    let cr: byte = "\r";
     while done == 0 {
         let rr = read(s, scratch)?;
         let is_none = 0;
