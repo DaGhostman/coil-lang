@@ -18,6 +18,7 @@ mod memory;
 mod opcode;
 pub mod packed_la;
 pub mod reactor;
+pub mod value_eq;
 #[cfg(feature = "regex")]
 pub mod regex;
 #[cfg(feature = "regex")]

@@ -1669,8 +1669,24 @@ impl<const S: usize> Machine<S> {
                 Instruction::LEQ => binary!(self.stack, <=, as_int),
                 Instruction::GT => binary!(self.stack, >, as_int),
                 Instruction::GEQ => binary!(self.stack, >=, as_int),
-                Instruction::EQ => binary!(self.stack, ==, raw),
-                Instruction::NEQ => binary!(self.stack, !=, raw),
+                Instruction::EQ => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1];
+                    let lhs = self.stack[sp - 2];
+                    let eq = crate::value_eq::values_eq(&self.heap, lhs, rhs);
+                    self.stack[sp - 2].replace(eq as _);
+                    self.stack.seek(sp - 1);
+                }
+                Instruction::NEQ => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1];
+                    let lhs = self.stack[sp - 2];
+                    let eq = crate::value_eq::values_eq(&self.heap, lhs, rhs);
+                    self.stack[sp - 2].replace((!eq) as _);
+                    self.stack.seek(sp - 1);
+                }
                 Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
                 Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
                 Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
@@ -1922,8 +1938,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
-                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -1958,8 +1978,8 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => lhs.as_int() <= rhs.as_int(),
                         Instruction::GT => lhs.as_int() > rhs.as_int(),
                         Instruction::GEQ => lhs.as_int() >= rhs.as_int(),
-                        Instruction::EQ => lhs.raw() == rhs.raw(),
-                        Instruction::NEQ => lhs.raw() != rhs.raw(),
+                        Instruction::EQ => crate::value_eq::values_eq(&self.heap, lhs, rhs),
+                        Instruction::NEQ => !crate::value_eq::values_eq(&self.heap, lhs, rhs),
                         Instruction::LEF => lhs.as_float() < rhs.as_float(),
                         Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
                         Instruction::GTF => lhs.as_float() > rhs.as_float(),
@@ -1990,8 +2010,8 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => lhs.as_int() <= rhs.as_int(),
                         Instruction::GT => lhs.as_int() > rhs.as_int(),
                         Instruction::GEQ => lhs.as_int() >= rhs.as_int(),
-                        Instruction::EQ => lhs.raw() == rhs.raw(),
-                        Instruction::NEQ => lhs.raw() != rhs.raw(),
+                        Instruction::EQ => crate::value_eq::values_eq(&self.heap, lhs, rhs),
+                        Instruction::NEQ => !crate::value_eq::values_eq(&self.heap, lhs, rhs),
                         Instruction::LEF => lhs.as_float() < rhs.as_float(),
                         Instruction::LEQF => lhs.as_float() <= rhs.as_float(),
                         Instruction::GTF => lhs.as_float() > rhs.as_float(),
@@ -2036,8 +2056,8 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => va.as_int() <= vb.as_int(),
                         Instruction::GT => va.as_int() > vb.as_int(),
                         Instruction::GEQ => va.as_int() >= vb.as_int(),
-                        Instruction::EQ => va.raw() == vb.raw(),
-                        Instruction::NEQ => va.raw() != vb.raw(),
+                        Instruction::EQ => crate::value_eq::values_eq(&self.heap, va, vb),
+                        Instruction::NEQ => !crate::value_eq::values_eq(&self.heap, va, vb),
                         Instruction::LEF => va.as_float() < vb.as_float(),
                         Instruction::LEQF => va.as_float() <= vb.as_float(),
                         Instruction::GTF => va.as_float() > vb.as_float(),
@@ -2073,8 +2093,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
-                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -2123,8 +2147,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
-                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
+                        ),
                         _ => Value::default(),
                     };
                     let dest_idx = sp + dest;
@@ -2176,8 +2204,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from((lhs.raw() == rhs.raw()) as i64),
-                        Instruction::NEQ => Value::from((lhs.raw() != rhs.raw()) as i64),
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::LEF => Value::from((lhs.as_float() < rhs.as_float()) as i64),
                         Instruction::LEQF => Value::from((lhs.as_float() <= rhs.as_float()) as i64),
                         Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
@@ -2235,8 +2267,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
-                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
+                        ),
                         Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
                         Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
                         Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
@@ -3558,24 +3594,22 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(result));
                 }
                 Instruction::DynEq | Instruction::DynNe => {
-                    fn classify_raw_dyn(v: Value, heap: &Heap) -> u64 {
+                    fn unbox_dyn(v: Value, heap: &Heap) -> Value {
                         let addr = v.raw() as u64;
                         if v.raw().is_null() {
-                            return v.raw() as u64;
+                            return v;
                         }
                         if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
                             return match &gc.as_ref().payload {
-                                Member::Value(iv) => iv.raw() as u64,
-                                Member::Object(o) => o.addr(),
+                                Member::Value(iv) => *iv,
+                                Member::Object(o) => Value::from(o.addr()),
                             };
                         }
-                        v.raw() as u64
+                        v
                     }
-                    let b_val = self.stack.pop();
-                    let a_val = self.stack.pop();
-                    let ar = classify_raw_dyn(a_val, &self.heap);
-                    let br = classify_raw_dyn(b_val, &self.heap);
-                    let eq = ar == br;
+                    let b_val = unbox_dyn(self.stack.pop(), &self.heap);
+                    let a_val = unbox_dyn(self.stack.pop(), &self.heap);
+                    let eq = crate::value_eq::values_eq(&self.heap, a_val, b_val);
                     let result = if matches!(opcode.bytecode(), Instruction::DynEq) {
                         eq
                     } else {

@@ -161,6 +161,8 @@ Short-circuit behavior follows VM evaluation order (both operands evaluated eage
 
 Float and int comparisons use separate opcode families (`LE` vs `LEF`, etc.) selected at codegen from inferred types.
 
+`==` / `!=` on arrays and tuples are **structural** (length + element-wise, recursively). Strings compare by UTF-8 content. Enums, classes, and records stay pointer-identity unless a user `Eq` instance is dispatched.
+
 ---
 
 ## Assignment
