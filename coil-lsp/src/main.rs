@@ -2584,6 +2584,35 @@ fn main() {
         types
     }
 
+    fn token_at_byte<'a>(
+        source: &str,
+        encoded: &'a [SemanticToken],
+        byte: usize,
+    ) -> Option<&'a SemanticToken> {
+        let mut line = 0u32;
+        let mut character = 0u32;
+        for token in encoded {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                character = token.delta_start;
+            } else {
+                character += token.delta_start;
+            }
+            let start = position_to_byte(
+                source,
+                Position {
+                    line,
+                    character,
+                },
+            )
+            .expect("token start");
+            if start == byte {
+                return Some(token);
+            }
+        }
+        None
+    }
+
     #[test]
     fn semantic_tokens_mark_comments_strings_and_numbers() {
         let source = "// comment\nfn main() { let x = \"hi\" + 42; return; }\n";
@@ -2657,5 +2686,106 @@ fn main() {
             .find(|token| token.token_type == TOKEN_STRING)
             .expect("string token");
         assert_eq!(string_token.length, 3);
+    }
+
+    #[test]
+    fn semantic_tokens_classify_namespaces_and_enums() {
+        let source = "\
+use io::stdout as out;
+enum Color { Red, Green }
+fn main() { return; }
+";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        assert!(
+            token_types_at_word(source, &tokens, "out").contains(&TOKEN_NAMESPACE),
+            "use alias should be namespace"
+        );
+        assert!(
+            token_types_at_word(source, &tokens, "Color").contains(&TOKEN_TYPE),
+            "enum decl should be type"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_mark_yield_from_keyword_but_not_bare_from() {
+        let with_yield = "async fn f() { yield from inner(); }\n";
+        let bare = "fn main() { let x = from; return; }\n";
+        let yield_tokens = semantic_tokens(with_yield, None, None);
+        let bare_tokens = semantic_tokens(bare, None, None);
+        assert!(
+            token_types_at_word(with_yield, &yield_tokens, "from").contains(&TOKEN_KEYWORD),
+            "`from` after yield must be a keyword"
+        );
+        assert!(
+            token_types_at_word(bare, &bare_tokens, "from")
+                .iter()
+                .all(|token_type| *token_type == TOKEN_VARIABLE),
+            "bare `from` must not be keyword-colored"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_scan_floats_and_multi_char_operators() {
+        let source = "fn id(int n) -> int { return Color::Red + 3.14; }\n";
+        let tokens = semantic_tokens(source, None, None);
+        let arrow = token_at_byte(source, &tokens, source.find("->").expect("arrow"))
+            .expect("-> token");
+        assert_eq!(arrow.token_type, TOKEN_OPERATOR);
+        assert_eq!(arrow.length, 2);
+        let path = token_at_byte(source, &tokens, source.find("::").expect("path"))
+            .expect(":: token");
+        assert_eq!(path.token_type, TOKEN_OPERATOR);
+        assert_eq!(path.length, 2);
+        let float = token_at_byte(source, &tokens, source.find("3.14").expect("float"))
+            .expect("float token");
+        assert_eq!(float.token_type, TOKEN_NUMBER);
+        assert_eq!(float.length, 4);
+    }
+
+    #[test]
+    fn semantic_tokens_typed_priority_overrides_pascal_case_heuristic() {
+        // Top-level static so SymbolIndex records a Variable definition whose
+        // inferred type (int) must beat the lexical PascalCase → type heuristic.
+        let source = "\
+static let Point = 1;
+fn main() { return Point; }
+";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        let point = token_types_at_word(source, &tokens, "Point");
+        assert!(
+            !point.is_empty(),
+            "expected tokens for Point binding/use"
+        );
+        assert!(
+            point.iter().all(|token_type| *token_type == TOKEN_VARIABLE),
+            "typed int binding must beat PascalCase type heuristic, got {point:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_classify_static_function_binding() {
+        let source = "\
+fn fib(int n) -> int { return n; }
+static let f = fib;
+fn main() { return f(1); }
+";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        let f_types = token_types_at_word(source, &tokens, "f");
+        assert!(
+            f_types.contains(&TOKEN_FUNCTION),
+            "static function-valued binding should highlight as function, got {f_types:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_lexical_survive_parse_errors() {
+        let source = "// broken\nfn {{{ \"hi\" 2.5\n";
+        let tokens = semantic_tokens(source, None, None);
+        let types: Vec<_> = tokens.iter().map(|token| token.token_type).collect();
+        assert!(types.contains(&TOKEN_COMMENT));
+        assert!(types.contains(&TOKEN_KEYWORD));
+        assert!(types.contains(&TOKEN_STRING));
+        assert!(types.contains(&TOKEN_NUMBER));
+        assert!(types.contains(&TOKEN_OPERATOR));
     }
 }
