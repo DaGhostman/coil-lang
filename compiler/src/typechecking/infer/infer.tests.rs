@@ -5045,7 +5045,7 @@ fn main() {
         assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
     }
 
-    /// Duplicate fixed arity is a `DuplicateOverload` error.
+    /// Duplicate fixed arity with the same parameter types is a `DuplicateOverload` error.
     #[test]
     fn overload_duplicate_fixed_arity_is_error() {
         let msgs = assert_messages(
@@ -5061,6 +5061,28 @@ fn main() { let a = f(1); }
             "expected DuplicateOverload, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    /// Same arity with distinct parameter types is allowed and dispatches by type.
+    #[test]
+    fn overload_same_arity_distinct_types_dispatch() {
+        let (mut c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(float x) -> float { return x; }
+fn main() {
+    let a = f(1);
+    let b = f(1.5);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
     }
 
     #[test]
@@ -5431,4 +5453,34 @@ fn main() {
             "got: {}",
             msgs[0].message()
         );
+    }
+    #[test]
+    fn module_qualified_type_overloads_resolve_bare_calls() {
+        // Namespaced registration + within-module bare calls (as in `stdlib/num.hy`).
+        let mut c = Checker::new();
+        c.set_current_module("num");
+        let src = r#"
+fn min(int a, int b) -> int { return a; }
+fn min(float a, float b) -> float { return a; }
+fn max(int a, int b) -> int { return a; }
+fn max(float a, float b) -> float { return a; }
+fn clamp(int x, int lo, int hi) -> int { return min(max(x, lo), hi); }
+fn clamp(float x, float lo, float hi) -> float { return min(max(x, lo), hi); }
+"#;
+        let parser = Pratt::default();
+        let ast = parser.parse(src).expect("parse");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.overload_candidates("min").map(|v| v.len()),
+            Some(2),
+            "bare lookup should see num::min via current_module"
+        );
+        assert_eq!(c.overload_candidates("num::min").map(|v| v.len()), Some(2));
+        assert_eq!(c.overload_candidates("clamp").map(|v| v.len()), Some(2));
     }

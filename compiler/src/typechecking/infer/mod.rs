@@ -90,13 +90,15 @@ use crate::typechecking::virtual_modules::{
     BuiltinExport, VirtualModules,
 };
 
-/// One candidate in a compile-time arity overload set.
+/// One candidate in a compile-time overload set (arity and/or parameter types).
 ///
 /// Stored in [`Checker::overload_sets`] keyed by the function's simple
 /// (or qualified) name.  Codegen uses the span-indexed
 /// [`Checker::selected_overloads_by_span`] to decide which ABI to emit.
 #[derive(Clone, Debug)]
 pub struct OverloadCandidate {
+    /// Unique id within the overload family (registration order).
+    pub id: u32,
     /// Number of fixed (non-rest) parameters.
     pub fixed_arity: usize,
     /// True when the last parameter is a rest pack (`T... name`).
@@ -229,9 +231,13 @@ pub struct Checker {
 
     /// Call-site selection results keyed by source span `(start, end)`.
     ///
-    /// Populated by `select_overload` during inference; consumed by codegen
-    /// to decide how many args to emit and whether to pack rest.
-    pub selected_overloads_by_span: std::collections::HashMap<(usize, usize), (usize, bool)>,
+    /// Value is `(fixed_arity, is_rest, candidate_id)`. Populated during
+    /// inference; consumed by codegen for the mangled table key.
+    pub selected_overloads_by_span: std::collections::HashMap<(usize, usize), (usize, bool, u32)>,
+
+    /// Declaration span → `(candidate_id, fixed_arity, is_rest)` for
+    /// overloaded functions so codegen can mangle each body uniquely.
+    pub overload_decl_by_span: std::collections::HashMap<(usize, usize), (u32, usize, bool)>,
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,

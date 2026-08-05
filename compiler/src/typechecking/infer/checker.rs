@@ -64,6 +64,7 @@ impl Checker {
             spread_expanded_bases: std::collections::HashSet::new(),
             overload_sets: std::collections::HashMap::new(),
             selected_overloads_by_span: std::collections::HashMap::new(),
+            overload_decl_by_span: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -1269,8 +1270,14 @@ impl Checker {
         self.current_tuple_pack = None;
         self.spread_call_arity.clear();
         self.spread_expanded_bases.clear();
-        self.overload_sets.clear();
+        // Keep module-qualified overload families across multi-file
+        // `check_program` calls so importers can type-dispatch after deps
+        // were checked. Drop bare keys (entry registrations + prior `use`
+        // aliases) so they do not leak into the next module.
+        self.overload_sets.retain(|k, _| k.contains("::"));
+        // Declaration/call span tables are per-module.
         self.selected_overloads_by_span.clear();
+        self.overload_decl_by_span.clear();
         self.partial_fills_by_span.clear();
         self.partial_filled_tys_by_span.clear();
         self.lambda_uncaptured_outer = None;
@@ -2053,8 +2060,10 @@ impl Checker {
                 // When `name` has multiple overload candidates and appears in
                 // value position, try to narrow using `current_expected`.
                 if self.is_overloaded(name) {
-                    let candidates: Vec<OverloadCandidate> =
-                        self.overload_sets.get(*name).cloned().unwrap_or_default();
+                    let candidates: Vec<OverloadCandidate> = self
+                        .overload_candidates(name)
+                        .map(|c| c.to_vec())
+                        .unwrap_or_default();
                     // If exactly one candidate matches current_expected, pick it.
                     let expected = self.current_expected.clone();
                     let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
@@ -2079,7 +2088,7 @@ impl Checker {
                         let candidate = matching[0].clone();
                         self.selected_overloads_by_span.insert(
                             (range.start, range.end),
-                            (candidate.fixed_arity, candidate.is_rest),
+                            (candidate.fixed_arity, candidate.is_rest, candidate.id),
                         );
                         return self.instantiate_ty(&candidate.scheme);
                     } else if matching.len() > 1 || expected.is_none() {
@@ -2089,13 +2098,7 @@ impl Checker {
                         // (len > 1), so ambiguous.
                         let arities: Vec<String> = candidates
                             .iter()
-                            .map(|c| {
-                                if c.is_rest {
-                                    format!("{}+ args (rest)", c.fixed_arity)
-                                } else {
-                                    format!("{} args", c.fixed_arity)
-                                }
-                            })
+                            .map(|c| Self::overload_sig_label(c))
                             .collect();
                         return self.error_with_help(
                             ErrorCode::AmbiguousOverload,
@@ -2116,13 +2119,7 @@ impl Checker {
                     // confusing TypeMismatch downstream).
                     let arities: Vec<String> = candidates
                         .iter()
-                        .map(|c| {
-                            if c.is_rest {
-                                format!("{}+ args (rest)", c.fixed_arity)
-                            } else {
-                                format!("{} args", c.fixed_arity)
-                            }
-                        })
+                        .map(|c| Self::overload_sig_label(c))
                         .collect();
                     let expected_pretty = expected
                         .as_ref()
@@ -2214,12 +2211,52 @@ impl Checker {
                     }
                     return unit_ty();
                 }
+                let module_ns = path.join("::");
+                if name == "*" {
+                    // Bind each exported overload family / item under its base name.
+                    let prefix = if module_ns.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{module_ns}::")
+                    };
+                    let keys: Vec<String> = self
+                        .overload_sets
+                        .keys()
+                        .filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains("::"))
+                        .cloned()
+                        .collect();
+                    for fqn in keys {
+                        let base = fqn[prefix.len()..].to_string();
+                        if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
+                            if cands.len() > 1 {
+                                self.overload_sets.insert(base.clone(), cands);
+                            }
+                        }
+                        if self.env.lookup(&base).is_none() {
+                            self.env
+                                .insert_top(base, Scheme::mono(Ty::Var(self.counter.fresh())));
+                        }
+                    }
+                    return unit_ty();
+                }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
                 // Disk module: insert a polymorphic type variable so
                 // calls to the local name pass type-checking. Codegen
                 // resolves the FQN via `self.aliases`.
                 self.env
-                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                    .insert_top(local.clone(), Scheme::mono(Ty::Var(self.counter.fresh())));
+                // Re-export overload families under the local alias so
+                // `use num::{abs}` can still type-dispatch.
+                let fqn = if module_ns.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{module_ns}::{name}")
+                };
+                if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
+                    if cands.len() > 1 {
+                        self.overload_sets.insert(local, cands);
+                    }
+                }
                 unit_ty()
             }
             Expression::Module(_, _) => unit_ty(),
@@ -2286,6 +2323,7 @@ impl Checker {
                         self.register_overload_candidate(
                             decl.name,
                             OverloadCandidate {
+                    id: 0,
                                 fixed_arity: nfixed,
                                 is_rest: false,
                                 scheme: Scheme::mono(fn_ty),
@@ -2585,7 +2623,7 @@ impl Checker {
                                     Some(c) => {
                                         self.selected_overloads_by_span.insert(
                                             (range.start, range.end),
-                                            (c.fixed_arity, c.is_rest),
+                                            (c.fixed_arity, c.is_rest, c.id),
                                         );
                                         c.scheme
                                     }
@@ -2756,7 +2794,7 @@ impl Checker {
                                 Some(c) => {
                                     self.selected_overloads_by_span.insert(
                                         (range.start, range.end),
-                                        (c.fixed_arity, c.is_rest),
+                                        (c.fixed_arity, c.is_rest, c.id),
                                     );
                                     (c.scheme, true)
                                 }
@@ -3062,30 +3100,36 @@ impl Checker {
                     );
                 }
 
-                // ── Overload-dispatch: select candidate by argc ───────────────
+                // ── Overload-dispatch: select by argc + argument types ─────
                 // Must happen before `has_named` and `fn_has_rest` branches so
                 // the correct candidate's param_names / is_rest are used.
                 if self.is_overloaded(&ident) {
                     let argc = raw_args.len();
-                    // Clone candidate to avoid borrow conflict with `self`.
-                    let candidate_opt = self.select_overload(&ident, argc).cloned();
+                    // Preliminary arg types for same-arity disambiguation.
+                    // Named args contribute their value type in source order;
+                    // reordering happens after the candidate is chosen.
+                    let prelim_tys: Vec<Ty> = raw_args
+                        .iter()
+                        .map(|a| {
+                            let value = match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v,
+                                _ => a,
+                            };
+                            let ty = self.infer(value);
+                            apply_ty_prune(&self.subst, &ty)
+                        })
+                        .collect();
+                    let candidate_opt = self
+                        .select_overload_for_args(&ident, argc, &prelim_tys)
+                        .cloned();
                     match candidate_opt {
                         None => {
-                            // No candidate accepts this arity — emit a
+                            // No candidate accepts this arity/types — emit a
                             // "no overload" error listing the available arities.
                             let available: Vec<String> = self
-                                .overload_sets
-                                .get(&ident)
+                                .overload_candidates(&ident)
                                 .map(|cs| {
-                                    cs.iter()
-                                        .map(|c| {
-                                            if c.is_rest {
-                                                format!("{}+ args (rest)", c.fixed_arity)
-                                            } else {
-                                                format!("{} args", c.fixed_arity)
-                                            }
-                                        })
-                                        .collect()
+                                    cs.iter().map(|c| Self::overload_sig_label(c)).collect()
                                 })
                                 .unwrap_or_default();
                             return self.error_with_help(
@@ -3097,14 +3141,14 @@ impl Checker {
                                     if argc == 1 { "" } else { "s" }
                                 ),
                                 range,
-                                Some(format!("available arities: {}", available.join(", "))),
+                                Some(format!("available overloads: {}", available.join(", "))),
                             );
                         }
                         Some(candidate) => {
                             // Record the selection for codegen.
                             self.selected_overloads_by_span.insert(
                                 (range.start, range.end),
-                                (candidate.fixed_arity, candidate.is_rest),
+                                (candidate.fixed_arity, candidate.is_rest, candidate.id),
                             );
                             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
                                 let (fun_ty, constraints, mapping) =
@@ -10337,6 +10381,7 @@ impl Checker {
                     self.register_overload_candidate(
                         &fqn,
                         OverloadCandidate {
+                    id: 0,
                             fixed_arity,
                             is_rest: has_rest,
                             scheme: scheme.clone(),
@@ -10875,9 +10920,17 @@ impl Checker {
                 Some(s) => s.clone(),
                 None => Scheme::mono(fun_ty.clone()),
             };
+            // Non-entry modules register under `module::name` so same-arity
+            // helpers in `bytes` / `text` (e.g. `starts_with`) do not collide.
+            let overload_key = if self.current_module.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{}", self.current_module, name)
+            };
             self.register_overload_candidate(
-                name,
+                &overload_key,
                 OverloadCandidate {
+                    id: 0, // assigned in register_overload_candidate
                     fixed_arity: fixed_arity_for_overload,
                     is_rest: has_rest,
                     scheme: candidate_scheme,
@@ -10891,20 +10944,29 @@ impl Checker {
     }
 
     /// Insert `candidate` into `overload_sets[key]`, emitting
-    /// [`ErrorCode::DuplicateOverload`] on any arity-range overlap.
+    /// [`ErrorCode::DuplicateOverload`] on arity-range or parameter-type overlap.
+    ///
+    /// Same fixed arity is allowed when parameter types are distinct (e.g.
+    /// `sum(int)` vs `sum(float)`). Identical / unifiable parameter lists at
+    /// the same arity still conflict.
     pub(crate) fn register_overload_candidate(
         &mut self,
         key: &str,
-        new_candidate: OverloadCandidate,
+        mut new_candidate: OverloadCandidate,
         range: &Range<usize>,
     ) {
         let candidates = self.overload_sets.entry(key.to_string()).or_default();
+        new_candidate.id = candidates.len() as u32;
         let mut conflict = false;
         for existing in candidates.iter() {
             let overlap = if existing.is_rest && new_candidate.is_rest {
                 true
             } else if !existing.is_rest && !new_candidate.is_rest {
-                existing.fixed_arity == new_candidate.fixed_arity
+                if existing.fixed_arity != new_candidate.fixed_arity {
+                    false
+                } else {
+                    Self::schemes_params_overlap(&existing.scheme, &new_candidate.scheme)
+                }
             } else {
                 let (fixed_n, rest_k) = if existing.is_rest {
                     (new_candidate.fixed_arity, existing.fixed_arity)
@@ -10921,10 +10983,19 @@ impl Checker {
                         key
                     )
                 } else if !existing.is_rest && !new_candidate.is_rest {
-                    format!(
-                        "Duplicate function `{}` with arity {}",
-                        key, new_candidate.fixed_arity
-                    )
+                    if existing.fixed_arity == new_candidate.fixed_arity
+                        && Self::schemes_params_overlap(&existing.scheme, &new_candidate.scheme)
+                    {
+                        format!(
+                            "Duplicate function `{}` with arity {} and overlapping parameter types",
+                            key, new_candidate.fixed_arity
+                        )
+                    } else {
+                        format!(
+                            "Duplicate function `{}` with arity {}",
+                            key, new_candidate.fixed_arity
+                        )
+                    }
                 } else {
                     let (fixed_n, rest_k) = if existing.is_rest {
                         (new_candidate.fixed_arity, existing.fixed_arity)
@@ -10938,7 +11009,7 @@ impl Checker {
                 };
                 let mut err = Message::error(ErrorCode::DuplicateOverload, msg_text, range.clone());
                 err.with_help(
-                    "choose distinct arities, or make the fixed overload have fewer params than the rest's fixed prefix"
+                    "choose distinct arities or parameter types, or make the fixed overload have fewer params than the rest's fixed prefix"
                         .to_string(),
                 );
                 self.messages.push(err);
@@ -10946,7 +11017,54 @@ impl Checker {
             }
         }
         if !conflict {
+            self.overload_decl_by_span.insert(
+                (range.start, range.end),
+                (
+                    new_candidate.id,
+                    new_candidate.fixed_arity,
+                    new_candidate.is_rest,
+                ),
+            );
             candidates.push(new_candidate);
+        }
+    }
+
+    /// True when two function schemes have unifiable parameter lists (same shape).
+    fn schemes_params_overlap(a: &Scheme, b: &Scheme) -> bool {
+        let pa = Self::fun_param_tys(&a.ty);
+        let pb = Self::fun_param_tys(&b.ty);
+        if pa.len() != pb.len() {
+            return false;
+        }
+        let empty = crate::typechecking::subst::Subst::default();
+        pa.iter()
+            .zip(pb.iter())
+            .all(|(x, y)| crate::typechecking::unify::unify_with(&empty, x, y).is_ok())
+    }
+
+    /// Peel `a -> b -> … -> r` into parameter types (left-to-right).
+    fn fun_param_tys(ty: &Ty) -> Vec<Ty> {
+        let mut params = Vec::new();
+        let mut cur = ty;
+        while let Ty::Fun(arg, ret) = cur {
+            params.push((**arg).clone());
+            cur = ret;
+        }
+        params
+    }
+
+    /// Human-readable overload signature for diagnostics: `(int, int)` or `(int…)+ (rest)`.
+    fn overload_sig_label(c: &OverloadCandidate) -> String {
+        let params = Self::fun_param_tys(&c.scheme.ty);
+        let sig = params
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if c.is_rest {
+            format!("({})+ (rest)", sig)
+        } else {
+            format!("({})", sig)
         }
     }
 
@@ -11167,42 +11285,120 @@ impl Checker {
 
     /// All registered overload candidates for `fn_name`, if any.
     pub fn overload_candidates(&self, fn_name: &str) -> Option<&[OverloadCandidate]> {
-        self.overload_sets.get(fn_name).map(|v| v.as_slice())
+        self.overload_sets
+            .get(fn_name)
+            .or_else(|| {
+                if self.current_module.is_empty() {
+                    None
+                } else {
+                    self.overload_sets
+                        .get(&format!("{}::{}", self.current_module, fn_name))
+                }
+            })
+            .map(|v| v.as_slice())
     }
 
     /// True when `fn_name` has more than one overload candidate.
     pub fn is_overloaded(&self, fn_name: &str) -> bool {
-        self.overload_sets
-            .get(fn_name)
+        self.overload_candidates(fn_name)
             .map_or(false, |v| v.len() > 1)
     }
 
-    /// Select the best overload candidate for a call with `argc` arguments.
+    /// Select the best overload candidate for a call with `argc` arguments
+    /// and (optional) preliminary argument types.
     ///
     /// Resolution order:
-    /// 1. Fixed candidate whose `fixed_arity == argc`.
-    /// 2. Rest candidate whose `fixed_arity <= argc`.
-    /// 3. `None` — caller emits a missing-arity diagnostic.
+    /// 1. Candidates that accept `argc` (exact fixed, else rest).
+    /// 2. If several share that arity, prefer those whose parameters unify
+    ///    with `arg_tys` (when provided and non-empty).
+    /// 3. If still several, prefer monomorphic / concrete params over vars.
+    /// 4. `None` when nothing fits.
     pub fn select_overload(&self, fn_name: &str, argc: usize) -> Option<&OverloadCandidate> {
-        let candidates = self.overload_sets.get(fn_name)?;
-        // Prefer exact fixed match.
-        if let Some(c) = candidates
+        self.select_overload_for_args(fn_name, argc, &[])
+    }
+
+    /// Like [`Self::select_overload`], but disambiguate same-arity candidates
+    /// with `arg_tys` (left-to-right parameter positions).
+    pub fn select_overload_for_args(
+        &self,
+        fn_name: &str,
+        argc: usize,
+        arg_tys: &[Ty],
+    ) -> Option<&OverloadCandidate> {
+        let candidates = self.overload_candidates(fn_name)?;
+        let arity_ok: Vec<&OverloadCandidate> = candidates
             .iter()
-            .find(|c| !c.is_rest && c.fixed_arity == argc)
-        {
-            return Some(c);
+            .filter(|c| {
+                if c.is_rest {
+                    c.fixed_arity <= argc
+                } else {
+                    c.fixed_arity == argc
+                }
+            })
+            .collect();
+        if arity_ok.is_empty() {
+            return None;
         }
-        // Fall back to rest candidate that can accept `argc`.
-        candidates
-            .iter()
-            .find(|c| c.is_rest && c.fixed_arity <= argc)
+        let fixed: Vec<&OverloadCandidate> =
+            arity_ok.iter().copied().filter(|c| !c.is_rest).collect();
+        let pool: Vec<&OverloadCandidate> = if !fixed.is_empty() {
+            fixed
+        } else {
+            arity_ok
+        };
+        if pool.len() == 1 {
+            return Some(pool[0]);
+        }
+        if arg_tys.is_empty() {
+            // No type info: keep legacy behaviour (first fixed / first rest).
+            return Some(pool[0]);
+        }
+        let empty = crate::typechecking::subst::Subst::default();
+        let mut matches: Vec<&OverloadCandidate> = Vec::new();
+        for c in &pool {
+            let params = Self::fun_param_tys(&c.scheme.ty);
+            let n = params.len().min(arg_tys.len());
+            let ok = (0..n).all(|i| {
+                crate::typechecking::unify::unify_with(&empty, &params[i], &arg_tys[i]).is_ok()
+            });
+            if ok {
+                matches.push(*c);
+            }
+        }
+        match matches.len() {
+            0 => None,
+            1 => Some(matches[0]),
+            _ => {
+                // Prefer candidates whose params are all concrete constructors.
+                let concrete: Vec<_> = matches
+                    .iter()
+                    .copied()
+                    .filter(|c| {
+                        Self::fun_param_tys(&c.scheme.ty)
+                            .iter()
+                            .all(|t| matches!(t, Ty::Con(_)))
+                    })
+                    .collect();
+                if concrete.len() == 1 {
+                    Some(concrete[0])
+                } else {
+                    // Ambiguous — caller may re-check; pick first for recovery.
+                    Some(matches[0])
+                }
+            }
+        }
     }
 
     /// The call-site selection result for the call spanning `(start, end)`.
     ///
-    /// Returns `(fixed_arity, is_rest)` of the chosen candidate.
-    pub fn selected_overload_at(&self, start: usize, end: usize) -> Option<(usize, bool)> {
+    /// Returns `(fixed_arity, is_rest, candidate_id)` of the chosen candidate.
+    pub fn selected_overload_at(&self, start: usize, end: usize) -> Option<(usize, bool, u32)> {
         self.selected_overloads_by_span.get(&(start, end)).copied()
+    }
+
+    /// Declaration-site overload identity for mangling the function table key.
+    pub fn overload_decl_at(&self, start: usize, end: usize) -> Option<(u32, usize, bool)> {
+        self.overload_decl_by_span.get(&(start, end)).copied()
     }
 
     /// Fill bitmask for a partial-application call site, if any.
