@@ -1898,7 +1898,8 @@ impl<const S: usize> Machine<S> {
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
                     let _ = r.as_mut();
-
+                    // Root before GC — same rule as `push_interned_string`.
+                    self.stack.push(Value::from(r.as_ptr().addr() as u64));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -1908,8 +1909,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-
-                    self.stack.push(Value::from(r.as_ptr().addr() as u64));
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
@@ -2572,7 +2571,9 @@ impl<const S: usize> Machine<S> {
 
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
-
+                    // Root before GC — unmarked fresh enums are swept otherwise
+                    // (result-mode `return Ok(s)` after a heavy callee was flaky).
+                    self.stack.push(Value::from(object.addr()));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -2582,8 +2583,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
@@ -2670,6 +2669,7 @@ impl<const S: usize> Machine<S> {
                             instance.set(key, member);
                         }
                     }
+                    self.stack.push(Value::from(object.addr()));
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
@@ -2678,7 +2678,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
@@ -2806,6 +2805,7 @@ impl<const S: usize> Machine<S> {
                         },
                         Object::Array,
                     );
+                    self.stack.push(Value::from(array_obj.addr()));
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
                             &mut self.heap,
@@ -2814,7 +2814,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(array_obj.addr()));
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; pool index in operands[15:0]
@@ -2996,6 +2995,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
+                    self.stack.push(Value::from(object.addr()));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -3005,8 +3005,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
@@ -3177,6 +3175,7 @@ impl<const S: usize> Machine<S> {
                                 captures,
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
+                            self.stack.push(Value::from(object.addr()));
                             self.alloc_counter += 1;
                             if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                                 Self::gc_collect(
@@ -3186,7 +3185,6 @@ impl<const S: usize> Machine<S> {
                                     &mut self.alloc_counter,
                                 );
                             }
-                            self.stack.push(Value::from(object.addr()));
                             continue;
                         }
 
@@ -3346,6 +3344,7 @@ impl<const S: usize> Machine<S> {
                         captures,
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::Fn);
+                    self.stack.push(Value::from(object.addr()));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -3355,7 +3354,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::LoadStatic => {
                     let slot = opcode.operand_u32() as usize;
@@ -3434,6 +3432,7 @@ impl<const S: usize> Machine<S> {
                         captured_dicts: Vec::new(),
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
+                    self.stack.push(Value::from(object.addr()));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -3443,7 +3442,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::MakePolyFnCapture => {
                     let count = (opcode.operand_u32() & 0xFF) as usize;
@@ -3467,6 +3465,7 @@ impl<const S: usize> Machine<S> {
                         captured_dicts,
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
+                    self.stack.push(Value::from(object.addr()));
                     self.alloc_counter += 1;
                     if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
                         Self::gc_collect(
@@ -3476,7 +3475,6 @@ impl<const S: usize> Machine<S> {
                             &mut self.alloc_counter,
                         );
                     }
-                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::DynAdd
                 | Instruction::DynSub
