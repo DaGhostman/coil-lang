@@ -205,9 +205,18 @@ fn pad_left([byte] src, int width, byte fill) -> [byte] {
 
 /// Pad on the right with `fill` until the buffer reaches `width`.
 fn pad_right([byte] src, int width, byte fill) -> [byte] {
-    let out = copy(src);
-    while len(out) < width {
+    let out: [byte] = [];
+    let j = 0;
+    let n = len(src);
+    while j < n {
+        out[] = src[j];
+        j = j + 1;
+    }
+    let padding = width - n;
+    let i = 0;
+    while i < padding {
         out[] = fill;
+        i = i + 1;
     }
     return out;
 }
