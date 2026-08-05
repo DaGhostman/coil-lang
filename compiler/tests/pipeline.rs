@@ -3038,6 +3038,12 @@ fn example_overload_prints_15() {
 }
 
 #[test]
+fn example_type_overload_prints_typed_tags() {
+    let output = run_example("examples/type_overload.hy");
+    assert_eq!(output, "i:7f:1.5s:hi");
+}
+
+#[test]
 fn example_fn_value_prints_423() {
     let output = run_example("examples/fn_value.hy");
     assert_eq!(output, "423");
