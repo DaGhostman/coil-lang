@@ -2299,7 +2299,11 @@ impl Checker {
             }
 
             Expression::Expr(e) | Expression::Group(e) | Expression::Statement(e) => self.infer(e),
-            Expression::ExprStatement(e) => self.infer(e),
+            // Semicolon form discards the value (same as a Rust statement).
+            Expression::ExprStatement(e) => {
+                let _ = self.infer(e);
+                unit_ty()
+            }
 
             // ---- Blocks ----
             // Program runs in the current frame (the global frame from
