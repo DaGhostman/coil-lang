@@ -1334,7 +1334,10 @@ impl Checker {
         self.main_decl_span = None;
         self.generics.generic_type_ctors.clear();
         self.generics.register_builtin_type_ctors();
-        self.generics.generic_fns.clear();
+        // Keep module-qualified generic names so importers still see
+        // `num::min` as generic after `num` was checked (dict-passing ABI).
+        self.generics.generic_fns.retain(|k| k.contains("::"));
+        self.fn_dict_arity.retain(|k, _| k.contains("::"));
         self.var_kinds.clear();
         self.current_typeclass = None;
         self.current_assoc_projections = None;
@@ -2219,12 +2222,20 @@ impl Checker {
                     } else {
                         format!("{module_ns}::")
                     };
-                    let keys: Vec<String> = self
+                    let mut keys: Vec<String> = self
                         .overload_sets
                         .keys()
                         .filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains("::"))
                         .cloned()
                         .collect();
+                    // Also re-export module-qualified generics (`num::min`).
+                    for g in &self.generics.generic_fns {
+                        if g.starts_with(&prefix) && !g[prefix.len()..].contains("::") {
+                            keys.push(g.clone());
+                        }
+                    }
+                    keys.sort();
+                    keys.dedup();
                     for fqn in keys {
                         let base = fqn[prefix.len()..].to_string();
                         if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
@@ -2232,26 +2243,21 @@ impl Checker {
                                 self.overload_sets.insert(base.clone(), cands);
                             }
                         }
-                        if self.env.lookup(&base).is_none() {
-                            self.env
-                                .insert_top(base, Scheme::mono(Ty::Var(self.counter.fresh())));
-                        }
+                        self.reexport_module_item(&fqn, &base);
                     }
                     return unit_ty();
                 }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
-                // Disk module: insert a polymorphic type variable so
-                // calls to the local name pass type-checking. Codegen
-                // resolves the FQN via `self.aliases`.
-                self.env
-                    .insert_top(local.clone(), Scheme::mono(Ty::Var(self.counter.fresh())));
-                // Re-export overload families under the local alias so
-                // `use num::{abs}` can still type-dispatch.
                 let fqn = if module_ns.is_empty() {
                     name.clone()
                 } else {
                     format!("{module_ns}::{name}")
                 };
+                // Prefer the defining module's real scheme (incl. generics with
+                // bounds) over a dummy Var so call sites get dict-passing ABI.
+                self.reexport_module_item(&fqn, &local);
+                // Re-export overload families under the local alias so
+                // `use num::{abs}` can still type-dispatch.
                 if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
                     if cands.len() > 1 {
                         self.overload_sets.insert(local, cands);
@@ -10881,8 +10887,6 @@ impl Checker {
 
         // If generic, build a poly scheme and re-insert into env.
         if is_generic {
-            self.generic_fns.insert(name.to_string());
-            self.generics.generic_fns.insert(name.to_string());
             let mut bounds = param_vars;
             bounds.extend(fn_assoc_projections.iter().map(|p| p.var));
             let mut kinds = param_kinds;
@@ -10894,14 +10898,33 @@ impl Checker {
                 fn_assoc_projections,
                 fun_ty.clone(),
             );
-            self.env.insert_top(name.to_string(), scheme);
+            // Non-entry modules also register under `module::name` so later
+            // files can `use` the real poly scheme (not a dummy Var).
+            let fqn = if self.current_module.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{}", self.current_module, name)
+            };
+            self.generic_fns.insert(name.to_string());
+            self.generics.generic_fns.insert(name.to_string());
+            if fqn != name {
+                self.generic_fns.insert(fqn.clone());
+                self.generics.generic_fns.insert(fqn.clone());
+            }
+            self.env.insert_top(name.to_string(), scheme.clone());
+            if fqn != name {
+                self.env.insert_top(fqn.clone(), scheme);
+            }
 
             // Every constraint is a trailing dictionary argument. Builtin
             // classes use compiler-generated implementation thunks, while
             // user classes use source-declared methods; their calling ABI is
             // intentionally identical.
-            self.fn_dict_arity
-                .insert(name.to_string(), resolved_param_constraints.len());
+            let dict_n = resolved_param_constraints.len();
+            self.fn_dict_arity.insert(name.to_string(), dict_n);
+            if fqn != name {
+                self.fn_dict_arity.insert(fqn, dict_n);
+            }
         }
 
         // ── Overload-set registration ──────────────────────────────────────
@@ -14927,14 +14950,54 @@ impl Checker {
 
     /// Whether `name` is a generic function (has type params).
     pub fn is_generic_fn(&self, name: &str) -> bool {
-        self.generics.generic_fns.contains(name)
+        if self.generics.generic_fns.contains(name) {
+            return true;
+        }
+        // Cross-module: defining file registered `module::name`; importers
+        // call the bare alias after `use`.
+        let suffix = format!("::{name}");
+        self.generics.generic_fns.iter().any(|k| k.ends_with(&suffix))
+    }
+
+    /// Bind `local` to the defining module's scheme for `fqn` when known;
+    /// otherwise insert a fresh monomorphic placeholder (historical disk-module
+    /// ABI). Marks generic aliases so codegen emits dictionaries.
+    fn reexport_module_item(&mut self, fqn: &str, local: &str) {
+        if let Some(scheme) = self.env.lookup(fqn).cloned() {
+            self.env.insert_top(local.to_string(), scheme);
+        } else if self.env.lookup(local).is_none() {
+            self.env
+                .insert_top(local.to_string(), Scheme::mono(Ty::Var(self.counter.fresh())));
+        }
+        if self.generics.generic_fns.contains(fqn)
+            || self
+                .generics
+                .generic_fns
+                .iter()
+                .any(|k| k.ends_with(&format!("::{local}")) && k != local)
+        {
+            self.generics.generic_fns.insert(local.to_string());
+        }
+        if let Some(arity) = self.fn_dict_arity.get(fqn).copied() {
+            self.fn_dict_arity.insert(local.to_string(), arity);
+        }
     }
 
     /// Number of *user-defined* trait dict slots expected by a generic
     /// function.  Returns 0 for non-generic functions or functions whose
     /// constraints are all built-in classes (Num / Ord / Eq / Show).
     pub fn dict_arity_for(&self, fn_name: &str) -> usize {
-        self.fn_dict_arity.get(fn_name).copied().unwrap_or(0)
+        self.fn_dict_arity
+            .get(fn_name)
+            .copied()
+            .or_else(|| {
+                let suffix = format!("::{fn_name}");
+                self.fn_dict_arity
+                    .iter()
+                    .find(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, v)| *v)
+            })
+            .unwrap_or(0)
     }
 
     /// True for compiler-built-in typeclasses (Num / Ord / Eq / Show).
