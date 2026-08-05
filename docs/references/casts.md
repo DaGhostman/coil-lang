@@ -6,9 +6,11 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 - Non-literal `int as byte` keeps the low 8 bits (`let n = 257; n as byte` → `1`; negatives wrap the same way, e.g. `-1 as byte` when the operand is a variable).
 - A **literal** `int as byte` outside `0..=255` is a compile-time type error (same message as a byte literal out of range).
 
-Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
+Examples: `n as byte`, `f as int`, `flag as bool`, `"/" as byte`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
 
 `as` is a Pratt **postfix** operator (see [Operators](operators.md)): it binds tighter than arithmetic and assignment, so `c = m as byte` means `c = (m as byte)`, and `1 + 2 as float` means `1 + (2 as float)`.
+
+A **string literal** whose UTF-8 encoding is exactly one byte coerces to `byte` under an expected `byte` (or via `"/" as byte`). This is a compile-time rewrite to a byte constant — not a runtime `Into` on arbitrary strings. Escapes like `"\n"` and `"\x22"` work; multi-byte literals are a type error.
 
 ---
 

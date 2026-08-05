@@ -17,7 +17,9 @@ coil uses **Hindley–Milner (Algorithm W)** type inference with optional annota
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
-Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`). `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
+Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`).
+
+**Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\x22"`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce — use `to_bytes` for UTF-8 scanning. `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
 Strings support `+` / `+=` with other strings. `string::format(...)` returns `string` and validates literal format specifiers (`%i` accepts `byte`).
 
