@@ -150,7 +150,7 @@ fn parse_literal([byte] b, int i, string lit, Json val) -> Result<(Json, int), J
 }
 
 fn append_escape([byte] out, byte e) -> Result<[byte], JsonError> {
-    let q: byte = "\x22";
+    let q: byte = "\"";
     let bs: byte = "\\";
     let sl: byte = "/";
     let nch: byte = "n";
@@ -184,7 +184,7 @@ fn append_escape([byte] out, byte e) -> Result<[byte], JsonError> {
 }
 
 fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
-    let q: byte = "\x22";
+    let q: byte = "\"";
     let bs: byte = "\\";
     if i >= len(b) {
         raise JsonError::JsonUnexpectedEnd;
@@ -454,7 +454,7 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
 /// Recursive descent entry — arrays/objects call back into this function.
 #[max_depth(256)]
 fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
-    let q: byte = "\x22";
+    let q: byte = "\"";
     let lbr: byte = "[";
     let rbr: byte = "]";
     let lbrace: byte = "{";
@@ -600,7 +600,7 @@ fn escape_string(string s) -> [byte] {
     let out: [byte] = [];
     out[] = 34;
     let i = 0;
-    let q: byte = "\x22";
+    let q: byte = "\"";
     let bs: byte = "\\";
     let lf: byte = "\n";
     let cr: byte = "\r";

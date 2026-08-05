@@ -8,3 +8,8 @@ test("string literal coerces to byte") {
     assert((buf[0] as int) == 72)?;
     assert(("." as byte) as int == 46)?;
 }
+
+test("escaped quote string literal as byte") {
+    let q: byte = "\"";
+    assert((q as int) == 34)?;
+}

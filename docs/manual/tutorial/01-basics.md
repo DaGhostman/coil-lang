@@ -71,7 +71,7 @@ coil has four primitive literal forms.
 |--------|-----------------------|--------------------------------------------|
 | `int`  | `0`, `42`, `-7`       | Signed integers                            |
 | `float`| `1.0`, `3.14`, `-0.5` | Must contain a decimal point (`1.0`, not `1`) |
-| `string` | `"hello"`, `"FIZ"`  | Double-quoted; escape sequences follow C-style conventions where supported |
+| `string` | `"hello"`, `"FIZ"`, `"say \"hi\""`  | Double-quoted; escapes: `\\` `\"` `\n` `\r` `\t` `\0` `\e` `\xHH` `\u{HEX}` |
 | `bool` | `true`, `false`       | Boolean literals                           |
 
 ```coil

@@ -10,7 +10,7 @@ Examples: `n as byte`, `f as int`, `flag as bool`, `"/" as byte`. The same matri
 
 `as` is a Pratt **postfix** operator (see [Operators](operators.md)): it binds tighter than arithmetic and assignment, so `c = m as byte` means `c = (m as byte)`, and `1 + 2 as float` means `1 + (2 as float)`.
 
-A **string literal** whose UTF-8 encoding is exactly one byte coerces to `byte` under an expected `byte` (or via `"/" as byte`). This is a compile-time rewrite to a byte constant — not a runtime `Into` on arbitrary strings. Escapes like `"\n"` and `"\x22"` work; multi-byte literals are a type error.
+A **string literal** whose UTF-8 encoding is exactly one byte coerces to `byte` under an expected `byte` (or via `"/" as byte`). This is a compile-time rewrite to a byte constant — not a runtime `Into` on arbitrary strings. Escapes like `"\n"` and `"\""` work; multi-byte literals are a type error.
 
 ---
 
