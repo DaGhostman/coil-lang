@@ -86,24 +86,20 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
     if nn == 0 {
         return 0;
     }
-    // Guard empty hay explicitly (see coil compare quirks with zero).
-    if hn == 0 {
-        return 999999;
-    }
     if nn > hn {
         return 999999;
     }
     let i = 0;
     while i + nn <= hn {
-        let ok = 1;
+        let ok = true;
         let j = 0;
         while j < nn {
             if hay[i + j] != needle[j] {
-                ok = 0;
+                ok = false;
             }
             j = j + 1;
         }
-        if ok == 1 {
+        if ok {
             return i;
         }
         i = i + 1;
