@@ -2382,3 +2382,59 @@ fn main() {}
         msgs
     );
 }
+
+#[test]
+fn gc_get_rejects_weak_handle() {
+    let (_ty, msgs) = check(
+        r#"
+use gc::*;
+fn main() {
+    let w = weak(1);
+    let _ = get(w);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Type mismatch")),
+        "expected get(Weak) type mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn gc_upgrade_rejects_root_handle() {
+    let (_ty, msgs) = check(
+        r#"
+use gc::*;
+fn main() {
+    let r = root(1);
+    let _ = upgrade(r);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Type mismatch")),
+        "expected upgrade(Root) type mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn gc_root_get_roundtrip_typechecks() {
+    let (_ty, msgs) = check(
+        r#"
+use gc::*;
+fn main() {
+    let r = root(1);
+    let n: int = get(r);
+    let w = weak(n);
+    let _ = upgrade(w);
+}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "root/get/weak/upgrade should typecheck; got: {:?}",
+        msgs
+    );
+}

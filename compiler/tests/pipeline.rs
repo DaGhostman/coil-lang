@@ -3996,6 +3996,133 @@ fn example_thread_mutex_prints_2() {
 }
 
 #[test]
+fn example_gc_root_weak_prints_pinned() {
+    let output = run_example("examples/gc_root_weak.hy");
+    assert_eq!(output, "pinned\npinned");
+}
+
+#[test]
+fn gc_upgrade_some_while_rooted() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+fn main() {
+    let r = root([7, 8]);
+    let w = weak(get(r));
+    let out = match upgrade(w) {
+        Option::Some(_) => "some",
+        Option::None => "none",
+    };
+    write_all(stdout(), to_bytes(out));
+}
+"#,
+    );
+    assert_eq!(output, "some");
+}
+
+#[test]
+fn example_gc_collect_clears_weak() {
+    assert_eq!(run_example("examples/gc_collect.hy"), "none");
+}
+
+#[test]
+fn gc_heap_bytes_is_nonnegative() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    let _ = root([1, 2, 3, 4]);
+    let n = heap_bytes();
+    write_all(stdout(), to_bytes(format("%z", n >= 0)));
+}
+"#,
+    );
+    assert_eq!(output, "true");
+}
+
+#[test]
+fn gc_collect_preserves_stack_rooted_weak() {
+    // `collect` must root the operand stack like auto-GC; a live `Root` on
+    // the frame keeps the referent alive so `upgrade` stays `Some`.
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+fn main() {
+    let r = root([9, 8, 7]);
+    let w = weak(get(r));
+    let _freed = collect();
+    let out = match upgrade(w) {
+        Option::Some(_) => "some",
+        Option::None => "none",
+    };
+    write_all(stdout(), to_bytes(out));
+}
+"#,
+    );
+    assert_eq!(output, "some");
+}
+
+#[test]
+fn gc_collect_returns_nonnegative_freed_bytes() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    let n = collect();
+    write_all(stdout(), to_bytes(format("%z", n >= 0)));
+}
+"#,
+    );
+    assert_eq!(output, "true");
+}
+
+#[test]
+fn gc_get_after_unroot_then_collect_clears_weak() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+fn only_weak() {
+    let r = root("temp");
+    let w = weak(get(r));
+    let _ = unroot(r);
+    return w;
+}
+
+fn main() {
+    let w = only_weak();
+    let _ = collect();
+    let out = match upgrade(w) {
+        Option::Some(_) => "some",
+        Option::None => "none",
+    };
+    write_all(stdout(), to_bytes(out));
+}
+"#,
+    );
+    assert_eq!(output, "none");
+}
+
+#[test]
 fn thread_channel_close_try_recv_is_disconnected() {
     let output = run_example_src(
         r#"

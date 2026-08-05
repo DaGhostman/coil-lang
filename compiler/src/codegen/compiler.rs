@@ -2244,6 +2244,9 @@ impl Compiler {
                     if self.checker.thread_fn_in_scope(fname).is_some() {
                         return true;
                     }
+                    if self.checker.gc_fn_in_scope(fname).is_some() {
+                        return true;
+                    }
                     if self.checker.host_fn_in_scope(fname).is_some() {
                         return true;
                     }
@@ -8296,6 +8299,12 @@ impl Compiler {
                     && let Some(kind) = self.checker.thread_fn_in_scope(fname)
                 {
                     self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    return bytecode;
+                }
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(kind) = self.checker.gc_fn_in_scope(fname)
+                {
+                    self.emit_host_native_invoke(kind.native_name(), args.as_deref().unwrap_or(&[]));
                     return bytecode;
                 }
                 if let Expression::Identifier(fname) = name.1.as_ref()

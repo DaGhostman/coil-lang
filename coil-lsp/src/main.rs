@@ -1065,6 +1065,7 @@ fn insert_virtual_candidate(
         | BuiltinExport::IoFn { .. }
         | BuiltinExport::StringFn { .. }
         | BuiltinExport::ThreadFn { .. }
+        | BuiltinExport::GcFn { .. }
         | BuiltinExport::HostFn { .. } => CompletionItemKind::FUNCTION,
     };
     out.entry(name.clone())
@@ -1086,6 +1087,7 @@ fn builtin_documentation(path: &[String], name: &str, export: &BuiltinExport) ->
         "env" => "env.md",
         "crypto" => "crypto.md",
         "regex" => "regex.md",
+        "gc" => "gc.md",
         "ffi" | "ffi::types" => "ffi.md",
         _ => "modules.md",
     };
@@ -1195,6 +1197,15 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
         ("crypto", "random_bytes") => "Generates cryptographically secure random bytes.".into(),
         ("crypto", "random_u64") => "Generates a cryptographically secure random 64-bit integer.".into(),
         ("crypto", "ct_eq") => "Compares byte arrays in constant time.".into(),
+        ("gc", "root") => "Pins a value so the GC keeps it alive (`Root<T>`).".into(),
+        ("gc", "unroot") => "Takes the pinned value and clears the `Root`.".into(),
+        ("gc", "get") => "Reads the value inside a `Root` without releasing the pin.".into(),
+        ("gc", "weak") => "Creates a non-rooting `Weak<T>` handle.".into(),
+        ("gc", "upgrade") => "Upgrades a `Weak<T>` to `Option<T>` if the referent is live.".into(),
+        ("gc", "heap_bytes") => "Returns the managed heap size in bytes.".into(),
+        ("gc", "collect") => "Forces a full GC; returns bytes freed.".into(),
+        ("gc", "Root") => "Strong GC pin type constructor (`Root<T>`).".into(),
+        ("gc", "Weak") => "Weak GC handle type constructor (`Weak<T>`).".into(),
         _ => match export {
             BuiltinExport::TypeClass { .. } => {
                 format!("Provides the `{name}` typeclass used by generic constraints.")

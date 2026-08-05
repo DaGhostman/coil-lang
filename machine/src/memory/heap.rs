@@ -217,6 +217,12 @@ impl Heap {
             Object::Boxed(b) => {
                 b.release();
             }
+            Object::Root(r) => {
+                r.release();
+            }
+            Object::Weak(w) => {
+                w.release();
+            }
             Object::PolyFn(p) => {
                 p.release();
             }
@@ -269,6 +275,31 @@ impl Heap {
         }
         gray.clear();
         self.gc_gray = gray;
+    }
+
+    /// Clear [`Object::Weak`] handles whose referents were not marked.
+    ///
+    /// Must run after the mark phase and before [`Self::sweep`] so upgrades
+    /// never observe a recycled address (ABA).
+    pub fn clear_dead_weaks(&self) {
+        let mut current = self.head;
+        while let Some(obj) = current {
+            if let Object::Weak(gc) = obj {
+                let weak = gc.as_ref();
+                if !weak.cleared.get() {
+                    let target = weak.target.get();
+                    let addr = target.raw() as u64;
+                    if addr != 0
+                        && let Some(referent) = self.find_object_by_addr(addr)
+                        && !referent.is_marked()
+                    {
+                        weak.cleared.set(true);
+                        weak.target.set(Value::from(0i64));
+                    }
+                }
+            }
+            current = obj.get_next();
+        }
     }
 
     /// Take the reusable GC root address buffer (caller must restore via [`Self::restore_gc_roots`]).
@@ -424,6 +455,8 @@ impl fmt::Display for Error {
 }
 
 pub type RefBoxed = Gc<ObjBoxed>;
+pub type RefRoot = Gc<ObjRoot>;
+pub type RefWeak = Gc<ObjWeak>;
 pub type RefPolyFn = Gc<ObjPolyFn>;
 pub type RefFn = Gc<ObjFn>;
 pub type RefStream = Gc<ObjStream>;
@@ -463,6 +496,10 @@ pub enum Object {
     Array(crate::memory::Gc<ObjArray>),
     Coroutine(RefCoroutine),
     Boxed(RefBoxed),
+    /// Strong GC pin: marks `payload` while this handle is reachable.
+    Root(RefRoot),
+    /// Non-rooting handle; cleared when the referent is unmarked.
+    Weak(RefWeak),
     PolyFn(RefPolyFn),
     Fn(RefFn),
     Stream(RefStream),
@@ -489,6 +526,8 @@ impl Object {
             Self::Array(a) => a.mark(),
             Self::Coroutine(c) => c.mark(),
             Self::Boxed(b) => b.mark(),
+            Self::Root(r) => r.mark(),
+            Self::Weak(w) => w.mark(),
             Self::PolyFn(p) => p.mark(),
             Self::Fn(f) => f.mark(),
             Self::Stream(s) => s.mark(),
@@ -518,6 +557,8 @@ impl Object {
             Self::Array(a) => a.unmark(),
             Self::Coroutine(c) => c.unmark(),
             Self::Boxed(b) => b.unmark(),
+            Self::Root(r) => r.unmark(),
+            Self::Weak(w) => w.unmark(),
             Self::PolyFn(p) => p.unmark(),
             Self::Fn(f) => f.unmark(),
             Self::Stream(s) => s.unmark(),
@@ -545,6 +586,8 @@ impl Object {
             Self::Array(a) => a.is_marked(),
             Self::Coroutine(c) => c.is_marked(),
             Self::Boxed(b) => b.is_marked(),
+            Self::Root(r) => r.is_marked(),
+            Self::Weak(w) => w.is_marked(),
             Self::PolyFn(p) => p.is_marked(),
             Self::Fn(f) => f.is_marked(),
             Self::Stream(s) => s.is_marked(),
@@ -592,6 +635,12 @@ impl Object {
                     o.mark(grey_objects);
                 }
             }
+            Self::Root(r) => {
+                if let Member::Object(o) = &r.as_ref().payload {
+                    o.mark(grey_objects);
+                }
+            }
+            Self::Weak(_) => {}
             Self::PolyFn(p) => {
                 for captured in p.as_ref().captured_dicts.iter().flatten() {
                     if let Member::Object(o) = captured {
@@ -629,6 +678,8 @@ impl Object {
             Self::Array(a) => a.get_next(),
             Self::Coroutine(c) => c.get_next(),
             Self::Boxed(b) => b.get_next(),
+            Self::Root(r) => r.get_next(),
+            Self::Weak(w) => w.get_next(),
             Self::PolyFn(p) => p.get_next(),
             Self::Fn(f) => f.get_next(),
             Self::Stream(s) => s.get_next(),
@@ -655,6 +706,8 @@ impl Object {
             Self::Array(a) => a.set_next(next),
             Self::Coroutine(c) => c.set_next(next),
             Self::Boxed(b) => b.set_next(next),
+            Self::Root(r) => r.set_next(next),
+            Self::Weak(w) => w.set_next(next),
             Self::PolyFn(p) => p.set_next(next),
             Self::Fn(f) => f.set_next(next),
             Self::Stream(s) => s.set_next(next),
@@ -681,6 +734,8 @@ impl Object {
             Self::Array(a) => a.as_ptr() as u64,
             Self::Coroutine(c) => c.as_ptr() as u64,
             Self::Boxed(b) => b.as_ptr() as u64,
+            Self::Root(r) => r.as_ptr() as u64,
+            Self::Weak(w) => w.as_ptr() as u64,
             Self::PolyFn(p) => p.as_ptr() as u64,
             Self::Fn(f) => f.as_ptr() as u64,
             Self::Stream(s) => s.as_ptr() as u64,
@@ -708,6 +763,8 @@ impl GcSized for Object {
             Self::Array(a) => a.size(),
             Self::Coroutine(c) => c.size(),
             Self::Boxed(b) => b.size(),
+            Self::Root(r) => r.size(),
+            Self::Weak(w) => w.size(),
             Self::PolyFn(p) => p.size(),
             Self::Fn(f) => f.size(),
             Self::Stream(s) => s.size(),
@@ -735,6 +792,8 @@ impl fmt::Display for Object {
             Self::Array(a) => write!(f, "{}", a.as_ref()),
             Self::Coroutine(c) => write!(f, "{}", c.as_ref()),
             Self::Boxed(_) => write!(f, "<boxed 0x{:08x}>", self.addr()),
+            Self::Root(_) => write!(f, "<root 0x{:08x}>", self.addr()),
+            Self::Weak(_) => write!(f, "<weak 0x{:08x}>", self.addr()),
             Self::PolyFn(_) => write!(f, "<polyfn 0x{:08x}>", self.addr()),
             Self::Fn(_) => write!(f, "<fn 0x{:08x}>", self.addr()),
             Self::Stream(_) => write!(f, "<stream 0x{:08x}>", self.addr()),
@@ -763,6 +822,8 @@ impl Object {
             | Self::Array(_)
             | Self::Coroutine(_)
             | Self::Boxed(_)
+            | Self::Root(_)
+            | Self::Weak(_)
             | Self::PolyFn(_)
             | Self::Fn(_)
             | Self::Stream(_)
@@ -894,6 +955,20 @@ pub struct ObjBoxed {
     pub tag: u16,
     /// The wrapped payload.
     pub payload: Member,
+}
+
+/// Explicit strong GC pin: keeps `payload` alive while this object is reachable.
+pub struct ObjRoot {
+    /// Rooted value; cleared to `Member::Value(0)` after [`crate::gc_handles`] unroot.
+    pub payload: Member,
+}
+
+/// Non-rooting handle to a value; cleared when the referent is unmarked.
+pub struct ObjWeak {
+    /// Referent (immediate or heap address). Not traced by mark-sweep.
+    pub target: Cell<Value>,
+    /// Set when the referent dies (or after an explicit clear).
+    pub cleared: Cell<bool>,
 }
 
 /// Heap-allocated polymorphic function descriptor.
@@ -1073,6 +1148,18 @@ impl GcSized for ObjCoroutine {
 }
 
 impl GcSized for ObjBoxed {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+}
+
+impl GcSized for ObjRoot {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+}
+
+impl GcSized for ObjWeak {
     fn size(&self) -> usize {
         mem::size_of::<Self>()
     }

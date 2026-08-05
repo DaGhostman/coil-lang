@@ -83,6 +83,7 @@ Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
 | `ffi` | `use ffi::*;` | Dynamic loading; tags in `ffi::types` |
 | `thread` | `use thread::*;` | `spawn`/`join`, channels, mutex |
 | `time` / `env` / `crypto` / `regex` | `use …::*;` | Cargo-feature gated (default on) |
+| `gc` | `use gc::*;` | `Root` / `Weak` GC pins |
 
 `byte` is 0..=255; integer literals coerce under `byte` / `[byte]` expectations.
 

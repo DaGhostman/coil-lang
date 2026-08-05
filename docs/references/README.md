@@ -2,7 +2,7 @@
 
 Lookup docs for language constructs and compiler-provided APIs. For a guided introduction, start with the [manual](../manual/getting-started.md).
 
-Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, and `regex` require an explicit `use`.
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, `regex`, and `gc` require an explicit `use`.
 
 ## Language
 
@@ -39,6 +39,7 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [env](env.md) | Virtual module | Args, env vars, `exec` |
 | [crypto](crypto.md) | Virtual module | Hashes, AEAD, keys |
 | [regex](regex.md) | Virtual module | PCRE2 |
+| [gc](gc.md) | Virtual module | `Root` / `Weak` pins |
 | [ord / char](ord-char.md) | Prelude | Single-byte string ↔ `byte` |
 | [host natives](host-natives.md) | Embedder API | Rust closures via `HostInvoke` |
 | [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs a full stdlib |

@@ -19,6 +19,7 @@ use crate::CRYPTO_WIRING;
 use crate::REGEX_WIRING;
 #[cfg(feature = "time")]
 use crate::TIME_WIRING;
+use crate::GC_WIRING;
 
 /// Build the standard host-native table in stable order.
 ///
@@ -43,6 +44,7 @@ pub fn build_standard_host_natives(
     push_packed_la(&mut out, &mut register_id);
     // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
     push_io_wait_ready(&mut out, &mut register_id);
+    push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
     out
 }
 

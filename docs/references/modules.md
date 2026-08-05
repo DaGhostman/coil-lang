@@ -69,6 +69,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::*;` |
 | `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::*;` |
 | `thread` | `spawn`, channels, mutexes | No — `use thread::*;` |
+| `gc` | `Root` / `Weak`, `root` / `unroot` / `get` / `weak` / `upgrade`, `heap_bytes` / `collect` | No — `use gc::*;` |
 
 ### Prelude rebind / redefine
 

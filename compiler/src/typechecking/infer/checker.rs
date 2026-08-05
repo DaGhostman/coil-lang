@@ -21,7 +21,8 @@ use crate::typechecking::ty::{
 };
 use crate::typechecking::unify::{UnifyError, unify_with};
 use crate::typechecking::virtual_modules::{
-    BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,
+    BuiltinExport, FfiBuiltin, GcBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin,
+    VirtualModules,
 };
 
 use super::*;
@@ -309,6 +310,14 @@ impl Checker {
     pub fn thread_fn_in_scope(&self, name: &str) -> Option<ThreadBuiltin> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::ThreadFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Resolve an in-scope name to a GC host native (`root`, `weak`, …).
+    pub fn gc_fn_in_scope(&self, name: &str) -> Option<GcBuiltin> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::GcFn { kind } => Some(*kind),
             _ => None,
         }
     }
@@ -671,6 +680,7 @@ impl Checker {
             BuiltinExport::IoFn { kind } => Some(Self::io_fn_scheme(kind)),
             BuiltinExport::StringFn { kind } => Some(Self::string_fn_scheme(kind)),
             BuiltinExport::ThreadFn { kind } => Some(self.thread_fn_scheme(kind)),
+            BuiltinExport::GcFn { kind } => Some(self.gc_fn_scheme(kind)),
             BuiltinExport::HostFn { registry, .. } => Some(self.host_fn_scheme(registry, range)),
             BuiltinExport::FfiFn { .. } => Some(Scheme::mono(Ty::Var(self.counter.fresh()))),
             _ => None,
@@ -803,6 +813,45 @@ impl Checker {
             ThreadBuiltin::Lock | ThreadBuiltin::TryLock | ThreadBuiltin::Unlock => {
                 Scheme::mono(fun(&[mutex_ty()], res_unit))
             }
+        }
+    }
+
+    /// Scheme for a virtual `gc` host native (inserted on `use gc::*`).
+    pub fn gc_fn_scheme(&mut self, kind: GcBuiltin) -> Scheme {
+        use crate::typechecking::ty::{root_app_ty, weak_app_ty};
+        let fun = |params: &[Ty], ret: Ty| {
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
+        };
+        match kind {
+            GcBuiltin::Root => {
+                let t = self.counter.fresh();
+                Scheme::poly(vec![t], vec![], fun(&[Ty::Var(t)], root_app_ty(Ty::Var(t))))
+            }
+            GcBuiltin::Unroot | GcBuiltin::Get => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(&[root_app_ty(Ty::Var(t))], Ty::Var(t)),
+                )
+            }
+            GcBuiltin::Weak => {
+                let t = self.counter.fresh();
+                Scheme::poly(vec![t], vec![], fun(&[Ty::Var(t)], weak_app_ty(Ty::Var(t))))
+            }
+            GcBuiltin::Upgrade => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(&[weak_app_ty(Ty::Var(t))], option_app_ty(Ty::Var(t))),
+                )
+            }
+            GcBuiltin::HeapBytes => Scheme::mono(fun(&[], int())),
+            GcBuiltin::Collect => Scheme::mono(fun(&[], int())),
         }
     }
 
@@ -1123,6 +1172,7 @@ impl Checker {
                 if matches!(
                     n.as_str(),
                     "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn" | "regex"
+                        | "root" | "weak"
                 ) {
                     return false;
                 }
@@ -1160,6 +1210,12 @@ impl Checker {
             }
             Ty::App(head, args) => {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") {
+                    return false;
+                }
+                if matches!(
+                    head.as_ref(),
+                    Ty::Con(n) if n == common::BUILTIN_ROOT_TYPE || n == common::BUILTIN_WEAK_TYPE
+                ) {
                     return false;
                 }
                 args.iter().all(|t| self.is_thread_sendable_ty(t))
@@ -2127,6 +2183,7 @@ impl Checker {
                                     | BuiltinExport::IoFn { .. }
                                     | BuiltinExport::StringFn { .. }
                                     | BuiltinExport::ThreadFn { .. }
+                                    | BuiltinExport::GcFn { .. }
                                     | BuiltinExport::HostFn { .. }
                             )
                         })
@@ -3810,6 +3867,7 @@ impl Checker {
                                 | BuiltinExport::IoFn { .. }
                                 | BuiltinExport::StringFn { .. }
                                 | BuiltinExport::ThreadFn { .. }
+                                | BuiltinExport::GcFn { .. }
                                 | BuiltinExport::HostFn { .. }
                         )
                     })
@@ -3999,6 +4057,7 @@ impl Checker {
                                 | BuiltinExport::IoFn { .. }
                                 | BuiltinExport::StringFn { .. }
                                 | BuiltinExport::ThreadFn { .. }
+                                | BuiltinExport::GcFn { .. }
                                 | BuiltinExport::HostFn { .. }
                         )
                     })

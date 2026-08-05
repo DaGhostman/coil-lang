@@ -69,6 +69,9 @@ pub const CRYPTO_MODULE: &str = "crypto";
 #[cfg(feature = "regex")]
 pub const REGEX_MODULE: &str = "regex";
 
+/// Explicit GC pins and weak handles (`root`, `weak`, `Root`, `Weak`, …).
+pub const GC_MODULE: &str = "gc";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -525,6 +528,56 @@ impl ThreadBuiltin {
     }
 }
 
+/// GC host natives exported from virtual `gc` (`Root` / `Weak`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GcBuiltin {
+    Root,
+    Unroot,
+    Get,
+    Weak,
+    Upgrade,
+    HeapBytes,
+    Collect,
+}
+
+impl GcBuiltin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Unroot => "unroot",
+            Self::Get => "get",
+            Self::Weak => "weak",
+            Self::Upgrade => "upgrade",
+            Self::HeapBytes => "heap_bytes",
+            Self::Collect => "collect",
+        }
+    }
+
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Self::Root => "gc_root",
+            Self::Unroot => "gc_unroot",
+            Self::Get => "gc_get",
+            Self::Weak => "gc_weak",
+            Self::Upgrade => "gc_upgrade",
+            Self::HeapBytes => "gc_heap_bytes",
+            Self::Collect => "gc_collect",
+        }
+    }
+
+    pub fn all() -> &'static [GcBuiltin] {
+        &[
+            Self::Root,
+            Self::Unroot,
+            Self::Get,
+            Self::Weak,
+            Self::Upgrade,
+            Self::HeapBytes,
+            Self::Collect,
+        ]
+    }
+}
+
 /// One item exported by a virtual module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinExport {
@@ -546,6 +599,8 @@ pub enum BuiltinExport {
     StringFn { kind: StringBuiltin },
     /// Thread host native (`spawn`, `send`, …).
     ThreadFn { kind: ThreadBuiltin },
+    /// GC host native (`root`, `weak`, …).
+    GcFn { kind: GcBuiltin },
     /// Generic pipeline host native (`registry` key for [`HostInvoke`]).
     HostFn {
         surface: &'static str,
@@ -565,6 +620,7 @@ impl BuiltinExport {
             Self::IoFn { kind } => kind.as_str(),
             Self::StringFn { kind } => kind.as_str(),
             Self::ThreadFn { kind } => kind.as_str(),
+            Self::GcFn { kind } => kind.as_str(),
             Self::HostFn { surface, .. } => surface,
         }
     }
@@ -755,6 +811,19 @@ impl VirtualModules {
             thread_exports.push(BuiltinExport::ThreadFn { kind: *kind });
         }
         modules.insert(THREAD_MODULE, thread_exports);
+
+        let mut gc_exports = vec![
+            BuiltinExport::OpaqueType {
+                name: common::BUILTIN_ROOT_TYPE,
+            },
+            BuiltinExport::OpaqueType {
+                name: common::BUILTIN_WEAK_TYPE,
+            },
+        ];
+        for kind in GcBuiltin::all() {
+            gc_exports.push(BuiltinExport::GcFn { kind: *kind });
+        }
+        modules.insert(GC_MODULE, gc_exports);
 
         fn host_exports(pairs: &[(&'static str, &'static str)]) -> Vec<BuiltinExport> {
             pairs
@@ -1321,5 +1390,24 @@ mod tests {
                 registry: "regex_compile"
             })
         ));
+        assert!(vm.resolves_use(&["gc".into()], "*"));
+        assert!(matches!(
+            vm.resolve_item(&["gc".into()], "root"),
+            Some(BuiltinExport::GcFn {
+                kind: GcBuiltin::Root
+            })
+        ));
+        assert!(
+            vm.resolve_glob(&["gc".into()])
+                .expect("gc")
+                .iter()
+                .any(|e| e.short_name() == "Root")
+        );
+        assert!(
+            vm.resolve_glob(&["gc".into()])
+                .expect("gc")
+                .iter()
+                .any(|e| e.short_name() == "Weak")
+        );
     }
 }

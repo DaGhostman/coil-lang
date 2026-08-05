@@ -93,7 +93,7 @@ rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default r
 
 Auto: `prelude`, `prelude::ops`, `prelude::test`, `prelude::math`.
 
-Explicit `use`: `ffi`, `io`, `thread`, `regex`, `crypto`, `time`, `env`, `string`.
+Explicit `use`: `ffi`, `io`, `thread`, `regex`, `crypto`, `time`, `env`, `string`, `gc`.
 
 Cargo features `crypto`, `time`, `regex`, `tls` gate modules (default on).
 

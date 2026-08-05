@@ -586,7 +586,9 @@ fn encode_value(
         | Object::Coroutine(_)
         | Object::Fn(_)
         | Object::PolyFn(_)
-        | Object::Library(_) => Err(ThreadErrorTag::NotSendable),
+        | Object::Library(_)
+        | Object::Root(_)
+        | Object::Weak(_) => Err(ThreadErrorTag::NotSendable),
         #[cfg(feature = "regex")]
         Object::Regex(_) => Err(ThreadErrorTag::NotSendable),
         #[cfg(feature = "crypto")]
@@ -1424,6 +1426,23 @@ mod tests {
         let v = Value::from(obj.addr());
         assert_eq!(
             value_to_portable(&heap, v),
+            Err(ThreadErrorTag::NotSendable)
+        );
+    }
+
+    #[test]
+    fn portable_rejects_root_and_weak_handles() {
+        use crate::gc_handles::{host_gc_root, host_gc_weak};
+
+        let mut heap = Heap::default();
+        let root = host_gc_root(&mut heap, &[Value::from(1_i64)]);
+        assert_eq!(
+            value_to_portable(&heap, root),
+            Err(ThreadErrorTag::NotSendable)
+        );
+        let weak = host_gc_weak(&mut heap, &[Value::from(2_i64)]);
+        assert_eq!(
+            value_to_portable(&heap, weak),
             Err(ThreadErrorTag::NotSendable)
         );
     }

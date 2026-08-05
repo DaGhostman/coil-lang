@@ -44,3 +44,6 @@ pub use ty::Ty;
 pub use virtual_modules::{
     BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, StringBuiltin, ThreadBuiltin, VirtualModules,
 };
+// Re-export for callers / tests that match on GC virtual exports.
+#[allow(unused_imports)]
+pub use virtual_modules::GcBuiltin;
