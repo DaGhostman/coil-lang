@@ -110,16 +110,14 @@ fn parse_float(string s) -> Result<float, string> {
         raise "invalid float";
     }
 
-    let exponent = 0;
-    let exponent_sign = 1;
+    let exponent: int = 0;
+    let divide_exp = false;
     if i < len(b) {
         if b[i] == "e" || b[i] == "E" {
             i = i + 1;
             if i < len(b) {
                 if b[i] == "-" || b[i] == "+" {
-                    if b[i] == "-" {
-                        exponent_sign = -1;
-                    }
+                    divide_exp = b[i] == "-";
                     i = i + 1;
                 }
             }
@@ -128,7 +126,7 @@ fn parse_float(string s) -> Result<float, string> {
                 if is_digit(b[i]) == false {
                     break;
                 }
-                let exponent_digit = digit_val(b[i]);
+                let exponent_digit: int = digit_val(b[i]);
                 exponent = exponent * 10 + exponent_digit;
                 i = i + 1;
             }
@@ -142,9 +140,9 @@ fn parse_float(string s) -> Result<float, string> {
     }
 
     let scaled = sign * value;
-    let e = 0;
+    let e: int = 0;
     while e < exponent {
-        if exponent_sign < 0 {
+        if divide_exp {
             scaled = scaled / 10.0;
         } else {
             scaled = scaled * 10.0;
