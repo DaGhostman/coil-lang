@@ -18,7 +18,7 @@ use chumsky::{
     error::Rich,
     extra,
     pratt::{infix, left, none, postfix, prefix, right},
-    prelude::{choice, empty, just, none_of, recursive},
+    prelude::{any, choice, empty, just, none_of, recursive},
     text,
 };
 use reporting::{ErrorCode, Label, Message};
@@ -116,12 +116,29 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(Float))
     }
 
+    /// Body of a `"..."` literal (between the quotes).
+    ///
+    /// A backslash escapes the next character, so `\"` is content and does not
+    /// end the literal. The returned slice is the raw source (escapes intact);
+    /// [`crate::codegen::unescape_coil_string`] expands them later.
+    fn string_lit_body(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, &'pratt str, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        choice((
+            just('\\').then(any()).ignored(),
+            none_of('"').ignored(),
+        ))
+        .repeated()
+        .to_slice()
+    }
+
     fn string(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         just('"')
-            .ignore_then(none_of('"').repeated().to_slice())
+            .ignore_then(self.string_lit_body())
             .then_ignore(just('"'))
             .map_with(output!(String))
             .labelled("string")
@@ -1790,7 +1807,7 @@ impl<'pratt> Pratt<'pratt> {
         // but we just need the raw `String` for the library
         // name (it's metadata, not a runtime expression).
         let library_name = just('"')
-            .ignore_then(none_of('"').repeated().to_slice())
+            .ignore_then(self.string_lit_body())
             .then_ignore(just('"'))
             .map(|s: &'pratt str| s.to_string());
 
@@ -1828,7 +1845,7 @@ impl<'pratt> Pratt<'pratt> {
 
         let attr_lit = choice((
             just('"')
-                .ignore_then(none_of('"').repeated().to_slice())
+                .ignore_then(self.string_lit_body())
                 .then_ignore(just('"'))
                 .map(AttrLit::String),
             text::int(10)
@@ -1851,7 +1868,7 @@ impl<'pratt> Pratt<'pratt> {
                 .collect::<Vec<_>>()
                 .map(AttrArgs::KeyValues),
             just('"')
-                .ignore_then(none_of('"').repeated().to_slice())
+                .ignore_then(self.string_lit_body())
                 .then_ignore(just('"'))
                 .map(AttrArgs::String),
             attr_lit

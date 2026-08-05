@@ -982,6 +982,46 @@
     }
 
     #[test]
+    fn string_literal_allows_escaped_quote() {
+        let e = expr_ast!(r#""\"""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"\""#),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_literal_allows_escaped_quote_amid_text() {
+        let e = expr_ast!(r#""say \"hi\"""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"say \"hi\""#),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_literal_backslash_before_close_is_escape() {
+        // `"\\""` → content `\\` then closing quote — a string holding one `\`.
+        let e = expr_ast!(r#""\\""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"\\"#),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rest_param_parses_in_arg_list() {
         let src = "fn sum(int... xs) -> int { return 0; }";
         let ast = Pratt::default().parse(src).expect("parse");
