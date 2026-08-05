@@ -187,12 +187,15 @@ fn lines(string s) -> Result<[string], string> {
                     end = end - 1;
                 }
             }
-            out[] = utf8_ok(bytes_slice(b, start, end))?;
+            let piece = match from_bytes(bytes_slice(b, start, end)) {
+                Result::Ok(x) => x,
+                Result::Err(_) => raise "utf8",
+            };
+            out[] = piece;
             start = i + 1;
         }
         i = i + 1;
     }
-    // Trailing segment (including empty after a final LF).
     let end = n;
     if end > start {
         if b[end - 1] == "\r" {
@@ -200,7 +203,11 @@ fn lines(string s) -> Result<[string], string> {
         }
     }
     if start <= n {
-        out[] = utf8_ok(bytes_slice(b, start, end))?;
+        let piece = match from_bytes(bytes_slice(b, start, end)) {
+            Result::Ok(x) => x,
+            Result::Err(_) => raise "utf8",
+        };
+        out[] = piece;
     }
     return out;
 }
