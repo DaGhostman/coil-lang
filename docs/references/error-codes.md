@@ -40,7 +40,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0119` | `GenericTypeError` | Other type error |
 | `E0120`–`E0122` | Overload family | Wrong arity / duplicate / ambiguous overload |
 | `E0123` | `DeferNeverRuns` | `defer` never runs on function exit (warning) |
-| `E0124` | `WildcardImport` | Userland (disk) `use path::*` — list names explicitly; virtual modules may still glob |
+| `E0124` | `WildcardImport` | `use path::*` is banned (virtual and userland) — list names explicitly; prelude is auto-injected |
 | `E0200`–`E0212` | Enum / match family | Duplicate enum, unknown variant, non-exhaustive match, field errors, … |
 | `E0300`–`E0301` | Format family | Specifier / arity mismatch |
 | `E0400`–`E0405` | Aggregate / FFI family | Index OOB, array element mismatch, `declare`/`invoke` arity, … |

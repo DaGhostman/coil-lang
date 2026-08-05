@@ -1,13 +1,13 @@
 # 11 — OS threads
 
-coil can run **native OS threads** alongside the main VM. Each worker gets its own `Machine` and heap; communication uses typed channels and mutexes from the virtual **`thread`** module (`use thread::*;`).
+coil can run **native OS threads** alongside the main VM. Each worker gets its own `Machine` and heap; communication uses typed channels and mutexes from the virtual **`thread`** module (`use thread::{spawn, join, channel, …};`).
 
 This is separate from **coroutines** ([08 — Coroutines](08-coroutines.md)): coroutines are cooperative handles on one VM; `spawn` starts a real thread with an isolated bytecode interpreter.
 
 ## Import
 
 ```coil
-use thread::*;
+use thread::{spawn, join, channel, send, recv, mutex, with_lock};
 ```
 
 All primitives return `prelude::Result<…, thread::Error>`. Use `?` in result-mode functions (omit an explicit `-> int` return type when you want `?` to propagate errors).
@@ -17,8 +17,9 @@ All primitives return `prelude::Result<…, thread::Error>`. Use `?` in result-m
 `spawn(f)` runs nullary function `f` on a new thread. `spawn(f, arg)` passes one argument (the function must be `fn (A) -> R`).
 
 ```coil
-use thread::*;
-use io::{stdout, write_all};
+use thread::{join, spawn};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn work() -> int {
@@ -50,8 +51,9 @@ compile-time cutoff for those specializations (see
 `recv` **blocks** until a value arrives or the channel is closed (`Disconnected`). Prefer `try_recv` when you need a non-blocking poll (`WouldBlock` if empty).
 
 ```coil
-use thread::*;
-use io::{stdout, write_all};
+use thread::{Sender, channel, join, recv, send, spawn};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn producer(Sender tx) {
@@ -73,8 +75,9 @@ fn main() {
 One channel is one-way. To send work *and* receive a reply, create **two** channels and pass both ends the worker needs as a tuple (or any sendable aggregate of handles):
 
 ```coil
-use thread::*;
-use io::{stdout, write_all};
+use thread::{Receiver, Sender, channel, join, recv, send, spawn};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn worker((Receiver, Sender) ends) {
@@ -109,8 +112,9 @@ Channels are **unbounded** today: `try_send` always enqueues (same as `send`) an
 `mutex(initial)` allocates a mutex holding a value. Prefer **`with_lock(m, callback)`**: the callback receives the current value and returns `(new_value, result)`; the mutex is updated and `result` is returned to the caller.
 
 ```coil
-use thread::*;
-use io::{stdout, write_all};
+use thread::{join, mutex, spawn, with_lock};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn bump(Mutex m) {

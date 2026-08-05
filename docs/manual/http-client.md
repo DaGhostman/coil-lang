@@ -21,7 +21,7 @@ The workspace manifest already includes `./stdlib`. See
 ## API
 
 ```coil
-use http::client::*;
+use http::client::{get, post};
 
 fn main() {
     match get("http://127.0.0.1:41250/") {

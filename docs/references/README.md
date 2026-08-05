@@ -2,7 +2,7 @@
 
 Lookup docs for language constructs and compiler-provided APIs. For a guided introduction, start with the [manual](../manual/getting-started.md).
 
-Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, `regex`, and `gc` require an explicit `use` (virtual `::*` is fine). Userland `.hy` modules must list names — disk `use foo::*` is rejected (`E0124`).
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets prelude auto-injected (`inject_prelude_scope` — `prelude`, `prelude::ops`, `prelude::test`, `prelude::math`; no source `use` needed). FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, `regex`, and `gc` require an explicit `use` with concrete or brace imports (`use io::{stdout, open};`). `use path::*` is always rejected (`E0124`).
 
 ## Language
 

@@ -775,7 +775,7 @@ fn read_x_v(Outer o) -> int {
 
 ## IO streams
 
-Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
+Virtual `io` module (`use io::{open, stdout, …};`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
 
 ### `examples/io_bytes.hy`
 
@@ -815,7 +815,7 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text 
 
 ### `examples/io_udp.hy`
 
-**Demonstrates:** `use io::net::udp::*;` — `bind` / `local_port` / `send_to` / `recv_from_wait` localhost echo.
+**Demonstrates:** `use io::net::udp::{bind, local_port, send_to, recv_from_wait};` — localhost echo.
 
 | | |
 |---|---|
@@ -902,7 +902,7 @@ fn main() {
 **Demonstrates:** Virtual `regex` (PCRE2) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
 
 ```coil
-use regex::*;
+use regex::{compile, find_all, is_match, replace_all, split};
 
 fn main() {
     let re = match compile("(\\w+)=(\\d+)", "i") {
@@ -1443,9 +1443,10 @@ fn main() {
 **Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result<_, Error>`; unwrap with `match` (or `?`). Check `e.kind` for typed recovery.
 
 ```coil
-use ffi::*;
-use ffi::types::*;
-use io::{stdout, write_all};
+use ffi::{declare, dload, invoke};
+use ffi::types::{Int};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -1747,7 +1748,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ## OS threads
 
-Native threads via `use thread::*;` — each worker runs on its own VM. See [Tutorial 11 — OS threads](tutorial/11-threads.md).
+Native threads via `use thread::{spawn, join, …};` — each worker runs on its own VM. See [Tutorial 11 — OS threads](tutorial/11-threads.md).
 
 ### `examples/thread_join.hy`
 

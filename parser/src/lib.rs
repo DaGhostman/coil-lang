@@ -368,7 +368,7 @@ impl<'pratt> Pratt<'pratt> {
                 // to match it.
                 self.match_expr(expr.clone(), stmt.clone()),
                 // `done` stays a keyword builtin. `dload` / `declare` /
-                // `invoke` are ordinary calls resolved via `use ffi::*`.
+                // `invoke` are ordinary calls resolved via `use ffi::{…}`.
                 self.done_(expr.clone()),
                 self.resume_(expr.clone()),
                 self.yield_expr_(expr.clone()),

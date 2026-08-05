@@ -1,6 +1,6 @@
 # `regex` module
 
-`use regex::*;` — PCRE2 patterns via HostInvoke (system **libpcre2** / `pcre2-sys`). Opaque `Regex` handle from `compile(pattern, flags)`.
+`use regex::{compile, is_match, find, replace};` — PCRE2 patterns via HostInvoke (system **libpcre2** / `pcre2-sys`). Opaque `Regex` handle from `compile(pattern, flags)`.
 
 | Surface | Types |
 |---------|--------|

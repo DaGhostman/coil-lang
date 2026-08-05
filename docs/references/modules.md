@@ -11,9 +11,11 @@ This document specifies the syntax and semantics of coil's module system: `use` 
 ```
 use_stmt   ::= 'use' use_path ';'
 use_path   ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
-             | IDENT ('::' IDENT)* ('::' '*')? ('as' IDENT)?
+             | IDENT ('::' IDENT)* ('as' IDENT)?
 use_item   ::= IDENT ('as' IDENT)?
 ```
+
+(`use path::*` is still parsed but always rejected at typecheck with `E0124`.)
 
 Forms:
 
@@ -21,7 +23,6 @@ Forms:
 |------|---------|
 | Concrete import | `use foo::sadge;` |
 | Aliased import | `use foo::sadge as f;` |
-| Glob import | `use io::*;` (virtual modules only; prelude is auto-imported) |
 | Brace group | `use math::{add, mul as product};` |
 | Multi-segment | `use lib::io::read;` |
 
@@ -29,11 +30,11 @@ Rules:
 
 - Every `use` statement ends with `;`.
 - Path segments are identifiers separated by `::`.
-- The last segment is either an identifier (concrete import), `*` (glob), or a `{ … }` brace group.
-- Concrete imports and brace-group items may use `as`. Glob imports cannot be aliased.
-- A glob marker (`*`) or brace group must be the **last** segment.
+- The last segment is either an identifier (concrete import) or a `{ … }` brace group.
+- Concrete imports and brace-group items may use `as`.
+- A brace group must be the **last** segment.
 - Brace groups desugar to one concrete import per item (same module path).
-- **Userland (disk) modules must list names** (`use foo::{a, b}`). `use foo::*` is rejected (`E0124`). Glob `::*` remains valid for **virtual** modules (`io`, `ffi`, `thread`, …). Prelude modules are auto-imported.
+- **`use path::*` is banned** for every module (virtual and userland). List names explicitly (`use foo::{a, b}` or `use io::open;`). Prelude is auto-injected via `inject_prelude_scope` — no source `use prelude::*` needed.
 
 ### `mod` statement
 
@@ -56,21 +57,21 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `prelude` | `Option`, `Result`, `Iterator`, `IntoIterator`, `ArrayIter` | Yes (every file) |
 | `prelude::ops` | `Add`, `Sub`, `Mul`, `Div`, `Num`, `Eq`, `Ord`, `Lt`, `Le`, `Gt`, `Ge`, `Show`, `Length`, `Into` | Yes (every file) |
 | `prelude::test` | `assert` | Yes (every file) |
-| `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
-| `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — write `use ffi::types::*;` |
-| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters, stream timeouts | No — write `use io::*;` |
-| `io::net::tcp` | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, address helpers, `set_nodelay`, `shutdown` | No — write `use io::net::tcp::*;` |
-| `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — write `use io::net::udp::*;` |
+| `ffi` | `dload`, `declare`, `invoke` | No — `use ffi::{dload, declare, invoke};` |
+| `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — `use ffi::types::{Int, Ptr, …};` |
+| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters, stream timeouts | No — `use io::{stdout, open, …};` |
+| `io::net::tcp` | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, address helpers, `set_nodelay`, `shutdown` | No — `use io::net::tcp::{connect, listen, …};` |
+| `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — `use io::net::udp::{bind, send_to, …};` |
 | `io::net::tls` | *(none)* | Parent namespace only — import `client` / `server` (feature `tls`) |
-| `io::net::tls::client` | `enable` / `disable` | No — write `use io::net::tls::client::*;` (feature `tls`) |
-| `io::net::tls::server` | `enable` / `disable` | No — write `use io::net::tls::server::*;` (feature `tls`) |
-| `io::fs` | Path/metadata helpers (`exists`, `realpath`, `list_dir`, …) | No — `use io::fs::*;` |
-| `time` | `timestamp`, `Period`, `format` / `parse`, monotonic `Instant` | No — `use time::*;` |
-| `env` | `args`, `var`, `cwd`, `exit`, `exec` (argv-only) | No — `use env::*;` |
-| `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::*;` |
-| `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::*;` |
-| `thread` | `spawn`, channels, mutexes | No — `use thread::*;` |
-| `gc` | `Root` / `Weak`, `root` / `unroot` / `get` / `weak` / `upgrade`, `heap_bytes` / `collect` | No — `use gc::*;` |
+| `io::net::tls::client` | `enable` / `disable` | No — `use io::net::tls::client::{enable, disable};` (feature `tls`) |
+| `io::net::tls::server` | `enable` / `disable` | No — `use io::net::tls::server::{enable, disable};` (feature `tls`) |
+| `io::fs` | Path/metadata helpers (`exists`, `realpath`, `list_dir`, …) | No — `use io::fs::{exists, list_dir, …};` |
+| `time` | `timestamp`, `Period`, `format` / `parse`, monotonic `Instant` | No — `use time::{timestamp, sleep_ms, …};` |
+| `env` | `args`, `var`, `cwd`, `exit`, `exec` (argv-only) | No — `use env::{args, var, …};` |
+| `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::{sha256, random_bytes, …};` |
+| `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::{compile, is_match, …};` |
+| `thread` | `spawn`, channels, mutexes | No — `use thread::{spawn, join, channel, …};` |
+| `gc` | `Root` / `Weak`, `root` / `unroot` / `get` / `weak` / `upgrade`, `heap_bytes` / `collect` | No — `use gc::{root, weak, collect, …};` |
 
 ### Prelude rebind / redefine
 
@@ -111,15 +112,12 @@ Given a brace-group import `use math::{add, mul};`:
 1. Desugar to `use math::add;` + `use math::mul;` (same path, one item each).
 2. Resolve each item with the algorithm above (typically both hit the same `math.hy`).
 
-Given a glob import `use a::b::*;` (virtual modules only at typecheck):
+Given a wildcard import `use a::b::*;`:
 
-1. Split the path. The segment before `*` is the **module stem**.
-   - For `use foo::*`: path = `["foo"]`, stem = `"foo"`
-   - For `use a::b::*`: path = `["a"]`, stem = `"b"` (the last non-glob segment names the file)
-2. Pop the last segment from the path to get the directory prefix.
-3. For disk paths, discovery may still enqueue `<root>/<path>/<stem>.hy`, but
-   typechecking rejects userland `::*` with `E0124`. Virtual globs bind exports
-   without a `.hy` file.
+1. Discovery may still enqueue `<root>/…/stem.hy` (same path split as before:
+   `use foo::*` → stem `"foo"`; `use a::b::*` → stem `"b"` under prefix `a`).
+2. Typechecking always rejects the import with `E0124` (`WildcardImport`) before
+   names are bound — virtual and userland alike. List exports explicitly.
 
 Given a `mod foo;` declaration:
 
@@ -133,8 +131,8 @@ Given a `mod foo;` declaration:
 | `use foo::sadge;` | `src/foo/sadge.hy`, else `src/foo.hy` |
 | `use math::{add, mul};` | `src/math.hy` (module-file fallback) |
 | `use lib::io::read;` | `src/lib/io/read.hy`, else `src/lib/io.hy` |
-| `use foo::*;` | rejected for disk (`E0124`); use brace/concrete imports |
-| `use io::*;` | virtual `io` (no `.hy`) |
+| `use foo::*;` | rejected (`E0124`); use brace/concrete imports |
+| `use io::{open, stdout};` | virtual `io` exports (no `.hy`) |
 | `mod foo;` | `src/foo.hy` |
 
 With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
@@ -142,7 +140,7 @@ With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` fir
 ### Shipping / consuming `stdlib`
 
 The coil workspace manifest includes `./stdlib` in `[module].roots` so programs
-can `use http::client::*;` (and future stdlib packages) without vendoring by
+can `use http::client::{get, …};` (and future stdlib packages) without vendoring by
 hand. Project manifests should list the same root (or a path to a checkout):
 
 ```toml
@@ -205,19 +203,20 @@ The FQN shape depends on **which file** path resolution loaded (see [Path resolu
 
 ---
 
-## Glob semantics
+## Wildcard imports (`::*`)
 
-`use path::*;` applies only to **virtual** modules (`io`, `ffi`, `string`, …).
-Userland disk modules must use concrete or brace imports (`use foo::{sadge, greet}`).
+`use path::*;` is **always** a compile error (`E0124`), for virtual modules
+(`io`, `ffi`, `string`, …) and userland disk modules alike. Import concrete
+names or use a brace group.
 
-Discovery still resolves a disk path ending in `*` to `<root>/…/stem.hy` for
-dependency loading, but typechecking rejects the import with `E0124`
-(`WildcardImport`) before names are bound.
+Prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) is
+auto-injected every file via `inject_prelude_scope` — do not write
+`use prelude::*` in source.
 
-Virtual glob example — `use io::*;` binds every export of the virtual `io`
-module (see the table above).
+Discovery may still resolve a path ending in `*` to `<root>/…/stem.hy` when
+scanning dependencies, but no names are imported from a wildcard `use`.
 
-Userland brace example — `src/foo.hy`:
+Brace-group example — `src/foo.hy`:
 
 ```coil
 use io::{stdout, write_all};
@@ -227,12 +226,7 @@ fn greet() { write_all(stdout(), to_bytes(format("%i", 200))); }
 ```
 
 After `use foo::{sadge, greet};` in another file, both are callable by those
-local names. `use foo::*;` is a compile error.
-
-### Glob limitations (virtual)
-
-- **No aliasing.** `use io::* as bar;` is not valid syntax.
-- **Virtual only.** Disk `::*` is rejected; list names or use a brace group.
+local names.
 
 ---
 

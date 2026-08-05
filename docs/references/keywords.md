@@ -119,7 +119,7 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | Kind | Examples | Callable as `name(...)`? |
 |------|----------|------------------------|
 | Statement keyword | `return` | No — statement form only |
-| Virtual-module export | `format` (via `use string::format`), `dload`, `declare`, `invoke` (via `use ffi::*`) | Yes as identifiers — not reserved keywords |
+| Virtual-module export | `format` (via `use string::format`), `dload`, `declare`, `invoke` (via `use ffi::{dload, declare, invoke}`) | Yes as identifiers — not reserved keywords |
 | Declaration keyword | `fn`, `enum` | No |
 
 ---

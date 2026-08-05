@@ -50,7 +50,7 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `coil.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, C varargs `...`, struct/callback returns) | Supported (requires libffi) |
-| IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
+| IO streams (`use io::{…};`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
@@ -86,7 +86,7 @@ Docs are split into three trees:
 | [08 — Coroutines](manual/tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](manual/tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 | [10 — IO streams](manual/tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
-| [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::*`, `spawn` / `join`, channels, mutexes |
+| [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::{spawn, join, …}`, channels, mutexes |
 | [Examples catalog](manual/examples.md) | Every file in `examples/`, expected output |
 | [Showcase projects](../examples/projects/README.md) | Multi-file apps + co-located tests |
 

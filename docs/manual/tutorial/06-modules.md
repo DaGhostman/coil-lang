@@ -108,12 +108,10 @@ fn main() {
 
 The `as` clause binds a local name; the underlying FQN is unchanged.
 
-### Glob import (virtual modules only)
+### Wildcard imports (`E0124`)
 
-`use path::*;` is allowed for **compiler virtual modules** (`io`, `ffi`,
-`thread`, …). Prelude is already auto-imported every file.
-
-**Userland** `.hy` modules must name what they import:
+`use path::*;` is banned for every module — virtual (`io`, `ffi`, `thread`, …)
+and userland `.hy` files. List names explicitly:
 
 ```coil
 use foo::{sadge, greet};
@@ -124,8 +122,8 @@ fn main() {
 }
 ```
 
-`use foo::*;` against a disk module is a type error (`E0124`). Brace groups
-and concrete imports only pull items from that module file — they do not
+Prelude is auto-injected every file — no `use prelude::*` in source. Brace
+groups and concrete imports only pull items from that module file — they do not
 reach into `foo/bar.hy`.
 
 ### Brace-group import
@@ -245,7 +243,7 @@ You normally call imported items by their local alias (`sadge()`), but the FQN i
 | `use foo::bar;` | `<root>/foo/bar.hy` | `bar` (local = `bar`) |
 | `use foo::bar as baz;` | `<root>/foo/bar.hy` | `baz` (local alias) |
 | `use foo::{a, b};` | `<root>/foo.hy` | listed top-level items from that file |
-| `use io::*;` | (virtual) | all exports of virtual `io` |
+| `use io::{open, stdout};` | (virtual) | named exports of virtual `io` |
 | `mod foo;` | `<root>/foo.hy` | none |
 
 For complete syntax rules, path resolution details, and edge cases, see the [Modules reference](../../references/modules.md).

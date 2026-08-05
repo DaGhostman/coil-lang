@@ -3,8 +3,8 @@
 Runtime FFI callables are exports of the virtual `ffi` module. They are **not** keywords and are **not** in scope until you import them:
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{dload, declare, invoke};
+use ffi::types::{Int, String, Ptr};
 ```
 
 Or import individually: `use ffi::dload;`, `use ffi::declare;`, `use ffi::invoke;`.
@@ -24,7 +24,7 @@ dload(path_expr)
 Returns `Result<int, Error>` — `Ok` is the library handle (heap object address). Failure is `Err(Error)`, never `-1`.
 
 ```coil
-use ffi::*;
+use ffi::{dload};
 let lib = match dload("sum") {
     Result::Ok(h) => h,
     Result::Err(e) => panic e.message,
@@ -36,7 +36,7 @@ Notes:
 - Requires libffi-enabled build.
 - `dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths`.
 - `dload("c")` / `extern "c"` is the portable libc alias.
-- Same resolver as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`; it unwraps Results and panics on `e.message`).
+- Same resolver as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::{…};`; it unwraps Results and panics on `e.message`).
 - Check `e.kind` (`ErrorKind::LibraryNotFound`, …) for recovery; use `e.message` for display.
 
 ---
@@ -62,15 +62,15 @@ Returns `Result<int, Error>` — `Ok` is the function id; `Err` if the symbol is
 
 ### FFI type tags (`ffi::types`)
 
-Tag constructors live in the virtual `ffi::types` module. After `use ffi::types::*;`, write bare `Int`, `Ptr`, `Callback`, …:
+Tag constructors live in the virtual `ffi::types` module. After `use ffi::types::{Int, Ptr, …};`, write bare `Int`, `Ptr`, `Callback`, …:
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare};
+use ffi::types::{Int, String};
 
 declare(lib, "f", (Int, String), Int);
 declare(lib, "g", (int, float), void);   // bare lowercase names still work
-declare(lib, "h", (ffi::types::Ptr,), Int); // qualified path needs no glob
+declare(lib, "h", (ffi::types::Ptr,), Int); // qualified path needs no import
 ```
 
 | Tag | Meaning |
@@ -113,7 +113,7 @@ write_all(stdout(), to_bytes(format("%i", n)));
 
 ### `Error` / `ErrorKind`
 
-Virtual `ffi` exports (via `use ffi::*`):
+Virtual `ffi` exports (via `use ffi::{Error, ErrorKind};`):
 
 | Name | Shape |
 |------|-------|

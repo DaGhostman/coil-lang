@@ -1,6 +1,6 @@
 # Math (`sin` / `sqrt` / `pow` / linear algebra)
 
-Auto-imported from virtual `prelude::math` (implicit `use prelude::math::*;`).
+Auto-imported from virtual `prelude::math` (via `inject_prelude_scope` — no source `use` needed).
 
 ## Scalar float math
 

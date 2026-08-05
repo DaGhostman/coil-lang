@@ -93,8 +93,8 @@ fn main() {
 Userland mirror — optional 5th `bool` on `declare`:
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{dload, declare, invoke};
+use ffi::types::{Int, String};
 
 let lib = dload("c")?;
 let id = declare(lib, "printf", (String,), Int, true)?;
@@ -130,7 +130,7 @@ You do not write those steps by hand when using `extern` blocks.
 
 ### Supported FFI types
 
-In runtime `declare`, import tag constructors from the virtual `ffi::types` module (`use ffi::types::*;`) or use bare lowercase / aggregate names. `extern` blocks accept bare type names without any import:
+In runtime `declare`, import tag constructors from the virtual `ffi::types` module (`use ffi::types::{Int, Ptr, …};`) or use bare lowercase / aggregate names. `extern` blocks accept bare type names without any import:
 
 | Form | C / libffi mapping |
 |------|---------------------|
@@ -154,8 +154,8 @@ Use this when you want to load libraries dynamically, pick symbols at runtime, o
 These names are exports of the virtual `ffi` module — **import them** before use:
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{dload, declare, invoke};
+use ffi::types::{Int};
 ```
 
 ### Example: calling a custom `sum` library
@@ -182,8 +182,8 @@ clang -shared -o examples/sum.dll examples/sum.c
 **coil** (`examples/ffi_sum.hy`):
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{dload, declare, invoke, Error, ErrorKind};
+use ffi::types::{Int};
 use io::{stdout, write_all};
 use string::{format, to_bytes};
 
@@ -217,7 +217,7 @@ fn main() {
 | `declare(lib, name, args_tuple, ret, variadic)` | Five arguments | Same; `variadic: bool` marks C `...` |
 | `invoke(lib, fn_id, args_tuple)` | Three arguments | `Result<T, Error>` — `T` from the matching `declare` return tag |
 
-`Error` (from `use ffi::*`) is a record-shaped enum with fields:
+`Error` (from `use ffi::{Error, ErrorKind};`) is a record-shaped enum with fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -259,7 +259,7 @@ The third argument to `declare` and the fourth (return) must be FFI type tags. A
 
 | Form | Example |
 |------|---------|
-| In-scope `ffi::types` tag | `Int`, `Ptr`, `Callback` (after `use ffi::types::*;`) |
+| In-scope `ffi::types` tag | `Int`, `Ptr`, `Callback` (after `use ffi::types::{Int, Ptr, …};`) |
 | Qualified virtual path | `ffi::types::Int` |
 | Bare primitive / aggregate name | `int`, `void`, `[int]`, `(int, float)` |
 
