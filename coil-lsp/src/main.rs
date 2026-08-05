@@ -1202,6 +1202,8 @@ fn builtin_description(module: &str, name: &str, export: &BuiltinExport) -> Stri
         ("gc", "get") => "Reads the value inside a `Root` without releasing the pin.".into(),
         ("gc", "weak") => "Creates a non-rooting `Weak<T>` handle.".into(),
         ("gc", "upgrade") => "Upgrades a `Weak<T>` to `Option<T>` if the referent is live.".into(),
+        ("gc", "heap_bytes") => "Returns the managed heap size in bytes.".into(),
+        ("gc", "collect") => "Forces a full GC; returns bytes freed.".into(),
         ("gc", "Root") => "Strong GC pin type constructor (`Root<T>`).".into(),
         ("gc", "Weak") => "Weak GC handle type constructor (`Weak<T>`).".into(),
         _ => match export {

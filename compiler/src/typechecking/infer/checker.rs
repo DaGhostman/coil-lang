@@ -850,6 +850,8 @@ impl Checker {
                     fun(&[weak_app_ty(Ty::Var(t))], option_app_ty(Ty::Var(t))),
                 )
             }
+            GcBuiltin::HeapBytes => Scheme::mono(fun(&[], int())),
+            GcBuiltin::Collect => Scheme::mono(fun(&[], int())),
         }
     }
 

@@ -536,6 +536,8 @@ pub enum GcBuiltin {
     Get,
     Weak,
     Upgrade,
+    HeapBytes,
+    Collect,
 }
 
 impl GcBuiltin {
@@ -546,6 +548,8 @@ impl GcBuiltin {
             Self::Get => "get",
             Self::Weak => "weak",
             Self::Upgrade => "upgrade",
+            Self::HeapBytes => "heap_bytes",
+            Self::Collect => "collect",
         }
     }
 
@@ -556,6 +560,8 @@ impl GcBuiltin {
             Self::Get => "gc_get",
             Self::Weak => "gc_weak",
             Self::Upgrade => "gc_upgrade",
+            Self::HeapBytes => "gc_heap_bytes",
+            Self::Collect => "gc_collect",
         }
     }
 
@@ -566,6 +572,8 @@ impl GcBuiltin {
             Self::Get,
             Self::Weak,
             Self::Upgrade,
+            Self::HeapBytes,
+            Self::Collect,
         ]
     }
 }
