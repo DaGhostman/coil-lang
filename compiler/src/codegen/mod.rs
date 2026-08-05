@@ -140,12 +140,15 @@ pub fn unescape_coil_string(s: &str) -> String {
     out
 }
 
+/// Decode a coil string literal to its UTF-8 bytes (after escapes).
+pub fn string_literal_as_bytes(raw: &str) -> Vec<u8> {
+    unescape_coil_string(raw).into_bytes()
+}
+
 /// If `raw` (coil string-literal contents) unescapes to exactly one UTF-8 byte,
 /// return that byte. Used for static `string` → `byte` literal coercion.
 pub fn string_literal_as_single_byte(raw: &str) -> Result<u8, StringLiteralByteError> {
-    let decoded = unescape_coil_string(raw);
-    let bytes = decoded.as_bytes();
-    match bytes {
+    match string_literal_as_bytes(raw).as_slice() {
         [b] => Ok(*b),
         [] => Err(StringLiteralByteError::Empty),
         _ => Err(StringLiteralByteError::NotSingleByte),

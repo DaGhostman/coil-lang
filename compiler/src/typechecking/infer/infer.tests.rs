@@ -4606,6 +4606,34 @@ trait Pointer<P: * -> *> {
     // ---- byte / [byte] ----
 
     #[test]
+    fn byte_array_annotation_accepts_string_literal() {
+        let (mut c, _) = check(r#"let b: [byte] = "Hi";"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("b")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("b");
+        match ty {
+            Ty::Array { element, .. } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_array_fixed_rejects_wrong_string_length() {
+        let msgs = assert_messages(r#"let b: [byte; 2] = "Hi!";"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("expected `[byte; 2]`")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn byte_annotation_accepts_single_byte_string_literal() {
         let (mut c, _) = check(r#"let b: byte = "/";"#);
         let msgs = c.take_messages();

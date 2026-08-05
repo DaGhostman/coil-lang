@@ -2032,12 +2032,16 @@ impl Checker {
             Expression::Float(_) => float(),
             Expression::String(s) => {
                 // Under an expected `byte`, a string literal whose UTF-8
-                // encoding is exactly one byte types as `byte` (same idea as
-                // in-range integer literals).
+                // encoding is exactly one byte types as `byte`. Under an
+                // expected `[byte]` / `[byte; N]`, the whole literal becomes
+                // that byte array (length must match for fixed `N`).
                 if let Some(exp) = self.current_expected.clone() {
                     let exp = apply_ty_prune(&self.subst, &exp);
                     if Self::is_byte_ty(&exp) {
                         return self.coerce_string_literal_to_byte(s, &range);
+                    }
+                    if Self::is_byte_array_ty(&exp).is_some() {
+                        return self.coerce_string_literal_to_bytes(s, &exp, &range);
                     }
                 }
                 string()
@@ -3534,16 +3538,33 @@ impl Checker {
             Expression::Cast(expr, ty_ann) => {
                 let dst_ty = self.parse_type_name(ty_ann);
                 let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
-                // Pin expected type so `"/" as byte` and `65 as byte` type the
-                // operand as `byte` when it is a coercible literal.
+                // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
+                // in-range `65 as byte` type the operand as the target when it
+                // is a coercible literal.
                 let prev_expected = self.current_expected.take();
-                if Self::is_byte_ty(&dst_ty) {
-                    self.current_expected = Some(crate::typechecking::ty::byte());
+                if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
+                    self.current_expected = Some(dst_ty.clone());
                 }
                 let src_ty = self.infer(expr);
                 self.current_expected = prev_expected;
                 let src_ty = apply_ty_prune(&self.subst, &src_ty);
                 let range = expr.0.into_range();
+                if Self::is_byte_array_ty(&dst_ty).is_some() {
+                    if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
+                        return dst_ty;
+                    }
+                    if Self::is_string_ty(&src_ty) {
+                        return self.error_with_help(
+                            ErrorCode::TypeMismatch,
+                            "cannot cast `string` to byte array".to_string(),
+                            range,
+                            Some(
+                                "only a string literal coerces to `[byte]` / `[byte; N]` (e.g. `\"hi\" as [byte]`)"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
                 match (
                     Self::primitive_cast_name(&src_ty),
                     Self::primitive_cast_name(&dst_ty),
@@ -3569,7 +3590,7 @@ impl Checker {
                         ErrorCode::TypeMismatch,
                         format!("cannot cast `{from}` to `{to}`"),
                         range,
-                        Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte".to_string()),
+                        Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
                     ),
                     (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
                         ErrorCode::TypeMismatch,
@@ -3582,7 +3603,7 @@ impl Checker {
                     ),
                     _ => self.error_with_help(
                         ErrorCode::TypeMismatch,
-                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
                             .to_string(),
                         ty_ann.0.into_range(),
                         None,
@@ -7674,6 +7695,18 @@ impl Checker {
                 return self.string_literal_byte_mismatch(s, range);
             }
         }
+        // String literals coerce to `[byte]` / `[byte; N]` (UTF-8 bytes).
+        if Self::is_byte_array_ty(&expected).is_some()
+            && Self::is_string_ty(&actual)
+            && let Some(expr) = expr
+        {
+            if self.try_mark_string_literal_as_bytes(expr, &expected) {
+                return expected.clone();
+            }
+            if let Expression::String(s) = unwrap_expr_wrappers(expr).1.as_ref() {
+                return self.coerce_string_literal_to_bytes(s, &expected, range);
+            }
+        }
         // Array literals of in-range integer / single-byte string literals coerce to `[byte]`.
         if let (
             Ty::Array {
@@ -7789,11 +7822,61 @@ impl Checker {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::INT)
     }
 
+    /// `[byte]` or `[byte; N]` — returns the length constraint when so.
+    fn is_byte_array_ty(ty: &Ty) -> Option<&ArrayLength> {
+        match ty {
+            Ty::Array { element, length } if Self::is_byte_ty(element) => Some(length),
+            _ => None,
+        }
+    }
+
+    fn byte_array_tys_compatible(src: &Ty, dst: &Ty) -> bool {
+        match (Self::is_byte_array_ty(src), Self::is_byte_array_ty(dst)) {
+            (Some(src_len), Some(dst_len)) => match (src_len, dst_len) {
+                (ArrayLength::Dynamic, _) | (_, ArrayLength::Dynamic) => true,
+                (ArrayLength::Static(a), ArrayLength::Static(b)) => a == b,
+            },
+            _ => false,
+        }
+    }
+
     /// Type a string literal as `byte` when its UTF-8 encoding is one byte.
     fn coerce_string_literal_to_byte(&mut self, raw: &str, range: &Range<usize>) -> Ty {
         match crate::codegen::string_literal_as_single_byte(raw) {
             Ok(_) => crate::typechecking::ty::byte(),
             Err(err) => self.string_literal_byte_error(err, range),
+        }
+    }
+
+    /// Type a string literal as `[byte]` / `[byte; N]` from its UTF-8 bytes.
+    fn coerce_string_literal_to_bytes(
+        &mut self,
+        raw: &str,
+        expected: &Ty,
+        range: &Range<usize>,
+    ) -> Ty {
+        let bytes = crate::codegen::string_literal_as_bytes(raw);
+        let Some(length) = Self::is_byte_array_ty(expected) else {
+            return string();
+        };
+        match length {
+            ArrayLength::Static(n) if *n != bytes.len() => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "string literal has {} byte{}, but expected `[byte; {}]`",
+                    bytes.len(),
+                    if bytes.len() == 1 { "" } else { "s" },
+                    n
+                ),
+                range.clone(),
+                Some("fixed-length `[byte; N]` requires a string literal with exactly N UTF-8 bytes".to_string()),
+            ),
+            ArrayLength::Static(_) => expected.clone(),
+            ArrayLength::Dynamic => {
+                // Prefer a fixed length for the literal; assignment to `[byte]`
+                // accepts `[byte; N]` via array length flexibility.
+                crate::typechecking::ty::array_fixed(crate::typechecking::ty::byte(), bytes.len())
+            }
         }
     }
 
@@ -7810,6 +7893,32 @@ impl Checker {
             (node.0.start, node.0.end),
             crate::typechecking::ty::byte(),
         );
+        true
+    }
+
+    /// If `expr` is a string literal compatible with `expected` byte-array type,
+    /// retarget its codegen span to that array type.
+    fn try_mark_string_literal_as_bytes(&mut self, expr: &Output, expected: &Ty) -> bool {
+        let node = unwrap_expr_wrappers(expr);
+        let Expression::String(s) = node.1.as_ref() else {
+            return false;
+        };
+        let Some(length) = Self::is_byte_array_ty(expected) else {
+            return false;
+        };
+        let bytes = crate::codegen::string_literal_as_bytes(s);
+        match length {
+            ArrayLength::Static(n) if *n != bytes.len() => return false,
+            _ => {}
+        }
+        let ty = match length {
+            ArrayLength::Static(_) => expected.clone(),
+            ArrayLength::Dynamic => {
+                crate::typechecking::ty::array_fixed(crate::typechecking::ty::byte(), bytes.len())
+            }
+        };
+        self.codegen_types_by_span
+            .insert((node.0.start, node.0.end), ty);
         true
     }
 
@@ -11147,6 +11256,10 @@ impl Checker {
     }
 
     /// Infer a call argument, skipping ID consumption for spread-expanded indices.
+    ///
+    /// Clears `current_expected` so an outer context (e.g. `return` typed as
+    /// `[byte]`) does not coerce string/int literals inside the argument list
+    /// before parameter types are applied via `coerce_or_unify`.
     fn infer_call_arg(&mut self, arg: &Output) -> Ty {
         if let Expression::Index(target, Some(index_expr)) = arg.1.as_ref() {
             if self
@@ -11160,7 +11273,10 @@ impl Checker {
                 return ty;
             }
         }
-        self.infer(arg)
+        let prev_expected = self.current_expected.take();
+        let ty = self.infer(arg);
+        self.current_expected = prev_expected;
+        ty
     }
 
     /// Infer call arguments, reordering named args and packing rest.

@@ -9873,13 +9873,24 @@ impl Compiler {
                 bytecode.push_const_pool(idx);
             }
             Expression::String(str) => {
+                use crate::typechecking::subst::apply_ty_prune;
                 let escaped = unescape_coil_string(str);
-                // Single-byte string literals typed as `byte` emit CONST, not a
-                // heap string (see string → byte literal coercion).
-                let as_byte = self
+                let span_ty = self
                     .checker
                     .lookup_for_codegen_span(span.start, span.end)
-                    .is_some_and(|ty| matches!(&ty, Ty::Con(n) if n == "byte"));
+                    .map(|ty| apply_ty_prune(self.checker.subst(), &ty));
+                // Single-byte string literals typed as `byte` emit CONST.
+                let as_byte = span_ty
+                    .as_ref()
+                    .is_some_and(|ty| matches!(ty, Ty::Con(n) if n == "byte"));
+                // String literals typed as `[byte]` / `[byte; N]` emit CONST*N + MakeArray.
+                let as_bytes = span_ty.as_ref().is_some_and(|ty| {
+                    matches!(
+                        ty,
+                        Ty::Array { element, .. }
+                            if matches!(element.as_ref(), Ty::Con(n) if n == "byte")
+                    )
+                });
                 if as_byte {
                     match escaped.as_bytes() {
                         [b] => {
@@ -9889,11 +9900,18 @@ impl Compiler {
                             ));
                         }
                         _ => {
-                            // Typechecker should have rejected this; fall back
-                            // to a string so the program still fails loudly.
                             self.emit_raw_string_literal(&mut bytecode, &escaped);
                         }
                     }
+                } else if as_bytes {
+                    let bytes = escaped.as_bytes();
+                    for &b in bytes {
+                        bytecode.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::from(b as i64).raw() as _,
+                        ));
+                    }
+                    bytecode.push_make_array(bytes.len() as u32);
                 } else {
                     self.emit_raw_string_literal(&mut bytecode, &escaped);
                 }
