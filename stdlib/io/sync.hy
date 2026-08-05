@@ -9,9 +9,13 @@ use io::{
     write,
     await_readable as wait_readable,
     await_writable as wait_writable,
+    stdout,
+    stderr,
+    from_bytes as io_from_bytes,
 };
 use io::net::tcp::accept;
 use io::net::udp::recv_from;
+use string::{to_bytes as str_to_bytes};
 
 fn write_all(Stream s, [byte] buf) -> Result<int, IoError> {
     let offset = 0;
@@ -200,4 +204,88 @@ fn recv_from_wait(Stream s, [byte] buf) -> Result<(int, string, int), IoError> {
         }
     }
     return (out_n, out_host, out_port);
+}
+
+// --- text / line helpers (stdlib ergonomics) ---
+
+fn newline_bytes() -> [byte] {
+    let nl: [byte] = [];
+    nl[] = 10;
+    return nl;
+}
+
+/// Write UTF-8 bytes of `s` to stdout (no trailing newline).
+fn print(string s) -> Result<int, IoError> {
+    return write_all(stdout(), str_to_bytes(s))?;
+}
+
+/// Write `s` plus a trailing LF to stdout.
+fn println(string s) -> Result<int, IoError> {
+    write_all(stdout(), str_to_bytes(s))?;
+    return write_all(stdout(), newline_bytes())?;
+}
+
+/// Write `s` plus a trailing LF to stderr.
+fn eprintln(string s) -> Result<int, IoError> {
+    write_all(stderr(), str_to_bytes(s))?;
+    return write_all(stderr(), newline_bytes())?;
+}
+
+/// Read until LF (10) or EOF. Returns `None` on EOF with no bytes read.
+/// The trailing LF is not included; a lone CR before LF is stripped.
+fn read_line(Stream s) -> Result<Option<string>, IoError> {
+    let acc: [byte] = [];
+    let scratch: [byte] = [];
+    scratch[] = 0;
+    let done = 0;
+    let saw = 0;
+    let lf: byte = 10;
+    let cr: byte = 13;
+    while done == 0 {
+        let rr = read(s, scratch)?;
+        let is_none = 0;
+        let nread = 0;
+        match rr {
+            Option::None => {
+                is_none = 1;
+            },
+            Option::Some(n) => {
+                nread = n;
+            },
+        };
+        if is_none == 1 {
+            done = 1;
+        }
+        if is_none == 0 {
+            if nread == 0 {
+                wait_readable(s)?;
+            }
+            if nread != 0 {
+                saw = 1;
+                let c = scratch[0];
+                if c == lf {
+                    done = 1;
+                }
+                if c != lf {
+                    acc[] = c;
+                }
+            }
+        }
+    }
+    if saw == 0 {
+        return Option::None;
+    }
+    // Strip trailing CR if present (CRLF).
+    if len(acc) > 0 {
+        if acc[len(acc) - 1] == cr {
+            let trimmed: [byte] = [];
+            let i = 0;
+            while i + 1 < len(acc) {
+                trimmed[] = acc[i];
+                i = i + 1;
+            }
+            return Option::Some(io_from_bytes(trimmed)?);
+        }
+    }
+    return Option::Some(io_from_bytes(acc)?);
 }
