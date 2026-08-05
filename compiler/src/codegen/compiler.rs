@@ -464,11 +464,11 @@ impl Compiler {
             .get(*fname)
             .cloned()
             .unwrap_or_else(|| fname.to_string());
-        if let Some((fa, is_rest)) = self
+        if let Some((fa, is_rest, id)) = self
             .checker
             .selected_overload_at(call_expr.0.start, call_expr.0.end)
         {
-            let keyed = overload_fn_key(&call_key, fa, is_rest);
+            let keyed = overload_fn_key(&call_key, fa, is_rest, id);
             if self.functions.contains_key(&keyed) {
                 call_key = keyed;
             } else {
@@ -477,7 +477,7 @@ impl Compiler {
                     .next()
                     .unwrap_or(&call_key)
                     .to_string();
-                let keyed_simple = overload_fn_key(&simple, fa, is_rest);
+                let keyed_simple = overload_fn_key(&simple, fa, is_rest, id);
                 if self.functions.contains_key(&keyed_simple) {
                     call_key = keyed_simple;
                 }
@@ -7282,8 +7282,11 @@ impl Compiler {
                         .cloned()
                         .collect();
                     for fqn in fqns {
-                        let item_name = fqn[prefix.len()..].to_string();
-                        self.aliases.insert(item_name, fqn);
+                        let rest = &fqn[prefix.len()..];
+                        // `num::abs#1.0` → local `abs` → family `num::abs`.
+                        let base = strip_overload_key(rest);
+                        let family = format!("{prefix}{base}");
+                        self.aliases.insert(base.to_string(), family);
                     }
                 } else {
                     // Prefer the FQN that actually exists in the function
@@ -7485,12 +7488,19 @@ impl Compiler {
                     .or_default()
                     .push(name.to_string());
                 let (fixed_arity, has_rest) = fn_arity_from_args(args);
-                let table_key =
-                    if self.checker.is_overloaded(name) || self.checker.is_overloaded(&qualified) {
-                        overload_fn_key(&qualified, fixed_arity, has_rest)
+                let table_key = if self.checker.is_overloaded(name)
+                    || self.checker.is_overloaded(&qualified)
+                {
+                    if let Some((decl_id, fa, rest)) =
+                        self.checker.overload_decl_at(span.start, span.end)
+                    {
+                        overload_fn_key(&qualified, fa, rest, decl_id)
                     } else {
-                        qualified.clone()
-                    };
+                        overload_fn_key(&qualified, fixed_arity, has_rest, 0)
+                    }
+                } else {
+                    qualified.clone()
+                };
                 let (fn_offset, _) = self.bind_function_entry(table_key.clone());
                 let fn_offset = fn_offset as u32;
                 self.fn_arities
@@ -8493,10 +8503,10 @@ impl Compiler {
                         .cloned();
                     if let Some(fqn_base) = fqn {
                         let nargs = args.as_ref().map(|items| items.len()).unwrap_or(0);
-                        let fqn = if let Some((fa, is_rest)) =
+                        let fqn = if let Some((fa, is_rest, id)) =
                             self.checker.selected_overload_at(span.start, span.end)
                         {
-                            let keyed = overload_fn_key(&fqn_base, fa, is_rest);
+                            let keyed = overload_fn_key(&fqn_base, fa, is_rest, id);
                             if self.functions.contains_key(&keyed) {
                                 keyed
                             } else {
@@ -8508,7 +8518,7 @@ impl Compiler {
                             // selection (set had size 1 at infer time).
                             self.checker
                                 .select_overload(&fqn_base, nargs)
-                                .map(|c| overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest))
+                                .map(|c| overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest, c.id))
                                 .filter(|k| self.functions.contains_key(k))
                                 .unwrap_or(fqn_base)
                         } else {
@@ -8675,16 +8685,16 @@ impl Compiler {
                     };
 
                     // Arity-overload table key (when the typechecker selected one).
-                    let n = if let Some((fa, is_rest)) =
+                    let n = if let Some((fa, is_rest, id)) =
                         self.checker.selected_overload_at(span.start, span.end)
                     {
-                        let keyed = overload_fn_key(&n, fa, is_rest);
+                        let keyed = overload_fn_key(&n, fa, is_rest, id);
                         if self.functions.contains_key(&keyed) {
                             keyed
                         } else {
                             // Try bare-name key when FQN wasn't used at registration.
                             let simple = n.rsplit("::").next().unwrap_or(&n);
-                            let keyed_simple = overload_fn_key(simple, fa, is_rest);
+                            let keyed_simple = overload_fn_key(simple, fa, is_rest, id);
                             if self.functions.contains_key(&keyed_simple) {
                                 keyed_simple
                             } else {
@@ -8816,7 +8826,7 @@ impl Compiler {
                         }
 
                         // Partial application → MakeFn (not CALL).
-                        let (fa, is_rest) = self
+                        let (fa, is_rest, _id) = self
                             .checker
                             .selected_overload_at(span.start, span.end)
                             .or_else(|| {
@@ -8827,15 +8837,15 @@ impl Compiler {
                                 } else {
                                     names.len()
                                 };
-                                Some((fixed, rest))
+                                Some((fixed, rest, 0))
                             })
                             .or_else(|| {
                                 self.fn_arities
                                     .get(&lookup_name)
                                     .or_else(|| self.fn_arities.get(&n))
-                                    .map(|(a, r)| (*a as usize, *r))
+                                    .map(|(a, r)| (*a as usize, *r, 0))
                             })
-                            .unwrap_or((0, false));
+                            .unwrap_or((0, false, 0));
                         let fill_mask =
                             self.checker
                                 .partial_fill_at(span.start, span.end)
@@ -9253,10 +9263,10 @@ impl Compiler {
                         }
                     } else {
                         // Monomorphic function in value position → MakeFn.
-                        let (fa, is_rest, entry_key) = if let Some((fa, is_rest)) =
+                        let (fa, is_rest, entry_key) = if let Some((fa, is_rest, id)) =
                             self.checker.selected_overload_at(span.start, span.end)
                         {
-                            let keyed = overload_fn_key(&resolved_n, fa, is_rest);
+                            let keyed = overload_fn_key(&resolved_n, fa, is_rest, id);
                             (fa, is_rest, keyed)
                         } else if self.checker.is_overloaded(&resolved_n) {
                             // Ambiguous — typechecker should have diagnosed.
@@ -10147,7 +10157,7 @@ impl Compiler {
                     // Key fixed-arity overloads; keep bare name for
                     // single decls and for C-varargs (not overload members).
                     let table_name = if !decl.variadic && self.checker.is_overloaded(decl.name) {
-                        overload_fn_key(&fn_name, nfixed, false)
+                        overload_fn_key(&fn_name, nfixed, false, 0)
                     } else {
                         fn_name.clone()
                     };
