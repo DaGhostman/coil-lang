@@ -49,9 +49,15 @@ test("repeat text") {
     assert(repeat("ab", -1) == "")?;
 }
 
-test("pad text") {
+test("pad text left") {
     assert(pad_left("7", 3, "0")? == "007")?;
+}
+
+test("pad text right") {
     assert(pad_right("7", 3, "0")? == "700")?;
+}
+
+test("pad text preserves wide input") {
     assert(pad_right("wide", 2, "0")? == "wide")?;
 }
 

@@ -35,9 +35,15 @@ test("repeat bytes") {
     assert(eq(repeat(to_bytes("ab"), 0), to_bytes("")))?;
 }
 
-test("pad bytes") {
+test("pad bytes left") {
     assert(eq(pad_left(to_bytes("7"), 3, "0"), to_bytes("007")))?;
+}
+
+test("pad bytes right") {
     assert(eq(pad_right(to_bytes("7"), 3, "0"), to_bytes("700")))?;
+}
+
+test("pad bytes preserves wide input") {
     assert(eq(pad_left(to_bytes("wide"), 2, "0"), to_bytes("wide")))?;
 }
 

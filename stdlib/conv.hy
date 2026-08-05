@@ -81,7 +81,7 @@ fn parse_float(string s) -> Result<float, string> {
     let value = 0.0;
     let saw_digit = false;
     while i < len(b) {
-        if !is_digit(b[i]) {
+        if is_digit(b[i]) == false {
             break;
         }
         let whole_digit = digit_val(b[i]);
@@ -95,7 +95,7 @@ fn parse_float(string s) -> Result<float, string> {
             i = i + 1;
             let place = 0.1;
             while i < len(b) {
-                if !is_digit(b[i]) {
+                if is_digit(b[i]) == false {
                     break;
                 }
                 let fraction_digit = digit_val(b[i]);
@@ -125,7 +125,7 @@ fn parse_float(string s) -> Result<float, string> {
             }
             let exponent_start = i;
             while i < len(b) {
-                if !is_digit(b[i]) {
+                if is_digit(b[i]) == false {
                     break;
                 }
                 let exponent_digit = digit_val(b[i]);
