@@ -891,12 +891,21 @@ fn incomplete_ident_near(source: &str, offset: usize) -> Option<Range<usize>> {
 }
 
 fn completion_kind_for_ty(ty: &compiler::Ty) -> CompletionItemKind {
-    match ty {
-        compiler::Ty::Fun(_, _) | compiler::Ty::Forall { .. } => CompletionItemKind::FUNCTION,
-        compiler::Ty::Con(name) if name.chars().next().is_some_and(|c| c.is_uppercase()) => {
-            CompletionItemKind::CLASS
-        }
+    match semantic_token_type_for_ty(ty) {
+        TOKEN_FUNCTION => CompletionItemKind::FUNCTION,
+        TOKEN_TYPE => CompletionItemKind::CLASS,
         _ => CompletionItemKind::VARIABLE,
+    }
+}
+
+fn semantic_token_type_for_ty(ty: &compiler::Ty) -> u32 {
+    match ty {
+        compiler::Ty::Fun(_, _) | compiler::Ty::Forall { .. } => TOKEN_FUNCTION,
+        compiler::Ty::Con(name) if name.chars().next().is_some_and(|c| c.is_uppercase()) => {
+            TOKEN_TYPE
+        }
+        compiler::Ty::Constructor { .. } => TOKEN_TYPE,
+        _ => TOKEN_VARIABLE,
     }
 }
 
@@ -1843,6 +1852,8 @@ const TOKEN_STRING: u32 = 5;
 const TOKEN_NUMBER: u32 = 6;
 const TOKEN_NAMESPACE: u32 = 7;
 const TOKEN_OPERATOR: u32 = 8;
+const TOKEN_TYPED_PRIORITY: u8 = 5;
+const TOKEN_AST_PRIORITY: u8 = 4;
 
 #[derive(Clone)]
 struct SpannedToken {
@@ -1903,6 +1914,88 @@ fn reference_token_type(index: &SymbolIndex, name: &str) -> u32 {
         .unwrap_or(TOKEN_VARIABLE)
 }
 
+fn definition_token_type(checker: &Checker, definition: &compiler::SymbolDef) -> u32 {
+    match definition.kind {
+        SymbolKind::Class | SymbolKind::Enum | SymbolKind::TypeAlias | SymbolKind::Namespace => {
+            symbol_kind_to_token_type(definition.kind)
+        }
+        SymbolKind::Function | SymbolKind::Method => TOKEN_FUNCTION,
+        SymbolKind::Variable => checker
+            .codegen_var_type(&definition.name)
+            .map(|ty| semantic_token_type_for_ty(ty))
+            .or_else(|| {
+                checker
+                    .env()
+                    .lookup(&definition.name)
+                    .map(|scheme| semantic_token_type_for_ty(&scheme.ty))
+            })
+            .unwrap_or(TOKEN_VARIABLE),
+    }
+}
+
+fn type_for_reference_site(
+    checker: &Checker,
+    index: &SymbolIndex,
+    site: &compiler::RefSite,
+) -> Option<u32> {
+    if index.definitions(&site.name).first().is_some_and(|definition| {
+        matches!(
+            definition.kind,
+            SymbolKind::Namespace | SymbolKind::Class | SymbolKind::Enum | SymbolKind::TypeAlias
+        )
+    }) {
+        return Some(reference_token_type(index, &site.name));
+    }
+    if let Some(ty) = checker.lookup_for_codegen_span(site.range.start, site.range.end) {
+        return Some(semantic_token_type_for_ty(&ty));
+    }
+    if let Some(ty) = checker.codegen_var_type(&site.name) {
+        return Some(semantic_token_type_for_ty(ty));
+    }
+    if let Some(scheme) = checker.env().lookup(&site.name) {
+        return Some(semantic_token_type_for_ty(&scheme.ty));
+    }
+    None
+}
+
+fn reference_token_type_typeaware(
+    checker: &Checker,
+    index: &SymbolIndex,
+    site: &compiler::RefSite,
+) -> u32 {
+    type_for_reference_site(checker, index, site)
+        .unwrap_or_else(|| reference_token_type(index, &site.name))
+}
+
+fn typed_semantic_tokens(source: &str, file: &PathBuf) -> Option<Vec<SpannedToken>> {
+    let ast = Pratt::default().parse(source).ok()?;
+    let mut checker = Checker::new();
+    let _ = checker.check_program(&ast);
+    let index = SymbolIndex::from_source(file.clone(), source);
+    let mut tokens = Vec::new();
+    for definition in index.all_definitions() {
+        if definition.file != *file {
+            continue;
+        }
+        tokens.push(SpannedToken {
+            range: definition.name_range.clone(),
+            token_type: definition_token_type(&checker, definition),
+            priority: TOKEN_TYPED_PRIORITY,
+        });
+    }
+    for site in index.all_reference_sites() {
+        if site.file != *file {
+            continue;
+        }
+        tokens.push(SpannedToken {
+            range: site.range.clone(),
+            token_type: reference_token_type_typeaware(&checker, &index, site),
+            priority: TOKEN_TYPED_PRIORITY,
+        });
+    }
+    Some(tokens)
+}
+
 fn ast_semantic_tokens(source: &str, file: &PathBuf) -> Vec<SpannedToken> {
     let index = SymbolIndex::from_source(file.clone(), source);
     let mut tokens = Vec::new();
@@ -1913,7 +2006,7 @@ fn ast_semantic_tokens(source: &str, file: &PathBuf) -> Vec<SpannedToken> {
         tokens.push(SpannedToken {
             range: definition.name_range.clone(),
             token_type: symbol_kind_to_token_type(definition.kind),
-            priority: 4,
+            priority: TOKEN_AST_PRIORITY,
         });
     }
     for site in index.all_reference_sites() {
@@ -1923,7 +2016,7 @@ fn ast_semantic_tokens(source: &str, file: &PathBuf) -> Vec<SpannedToken> {
         tokens.push(SpannedToken {
             range: site.range.clone(),
             token_type: reference_token_type(&index, &site.name),
-            priority: 4,
+            priority: TOKEN_AST_PRIORITY,
         });
     }
     tokens
@@ -2126,7 +2219,9 @@ fn semantic_tokens(
 ) -> Vec<SemanticToken> {
     let file = file.unwrap_or_else(|| PathBuf::from("untitled.hy"));
     let mut tokens = scan_lexical_tokens(source);
-    if Pratt::default().parse(source).is_ok() {
+    if let Some(typed) = typed_semantic_tokens(source, &file) {
+        tokens.extend(typed);
+    } else if Pratt::default().parse(source).is_ok() {
         tokens.extend(ast_semantic_tokens(source, &file));
     }
     let merged = merge_spanned_tokens(tokens);
@@ -2508,6 +2603,23 @@ fn main() {
         let fib = token_types_at_word(source, &tokens, "fib");
         assert_eq!(fib.len(), 2);
         assert!(fib.iter().all(|token_type| *token_type == TOKEN_FUNCTION));
+    }
+
+    #[test]
+    fn semantic_tokens_use_inferred_types_for_references() {
+        let source = "\
+fn fib(int n) -> int { return n; }
+fn main() {
+    let f = fib;
+    return f(1);
+}
+";
+        let tokens = semantic_tokens(source, Some(PathBuf::from("test.hy")), None);
+        let call_f = token_types_at_word(source, &tokens, "f");
+        assert!(
+            call_f.contains(&TOKEN_FUNCTION),
+            "expected function type at call site, got {call_f:?}"
+        );
     }
 
     #[test]
