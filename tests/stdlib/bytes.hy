@@ -38,10 +38,3 @@ test("repeat and padding") {
     assert(eq(pad_left(to_bytes("wide"), 2, "0"), to_bytes("wide")))?;
 }
 
-test("join buffers") {
-    let parts: [[byte]] = [];
-    parts[] = to_bytes("a");
-    parts[] = to_bytes("b");
-    parts[] = to_bytes("c");
-    assert(eq(join_buffers(parts, to_bytes(",")), to_bytes("a,b,c")))?;
-}

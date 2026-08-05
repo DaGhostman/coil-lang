@@ -206,28 +206,6 @@ fn pad_right([byte] src, int width, byte fill) -> [byte] {
     return out;
 }
 
-/// Join byte buffers, placing `sep` between adjacent parts.
-fn join_buffers([[byte]] parts, [byte] sep) -> [byte] {
-    let out: [byte] = [];
-    let i = 0;
-    while i < len(parts) {
-        if i > 0 {
-            let j = 0;
-            while j < len(sep) {
-                out[] = sep[j];
-                j = j + 1;
-            }
-        }
-        let k = 0;
-        while k < len(parts[i]) {
-            out[] = parts[i][k];
-            k = k + 1;
-        }
-        i = i + 1;
-    }
-    return out;
-}
-
 /// Decode UTF-8 bytes (maps `string::from_bytes` errors to a bare string Err).
 fn to_string([byte] b) -> Result<string, string> {
     return match from_bytes(b) {
