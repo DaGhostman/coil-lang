@@ -1,13 +1,29 @@
 //! End-to-end tests for `use` / `mod` module resolution.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use compiler::Pipeline;
 use machine::Machine;
 
 // Tests change cwd; serialize with CWD_LOCK when running in parallel.
+
+/// Absolute path to workspace `stdlib/` for temp-project module roots.
+fn workspace_stdlib() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate parent")
+        .join("stdlib")
+}
+
+/// Manifest with `./src` plus the real workspace stdlib (for `io::sync`, …).
+fn manifest_src_and_stdlib() -> String {
+    format!(
+        "[module]\nroots = [\"./src\", \"{}\"]\n",
+        workspace_stdlib().display()
+    )
+}
 
 #[derive(Clone, Default)]
 struct SharedBuf {
@@ -171,73 +187,64 @@ fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String
 
 #[test]
 fn use_single_segment_resolves_in_src_root() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "use foo::sadge;\nfn main() { sadge(); }\n"),
-        ("src/foo/sadge.hy", "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
+        ("src/foo/sadge.hy", "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%x\\n\", 420))); }\n"),
     ];
-    let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_single_segment", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "1a4\n");
 }
 
 #[test]
 fn use_with_alias_renames_imported_item() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "use foo::sadge as f;\nfn main() { f(); }\n"),
         (
             "src/foo/sadge.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 99))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_with_alias", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "99");
 }
 
 #[test]
 fn use_multi_segment_path_walks_into_nested_directory() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "use lib::io::read;\nfn main() { read(); }\n"),
         (
             "src/lib/io/read.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn read() { write_all(stdout(), to_bytes(format(\"%i\", 7))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_multi_segment", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
 }
 
 #[test]
 fn multiple_roots_search_in_order() {
-    let manifest = r#"
-[module]
-roots = ["./src", "./vendor"]
-"#;
+    let manifest = format!(
+        "[module]\nroots = [\"./src\", \"./vendor\", \"{}\"]\n",
+        workspace_stdlib().display()
+    );
     let files = &[
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-src\"))); }\n",
         ),
         (
             "vendor/foo/greet.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%s\", \"from-vendor\"))); }\n",
         ),
     ];
-    let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("multiple_roots", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "from-src");
 }
@@ -248,7 +255,8 @@ fn no_manifest_uses_default_src_root() {
         ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn greet() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+            // No coil.toml → no stdlib root; use virtual `io::write` only.
+            "use io::{stdout, write};\nuse string::{format, to_bytes};\nfn greet() { write(stdout(), to_bytes(format(\"%i\", 42))); }\n",
         ),
     ];
     let tmp = std::env::temp_dir().join("coil_ns_test_no_manifest");
@@ -268,10 +276,7 @@ fn no_manifest_uses_default_src_root() {
 
 #[test]
 fn use_brace_brings_items_into_scope() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
@@ -279,21 +284,18 @@ roots = ["./src"]
         ),
         (
             "src/foo.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn sadge() { write_all(stdout(), to_bytes(format(\"%i\", 100))); }\n\
              fn greet() { write_all(stdout(), to_bytes(format(\"%i\", 200))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_brace_items", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_brace_items", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "100200");
 }
 
 #[test]
 fn use_module_file_does_not_reach_subdirectory_files() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
@@ -301,29 +303,26 @@ roots = ["./src"]
         ),
         (
             "src/foo.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn top_only() { write_all(stdout(), to_bytes(format(\"%s\", \"ok\"))); }\n",
         ),
         (
             "src/foo/bar.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn bar() { write_all(stdout(), to_bytes(format(\"%s\", \"BAD\"))); }\n",
         ),
     ];
-    let (root, entry) = build_project("use_module_file_subdir", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_module_file_subdir", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
 }
 
 #[test]
 fn disk_wildcard_import_is_rejected() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "use foo::*;\nfn main() {}\n"),
         ("src/foo.hy", "fn sadge() {}\n"),
     ];
-    let (root, entry) = build_project("disk_wildcard_reject", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("disk_wildcard_reject", &manifest, files, "src/main.hy");
     let msgs = compile_project_errors(&root, &entry);
     assert!(
         msgs.iter()
@@ -335,10 +334,7 @@ roots = ["./src"]
 
 #[test]
 fn orphan_instance_across_modules_is_rejected() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
@@ -348,7 +344,7 @@ roots = ["./src"]
         ),
         ("src/iface.hy", "trait Foreign<T> { fn id(T x) -> int; }\n"),
     ];
-    let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("orphan_instance_modules", &manifest, files, "src/main.hy");
     let msgs = compile_project_errors(&root, &entry);
     assert!(
         msgs.iter()
@@ -364,16 +360,13 @@ roots = ["./src"]
 fn two_module_polyfn_and_fib_fuse_and_run() {
     use common::Instruction;
 
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     // Keep recursive `fib` in the entry namespace (empty prefix) — namespaced
     // modules do not rewrite bare recursive calls to the FQN today.
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::inc;\n\
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse util::inc;\n\
              fn id<T>(T x) -> T { return x; }\n\
              fn fib(int n) -> int {\n\
                if n <= 2 { return 1; }\n\
@@ -389,7 +382,7 @@ roots = ["./src"]
             "fn inc(int x) -> int { return x + 1; }\n",
         ),
     ];
-    let (root, entry) = build_project("two_module_polyfn_fib", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("two_module_polyfn_fib", &manifest, files, "src/main.hy");
 
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
     let original_cwd = std::env::current_dir().expect("get cwd");
@@ -445,10 +438,7 @@ roots = ["./src"]
 /// P2a: two brace imports must both resolve after discovery scans every dep.
 #[test]
 fn two_brace_imports_both_resolve() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
@@ -456,14 +446,14 @@ roots = ["./src"]
         ),
         (
             "src/a.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn from_a() { write_all(stdout(), to_bytes(format(\"%i\", 1))); }\n",
         ),
         (
             "src/b.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn from_b() { write_all(stdout(), to_bytes(format(\"%i\", 2))); }\n",
         ),
     ];
-    let (root, entry) = build_project("two_brace_imports", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("two_brace_imports", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "12");
 }
@@ -471,14 +461,11 @@ roots = ["./src"]
 /// P2b: bare sibling calls inside a non-entry module resolve to `ns::name`.
 #[test]
 fn sibling_bare_call_in_namespaced_module() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse util::{public_fn};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse util::{public_fn};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", public_fn()))); }\n",
         ),
         (
             "src/util.hy",
@@ -486,39 +473,33 @@ roots = ["./src"]
              fn public_fn() -> int { return helper(); }\n",
         ),
     ];
-    let (root, entry) = build_project("sibling_bare_call", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("sibling_bare_call", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
 }
 
 #[test]
 fn cross_module_static_slot_init_and_mutation() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/counter.hy", "static let n = 0;\n"),
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nmod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    write_all(stdout(), to_bytes(format(\"%i\", counter::n)));\n}\n",
         ),
     ];
-    let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("cross_module_static", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "5");
 }
 
 #[test]
 fn use_brace_group_imports_from_module_file() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::{add, mul};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(2, 3)))); write_all(stdout(), to_bytes(format(\"%i\", mul(4, 5)))); }\n",
         ),
         (
             "src/math.hy",
@@ -526,7 +507,7 @@ roots = ["./src"]
              fn mul(int a, int b) -> int { return a * b; }\n",
         ),
     ];
-    let (root, entry) = build_project("use_brace_group", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_brace_group", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "520");
 }
@@ -534,21 +515,18 @@ roots = ["./src"]
 #[test]
 fn use_brace_group_as_alias_imports_from_module_file() {
     // Parser covers `as` AST shape; this locks the desugar → alias map → call path.
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::{add as plus};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", plus(2, 3)))); }\n",
         ),
         (
             "src/math.hy",
             "fn add(int a, int b) -> int { return a + b; }\n",
         ),
     ];
-    let (root, entry) = build_project("use_brace_as", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_brace_as", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "5");
 }
@@ -575,15 +553,12 @@ fn parse_fail_dependency_emits_single_diagnostic() {
         }
     }
 
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         ("src/main.hy", "mod bad;\nfn main() {}\n"),
         ("src/bad.hy", "@@@ not valid coil\n"),
     ];
-    let (root, entry) = build_project("parse_fail_dep", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("parse_fail_dep", &manifest, files, "src/main.hy");
 
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
     let original_cwd = std::env::current_dir().expect("get cwd");
@@ -623,18 +598,20 @@ roots = ["./src"]
 
 #[test]
 fn manifest_entry_path_joins_project_root() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
+    let manifest = format!(
+        r#"[module]
+roots = ["./src", "{}"]
 
 [entry]
 file = "./src/main.hy"
-"#;
+"#,
+        workspace_stdlib().display()
+    );
     let files = &[(
         "src/main.hy",
-        "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
+        "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", 42))); }\n",
     )];
-    let (root, _entry) = build_project("manifest_entry", manifest, files, "src/main.hy");
+    let (root, _entry) = build_project("manifest_entry", &manifest, files, "src/main.hy");
 
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
     let original_cwd = std::env::current_dir().expect("get cwd");
@@ -667,21 +644,18 @@ file = "./src/main.hy"
 fn use_item_from_module_file_without_subdir() {
     // Concrete `use math::add` must fall back to math.hy when math/add.hy
     // does not exist (the "modules in roots don't get imported" gap).
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = &[
         (
             "src/main.hy",
-            "use io::{stdout, write_all};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
+            "use io::{stdout};\nuse io::sync::{write_all};\nuse string::{format, to_bytes};\nuse math::add;\nfn main() { write_all(stdout(), to_bytes(format(\"%i\", add(10, 32)))); }\n",
         ),
         (
             "src/math.hy",
             "fn add(int a, int b) -> int { return a + b; }\n",
         ),
     ];
-    let (root, entry) = build_project("use_module_file_item", manifest, files, "src/main.hy");
+    let (root, entry) = build_project("use_module_file_item", &manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "42");
 }
@@ -692,10 +666,7 @@ roots = ["./src"]
 /// at `jump_if_match_target` (pool index OOB) under `spawn`.
 #[test]
 fn multi_file_try_operator_pool_survives_module_link() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = [
         (
             "src/main.hy",
@@ -733,7 +704,8 @@ fn main() {
             "src/pool/worker.hy",
             r#"
 use thread::*;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
@@ -749,7 +721,7 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
 "#,
         ),
     ];
-    let (root, entry) = build_project("try_pool", manifest, &files, "src/main.hy");
+    let (root, entry) = build_project("try_pool", &manifest, &files, "src/main.hy");
 
     let output = with_project_cwd(&root, || {
         let (bytecode, constants, pipeline) =
@@ -765,15 +737,13 @@ fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
 /// IO rather than thread channels).
 #[test]
 fn multi_file_io_hostinvoke_try_in_dependency() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = [
         (
             "src/main.hy",
             r#"
 use io::*;
+use io::sync::{write_all};
 use helper::write_greeting;
 use string::*;
 
@@ -787,6 +757,7 @@ fn main() {
             "src/helper.hy",
             r#"
 use io::*;
+use io::sync::{write_all};
 
 fn write_greeting() -> Result<(), IoError> {
     let path = "greeting.bin";
@@ -820,16 +791,14 @@ fn write_greeting() -> Result<(), IoError> {
 /// shared constant pool must survive every `compile_module` hop.
 #[test]
 fn multi_file_io_hostinvoke_try_in_nested_dependency() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = [
         (
             "src/main.hy",
             r#"
 use facade::roundtrip;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -854,6 +823,7 @@ fn roundtrip() -> Result<(), IoError> {
             "src/transport.hy",
             r#"
 use io::*;
+use io::sync::{write_all, read_exact};
 
 fn write_then_read(string path) -> Result<(), IoError> {
     let a: byte = 65;
@@ -890,16 +860,14 @@ fn write_then_read(string path) -> Result<(), IoError> {
 /// this PR's docs now treat as supported.
 #[test]
 fn multi_file_sibling_use_free_fn_from_dependency() {
-    let manifest = r#"
-[module]
-roots = ["./src"]
-"#;
+    let manifest = manifest_src_and_stdlib();
     let files = [
         (
             "src/main.hy",
             r#"
 use server::check;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
