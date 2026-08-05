@@ -6129,7 +6129,10 @@ impl Compiler {
             Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
             Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
             Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
-            Expression::String(_) => Some(Ty::Con(crate::typechecking::ty::STRING.into())),
+            Expression::String(_) => self
+                .checker
+                .lookup_for_codegen_span(node.0.start, node.0.end)
+                .or_else(|| Some(Ty::Con(crate::typechecking::ty::STRING.into()))),
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
                 for item in items {
@@ -9871,26 +9874,29 @@ impl Compiler {
             }
             Expression::String(str) => {
                 let escaped = unescape_coil_string(str);
-                //     while let Some(captures) = re.captures(escaped.as_str()) {
-                //         let unicode = captures.name("code").unwrap().as_str();
-                //
-                //         escaped = escaped.replace(
-                //             format!("\\u{}", unicode).as_str(),
-                //             char::from_u32(
-                //                 captures
-                //                     .name("code")
-                //                     .unwrap()
-                //                     .as_str()
-                //                     .parse()
-                //                     .unwrap_or_default(),
-                //             )
-                //             .unwrap_or_default()
-                //             .to_string()
-                //             .as_str(),
-                //         )
-                //     }
-                // }
-                self.emit_raw_string_literal(&mut bytecode, &escaped);
+                // Single-byte string literals typed as `byte` emit CONST, not a
+                // heap string (see string → byte literal coercion).
+                let as_byte = self
+                    .checker
+                    .lookup_for_codegen_span(span.start, span.end)
+                    .is_some_and(|ty| matches!(&ty, Ty::Con(n) if n == "byte"));
+                if as_byte {
+                    match escaped.as_bytes() {
+                        [b] => {
+                            bytecode.push(Byte::new_with_value(
+                                Instruction::CONST,
+                                Value::from(*b as i64).raw() as _,
+                            ));
+                        }
+                        _ => {
+                            // Typechecker should have rejected this; fall back
+                            // to a string so the program still fails loudly.
+                            self.emit_raw_string_literal(&mut bytecode, &escaped);
+                        }
+                    }
+                } else {
+                    self.emit_raw_string_literal(&mut bytecode, &escaped);
+                }
             }
             Expression::Variable(name, _ty) => {
                 if unlikely(self.context.variables.contains(&name.to_string())) {

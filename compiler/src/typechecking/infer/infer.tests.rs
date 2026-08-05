@@ -4606,6 +4606,60 @@ trait Pointer<P: * -> *> {
     // ---- byte / [byte] ----
 
     #[test]
+    fn byte_annotation_accepts_single_byte_string_literal() {
+        let (mut c, _) = check(r#"let b: byte = "/";"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert_eq!(
+            c.codegen_var_type("b")
+                .map(|t| apply_ty_prune(c.subst(), t)),
+            Some(crate::typechecking::ty::byte())
+        );
+    }
+
+    #[test]
+    fn byte_annotation_rejects_multi_byte_string_literal() {
+        let msgs = assert_messages(r#"let b: byte = "é";"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("exactly one UTF-8 byte")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_array_literal_coerces_from_string_literals() {
+        let (mut c, _) = check(r#"let buf: [byte] = ["a", "b", "\n"];"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("buf")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("buf");
+        match ty {
+            Ty::Array { element, .. } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_compares_with_single_byte_string_literal() {
+        let (mut c, _) = check(
+            r#"
+fn main() {
+    let b: byte = "/";
+    let ok = b == "/";
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
     fn byte_annotation_accepts_in_range_literal() {
         let (mut c, _) = check("let b: byte = 42;");
         let msgs = c.take_messages();

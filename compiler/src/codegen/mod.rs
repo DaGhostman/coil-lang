@@ -140,6 +140,25 @@ pub fn unescape_coil_string(s: &str) -> String {
     out
 }
 
+/// If `raw` (coil string-literal contents) unescapes to exactly one UTF-8 byte,
+/// return that byte. Used for static `string` → `byte` literal coercion.
+pub fn string_literal_as_single_byte(raw: &str) -> Result<u8, StringLiteralByteError> {
+    let decoded = unescape_coil_string(raw);
+    let bytes = decoded.as_bytes();
+    match bytes {
+        [b] => Ok(*b),
+        [] => Err(StringLiteralByteError::Empty),
+        _ => Err(StringLiteralByteError::NotSingleByte),
+    }
+}
+
+/// Why a string literal cannot coerce to `byte`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringLiteralByteError {
+    Empty,
+    NotSingleByte,
+}
+
 fn primitive_name_from_type_ann(ty: &Output) -> Option<&'static str> {
     match ty.1.as_ref() {
         Expression::Type(name) => primitive_type_name(&Ty::Con((*name).into())),
