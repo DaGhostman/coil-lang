@@ -5009,6 +5009,25 @@ impl Compiler {
         scheme.bounds.iter().any(|bound| free.contains(bound))
     }
 
+    /// Whether a generic function has at least one bare type-parameter
+    /// argument (`T` rather than `[T]` / `F<T>`). Those positions use the
+    /// boxed shared-body ABI; nested ADT params do not.
+    fn generic_has_toplevel_type_param_args(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut current = &scheme.ty;
+        while let crate::typechecking::Ty::Fun(param, ret) = current {
+            if let crate::typechecking::Ty::Var(v) = param.as_ref() {
+                if scheme.bounds.iter().any(|b| b == v) {
+                    return true;
+                }
+            }
+            current = ret;
+        }
+        false
+    }
+
     /// Whether a generic call's return value is boxed at the ABI boundary.
     ///
     /// Direct type-parameter arguments (`id<T>(T x) -> T`) are boxed at the
@@ -8782,6 +8801,11 @@ impl Compiler {
                         let lookup_name = strip_overload_key(&n).to_string();
                         let is_generic =
                             self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
+                        // Only box bare `T` args for the shared dict ABI. Nested
+                        // params like `[T]` (e.g. `collections::sort`) keep the
+                        // native representation even when not monomorphized.
+                        let box_generic_args =
+                            is_generic && self.generic_has_toplevel_type_param_args(&lookup_name);
                         let arg_slice = args.as_deref().unwrap_or(&[]);
                         self.consume_spread_emit_ids(arg_slice);
                         let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
@@ -8884,7 +8908,7 @@ impl Compiler {
                             &lookup_name,
                             arg_slice,
                             &mut bytecode,
-                            is_generic,
+                            box_generic_args,
                         );
 
                         // ── Dictionary-passing calling convention ──────────────────
