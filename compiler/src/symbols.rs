@@ -86,10 +86,19 @@ impl SymbolIndex {
                 _ => continue,
             };
             let range = span.start..span.end;
-            let name_start = source[range.clone()]
-                .find(name)
-                .map(|offset| range.start + offset)
-                .unwrap_or(range.start);
+            // `use path as alias` spans the whole import; prefer the rightmost
+            // name match so aliases like `out` are not bound to `stdout`.
+            let name_start = if matches!(expression.as_ref(), Expression::Use { .. }) {
+                source[range.clone()]
+                    .rfind(name)
+                    .map(|offset| range.start + offset)
+                    .unwrap_or(range.start)
+            } else {
+                source[range.clone()]
+                    .find(name)
+                    .map(|offset| range.start + offset)
+                    .unwrap_or(range.start)
+            };
             let definition = SymbolDef {
                 name: name.to_owned(),
                 kind,
