@@ -7503,10 +7503,9 @@ impl Compiler {
                 let fn_offset = fn_offset as u32;
                 self.fn_arities
                     .insert(table_key.clone(), (fixed_arity as u32, has_rest));
-                if table_key != qualified {
-                    self.fn_arities
-                        .insert(qualified.clone(), (fixed_arity as u32, has_rest));
-                }
+                // Overloads share the unmangled FQN; do not mirror arity
+                // under `qualified` (last decl would win and poison
+                // fallbacks that lack `selected_overload_at`).
                 if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
                     self.test_cases.push((desc, fn_offset));
                 }
@@ -8514,11 +8513,46 @@ impl Compiler {
                             // Forward call inside an impl that later gained
                             // more overloads — TC may not have recorded a
                             // selection (set had size 1 at infer time).
-                            self.checker
-                                .select_overload(&fqn_base, nargs)
-                                .map(|c| overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest, c.id))
-                                .filter(|k| self.functions.contains_key(k))
-                                .unwrap_or(fqn_base)
+                            // Prefer arg types so same-arity overloads match
+                            // the checker path (`select_overload_for_args`).
+                            let arg_tys: Vec<Ty> = args
+                                .as_ref()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|a| {
+                                            let value = match a.1.as_ref() {
+                                                Expression::NamedArg(_, v) => v,
+                                                _ => a,
+                                            };
+                                            self.codegen_expr_ty(value)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            // Only pass types when every arg resolved; a
+                            // partial vec would shift positions under unify.
+                            let tys = if arg_tys.len() == nargs {
+                                arg_tys.as_slice()
+                            } else {
+                                &[]
+                            };
+                            match self.checker.select_overload_for_args(&fqn_base, nargs, tys) {
+                                crate::typechecking::infer::OverloadSelect::Selected(c) => {
+                                    let keyed = overload_fn_key(
+                                        &fqn_base,
+                                        c.fixed_arity,
+                                        c.is_rest,
+                                        c.id,
+                                    );
+                                    if self.functions.contains_key(&keyed) {
+                                        keyed
+                                    } else {
+                                        fqn_base
+                                    }
+                                }
+                                _ => fqn_base,
+                            }
                         } else {
                             fqn_base
                         };
