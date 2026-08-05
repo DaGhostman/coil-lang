@@ -3841,21 +3841,40 @@ impl Checker {
                     }
                     let t = self.infer(item);
                     self.current_expected = prev_expected;
-                    let t_pruned = apply_ty_prune(&self.subst, &t);
+                    // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
+                    // `[Rank; 2]`, not a stuck `::v0` element type.
+                    let t_pruned =
+                        crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
+                            &self.subst, &t,
+                        ));
                     match &elem_ty {
                         None => elem_ty = Some(t_pruned),
                         Some(prev) => {
                             let prev_pruned = apply_ty_prune(&self.subst, prev);
-                            if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
-                                let _ = self.error_with_help(
-                                    ErrorCode::TypeMismatch, format!(
-                                        "array element type mismatch: expected `{}`, found `{}`",
-                                        prev_pruned,
-                                        t_pruned
-                                    ),
-                                    range.clone(),
-                                    Some("an array literal requires every element to have the same type".to_string()),
-                                );
+                            match unify_with(&self.subst, &prev_pruned, &t_pruned) {
+                                Ok(s) => {
+                                    self.subst = compose(&s, &self.subst);
+                                    elem_ty = Some(apply_ty_prune(
+                                        &self.subst,
+                                        &crate::typechecking::ty::peel_constructor_refinement(
+                                            prev_pruned,
+                                        ),
+                                    ));
+                                }
+                                Err(_) => {
+                                    let _ = self.error_with_help(
+                                        ErrorCode::TypeMismatch,
+                                        format!(
+                                            "array element type mismatch: expected `{}`, found `{}`",
+                                            prev_pruned, t_pruned
+                                        ),
+                                        range.clone(),
+                                        Some(
+                                            "an array literal requires every element to have the same type"
+                                                .to_string(),
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }

@@ -120,7 +120,11 @@ Constructors in expressions and patterns use qualified form: `Option::Some(42)` 
 
 ### Constructor types (`Ty::Constructor`)
 
-Applying a variant yields a constructor type carrying tag and arity, unified against the parent sum (or applied `Ty::App` for polymorphic enums).
+Applying a variant yields a constructor type carrying tag and arity. Unification
+joins constructors with their parent sum (or applied `Ty::App` for polymorphic
+enums). Distinct tags of the same enum also join at the owner, and binding a
+type variable peels the refinement — so `min(Rank::Mid, Rank::Low)` and
+`[Rank::Low, Rank::Mid]` type-check as the parent enum without annotations.
 
 ---
 
@@ -362,7 +366,7 @@ Unification is structural (Robinson) with an occurs check.
 | `Ty::Array` | `Ty::Array` | Unify elements; lengths compatible if either is `Dynamic` or both `Static` with same N |
 | `Ty::Record` | `Ty::Record` | Same fields (sorted by name); unify each field type |
 | `Ty::Sum` | `Ty::Sum` | Same enum name; same variant names, shapes, arities; unify payload types |
-| `Ty::Constructor` | `Ty::Sum` / other constructor | Tag, arity, owner must match |
+| `Ty::Constructor` | `Ty::Sum` / other constructor | Owner must unify; distinct tags of the same enum join at the parent (refinements peel when binding a `Ty::Var`) |
 | `Ty::Var` | anything | Bind variable (if occurs check passes) |
 | Otherwise | | `Type mismatch` error |
 
