@@ -62,6 +62,10 @@ impl SymbolIndex {
         self.definitions.values().flatten()
     }
 
+    pub fn all_reference_sites(&self) -> impl Iterator<Item = &RefSite> {
+        self.references.values().flatten()
+    }
+
     fn collect_definitions(&mut self, file: &PathBuf, source: &str, expression: &Output<'_>) {
         let Expression::Program(items) = expression.1.as_ref() else {
             return;
@@ -82,10 +86,19 @@ impl SymbolIndex {
                 _ => continue,
             };
             let range = span.start..span.end;
-            let name_start = source[range.clone()]
-                .find(name)
-                .map(|offset| range.start + offset)
-                .unwrap_or(range.start);
+            // `use path as alias` spans the whole import; prefer the rightmost
+            // name match so aliases like `out` are not bound to `stdout`.
+            let name_start = if matches!(expression.as_ref(), Expression::Use { .. }) {
+                source[range.clone()]
+                    .rfind(name)
+                    .map(|offset| range.start + offset)
+                    .unwrap_or(range.start)
+            } else {
+                source[range.clone()]
+                    .find(name)
+                    .map(|offset| range.start + offset)
+                    .unwrap_or(range.start)
+            };
             let definition = SymbolDef {
                 name: name.to_owned(),
                 kind,
@@ -458,5 +471,50 @@ fn main() {
         let defs = idx.definitions("stdout");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].kind, SymbolKind::Namespace);
+    }
+
+    #[test]
+    fn use_alias_name_range_skips_path_substring() {
+        let source = "use io::stdout as out;\nfn main() { return; }\n";
+        let idx = index(source);
+        let defs = idx.definitions("out");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(&source[defs[0].name_range.clone()], "out");
+        assert!(
+            defs[0].name_range.start > source.find("stdout").expect("path"),
+            "alias span must not point at the `out` inside `stdout`"
+        );
+    }
+
+    #[test]
+    fn all_reference_sites_flattens_every_name() {
+        let source = "\
+fn fib(int n) -> int {
+    return fib(n - 1);
+}
+fn main() {
+    fib(10);
+    return;
+}
+";
+        let idx = index(source);
+        let per_name = idx.references("fib").len() + idx.references("n").len();
+        let flattened: Vec<_> = idx.all_reference_sites().collect();
+        assert!(
+            flattened.len() >= per_name,
+            "flattened sites should include every named reference"
+        );
+        assert_eq!(
+            flattened.iter().filter(|site| site.name == "fib").count(),
+            idx.references("fib").len()
+        );
+        assert_eq!(
+            flattened.iter().filter(|site| site.name == "n").count(),
+            idx.references("n").len()
+        );
+        assert!(
+            !flattened.is_empty(),
+            "expected reference sites from recursive + main call"
+        );
     }
 }
