@@ -3567,12 +3567,20 @@ impl Checker {
                         return dst_ty;
                     }
                     if Self::is_string_ty(&src_ty) {
+                        // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
+                        // `[byte; N]` still requires a literal (length known).
+                        if matches!(
+                            Self::is_byte_array_ty(&dst_ty),
+                            Some(crate::typechecking::ty::ArrayLength::Dynamic)
+                        ) {
+                            return dst_ty;
+                        }
                         return self.error_with_help(
                             ErrorCode::TypeMismatch,
-                            "cannot cast `string` to byte array".to_string(),
+                            "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
                             range,
                             Some(
-                                "only a string literal coerces to `[byte]` / `[byte; N]` (e.g. `\"hi\" as [byte]`)"
+                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]`"
                                     .to_string(),
                             ),
                         );

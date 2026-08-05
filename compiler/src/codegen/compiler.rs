@@ -11137,6 +11137,31 @@ impl Compiler {
                 // Payload left on stack for the caller (e.g. StorePop).
             }
             Expression::Cast(expr, ty_ann) => {
+                use crate::typechecking::subst::apply_ty_prune;
+                use crate::typechecking::ty::{ArrayLength, Ty};
+
+                let dst_ty = self
+                    .checker
+                    .lookup_for_codegen_span(span.start, span.end)
+                    .map(|ty| apply_ty_prune(self.checker.subst(), &ty));
+                let src_ty = self.codegen_expr_ty(expr);
+                let string_to_bytes = matches!(
+                    (src_ty.as_ref(), dst_ty.as_ref()),
+                    (
+                        Some(Ty::Con(s)),
+                        Some(Ty::Array {
+                            element,
+                            length: ArrayLength::Dynamic,
+                            ..
+                        })
+                    ) if s == "string"
+                        && matches!(element.as_ref(), Ty::Con(n) if n == "byte")
+                );
+                if string_to_bytes {
+                    self.emit_host_native_invoke("to_bytes", std::slice::from_ref(expr));
+                    return bytecode;
+                }
+
                 bytecode.append(&mut self.do_compile(expr));
                 let src_ty = self.codegen_expr_ty(expr);
                 let dst_name = primitive_name_from_type_ann(ty_ann);
