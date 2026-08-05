@@ -34,8 +34,8 @@ test("nested prelude math host invokes") {
 test("prelude math preserves IEEE exceptional values") {
     let sqrt_nan = sqrt(0.0 - 1.0);
     let ln_nan = ln(0.0 - 1.0);
-    assert(sqrt_nan != sqrt_nan)?;
-    assert(ln_nan != ln_nan)?;
+    assert(!(sqrt_nan < 0.0) && !(sqrt_nan >= 0.0))?;
+    assert(!(ln_nan < 0.0) && !(ln_nan >= 0.0))?;
     assert(ln(0.0) < 0.0 - 1000000.0)?;
     assert(exp(1000.0) > 1000000.0)?;
     assert(pow(0.0, 0.0 - 1.0) > 1000000.0)?;

@@ -5344,8 +5344,20 @@ impl Compiler {
         // advances `emit_idx` past lhs's entire subtree.
         let lhs_ty = self.codegen_expr_ty(lhs);
         let lhs_id = self.checker.id_table().ids().get(self.emit_idx).copied();
-        bytecode.append(&mut self.do_compile(lhs));
-        bytecode.append(&mut self.do_compile(rhs));
+        if self.arg_emits_on_self_bytecode(lhs) || self.arg_emits_on_self_bytecode(rhs) {
+            // HostInvoke results live on the shared operand/local stack. A
+            // second invoke can overwrite the first result before this local
+            // bytecode buffer is appended, so stage both operands immediately.
+            let mut lhs_slot = 0;
+            let mut rhs_slot = 0;
+            self.stage_call_arg_to_temp(lhs, false, &mut lhs_slot);
+            self.stage_call_arg_to_temp(rhs, false, &mut rhs_slot);
+            bytecode.push_load(lhs_slot);
+            bytecode.push_load(rhs_slot);
+        } else {
+            bytecode.append(&mut self.do_compile(lhs));
+            bytecode.append(&mut self.do_compile(rhs));
+        }
         if matches!(
             lhs_ty,
             Some(crate::typechecking::ty::Ty::Con(ref name))
