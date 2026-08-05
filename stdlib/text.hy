@@ -179,7 +179,13 @@ fn lines(string s) -> Result<[string], string> {
     let start = 0;
     let i = 0;
     while i <= len(b) {
-        if i == len(b) || b[i] == "\n" {
+        let at_separator = i == len(b);
+        if i < len(b) {
+            if b[i] == "\n" {
+                at_separator = true;
+            }
+        }
+        if at_separator {
             let end = i;
             if end > start {
                 if b[end - 1] == "\r" {

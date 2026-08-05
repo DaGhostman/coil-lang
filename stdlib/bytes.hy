@@ -130,7 +130,13 @@ fn ends_with([byte] buf, [byte] suffix) -> bool {
 
 /// Copy every byte of `src` into a new buffer.
 fn copy([byte] src) -> [byte] {
-    return slice(src, 0, len(src));
+    let out: [byte] = [];
+    let i = 0;
+    while i < len(src) {
+        out[] = src[i];
+        i = i + 1;
+    }
+    return out;
 }
 
 /// Replace all non-overlapping occurrences of `old` with `new`.

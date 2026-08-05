@@ -1,6 +1,6 @@
 // Shared decimal parsing and formatting helpers (pure userland).
 use string::{to_bytes};
-use ascii::{digit_val, digit_char};
+use ascii::{is_digit, digit_val, digit_char};
 
 /// Format an integer in base 10.
 fn int_to_dec(int n) -> string {
@@ -81,11 +81,11 @@ fn parse_float(string s) -> Result<float, string> {
     let value = 0.0;
     let saw_digit = false;
     while i < len(b) {
-        let digit = digit_val(b[i]);
-        if digit < 0 {
+        if !is_digit(b[i]) {
             break;
         }
-        value = value * 10.0 + (digit as float);
+        let whole_digit = digit_val(b[i]);
+        value = value * 10.0 + (whole_digit as float);
         saw_digit = true;
         i = i + 1;
     }
@@ -95,11 +95,11 @@ fn parse_float(string s) -> Result<float, string> {
             i = i + 1;
             let place = 0.1;
             while i < len(b) {
-                let digit = digit_val(b[i]);
-                if digit < 0 {
+                if !is_digit(b[i]) {
                     break;
                 }
-                value = value + (digit as float) * place;
+                let fraction_digit = digit_val(b[i]);
+                value = value + (fraction_digit as float) * place;
                 place = place / 10.0;
                 saw_digit = true;
                 i = i + 1;
@@ -125,11 +125,11 @@ fn parse_float(string s) -> Result<float, string> {
             }
             let exponent_start = i;
             while i < len(b) {
-                let digit = digit_val(b[i]);
-                if digit < 0 {
+                if !is_digit(b[i]) {
                     break;
                 }
-                exponent = exponent * 10 + digit;
+                let exponent_digit = digit_val(b[i]);
+                exponent = exponent * 10 + exponent_digit;
                 i = i + 1;
             }
             if i == exponent_start {
