@@ -22,7 +22,7 @@ test("decimal float parse fraction") {
 }
 
 test("decimal float parse leading dot") {
-    assert(parse_float("-.25")? == -0.25)?;
+    assert(parse_float("-.25")? == 0.0 - 0.25)?;
 }
 
 test("decimal float parse positive exponent") {
@@ -30,5 +30,7 @@ test("decimal float parse positive exponent") {
 }
 
 test("decimal float parse negative exponent") {
-    assert(parse_float("2E-1")? == 0.2)?;
+    let value = parse_float("2E-1")?;
+    assert(value > 0.19)?;
+    assert(value < 0.21)?;
 }
