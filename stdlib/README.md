@@ -11,7 +11,7 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 | `bytes` | `use bytes::*;` | `[byte]` slice / concat / find / replace / pad / eq |
 | `text` | `use text::*;` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::*;` | `sort` / `reverse` / `collect_ints` (range → array) |
-| `num` | `use num::*;` | Numeric conveniences (`abs`, min/max, clamp, `round`, `pow_int`) |
+| `num` | `use num::*;` | Numeric conveniences (`abs`/`min`/`max`/`clamp` overloads, `round`, `pow_int`) |
 | `random` | `use random::*;` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::*;` | `join` / `dirname` / `basename` / `extension` |
 | `json` | `use json::*;` | Minimal JSON parse / stringify |

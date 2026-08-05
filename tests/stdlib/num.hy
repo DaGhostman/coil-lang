@@ -1,17 +1,17 @@
 use num::*;
 
 test("abs min max") {
-    assert(abs_int(0 - 5) == 5)?;
+    assert(abs(0 - 5) == 5)?;
     assert(abs(0.0 - 2.5) == 2.5)?;
-    assert(min_int(3, 1) == 1)?;
-    assert(max_int(3, 1) == 3)?;
+    assert(min(3, 1) == 1)?;
+    assert(max(3, 1) == 3)?;
     assert(min(3.0, 1.0) == 1.0)?;
     assert(max(3.0, 1.0) == 3.0)?;
 }
 
 test("pow_int clamp round") {
     assert(pow_int(2, 8) == 256)?;
-    assert(clamp_int(5, 0, 3) == 3)?;
+    assert(clamp(5, 0, 3) == 3)?;
     assert(clamp(5.0, 0.0, 3.0) == 3.0)?;
     assert(round(3.6) == 4.0)?;
     assert(round(0.0 - 3.6) == 0.0 - 4.0)?;

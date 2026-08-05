@@ -1,7 +1,10 @@
 // Scalar numeric helpers not provided by auto-imported `prelude::math`.
 // Named `num` so workspace `examples/src/math.hy` does not shadow this module.
+//
+// Same-arity overloads (`abs(int)` / `abs(float)`) are selected by argument type.
+// Integer `pow` stays `pow_int` so `use num::*` does not shadow prelude `pow(float, float)`.
 
-fn abs_int(int x) -> int {
+fn abs(int x) -> int {
     if x < 0 {
         return 0 - x;
     }
@@ -18,14 +21,14 @@ fn abs(float x) -> float {
     return 0.0 - x;
 }
 
-fn min_int(int a, int b) -> int {
+fn min(int a, int b) -> int {
     if a < b {
         return a;
     }
     return b;
 }
 
-fn max_int(int a, int b) -> int {
+fn max(int a, int b) -> int {
     if a > b {
         return a;
     }
@@ -58,11 +61,11 @@ fn clamp(float x, float lo, float hi) -> float {
     return min(max(x, lo), hi);
 }
 
-fn clamp_int(int x, int lo, int hi) -> int {
-    return min_int(max_int(x, lo), hi);
+fn clamp(int x, int lo, int hi) -> int {
+    return min(max(x, lo), hi);
 }
 
-/// Integer power `base ** exp` for `exp >= 0`. Negative exp → treat as 0 result via empty loop when exp==0; callers should pass non-negative.
+/// Integer power `base ** exp` for `exp >= 0`.
 fn pow_int(int base, int exp) -> int {
     let r = 1;
     let i = 0;
