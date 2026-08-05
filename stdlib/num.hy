@@ -1,7 +1,8 @@
 // Scalar numeric helpers not provided by auto-imported `prelude::math`.
 // Named `num` so workspace `examples/src/math.hy` does not shadow this module.
 //
-// Same-arity overloads (`abs(int)` / `abs(float)`) are selected by argument type.
+// `abs` stays type-overloaded (numeric / negation, not Ord).
+// `min` / `max` / `clamp` are generic over `Ord` (int, float, and derived orders).
 // Integer `pow` stays `pow_int` so `use num::*` does not shadow prelude `pow(float, float)`.
 
 fn abs(int x) -> int {
@@ -21,28 +22,14 @@ fn abs(float x) -> float {
     return 0.0 - x;
 }
 
-fn min(int a, int b) -> int {
+fn min<T: Ord>(T a, T b) -> T {
     if a < b {
         return a;
     }
     return b;
 }
 
-fn max(int a, int b) -> int {
-    if a > b {
-        return a;
-    }
-    return b;
-}
-
-fn min(float a, float b) -> float {
-    if a < b {
-        return a;
-    }
-    return b;
-}
-
-fn max(float a, float b) -> float {
+fn max<T: Ord>(T a, T b) -> T {
     if a > b {
         return a;
     }
@@ -57,11 +44,7 @@ fn round(float x) -> float {
     return ceil(x - 0.5);
 }
 
-fn clamp(float x, float lo, float hi) -> float {
-    return min(max(x, lo), hi);
-}
-
-fn clamp(int x, int lo, int hi) -> int {
+fn clamp<T: Ord>(T x, T lo, T hi) -> T {
     return min(max(x, lo), hi);
 }
 

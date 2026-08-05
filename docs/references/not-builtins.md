@@ -13,7 +13,7 @@ Still not provided as **compiler builtins** (HostInvoke / opcodes):
 | String ops | slice, trim, split, replace, lines | `text::*` (byte-oriented) |
 | Bytes ops | find, replace, pad, repeat | `bytes::*` |
 | ASCII / parse | digit classify; `parse_int` / `int_to_dec` | `ascii::*`, `conv::*` |
-| Numeric conveniences | `abs`, `round`, casual `random` | `num::*`, `random::*` (`sin` / `sqrt` / `pow` are auto-imported from `prelude::math`) |
+| Numeric conveniences | `abs`, `round`, casual `random` | `num::*` (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `sin` / `sqrt` / `pow` are auto-imported from `prelude::math`), `random::*` |
 | High-level file helpers | whole-file read/write | `io::file::*` |
 | HTTP | — | `http::client` (userland; TLS via virtual `io::net::tls`) |
 | Memory | `alloc`, `free` | `gc::Root` / `gc::Weak` |
