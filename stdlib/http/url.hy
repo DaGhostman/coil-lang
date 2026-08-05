@@ -1,5 +1,4 @@
 // URL parse for the HTTP client (byte-scan; no string slice/index).
-// Note: avoid `x < 0` — use explicit sentinels with `==` (coil int compare quirk).
 use io::*;
 
 enum HttpError {

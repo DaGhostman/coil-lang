@@ -20,7 +20,6 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 ## Notes
 
 - Prefer **byte offsets** for `text::slice` / `find` (mid-codepoint slices error on decode).
-- Coil compares: avoid `x < 0` for int sentinels — APIs use `== (0 - 1)` where needed.
 - `json` enum constructors are globally unique (`JsonNull`, …); prefer `json_int` /
   `json_object` helpers. Glob `use json::*` imports functions; construct via helpers.
 - `num` is named so workspace `examples/src/math.hy` does not shadow it.

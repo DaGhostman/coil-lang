@@ -55,7 +55,7 @@ Single compilation path: stack codegen in `compiler/src/lib.rs` — no register 
 3. **Reject benchmark-shaped opcodes** unless pattern is universal (see AGENTS.md user preferences).
 4. **New language features** — full HM integration + `docs/` updates + minimal runnable example.
 
-`STORE` vs deprecated `StorePop`: compiler emits `STORE` only. Match bindings skip store (value already in slot via `UNPACK`/`JUMP_IF_MATCH`).
+`STORE` vs deprecated `StorePop`: compiler emits `STORE` only. Match bindings skip store (value already in slot via `UNPACK`/`JUMP_IF_MATCH`) but codegen must reserve those slots in `variables` so arm-body temps cannot clobber them.
 
 Stack IL: symbolic labels until `finalize_bytecode` → single `il::lower` after concat (not per-function lower). See [reference.md](reference.md) and `docs/internals/pipeline.md`.
 

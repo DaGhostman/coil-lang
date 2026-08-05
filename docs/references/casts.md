@@ -8,6 +8,8 @@ Narrowing conversions between `int`, `float`, `byte`, and `bool` (wrapping/trunc
 
 Examples: `n as byte`, `f as int`, `flag as bool`. The same matrix is available via `Into` (`n.into()` when the target type is known). See `examples/casts.hy`.
 
+`as` is a Pratt **postfix** operator (see [Operators](operators.md)): it binds tighter than arithmetic and assignment, so `c = m as byte` means `c = (m as byte)`, and `1 + 2 as float` means `1 + (2 as float)`.
+
 ---
 
 ## Related
