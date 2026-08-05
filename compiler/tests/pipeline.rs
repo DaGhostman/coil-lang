@@ -4025,6 +4025,30 @@ fn main() {
 }
 
 #[test]
+fn example_gc_collect_clears_weak() {
+    assert_eq!(run_example("examples/gc_collect.hy"), "none");
+}
+
+#[test]
+fn gc_heap_bytes_is_nonnegative() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    let _ = root([1, 2, 3, 4]);
+    let n = heap_bytes();
+    write_all(stdout(), to_bytes(format("%z", n >= 0)));
+}
+"#,
+    );
+    assert_eq!(output, "true");
+}
+
+#[test]
 fn thread_channel_close_try_recv_is_disconnected() {
     let output = run_example_src(
         r#"

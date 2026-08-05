@@ -1804,6 +1804,17 @@ Native threads via `use thread::*;` — each worker runs on its own VM. See [Tut
 
 ---
 
+### `examples/gc_collect.hy`
+
+**Demonstrates:** `unroot` + `collect` clears a `Weak` (upgrade → `None`).
+
+| | |
+|---|---|
+| **Run** | `cargo run --bin coil -- examples/gc_collect.hy` |
+| **Output** | `none` |
+
+---
+
 ### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
@@ -1961,6 +1972,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `dict.hy` | Collections | `4210042` |
 | `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
 | `gc_root_weak.hy` | GC | `pinned\npinned` |
+| `gc_collect.hy` | GC | `none` |
 | `aliases.hy` | Types | `347` |
 | `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |
