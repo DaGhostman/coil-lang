@@ -30,9 +30,12 @@ test("rfind and replace") {
     ))?;
 }
 
-test("repeat and padding") {
+test("repeat bytes") {
     assert(eq(repeat(to_bytes("ab"), 3), to_bytes("ababab")))?;
     assert(eq(repeat(to_bytes("ab"), 0), to_bytes("")))?;
+}
+
+test("pad bytes") {
     assert(eq(pad_left(to_bytes("7"), 3, "0"), to_bytes("007")))?;
     assert(eq(pad_right(to_bytes("7"), 3, "0"), to_bytes("700")))?;
     assert(eq(pad_left(to_bytes("wide"), 2, "0"), to_bytes("wide")))?;

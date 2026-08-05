@@ -17,9 +17,18 @@ test("invalid decimal integer") {
     assert(failed)?;
 }
 
-test("decimal float parse") {
+test("decimal float parse fraction") {
     assert(parse_float("12.5")? == 12.5)?;
+}
+
+test("decimal float parse leading dot") {
     assert(parse_float("-.25")? == -0.25)?;
+}
+
+test("decimal float parse positive exponent") {
     assert(parse_float("1.5e2")? == 150.0)?;
+}
+
+test("decimal float parse negative exponent") {
     assert(parse_float("2E-1")? == 0.2)?;
 }

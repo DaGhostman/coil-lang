@@ -44,15 +44,25 @@ test("replace split once and join") {
     assert(join(parts, "::") == "a::b::c")?;
 }
 
-test("repeat and pad") {
+test("repeat text") {
     assert(repeat("ab", 3) == "ababab")?;
     assert(repeat("ab", -1) == "")?;
+}
+
+test("pad text") {
     assert(pad_left("7", 3, "0")? == "007")?;
     assert(pad_right("7", 3, "0")? == "700")?;
     assert(pad_right("wide", 2, "0")? == "wide")?;
 }
 
-test("lines handles lf and crlf") {
+test("lines handles crlf") {
+    let rows = lines("a\r\nb")?;
+    assert(len(rows) == 2)?;
+    assert(rows[0] == "a")?;
+    assert(rows[1] == "b")?;
+}
+
+test("lines preserves trailing empty line") {
     let rows = lines("a\r\nb\n")?;
     assert(len(rows) == 3)?;
     assert(rows[0] == "a")?;
