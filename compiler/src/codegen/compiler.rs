@@ -2251,13 +2251,14 @@ impl Compiler {
                         return true;
                     }
                     if let Some(kind) = self.checker.prelude_fn_in_scope(fname) {
-                        return matches!(
-                            kind,
-                            crate::typechecking::PreludeFn::Ord
-                                | crate::typechecking::PreludeFn::Char
-                                | crate::typechecking::PreludeFn::Assert
-                                | crate::typechecking::PreludeFn::BlockOn
-                        );
+                        return kind.math_native_name().is_some()
+                            || matches!(
+                                kind,
+                                crate::typechecking::PreludeFn::Ord
+                                    | crate::typechecking::PreludeFn::Char
+                                    | crate::typechecking::PreludeFn::Assert
+                                    | crate::typechecking::PreludeFn::BlockOn
+                            );
                     }
                     if self.checker.ffi_fn_in_scope(fname).is_some() {
                         return true;
@@ -8265,6 +8266,20 @@ impl Compiler {
                         crate::typechecking::PreludeFn::Ord
                         | crate::typechecking::PreludeFn::Char => {
                             self.emit_prelude_host_call(arg_slice, kind.as_str());
+                        }
+                        crate::typechecking::PreludeFn::Sin
+                        | crate::typechecking::PreludeFn::Cos
+                        | crate::typechecking::PreludeFn::Tan
+                        | crate::typechecking::PreludeFn::Sqrt
+                        | crate::typechecking::PreludeFn::Floor
+                        | crate::typechecking::PreludeFn::Ceil
+                        | crate::typechecking::PreludeFn::Exp
+                        | crate::typechecking::PreludeFn::Ln
+                        | crate::typechecking::PreludeFn::Pow => {
+                            self.emit_prelude_host_call(
+                                arg_slice,
+                                kind.math_native_name().expect("scalar math native"),
+                            );
                         }
                     }
                     return bytecode;

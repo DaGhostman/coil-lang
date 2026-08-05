@@ -3022,6 +3022,15 @@ impl Checker {
                         PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
                         PreludeFn::Ord => self.infer_ord(arg_slice, range),
                         PreludeFn::Char => self.infer_char(arg_slice, range),
+                        PreludeFn::Sin
+                        | PreludeFn::Cos
+                        | PreludeFn::Tan
+                        | PreludeFn::Sqrt
+                        | PreludeFn::Floor
+                        | PreludeFn::Ceil
+                        | PreludeFn::Exp
+                        | PreludeFn::Ln
+                        | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
                     };
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
@@ -6755,6 +6764,43 @@ impl Checker {
         let b_ty = self.infer(&args[0]);
         self.unify(&b_ty, &byte(), &args[0].0.into_range(), "char argument");
         result_app_ty(string(), string())
+    }
+
+    /// Scalar `prelude::math` natives: unary `float -> float`, or `pow(float, float) -> float`.
+    fn infer_math(&mut self, kind: PreludeFn, args: &[Output], range: Range<usize>) -> Ty {
+        let expected_arity = if kind == PreludeFn::Pow { 2 } else { 1 };
+        if args.len() != expected_arity {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!(
+                    "{} expects {} argument{}, got {}",
+                    kind.as_str(),
+                    expected_arity,
+                    if expected_arity == 1 { "" } else { "s" },
+                    args.len()
+                ),
+                range,
+                Some(format!(
+                    "use `{}({})` with float arguments",
+                    kind.as_str(),
+                    if expected_arity == 1 { "x" } else { "base, exponent" }
+                )),
+            );
+        }
+
+        for arg in args {
+            let arg_ty = self.infer(arg);
+            self.unify(
+                &arg_ty,
+                &float(),
+                &arg.0.into_range(),
+                &format!("{} argument", kind.as_str()),
+            );
+        }
+        float()
     }
 
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
