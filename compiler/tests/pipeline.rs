@@ -3996,6 +3996,35 @@ fn example_thread_mutex_prints_2() {
 }
 
 #[test]
+fn example_gc_root_weak_prints_pinned() {
+    let output = run_example("examples/gc_root_weak.hy");
+    assert_eq!(output, "pinned\npinned");
+}
+
+#[test]
+fn gc_upgrade_some_while_rooted() {
+    let output = run_example_src(
+        r#"
+use gc::*;
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+fn main() {
+    let r = root([7, 8]);
+    let w = weak(get(r));
+    let out = match upgrade(w) {
+        Option::Some(_) => "some",
+        Option::None => "none",
+    };
+    write_all(stdout(), to_bytes(out));
+}
+"#,
+    );
+    assert_eq!(output, "some");
+}
+
+#[test]
 fn thread_channel_close_try_recv_is_disconnected() {
     let output = run_example_src(
         r#"

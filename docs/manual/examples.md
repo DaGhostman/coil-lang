@@ -1793,6 +1793,17 @@ Native threads via `use thread::*;` — each worker runs on its own VM. See [Tut
 
 ---
 
+### `examples/gc_root_weak.hy`
+
+**Demonstrates:** Virtual `gc` module — `root` / `get` / `weak` / `upgrade` / `unroot`.
+
+| | |
+|---|---|
+| **Run** | `cargo run --bin coil -- examples/gc_root_weak.hy` |
+| **Output** | `pinned` then `pinned` on the next line |
+
+---
+
 ### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
@@ -1949,6 +1960,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
 | `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
+| `gc_root_weak.hy` | GC | `pinned\npinned` |
 | `aliases.hy` | Types | `347` |
 | `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |

@@ -10,7 +10,7 @@ There is **no general standard library** yet. The following are **not** built-in
 | High-level file helpers | path utilities beyond `io::open` / `read_to_end` / `write_all` |
 | HTTP / TLS | Not in the VM (use userland on top of `io` TCP later) |
 | Concurrency | — (use virtual **`thread`** module for OS threads; coroutines via `async` / `yield` / `resume` / `done` — see [Tutorial 11](../manual/tutorial/11-threads.md) and [Tutorial 08](../manual/tutorial/08-coroutines.md)) |
-| Memory | `alloc`, `free` |
+| Memory | `alloc`, `free` (use `gc::Root` / `gc::Weak` for GC pins — see [gc](gc.md)) |
 
 Use **`io`** for streams, **FFI** for C libraries, or **host natives** when embedding the VM in Rust.
 
