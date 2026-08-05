@@ -9,7 +9,7 @@ use super::kind::Kind;
 use super::subst::Subst;
 use super::ty::{Ty, TyVarId};
 use super::unify::unify_with;
-use super::virtual_modules::{PRELUDE_MATH_MODULE, PRELUDE_MODULE, PRELUDE_OPS_MODULE};
+use super::virtual_modules::{GC_MODULE, PRELUDE_MATH_MODULE, PRELUDE_MODULE, PRELUDE_OPS_MODULE};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -256,6 +256,12 @@ impl Generics {
         self.generic_type_ctors
             .insert(common::BUILTIN_MATRIX_TYPE.into(), vec!["T".into()]);
         self.register_nominal_type(common::BUILTIN_MATRIX_TYPE, PRELUDE_MATH_MODULE);
+        self.generic_type_ctors
+            .insert(common::BUILTIN_ROOT_TYPE.into(), vec!["T".into()]);
+        self.register_nominal_type(common::BUILTIN_ROOT_TYPE, GC_MODULE);
+        self.generic_type_ctors
+            .insert(common::BUILTIN_WEAK_TYPE.into(), vec!["T".into()]);
+        self.register_nominal_type(common::BUILTIN_WEAK_TYPE, GC_MODULE);
     }
 
     pub fn register_nominal_type(&mut self, name: &str, module: &str) {
