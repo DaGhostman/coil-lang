@@ -10,7 +10,9 @@ Still not provided as **compiler builtins** (HostInvoke / opcodes):
 | Category | Examples | Userland alternative |
 |----------|----------|----------------------|
 | Collections API | `sort`; range→array materialize | `collections::{sort,collect_ints}` |
-| String ops | slice, trim, split | `text::*` (byte-oriented) |
+| String ops | slice, trim, split, replace, lines | `text::*` (byte-oriented) |
+| Bytes ops | find, replace, pad, repeat | `bytes::*` |
+| ASCII / parse | digit classify; `parse_int` / `int_to_dec` | `ascii::*`, `conv::*` |
 | Numeric conveniences | `abs`, `round`, casual `random` | `num::*`, `random::*` (`sin` / `sqrt` / `pow` are auto-imported from `prelude::math`) |
 | High-level file helpers | whole-file read/write | `io::file::*` |
 | HTTP | — | `http::client` (userland; TLS via virtual `io::net::tls`) |

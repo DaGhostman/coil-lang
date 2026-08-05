@@ -6,7 +6,9 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 
 | Module | Import | Role |
 |--------|--------|------|
-| `bytes` | `use bytes::*;` | `[byte]` slice / concat / find / eq / affixes |
+| `ascii` | `use ascii::*;` | ASCII classify / decimal digit helpers |
+| `conv` | `use conv::*;` | `int_to_dec` / `parse_int` / `parse_float` |
+| `bytes` | `use bytes::*;` | `[byte]` slice / concat / find / replace / pad / eq |
 | `text` | `use text::*;` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::*;` | `sort` / `reverse` / `collect_ints` (range → array) |
 | `num` | `use num::*;` | Numeric conveniences (`abs`, min/max, clamp, `round`, `pow_int`) |
