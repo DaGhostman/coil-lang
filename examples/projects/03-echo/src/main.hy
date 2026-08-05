@@ -7,10 +7,14 @@
 
 use io::*;
 use io::net::tcp::*;
-use io::sync::*;
-use protocol::*;
-use server::*;
-use client::*;
+use io::sync::{accept_wait, read_exact, write_all};
+
+use protocol::{encode_frame, payload_eq};
+
+use server::{echo_reply};
+
+use client::{client_port, request_body};
+
 use string::*;
 
 async fn greeting_bytes() {

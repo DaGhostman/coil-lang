@@ -1,7 +1,8 @@
 // 04-http — stdlib HTTP/1.1 client against a local cleartext server.
 //
 // Expected output: ok
-use http::client::*;
+use http::client::{get};
+
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};

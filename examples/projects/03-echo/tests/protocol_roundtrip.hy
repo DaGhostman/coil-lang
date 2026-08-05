@@ -1,5 +1,5 @@
 // Pure unit test: protocol encode/decode (no sockets).
-use protocol::*;
+use protocol::{encode_frame, frame_len, payload_eq};
 
 test("encode frame length") {
     let body: [byte] = [65, 66];

@@ -1,7 +1,7 @@
 // Unit test: advancing a task moves Todo -> Doing -> Done.
 // Bind `board[i]` before `.status` — chained index+field in `assert` has
 // been flaky under the test harness.
-use board::*;
+use board::{add_task, advance_task, count_done, empty_board};
 
 test("advance moves Todo to Doing to Done") {
     let b = empty_board();

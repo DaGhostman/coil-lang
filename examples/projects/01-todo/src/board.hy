@@ -1,4 +1,4 @@
-// Todo board logic — imported by main and by tests via `use board::*;`.
+// Todo board logic — imported by main and by tests via `use board::{…}`.
 //
 // Status is an int (0=Todo, 1=Doing, 2=Done): comparing an enum field on a
 // class instance (`t.status == Status::Todo`) has crashed the VM in the past.

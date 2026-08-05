@@ -3,7 +3,7 @@
 ## What it shows
 
 In-memory todo board: classes, arrays/`push`/`len`, status ints, format/print,
-and a sibling module imported via `use board::*;`.
+and a sibling module imported via `use board::{…}`.
 
 ## Run
 

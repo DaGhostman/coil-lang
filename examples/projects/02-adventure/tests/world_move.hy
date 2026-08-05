@@ -1,5 +1,13 @@
 // Pure unit test: room graph movement (no stdin / REPL).
-use world::*;
+use world::{
+    key_here,
+    move_ok,
+    new_player,
+    player_has_key,
+    player_room,
+    try_move,
+    try_take_key,
+};
 
 test("start in Hall and move to Library") {
     let p = new_player();

@@ -18,7 +18,8 @@
 // Smoke: client enable on a non-TCP stream → Err (InvalidInput).
 use io::*;
 use io::net::tls::client::*;
-use io::sync::*;
+use io::sync::{write_all};
+
 use string::*;
 
 fn main() {
