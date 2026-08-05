@@ -1,4 +1,4 @@
-use collections::*;
+use collections::{sort, reverse, collect_ints, collect_ints_inclusive};
 
 test("sort reverse collect") {
     let a = sort([3, 1, 4, 1, 5]);

@@ -1,4 +1,4 @@
-use conv::*;
+use conv::{int_to_dec, parse_int, parse_float};
 
 test("decimal integer format and parse") {
     assert(int_to_dec(0) == "0")?;

@@ -1,4 +1,4 @@
-use ascii::*;
+use ascii::{is_space, is_digit, is_alpha, digit_val, digit_char};
 
 test("ascii classification") {
     assert(is_space(" "))?;

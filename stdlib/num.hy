@@ -3,7 +3,8 @@
 //
 // `abs` stays type-overloaded (numeric / negation, not Ord).
 // `min` / `max` / `clamp` are generic over `Ord` (int, float, and derived orders).
-// Integer `pow` stays `pow_int` so `use num::*` does not shadow prelude `pow(float, float)`.
+// Integer power stays `pow_int` until prelude `pow(float, float)` joins the
+// same overload family (prelude still special-cases bare `pow`).
 
 fn abs(int x) -> int {
     if x < 0 {

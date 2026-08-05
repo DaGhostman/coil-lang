@@ -1,4 +1,6 @@
-use json::*;
+use json::{
+    parse, stringify, json_int, json_object, Json,
+};
 
 test("parse scalars") {
     let v = match parse("null") {

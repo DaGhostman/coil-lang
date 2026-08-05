@@ -1,4 +1,4 @@
-use num::*;
+use num::{abs, min, max, clamp, round, pow_int};
 
 test("abs min max") {
     assert(abs(0 - 5) == 5)?;

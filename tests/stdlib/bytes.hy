@@ -1,4 +1,7 @@
-use bytes::*;
+use bytes::{
+    slice, concat, eq, find, rfind, contains, starts_with, ends_with,
+    replace, repeat, pad_left, pad_right,
+};
 use string::{to_bytes};
 
 test("slice concat eq") {

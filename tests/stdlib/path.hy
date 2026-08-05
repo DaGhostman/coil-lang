@@ -1,4 +1,4 @@
-use path::*;
+use path::{join, dirname, basename, extension, is_absolute};
 
 test("join dirname basename extension") {
     let j = match join("a", "b") {

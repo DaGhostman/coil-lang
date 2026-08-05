@@ -1,4 +1,4 @@
-use io::file::*;
+use io::file::{read_text, write_text, read_bytes, write_bytes};
 use io::fs::{exists, remove_file};
 
 test("read write text roundtrip") {
