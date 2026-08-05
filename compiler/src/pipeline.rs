@@ -52,6 +52,11 @@ pub struct Pipeline {
     processed: Vec<PathBuf>,
     /// FIFO queue of files to process. Drained front-to-back.
     worklist: VecDeque<WorkItem>,
+    /// `use`/`mod` edges: file → modules it depends on (must compile first).
+    /// Built during discovery; used to topo-sort the compile pass. Discovery
+    /// re-enqueues scanned files and can destroy plain LIFO order, so
+    /// `pop_back` alone is not enough (e.g. entry before `io::sync`).
+    module_deps: HashMap<PathBuf, Vec<PathBuf>>,
     /// Native functions registered by the host. The
     /// pipeline tracks these so it can register them
     /// with the typechecker when a native call is
@@ -212,12 +217,13 @@ impl Pipeline {
         self.failed = false;
         self.processed.clear();
         self.worklist.clear();
+        self.module_deps.clear();
         self.entry_file = Some(file.to_path_buf());
         self.enqueue_file(file.to_path_buf());
         self.discover_all();
 
         let mut results = Vec::new();
-        while let Some(item) = self.worklist.pop_back() {
+        for item in self.worklist_in_dependency_order() {
             let source = match self.read_source(&item.file) {
                 Some(source) => source,
                 None => continue,
@@ -363,6 +369,7 @@ impl Pipeline {
             bytecode,
             processed: Vec::new(),
             worklist: VecDeque::new(),
+            module_deps: HashMap::new(),
             natives: Vec::new(),
             host_natives: Vec::new(),
             entry_file: None,
@@ -549,6 +556,7 @@ impl Pipeline {
                             self.manifest
                                 .resolve_use(&self.project_root, &segments, &last)
                         {
+                            self.record_module_dep(parent_file, &file);
                             self.enqueue_file(file);
                         } else {
                             self.emit_module_not_found(
@@ -559,12 +567,14 @@ impl Pipeline {
                             );
                         }
                     } else if let Some(file) = self.manifest.resolve_mod(&self.project_root, "*") {
+                        self.record_module_dep(parent_file, &file);
                         self.enqueue_file(file);
                     } else {
                         self.emit_module_not_found(parent_file, parent_src, use_range, "`use *`");
                     }
                 } else if let Some(file) = self.manifest.resolve_use(&self.project_root, path, name)
                 {
+                    self.record_module_dep(parent_file, &file);
                     self.enqueue_file(file);
                 } else {
                     self.emit_module_not_found(
@@ -577,6 +587,7 @@ impl Pipeline {
             }
             Expression::Module(name, _body) => {
                 if let Some(file) = self.manifest.resolve_mod(&self.project_root, name) {
+                    self.record_module_dep(parent_file, &file);
                     self.enqueue_file(file);
                 } else {
                     self.emit_module_not_found(
@@ -595,6 +606,116 @@ impl Pipeline {
                 }
             }
             _ => (),
+        }
+    }
+
+    /// Record that `from` `use`s/`mod`s `on` (compile `on` first).
+    fn record_module_dep(&mut self, from: &Path, on: &Path) {
+        if from == on {
+            return;
+        }
+        self.module_deps
+            .entry(from.to_path_buf())
+            .or_default()
+            .push(on.to_path_buf());
+    }
+
+    /// Drain the worklist into dependency order (callees before callers).
+    ///
+    /// Discovery's scan/re-enqueue rotation does not preserve LIFO depth, so a
+    /// plain `pop_back` can compile the entry before `io::sync` when another
+    /// module appears first in the entry's `use` list. Kahn topo-sort on the
+    /// recorded `use`/`mod` edges; on cycles, append leftovers with the entry
+    /// last.
+    fn worklist_in_dependency_order(&mut self) -> Vec<WorkItem> {
+        let items: Vec<WorkItem> = self.worklist.drain(..).collect();
+        if items.len() <= 1 {
+            return items;
+        }
+        let path_set: std::collections::HashSet<PathBuf> =
+            items.iter().map(|i| i.file.clone()).collect();
+        let mut remaining: HashMap<PathBuf, usize> = HashMap::new();
+        let mut dependents: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for item in &items {
+            let deps: Vec<PathBuf> = self
+                .module_deps
+                .get(&item.file)
+                .map(|deps| {
+                    deps.iter()
+                        .filter(|d| path_set.contains(*d))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Dedup deps so diamond edges don't inflate the counter.
+            let mut uniq = deps;
+            uniq.sort();
+            uniq.dedup();
+            remaining.insert(item.file.clone(), uniq.len());
+            for d in uniq {
+                dependents
+                    .entry(d)
+                    .or_default()
+                    .push(item.file.clone());
+            }
+        }
+        let entry = self.entry_file.clone();
+        let mut ready: Vec<PathBuf> = remaining
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut order_paths: Vec<PathBuf> = Vec::with_capacity(items.len());
+        while !ready.is_empty() {
+            // Prefer non-entry when several modules are ready so the program
+            // root stays last among otherwise unordered roots.
+            let idx = ready
+                .iter()
+                .position(|p| entry.as_ref() != Some(p))
+                .unwrap_or(0);
+            let p = ready.swap_remove(idx);
+            if let Some(children) = dependents.get(&p) {
+                for child in children {
+                    if let Some(n) = remaining.get_mut(child) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            ready.push(child.clone());
+                        }
+                    }
+                }
+            }
+            order_paths.push(p);
+        }
+        if order_paths.len() < items.len() {
+            for item in &items {
+                if !order_paths.contains(&item.file) {
+                    order_paths.push(item.file.clone());
+                }
+            }
+            if let Some(ref e) = entry {
+                if let Some(i) = order_paths.iter().position(|p| p == e) {
+                    let last = order_paths.remove(i);
+                    order_paths.push(last);
+                }
+            }
+        }
+        let mut by_path: HashMap<PathBuf, WorkItem> =
+            items.into_iter().map(|i| (i.file.clone(), i)).collect();
+        order_paths
+            .into_iter()
+            .filter_map(|p| by_path.remove(&p))
+            .collect()
+    }
+
+    /// Compile every discovered module in dependency order.
+    fn compile_discovered_modules(&mut self) {
+        for item in self.worklist_in_dependency_order() {
+            let is_entry = self
+                .entry_file
+                .as_ref()
+                .map(|e| *e == item.file)
+                .unwrap_or(false);
+            self.compile_file(item, is_entry);
         }
     }
 
@@ -740,8 +861,7 @@ impl Pipeline {
                 }
             };
             // Re-enqueue only after a successful parse so the compile
-            // pass drains the worklist in LIFO order via `pop_back`
-            // (dependencies at the back are compiled first).
+            // pass can topo-sort dependencies ahead of callers.
             self.worklist.push_back(item);
             self.enqueue_uses(&file, src.as_str(), &ast);
             // Only stop when every worklist entry has been
@@ -857,23 +977,10 @@ impl Pipeline {
         // order (dependencies first).
         self.discover_all();
 
-        // Compilation pass: drain the worklist in
-        // REVERSE order (LIFO via `pop_back`). The
-        // `enqueue_file`/`enqueue_uses` ordering
-        // means the LAST enqueued file is the
-        // deepest dependency; popping from the back
-        // gives us dependencies first. This guarantees
-        // that when a file's `use foo::bar;` looks
-        // up `foo::bar` in `self.functions`, the
-        // function is already there.
-        while let Some(item) = self.worklist.pop_back() {
-            let is_entry = self
-                .entry_file
-                .as_ref()
-                .map(|e| *e == item.file)
-                .unwrap_or(false);
-            self.compile_file(item, is_entry);
-        }
+        // Compilation pass: topo-sort on `use`/`mod` edges
+        // (see `worklist_in_dependency_order`). Discovery's
+        // scan rotation invalidates plain LIFO `pop_back`.
+        self.compile_discovered_modules();
 
         if self.failed {
             return;
@@ -952,14 +1059,18 @@ impl Pipeline {
             }
         };
 
+        self.failed = false;
+        self.processed.clear();
+        self.worklist.clear();
+        self.module_deps.clear();
+        self.entry_file = None;
+
         // Discover disk modules (`stdlib/io/sync.hy`, …) referenced by `use`
         // before compiling the in-memory entry — same dependency order as
         // `compile_src_from_file`, without requiring a temp file.
         self.enqueue_uses(path, src, &ast);
         self.discover_all();
-        while let Some(item) = self.worklist.pop_back() {
-            self.compile_file(item, false);
-        }
+        self.compile_discovered_modules();
         if self.failed || self.had_errors() {
             return Err(());
         }
@@ -1005,19 +1116,16 @@ impl Pipeline {
             self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
             machine::env::set_allow_exec(self.manifest.allow_exec);
         }
+        self.failed = false;
+        self.processed.clear();
+        self.worklist.clear();
+        self.module_deps.clear();
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);
 
-        // Discovery + LIFO compile (see `compile`).
+        // Discovery + dependency-ordered compile (see `compile`).
         self.discover_all();
-        while let Some(item) = self.worklist.pop_back() {
-            let is_entry = self
-                .entry_file
-                .as_ref()
-                .map(|e| *e == item.file)
-                .unwrap_or(false);
-            self.compile_file(item, is_entry);
-        }
+        self.compile_discovered_modules();
 
         if self.failed || self.had_errors() {
             return Err(());
@@ -1060,18 +1168,15 @@ impl Pipeline {
             self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
             machine::env::set_allow_exec(self.manifest.allow_exec);
         }
+        self.failed = false;
+        self.processed.clear();
+        self.worklist.clear();
+        self.module_deps.clear();
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);
 
         self.discover_all();
-        while let Some(item) = self.worklist.pop_back() {
-            let is_entry = self
-                .entry_file
-                .as_ref()
-                .map(|e| *e == item.file)
-                .unwrap_or(false);
-            self.compile_file(item, is_entry);
-        }
+        self.compile_discovered_modules();
 
         if self.failed || self.had_errors() {
             return Err(());
