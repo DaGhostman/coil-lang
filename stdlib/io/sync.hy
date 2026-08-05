@@ -1,9 +1,4 @@
 // Blocking IO adapters over L0 + `await_*` (userland; not host natives).
-//
-// Match-arm bodies that start with `let` / `return` / `if` can be parsed as
-// record literals — keep arms to assignments / trailing expressions, then
-// branch after the match. Avoid nested `match` on `Option` inside a
-// `Result::Ok` arm (bindings may not apply); unwrap or match Option outside.
 use io::{
     read,
     write,
@@ -27,33 +22,22 @@ fn write_all(Stream s, [byte] buf) -> Result<int, IoError> {
             rest[] = buf[i];
             i = i + 1;
         }
-        let nwritten = 0;
-        let got_ok = 0;
-        let got_wb = 0;
         match write(s, rest) {
             Result::Ok(n) => {
-                got_ok = 1;
-                nwritten = n;
+                if n == 0 {
+                    wait_writable(s)?;
+                }
+                if n != 0 {
+                    offset = offset + n;
+                }
             },
             Result::Err(IoError::WouldBlock) => {
-                got_wb = 1;
+                wait_writable(s)?;
             },
             Result::Err(e) => {
-                got_ok = 0;
                 raise e;
             },
         };
-        if got_wb == 1 {
-            wait_writable(s)?;
-        }
-        if got_ok == 1 {
-            if nwritten == 0 {
-                wait_writable(s)?;
-            }
-            if nwritten != 0 {
-                offset = offset + nwritten;
-            }
-        }
     }
     return 0;
 }
@@ -69,36 +53,27 @@ fn read_exact(Stream s, [byte] buf) -> Result<Option<int>, IoError> {
             scratch[] = 0;
             i = i + 1;
         }
-        // `?` propagates WouldBlock; callers that need wait should retry.
-        // Prefer this over nested Result/Option matches (bindings can misfire).
-        let rr = read(s, scratch)?;
-        let is_none = 0;
-        let nread = 0;
-        match rr {
+        match read(s, scratch)? {
             Option::None => {
-                is_none = 1;
+                if filled == 0 {
+                    return Option::None;
+                }
+                return Option::Some(filled);
             },
             Option::Some(n) => {
-                nread = n;
+                if n == 0 {
+                    wait_readable(s)?;
+                }
+                if n != 0 {
+                    let j = 0;
+                    while j < n {
+                        buf[filled + j] = scratch[j];
+                        j = j + 1;
+                    }
+                    filled = filled + n;
+                }
             },
         };
-        if is_none == 1 {
-            if filled == 0 {
-                return Option::None;
-            }
-            return Option::Some(filled);
-        }
-        if nread == 0 {
-            wait_readable(s)?;
-        }
-        if nread != 0 {
-            let j = 0;
-            while j < nread {
-                buf[filled + j] = scratch[j];
-                j = j + 1;
-            }
-            filled = filled + nread;
-        }
     }
     return Option::Some(filled);
 }
@@ -106,107 +81,78 @@ fn read_exact(Stream s, [byte] buf) -> Result<Option<int>, IoError> {
 fn read_to_end(Stream s) -> Result<[byte], IoError> {
     let acc: [byte] = [];
     let chunk_size = 256;
-    let done = 0;
-    while done == 0 {
+    let done = false;
+    while !done {
         let scratch: [byte] = [];
         let i = 0;
         while i < chunk_size {
             scratch[] = 0;
             i = i + 1;
         }
-        let rr = read(s, scratch)?;
-        let is_none = 0;
-        let nread = 0;
-        match rr {
+        match read(s, scratch)? {
             Option::None => {
-                is_none = 1;
+                done = true;
             },
             Option::Some(n) => {
-                nread = n;
+                if n == 0 {
+                    wait_readable(s)?;
+                }
+                if n != 0 {
+                    let j = 0;
+                    while j < n {
+                        acc[] = scratch[j];
+                        j = j + 1;
+                    }
+                }
             },
         };
-        if is_none == 1 {
-            done = 1;
-        }
-        if is_none == 0 {
-            if nread == 0 {
-                wait_readable(s)?;
-            }
-            if nread != 0 {
-                let j = 0;
-                while j < nread {
-                    acc[] = scratch[j];
-                    j = j + 1;
-                }
-            }
-        }
     }
     return acc;
 }
 
 fn accept_wait(Stream listener) -> Result<Stream, IoError> {
-    let done = 0;
+    let done = false;
     let out = listener;
-    while done == 0 {
-        let got = 0;
-        let got_wb = 0;
+    while !done {
         match accept(listener) {
             Result::Ok(s) => {
                 out = s;
-                got = 1;
+                done = true;
             },
             Result::Err(IoError::WouldBlock) => {
-                got_wb = 1;
+                wait_readable(listener)?;
             },
             Result::Err(e) => {
-                got = 0;
                 raise e;
             },
         };
-        if got == 1 {
-            done = 1;
-        }
-        if got_wb == 1 {
-            wait_readable(listener)?;
-        }
     }
     return out;
 }
 
 fn recv_from_wait(Stream s, [byte] buf) -> Result<(int, string, int), IoError> {
-    let done = 0;
+    let done = false;
     let out_n = 0;
     let out_host = "";
     let out_port = 0;
-    while done == 0 {
-        let got = 0;
-        let got_wb = 0;
+    while !done {
         match recv_from(s, buf) {
             Result::Ok(t) => {
                 out_n = t[0];
                 out_host = t[1];
                 out_port = t[2];
-                got = 1;
+                done = true;
             },
             Result::Err(IoError::WouldBlock) => {
-                got_wb = 1;
+                wait_readable(s)?;
             },
             Result::Err(e) => {
-                got = 0;
                 raise e;
             },
         };
-        if got == 1 {
-            done = 1;
-        }
-        if got_wb == 1 {
-            wait_readable(s)?;
-        }
     }
     return (out_n, out_host, out_port);
 }
-
-// --- text / line helpers (stdlib ergonomics) ---
 
 fn newline_bytes() -> [byte] {
     let nl: [byte] = [];
@@ -237,45 +183,35 @@ fn read_line(Stream s) -> Result<Option<string>, IoError> {
     let acc: [byte] = [];
     let scratch: [byte] = [];
     scratch[] = 0;
-    let done = 0;
-    let saw = 0;
+    let done = false;
+    let saw = false;
     let lf: byte = "\n";
     let cr: byte = "\r";
-    while done == 0 {
-        let rr = read(s, scratch)?;
-        let is_none = 0;
-        let nread = 0;
-        match rr {
+    while !done {
+        match read(s, scratch)? {
             Option::None => {
-                is_none = 1;
+                done = true;
             },
             Option::Some(n) => {
-                nread = n;
+                if n == 0 {
+                    wait_readable(s)?;
+                }
+                if n != 0 {
+                    saw = true;
+                    let c = scratch[0];
+                    if c == lf {
+                        done = true;
+                    }
+                    if c != lf {
+                        acc[] = c;
+                    }
+                }
             },
         };
-        if is_none == 1 {
-            done = 1;
-        }
-        if is_none == 0 {
-            if nread == 0 {
-                wait_readable(s)?;
-            }
-            if nread != 0 {
-                saw = 1;
-                let c = scratch[0];
-                if c == lf {
-                    done = 1;
-                }
-                if c != lf {
-                    acc[] = c;
-                }
-            }
-        }
     }
-    if saw == 0 {
+    if !saw {
         return Option::None;
     }
-    // Strip trailing CR if present (CRLF).
     if len(acc) > 0 {
         if acc[len(acc) - 1] == cr {
             let trimmed: [byte] = [];
