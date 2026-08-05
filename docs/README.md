@@ -36,7 +36,7 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; named holes on partials allowed) |
-| Arity overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.hy`, `fn_value.hy`, `lambda.hy`) |
+| Arity / type overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.hy`, `type_overload.hy`, `fn_value.hy`, `lambda.hy`) |
 | Rest parameters (`T... xs` / tuple `... xs`) | Supported (trailing only; `T...` packs to `[T]`, bare `...` packs to a tuple) |
 | Call-site spread (`f(...pack)`) | Supported (tuple and array operands) |
 | User-defined `attr` decorators | Supported (`attr` decl + `#[name(...)]` on `fn`, methods, class constructors) |

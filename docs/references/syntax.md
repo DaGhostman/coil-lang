@@ -140,7 +140,7 @@ attr_param  ::= type_fn_sig IDENT          // first param: `fn(...args) -> T tar
 type_fn_sig ::= 'fn' '(' '...' IDENT ')' '->' type_annotation
 ```
 
-Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.hy`, `fn_value.hy`, and `lambda.hy`.
+Arity overloads (same name, different arities / rest ranges), **type overloads** (same arity, distinct parameter types — e.g. `show(int)` / `show(float)`), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.hy`, `examples/type_overload.hy`, `fn_value.hy`, and `lambda.hy`.
 
 
 Call sites may use named arguments (`name: expr`) after any positional

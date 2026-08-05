@@ -2053,6 +2053,15 @@ This is useful to verify expected output without invoking the full CLI archive p
 | **Run** | `cargo run -- examples/overload.hy` |
 | **Output** | `15` |
 
+### `examples/type_overload.hy`
+
+**Demonstrates:** Same-arity type overloads — `show(int)` / `show(float)` / `show(string)` selected by argument type.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/type_overload.hy` |
+| **Output** | `i:7f:1.5s:hi` |
+
 ### `examples/fn_value.hy`
 
 **Demonstrates:** First-class monomorphic functions (`let f = add`) and positional partial application (`let g = add(1)`).
