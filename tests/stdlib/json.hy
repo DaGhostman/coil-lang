@@ -56,3 +56,27 @@ test("array roundtrip") {
     };
     assert(s == "[1,2,true]")?;
 }
+
+test("string escapes roundtrip") {
+    let v = match parse("\"a\\\"b\\\\c\"") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse esc",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify esc",
+    };
+    assert(s == "\"a\\\"b\\\\c\"")?;
+}
+
+test("false scalar") {
+    let v = match parse("false") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "false",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify false",
+    };
+    assert(s == "false")?;
+}

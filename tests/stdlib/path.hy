@@ -29,3 +29,39 @@ test("join dirname basename extension") {
     assert(is_absolute("/tmp"))?;
     assert(is_absolute("rel") == false)?;
 }
+
+test("join empty sides") {
+    let j = match join("a", "") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "join empty b",
+    };
+    assert(j == "a")?;
+    let j2 = match join("", "b") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "join empty a",
+    };
+    assert(j2 == "b")?;
+}
+
+test("dirname basename extension edges") {
+    let d = match dirname("plain") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "dirname plain",
+    };
+    assert(d == ".")?;
+    let b = match basename("plain") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "basename plain",
+    };
+    assert(b == "plain")?;
+    let e = match extension("noext") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "extension none",
+    };
+    assert(e == "")?;
+    let root = match dirname("/") {
+        Result::Ok(s) => s,
+        Result::Err(_) => panic "dirname root",
+    };
+    assert(root == "/")?;
+}
