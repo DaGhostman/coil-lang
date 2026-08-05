@@ -62,6 +62,10 @@ impl SymbolIndex {
         self.definitions.values().flatten()
     }
 
+    pub fn all_reference_sites(&self) -> impl Iterator<Item = &RefSite> {
+        self.references.values().flatten()
+    }
+
     fn collect_definitions(&mut self, file: &PathBuf, source: &str, expression: &Output<'_>) {
         let Expression::Program(items) = expression.1.as_ref() else {
             return;
