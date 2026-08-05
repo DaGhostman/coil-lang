@@ -7790,7 +7790,7 @@ impl Compiler {
                 let fqn = self.qualify_static_fqn(name);
                 self.emit_static_initializer(&fqn, init);
             }
-            // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::*) ---
+            // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::{…}) ---
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
