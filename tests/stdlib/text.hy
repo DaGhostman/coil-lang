@@ -30,3 +30,32 @@ test("split and case") {
     };
     assert(up == "ABC")?;
 }
+
+test("replace split once and join") {
+    assert(replace("one two two", "two", "2")? == "one 2 2")?;
+    let pair = split_once("key=value=rest", "=")?;
+    assert(pair[0] == "key")?;
+    assert(pair[1] == "value=rest")?;
+
+    let parts: [string] = [];
+    parts[] = "a";
+    parts[] = "b";
+    parts[] = "c";
+    assert(join(parts, "::") == "a::b::c")?;
+}
+
+test("repeat and pad") {
+    assert(repeat("ab", 3) == "ababab")?;
+    assert(repeat("ab", -1) == "")?;
+    assert(pad_left("7", 3, "0")? == "007")?;
+    assert(pad_right("7", 3, "0")? == "700")?;
+    assert(pad_right("wide", 2, "0")? == "wide")?;
+}
+
+test("lines handles lf and crlf") {
+    let rows = lines("a\r\nb\n")?;
+    assert(len(rows) == 3)?;
+    assert(rows[0] == "a")?;
+    assert(rows[1] == "b")?;
+    assert(rows[2] == "")?;
+}

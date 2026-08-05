@@ -5,31 +5,15 @@ use string::{to_bytes, from_bytes};
 use bytes::{
     slice as bytes_slice,
     find as bytes_find,
+    replace as bytes_replace,
+    pad_left as bytes_pad_left,
+    pad_right as bytes_pad_right,
     contains as bytes_contains,
     starts_with as bytes_starts_with,
     ends_with as bytes_ends_with,
     eq as bytes_eq,
 };
-
-fn is_ascii_space(byte c) -> bool {
-    let sp: byte = " ";
-    let tab: byte = "\t";
-    let lf: byte = "\n";
-    let cr: byte = "\r";
-    if c == sp {
-        return true;
-    }
-    if c == tab {
-        return true;
-    }
-    if c == lf {
-        return true;
-    }
-    if c == cr {
-        return true;
-    }
-    return false;
-}
+use ascii::{is_space};
 
 fn utf8_ok([byte] b) -> Result<string, string> {
     return match from_bytes(b) {
@@ -54,11 +38,11 @@ fn trim(string s) -> Result<string, string> {
     let lo = 0;
     let hi = len(b);
     while lo < hi {
-        if is_ascii_space(b[lo]) {
+        if is_space(b[lo]) {
             lo = lo + 1;
         }
         if lo < hi {
-            if is_ascii_space(b[lo]) == false {
+            if is_space(b[lo]) == false {
                 break;
             }
         }
@@ -67,11 +51,11 @@ fn trim(string s) -> Result<string, string> {
         }
     }
     while hi > lo {
-        if is_ascii_space(b[hi - 1]) {
+        if is_space(b[hi - 1]) {
             hi = hi - 1;
         }
         if hi > lo {
-            if is_ascii_space(b[hi - 1]) == false {
+            if is_space(b[hi - 1]) == false {
                 break;
             }
         }
@@ -122,6 +106,90 @@ fn split(string s, string sep) -> Result<[string], string> {
             out[] = part;
             start = start + rel + len(needle);
         }
+    }
+    return out;
+}
+
+/// Split at the first occurrence of `sep`, excluding the separator.
+fn split_once(string s, string sep) -> Result<(string, string), string> {
+    let hay = to_bytes(s);
+    let needle = to_bytes(sep);
+    let at = bytes_find(hay, needle);
+    if at < 0 {
+        raise "separator not found";
+    }
+    let left = utf8_ok(bytes_slice(hay, 0, at))?;
+    let right = utf8_ok(bytes_slice(hay, at + len(needle), len(hay)))?;
+    return (left, right);
+}
+
+/// Replace every non-overlapping occurrence of `old` with `new`.
+fn replace(string s, string old, string new) -> Result<string, string> {
+    let out = bytes_replace(to_bytes(s), to_bytes(old), to_bytes(new));
+    return utf8_ok(out)?;
+}
+
+/// Join strings with `sep` between adjacent parts.
+fn join([string] parts, string sep) -> string {
+    let out = "";
+    let i = 0;
+    while i < len(parts) {
+        if i > 0 {
+            out = out + sep;
+        }
+        out = out + parts[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Repeat `s` `n` times. Non-positive counts produce an empty string.
+fn repeat(string s, int n) -> string {
+    let out = "";
+    let i = 0;
+    while i < n {
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Pad on the left to a byte width using a one-byte `fill` string.
+fn pad_left(string s, int width, string fill) -> Result<string, string> {
+    let fill_bytes = to_bytes(fill);
+    if len(fill_bytes) != 1 {
+        raise "fill must be one byte";
+    }
+    return utf8_ok(bytes_pad_left(to_bytes(s), width, fill_bytes[0]))?;
+}
+
+/// Pad on the right to a byte width using a one-byte `fill` string.
+fn pad_right(string s, int width, string fill) -> Result<string, string> {
+    let fill_bytes = to_bytes(fill);
+    if len(fill_bytes) != 1 {
+        raise "fill must be one byte";
+    }
+    return utf8_ok(bytes_pad_right(to_bytes(s), width, fill_bytes[0]))?;
+}
+
+/// Split on LF and strip one optional CR from each resulting line.
+fn lines(string s) -> Result<[string], string> {
+    let b = to_bytes(s);
+    let out: [string] = [];
+    let start = 0;
+    let i = 0;
+    while i <= len(b) {
+        if i == len(b) || b[i] == "\n" {
+            let end = i;
+            if end > start {
+                if b[end - 1] == "\r" {
+                    end = end - 1;
+                }
+            }
+            out[] = utf8_ok(bytes_slice(b, start, end))?;
+            start = i + 1;
+        }
+        i = i + 1;
     }
     return out;
 }

@@ -76,6 +76,34 @@ fn find([byte] hay, [byte] needle) -> int {
     return -1;
 }
 
+/// Last index of `needle` in `hay`, or `-1` if missing. Empty needle → `len(hay)`.
+fn rfind([byte] hay, [byte] needle) -> int {
+    let hn = len(hay);
+    let nn = len(needle);
+    if nn == 0 {
+        return hn;
+    }
+    if nn > hn {
+        return -1;
+    }
+    let i = hn - nn;
+    while i >= 0 {
+        let ok = true;
+        let j = 0;
+        while j < nn {
+            if hay[i + j] != needle[j] {
+                ok = false;
+            }
+            j = j + 1;
+        }
+        if ok {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
 /// True when `hay` contains `needle` as a contiguous sub-buffer.
 fn contains([byte] hay, [byte] needle) -> bool {
     return find(hay, needle) >= 0;
@@ -103,6 +131,101 @@ fn ends_with([byte] buf, [byte] suffix) -> bool {
 /// Copy every byte of `src` into a new buffer.
 fn copy([byte] src) -> [byte] {
     return slice(src, 0, len(src));
+}
+
+/// Replace all non-overlapping occurrences of `old` with `new`.
+/// An empty `old` leaves `hay` unchanged.
+fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
+    if len(old) == 0 {
+        return copy(hay);
+    }
+    let out: [byte] = [];
+    let i = 0;
+    while i < len(hay) {
+        let matches = i + len(old) <= len(hay);
+        let j = 0;
+        while matches && j < len(old) {
+            if hay[i + j] != old[j] {
+                matches = false;
+            }
+            j = j + 1;
+        }
+        if matches {
+            let k = 0;
+            while k < len(new) {
+                out[] = new[k];
+                k = k + 1;
+            }
+            i = i + len(old);
+        } else {
+            out[] = hay[i];
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Repeat `src` `n` times. Non-positive counts produce an empty buffer.
+fn repeat([byte] src, int n) -> [byte] {
+    let out: [byte] = [];
+    let count = 0;
+    while count < n {
+        let i = 0;
+        while i < len(src) {
+            out[] = src[i];
+            i = i + 1;
+        }
+        count = count + 1;
+    }
+    return out;
+}
+
+/// Pad on the left with `fill` until the buffer reaches `width`.
+fn pad_left([byte] src, int width, byte fill) -> [byte] {
+    let out: [byte] = [];
+    let padding = width - len(src);
+    let i = 0;
+    while i < padding {
+        out[] = fill;
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(src) {
+        out[] = src[j];
+        j = j + 1;
+    }
+    return out;
+}
+
+/// Pad on the right with `fill` until the buffer reaches `width`.
+fn pad_right([byte] src, int width, byte fill) -> [byte] {
+    let out = copy(src);
+    while len(out) < width {
+        out[] = fill;
+    }
+    return out;
+}
+
+/// Join byte buffers, placing `sep` between adjacent parts.
+fn join_buffers([[byte]] parts, [byte] sep) -> [byte] {
+    let out: [byte] = [];
+    let i = 0;
+    while i < len(parts) {
+        if i > 0 {
+            let j = 0;
+            while j < len(sep) {
+                out[] = sep[j];
+                j = j + 1;
+            }
+        }
+        let k = 0;
+        while k < len(parts[i]) {
+            out[] = parts[i][k];
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 /// Decode UTF-8 bytes (maps `string::from_bytes` errors to a bare string Err).

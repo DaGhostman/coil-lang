@@ -15,3 +15,33 @@ test("find contains affixes") {
     assert(starts_with(to_bytes("abcdef"), to_bytes("ab")))?;
     assert(ends_with(to_bytes("abcdef"), to_bytes("ef")))?;
 }
+
+test("rfind and replace") {
+    assert(rfind(to_bytes("ababa"), to_bytes("ba")) == 3)?;
+    assert(rfind(to_bytes("abc"), to_bytes("z")) == -1)?;
+    assert(rfind(to_bytes("abc"), to_bytes("")) == 3)?;
+    assert(eq(
+        replace(to_bytes("aaaa"), to_bytes("aa"), to_bytes("b")),
+        to_bytes("bb"),
+    ))?;
+    assert(eq(
+        replace(to_bytes("abc"), to_bytes(""), to_bytes("x")),
+        to_bytes("abc"),
+    ))?;
+}
+
+test("repeat and padding") {
+    assert(eq(repeat(to_bytes("ab"), 3), to_bytes("ababab")))?;
+    assert(eq(repeat(to_bytes("ab"), 0), to_bytes("")))?;
+    assert(eq(pad_left(to_bytes("7"), 3, "0"), to_bytes("007")))?;
+    assert(eq(pad_right(to_bytes("7"), 3, "0"), to_bytes("700")))?;
+    assert(eq(pad_left(to_bytes("wide"), 2, "0"), to_bytes("wide")))?;
+}
+
+test("join buffers") {
+    let parts: [[byte]] = [];
+    parts[] = to_bytes("a");
+    parts[] = to_bytes("b");
+    parts[] = to_bytes("c");
+    assert(eq(join_buffers(parts, to_bytes(",")), to_bytes("a,b,c")))?;
+}

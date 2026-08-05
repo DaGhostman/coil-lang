@@ -1,0 +1,25 @@
+use conv::*;
+
+test("decimal integer format and parse") {
+    assert(int_to_dec(0) == "0")?;
+    assert(int_to_dec(42) == "42")?;
+    assert(int_to_dec(-907) == "-907")?;
+    assert(parse_int("123")? == 123)?;
+    assert(parse_int("+8")? == 8)?;
+    assert(parse_int("-45")? == -45)?;
+}
+
+test("invalid decimal integer") {
+    let failed = match parse_int("12x") {
+        Result::Ok(_) => false,
+        Result::Err(_) => true,
+    };
+    assert(failed)?;
+}
+
+test("decimal float parse") {
+    assert(parse_float("12.5")? == 12.5)?;
+    assert(parse_float("-.25")? == -0.25)?;
+    assert(parse_float("1.5e2")? == 150.0)?;
+    assert(parse_float("2E-1")? == 0.2)?;
+}
