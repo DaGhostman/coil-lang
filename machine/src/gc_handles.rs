@@ -94,13 +94,33 @@ pub fn host_gc_upgrade(heap: &mut Heap, args: &[Value]) -> Value {
     }
 }
 
+/// `gc::heap_bytes() -> int` — managed heap size in bytes (`Heap::size`).
+pub fn host_gc_heap_bytes(heap: &mut Heap, _args: &[Value]) -> Value {
+    Value::from(heap.size() as i64)
+}
+
+/// Registry name for [`host_gc_collect_stub`]; the VM HostInvoke path runs a
+/// real stack-rooted collect when it sees this name.
+pub const GC_COLLECT_NATIVE: &str = "gc_collect";
+
+/// Stub for `gc::collect()` — the VM replaces this with a full collect.
+///
+/// Returns `0` if somehow invoked without the VM special-case (unit tests).
+pub fn host_gc_collect_stub(_heap: &mut Heap, _args: &[Value]) -> Value {
+    Value::from(0i64)
+}
+
 /// Registry names / arities for [`crate::host_natives::build_standard_host_natives`].
+///
+/// Append-only: keep prior ids stable.
 pub const GC_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
     ("gc_root", 1, host_gc_root),
     ("gc_unroot", 1, host_gc_unroot),
     ("gc_get", 1, host_gc_get),
     ("gc_weak", 1, host_gc_weak),
     ("gc_upgrade", 1, host_gc_upgrade),
+    ("gc_heap_bytes", 0, host_gc_heap_bytes),
+    (GC_COLLECT_NATIVE, 0, host_gc_collect_stub),
 ];
 
 #[cfg(test)]
@@ -236,5 +256,14 @@ mod tests {
             }
             _ => panic!("expected Some(42)"),
         }
+    }
+
+    #[test]
+    fn heap_bytes_tracks_alloc() {
+        let mut heap = Heap::default();
+        let before = host_gc_heap_bytes(&mut heap, &[]).as_int();
+        let _ = host_gc_root(&mut heap, &[Value::from(1i64)]);
+        let after = host_gc_heap_bytes(&mut heap, &[]).as_int();
+        assert!(after > before);
     }
 }

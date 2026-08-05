@@ -2412,48 +2412,67 @@ impl<const S: usize> Machine<S> {
                     // pressure still fires when HostInvoke is the only
                     // allocator on a hot path.
                     let live_before = self.heap.live_object_count();
-                    match self.natives.get_by_id(fn_id) {
-                        Some(native) => match native.invoke(&mut self.heap, args) {
-                            Ok(Some(v)) => self.stack.push(v),
-                            Ok(None) => {
-                                if let Some(req) = crate::io::take_pending_io_park() {
-                                    if !self.resume_stack.is_empty() {
-                                        // Inside a coroutine: register for batch
-                                        // poll and yield (do not park the VM).
-                                        self.cooperative_io_await_yield(
-                                            &mut ip, &mut sp, req,
-                                        );
-                                    } else {
-                                        self.frames.get_mut().set(sp);
-                                        self.pending_io = Some(PendingIoWait {
-                                            request: req,
-                                            resume_ip: ip,
-                                            resume_sp: sp,
-                                        });
-                                        return true;
+                    let is_gc_collect = self
+                        .natives
+                        .get_by_id(fn_id)
+                        .is_some_and(|n| n.name() == crate::GC_COLLECT_NATIVE);
+                    if is_gc_collect {
+                        // Full stack-rooted collect; stub native is not used.
+                        let before = self.heap.size();
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                        let freed = before.saturating_sub(self.heap.size());
+                        self.stack.push(Value::from(freed as i64));
+                    } else {
+                        match self.natives.get_by_id(fn_id) {
+                            Some(native) => match native.invoke(&mut self.heap, args) {
+                                Ok(Some(v)) => self.stack.push(v),
+                                Ok(None) => {
+                                    if let Some(req) = crate::io::take_pending_io_park() {
+                                        if !self.resume_stack.is_empty() {
+                                            // Inside a coroutine: register for batch
+                                            // poll and yield (do not park the VM).
+                                            self.cooperative_io_await_yield(
+                                                &mut ip, &mut sp, req,
+                                            );
+                                        } else {
+                                            self.frames.get_mut().set(sp);
+                                            self.pending_io = Some(PendingIoWait {
+                                                request: req,
+                                                resume_ip: ip,
+                                                resume_sp: sp,
+                                            });
+                                            return true;
+                                        }
                                     }
                                 }
-                            }
+                                #[cfg(debug_assertions)]
+                                Err(e) => {
+                                    eprintln!("HostInvoke failed for `{}`: {e}", native.name())
+                                }
+                                #[cfg(not(debug_assertions))]
+                                Err(_) => {}
+                            },
                             #[cfg(debug_assertions)]
-                            Err(e) => eprintln!("HostInvoke failed for `{}`: {e}", native.name()),
+                            None => eprintln!("HostInvoke: unknown native id {fn_id}"),
                             #[cfg(not(debug_assertions))]
-                            Err(_) => {}
-                        },
-                        #[cfg(debug_assertions)]
-                        None => eprintln!("HostInvoke: unknown native id {fn_id}"),
-                        #[cfg(not(debug_assertions))]
-                        None => {}
-                    }
-                    let allocated = self.heap.live_object_count().saturating_sub(live_before);
-                    if allocated > 0 {
-                        self.alloc_counter += allocated;
-                        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                            Self::gc_collect(
-                                &mut self.heap,
-                                &self.stack,
-                                &self.resume_stack,
-                                &mut self.alloc_counter,
-                            );
+                            None => {}
+                        }
+                        let allocated = self.heap.live_object_count().saturating_sub(live_before);
+                        if allocated > 0 {
+                            self.alloc_counter += allocated;
+                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
+                                Self::gc_collect(
+                                    &mut self.heap,
+                                    &self.stack,
+                                    &self.resume_stack,
+                                    &mut self.alloc_counter,
+                                );
+                            }
                         }
                     }
                 }
