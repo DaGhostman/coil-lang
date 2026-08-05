@@ -1,5 +1,5 @@
 use json::{
-    parse, stringify, json_int, json_object, Json,
+    parse, stringify, json_int, json_float, json_object, object_get, Json,
 };
 
 test("parse scalars") {
@@ -43,10 +43,21 @@ test("stringify object") {
         Result::Err(_) => panic "stringify obj",
     };
     assert(len(s2) == 7)?;
+    let got = object_get(o, "a");
+    match got {
+        Option::Some(jv) => {
+            let ss = match stringify(jv) {
+                Result::Ok(x) => x,
+                Result::Err(_) => panic "get",
+            };
+            assert(ss == "1")?;
+        },
+        Option::None => panic "missing a",
+    };
 }
 
 test("array roundtrip") {
-    let v = match parse("[1,2,true]") {
+    let v = match parse("[1,2,3]") {
         Result::Ok(x) => x,
         Result::Err(_) => panic "parse arr",
     };
@@ -54,7 +65,19 @@ test("array roundtrip") {
         Result::Ok(x) => x,
         Result::Err(_) => panic "stringify",
     };
-    assert(s == "[1,2,true]")?;
+    assert(s == "[1,2,3]")?;
+}
+
+test("array bools") {
+    let v = match parse("[true,false]") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse bools",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify bools",
+    };
+    assert(s == "[true,false]")?;
 }
 
 test("string escapes roundtrip") {
@@ -79,4 +102,48 @@ test("false scalar") {
         Result::Err(_) => panic "stringify false",
     };
     assert(s == "false")?;
+}
+
+test("unicode escape and floats") {
+    let v = match parse("\"\\u0041\\u00e9\"") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse u",
+    };
+    let s = match stringify(v) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify u",
+    };
+    assert(s == "\"Aé\"")?;
+    let arr = match parse("[1.5,2.0,-3]") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "parse floats",
+    };
+    let as = match stringify(arr) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "stringify floats",
+    };
+    assert(as == "[1.5,2,-3]")?;
+    let f = match stringify(json_float(1.25)) {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "float",
+    };
+    assert(f == "1.25")?;
+}
+
+test("nested object float") {
+    let v = match parse("{\"n\":1.5,\"ok\":true}") {
+        Result::Ok(x) => x,
+        Result::Err(_) => panic "obj",
+    };
+    let n = object_get(v, "n");
+    match n {
+        Option::Some(jv) => {
+            let ss = match stringify(jv) {
+                Result::Ok(x) => x,
+                Result::Err(_) => panic "n",
+            };
+            assert(ss == "1.5")?;
+        },
+        Option::None => panic "missing n",
+    };
 }
