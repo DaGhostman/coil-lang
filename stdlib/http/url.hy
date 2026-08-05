@@ -1,5 +1,6 @@
 // URL parse for the HTTP client (byte-scan; no string slice/index).
 use io::*;
+use conv::{int_to_dec};
 
 enum HttpError {
     BadUrl,
@@ -415,35 +416,6 @@ fn parse_url(string s) -> Result<Url, HttpError> {
 
 // --- request builders (kept in url for single-import client graph) ---
 // Serialize an HTTP/1.1 request message to `[byte]`.
-
-fn digit_char(int d) -> string {
-    if d == 0 { return "0"; }
-    if d == 1 { return "1"; }
-    if d == 2 { return "2"; }
-    if d == 3 { return "3"; }
-    if d == 4 { return "4"; }
-    if d == 5 { return "5"; }
-    if d == 6 { return "6"; }
-    if d == 7 { return "7"; }
-    if d == 8 { return "8"; }
-    return "9";
-}
-
-// Decimal int → string without `format` (avoids Result-mode SEGV in deps).
-// Only non-negative lengths/ports are expected.
-fn int_to_dec(int n) -> string {
-    if n == 0 {
-        return "0";
-    }
-    let x = n;
-    let rev = "";
-    while x > 0 {
-        let d = x % 10;
-        rev = digit_char(d) + rev;
-        x = x / 10;
-    }
-    return rev;
-}
 
 fn host_header_value(Url u) -> Result<string, HttpError> {
     let host = url_host(u)?;
