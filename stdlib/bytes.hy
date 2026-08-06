@@ -2,15 +2,15 @@
 use string::{to_bytes, from_bytes};
 
 /// Copy `src[start..end)` into a new buffer (clamped to `src` bounds).
-fn slice([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn slice(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     if i < 0 {
         i = 0;
     }
     while i < end {
         if i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
         }
         i = i + 1;
     }
@@ -18,23 +18,23 @@ fn slice([byte] src, int start, int end) -> [byte] {
 }
 
 /// Append `b` after `a` into a new buffer.
-fn concat([byte] a, [byte] b) -> [byte] {
-    let out: [byte] = [];
+fn concat(Vec<byte> a, Vec<byte> b) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     while i < len(a) {
-        out[] = a[i];
+        out.push(a[i]);
         i = i + 1;
     }
     let j = 0;
     while j < len(b) {
-        out[] = b[j];
+        out.push(b[j]);
         j = j + 1;
     }
     return out;
 }
 
 /// True when `a` and `b` have equal length and equal bytes.
-fn eq([byte] a, [byte] b) -> bool {
+fn eq(Vec<byte> a, Vec<byte> b) -> bool {
     if len(a) != len(b) {
         return false;
     }
@@ -49,7 +49,7 @@ fn eq([byte] a, [byte] b) -> bool {
 }
 
 /// First index of `needle` in `hay`, or `-1` if missing. Empty needle → `0`.
-fn find([byte] hay, [byte] needle) -> int {
+fn find(Vec<byte> hay, Vec<byte> needle) -> int {
     let hn = len(hay);
     let nn = len(needle);
     if nn == 0 {
@@ -77,7 +77,7 @@ fn find([byte] hay, [byte] needle) -> int {
 }
 
 /// Last index of `needle` in `hay`, or `-1` if missing. Empty needle → `len(hay)`.
-fn rfind([byte] hay, [byte] needle) -> int {
+fn rfind(Vec<byte> hay, Vec<byte> needle) -> int {
     let hn = len(hay);
     let nn = len(needle);
     if nn == 0 {
@@ -105,12 +105,12 @@ fn rfind([byte] hay, [byte] needle) -> int {
 }
 
 /// True when `hay` contains `needle` as a contiguous sub-buffer.
-fn contains([byte] hay, [byte] needle) -> bool {
+fn contains(Vec<byte> hay, Vec<byte> needle) -> bool {
     return find(hay, needle) >= 0;
 }
 
 /// True when `buf` begins with `prefix`.
-fn starts_with([byte] buf, [byte] prefix) -> bool {
+fn starts_with(Vec<byte> buf, Vec<byte> prefix) -> bool {
     let n = len(prefix);
     if n > len(buf) {
         return false;
@@ -119,7 +119,7 @@ fn starts_with([byte] buf, [byte] prefix) -> bool {
 }
 
 /// True when `buf` ends with `suffix`.
-fn ends_with([byte] buf, [byte] suffix) -> bool {
+fn ends_with(Vec<byte> buf, Vec<byte> suffix) -> bool {
     let n = len(suffix);
     let m = len(buf);
     if n > m {
@@ -129,11 +129,11 @@ fn ends_with([byte] buf, [byte] suffix) -> bool {
 }
 
 /// Copy every byte of `src` into a new buffer.
-fn copy([byte] src) -> [byte] {
-    let out: [byte] = [];
+fn copy(Vec<byte> src) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     while i < len(src) {
-        out[] = src[i];
+        out.push(src[i]);
         i = i + 1;
     }
     return out;
@@ -141,11 +141,11 @@ fn copy([byte] src) -> [byte] {
 
 /// Replace all non-overlapping occurrences of `old` with `new`.
 /// An empty `old` leaves `hay` unchanged.
-fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
+fn replace(Vec<byte> hay, Vec<byte> old, Vec<byte> new) -> Vec<byte> {
     if len(old) == 0 {
         return copy(hay);
     }
-    let out: [byte] = [];
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     while i < len(hay) {
         let matches = i + len(old) <= len(hay);
@@ -159,12 +159,12 @@ fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
         if matches {
             let k = 0;
             while k < len(new) {
-                out[] = new[k];
+                out.push(new[k]);
                 k = k + 1;
             }
             i = i + len(old);
         } else {
-            out[] = hay[i];
+            out.push(hay[i]);
             i = i + 1;
         }
     }
@@ -172,13 +172,13 @@ fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
 }
 
 /// Repeat `src` `n` times. Non-positive counts produce an empty buffer.
-fn repeat([byte] src, int n) -> [byte] {
-    let out: [byte] = [];
+fn repeat(Vec<byte> src, int n) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let count = 0;
     while count < n {
         let i = 0;
         while i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
             i = i + 1;
         }
         count = count + 1;
@@ -187,42 +187,42 @@ fn repeat([byte] src, int n) -> [byte] {
 }
 
 /// Pad on the left with `fill` until the buffer reaches `width`.
-fn pad_left([byte] src, int width, byte fill) -> [byte] {
-    let out: [byte] = [];
+fn pad_left(Vec<byte> src, int width, byte fill) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let padding = width - len(src);
     let i = 0;
     while i < padding {
-        out[] = fill;
+        out.push(fill);
         i = i + 1;
     }
     let j = 0;
     while j < len(src) {
-        out[] = src[j];
+        out.push(src[j]);
         j = j + 1;
     }
     return out;
 }
 
 /// Pad on the right with `fill` until the buffer reaches `width`.
-fn pad_right([byte] src, int width, byte fill) -> [byte] {
-    let out: [byte] = [];
+fn pad_right(Vec<byte> src, int width, byte fill) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let j = 0;
     let n = len(src);
     while j < n {
-        out[] = src[j];
+        out.push(src[j]);
         j = j + 1;
     }
     let padding = width - n;
     let i = 0;
     while i < padding {
-        out[] = fill;
+        out.push(fill);
         i = i + 1;
     }
     return out;
 }
 
 /// Decode UTF-8 bytes (maps `string::from_bytes` errors to a bare string Err).
-fn to_string([byte] b) -> Result<string, string> {
+fn to_string(Vec<byte> b) -> Result<string, string> {
     return match from_bytes(b) {
         Result::Ok(s) => s,
         Result::Err(_) => raise "utf8",
@@ -230,6 +230,6 @@ fn to_string([byte] b) -> Result<string, string> {
 }
 
 /// Encode a string as UTF-8 bytes (alias of `string::to_bytes`).
-fn from_string(string s) -> [byte] {
+fn from_string(string s) -> Vec<byte> {
     return to_bytes(s);
 }

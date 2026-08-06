@@ -12,14 +12,14 @@ use io::net::tcp::accept;
 use io::net::udp::recv_from;
 use string::{to_bytes as str_to_bytes};
 
-fn write_all(Stream s, [byte] buf) -> Result<int, IoError> {
+fn write_all(Stream s, Vec<byte> buf) -> Result<int, IoError> {
     let offset = 0;
     let total = len(buf);
     while offset < total {
-        let rest: [byte] = [];
+        let rest: Vec<byte> = Vec::new();
         let i = offset;
         while i < total {
-            rest[] = buf[i];
+            rest.push(buf[i]);
             i = i + 1;
         }
         match write(s, rest) {
@@ -42,15 +42,15 @@ fn write_all(Stream s, [byte] buf) -> Result<int, IoError> {
     return 0;
 }
 
-fn read_exact(Stream s, [byte] buf) -> Result<Option<int>, IoError> {
+fn read_exact(Stream s, Vec<byte> buf) -> Result<Option<int>, IoError> {
     let need = len(buf);
     let filled = 0;
     while filled < need {
         let remaining = need - filled;
-        let scratch: [byte] = [];
+        let scratch: Vec<byte> = Vec::new();
         let i = 0;
         while i < remaining {
-            scratch[] = 0;
+            scratch.push(0);
             i = i + 1;
         }
         match read(s, scratch)? {
@@ -78,15 +78,15 @@ fn read_exact(Stream s, [byte] buf) -> Result<Option<int>, IoError> {
     return Option::Some(filled);
 }
 
-fn read_to_end(Stream s) -> Result<[byte], IoError> {
-    let acc: [byte] = [];
+fn read_to_end(Stream s) -> Result<Vec<byte>, IoError> {
+    let acc: Vec<byte> = Vec::new();
     let chunk_size = 256;
     let done = false;
     while !done {
-        let scratch: [byte] = [];
+        let scratch: Vec<byte> = Vec::new();
         let i = 0;
         while i < chunk_size {
-            scratch[] = 0;
+            scratch.push(0);
             i = i + 1;
         }
         match read(s, scratch)? {
@@ -100,7 +100,7 @@ fn read_to_end(Stream s) -> Result<[byte], IoError> {
                 if n != 0 {
                     let j = 0;
                     while j < n {
-                        acc[] = scratch[j];
+                        acc.push(scratch[j]);
                         j = j + 1;
                     }
                 }
@@ -130,7 +130,7 @@ fn accept_wait(Stream listener) -> Result<Stream, IoError> {
     return out;
 }
 
-fn recv_from_wait(Stream s, [byte] buf) -> Result<(int, string, int), IoError> {
+fn recv_from_wait(Stream s, Vec<byte> buf) -> Result<(int, string, int), IoError> {
     let done = false;
     let out_n = 0;
     let out_host = "";
@@ -154,9 +154,9 @@ fn recv_from_wait(Stream s, [byte] buf) -> Result<(int, string, int), IoError> {
     return (out_n, out_host, out_port);
 }
 
-fn newline_bytes() -> [byte] {
-    let nl: [byte] = [];
-    nl[] = "\n";
+fn newline_bytes() -> Vec<byte> {
+    let nl: Vec<byte> = Vec::new();
+    nl.push("\n");
     return nl;
 }
 
@@ -180,9 +180,9 @@ fn eprintln(string s) -> Result<int, IoError> {
 /// Read until LF (10) or EOF. Returns `None` on EOF with no bytes read.
 /// The trailing LF is not included; a lone CR before LF is stripped.
 fn read_line(Stream s) -> Result<Option<string>, IoError> {
-    let acc: [byte] = [];
-    let scratch: [byte] = [];
-    scratch[] = 0;
+    let acc: Vec<byte> = Vec::new();
+    let scratch: Vec<byte> = Vec::new();
+    scratch.push(0);
     let done = false;
     let saw = false;
     let lf: byte = "\n";
@@ -203,7 +203,7 @@ fn read_line(Stream s) -> Result<Option<string>, IoError> {
                         done = true;
                     }
                     if c != lf {
-                        acc[] = c;
+                        acc.push(c);
                     }
                 }
             },
@@ -214,10 +214,10 @@ fn read_line(Stream s) -> Result<Option<string>, IoError> {
     }
     if len(acc) > 0 {
         if acc[len(acc) - 1] == cr {
-            let trimmed: [byte] = [];
+            let trimmed: Vec<byte> = Vec::new();
             let i = 0;
             while i + 1 < len(acc) {
-                trimmed[] = acc[i];
+                trimmed.push(acc[i]);
                 i = i + 1;
             }
             return Option::Some(io_from_bytes(trimmed)?);

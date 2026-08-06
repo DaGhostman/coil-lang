@@ -11,13 +11,13 @@ fn main() {
     let a: byte = 97;
     let b: byte = 98;
     let c: byte = 99;
-    let payload: [byte] = [a, b, c];
+    let payload = Vec::from([a, b, c]);
     let w = open(path, "w")?;
     write_all(w, payload)?;
     close(w)?;
     let got = match read_to_end(open(path, "r")?) {
         Result::Ok(buf) => buf,
-        Result::Err(_) => [z],
+        Result::Err(_) => Vec::from([z]),
     };
     write_all(stdout(), to_bytes(format("%i", len(got))));
 }

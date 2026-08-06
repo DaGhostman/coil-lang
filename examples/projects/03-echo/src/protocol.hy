@@ -1,7 +1,7 @@
 // Length-prefixed frame helpers for the echo demo.
 // Frame layout: [nbytes:byte][payload…] (payload capped at 5 for the demo).
 
-fn frame_len([byte] frame) -> int {
+fn frame_len(Vec<byte> frame) -> int {
     if len(frame) < 1 {
         return 0;
     }
@@ -29,7 +29,7 @@ fn frame_len([byte] frame) -> int {
     return 0;
 }
 
-fn encode_frame([byte] body) -> [byte] {
+fn encode_frame(Vec<byte> body) -> Vec<byte> {
     let n = len(body);
     let nb: byte = 0;
     if n == 1 {
@@ -47,18 +47,19 @@ fn encode_frame([byte] body) -> [byte] {
     if n >= 5 {
         nb = 5;
     }
-    let frame: [byte] = [nb];
+    let frame: Vec<byte> = Vec::new();
+    frame.push(nb);
     let i = 0;
     while i < n {
         if i < 5 {
-            frame[] = body[i];
+            frame.push(body[i]);
         }
         i = i + 1;
     }
     return frame;
 }
 
-fn payload_eq([byte] frame, [byte] expect) -> int {
+fn payload_eq(Vec<byte> frame, Vec<byte> expect) -> int {
     let n = frame_len(frame);
     if n != len(expect) {
         return 0;

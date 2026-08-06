@@ -1821,9 +1821,11 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.message().contains("Cannot mutate a `readonly` value")),
-        "expected readonly append rejection, got: {:?}",
+        msgs.iter().any(|m| {
+            m.message()
+                .contains("append assignment `arr[] = value` is no longer supported")
+        }),
+        "expected append-assignment rejection, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
 }
@@ -1885,9 +1887,11 @@ fn main() {
 "#,
     );
     assert!(
-        msgs.iter()
-            .any(|m| m.message().contains("append assignment requires an array")),
-        "expected non-array append diagnostic, got: {:?}",
+        msgs.iter().any(|m| {
+            m.message()
+                .contains("append assignment `arr[] = value` is no longer supported")
+        }),
+        "expected append-assignment rejection, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
 }

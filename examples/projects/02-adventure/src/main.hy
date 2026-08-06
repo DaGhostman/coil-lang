@@ -66,7 +66,7 @@ fn print_help() {
     write_all(stdout(), to_bytes("Commands: look, go north/south/east/west, take [key], inventory, save, load, help, quit"));
 }
 
-fn handle_line(Player p, [byte] line, string save_path) -> int {
+fn handle_line(Player p, Vec<byte> line, string save_path) -> int {
     if len(line) == 0 {
         return 1;
     }
@@ -162,7 +162,7 @@ fn main() {
     let input = stdin();
     let raw = match read_to_end(input) {
         Result::Ok(b) => b,
-        Result::Err(_) => [z],
+        Result::Err(_) => Vec::from([z]),
     };
 
     let i = 0;
@@ -173,7 +173,8 @@ fn main() {
             running = 0;
         }
         if running == 1 {
-            let line: [byte] = [z];
+            let line: Vec<byte> = Vec::new();
+            line.push(z);
             let collecting = 1;
             while collecting == 1 {
                 if i >= len(raw) {
@@ -187,17 +188,18 @@ fn main() {
                     }
                     if b != nl {
                         if b != cr {
-                            line[] = b;
+                            line.push(b);
                         }
                     }
                 }
             }
             write_all(stdout(), to_bytes("> "));
             if len(line) > 1 {
-                let out: [byte] = [line[1]];
+                let out: Vec<byte> = Vec::new();
+                out.push(line[1]);
                 let j = 2;
                 while j < len(line) {
-                    out[] = line[j];
+                    out.push(line[j]);
                     j = j + 1;
                 }
                 running = handle_line(p, out, save_path);

@@ -4,7 +4,7 @@ use io::sync::{read_to_end, write_all};
 use string::{to_bytes, from_bytes};
 
 /// Read an entire file as bytes (`open` + `read_to_end` + `close`).
-fn read_bytes(string path) -> Result<[byte], IoError> {
+fn read_bytes(string path) -> Result<Vec<byte>, IoError> {
     let s = open(path, "r")?;
     let buf = match read_to_end(s) {
         Result::Ok(b) => b,
@@ -21,7 +21,7 @@ fn read_bytes(string path) -> Result<[byte], IoError> {
 }
 
 /// Write `buf` to `path`, creating/truncating (`"w"`).
-fn write_bytes(string path, [byte] buf) -> Result<int, IoError> {
+fn write_bytes(string path, Vec<byte> buf) -> Result<int, IoError> {
     let s = open(path, "w")?;
     match write_all(s, buf) {
         Result::Ok(_) => 0,

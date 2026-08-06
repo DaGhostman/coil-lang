@@ -1978,6 +1978,95 @@ impl Compiler {
         }
     }
 
+    /// Static length of a fixed `[T; N]` type, if any.
+    fn fixed_array_len(ty: &crate::typechecking::Ty) -> Option<usize> {
+        use crate::typechecking::{Ty, ty::ArrayLength};
+        match ty {
+            Ty::Array {
+                length: ArrayLength::Static(n),
+                ..
+            } => Some(*n),
+            Ty::Readonly(inner) => Self::fixed_array_len(inner),
+            _ => None,
+        }
+    }
+
+    fn stack_array_info(&self, name: &str) -> Option<(u32, usize)> {
+        self.context.stack_array_locals.get(name).copied()
+    }
+
+    /// Whether a fixed `[T; N]` local should use multi-slot stack layout.
+    ///
+    /// Any `N >= 1` qualifies: each element is one `Value` (immediate scalar or
+    /// heap pointer). Nested array *elements* still compile to heap `MakeArray`
+    /// and occupy a pointer slot in the outer spine.
+    fn stack_array_bind_len(ty: &crate::typechecking::Ty) -> Option<usize> {
+        Self::fixed_array_len(ty).filter(|&n| n >= 1)
+    }
+
+    /// Reserve `n` consecutive locals for a fixed array binding `name`.
+    fn alloc_stack_array_slots(&mut self, name: &str, n: usize) -> u32 {
+        let base = self.alloc_binding_slot(name);
+        for i in 1..n {
+            let pad = format!("__arrpad_{name}_{i}");
+            let slot = self.context.variables.intern(pad) as u32;
+            debug_assert_eq!(slot, base + i as u32, "stack array slots must be consecutive");
+        }
+        self.context
+            .stack_array_locals
+            .insert(name.to_string(), (base, n));
+        base
+    }
+
+    /// Push elements of a multi-slot local then `MakeArray` (escape to heap).
+    fn emit_box_stack_array(&mut self, bytecode: &mut Vec<Byte>, base: u32, n: usize) {
+        for i in 0..n {
+            bytecode.push_load(base + i as u32);
+        }
+        bytecode.push_make_array(n as u32);
+    }
+
+    /// Emit a multi-slot stack-array init: one Value per slot, store immediately.
+    ///
+    /// Forward `emit; STORE` (not reverse bulk store) so values never pile into
+    /// the destination slot range. Shared-stack + post-STORE seek would otherwise
+    /// re-pop those slots when lower packs adjacent STOREs.
+    ///
+    /// Returns `true` for array literals and copies from another multi-slot local.
+    fn try_emit_stack_array_init(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        rhs: &Output,
+        base: u32,
+        n: usize,
+    ) -> bool {
+        let rhs_node = unwrap_expr_output(rhs);
+        match rhs_node.1.as_ref() {
+            Expression::Array(items) if items.len() == n => {
+                for (i, item) in items.iter().enumerate() {
+                    let mut bc = self.do_compile(item);
+                    bytecode.append(&mut bc);
+                    bytecode.push_store_pop(base + i as u32);
+                }
+                true
+            }
+            Expression::Identifier(src) => {
+                if let Some((src_base, src_n)) = self.stack_array_info(src)
+                    && src_n == n
+                {
+                    for i in 0..n {
+                        bytecode.push_load(src_base + i as u32);
+                        bytecode.push_store_pop(base + i as u32);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Flatten `...expr` spread nodes for codegen using inferred types.
     fn flatten_call_args_for_emit<'a>(&self, args: &[Output<'a>]) -> Vec<Output<'a>> {
         use crate::typechecking::subst::apply_ty_prune;
@@ -4694,7 +4783,8 @@ impl Compiler {
 
         // Read/Write for Stream — lower to the same HostInvoke natives as
         // free functions `read` / `write`. Args may arrive boxed via the
-        // dictionary ABI; unbox then call.
+        // dictionary ABI; unbox then call. `Vec<byte>` shares the Array
+        // carrier tag with dynamic arrays.
         for (class, method, native_name, arity) in [
             ("Read", "read", "read", 2u32),
             ("Write", "write", "write", 2u32),
@@ -4778,6 +4868,101 @@ impl Compiler {
         }
     }
 
+    /// Emit intrinsic bodies for builtin `Vec<T>` methods and register
+    /// them in the function / method tables so `v.push(x)` / `Vec::new()`
+    /// lower to direct `CALL`s.
+    fn emit_vec_method_thunks(&mut self) {
+        let owner = common::BUILTIN_VEC_TYPE;
+        let methods = self.context.methods.entry(owner.to_string()).or_default();
+        for name in [
+            "push",
+            "pop",
+            "insert",
+            "remove",
+            "clear",
+            "reserve",
+            "capacity",
+            "len",
+            "new",
+            "with_capacity",
+            "from",
+        ] {
+            methods.insert(name.to_string(), format!("{owner}::{name}"));
+        }
+
+        let emit_host = |compiler: &mut Self, fqn: String, native: &str, slots: &[u32]| {
+            if compiler.functions.contains_key(&fqn) {
+                return;
+            }
+            let Some(native_id) = compiler.native_id(native) else {
+                return;
+            };
+            compiler.bind_function_entry(fqn);
+            compiler
+                .bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+            for &slot in slots {
+                compiler.bytecode.push_load(slot);
+            }
+            compiler
+                .bytecode
+                .push_make_tuple(slots.len() as u32);
+            compiler
+                .bytecode
+                .push_host_invoke(slots.len() as u32);
+            compiler.bytecode.push_return();
+        };
+
+        // static fn new() -> Vec<T>
+        {
+            let fqn = format!("{owner}::new");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_make_array(0);
+                self.bytecode.push_return();
+            }
+        }
+
+        // static fn with_capacity(n) -> Vec<T>
+        emit_host(self, format!("{owner}::with_capacity"), "vec_with_capacity", &[0]);
+
+        // static fn from(arr) -> Vec<T>
+        emit_host(self, format!("{owner}::from"), "vec_from_array", &[0]);
+
+        // fn push(x)
+        {
+            let fqn = format!("{owner}::push");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode.push_load(1);
+                self.bytecode
+                    .push(Byte::new(Instruction::ArrayPush));
+                self.bytecode.push_pop();
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
+            }
+        }
+
+        // fn len() / capacity() / clear() / pop() / remove(i) / reserve(n) / insert(i, x)
+        {
+            let fqn = format!("{owner}::len");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode
+                    .push(Byte::new(Instruction::ArrayLen));
+                self.bytecode.push_return();
+            }
+        }
+        emit_host(self, format!("{owner}::capacity"), "vec_capacity", &[0]);
+        emit_host(self, format!("{owner}::clear"), "vec_clear", &[0]);
+        emit_host(self, format!("{owner}::pop"), "vec_pop", &[0]);
+        emit_host(self, format!("{owner}::remove"), "vec_remove", &[0, 1]);
+        emit_host(self, format!("{owner}::reserve"), "vec_reserve", &[0, 1]);
+        emit_host(self, format!("{owner}::insert"), "vec_insert", &[0, 1, 2]);
+    }
+
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
     /// emission at generic call boundaries.
     fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
@@ -4799,6 +4984,11 @@ impl Compiler {
             Ty::Constructor { owner, .. } => Self::ty_to_value_tag(owner),
             Ty::Tuple(_) => Some(ValueTag::Tuple),
             Ty::Array { .. } => Some(ValueTag::Array),
+            Ty::App(head, _)
+                if matches!(head.as_ref(), Ty::Con(n) if n == common::BUILTIN_VEC_TYPE) =>
+            {
+                Some(ValueTag::Array)
+            }
             Ty::Record { .. } => Some(ValueTag::Record),
             // Open type vars — boxing is required but we don't know the tag yet
             Ty::Var(_) => None,
@@ -6299,6 +6489,15 @@ impl Compiler {
                 )
             }
             Expression::Index(arr, Some(idx)) => {
+                if let Expression::Identifier(name) = arr.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(i) = idx.1.as_ref()
+                    && *i >= 0
+                    && (*i as usize) < n
+                {
+                    bytecode.push_load(base + *i as u32);
+                    return self.is_float_ty(target);
+                }
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(arr));
@@ -6341,25 +6540,39 @@ impl Compiler {
                 // discard_statement_value to keep or POP.
             }
             Expression::Index(arr, Some(idx)) => {
-                // Always stash the RHS — `StoreIndex` pops value/index/array.
-                // Dropping with POP when `leave_value_on_stack == false` left
-                // StoreIndex without a value (stack underflow / wrong write).
-                let tmp_arr = self.alloc_temp_slot();
-                let tmp_idx = self.alloc_temp_slot();
-                let tmp_val = self.alloc_temp_slot();
-                bytecode.push_store_pop(tmp_val);
-                bytecode.append(&mut self.do_compile(arr));
-                bytecode.push_store_pop(tmp_arr);
-                bytecode.append(&mut self.do_compile(idx));
-                bytecode.push_store_pop(tmp_idx);
-                bytecode.push_load(tmp_arr);
-                bytecode.push_load(tmp_idx);
-                bytecode.push_load(tmp_val);
-                bytecode.push(Byte::new(Instruction::StoreIndex));
-                if leave_value_on_stack {
-                    // StoreIndex leaves the value on the stack; keep it.
+                // Const store into a multi-slot stack array → direct STORE.
+                if let Expression::Identifier(name) = arr.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(i) = idx.1.as_ref()
+                    && *i >= 0
+                    && (*i as usize) < n
+                {
+                    let slot = base + *i as u32;
+                    if leave_value_on_stack {
+                        bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    }
+                    bytecode.push_store_pop(slot);
                 } else {
-                    bytecode.push_pop();
+                    // Always stash the RHS — `StoreIndex` pops value/index/array.
+                    // Dropping with POP when `leave_value_on_stack == false` left
+                    // StoreIndex without a value (stack underflow / wrong write).
+                    let tmp_arr = self.alloc_temp_slot();
+                    let tmp_idx = self.alloc_temp_slot();
+                    let tmp_val = self.alloc_temp_slot();
+                    bytecode.push_store_pop(tmp_val);
+                    bytecode.append(&mut self.do_compile(arr));
+                    bytecode.push_store_pop(tmp_arr);
+                    bytecode.append(&mut self.do_compile(idx));
+                    bytecode.push_store_pop(tmp_idx);
+                    bytecode.push_load(tmp_arr);
+                    bytecode.push_load(tmp_idx);
+                    bytecode.push_load(tmp_val);
+                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                    if leave_value_on_stack {
+                        // StoreIndex leaves the value on the stack; keep it.
+                    } else {
+                        bytecode.push_pop();
+                    }
                 }
             }
             Expression::Index(_, None) => {}
@@ -6423,6 +6636,23 @@ impl Compiler {
         }
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
+            // Const index into a multi-slot stack array → read/op/write slots.
+            // The heap path below boxes via Identifier escape and StoreIndex
+            // would mutate only that temporary.
+            if let Expression::Identifier(name) = arr.1.as_ref()
+                && let Some((base, n)) = self.stack_array_info(name)
+                && let Expression::Integer(i) = idx.1.as_ref()
+                && *i >= 0
+                && (*i as usize) < n
+            {
+                let slot = base + *i as u32;
+                let is_float = self.is_float_ty(target);
+                bytecode.push_load(slot);
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Self::binop_for_assign_op(op, is_float)));
+                bytecode.push_store_pop(slot);
+                return;
+            }
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -6474,6 +6704,21 @@ impl Compiler {
         };
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
+            if let Expression::Identifier(name) = arr.1.as_ref()
+                && let Some((base, n)) = self.stack_array_info(name)
+                && let Expression::Integer(i) = idx.1.as_ref()
+                && *i >= 0
+                && (*i as usize) < n
+            {
+                let slot = base + *i as u32;
+                let is_float = self.is_float_ty(target);
+                let instr = match op {
+                    parser::ast::AdjustOp::Inc => Instruction::INC,
+                    parser::ast::AdjustOp::Dec => Instruction::DEC,
+                };
+                bytecode.push(Byte::new(instr).with_inc_dec(slot, prefix, is_float));
+                return;
+            }
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -7397,19 +7642,19 @@ impl Compiler {
                             // Returned/captured PolyFn (`let f = capture_show(0)`).
                             self.polyfn_vars.insert(name.clone());
                         }
-                        // Compile the RHS BEFORE interning the binding name.
-                        // Match payload slots use `variables.len()` as the first
-                        // free slot; interning early (e.g. `let v = match e`)
-                        // reserved a hole and made bindings land one slot too
-                        // high while JumpIfMatch still pushed at the real
-                        // cursor.
                         let rhs_is_match = Self::rhs_is_match_expr(&children[1]);
-                        if rhs_is_match {
-                            self.emit_binding_rhs(&children[1]);
-                        } else {
-                            self.append_binding_rhs(&mut bytecode, &children[1]);
-                        }
                         if is_const {
+                            // Compile the RHS BEFORE interning the binding name.
+                            // Match payload slots use `variables.len()` as the first
+                            // free slot; interning early (e.g. `let v = match e`)
+                            // reserved a hole and made bindings land one slot too
+                            // high while JumpIfMatch still pushed at the real
+                            // cursor.
+                            if rhs_is_match {
+                                self.emit_binding_rhs(&children[1]);
+                            } else {
+                                self.append_binding_rhs(&mut bytecode, &children[1]);
+                            }
                             if let Some(val) = crate::const_fold::eval_expr(&children[1], self.const_env())
                             {
                                 self.const_env_mut().insert(name.clone(), val);
@@ -7424,13 +7669,80 @@ impl Compiler {
                             }
                             is_binding = true;
                         } else {
-                            let slot = self.alloc_binding_slot(&name);
-                            if rhs_is_match {
-                                self.bytecode.push_store_pop(slot);
-                            } else {
-                                bytecode.push_store_pop(slot);
+                            // Fixed `[T; N]` locals (`N >= 1`): N consecutive slots.
+                            // Element Values may be immediates or heap pointers;
+                            // nested array *elements* compile to MakeArray and
+                            // occupy one pointer slot each in the outer spine.
+                            // Layout decision is structural where possible: array
+                            // literal length, or copy from a known multi-slot local.
+                            // Flat `codegen_var_type` is last-wins across functions
+                            // (sibling tests often reuse `a`/`b`), so it must not be
+                            // the sole source of `N`.
+                            let rhs_node = unwrap_expr_output(&children[1]);
+                            let bind_ty = self
+                                .expr_codegen_ty(rhs_node)
+                                .or_else(|| self.codegen_expr_ty(&children[1]))
+                                .or_else(|| {
+                                    self.checker.lookup_for_codegen_span(
+                                        children[0].0.start,
+                                        children[0].0.end,
+                                    )
+                                })
+                                .or_else(|| self.codegen_var_type_for(&name));
+                            let fixed_n = bind_ty
+                                .as_ref()
+                                .and_then(|ty| Self::stack_array_bind_len(ty));
+                            let stack_n = match rhs_node.1.as_ref() {
+                                Expression::Array(items) if items.len() >= 1 => Some(items.len()),
+                                Expression::Identifier(src) => {
+                                    self.stack_array_info(src).map(|(_, sn)| sn)
+                                }
+                                _ => None,
                             }
-                            is_binding = true;
+                            .or(fixed_n);
+                            if let Some(n) = stack_n {
+                                let can_stack = match rhs_node.1.as_ref() {
+                                    Expression::Array(items) if items.len() == n => true,
+                                    Expression::Identifier(src) => self
+                                        .stack_array_info(src)
+                                        .is_some_and(|(_, sn)| sn == n),
+                                    _ => false,
+                                };
+                                if can_stack {
+                                    let base = self.alloc_stack_array_slots(&name, n);
+                                    let ok = self.try_emit_stack_array_init(
+                                        &mut bytecode,
+                                        &children[1],
+                                        base,
+                                        n,
+                                    );
+                                    debug_assert!(ok, "can_stack implies init emit");
+                                    is_binding = true;
+                                } else if rhs_is_match {
+                                    self.emit_binding_rhs(&children[1]);
+                                    let slot = self.alloc_binding_slot(&name);
+                                    self.bytecode.push_store_pop(slot);
+                                    is_binding = true;
+                                } else {
+                                    self.append_binding_rhs(&mut bytecode, &children[1]);
+                                    let slot = self.alloc_binding_slot(&name);
+                                    bytecode.push_store_pop(slot);
+                                    is_binding = true;
+                                }
+                            } else {
+                                if rhs_is_match {
+                                    self.emit_binding_rhs(&children[1]);
+                                } else {
+                                    self.append_binding_rhs(&mut bytecode, &children[1]);
+                                }
+                                let slot = self.alloc_binding_slot(&name);
+                                if rhs_is_match {
+                                    self.bytecode.push_store_pop(slot);
+                                } else {
+                                    bytecode.push_store_pop(slot);
+                                }
+                                is_binding = true;
+                            }
                         }
                     }
                 }
@@ -7523,6 +7835,7 @@ impl Compiler {
                 // at slot 1 read garbage. Extern preload slots live in
                 // the entry frame (bytecode before `main`).
                 let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                let prev_stack_arrays = std::mem::take(&mut self.context.stack_array_locals);
                 let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
                 let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
                 let prev_fn_qualified = self.current_function_qualified.take();
@@ -7531,6 +7844,7 @@ impl Compiler {
                 self.current_function_table_key = Some(table_key.clone());
                 self.push_const_env();
                 self.context.variables = Interner::default();
+                self.context.stack_array_locals.clear();
                 self.expr_depth = 0;
                 if self.compiling_method {
                     let slot = self.context.variables.intern("self".to_string()) as u32;
@@ -7589,6 +7903,7 @@ impl Compiler {
                 self.bytecode
                     .record_func_with_sp(table_key.clone(), entry, body_start, body_end, entry_sp);
                 self.context.variables = prev_fn_vars;
+                self.context.stack_array_locals = prev_stack_arrays;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
 
@@ -7771,11 +8086,21 @@ impl Compiler {
             // opcode carries no operand (the index is at the top
             // of the operand stack at dispatch time).
             Expression::Index(target, Some(index)) => {
-                let mut target_bc = self.do_compile(target);
-                bytecode.append(&mut target_bc);
-                let mut index_bc = self.do_compile(index);
-                bytecode.append(&mut index_bc);
-                bytecode.push_index();
+                // Const index into a multi-slot stack array → direct LOAD.
+                if let Expression::Identifier(name) = target.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(idx) = index.1.as_ref()
+                    && *idx >= 0
+                    && (*idx as usize) < n
+                {
+                    bytecode.push_load(base + *idx as u32);
+                } else {
+                    let mut target_bc = self.do_compile(target);
+                    bytecode.append(&mut target_bc);
+                    let mut index_bc = self.do_compile(index);
+                    bytecode.append(&mut index_bc);
+                    bytecode.push_index();
+                }
             }
             Expression::Index(_, None) => {}
             Expression::Readonly(inner) => {
@@ -9248,7 +9573,12 @@ impl Compiler {
                 {
                     bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot));
                 } else if let Some(slot) = self.lookup_slot(n) {
-                    bytecode.push_load(slot);
+                    if let Some((base, len)) = self.stack_array_info(n) {
+                        // Escape multi-slot local to a heap ObjArray.
+                        self.emit_box_stack_array(&mut bytecode, base, len);
+                    } else {
+                        bytecode.push_load(slot);
+                    }
                 } else {
                     // Not a local variable — check if it's a generic function
                     // escaping into a non-call position (e.g. `let f = id;`).
@@ -10057,24 +10387,38 @@ impl Compiler {
                     // Value left on stack for expression result; ExprStatement POPs.
                 }
                 Expression::Index(arr, None) => {
+                    // Unreachable when typecheck rejects `arr[] =`; kept for
+                    // AST completeness. Prefer `vec.push(value)` for `Vec`.
                     bytecode.append(&mut self.do_compile(arr));
                     self.append_binding_rhs(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::ArrayPush));
                 }
                 Expression::Index(arr, Some(idx)) => {
-                    let tmp_arr = self.alloc_temp_slot();
-                    let tmp_idx = self.alloc_temp_slot();
-                    let tmp_val = self.alloc_temp_slot();
-                    self.append_binding_rhs(&mut bytecode, value);
-                    bytecode.push_store_pop(tmp_val);
-                    bytecode.append(&mut self.do_compile(arr));
-                    bytecode.push_store_pop(tmp_arr);
-                    bytecode.append(&mut self.do_compile(idx));
-                    bytecode.push_store_pop(tmp_idx);
-                    bytecode.push_load(tmp_arr);
-                    bytecode.push_load(tmp_idx);
-                    bytecode.push_load(tmp_val);
-                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                    if let Expression::Identifier(name) = arr.1.as_ref()
+                        && let Some((base, n)) = self.stack_array_info(name)
+                        && let Expression::Integer(i) = idx.1.as_ref()
+                        && *i >= 0
+                        && (*i as usize) < n
+                    {
+                        self.append_binding_rhs(&mut bytecode, value);
+                        bytecode.push_store_pop(base + *i as u32);
+                        // Leave value on stack like StoreIndex.
+                        bytecode.push_load(base + *i as u32);
+                    } else {
+                        let tmp_arr = self.alloc_temp_slot();
+                        let tmp_idx = self.alloc_temp_slot();
+                        let tmp_val = self.alloc_temp_slot();
+                        self.append_binding_rhs(&mut bytecode, value);
+                        bytecode.push_store_pop(tmp_val);
+                        bytecode.append(&mut self.do_compile(arr));
+                        bytecode.push_store_pop(tmp_arr);
+                        bytecode.append(&mut self.do_compile(idx));
+                        bytecode.push_store_pop(tmp_idx);
+                        bytecode.push_load(tmp_arr);
+                        bytecode.push_load(tmp_idx);
+                        bytecode.push_load(tmp_val);
+                        bytecode.push(Byte::new(Instruction::StoreIndex));
+                    }
                 }
                 Expression::Identifier(name) => {
                     let resolved = self
@@ -10127,8 +10471,30 @@ impl Compiler {
                                     self.messages.push(message);
                                 }
                             }
-                            self.append_binding_rhs(&mut bytecode, value);
-                            bytecode.push_store_pop(symbol as u32);
+                            // Multi-slot stack array: rewrite slots in place.
+                            if let Some((base, n)) = self.stack_array_info(name) {
+                                let ok = self.try_emit_stack_array_init(
+                                    &mut bytecode,
+                                    value,
+                                    base,
+                                    n,
+                                );
+                                if !ok {
+                                    // Heap `[T; N]` (e.g. call return): box into slots.
+                                    self.append_binding_rhs(&mut bytecode, value);
+                                    let tmp = self.alloc_temp_slot();
+                                    bytecode.push_store_pop(tmp);
+                                    for i in 0..n {
+                                        bytecode.push_load(tmp);
+                                        bytecode.push_const(i as i32);
+                                        bytecode.push_index();
+                                        bytecode.push_store_pop(base + i as u32);
+                                    }
+                                }
+                            } else {
+                                self.append_binding_rhs(&mut bytecode, value);
+                                bytecode.push_store_pop(symbol as u32);
+                            }
                         } else {
                             let mut message = Message::error(
                                 ErrorCode::UnknownValue,
@@ -11427,6 +11793,7 @@ impl Compiler {
             self.par_spec_args.clear();
         }
         self.emit_builtin_dict_thunks();
+        self.emit_vec_method_thunks();
         // Builtin dictionary thunks are emitted immediately after the
         // prologue and before user code. Keep `program_start_offset`
         // pointing at the first user byte so `extern` prologue JMPs

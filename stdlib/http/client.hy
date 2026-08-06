@@ -66,7 +66,7 @@ fn open_stream(Url u) -> Result<Stream, HttpError> {
     return http_fail_stream()?;
 }
 
-fn request_send([byte] head, Url u, [byte] body) -> Result<Response, HttpError> {
+fn request_send(Vec<byte> head, Url u, Vec<byte> body) -> Result<Response, HttpError> {
     let msg = concat_bytes(head, body);
     let s = open_stream(u)?;
     match write_all(s, msg) {
@@ -87,7 +87,7 @@ fn request_send([byte] head, Url u, [byte] body) -> Result<Response, HttpError> 
     return parse_response(raw)?;
 }
 
-fn request(string method, string url, Headers headers, [byte] body) -> Result<Response, HttpError> {
+fn request(string method, string url, Headers headers, Vec<byte> body) -> Result<Response, HttpError> {
     let u = parse_url(url)?;
     let bl = len(body);
     let n = len(headers.names);
@@ -114,11 +114,11 @@ fn request(string method, string url, Headers headers, [byte] body) -> Result<Re
 
 fn get(string url) -> Result<Response, HttpError> {
     let hs = empty_headers();
-    let body: [byte] = [];
+    let body: Vec<byte> = Vec::new();
     return request("GET", url, hs, body)?;
 }
 
-fn post(string url, [byte] body) -> Result<Response, HttpError> {
+fn post(string url, Vec<byte> body) -> Result<Response, HttpError> {
     let hs = empty_headers();
     return request("POST", url, hs, body)?;
 }

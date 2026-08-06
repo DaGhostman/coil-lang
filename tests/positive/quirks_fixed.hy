@@ -1,6 +1,6 @@
 use string::{format, to_bytes};
 
-fn find_opt([byte] hay, [byte] needle) -> Option<int> {
+fn find_opt(Vec<byte> hay, Vec<byte> needle) -> Option<int> {
     let i = 0;
     while i < len(hay) {
         if hay[i] == needle[0] {

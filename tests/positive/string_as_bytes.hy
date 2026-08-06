@@ -1,14 +1,14 @@
 use string::{to_bytes};
 
-test("non-literal string as [byte]") {
+test("non-literal string via to_bytes") {
     let s = "hi";
-    let b = s as [byte];
+    let b = to_bytes(s);
     assert(b == to_bytes("hi"))?;
     assert(len(b) == 2)?;
 }
 
-test("literal still works") {
-    let b = "ok" as [byte];
+test("literal cast to Vec<byte>") {
+    let b = "ok" as Vec<byte>;
     assert(len(b) == 2)?;
     assert(b == to_bytes("ok"))?;
 }

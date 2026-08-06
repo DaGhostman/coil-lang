@@ -5,7 +5,7 @@ use io::sync::{read_to_end, write_all};
 
 use string::{format, to_bytes};
 
-fn write_file(string path, [byte] data) {
+fn write_file(string path, Vec<byte> data) {
     let s = open(path, "w")?;
     write_all(s, data)?;
     close(s)?;
@@ -19,7 +19,7 @@ fn read_len(string path) {
     return len(buf);
 }
 
-fn run(string path, [byte] data) {
+fn run(string path, Vec<byte> data) {
     write_file(path, data)?;
     let n = read_len(path)?;
     return format("%i", n);
@@ -27,7 +27,7 @@ fn run(string path, [byte] data) {
 
 fn main() {
     let path = "/tmp/coil_io_file_test.bin";
-    let data: [byte] = [72, 105];
+    let data = to_bytes("Hi");
     write_all(stdout(), to_bytes(format("%s", match run(path, data) {
         Result::Ok(s) => s,
         Result::Err(_) => "err",

@@ -762,7 +762,7 @@ fn write_greeting() -> Result<(), IoError> {
     let h: byte = 104;
     let i: byte = 105;
     let nl: byte = 10;
-    let payload: [byte] = [h, i, nl];
+    let payload = Vec::from([h, i, nl]);
     let w = open(path, "w")?;
     write(w, payload)?;
     close(w)?;
@@ -825,13 +825,14 @@ use io::sync::{read_exact};
 fn write_then_read(string path) -> Result<(), IoError> {
     let a: byte = 65;
     let b: byte = 66;
-    let payload: [byte] = [a, b];
+    let payload = Vec::from([a, b]);
     let w = open(path, "w")?;
     write(w, payload)?;
     close(w)?;
 
     let r = open(path, "r")?;
-    let out: [byte] = [0, 0];
+    let z: byte = 0;
+    let out = Vec::from([z, z]);
     read_exact(r, out)?;
     close(r)?;
     return ();

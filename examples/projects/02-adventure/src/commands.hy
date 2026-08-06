@@ -1,14 +1,16 @@
-// Command parse for the adventure (byte-line equality — no from_bytes).
+// Command parse for the adventure (byte-line equality).
 //
 // Cmd kind: 0=look 1=go 2=take 3=inv 4=save 5=load 6=help 7=quit 8=bad
 // Dir: 0=north 1=south 2=east 3=west; unused sentinel = 99.
+
+use string::{to_bytes};
 
 class Cmd {
     kind: int,
     dir: int,
 }
 
-fn bytes_eq([byte] a, [byte] b) -> int {
+fn bytes_eq(Vec<byte> a, Vec<byte> b) -> int {
     if len(a) != len(b) {
         return 0;
     }
@@ -23,20 +25,20 @@ fn bytes_eq([byte] a, [byte] b) -> int {
     return ok;
 }
 
-fn parse_line([byte] line) -> Cmd {
-    let look: [byte] = [108, 111, 111, 107];
-    let inv: [byte] = [105, 110, 118, 101, 110, 116, 111, 114, 121];
-    let take: [byte] = [116, 97, 107, 101];
-    let take_key: [byte] = [116, 97, 107, 101, 32, 107, 101, 121];
-    let save: [byte] = [115, 97, 118, 101];
-    let load: [byte] = [108, 111, 97, 100];
-    let help: [byte] = [104, 101, 108, 112];
-    let quit: [byte] = [113, 117, 105, 116];
-    let exit: [byte] = [101, 120, 105, 116];
-    let go_n: [byte] = [103, 111, 32, 110, 111, 114, 116, 104];
-    let go_s: [byte] = [103, 111, 32, 115, 111, 117, 116, 104];
-    let go_e: [byte] = [103, 111, 32, 101, 97, 115, 116];
-    let go_w: [byte] = [103, 111, 32, 119, 101, 115, 116];
+fn parse_line(Vec<byte> line) -> Cmd {
+    let look = to_bytes("look");
+    let inv = to_bytes("inventory");
+    let take = to_bytes("take");
+    let take_key = to_bytes("take key");
+    let save = to_bytes("save");
+    let load = to_bytes("load");
+    let help = to_bytes("help");
+    let quit = to_bytes("quit");
+    let exit = to_bytes("exit");
+    let go_n = to_bytes("go north");
+    let go_s = to_bytes("go south");
+    let go_e = to_bytes("go east");
+    let go_w = to_bytes("go west");
 
     if bytes_eq(line, look) == 1 {
         return new Cmd(0, 99);

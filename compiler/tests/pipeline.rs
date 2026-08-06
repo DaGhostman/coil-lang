@@ -2424,7 +2424,7 @@ fn main() {
         Result::Ok(s) => s,
         Result::Err(_) => panic "listen",
     };
-    let msg: [byte] = [111, 107];
+    let msg = to_bytes("ok");
     let count = 0;
     while count < 2 {
         let server = match accept_wait(listener) {
@@ -2503,7 +2503,7 @@ fn for_in_let_match_preserves_accumulator() {
 use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
-    let items: [int] = [1, 2, 3];
+    let items = [1, 2, 3];
     let acc = 0;
     for n in items {
         let v = match Result::Ok(n) {
@@ -2805,7 +2805,7 @@ fn main() {
     assert_eq!(output, "16");
 }
 
-/// P1: empty array + append + index round-trip (and under GC pressure).
+/// P1: empty Vec + push + index round-trip (and under GC pressure).
 #[test]
 fn empty_array_append_and_index_round_trip() {
     let output = run_example_src(
@@ -2813,16 +2813,16 @@ fn empty_array_append_and_index_round_trip() {
 use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
-    let arr: [int] = [];
-    arr[] = 4;
-    arr[] = 1;
-    arr[] = 4;
+    let arr: Vec<int> = Vec::new();
+    arr.push(4);
+    arr.push(1);
+    arr.push(4);
     write(stdout(), to_bytes(format("%i", len(arr))));
     write(stdout(), to_bytes(format("%i", arr[0])));
     write(stdout(), to_bytes(format("%i", arr[2])));
     let i = 0;
     while i < 80 {
-        arr[] = i;
+        arr.push(i);
         i = i + 1;
     }
     write(stdout(), to_bytes(format("%i", arr[0])));
@@ -3823,7 +3823,7 @@ fn mem_fwd_post_call_store_compare_does_not_hang() {
         r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
-fn find_bytes([byte] hay, [byte] needle) -> int {
+fn find_bytes(Vec<byte> hay, Vec<byte> needle) -> int {
     let hn = len(hay);
     let nn = len(needle);
     if nn == 0 { return 0; }
@@ -3841,18 +3841,18 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
     }
     return 999999;
 }
-fn bytes_slice([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn bytes_slice(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     while i < end {
-        if i < len(src) { out[] = src[i]; }
+        if i < len(src) { out.push(src[i]); }
         i = i + 1;
     }
     return out;
 }
 fn parse_url(string s) -> int {
     let b = to_bytes(s);
-    let sep: [byte] = [58, 47, 47];
+    let sep = Vec::from([58 as byte, 47 as byte, 47 as byte]);
     let sep_at = find_bytes(b, sep);
     if sep_at == 999999 { return -1; }
     let scheme_b = bytes_slice(b, 0, sep_at);
@@ -4429,7 +4429,7 @@ use io::{stdout, write};
 use string::{format, to_bytes};
 
 fn digest_len() -> int {
-    let empty: [byte] = [];
+    let empty: Vec<byte> = Vec::new();
     return match sha256(empty) {
         Result::Ok(d) => len(d),
         Result::Err(_) => 0,
@@ -6138,16 +6138,16 @@ fn nested_host_invoke_call_args_stage_without_clobber() {
 use io::{stdout, write};
 use string::{format, to_bytes};
 
-fn concat_bytes([byte] a, [byte] b) -> [byte] {
-    let out: [byte] = [];
+fn concat_bytes(Vec<byte> a, Vec<byte> b) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     while i < len(a) {
-        out[] = a[i];
+        out.push(a[i]);
         i = i + 1;
     }
     let j = 0;
     while j < len(b) {
-        out[] = b[j];
+        out.push(b[j]);
         j = j + 1;
     }
     return out;

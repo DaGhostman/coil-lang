@@ -1074,6 +1074,32 @@
         assert_eq!(vm.pop().as_int(), 30); // slot 0 got TOS
     }
 
+
+    /// Reverse slot order (high→low) must still leave the cursor past max slot
+    /// so later pushes do not clobber multi-slot fixed-array locals.
+    #[test]
+    fn packed_store_reverse_slots_extends_cursor_past_max() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            const_int(30), // TOS
+            // Same order codegen emits for stack `[T; 3]` locals.
+            Byte::new(Instruction::STORE).with_load_store_packed(3, 2, 1, 0),
+            const_int(99),
+            store_pop(3),
+            load(0),
+            load(1),
+            load(2),
+            load(3),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 99);
+        assert_eq!(vm.pop().as_int(), 30);
+        assert_eq!(vm.pop().as_int(), 20);
+        assert_eq!(vm.pop().as_int(), 10);
+    }
+
     #[test]
     fn store_pop_writes_to_correct_slot_index() {
         let mut vm = Machine::<4>::default();

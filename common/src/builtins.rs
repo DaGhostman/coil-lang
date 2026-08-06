@@ -190,10 +190,17 @@ pub const BUILTIN_ROOT_TYPE: &str = "Root";
 /// Non-rooting GC handle (`Weak<T>` from virtual `gc`).
 pub const BUILTIN_WEAK_TYPE: &str = "Weak";
 
+/// Growable heap vector (`Vec<T>`) — replaces dynamic `[T]` arrays.
+pub const BUILTIN_VEC_TYPE: &str = "Vec";
+
 pub fn is_builtin_root_type(name: &str) -> bool {
     name == BUILTIN_ROOT_TYPE
 }
 
 pub fn is_builtin_weak_type(name: &str) -> bool {
     name == BUILTIN_WEAK_TYPE
+}
+
+pub fn is_builtin_vec_type(name: &str) -> bool {
+    name == BUILTIN_VEC_TYPE
 }

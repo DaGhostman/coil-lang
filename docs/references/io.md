@@ -18,7 +18,7 @@ use io::sync::{write_all, read_to_end};   // optional blocking adapters (userlan
 | `drive` | `() -> int` | Poll async waiters once (non-blocking) |
 | `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready |
 | `block_on` | Prelude | `block_on(coro) -> Y` — auto-imported; drives `async fn` to completion |
-| `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
+| `from_bytes` / `to_bytes` | Text aliases | UTF-8 `Vec<byte> ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
 | `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::{connect, listen, …};`; timeout `ms <= 0` waits forever |
 | `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
 | `io::net::udp::{bind,connect,send_to,recv_from,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
@@ -63,7 +63,7 @@ TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
 non-empty PEM enables mTLS. `timeout_ms <= 0` means no handshake deadline.
 
-Buffers are **`[byte]`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP remains userland (`stdlib/http`).
+Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP remains userland (`stdlib/http`).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 

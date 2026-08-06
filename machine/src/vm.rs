@@ -1607,17 +1607,20 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::STORE => {
                     // Pop TOS into each listed slot (packed n=1..=3, or wide n=0).
-                    // Extend the cursor when a slot is newly allocated, but never
-                    // shrink past higher locals — locals and the operand stack share memory.
+                    // After all pops, keep the shared operand/local cursor at or
+                    // past the highest written slot so later pushes do not
+                    // clobber multi-slot locals (fixed `[T; N]` on stack).
                     let count = opcode.load_store_count();
+                    let mut max_slot = sp;
                     for i in 0..count {
                         let slot = sp + opcode.load_store_slot_at(i) as usize;
+                        max_slot = max_slot.max(slot);
                         let val = self.stack.pop();
                         self.stack[slot] = val;
-                        let tell = self.stack.tell();
-                        if tell < slot + 1 {
-                            self.stack.seek(slot + 1);
-                        }
+                    }
+                    let need = max_slot + 1;
+                    if self.stack.tell() < need {
+                        self.stack.seek(need);
                     }
                 }
                 Instruction::LOAD => {

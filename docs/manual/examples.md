@@ -200,7 +200,7 @@ fn main() {
 
 ### `examples/variadic.hy`
 
-**Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
+**Demonstrates:** Trailing rest parameters (`T... name`) packing into a `Vec<T>`, including an empty rest and named fixed args followed by positional rest.
 
 ```coil
 use io::{stdout, write_all};
@@ -775,11 +775,11 @@ fn read_x_v(Outer o) -> int {
 
 ## IO streams
 
-Virtual `io` module (`use io::{open, stdout, …};`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
+Virtual `io` module (`use io::{open, stdout, …};`), `byte` / `Vec<byte>` buffers, files, EOF, text helpers, UDP.
 
 ### `examples/io_bytes.hy`
 
-**Demonstrates:** `byte` annotation, `[byte]` literal coercion, `len` / index.
+**Demonstrates:** `byte` annotation, `Vec<byte>` via `Vec::from`, `len` / index.
 
 | | |
 |---|---|
@@ -806,7 +806,7 @@ Virtual `io` module (`use io::{open, stdout, …};`), `byte` / `[byte]` buffers,
 
 ### `examples/io_text.hy`
 
-**Demonstrates:** `from_bytes` (`[byte]` → UTF-8 `string`) and `to_bytes` (`string` → `[byte]`).
+**Demonstrates:** `from_bytes` (`Vec<byte>` → UTF-8 `string`) and `to_bytes` (`string` → `Vec<byte>`).
 
 | | |
 |---|---|
@@ -853,15 +853,15 @@ Tuples, arrays, dicts, and `type` aliases.
 
 ### `examples/array_grow.hy`
 
-**Demonstrates:** Growing arrays with `arr[] =`, reading the runtime length with `len`, and indexing appended elements.
+**Demonstrates:** Growable `Vec` via `Vec::from` + `push`, reading length with `len`, and indexing appended elements. (`arr[] =` append is removed.)
 
 ```coil
 use io::{stdout, write_all};
 use string::{format, to_bytes};
 fn main() {
-    let a = [1, 2];
-    a[] = 3;
-    a[] = 4;
+    let a = Vec::from([1, 2]);
+    a.push(3);
+    a.push(4);
     write_all(stdout(), to_bytes(format("%i", len(a))));
     write_all(stdout(), to_bytes(format("%i", a[0])));
     write_all(stdout(), to_bytes(format("%i", a[3])));
@@ -872,6 +872,40 @@ fn main() {
 |---|---|
 | **Run** | `cargo run -- examples/array_grow.hy` |
 | **Output** | `414` |
+
+---
+
+### `examples/vec.hy`
+
+**Demonstrates:** Fixed `[T; N]` stack locals plus `Vec` methods (`push`, `pop`, `len`, index assign).
+
+```coil
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+fn main() {
+    let fixed = [10, 20, 30];
+    write_all(stdout(), to_bytes(format("%i,", fixed[1])));
+
+    let v: Vec<int> = Vec::new();
+    v.push(fixed[0]);
+    v.push(fixed[1]);
+    v.push(fixed[2]);
+    write_all(stdout(), to_bytes(format("%i,", v.len())));
+
+    v[1] = 99;
+    write_all(stdout(), to_bytes(format("%i,", v[1])));
+
+    let _ = v.pop();
+    write_all(stdout(), to_bytes(format("%i", v.len())));
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec.hy` |
+| **Output** | `20,3,99,2` |
 
 ---
 
@@ -947,11 +981,11 @@ fn main() {
 
 ### `examples/nested_aggregates.hy`
 
-**Demonstrates:** Nested aggregates — `type Row = (string, int); type Table = [Row];` with `for` and let-destructure.
+**Demonstrates:** Nested aggregates — `type Row = (string, int); type Table = [Row; 2];` with `for` and let-destructure.
 
 ```coil
 type Row = (string, int);
-type Table = [Row];
+type Table = [Row; 2];
 
 fn main() {
     let people: Table = [("alice", 30), ("bob", 25)];
@@ -1968,6 +2002,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `io_nested_host.hy` | IO | `3` |
 | `io_nested_write.hy` | IO | `2` |
 | `array_grow.hy` | Collections | `414` |
+| `vec.hy` | Collections | `20,3,99,2` |
 | `static_singleton.hy` | Statics | `121` |
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |

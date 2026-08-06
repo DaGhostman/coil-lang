@@ -9,8 +9,8 @@ use string::{format, from_bytes, to_bytes};
 | Export | Kind | Notes |
 |--------|------|-------|
 | `format` | Compiler intrinsic | `format("%i", value)` lowers to `FORMAT`; the first argument must be a string literal |
-| `from_bytes` | Host native | Decode UTF-8 `[byte]` to `Result<string, IoError>` |
-| `to_bytes` | Host native | Encode `string` to UTF-8 `[byte]` |
+| `from_bytes` | Host native | Decode UTF-8 `Vec<byte>` to `Result<string, IoError>` |
+| `to_bytes` | Host native | Encode `string` to UTF-8 `Vec<byte>` |
 
 `format` checks literal `%` specifiers against argument types at compile time:
 

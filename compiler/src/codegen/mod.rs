@@ -685,6 +685,10 @@ struct Context {
     /// block leaves the outer binding's stack value intact).
     block_bindings: Option<HashMap<String, u32>>,
 
+    /// Fixed `[T; N]` locals laid out as `N` consecutive frame slots:
+    /// name → (base_slot, N). Escaping uses → `MakeArray`.
+    stack_array_locals: HashMap<String, (u32, usize)>,
+
     prev: Option<Box<Self>>,
 }
 
@@ -954,6 +958,7 @@ impl<'ctx> Context {
             match_bindings: self.match_bindings.clone(),
             // Fresh overlay so inner `let` / destructure can shadow outer names.
             block_bindings: Some(HashMap::new()),
+            stack_array_locals: self.stack_array_locals.clone(),
             prev: Some(Box::new(self.to_owned())),
         }
     }

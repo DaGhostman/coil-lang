@@ -7,11 +7,11 @@ use io::net::tcp::{listen};
 use string::{to_bytes};
 use io::sync::{accept_wait, write_all};
 
-fn fixed_response() -> [byte] {
+fn fixed_response() -> Vec<byte> {
     return to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok");
 }
 
-fn find_header_end([byte] buf) -> int {
+fn find_header_end(Vec<byte> buf) -> int {
     let cr: byte = 13;
     let lf: byte = 10;
     let n = len(buf);
@@ -31,9 +31,20 @@ fn find_header_end([byte] buf) -> int {
     return 999999;
 }
 
+fn make_chunk() -> Vec<byte> {
+    let z: byte = 0;
+    let chunk: Vec<byte> = Vec::new();
+    let i = 0;
+    while i < 64 {
+        chunk.push(z);
+        i = i + 1;
+    }
+    return chunk;
+}
+
 fn drain_request(Stream server) {
-    let acc: [byte] = [];
-    let chunk: [byte] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+    let acc: Vec<byte> = Vec::new();
+    let chunk = make_chunk();
     let guard = 0;
     let done = 0;
     while done == 0 {
@@ -65,7 +76,7 @@ fn drain_request(Stream server) {
             if got == 1 {
                 let j = 0;
                 while j < nread {
-                    acc[] = chunk[j];
+                    acc.push(chunk[j]);
                     j = j + 1;
                 }
             }

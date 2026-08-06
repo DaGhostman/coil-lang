@@ -80,7 +80,7 @@ coil provides five primitive type names used in everyday programs:
 |----------|--------------------|--------------------------------------------|
 | `int`    | `0`, `-42`, `100`  | Signed integer                             |
 | `float`  | `1.0`, `3.14`      | IEEE-style floating point                  |
-| `byte`   | `0`…`255` (as `int` literal with annotation) | `0..=255`; used for IO buffers (`[byte]`) |
+| `byte`   | `0`…`255` (as `int` literal with annotation) | `0..=255`; used for IO buffers (`Vec<byte>`) |
 | `string` | `"hello"`          | Immutable string data                      |
 | `bool`   | `true`, `false`    | Boolean                                    |
 | `void`   | (no literal)       | **FFI only** — marks functions that return nothing to C/host code |
@@ -246,7 +246,7 @@ const VERSION = "1.0";
 // VERSION = "2.0";   // error: cannot assign to const binding
 ```
 
-`const` is **shallow**: if the initializer is heap-mutable (`[T]`, a class instance, or a dict), the compiler emits a warning that interior mutation (fields, indices, `arr[] =`) still succeeds. Scalars, strings, tuples, and enums without interior paths do not warn.
+`const` is **shallow**: if the initializer is heap-mutable (`Vec<T>`, a class instance, or a dict), the compiler emits a warning that interior mutation (fields, indices) still succeeds. Scalars, strings, tuples, and enums without interior paths do not warn.
 
 ### Module `static` slots
 
@@ -270,7 +270,7 @@ let xs = readonly [1, 2, 3];
 let p = readonly new Point(1, 2);
 ```
 
-Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.hy` and [Types — Readonly](../../references/types.md#readonly-types).
+Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[i] = …`) is rejected. See `examples/readonly_seal.hy` and [Types — Readonly](../../references/types.md#readonly-types).
 
 **Reading** a variable emits a load from that slot. The typechecker ensures you only assign types compatible with the binding's declared or inferred type.
 
