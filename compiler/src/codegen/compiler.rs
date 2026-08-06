@@ -61,6 +61,20 @@ impl Compiler {
         &self.debug_locs
     }
 
+    /// Function entry symbols for panic backtraces (sorted by `entry_pc`).
+    pub fn fn_debug_symbols(&self) -> Vec<FnDebugSym> {
+        let mut syms: Vec<FnDebugSym> = self
+            .functions
+            .iter()
+            .map(|(name, &pc)| FnDebugSym {
+                name: name.clone(),
+                entry_pc: pc as u32,
+            })
+            .collect();
+        syms.sort_by_key(|s| s.entry_pc);
+        syms
+    }
+
     fn pad_debug_locs(&mut self) {
         while self.debug_locs.len() < self.bytecode.len() {
             self.debug_locs.push(DebugLoc::unknown());
@@ -432,6 +446,81 @@ impl Compiler {
             self.discard_if_branch(b);
         }
         true
+    }
+
+    /// Whether `body` is a tail self-call eligible for TCO.
+    fn expr_is_tail_self_call(&self, expr: &Output<'_>) -> bool {
+        if self.fn_defers.is_empty() {
+            // defer check only
+        } else {
+            return false;
+        }
+        let Some(cur) = self.current_function_table_key.as_ref() else {
+            return false;
+        };
+        let call_expr = match expr.1.as_ref() {
+            Expression::Call { .. } => expr,
+            Expression::Expr(inner) | Expression::Group(inner) => {
+                if matches!(inner.1.as_ref(), Expression::Call { .. }) {
+                    inner
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        let Expression::Call { name, .. } = call_expr.1.as_ref() else {
+            return false;
+        };
+        let Expression::Identifier(fname) = name.1.as_ref() else {
+            return false;
+        };
+        let mut call_key = self
+            .aliases
+            .get(*fname)
+            .cloned()
+            .unwrap_or_else(|| fname.to_string());
+        if let Some((fa, is_rest, id)) = self
+            .checker
+            .selected_overload_at(call_expr.0.start, call_expr.0.end)
+        {
+            let keyed = overload_fn_key(&call_key, fa, is_rest, id);
+            if self.functions.contains_key(&keyed) {
+                call_key = keyed;
+            }
+        } else if !self.functions.contains_key(&call_key) {
+            if let Some(q) = self.current_function_qualified.as_ref() {
+                if call_key == *q || call_key == strip_overload_key(cur) {
+                    call_key = cur.clone();
+                }
+            }
+        }
+        if &call_key != cur {
+            return false;
+        }
+        let qualified = self.current_function_qualified.as_deref().unwrap_or("");
+        !self.coroutine_fns.contains(qualified) && !self.coroutine_fns.contains(&call_key)
+    }
+
+    fn return_is_tail_match(&self, expr: &Output<'_>) -> bool {
+        let match_expr = match expr.1.as_ref() {
+            Expression::Match { .. } => Some(expr),
+            Expression::Expr(inner) | Expression::Group(inner) => {
+                if matches!(inner.1.as_ref(), Expression::Match { .. }) {
+                    Some(inner)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(match_expr) = match_expr else {
+            return false;
+        };
+        let Expression::Match { arms, .. } = match_expr.1.as_ref() else {
+            return false;
+        };
+        !arms.is_empty() && arms.iter().all(|arm| self.expr_is_tail_self_call(&arm.body))
     }
 
     /// `return self(...)` tail-call when eligible.
@@ -2299,6 +2388,12 @@ impl Compiler {
         if args.len() < 2 {
             return false;
         }
+        if args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::Identifier(_)))
+        {
+            return false;
+        }
         let mut saw_pure = false;
         let mut saw_effect = false;
         for arg in args {
@@ -2517,17 +2612,8 @@ impl Compiler {
         id
     }
 
-    fn codegen_var_type_for(&self, name: &str) -> Option<Ty> {
-        for frame in self.mono_codegen_var_types.iter().rev() {
-            if let Some(ty) = frame.get(name) {
-                return Some(ty.clone());
-            }
-        }
-        self.checker.codegen_var_type(name).cloned()
-    }
-
     /// Identifier type for codegen: mono arm overrides, then span cache, then
-    /// the flat name map. Preferring span avoids later functions' `let x`
+    /// scoped checker bindings. Preferring span avoids later functions' `let x`
     /// overwriting earlier `x` entries used by `static_len_of` / arith.
     fn codegen_ident_ty(&self, node: &Output) -> Option<Ty> {
         use crate::typechecking::subst::apply_ty_prune;
@@ -3783,7 +3869,7 @@ impl Compiler {
             match pattern {
                 Pattern::Binding { name } => Some(name),
                 Pattern::Constructor { payload, .. } => match payload {
-                    PatternPayload::Tuple(items) if items.len() == 1 => sole_binding(&items[0]),
+                    PatternPayload::Tuple(items) if items.len() == 1 => sole_binding(&items[0].1),
                     _ => None,
                 },
                 _ => None,
@@ -5268,7 +5354,29 @@ impl Compiler {
     /// Returned/captured PolyFns and rank-n parameters fall back to the local's
     /// recorded type: unbox only when that type's result is still a type
     /// parameter (boxed at runtime) and the call site resolved it concretely.
-    fn local_polyfn_call_needs_unbox(&self, local: &str, call_ty: &Ty) -> bool {
+    fn local_polyfn_var_ty(&self, local: &str, span: Option<(usize, usize)>) -> Option<Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        if let Some((start, end)) = span {
+            if let Some(ty) = self.checker.lookup_for_codegen_span(start, end) {
+                return Some(apply_ty_prune(self.checker.subst(), &ty));
+            }
+        }
+        for frame in self.mono_codegen_var_types.iter().rev() {
+            if let Some(ty) = frame.get(local) {
+                return Some(apply_ty_prune(self.checker.subst(), ty));
+            }
+        }
+        self.checker
+            .codegen_var_type(local)
+            .map(|ty| apply_ty_prune(self.checker.subst(), ty))
+    }
+
+    fn local_polyfn_call_needs_unbox(
+        &self,
+        local: &str,
+        call_ty: &Ty,
+        span: Option<(usize, usize)>,
+    ) -> bool {
         use crate::typechecking::subst::apply_ty_prune;
 
         if let Some(source) = self.polyfn_sources.get(local) {
@@ -5277,7 +5385,7 @@ impl Compiler {
         if Self::ty_to_value_tag(call_ty).is_none() {
             return false;
         }
-        let Some(var_ty) = self.codegen_var_type_for(local) else {
+        let Some(var_ty) = self.local_polyfn_var_ty(local, span) else {
             return false;
         };
         let pruned = apply_ty_prune(self.checker.subst(), &var_ty);
@@ -5542,6 +5650,14 @@ impl Compiler {
     /// the current `emit_idx` (since `lhs` is the next AST node to be
     /// visited). Returns true iff that type is the float constructor.
     ///
+    fn string_concat_needs_staging(&self, lhs: &Output, rhs: &Output) -> bool {
+        if self.arg_emits_on_self_bytecode(lhs) || self.arg_emits_on_self_bytecode(rhs) {
+            return true;
+        }
+        matches!(lhs.1.as_ref(), Expression::Add(_, _))
+            || matches!(rhs.1.as_ref(), Expression::Add(_, _))
+    }
+
     /// Recurses into `lhs` and `rhs`, appending their bytecodes to
     /// `bytecode` in the same order as the legacy emitter. The caller
     /// is then responsible for emitting the operator-specific
@@ -7687,8 +7803,7 @@ impl Compiler {
                                         children[0].0.start,
                                         children[0].0.end,
                                     )
-                                })
-                                .or_else(|| self.codegen_var_type_for(&name));
+                                });
                             let fixed_n = bind_ty
                                 .as_ref()
                                 .and_then(|ty| Self::stack_array_bind_len(ty));
@@ -8131,18 +8246,23 @@ impl Compiler {
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                if self.try_emit_tail_call_expr(expr, &mut bytecode) {
+                let tail_match = self.return_is_tail_match(expr);
+                if !tail_match && self.try_emit_tail_call_expr(expr, &mut bytecode) {
                     if self.compiling_result_mode {
                         Self::emit_ok_or_some_wrap(&mut bytecode, false);
                     }
                     return bytecode;
                 }
 
+                if tail_match {
+                    self.match_tail_call = true;
+                }
                 // Evaluate the return value first, then run defers (LIFO).
                 // Each defer thunk returns a sentinel that we POP so the
                 // pending return value stays on top for RETURN.
                 // Flush the value into `self.bytecode` before labeled defers.
                 self.append_with_existential_pack(&mut bytecode, expr);
+                self.match_tail_call = false;
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
@@ -9503,7 +9623,11 @@ impl Compiler {
                         );
                         // Generic→concrete unbox for polyfn call site.
                         if let Some(call_ty) = self.codegen_expr_ty(ast) {
-                            if self.local_polyfn_call_needs_unbox(&identifier, &call_ty) {
+                            if self.local_polyfn_call_needs_unbox(
+                                &identifier,
+                                &call_ty,
+                                Some((span.start, span.end)),
+                            ) {
                                 Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                             }
                         }
@@ -10102,8 +10226,17 @@ impl Compiler {
                     // condition already wrote bytecode as a side effect.
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     self.emit_raw_string_literal(&mut bytecode, "%s%s");
-                    bytecode.append(&mut self.do_compile(lhs));
-                    bytecode.append(&mut self.do_compile(rhs));
+                    if self.string_concat_needs_staging(lhs, rhs) {
+                        let mut lhs_slot = 0;
+                        let mut rhs_slot = 0;
+                        self.stage_call_arg_to_temp(lhs, false, &mut lhs_slot);
+                        self.stage_call_arg_to_temp(rhs, false, &mut rhs_slot);
+                        bytecode.push_load(lhs_slot);
+                        bytecode.push_load(rhs_slot);
+                    } else {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.append(&mut self.do_compile(rhs));
+                    }
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
@@ -10915,8 +11048,18 @@ impl Compiler {
                 match fields {
                     EnumConstructPayload::Unit => {}
                     EnumConstructPayload::Tuple(args) => {
+                        let in_generic = self
+                            .current_function_qualified
+                            .as_deref()
+                            .is_some_and(|n| self.generic_return_is_boxed(n));
                         for arg in args.iter().rev() {
-                            bytecode.append(&mut self.do_compile(arg));
+                            let mut arg_bc = self.do_compile(arg);
+                            if in_generic {
+                                if let Some(ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_unbox_if_needed(&mut arg_bc, &ty);
+                                }
+                            }
+                            bytecode.append(&mut arg_bc);
                         }
                     }
                     EnumConstructPayload::Record(parts) => {
@@ -11022,7 +11165,7 @@ impl Compiler {
                                 .last()
                                 .expect("last group must have at least one arm");
                             let last_arm = &arms[last_arm_idx];
-                            match &last_arm.pattern {
+                            match &last_arm.pattern.1 {
                                 Pattern::Constructor {
                                     enum_name,
                                     variant_name,
@@ -11217,7 +11360,7 @@ impl Compiler {
                             // for runtime tests, by the
                             // definition of
                             // `arm_has_runtime_test`).
-                            let (enum_name, variant_name, payload) = match &arms[arm_idx].pattern {
+                            let (enum_name, variant_name, payload) = match &arms[arm_idx].pattern.1 {
                                 Pattern::Constructor {
                                     enum_name,
                                     variant_name,
@@ -11340,7 +11483,7 @@ impl Compiler {
                             // `consume_values = false` so we
                             // don't re-emit the bytecode (the
                             // test chain handled the values).
-                            match &arm.pattern {
+                            match &arm.pattern.1 {
                                 Pattern::Binding { name } => {
                                     arm_bindings.insert(name.to_string(), payload_base);
                                 }
@@ -11370,7 +11513,7 @@ impl Compiler {
                                         &self.checker,
                                         &mut arm_bindings,
                                         &mut next_slot,
-                                        &arm.pattern,
+                                        &arm.pattern.1,
                                         &decl_order,
                                         &mut self.bytecode,
                                         false,
@@ -11383,7 +11526,7 @@ impl Compiler {
                             // Not in a test chain: emit binding
                             // code at the outer level (consume
                             // the values via POP/STORE/UNPACK).
-                            match &arm.pattern {
+                            match &arm.pattern.1 {
                                 Pattern::Binding { name } => {
                                     // Binding arm: the forward pass
                                     // already emitted STORE at
@@ -11414,7 +11557,7 @@ impl Compiler {
                                         &self.checker,
                                         &mut arm_bindings,
                                         &mut next_slot,
-                                        &arm.pattern,
+                                        &arm.pattern.1,
                                         &decl_order,
                                         &mut self.bytecode,
                                         true,
@@ -11465,10 +11608,10 @@ impl Compiler {
                         let mut arm_binding_tys = HashMap::new();
                         collect_pattern_binding_types(
                             &self.checker,
-                            &arm.pattern,
+                            &arm.pattern.1,
                             &mut arm_binding_tys,
                         );
-                        if let Pattern::Binding { name } = &arm.pattern {
+                        if let Pattern::Binding { name } = &arm.pattern.1 {
                             if let Some(ty) = self.checker.codegen_var_type(name) {
                                 arm_binding_tys.insert(name.to_string(), ty.clone());
                             }
@@ -11478,9 +11621,17 @@ impl Compiler {
                         // Emit the arm body unless it is the sole bound name
                         // (`Ok(x) => x`): JumpIfMatch already left the payload
                         // on the stack at the binding slot.
-                        if !Self::match_arm_body_is_identity_binding(&arm.pattern, &arm.body) {
-                            let body_bc = self.do_compile(&arm.body);
-                            self.bytecode.extend(body_bc);
+                        if !Self::match_arm_body_is_identity_binding(&arm.pattern.1, &arm.body) {
+                            if self.match_tail_call {
+                                let mut arm_bc = Vec::new();
+                                if !self.try_emit_tail_call_expr(&arm.body, &mut arm_bc) {
+                                    arm_bc = self.do_compile(&arm.body);
+                                }
+                                self.bytecode.extend(arm_bc);
+                            } else {
+                                let body_bc = self.do_compile(&arm.body);
+                                self.bytecode.extend(body_bc);
+                            }
                         }
 
                         self.mono_codegen_var_types.pop();

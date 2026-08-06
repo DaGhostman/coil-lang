@@ -112,6 +112,7 @@
             bytecode: bytecode.clone(),
             source_files: pipeline.program_debug().source_files,
             debug_locs: pipeline.program_debug().debug_locs,
+            fn_symbols: Vec::new(),
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
         let archived = rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice())
@@ -4983,11 +4984,8 @@ fn main() {
         );
     }
 
-    /// Dims over the `u8` packed ceiling fall back to scalar unroll (and the
-    /// typechecker warns — see diagnostics `*_over_packed_u8_limit_warns`).
-    // Pre-existing on main (#70): LA side-table miss → no scalar unroll MULs.
+    // Dims over the `u8` packed ceiling fall back to scalar unroll.
     #[test]
-    #[ignore = "pre-existing: 256-dim matmul does not attach LA info / unroll"]
     fn matmul_dims_over_u8_limit_falls_back_to_unroll() {
         use common::Instruction;
         let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
