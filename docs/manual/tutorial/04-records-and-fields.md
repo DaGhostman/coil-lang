@@ -83,7 +83,8 @@ Point::Point { x, y } => x * x + y * y
 Patterns can nest constructors inside record fields. From `examples/nested_records.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     I { v: int },
@@ -130,7 +131,8 @@ Dot access works on values whose type is a record-shaped enum variant. The compi
 From `examples/record.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Point {
     Origin,
@@ -176,7 +178,8 @@ Use `match` when you need to branch on the variant tag (e.g. `Origin` vs `Point`
 When a field's type is itself a record-shaped enum, chain dots to read through nested records. From `examples/chained.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Inner {
     Inner { v: int },

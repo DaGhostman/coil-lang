@@ -23,7 +23,8 @@ impl Length for Pair {
 Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let a = [1, 2];
 a[] = 3;

@@ -11,7 +11,8 @@ print "%i", x;
 New:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 write_all(stdout(), to_bytes(format("%i", x)));
@@ -20,7 +21,8 @@ write_all(stdout(), to_bytes(format("%i", x)));
 Literal-only output does not need `format`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::to_bytes;
 
 write_all(stdout(), to_bytes("hello"));

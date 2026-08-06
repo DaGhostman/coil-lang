@@ -132,7 +132,8 @@ Import several named items from one module without repeating the path:
 
 ```coil
 use math::{add, mul as product};
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -174,7 +175,8 @@ examples/
 **`examples/src/foo/sadge.hy`:**
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sadge() {
     write_all(stdout(), to_bytes(format("%x\n", 420)));
@@ -185,7 +187,8 @@ fn sadge() {
 
 ```coil
 use foo::sadge;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {

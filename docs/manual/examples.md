@@ -21,7 +21,8 @@ Core syntax: functions, `let`, arithmetic, control flow, and I/O.
 **Demonstrates:** Literal string output with `io::write_all`.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes("hello"));
@@ -40,7 +41,8 @@ fn main() {
 **Demonstrates:** Formatted output with `string::format` and `io::write_all`.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%i", 42)));
@@ -59,7 +61,8 @@ fn main() {
 **Demonstrates:** String concatenation with `+` and the `format` expression returning a string.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = "hello";
@@ -82,7 +85,8 @@ fn main() {
 **Demonstrates:** `%v` structural Show for tuples and anonymous records.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%v", (1, 2))));
@@ -102,7 +106,8 @@ fn main() {
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 5;
@@ -126,7 +131,8 @@ fn main() {
 **Demonstrates:** `defer` blocks that run on function exit (fall-through or early `return`), including LIFO order when multiple defers are registered, plus `defer use (n)` to capture an outer local.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn with_cleanup() {
     defer { write_all(stdout(), to_bytes("leave")); }
@@ -178,7 +184,8 @@ fn main() {
 **Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn greet(string name, int age) {
     write_all(stdout(), to_bytes(format("%s", name)));
@@ -203,7 +210,8 @@ fn main() {
 **Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sum(int... xs) -> int { /* len + loop */ }
 fn greet(string name, string... extras) -> string { /* concat */ }
@@ -227,7 +235,8 @@ fn main() {
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     const answer = 42;
@@ -249,7 +258,8 @@ fn main() {
 **Demonstrates:** C-style `for` with `continue` and `break` (sum `0+1+2+4+5+6` = `18`).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let sum = 0;
@@ -274,7 +284,8 @@ fn main() {
 **Demonstrates:** `if` conditions, modulo, and independent stdout writes (FizzBuzz-style, without newlines between numbers).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fizbuz(int n) {
     if (n % 3) == 0 {
@@ -304,7 +315,8 @@ fn main() {
 **Demonstrates:** Recursive functions, `if`, and integer arithmetic (smoke / docs).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
@@ -345,7 +357,8 @@ dedicated entry for release `poop` / `perf_metrics` without long wall time.
 **Demonstrates:** Minimal `let` + arithmetic smoke test (not a performance benchmark).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = 5;
@@ -367,7 +380,8 @@ fn main() {
 **Demonstrates:** Calling a function for side effect; expression statement discards the return value.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
@@ -391,7 +405,8 @@ fn main() {
 **Demonstrates:** String parameter passing and stdout text writes (also exercises heap allocation / GC paths when many strings are allocated).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sadge(string n) {
     write_all(stdout(), to_bytes(format("%s", n)));
@@ -418,7 +433,8 @@ Sum types with unit, tuple, and record-shaped payloads.
 **Demonstrates:** Built-in `Option`, constructor calls, and `match` with a binding arm.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
@@ -444,7 +460,8 @@ fn main() {
 **Demonstrates:** Built-in `Result` wrapping `Option`, multiple `match` arms sharing an outer tag with different inner patterns, and inner-pattern dispatch at runtime.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
@@ -657,7 +674,8 @@ enum Outer {
 **Demonstrates:** `#[ffi(lib = "c")]` attribute sugar for a single libc binding (equivalent to an `extern` block entry).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
@@ -681,7 +699,8 @@ fn main() {
 **Demonstrates:** Call-site spread for tuples and arrays.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn pair_sum(int a, int b) -> int { return a + b; }
 fn triple_sum(int a, int b, int c) -> int { return a + b + c; }
@@ -856,7 +875,8 @@ Tuples, arrays, dicts, and `type` aliases.
 **Demonstrates:** Growing arrays with `arr[] =`, reading the runtime length with `len`, and indexing appended elements.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2];
@@ -880,7 +900,8 @@ fn main() {
 **Demonstrates:** Anonymous structurally typed records (`{ foo: 42, bar: 100 }`) and field read via `d.foo`.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let d = { foo: 42, bar: 100 };
@@ -926,7 +947,8 @@ fn main() {
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Point = (int, int);
 
@@ -1038,7 +1060,8 @@ fn main() {
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Pair<T> = (T, T);
 
@@ -1060,7 +1083,8 @@ fn main() {
 **Demonstrates:** User generic enums — `enum Box<T> { Empty, Full(T) }` with construct/match typed as `Box<int>` (same machinery as builtin `Option` / `Result`).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Box<T> {
     Empty,
@@ -1091,7 +1115,8 @@ fn main() {
 **Demonstrates:** Generic functions with a `Num` trait bound — one `add<T: Num>` body used at `int` and `float` call sites.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add<T: Num>(T a, T b) -> T {
     return a + b;
@@ -1130,7 +1155,8 @@ primitives, a user `impl Show<Point>`, and `string::format("%v", ...)`.
 `show(x)` dispatches through that stored dictionary.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn print_any(Show x) {
     write_all(stdout(), to_bytes(format("%s", show(x))));
@@ -1318,7 +1344,8 @@ Multi-file projects using `use` and `mod`. Support files live under `examples/sr
 
 ```coil
 use foo::sadge;
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -1342,7 +1369,8 @@ fn main() {
 
 ```coil
 use math::{add, mul};
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
@@ -1374,7 +1402,8 @@ fn main() {
 **Demonstrates:** Alternate / legacy module layout (single `foo.hy` with a top-level `sadge`).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sadge() {
     write_all(stdout(), to_bytes(format("%x\n", 420)));
@@ -1396,7 +1425,8 @@ Calling C from coil. Requires **libffi**.
 **Demonstrates:** Compile-time `extern` block — no manual `dload`/`declare` in source. The compiler emits library load and symbol registration bytecode (unwraps `Result`, panics on failure).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 extern "c" {
     fn strlen(string s) -> int;
@@ -1527,7 +1557,8 @@ int sum(int a, int b) { return a + b; }
 **Demonstrates:** Positional ctor args, field read/write, and method calls (`self`).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,
@@ -1564,7 +1595,8 @@ fn main() {
 **Demonstrates:** `static fn` constructors via `Class::new(...)` alongside unchanged positional `new Class(...)`. Bodies build instances with `new ClassName(...)`.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Point {
     x: int,
@@ -1618,7 +1650,8 @@ return match m {
 and a method that returns the type parameter.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Cell<T> {
     value: T

@@ -80,7 +80,8 @@ The canonical starter example computes the 10th Fibonacci number recursively
 workload in `examples/fib_bench.hy`):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
@@ -221,7 +222,8 @@ cargo run -- examples/print_literal.hy
 Source:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes("hello"));

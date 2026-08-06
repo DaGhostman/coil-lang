@@ -46,7 +46,8 @@ Index tuples with integer literals: `t[0]`, `t[1]`, and so on.
 When the index is a **compile-time constant**, the typechecker verifies it is in bounds:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let t = (10, 20);
 write_all(stdout(), to_bytes(format("%i", t[0])));   // OK — index 0
@@ -151,7 +152,8 @@ Indexing uses the same `arr[i]` syntax as tuples.
 `arr[] = value` appends in place (empty index is only legal on the left of `=`). `len(arr)` returns the current runtime length.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let a = [1, 2];
@@ -171,7 +173,8 @@ The appended value must match the element type. After append, a fixed literal ar
 A **dict** (anonymous record) is written with curly braces and named fields:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let d = { foo: 42, bar: 100 };
 write_all(stdout(), to_bytes(format("%i", d.foo)));   // 42
@@ -195,7 +198,8 @@ There is no separate type name to declare — the shape `{ foo: int, bar: int }`
 Use dot notation: `d.foo`. The compiler resolves the field at compile time. Accessing a field that does not exist on the record's type is an error:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let d = { foo: 42 };
 write_all(stdout(), to_bytes(format("%i", d.bar)));   // error: Cannot find field `bar` on record `{ foo: int }`
@@ -218,7 +222,8 @@ Enum variants can also use record-shaped payloads (`Point { x: int, y: int }`), 
 Give a readable name to any type with `type Name = T;`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Point = (int, int);
 
@@ -272,7 +277,8 @@ See `examples/aliases.hy` for a complete runnable example.
 Aggregates compose. A common shape is an **array of typed tuples** — a table of heterogeneous rows:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Row = (string, int);
 type Table = [Row];

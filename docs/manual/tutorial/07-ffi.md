@@ -37,7 +37,8 @@ An `extern` block names a shared library and lists function signatures. Calls to
 From `examples/strlen.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 extern "c" {
     fn strlen(string s) -> int;
@@ -58,7 +59,8 @@ fn main() {
 A single libc function can be declared without an `extern` block:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
@@ -184,7 +186,8 @@ clang -shared -o examples/sum.dll examples/sum.c
 ```coil
 use ffi::{dload, declare, invoke, Error, ErrorKind};
 use ffi::types::{Int};
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {

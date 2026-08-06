@@ -165,7 +165,8 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed. `len(value)` returns length as `int` for arrays, strings, tuples, and dicts (structural); for other types it requires a `Length` instance (`impl Length for T { fn len(T x) -> int { … } }`). Literal / fixed-size cases fold at compile time.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let xs = [1, 2];   // starts as [int; 2]
 xs[] = 3;          // xs is treated as dynamic [int] afterwards
@@ -441,7 +442,8 @@ a stale value.
 Generic functions use an optional type-parameter list and trait bounds on parameters:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 
@@ -540,7 +542,8 @@ fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 A unary trait name in a value type position denotes an existential value:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn print_any(Show x) {
     write_all(stdout(), to_bytes(format("%s", show(x))));
@@ -840,7 +843,8 @@ When a concrete value crosses into a generic function body, the compiler wraps i
 This means **most generic calls to primitive-returning functions are transparent** — the caller receives a plain `int`, `float`, `bool`, or `string`, not a boxed wrapper:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn id<T>(T x) -> T { return x; }
 
@@ -855,7 +859,8 @@ fn main() {
 Concrete format specifiers (`%i`, `%f`, `%s`, `%z`, …) require a resolved concrete type. An open type parameter is a type error; use `%v`, which requires `T: Show` and lowers through the `show` method to a string before formatting:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn show_it<T: Show>(T x) {
     write_all(stdout(), to_bytes(format("%v", x)));   // ok — dictionary Show

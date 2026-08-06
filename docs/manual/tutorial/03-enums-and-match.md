@@ -133,7 +133,8 @@ Because `match` is an expression, it can appear anywhere a value is expected —
 From `examples/option.hy` (`Option` is a compiler builtin — no local `enum` declaration):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap(Option o) -> int {
     return match o {
@@ -205,7 +206,8 @@ This matches a `Result::Ok` whose inner `Option` is `Some`, binding `v` to the i
 When **multiple arms share the same outer variant** but differ on the inner pattern, the runtime dispatches on the inner tag at match time. From `examples/result.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn unwrap_result(Result r) -> int {
     return match r {
@@ -241,7 +243,8 @@ The two `Result::Ok` arms share the outer tag but differ on the inner `Option` t
 Variants can reference their own enum type, enabling tree-like structures. From `examples/tree.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Tree {
     Leaf,
@@ -273,7 +276,8 @@ The tree has value `1` at the root, `2` on the left subtree, and `3` on the righ
 A single enum can combine unit, tuple, and record variants. From `examples/mixed.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 enum Shape {
     Empty,
