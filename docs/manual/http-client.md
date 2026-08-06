@@ -34,12 +34,12 @@ fn main() {
 | Function | Role |
 |----------|------|
 | `get(url)` | `GET` with empty body |
-| `post(url, body)` | `POST` with `[byte]` body |
+| `post(url, body)` | `POST` with `Vec<byte>` body |
 | `request(method, url, headers, body)` | Full builder |
 | `status_code(r)` / `body_len(r)` | Result-mode accessors for `Response` |
 
 `Response` carries `status: int`, parallel `header_names` / `header_values`, and
-`body: [byte]`. Errors use `HttpError` (`BadUrl`, `BadResponse`,
+`body: Vec<byte>`. Errors use `HttpError` (`BadUrl`, `BadResponse`,
 `UnsupportedScheme`, `Io`).
 
 Requests are HTTP/1.1 with `Host`, `Content-Length`, and `Connection: close`.

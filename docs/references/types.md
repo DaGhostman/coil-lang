@@ -17,11 +17,11 @@ coil uses **Hindley–Milner (Algorithm W)** type inference with optional annota
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
-Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`).
+Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `Vec<byte>` / `[byte; N]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`).
 
 **Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\""`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce to `byte`.
 
-**String literals** also coerce to `[byte]` / `[byte; N]` (UTF-8 bytes) under an expected byte-array type, via `"…" as [byte]`, and as `[byte]` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal strings may use `s as [byte]` (lowers to `to_bytes`); fixed `[byte; N]` still needs a literal.
+**String literals** also coerce to `Vec<byte>` / `[byte; N]` (UTF-8 bytes) under an expected byte-buffer type, via `"…" as Vec<byte>`, and as `Vec<byte>` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal strings may use `s as Vec<byte>` (lowers to `to_bytes`); fixed `[byte; N]` still needs a literal.
 
 `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
@@ -146,38 +146,55 @@ broadcast / unary `-`). See [Operators](operators.md).
 
 ---
 
-## Arrays (`Ty::Array`)
+## Arrays (`Ty::Array`) — `[T; N]` only
 
-Homogeneous collections with optional static length:
+Homogeneous **fixed-length** arrays. Length `N` is part of the type and is
+inferred from literals when possible; otherwise write it explicitly.
+Annotation `[T]` (no length) is a type error (`E0119`) — use `[T; N]` or
+growable [`Vec<T>`](arrays.md).
 
 | Annotation | `ArrayLength` | Example |
 |------------|---------------|---------|
-| `[T]` | `Dynamic` | Function param — length unknown at compile time |
 | `[T; N]` | `Static(N)` | Literal `[1, 2, 3]` infers `[int; 3]` |
+| `[T]` | — | **Rejected** — use `[T; N]` or `Vec<T>` |
 
 ```coil
-let xs = [1, 2, 3];        // [int; 3]
-fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
+let xs = [1, 2, 3];           // [int; 3]
+let zs: [int; 3] = [0, 0, 0];
+fn sum([int; 3] arr) -> int { /* ... */ }
 ```
 
-### Growing arrays
+Locals of type `[T; N]` occupy **N consecutive frame slots** (stack). Escaping
+into a single-value context (call, return, store into a heap object) boxes into
+a non-growable heap array.
 
-Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed. `len(value)` returns length as `int` for arrays, strings, tuples, and dicts (structural); for other types it requires a `Length` instance (`impl Length for T { fn len(T x) -> int { … } }`). Literal / fixed-size cases fold at compile time.
+Empty `[]` needs an annotation: `Vec<T>` or `[T; 0]`. There is **no**
+`arr[] =` append — use `Vec::push` (rejected append is `E0107`).
+
+`len(value)` returns length as `int` for arrays, `Vec`, strings, tuples, and
+dicts (structural); for other types it requires a `Length` instance
+(`impl Length for T { fn len(T x) -> int { … } }`). Fixed-size cases fold at
+compile time.
+
+### `Vec<T>` — growable vectors
 
 ```coil
-use io::{stdout, write_all};
-use string::{format, to_bytes};
-let xs = [1, 2];   // starts as [int; 2]
-xs[] = 3;          // xs is treated as dynamic [int] afterwards
-write_all(stdout(), to_bytes(format("%i", len(xs))));
+let v: Vec<int> = Vec::new();
+v.push(1);
+v.push(2);
 ```
+
+Statics: `Vec::new`, `Vec::with_capacity`, `Vec::from`. Methods: `push`, `pop`,
+`insert`, `remove`, `clear`, `reserve`, `capacity`, `len`, plus `v[i]` /
+`v[i] = x`. Rest parameters `T... xs` pack into `Vec<T>`. IO buffers use
+`Vec<byte>`. Full table: [Arrays and Vec](arrays.md).
 
 ### Indexing
 
 | Target | Compile-time index | Runtime index |
 |--------|-------------------|---------------|
-| Static array `[T; N]` | OOB literal → diagnostic | Allowed (no static check) |
-| Dynamic `[T]` | N/A | Allowed (no OOB diagnostic) |
+| Fixed array `[T; N]` | OOB literal → diagnostic | Allowed (no static check) |
+| `Vec<T>` | N/A | Allowed (no OOB diagnostic) |
 | Tuple | OOB literal → diagnostic | — |
 | Non-aggregate | Error | — |
 
@@ -271,7 +288,7 @@ let p = new readonly Point(1, 2);
 | Operation | `readonly T` handle | Inside `impl` via `self` |
 |-----------|-------------------|---------------------------|
 | Read fields / index | Allowed | Allowed |
-| `p.field = …` / `xs[] = …` | Error | Allowed for class fields |
+| `p.field = …` / `xs[i] = …` | Error | Allowed for class fields |
 | Rebind variable | Allowed (`let a = readonly [1]; a = readonly [2];`) | — |
 
 Type pretty-print: `readonly T`. Arrays and dicts have no method exception — external `StoreIndex` / field writes are rejected.
@@ -289,7 +306,7 @@ class Point {
 
 Const fields may be set only in `new` (constructor). Any later `p.x = …` or `self.x = …` is a type error — stricter than `readonly`, which allows method bodies to mutate via `self`.
 
-Local `const` bindings are shallow: the compiler warns when the initializer type is heap-mutable (`[T]`, class instances, dicts) because interior mutation through fields or `arr[] =` still succeeds.
+Local `const` bindings are shallow: the compiler warns when the initializer type is heap-mutable (`Vec<T>`, class instances, dicts) because interior mutation through fields or indexed writes still succeeds. Fixed `[T; N]` locals are multi-slot and warn when the array element type is itself heap-mutable.
 
 ---
 
@@ -323,21 +340,23 @@ fn main() {
 
 | Context | Example |
 |---------|---------|
-| Function parameter | `fn f(int x, [string] rows) -> bool` |
+| Function parameter | `fn f(int x, [string; 4] rows) -> bool` |
 | Return type | `-> (int, int)` |
 | `let` binding | `let x: int = 1;` |
 | Enum variant payload | `Some(int)`, `Node { left: Tree, right: Tree }` |
-| Type alias RHS | `type A = [int; 4];` |
+| Type alias RHS | `type A = [int; 4];` / `type Buf = Vec<byte>;` |
 | Class field | `name: string` |
 
 Forms:
 
 ```
-IDENT                    // int, MyEnum, Foo
-'[' IDENT (';' INT)? ']' // [T] or [T; N]
-'(' type (',' type)+ ')'  // tuples — at least two components in type position
+IDENT                         // int, MyEnum, Foo, Vec
+IDENT '<' type (',' type)* '>' // Vec<T>, Option<T>, …
+'[' type ';' INT ']'          // [T; N] — length required
+'(' type (',' type)+ ')'      // tuples — at least two components in type position
 ```
 
+Bare `[T]` (no `; N`) is rejected at typecheck (`E0119`).
 ---
 
 ## Inference highlights
@@ -639,8 +658,8 @@ class Cell {
 | `Default` | `default` | First enum variant / zero field values for classes |
 | `Hash` | `hash` | Tag + recursive `field.hash()` mix (`* 31 + hash`); builtins for `int`/`byte`/`bool`/`float`/`string`/`unit`; nested `Hash` types recurse |
 | `String` | `to_string` | `format` with `%v` per field |
-| `Serialize` | `serialize` | `[byte]` wire: tag byte + payload field bytes in order (enum) or fields only (class). **MVP:** each payload field is cast through `byte` (`as_byte` / `as_int`); values outside `0..=255` and non-byte types silently corrupt — use only small integer / `byte` fields until a real encoding exists |
-| `Deserialize` | `deserialize` | Inverse of `Serialize` from `[byte]`; invalid tag → `panic` |
+| `Serialize` | `serialize` | `Vec<byte>` wire: tag byte + payload field bytes in order (enum) or fields only (class). **MVP:** each payload field is cast through `byte` (`as_byte` / `as_int`); values outside `0..=255` and non-byte types silently corrupt — use only small integer / `byte` fields until a real encoding exists |
+| `Deserialize` | `deserialize` | Inverse of `Serialize` from `Vec<byte>`; invalid tag → `panic` |
 | `Send` | _(marker)_ | Empty instance (thread spawn still uses structural sendability) |
 | `Sensitive` | _(marker)_ | Empty instance (redaction hooks deferred) |
 

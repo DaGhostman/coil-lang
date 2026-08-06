@@ -8,16 +8,16 @@ use io::{stdout, open, close, from_bytes};
 use io::sync::{write_all, read_to_end};
 ```
 
-Buffers use the **`byte`** primitive and **`[byte]`** arrays.
+Buffers use the **`byte`** primitive and **`Vec<byte>`** vectors.
 
 ---
 
-## `byte` and `[byte]`
+## `byte` and `Vec<byte>`
 
 | Type | Notes |
 |------|--------|
 | `byte` | Integer in `0..=255`. Literals coerce when annotated / expected. |
-| `[byte]` | Homogeneous byte buffer for `read` / `write`. |
+| `Vec<byte>` | Growable byte buffer for `read` / `write`. |
 
 ```coil
 use io::{stdout};
@@ -25,7 +25,7 @@ use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let b: byte = 255;
-    let arr: [byte] = [1, 2, 3];
+    let arr = Vec::from([1 as byte, 2 as byte, 3 as byte]);
     write_all(stdout(), to_bytes(format("%i", b)));
     write_all(stdout(), to_bytes(format("%i", len(arr))));
 }
@@ -38,8 +38,8 @@ fn main() {
 
 | Function | Signature | Notes |
 |----------|-----------|--------|
-| `from_bytes` | `[byte] → Result<string, IoError>` | UTF-8 decode; invalid sequences → `InvalidInput` |
-| `to_bytes` | `string → [byte]` | UTF-8 encode (always succeeds) |
+| `from_bytes` | `Vec<byte> → Result<string, IoError>` | UTF-8 decode; invalid sequences → `InvalidInput` |
+| `to_bytes` | `string → Vec<byte>` | UTF-8 encode (always succeeds) |
 
 ```coil
 use io::{stdout, from_bytes};
@@ -47,7 +47,7 @@ use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
-    let hello: [byte] = [104, 101, 108, 108, 111];
+    let hello = Vec::from([104 as byte, 101 as byte, 108 as byte, 108 as byte, 111 as byte]);
     write_all(stdout(), to_bytes(format("%s", match from_bytes(hello) {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
@@ -119,9 +119,9 @@ fn main() {
     let server = bind("127.0.0.1", 0)?;
     let port = local_port(server)?;
     let client = bind("127.0.0.1", 0)?;
-    let msg: [byte] = [72, 105];
+    let msg = Vec::from([72 as byte, 105 as byte]);
     send_to(client, msg, "127.0.0.1", port)?;
-    let buf: [byte] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let buf: Vec<byte> = Vec::from([0 as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte]);
     let t = recv_from_wait(server, buf)?;
     write_all(stdout(), to_bytes(format("%i", t[0])));
 }
@@ -208,7 +208,7 @@ use string::{format, to_bytes};
 
 fn main() {
     let path = "/tmp/demo.bin";
-    let data: [byte] = [72, 105];
+    let data = Vec::from([72 as byte, 105 as byte]);
     let s = open(path, "w")?;
     write_all(s, data)?;
     close(s)?;
