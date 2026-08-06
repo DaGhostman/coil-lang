@@ -201,6 +201,8 @@ pub enum IoBuiltin {
     Close,
     Read,
     Write,
+    /// Write `buf[offset..]` without allocating a suffix array (`write_from`).
+    WriteFrom,
     AwaitReadable,
     AwaitWritable,
     Drive,
@@ -253,6 +255,7 @@ impl IoBuiltin {
             Self::Close => "close",
             Self::Read => "read",
             Self::Write => "write",
+            Self::WriteFrom => "write_from",
             Self::AwaitReadable => "await_readable",
             Self::AwaitWritable => "await_writable",
             Self::Drive => "drive",
@@ -289,6 +292,7 @@ impl IoBuiltin {
             | Self::Close
             | Self::Read
             | Self::Write
+            | Self::WriteFrom
             | Self::AwaitReadable
             | Self::AwaitWritable
             | Self::Drive
@@ -329,6 +333,7 @@ impl IoBuiltin {
             Self::Close,
             Self::Read,
             Self::Write,
+            Self::WriteFrom,
             Self::AwaitReadable,
             Self::AwaitWritable,
             Self::Drive,
@@ -424,8 +429,10 @@ impl IoBuiltin {
             Self::TlsServerDisable,
             // Appended after TLS so historical `IoBuiltin::all` positions stay
             // stable for any tooling that indexes this list; HostInvoke ids for
-            // `wait_ready` come from `build_standard_host_natives` (append-only).
+            // `wait_ready` / `write_from` come from `build_standard_host_natives`
+            // (append-only).
             Self::WaitReady,
+            Self::WriteFrom,
         ]
     }
 }
@@ -1410,6 +1417,7 @@ mod tests {
         assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
         assert!(exports.iter().any(|e| e.short_name() == "await_readable"));
         assert!(exports.iter().any(|e| e.short_name() == "wait_ready"));
+        assert!(exports.iter().any(|e| e.short_name() == "write_from"));
         assert!(!exports.iter().any(|e| e.short_name() == "write_all"));
         assert!(!exports.iter().any(|e| e.short_name() == "set_read_timeout"));
         assert!(!exports.iter().any(|e| e.short_name() == "set_write_timeout"));

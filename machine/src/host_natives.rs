@@ -45,6 +45,7 @@ pub fn build_standard_host_natives(
     push_packed_la(&mut out, &mut register_id);
     // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
     push_io_wait_ready(&mut out, &mut register_id);
+    push_io_write_from(&mut out, &mut register_id);
     push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
     push_math_libm(&mut out, &mut register_id);
     out
@@ -171,6 +172,26 @@ fn push_io_wait_ready(
     register_id("wait_ready", id);
     out.push(Arc::new(HostClosureFn::new(sig, |heap, _args| {
         Ok(Some(crate::io::io_wait_ready(heap)))
+    })));
+}
+
+/// Write `buf[offset..]` without allocating a Coil suffix array.
+fn push_io_write_from(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    use crate::io::{as_result_int, stream_write_from};
+    let sig = FfiSignature::from_parts(
+        "write_from".to_string(),
+        vec![FfiType::Int, FfiType::Int, FfiType::Int],
+        FfiType::Int,
+    )
+    .expect("write_from signature");
+    let id = out.len();
+    register_id("write_from", id);
+    out.push(Arc::new(HostClosureFn::new(sig, |heap, args| {
+        let r = stream_write_from(heap, args[0], args[1], args[2].as_int());
+        Ok(Some(as_result_int(heap, r)))
     })));
 }
 

@@ -330,9 +330,23 @@ pub fn stream_read(
     stream: Value,
     buf: Value,
 ) -> Result<Option<usize>, IoErrorTag> {
+    let capacity = match heap.find_object_by_addr(buf.raw() as u64) {
+        Some(Object::Array(arr_gc)) => arr_gc.as_ref().elements.len(),
+        _ => return Err(IoErrorTag::InvalidInput),
+    };
+    stream_read_into(heap, stream, buf, capacity)
+}
+
+/// Read up to `cap` bytes into the prefix of an existing `[byte]` buffer.
+fn stream_read_into(
+    heap: &mut Heap,
+    stream: Value,
+    buf: Value,
+    cap: usize,
+) -> Result<Option<usize>, IoErrorTag> {
     let buf_addr = buf.raw() as u64;
     let capacity = match heap.find_object_by_addr(buf_addr) {
-        Some(Object::Array(arr_gc)) => arr_gc.as_ref().elements.len(),
+        Some(Object::Array(arr_gc)) => arr_gc.as_ref().elements.len().min(cap),
         _ => return Err(IoErrorTag::InvalidInput),
     };
     if capacity == 0 {
@@ -379,26 +393,56 @@ pub fn stream_read(
 }
 
 pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize, IoErrorTag> {
+    stream_write_from(heap, stream, buf, 0)
+}
+
+/// Non-blocking write of `buf[offset..]`. Avoids allocating a Coil suffix array
+/// for partial `write_all` loops (userland sync adapters).
+pub fn stream_write_from(
+    heap: &mut Heap,
+    stream: Value,
+    buf: Value,
+    offset: i64,
+) -> Result<usize, IoErrorTag> {
+    if offset < 0 {
+        return Err(IoErrorTag::InvalidInput);
+    }
     let buf_addr = buf.raw() as u64;
     let bytes: Vec<u8> = match heap.find_object_by_addr(buf_addr) {
-        Some(Object::Array(arr_gc)) => arr_gc
-            .as_ref()
-            .elements
-            .iter()
-            .map(|v| {
-                let n = v.as_int();
-                if !(0..=255).contains(&n) { 0 } else { n as u8 }
-            })
-            .collect(),
+        Some(Object::Array(arr_gc)) => {
+            let elems = &arr_gc.as_ref().elements;
+            let start = offset as usize;
+            if start > elems.len() {
+                return Err(IoErrorTag::InvalidInput);
+            }
+            elems[start..]
+                .iter()
+                .map(|v| {
+                    let n = v.as_int();
+                    if !(0..=255).contains(&n) {
+                        0
+                    } else {
+                        n as u8
+                    }
+                })
+                .collect()
+        }
         _ => return Err(IoErrorTag::InvalidInput),
     };
+    stream_write_bytes(heap, stream, &bytes)
+}
 
+fn stream_write_bytes(
+    heap: &mut Heap,
+    stream: Value,
+    bytes: &[u8],
+) -> Result<usize, IoErrorTag> {
     with_stream_mut(heap, stream, |s| -> Result<usize, IoErrorTag> {
         if s.closed || s.fd.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if matches!(s.kind, StreamKind::Stdout | StreamKind::Stderr)
-            && let Some(result) = write_captured_stdout(&bytes)
+            && let Some(result) = write_captured_stdout(bytes)
         {
             return result;
         }
@@ -406,10 +450,10 @@ pub fn stream_write(heap: &mut Heap, stream: Value, buf: Value) -> Result<usize,
         #[cfg(feature = "tls")]
         if s.kind == StreamKind::Tls {
             let tls = s.tls.as_mut().ok_or(IoErrorTag::Other)?;
-            return crate::tls::tls_write(fd, tls, &bytes);
+            return crate::tls::tls_write(fd, tls, bytes);
         }
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let result = match file.write(&bytes) {
+        let result = match file.write(bytes) {
             Ok(n) => Ok(n),
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                 Err(IoErrorTag::WouldBlock)
@@ -432,20 +476,22 @@ pub fn stream_read_exact(
         return Err(IoErrorTag::InvalidInput);
     };
     let need = arr_gc.as_ref().elements.len();
+    if need == 0 {
+        return Ok(Some(0));
+    }
+    // One reusable scratch for the whole call (no per-iteration Coil alloc).
+    let scratch_vals: Vec<Value> = (0..need).map(|_| Value::from(0_i64)).collect();
+    let (scratch_obj, _) = heap.alloc(
+        ObjArray {
+            elements: scratch_vals,
+        },
+        Object::Array,
+    );
+    let scratch = Value::from(scratch_obj.addr());
     let mut filled = 0usize;
     while filled < need {
-        // Read into a temporary array view by slicing conceptually —
-        // we read into the remaining suffix via a scratch then copy.
         let remaining = need - filled;
-        let scratch_vals: Vec<Value> = (0..remaining).map(|_| Value::from(0_i64)).collect();
-        let (scratch_obj, _) = heap.alloc(
-            ObjArray {
-                elements: scratch_vals,
-            },
-            Object::Array,
-        );
-        let scratch = Value::from(scratch_obj.addr());
-        match stream_read(heap, stream, scratch) {
+        match stream_read_into(heap, stream, scratch, remaining) {
             Ok(None) => {
                 return if filled == 0 {
                     Ok(None)
@@ -454,7 +500,6 @@ pub fn stream_read_exact(
                 };
             }
             Ok(Some(0)) => {
-                // Spurious; wait for readability.
                 wait_readable(heap, stream)?;
             }
             Ok(Some(n)) => {
@@ -484,15 +529,15 @@ pub fn stream_read_exact(
 pub fn stream_read_to_end(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     let mut acc: Vec<u8> = Vec::new();
     let chunk_size = 4096usize;
+    let scratch_vals: Vec<Value> = (0..chunk_size).map(|_| Value::from(0_i64)).collect();
+    let (scratch_obj, _) = heap.alloc(
+        ObjArray {
+            elements: scratch_vals,
+        },
+        Object::Array,
+    );
+    let scratch = Value::from(scratch_obj.addr());
     loop {
-        let scratch_vals: Vec<Value> = (0..chunk_size).map(|_| Value::from(0_i64)).collect();
-        let (scratch_obj, _) = heap.alloc(
-            ObjArray {
-                elements: scratch_vals,
-            },
-            Object::Array,
-        );
-        let scratch = Value::from(scratch_obj.addr());
         match stream_read(heap, stream, scratch) {
             Ok(None) => break,
             Ok(Some(0)) => wait_readable(heap, stream)?,
@@ -523,7 +568,7 @@ pub fn stream_write_all(heap: &mut Heap, stream: Value, buf: Value) -> Result<()
     let Some(Object::Array(arr_gc)) = heap.find_object_by_addr(buf_addr) else {
         return Err(IoErrorTag::InvalidInput);
     };
-    let mut bytes: Vec<u8> = arr_gc
+    let bytes: Vec<u8> = arr_gc
         .as_ref()
         .elements
         .iter()
@@ -531,20 +576,12 @@ pub fn stream_write_all(heap: &mut Heap, stream: Value, buf: Value) -> Result<()
         .collect();
     let mut offset = 0usize;
     while offset < bytes.len() {
-        // Write remaining suffix via a temp array.
-        let rest: Vec<Value> = bytes[offset..]
-            .iter()
-            .map(|&b| Value::from(b as i64))
-            .collect();
-        let (tmp_obj, _) = heap.alloc(ObjArray { elements: rest }, Object::Array);
-        let tmp = Value::from(tmp_obj.addr());
-        match stream_write(heap, stream, tmp) {
+        match stream_write_bytes(heap, stream, &bytes[offset..]) {
             Ok(0) => wait_writable(heap, stream)?,
             Ok(n) => offset += n,
             Err(IoErrorTag::WouldBlock) => wait_writable(heap, stream)?,
             Err(e) => return Err(e),
         }
-        let _ = &mut bytes; // silence
     }
     Ok(())
 }
