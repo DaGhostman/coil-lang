@@ -138,6 +138,41 @@ mod tests {
     }
 
     #[test]
+    fn archive_round_trip_preserves_fn_symbols() {
+        use crate::debug::FnDebugSym;
+
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            static_slot_count: 0,
+            constants: vec![],
+            strings: vec![],
+            bytecode: vec![Byte::new(Instruction::HALT)],
+            source_files: vec!["main.hy".into()],
+            debug_locs: vec![DebugLoc::unknown()],
+            fn_symbols: vec![
+                FnDebugSym {
+                    name: "main".into(),
+                    entry_pc: 0,
+                },
+                FnDebugSym {
+                    name: "helper".into(),
+                    entry_pc: 4,
+                },
+            ],
+        };
+        let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
+        let archived =
+            rkyv::access::<ArchivedArchivedProgram, Error>(bytes.as_slice()).expect("access");
+        let back: ArchivedProgram =
+            rkyv::deserialize::<ArchivedProgram, Error>(archived).expect("deserialize");
+        assert_eq!(back.fn_symbols, program.fn_symbols);
+        let bundle = back.debug_bundle();
+        assert_eq!(bundle.fn_symbols.len(), 2);
+        assert_eq!(bundle.fn_symbols[0].name, "main");
+        assert_eq!(bundle.fn_symbols[1].entry_pc, 4);
+    }
+
+    #[test]
     fn archive_version_matches_current_abi() {
         assert_eq!(ARCHIVE_MAJOR, 2);
         assert_eq!(ARCHIVE_MINOR, 0);
