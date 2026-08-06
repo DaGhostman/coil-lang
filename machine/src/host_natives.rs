@@ -735,4 +735,25 @@ mod tests {
             assert_eq!(registrations[math_start + offset].1, math_start + offset);
         }
     }
+
+    #[test]
+    fn write_from_is_registered_immediately_after_wait_ready() {
+        let mut registrations = Vec::new();
+        let natives = build_standard_host_natives(|name, id| {
+            registrations.push((name.to_string(), id));
+        });
+        let wait = registrations
+            .iter()
+            .position(|(name, _)| name == "wait_ready")
+            .expect("wait_ready");
+        let write_from = registrations
+            .iter()
+            .position(|(name, _)| name == "write_from")
+            .expect("write_from");
+        assert_eq!(write_from, wait + 1);
+        assert_eq!(registrations[write_from].1, write_from);
+        let sig = natives[write_from].signature();
+        assert_eq!(sig.args, vec![FfiType::Int, FfiType::Int, FfiType::Int]);
+        assert_eq!(sig.ret, FfiType::Int);
+    }
 }
