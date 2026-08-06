@@ -120,8 +120,9 @@ fn run_bytecode(
     pipeline: &Pipeline,
     entry: Option<&std::path::Path>,
 ) -> String {
+    let operand_slots = pipeline.operand_stack_slots() as usize;
     let shared = SharedBuf::new();
-    let mut machine = Machine::<128>::default();
+    let mut machine = Machine::<256>::with_operand_capacity(operand_slots);
     machine.set_shared_print(shared.inner.clone());
     machine.with_output(shared.clone());
     pipeline.wire_vm_ffi(&mut machine, entry);
@@ -1463,6 +1464,28 @@ fn example_strlen_prints_5() {
         }
     };
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
+}
+
+#[test]
+fn example_strlen_prints_5_compile_src_from_file() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable on this platform via resolve_library(\"c\")");
+        return;
+    }
+
+    let result = std::panic::catch_unwind(|| run_example("examples/strlen.hy"));
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("strlen test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(
+        output,
+        "5",
+        "strlen(\"hello\") via compile_src_from_file should print 5"
+    );
 }
 
 /// Serialize fd-1 redirection: parallel tests + libtest status lines share
@@ -6059,6 +6082,7 @@ fn main() {
         bytecode: bytecode.clone(),
         source_files: pipeline.program_debug().source_files,
         debug_locs: pipeline.program_debug().debug_locs,
+        fn_symbols: Vec::new(),
     };
     let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
     let archived =

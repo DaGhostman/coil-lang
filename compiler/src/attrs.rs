@@ -16,6 +16,28 @@ use parser::{
 };
 use reporting::{ErrorCode, Message};
 
+type PatternOut<'a> = (SimpleSpan, Pattern<'a>);
+
+fn span_pat<'a>(span: SimpleSpan, pattern: Pattern<'a>) -> PatternOut<'a> {
+    (span, pattern)
+}
+
+fn wildcard_tuple<'a>(span: SimpleSpan, arity: usize) -> PatternPayload<'a> {
+    PatternPayload::Tuple(vec![(span, Pattern::Wildcard); arity])
+}
+
+fn record_wildcard_fields<'a>(span: SimpleSpan, fields: &[&'a str]) -> PatternPayload<'a> {
+    PatternPayload::Record(
+        fields
+            .iter()
+            .map(|fname| PatternField {
+                name: fname,
+                pattern: span_pat(span, Pattern::Wildcard),
+            })
+            .collect(),
+    )
+}
+
 /// Builtin traits the compiler knows how to synthesize.
 const DERIVABLE: &[&str] = &[
     "Show",
@@ -237,7 +259,7 @@ fn collect_and_desugar_attr_decls(
         } = decls[i].1.as_ref()
         {
             let span = decls[i].0;
-            if let Err(msg) = validate_attr_protocol(args, span) {
+            if let Err(msg) = validate_attr_protocol(args, body, span) {
                 messages.push(msg);
             }
             let params = fn_param_nodes(args);
@@ -271,7 +293,12 @@ fn collect_and_desugar_attr_decls(
     }
 }
 
-fn validate_attr_protocol(args: &Output, span: SimpleSpan) -> Result<(), Message> {
+fn validate_attr_protocol(args: &Output, body: &Output, span: SimpleSpan) -> Result<(), Message> {
+    let _ = body;
+    validate_attr_protocol_shape(args, span)
+}
+
+fn validate_attr_protocol_shape(args: &Output, span: SimpleSpan) -> Result<(), Message> {
     let params = fn_param_nodes(args);
     if params.len() < 2 {
         return Err(Message::error(
@@ -291,6 +318,117 @@ fn validate_attr_protocol(args: &Output, span: SimpleSpan) -> Result<(), Message
         ));
     }
     Ok(())
+}
+
+/// True when the attr body contains `yield` outside a `target(...args)` call site.
+fn attr_body_crosses_yield(body: &Output<'_>) -> bool {
+    fn walk(expr: &Output<'_>, in_target: bool) -> bool {
+        match expr.1.as_ref() {
+            Expression::Yield(_) | Expression::YieldFrom(_) if !in_target => return true,
+            Expression::Call { name, args }
+                if matches!(name.1.as_ref(), Expression::Identifier("target"))
+                    && is_target_args_spread(args) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        match expr.1.as_ref() {
+            Expression::Program(items)
+            | Expression::Block(items)
+            | Expression::Fragment(items)
+            | Expression::Declare(items)
+            | Expression::Invoke(items)
+            | Expression::List(items)
+            | Expression::Array(items)
+            | Expression::Tuple(items) => items.iter().any(|c| walk(c, false)),
+            Expression::Return(inner)
+            | Expression::ImplicitReturn(inner)
+            | Expression::Raise(inner)
+            | Expression::Panic(inner)
+            | Expression::Yield(inner)
+            | Expression::YieldFrom(inner)
+            | Expression::Try(inner)
+            | Expression::Negate(inner)
+            | Expression::Not(inner)
+            | Expression::LogicalNot(inner)
+            | Expression::Positive(inner)
+            | Expression::Dload(inner)
+            | Expression::Done(inner)
+            | Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Member(inner)
+            | Expression::Spread(inner)
+            | Expression::Noop(inner)
+            | Expression::TypeOf(inner) => walk(inner, false),
+            Expression::Defer { body, .. } => walk(body, false),
+            Expression::Resume(handle, send) => {
+                walk(handle, false) || send.as_ref().is_some_and(|s| walk(s, false))
+            }
+            Expression::If(branches) => branches.iter().any(|b| walk(b, false)),
+            Expression::Match { scrutinee, arms } => {
+                walk(scrutinee, false)
+                    || arms.iter().any(|arm| walk(&arm.body, false))
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                init.as_ref().is_some_and(|e| walk(e, false))
+                    || walk(cond, false)
+                    || step.as_ref().is_some_and(|e| walk(e, false))
+                    || walk(body, false)
+            }
+            Expression::Loop { iterable, body, .. } => walk(iterable, false) || walk(body, false),
+            Expression::Add(l, r)
+            | Expression::Sub(l, r)
+            | Expression::Mul(l, r)
+            | Expression::Div(l, r)
+            | Expression::Mod(l, r)
+            | Expression::Pow(l, r)
+            | Expression::Shl(l, r)
+            | Expression::Shr(l, r)
+            | Expression::Xor(l, r)
+            | Expression::And(l, r)
+            | Expression::BitAnd(l, r)
+            | Expression::Or(l, r)
+            | Expression::BitOr(l, r)
+            | Expression::Eq(l, r)
+            | Expression::Neq(l, r)
+            | Expression::Leq(l, r)
+            | Expression::Geq(l, r)
+            | Expression::Le(l, r)
+            | Expression::Gt(l, r)
+            | Expression::Coalesce(l, r) => walk(l, false) || walk(r, false),
+            Expression::Assignment(lhs, rhs) | Expression::CompoundAssign(lhs, _, rhs) => {
+                walk(lhs, false) || walk(rhs, false)
+            }
+            Expression::Access(receiver, _) | Expression::OptionalAccess(receiver, _) => {
+                walk(receiver, false)
+            }
+            Expression::Index(receiver, index) => {
+                walk(receiver, false) || index.as_ref().is_some_and(|i| walk(i, false))
+            }
+            Expression::Cast(inner, ty) => walk(inner, false) || walk(ty, false),
+            Expression::NamedArg(_, inner) => walk(inner, false),
+            Expression::Branch(cond, body) => {
+                cond.as_ref().is_some_and(|c| walk(c, false)) || walk(body, false)
+            }
+            Expression::Call { name, args } => {
+                walk(name, false)
+                    || args
+                        .as_ref()
+                        .is_some_and(|items| items.iter().any(|a| walk(a, false)))
+            }
+            Expression::Lambda { args, body, .. } => walk(args, false) || walk(body, false),
+            Expression::Range { start, end, .. } => walk(start, false) || walk(end, false),
+            Expression::Adjust { target, .. } => walk(target, false),
+            _ => false,
+        }
+    }
+    walk(body, false)
 }
 
 fn fn_param_nodes<'a>(args: &'a Output<'a>) -> Vec<(Option<Output<'a>>, &'static str, bool)> {
@@ -1774,14 +1912,33 @@ fn expand_decls<'a>(
                 is_ffi_sig,
             );
             if body.is_some() {
-                if *is_coro && !user_attrs_on(attrs, user_attrs).is_empty() {
+                let mut crossing: Vec<String> = Vec::new();
+                for attr in user_attrs_on(attrs, user_attrs) {
+                    if attr_bodies
+                        .get(attr.name)
+                        .is_some_and(attr_body_crosses_yield)
+                    {
+                        crossing.push(attr.name.to_string());
+                    }
+                }
+                for name in &crossing {
                     messages.push(Message::error(
                         ErrorCode::GenericTypeError,
-                        "user-defined attributes are not supported on `async fn`".to_string(),
+                        format!(
+                            "user-defined attribute `{name}` cannot be applied to `async fn` (attribute body contains yield outside `target(...args)`)"
+                        ),
                         span.into_range(),
                     ));
-                    strip_user_attrs(attrs, user_attrs);
-                } else {
+                }
+                if *is_coro {
+                    let drop_attrs: HashSet<&str> = crossing.iter().map(String::as_str).collect();
+                    attrs.retain(|a| {
+                        !drop_attrs.contains(a.name)
+                            || !user_attrs.contains(a.name)
+                            || KNOWN_ATTRS.contains(&a.name)
+                    });
+                }
+                if !user_attrs_on(attrs, user_attrs).is_empty() {
                     expand_function_user_attrs(
                         attr_bodies,
                         attrs,
@@ -2414,16 +2571,19 @@ fn show_variant_arm<'a>(
     vname: &'a str,
     shape: &VariantShape<'a>,
     recv: &'a str,
-) -> (Pattern<'a>, &'static str, Vec<Output<'a>>) {
+) -> (PatternOut<'a>, &'static str, Vec<Output<'a>>) {
     match shape {
         VariantShape::Unit => {
             let fmt = leak(format!("{}::{}", enum_name, vname));
             (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: PatternPayload::Unit,
-                },
+                span_pat(
+                    span,
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name: vname,
+                        payload: PatternPayload::Unit,
+                    },
+                ),
                 fmt,
                 vec![],
             )
@@ -2442,11 +2602,14 @@ fn show_variant_arm<'a>(
             }
             let fmt = leak(format!("{}::{}({})", enum_name, vname, specs.join(", ")));
             (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: PatternPayload::Tuple(vec![Pattern::Wildcard; *arity]),
-                },
+                span_pat(
+                    span,
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name: vname,
+                        payload: wildcard_tuple(span, *arity),
+                    },
+                ),
                 fmt,
                 fmt_args,
             )
@@ -2467,19 +2630,14 @@ fn show_variant_arm<'a>(
                 specs.join(", ")
             ));
             (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: PatternPayload::Record(
-                        fields
-                            .iter()
-                            .map(|fname| PatternField {
-                                name: fname,
-                                pattern: Pattern::Wildcard,
-                            })
-                            .collect(),
-                    ),
-                },
+                span_pat(
+                    span,
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name: vname,
+                        payload: record_wildcard_fields(span, fields),
+                    },
+                ),
                 fmt,
                 fmt_args,
             )
@@ -2506,7 +2664,7 @@ fn synth_eq_enum<'a>(
     }
     // Defensive fallback (should be unreachable if exhaustive).
     arms.push(MatchArm {
-        pattern: Pattern::Wildcard,
+        pattern: span_pat(span, Pattern::Wildcard),
         body: at(span, Expression::Bool(false)),
     });
     let match_expr = at(
@@ -2546,20 +2704,21 @@ fn eq_variant_arm<'a>(
     shape: &VariantShape<'a>,
     a_name: &'a str,
     b_name: &'a str,
-) -> (Pattern<'a>, Output<'a>) {
+) -> (PatternOut<'a>, Output<'a>) {
     match shape {
         VariantShape::Unit => {
+            let ctor = Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: PatternPayload::Unit,
+            };
             let inner_arms = vec![
                 MatchArm {
-                    pattern: Pattern::Constructor {
-                        enum_name,
-                        variant_name: vname,
-                        payload: PatternPayload::Unit,
-                    },
+                    pattern: span_pat(span, ctor.clone()),
                     body: at(span, Expression::Bool(true)),
                 },
                 MatchArm {
-                    pattern: Pattern::Wildcard,
+                    pattern: span_pat(span, Pattern::Wildcard),
                     body: at(span, Expression::Bool(false)),
                 },
             ];
@@ -2570,19 +2729,9 @@ fn eq_variant_arm<'a>(
                     arms: inner_arms,
                 },
             );
-            (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: PatternPayload::Unit,
-                },
-                body,
-            )
+            (span_pat(span, ctor), body)
         }
         VariantShape::Tuple(arity) => {
-            // Same-tag confirmation via wildcards, then compare through
-            // synthetic Access indices on the original `a` / `b` params
-            // (avoids nested-match binder + instance-method slot bugs).
             let mut cmp: Option<Output<'a>> = None;
             for i in 0..*arity {
                 let fname = leak(i.to_string());
@@ -2595,18 +2744,19 @@ fn eq_variant_arm<'a>(
                 });
             }
             let cmp = cmp.unwrap_or_else(|| at(span, Expression::Bool(true)));
-            let wild_tuple = PatternPayload::Tuple(vec![Pattern::Wildcard; *arity]);
+            let wild_tuple = wildcard_tuple(span, *arity);
+            let ctor = Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: wild_tuple.clone(),
+            };
             let inner_arms = vec![
                 MatchArm {
-                    pattern: Pattern::Constructor {
-                        enum_name,
-                        variant_name: vname,
-                        payload: wild_tuple.clone(),
-                    },
+                    pattern: span_pat(span, ctor.clone()),
                     body: cmp,
                 },
                 MatchArm {
-                    pattern: Pattern::Wildcard,
+                    pattern: span_pat(span, Pattern::Wildcard),
                     body: at(span, Expression::Bool(false)),
                 },
             ];
@@ -2617,18 +2767,9 @@ fn eq_variant_arm<'a>(
                     arms: inner_arms,
                 },
             );
-            (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: wild_tuple,
-                },
-                body,
-            )
+            (span_pat(span, ctor), body)
         }
         VariantShape::Record(fields) => {
-            // Field access on `a` / `b` after same-tag confirmation — avoids
-            // the nested-match binding limitation.
             let mut cmp: Option<Output<'a>> = None;
             for &fname in fields {
                 let l = at(span, Expression::Access(ident(span, a_name), fname));
@@ -2640,26 +2781,19 @@ fn eq_variant_arm<'a>(
                 });
             }
             let cmp = cmp.unwrap_or_else(|| at(span, Expression::Bool(true)));
-            let wild_record = PatternPayload::Record(
-                fields
-                    .iter()
-                    .map(|fname| PatternField {
-                        name: fname,
-                        pattern: Pattern::Wildcard,
-                    })
-                    .collect(),
-            );
+            let wild_record = record_wildcard_fields(span, fields);
+            let ctor = Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: wild_record.clone(),
+            };
             let inner_arms = vec![
                 MatchArm {
-                    pattern: Pattern::Constructor {
-                        enum_name,
-                        variant_name: vname,
-                        payload: wild_record.clone(),
-                    },
+                    pattern: span_pat(span, ctor.clone()),
                     body: cmp,
                 },
                 MatchArm {
-                    pattern: Pattern::Wildcard,
+                    pattern: span_pat(span, Pattern::Wildcard),
                     body: at(span, Expression::Bool(false)),
                 },
             ];
@@ -2670,14 +2804,7 @@ fn eq_variant_arm<'a>(
                     arms: inner_arms,
                 },
             );
-            (
-                Pattern::Constructor {
-                    enum_name,
-                    variant_name: vname,
-                    payload: wild_record,
-                },
-                body,
-            )
+            (span_pat(span, ctor), body)
         }
     }
 }
@@ -2782,7 +2909,7 @@ fn ord_method<'a>(
         arms.push(MatchArm { pattern, body });
     }
     arms.push(MatchArm {
-        pattern: Pattern::Wildcard,
+        pattern: span_pat(span, Pattern::Wildcard),
         body: at(span, Expression::Bool(false)),
     });
     let match_expr = at(
@@ -2810,7 +2937,7 @@ fn ord_outer_arm<'a>(
     a: &'a str,
     b: &'a str,
     op: OrdOp,
-) -> (Pattern<'a>, Output<'a>) {
+) -> (PatternOut<'a>, Output<'a>) {
     let mut inner_arms = Vec::new();
     for (j, rv) in variants.iter().enumerate() {
         let body = if j == left_idx {
@@ -2821,12 +2948,12 @@ fn ord_outer_arm<'a>(
             at(span, Expression::Bool(!op.when_left_tag_less()))
         };
         inner_arms.push(MatchArm {
-            pattern: ord_wildcard_pattern(enum_name, rv.name, &rv.shape),
+            pattern: ord_wildcard_pattern(span, enum_name, rv.name, &rv.shape),
             body,
         });
     }
     inner_arms.push(MatchArm {
-        pattern: Pattern::Wildcard,
+        pattern: span_pat(span, Pattern::Wildcard),
         body: at(span, Expression::Bool(false)),
     });
     let body = at(
@@ -2837,41 +2964,37 @@ fn ord_outer_arm<'a>(
         },
     );
     (
-        ord_wildcard_pattern(enum_name, left.name, &left.shape),
+        ord_wildcard_pattern(span, enum_name, left.name, &left.shape),
         body,
     )
 }
 
 fn ord_wildcard_pattern<'a>(
+    span: SimpleSpan,
     enum_name: &'a str,
     vname: &'a str,
     shape: &VariantShape<'a>,
-) -> Pattern<'a> {
-    match shape {
-        VariantShape::Unit => Pattern::Constructor {
-            enum_name,
-            variant_name: vname,
-            payload: PatternPayload::Unit,
+) -> PatternOut<'a> {
+    span_pat(
+        span,
+        match shape {
+            VariantShape::Unit => Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: PatternPayload::Unit,
+            },
+            VariantShape::Tuple(arity) => Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: wildcard_tuple(span, *arity),
+            },
+            VariantShape::Record(fields) => Pattern::Constructor {
+                enum_name,
+                variant_name: vname,
+                payload: record_wildcard_fields(span, fields),
+            },
         },
-        VariantShape::Tuple(arity) => Pattern::Constructor {
-            enum_name,
-            variant_name: vname,
-            payload: PatternPayload::Tuple(vec![Pattern::Wildcard; *arity]),
-        },
-        VariantShape::Record(fields) => Pattern::Constructor {
-            enum_name,
-            variant_name: vname,
-            payload: PatternPayload::Record(
-                fields
-                    .iter()
-                    .map(|fname| PatternField {
-                        name: fname,
-                        pattern: Pattern::Wildcard,
-                    })
-                    .collect(),
-            ),
-        },
-    }
+    )
 }
 
 fn ord_payload_cmp<'a>(
@@ -3151,12 +3274,12 @@ fn synth_hash_enum<'a>(
     for (tag, v) in variants.iter().enumerate() {
         let body = hash_variant_body(span, tag, &v.shape, p);
         arms.push(MatchArm {
-            pattern: ord_wildcard_pattern(enum_name, v.name, &v.shape),
+            pattern: ord_wildcard_pattern(span, enum_name, v.name, &v.shape),
             body,
         });
     }
     arms.push(MatchArm {
-        pattern: Pattern::Wildcard,
+        pattern: span_pat(span, Pattern::Wildcard),
         body: int_zero(span),
     });
     let match_expr = at(
@@ -3278,12 +3401,12 @@ fn synth_serialize_enum<'a>(
     for (tag, v) in variants.iter().enumerate() {
         let body = serialize_variant_body(span, tag, &v.shape, p);
         arms.push(MatchArm {
-            pattern: ord_wildcard_pattern(enum_name, v.name, &v.shape),
+            pattern: ord_wildcard_pattern(span, enum_name, v.name, &v.shape),
             body,
         });
     }
     arms.push(MatchArm {
-        pattern: Pattern::Wildcard,
+        pattern: span_pat(span, Pattern::Wildcard),
         body: at(span, Expression::Array(vec![])),
     });
     let match_expr = at(
