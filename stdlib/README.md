@@ -13,12 +13,12 @@ virtual modules alike. Prelude is auto-injected.
 | `conv` | `use conv::{parse_int, …};` | `int_to_dec` / `parse_int` / `parse_float` |
 | `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / replace / pad / eq |
 | `text` | `use text::{trim, split, …};` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
-| `collections` | `use collections::{sort, …};` | `sort` / `reverse` / `collect_ints` (range → array) |
+| `collections` | `use collections::{sort, …};` | Stable mergesort / `reverse` / `collect_ints` (range → array) |
 | `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
 | `random` | `use random::{u64, range, …};` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::{join, dirname, …};` | `join` / `dirname` / `basename` / `extension` |
 | `json` | `use json::{parse, stringify, …};` | Minimal JSON parse / stringify (`\uXXXX` BMP; `object_get`) |
-| `io::sync` | `use io::sync::{write_all, …};` | Blocking adapters + `print` / `println` / `read_line` |
+| `io::sync` | `use io::sync::{write_all, …};` | Blocking adapters + `print` / `println` / `read_line` (`write_all` via `io::write_from`) |
 | `io::file` | `use io::file::{read_text, …};` | Whole-file `read_bytes` / `write_text` / … |
 | `http` | `use http::client::{get, …};` | HTTP/1.1 client (existing) |
 
