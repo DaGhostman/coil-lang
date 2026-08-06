@@ -90,13 +90,15 @@ use crate::typechecking::virtual_modules::{
     BuiltinExport, VirtualModules,
 };
 
-/// One candidate in a compile-time arity overload set.
+/// One candidate in a compile-time overload set (arity and/or parameter types).
 ///
 /// Stored in [`Checker::overload_sets`] keyed by the function's simple
 /// (or qualified) name.  Codegen uses the span-indexed
 /// [`Checker::selected_overloads_by_span`] to decide which ABI to emit.
 #[derive(Clone, Debug)]
 pub struct OverloadCandidate {
+    /// Unique id within the overload family (registration order).
+    pub id: u32,
     /// Number of fixed (non-rest) parameters.
     pub fixed_arity: usize,
     /// True when the last parameter is a rest pack (`T... name`).
@@ -107,6 +109,17 @@ pub struct OverloadCandidate {
     /// Declaration-order parameter names (including the rest name when
     /// present).
     pub param_names: Vec<String>,
+}
+
+/// Result of selecting among same-name overload candidates.
+#[derive(Clone, Copy, Debug)]
+pub enum OverloadSelect<'a> {
+    /// Exactly one candidate fits.
+    Selected(&'a OverloadCandidate),
+    /// No candidate accepts this arity / argument types.
+    NoMatch,
+    /// Two or more candidates still fit after filtering.
+    Ambiguous,
 }
 
 /// A parametric type alias (`type Pair<T> = (T, T)`).
@@ -224,14 +237,18 @@ pub struct Checker {
     /// Populated at the end of each `infer_function` call.  When a name has
     /// exactly one candidate this is functionally equivalent to the legacy
     /// `fn_param_names` / `fn_has_rest` path; when there are multiple
-    /// candidates, call-site resolution uses [`Checker::select_overload`].
+    /// candidates, call-site resolution uses [`Checker::select_overload_for_args`].
     overload_sets: std::collections::HashMap<String, Vec<OverloadCandidate>>,
 
     /// Call-site selection results keyed by source span `(start, end)`.
     ///
-    /// Populated by `select_overload` during inference; consumed by codegen
-    /// to decide how many args to emit and whether to pack rest.
-    pub selected_overloads_by_span: std::collections::HashMap<(usize, usize), (usize, bool)>,
+    /// Value is `(fixed_arity, is_rest, candidate_id)`. Populated during
+    /// inference; consumed by codegen for the mangled table key.
+    pub selected_overloads_by_span: std::collections::HashMap<(usize, usize), (usize, bool, u32)>,
+
+    /// Declaration span → `(candidate_id, fixed_arity, is_rest)` for
+    /// overloaded functions so codegen can mangle each body uniquely.
+    pub overload_decl_by_span: std::collections::HashMap<(usize, usize), (u32, usize, bool)>,
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,

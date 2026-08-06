@@ -432,6 +432,23 @@ pub fn weak_app_ty(inner: Ty) -> Ty {
     )
 }
 
+/// Drop variant-tag refinement, yielding the owning enum type.
+///
+/// Construct sites infer `Ty::Constructor { tag, owner, … }`. Comparisons
+/// already peel to the parent; polymorphic params / mixed-variant joins must
+/// do the same so `min(Rank::Mid, Rank::Low)` unifies as one `T`.
+///
+/// Monomorphic enums collapse to `Ty::Con(name)` (same shape as a `: Rank`
+/// annotation and as derive-Ord instance keys). Builtin `Option`/`Result`
+/// keep their structural `Sum` so payload types are preserved.
+pub fn peel_constructor_refinement(ty: Ty) -> Ty {
+    match ty {
+        Ty::Constructor { owner, .. } => peel_constructor_refinement(*owner),
+        Ty::Sum { name, .. } if !common::is_poly_builtin_enum(&name) => Ty::Con(name),
+        other => other,
+    }
+}
+
 /// Build `Option<T>` as a sum type (`None` | `Some(T)`).
 ///
 /// The builtin annotation path uses [`option_app_ty`]. This structural

@@ -1,5 +1,5 @@
 // Edge cases for length-prefixed frames: empty body, truncate at 5.
-use protocol::*;
+use protocol::{encode_frame, frame_len, payload_eq};
 
 test("empty frame") {
     let empty: [byte] = [];

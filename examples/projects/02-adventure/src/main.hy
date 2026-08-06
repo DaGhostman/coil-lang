@@ -8,12 +8,27 @@
 //   printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
 //     timeout 10s ./target/release/coil examples/projects/02-adventure/src/main.hy
 
-use io::*;
-use io::sync::*;
-use world::*;
-use commands::*;
-use save::*;
-use string::*;
+use io::{close, open, stdin, stdout};
+use io::sync::{read_to_end, write_all};
+
+use world::{
+    Player,
+    key_here,
+    move_ok,
+    new_player,
+    player_has_key,
+    player_room,
+    room_exits,
+    room_title,
+    try_move,
+    try_take_key,
+};
+
+use commands::{cmd_dir, cmd_kind, parse_line};
+
+use save::{SaveData, decode_save, encode_save};
+
+use string::{format, to_bytes};
 
 fn save_player(string path, int room, int has_key) {
     let payload = encode_save(room, has_key);

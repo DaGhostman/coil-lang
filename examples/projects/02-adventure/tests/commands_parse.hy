@@ -1,4 +1,4 @@
-use commands::*;
+use commands::{cmd_dir, cmd_kind, parse_line};
 
 test("parse look") {
     let look: [byte] = [108, 111, 111, 107];

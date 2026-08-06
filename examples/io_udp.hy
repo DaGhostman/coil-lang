@@ -1,9 +1,10 @@
 // UDP datagram round-trip via `io::net::udp`.
 // Server binds ephemeral port; client send_to; server recv_from_wait.
-use io::*;
-use io::net::udp::*;
-use io::sync::*;
-use string::*;
+use io::{close, stdout};
+use io::net::udp::{bind, local_port, send_to};
+use io::sync::{recv_from_wait, write_all};
+
+use string::{format, to_bytes};
 
 fn echo_once() {
     let server = bind("127.0.0.1", 0)?;

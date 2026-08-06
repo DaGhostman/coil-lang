@@ -114,6 +114,15 @@ pub enum PreludeFn {
     Ord,
     /// Drive a coroutine to completion: `block_on(coro) -> Y`.
     BlockOn,
+    Sin,
+    Cos,
+    Tan,
+    Sqrt,
+    Floor,
+    Ceil,
+    Exp,
+    Ln,
+    Pow,
 }
 
 impl PreludeFn {
@@ -127,6 +136,15 @@ impl PreludeFn {
             Self::Char => "char",
             Self::Ord => "ord",
             Self::BlockOn => "block_on",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tan => "tan",
+            Self::Sqrt => "sqrt",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Exp => "exp",
+            Self::Ln => "ln",
+            Self::Pow => "pow",
         }
     }
 
@@ -140,6 +158,30 @@ impl PreludeFn {
             "char" => Some(Self::Char),
             "ord" => Some(Self::Ord),
             "block_on" => Some(Self::BlockOn),
+            "sin" => Some(Self::Sin),
+            "cos" => Some(Self::Cos),
+            "tan" => Some(Self::Tan),
+            "sqrt" => Some(Self::Sqrt),
+            "floor" => Some(Self::Floor),
+            "ceil" => Some(Self::Ceil),
+            "exp" => Some(Self::Exp),
+            "ln" => Some(Self::Ln),
+            "pow" => Some(Self::Pow),
+            _ => None,
+        }
+    }
+
+    pub fn math_native_name(self) -> Option<&'static str> {
+        match self {
+            Self::Sin => Some("math_sin"),
+            Self::Cos => Some("math_cos"),
+            Self::Tan => Some("math_tan"),
+            Self::Sqrt => Some("math_sqrt"),
+            Self::Floor => Some("math_floor"),
+            Self::Ceil => Some("math_ceil"),
+            Self::Exp => Some("math_exp"),
+            Self::Ln => Some("math_ln"),
+            Self::Pow => Some("math_pow"),
             _ => None,
         }
     }
@@ -743,6 +785,33 @@ impl VirtualModules {
                 BuiltinExport::Fn {
                     kind: PreludeFn::Matrix,
                 },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Sin,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Cos,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Tan,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Sqrt,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Floor,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Ceil,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Exp,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Ln,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Pow,
+                },
                 BuiltinExport::OpaqueType {
                     name: common::BUILTIN_MATRIX_TYPE,
                 },
@@ -1010,6 +1079,9 @@ impl VirtualModules {
 
     /// Exports injected into every file (implicit
     /// `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`).
+    ///
+    /// `pow` stays on virtual `prelude::math` for an explicit import, but is
+    /// **not** auto-injected so userland `num::pow` overloads can own the bare name.
     pub fn prelude_exports(&self) -> Vec<BuiltinExport> {
         let mut out = Vec::new();
         if let Some(e) = self.modules.get(PRELUDE_MODULE) {
@@ -1022,7 +1094,14 @@ impl VirtualModules {
             out.extend(e.iter().cloned());
         }
         if let Some(e) = self.modules.get(PRELUDE_MATH_MODULE) {
-            out.extend(e.iter().cloned());
+            out.extend(e.iter().cloned().filter(|export| {
+                !matches!(
+                    export,
+                    BuiltinExport::Fn {
+                        kind: PreludeFn::Pow
+                    }
+                )
+            }));
         }
         out
     }
@@ -1099,6 +1178,42 @@ mod tests {
                 kind: PreludeFn::Dot
             }
         )));
+        for kind in [
+            PreludeFn::Sin,
+            PreludeFn::Cos,
+            PreludeFn::Tan,
+            PreludeFn::Sqrt,
+            PreludeFn::Floor,
+            PreludeFn::Ceil,
+            PreludeFn::Exp,
+            PreludeFn::Ln,
+        ] {
+            assert!(
+                exports
+                    .iter()
+                    .any(|e| matches!(e, BuiltinExport::Fn { kind: found } if *found == kind)),
+                "missing prelude::math export {}",
+                kind.as_str()
+            );
+            assert!(kind.math_native_name().is_some());
+        }
+        assert!(
+            !exports.iter().any(|e| matches!(
+                e,
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Pow
+                }
+            )),
+            "pow must not be auto-injected (lives in userland num)"
+        );
+        assert!(
+            vm.resolve_item(
+                &["prelude".to_string(), "math".to_string()],
+                "pow",
+            )
+                .is_some(),
+            "pow remains importable from prelude::math"
+        );
         assert!(
             !exports
                 .iter()

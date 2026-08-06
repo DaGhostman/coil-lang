@@ -3,8 +3,8 @@
 Non-blocking file / stdio / TCP / UDP streams. **Not** auto-imported:
 
 ```coil
-use io::*;
-use io::sync::*;   // optional blocking adapters (userland)
+use io::{stdout, open, read, write, close};
+use io::sync::{write_all, read_to_end};   // optional blocking adapters (userland)
 ```
 
 | Export | Kind | Notes |
@@ -19,7 +19,7 @@ use io::sync::*;   // optional blocking adapters (userland)
 | `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready |
 | `block_on` | Prelude | `block_on(coro) -> Y` — auto-imported; drives `async fn` to completion |
 | `from_bytes` / `to_bytes` | Text aliases | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`); also exported by [`string`](string.md) |
-| `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::*`; timeout `ms <= 0` waits forever |
+| `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::{connect, listen, …};`; timeout `ms <= 0` waits forever |
 | `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
 | `io::net::udp::{bind,connect,send_to,recv_from,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
 | `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS with required opts |
@@ -34,6 +34,8 @@ Blocking helpers live in stdlib (`stdlib/io/sync.hy`), not as host natives:
 | `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops |
 | `accept_wait` | `accept` + `await_readable` |
 | `recv_from_wait` | `recv_from` + `await_readable` |
+| `print` / `println` / `eprintln` | UTF-8 stdout/stderr helpers |
+| `read_line` | Read until LF (strips CR); `None` on EOF with no bytes |
 
 ```coil
 use io::{stdout};

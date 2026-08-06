@@ -1,6 +1,13 @@
 // Pure unit tests: response parse (no sockets).
-use io::*;
-use http::url::*;
+use string::{to_bytes};
+use http::url::{
+    find_bytes,
+    header_count,
+    header_get,
+    parse_response,
+    response_body_len,
+    response_status,
+};
 
 test("parse response with content-length") {
     let raw = to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok");

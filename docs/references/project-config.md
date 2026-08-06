@@ -42,7 +42,7 @@ Unknown sections or keys are parse errors.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib` (or a path to coil's stdlib) for `http::*` and other userland libraries. |
+| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib` (or a path to coil's stdlib) for `http::client` and other userland libraries. |
 
 Example:
 
@@ -178,14 +178,17 @@ Strip the matching root prefix, remove `.hy`, replace `/` with `::`:
 ./src/a/b.hy    →  namespace "a::b"     (module-file fallback)
 ```
 
-### Glob imports
+### Wildcard imports (`E0124`)
 
-For `use foo::*;`:
+`use path::*;` is rejected at typecheck for **every** module — virtual (`io`,
+`ffi`, …) and userland disk modules. List names explicitly:
+`use io::{stdout, open};`, `use foo::{name, …}`, or concrete `use io::open;`.
+Prelude is auto-injected; do not write `use prelude::*` in source.
 
-1. The module stem is the last non-`*` segment: `"foo"`.
-2. Directory prefix is all preceding segments (empty for `use foo::*`).
-3. Resolve `<root>/foo.hy` (not a subdirectory).
-4. Namespace of `foo.hy` is `foo`.
+`mod foo;` loads a file for discovery/link order without binding names.
+
+Discovery may still map a path ending in `*` to `<root>/…/stem.hy` when
+scanning dependencies, but no names are imported from a wildcard `use`.
 
 ### `mod` declarations
 

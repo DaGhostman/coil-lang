@@ -815,6 +815,44 @@
         assert_eq!(s, format!("lit-{}", n - 1));
     }
 
+    /// Regression: `MakeEnum` used to allocate then maybe `gc_collect`
+    /// *before* pushing. The fresh enum was not a stack root, so it (and
+    /// payload objects only reachable through it) could be swept — dangling
+    /// `Result::Ok` after a heavy callee, seen as json `stringify` flaking
+    /// on `[1,2,true]` under a cold heap.
+    #[test]
+    fn make_enum_survives_gc_triggered_at_alloc() {
+        let mut vm = Machine::<32>::default();
+        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let strings: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
+        let mut bytecode: Vec<Byte> = Vec::new();
+        // Burn the alloc counter with interned strings (popped so unmarked).
+        for i in 0..n {
+            bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(i as u32));
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        // Payload string for Result::Ok(s).
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        bytecode.push(make_enum(0, 1)); // Ok(s)
+        // JumpIfMatch Ok — if the enum was swept, find_object fails and we
+        // fall through to panic.
+        let jump_pc = bytecode.len();
+        bytecode.push(jump_if_match(0, 0)); // pool[0] patched below
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        bytecode.push(Byte::new(Instruction::Panic));
+        let ok_arm = bytecode.len();
+        bytecode.push(Byte::new(Instruction::POP)); // Ok payload
+        bytecode.push(Byte::new(Instruction::HALT));
+        let _ = jump_pc;
+        let constants = [ok_arm as u64];
+
+        vm.run_with_pool(&bytecode, &constants, &strings, 0);
+        assert!(
+            !vm.panicked(),
+            "MakeEnum Ok should survive GC at alloc; JumpIfMatch must see the enum"
+        );
+    }
+
     #[test]
     fn format_concat_survives_gc_triggered_at_intern() {
         let mut vm = Machine::<16>::default();

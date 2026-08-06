@@ -1,6 +1,6 @@
 # `gc` module
 
-`use gc::*;` — explicit GC pins, weak handles, heap stats, and manual collection via HostInvoke.
+`use gc::{root, weak, upgrade, collect, heap_bytes};` — explicit GC pins, weak handles, heap stats, and manual collection via HostInvoke.
 
 | Surface | Types | Notes |
 |---------|--------|--------|
@@ -27,7 +27,7 @@
 Typical FFI pattern: `root` a Coil buffer/callback before handing its address to C; hold `Weak` entries in Coil-side registries so maps do not extend lifetimes.
 
 ```coil
-use gc::*;
+use gc::{collect, get, root, unroot, upgrade, weak};
 use io::{stdout};
 use io::sync::{write_all};
 use string::{to_bytes};

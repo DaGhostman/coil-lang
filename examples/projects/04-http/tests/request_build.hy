@@ -1,5 +1,17 @@
-use io::*;
-use http::url::*;
+use string::{to_bytes};
+use http::url::{
+    build_request_head,
+    build_request_head_extras,
+    concat_bytes,
+    empty_headers,
+    extras_sanitize,
+    find_bytes,
+    format_extra_headers_str,
+    header_add,
+    headers_have_crlf,
+    parse_url,
+    request_line_ok,
+};
 
 test("build get request has host and connection close") {
     let u = match parse_url("http://example.com/hi") {

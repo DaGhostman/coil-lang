@@ -12,6 +12,9 @@ test("int ordering") {
     assert(2 >= 2)?;
     assert(3 >= 2)?;
     assert(!(5 < 3))?;
+    assert(-5 < 0)?;
+    assert(-1 <= -1)?;
+    assert(!(-5 > 0))?;
 }
 
 test("float comparisons") {

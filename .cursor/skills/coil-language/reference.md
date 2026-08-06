@@ -109,11 +109,11 @@ extern {
 Runtime:
 
 ```coil
-use ffi::*;
-use ffi::types::*;
+use ffi::{dload, declare, invoke};
+use ffi::types::{Int, Ptr};
 
 let lib = dload("libc.so.6")?;
-let f = declare<Int, Ptr>(lib, "strlen")?;
+let f = declare(lib, "strlen", (String,), Int)?;
 ```
 
 ## Iterator / for-in

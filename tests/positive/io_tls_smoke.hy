@@ -1,6 +1,6 @@
 // HostInvoke + typechecker smoke for `io::net::tls::{client,server}` (feature `tls`).
 // Kind / opts errors only — no network / certificates needed.
-use io::*;
+use io::{open};
 use io::net::tls::client::enable as client_enable;
 use io::net::tls::client::disable as client_disable;
 use io::net::tls::server::enable as server_enable;

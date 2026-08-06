@@ -12,6 +12,7 @@ use crate::{
     PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, PACKED_VEC_ARITH, packed_dot,
     packed_matmul, packed_matrix_neg, packed_matrix_zip, packed_vec_arith,
 };
+use crate::math_libm::MATH_LIBM_WIRING;
 
 #[cfg(feature = "crypto")]
 use crate::CRYPTO_WIRING;
@@ -45,6 +46,7 @@ pub fn build_standard_host_natives(
     // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
     push_io_wait_ready(&mut out, &mut register_id);
     push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
+    push_math_libm(&mut out, &mut register_id);
     out
 }
 
@@ -65,6 +67,22 @@ fn push_wiring(
         let args = vec![FfiType::Int; arity];
         let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
             .unwrap_or_else(|_| panic!("{label} native signature"));
+        let id = out.len();
+        register_id(name, id);
+        out.push(Arc::new(HostClosureFn::new(sig, move |heap, args| {
+            Ok(Some(host(heap, args)))
+        })));
+    }
+}
+
+fn push_math_libm(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    for &(name, arity, host) in MATH_LIBM_WIRING {
+        let args = vec![FfiType::Float; arity];
+        let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Float)
+            .expect("math libm native signature");
         let id = out.len();
         register_id(name, id);
         out.push(Arc::new(HostClosureFn::new(sig, move |heap, args| {
@@ -645,5 +663,55 @@ fn push_thread_natives(
             Arc::new(HostClosureFn::new(sig, closure))
         };
         out.push(native);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_libm_natives_are_float_typed_and_appended_after_gc() {
+        let mut registrations = Vec::new();
+        let natives = build_standard_host_natives(|name, id| {
+            registrations.push((name.to_string(), id));
+        });
+
+        let math_start = registrations
+            .iter()
+            .position(|(name, _)| name == "math_sin")
+            .expect("math_sin registration");
+        let gc_collect = registrations
+            .iter()
+            .position(|(name, _)| name == crate::GC_COLLECT_NATIVE)
+            .expect("gc_collect registration");
+        assert_eq!(math_start, gc_collect + 1);
+
+        let expected = [
+            "math_sin",
+            "math_cos",
+            "math_tan",
+            "math_sqrt",
+            "math_floor",
+            "math_ceil",
+            "math_exp",
+            "math_ln",
+            "math_pow",
+        ];
+        assert_eq!(
+            registrations[math_start..]
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        for (offset, native) in natives[math_start..].iter().enumerate() {
+            let signature = native.signature();
+            assert_eq!(signature.ret, FfiType::Float);
+            let expected_arity = if offset + 1 == expected.len() { 2 } else { 1 };
+            assert_eq!(signature.args, vec![FfiType::Float; expected_arity]);
+            assert_eq!(registrations[math_start + offset].1, math_start + offset);
+        }
     }
 }

@@ -4,8 +4,8 @@ coil exposes non-blocking file, stdio, and TCP IO through the virtual
 **`io`** module. Import it explicitly (like `ffi`):
 
 ```coil
-use io::*;
-use io::sync::*;
+use io::{stdout, open, close, from_bytes};
+use io::sync::{write_all, read_to_end};
 ```
 
 Buffers use the **`byte`** primitive and **`[byte]`** arrays.
@@ -42,8 +42,9 @@ fn main() {
 | `to_bytes` | `string → [byte]` | UTF-8 encode (always succeeds) |
 
 ```coil
-use io::*;
-use string::*;
+use io::{stdout, from_bytes};
+use io::sync::{write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let hello: [byte] = [104, 101, 108, 108, 111];
@@ -74,10 +75,10 @@ See `examples/io_text.hy`.
 | `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready (multiplex) |
 | `block_on` | prelude | Drive an `async fn` handle to completion (see [IO reactor](../../internals/io-reactor.md)) |
 | `io::sync::{write_all,read_exact,read_to_end}` | userland | Blocking adapters over L0 + `await_*` |
-| `io::net::tcp::*` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |
-| `io::net::udp::*` | UDP | Datagram sockets; see below |
-| `io::net::tls::client::*` | TLS client | `enable` / `disable` (feature `tls`) |
-| `io::net::tls::server::*` | TLS server | `enable` / `disable` (feature `tls`) |
+| `io::net::tcp::{connect,listen,accept,…}` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |
+| `io::net::udp::{bind,send_to,recv_from,…}` | UDP | Datagram sockets; see below |
+| `io::net::tls::client::{enable,disable}` | TLS client | `enable` / `disable` (feature `tls`) |
+| `io::net::tls::server::{enable,disable}` | TLS server | `enable` / `disable` (feature `tls`) |
 
 For stdout text, call `write_all(stdout(), to_bytes(...))`.
 
@@ -85,11 +86,11 @@ TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 (like `ffi::types`):
 
 ```coil
-use io::*;
-use io::net::tcp::*;
-use io::net::udp::*;
-use io::net::tls::client::*;
-use io::net::tls::server::*;
+use io::{stdout};
+use io::net::tcp::{connect};
+use io::net::udp::{bind, local_port, send_to};
+use io::net::tls::client::{enable, disable};
+use io::net::tls::server::{enable, disable};
 ```
 
 ---
@@ -109,10 +110,10 @@ you need peer addresses:
 | `io::sync::recv_from_wait(s, buf)` | same | Userland: `recv_from` + `await_readable` |
 
 ```coil
-use io::*;
-use io::net::udp::*;
-use io::sync::*;
-use string::*;
+use io::{close, stdout};
+use io::net::udp::{bind, local_port, send_to};
+use io::sync::{recv_from_wait, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let server = bind("127.0.0.1", 0)?;
@@ -160,8 +161,8 @@ Client and server share the names `enable` / `disable` under separate modules.
 | `tls::server` | `disable(s)` | Same teardown as client `disable` |
 
 ```coil
-use io::net::tcp::*;
-use io::net::tls::client::*;
+use io::net::tcp::{connect};
+use io::net::tls::client::{enable, disable};
 
 let s = connect("example.com", 443)?;
 let s = enable(s, "example.com", { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
@@ -169,8 +170,8 @@ let s = disable(s)?;
 ```
 
 ```coil
-use io::net::tcp::*;
-use io::net::tls::server::*;
+use io::net::tcp::{accept_wait};
+use io::net::tls::server::{enable, disable};
 
 let s = accept_wait(listener)?;
 let s = enable(s, { cert_pem: cert, key_pem: key, timeout_ms: 0, client_ca_pem: "" })?;
@@ -201,8 +202,9 @@ See `examples/io_tls.hy`.
 ## File round-trip
 
 ```coil
-use io::*;
-use string::*;
+use io::{close, open, stdout};
+use io::sync::{read_to_end, write_all};
+use string::{format, to_bytes};
 
 fn main() {
     let path = "/tmp/demo.bin";

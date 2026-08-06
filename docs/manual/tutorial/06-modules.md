@@ -108,18 +108,13 @@ fn main() {
 
 The `as` clause binds a local name; the underlying FQN is unchanged.
 
-### Glob import
+### Wildcard imports (`E0124`)
 
-Import **every top-level item** from a module file:
-
-```coil
-use foo::*;
-```
-
-This loads `foo.hy` (note: the file is `foo.hy`, not a directory) and brings all of its top-level functions into scope by their bare names:
+`use path::*;` is banned for every module — virtual (`io`, `ffi`, `thread`, …)
+and userland `.hy` files. List names explicitly:
 
 ```coil
-use foo::*;
+use foo::{sadge, greet};
 
 fn main() {
     sadge();   // from foo.hy
@@ -127,7 +122,9 @@ fn main() {
 }
 ```
 
-Glob imports are **file-scoped**. They do not reach into subdirectories — `use foo::*` imports from `foo.hy` only, not from `foo/bar.hy`.
+Prelude is auto-injected every file — no `use prelude::*` in source. Brace
+groups and concrete imports only pull items from that module file — they do not
+reach into `foo/bar.hy`.
 
 ### Brace-group import
 
@@ -245,7 +242,8 @@ You normally call imported items by their local alias (`sadge()`), but the FQN i
 |-----------|------------|---------------|
 | `use foo::bar;` | `<root>/foo/bar.hy` | `bar` (local = `bar`) |
 | `use foo::bar as baz;` | `<root>/foo/bar.hy` | `baz` (local alias) |
-| `use foo::*;` | `<root>/foo.hy` | all top-level items from that file |
+| `use foo::{a, b};` | `<root>/foo.hy` | listed top-level items from that file |
+| `use io::{open, stdout};` | (virtual) | named exports of virtual `io` |
 | `mod foo;` | `<root>/foo.hy` | none |
 
 For complete syntax rules, path resolution details, and edge cases, see the [Modules reference](../../references/modules.md).

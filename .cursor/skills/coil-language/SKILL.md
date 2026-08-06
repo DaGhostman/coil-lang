@@ -36,7 +36,7 @@ ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
 
 Every runnable program needs `fn main()` **unless** the file only has `test("…")` cases (harness injects virtual `main` for `coil test`; do not mix `main` and `test()` in one file).
 
-Implicit imports (no `use` needed): `prelude::*`, `prelude::ops::*`, `prelude::test::*`, `prelude::math::*`.
+Implicit imports (no `use` needed): prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) — injected by the compiler, not written in source.
 
 Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`.
 
@@ -64,7 +64,7 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 | Errors | Built-in `Option`/`Result`; `raise`, `?`, `??`, `?.` |
 | Classes | `class C { … }`, `impl C { … }`, `new C(…)` |
 | Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
-| FFI | `extern { … }` blocks or `use ffi::*` + `dload`/`declare`/`invoke` |
+| FFI | `extern { … }` blocks or `use ffi::{dload, declare, invoke}` + `ffi::types::{Int, …}` |
 | Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
 | Type query | `typeof expr` → compile-time FQN string (not evaluated at runtime) |
 
@@ -76,14 +76,17 @@ Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
 
 ## Virtual modules (explicit `use`)
 
+`use path::*` is banned (`E0124`) — list names explicitly for virtual and
+userland modules. Prelude is auto-injected.
+
 | Module | Typical import | Notes |
 |--------|----------------|-------|
-| `io` | `use io::*;` | `Stream`, `[byte]`, files, TCP/UDP; non-blocking L0 |
-| `string` | `use string::*;` | `format`, `to_bytes` / `from_bytes` |
-| `ffi` | `use ffi::*;` | Dynamic loading; tags in `ffi::types` |
-| `thread` | `use thread::*;` | `spawn`/`join`, channels, mutex |
-| `time` / `env` / `crypto` / `regex` | `use …::*;` | Cargo-feature gated (default on) |
-| `gc` | `use gc::*;` | `Root` / `Weak` GC pins |
+| `io` | `use io::{stdout, open, read, write};` | `Stream`, `[byte]`, files, TCP/UDP; non-blocking L0 |
+| `string` | `use string::{format, to_bytes, from_bytes};` | Formatting / UTF-8 bytes |
+| `ffi` | `use ffi::{dload, declare, invoke};` + `use ffi::types::{Int, Ptr};` | Dynamic loading |
+| `thread` | `use thread::{spawn, join, channel, send, recv};` | OS threads, channels, mutex |
+| `time` / `env` / `crypto` / `regex` | `use time::{timestamp, sleep_ms};` etc. | Cargo-feature gated (default on) |
+| `gc` | `use gc::{root, weak, collect};` | `Root` / `Weak` GC pins |
 
 `byte` is 0..=255; integer literals coerce under `byte` / `[byte]` expectations.
 

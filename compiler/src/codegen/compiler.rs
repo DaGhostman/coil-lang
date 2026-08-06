@@ -464,11 +464,11 @@ impl Compiler {
             .get(*fname)
             .cloned()
             .unwrap_or_else(|| fname.to_string());
-        if let Some((fa, is_rest)) = self
+        if let Some((fa, is_rest, id)) = self
             .checker
             .selected_overload_at(call_expr.0.start, call_expr.0.end)
         {
-            let keyed = overload_fn_key(&call_key, fa, is_rest);
+            let keyed = overload_fn_key(&call_key, fa, is_rest, id);
             if self.functions.contains_key(&keyed) {
                 call_key = keyed;
             } else {
@@ -477,7 +477,7 @@ impl Compiler {
                     .next()
                     .unwrap_or(&call_key)
                     .to_string();
-                let keyed_simple = overload_fn_key(&simple, fa, is_rest);
+                let keyed_simple = overload_fn_key(&simple, fa, is_rest, id);
                 if self.functions.contains_key(&keyed_simple) {
                     call_key = keyed_simple;
                 }
@@ -2251,13 +2251,14 @@ impl Compiler {
                         return true;
                     }
                     if let Some(kind) = self.checker.prelude_fn_in_scope(fname) {
-                        return matches!(
-                            kind,
-                            crate::typechecking::PreludeFn::Ord
-                                | crate::typechecking::PreludeFn::Char
-                                | crate::typechecking::PreludeFn::Assert
-                                | crate::typechecking::PreludeFn::BlockOn
-                        );
+                        return kind.math_native_name().is_some()
+                            || matches!(
+                                kind,
+                                crate::typechecking::PreludeFn::Ord
+                                    | crate::typechecking::PreludeFn::Char
+                                    | crate::typechecking::PreludeFn::Assert
+                                    | crate::typechecking::PreludeFn::BlockOn
+                            );
                     }
                     if self.checker.ffi_fn_in_scope(fname).is_some() {
                         return true;
@@ -3521,7 +3522,7 @@ impl Compiler {
                     args_tuple.0.into_range(),
                 );
                 m.push(DiagLabel::new(
-                    "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                    "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::{Int, Float, …}`"
                         .to_string(),
                     args_tuple.0.into_range(),
                 ));
@@ -4792,7 +4793,10 @@ impl Compiler {
                 UNIT => Some(ValueTag::Unit),
                 _ => Some(ValueTag::Instance), // user-defined class / enum
             },
-            Ty::Sum { .. } => Some(ValueTag::Enum),
+            // Same carrier ABI as `Con(enum)` — trait methods unbox Instance.
+            Ty::Sum { .. } => Some(ValueTag::Instance),
+            // Variant refinements box like their owning enum.
+            Ty::Constructor { owner, .. } => Self::ty_to_value_tag(owner),
             Ty::Tuple(_) => Some(ValueTag::Tuple),
             Ty::Array { .. } => Some(ValueTag::Array),
             Ty::Record { .. } => Some(ValueTag::Record),
@@ -5006,6 +5010,25 @@ impl Compiler {
         }
         let free = crate::typechecking::subst::ftv(result);
         scheme.bounds.iter().any(|bound| free.contains(bound))
+    }
+
+    /// Whether a generic function has at least one bare type-parameter
+    /// argument (`T` rather than `[T]` / `F<T>`). Those positions use the
+    /// boxed shared-body ABI; nested ADT params do not.
+    fn generic_has_toplevel_type_param_args(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut current = &scheme.ty;
+        while let crate::typechecking::Ty::Fun(param, ret) = current {
+            if let crate::typechecking::Ty::Var(v) = param.as_ref() {
+                if scheme.bounds.iter().any(|b| b == v) {
+                    return true;
+                }
+            }
+            current = ret;
+        }
+        false
     }
 
     /// Whether a generic call's return value is boxed at the ABI boundary.
@@ -5343,8 +5366,20 @@ impl Compiler {
         // advances `emit_idx` past lhs's entire subtree.
         let lhs_ty = self.codegen_expr_ty(lhs);
         let lhs_id = self.checker.id_table().ids().get(self.emit_idx).copied();
-        bytecode.append(&mut self.do_compile(lhs));
-        bytecode.append(&mut self.do_compile(rhs));
+        if self.arg_emits_on_self_bytecode(lhs) || self.arg_emits_on_self_bytecode(rhs) {
+            // HostInvoke results live on the shared operand/local stack. A
+            // second invoke can overwrite the first result before this local
+            // bytecode buffer is appended, so stage both operands immediately.
+            let mut lhs_slot = 0;
+            let mut rhs_slot = 0;
+            self.stage_call_arg_to_temp(lhs, false, &mut lhs_slot);
+            self.stage_call_arg_to_temp(rhs, false, &mut rhs_slot);
+            bytecode.push_load(lhs_slot);
+            bytecode.push_load(rhs_slot);
+        } else {
+            bytecode.append(&mut self.do_compile(lhs));
+            bytecode.append(&mut self.do_compile(rhs));
+        }
         if matches!(
             lhs_ty,
             Some(crate::typechecking::ty::Ty::Con(ref name))
@@ -6129,7 +6164,10 @@ impl Compiler {
             Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
             Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
             Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
-            Expression::String(_) => Some(Ty::Con(crate::typechecking::ty::STRING.into())),
+            Expression::String(_) => self
+                .checker
+                .lookup_for_codegen_span(node.0.start, node.0.end)
+                .or_else(|| Some(Ty::Con(crate::typechecking::ty::STRING.into()))),
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
                 for item in items {
@@ -7249,26 +7287,8 @@ impl Compiler {
                 if self.checker.virtual_modules().resolves_use(p, name) {
                     // Scope already populated by check_program.
                 } else if name == "*" {
-                    let module_ns = p.join("::");
-                    let prefix = if module_ns.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{}::", module_ns)
-                    };
-                    let fqns: Vec<String> = self
-                        .functions
-                        .keys()
-                        .filter(|fqn| {
-                            fqn.starts_with(&prefix)
-                                && !fqn[prefix.len()..].contains("::")
-                                && !fqn[prefix.len()..].is_empty()
-                        })
-                        .cloned()
-                        .collect();
-                    for fqn in fqns {
-                        let item_name = fqn[prefix.len()..].to_string();
-                        self.aliases.insert(item_name, fqn);
-                    }
+                    // Disk-module wildcards are rejected in typecheck
+                    // (`ErrorCode::WildcardImport`); leave aliases unchanged.
                 } else {
                     // Prefer the FQN that actually exists in the function
                     // table so both conventions work:
@@ -7285,14 +7305,16 @@ impl Compiler {
                     } else {
                         format!("{module_ns}::{name}")
                     };
-                    let qualified = if self.functions.contains_key(&file_per_item) {
-                        file_per_item
-                    } else if self.functions.contains_key(&item_in_module) {
+                    let qualified = if self.functions.contains_key(&item_in_module) {
                         item_in_module
-                    } else {
-                        // Defensive: keep the historical one-item-per-file
-                        // shape when the dependency has not been linked yet.
+                    } else if self.functions.contains_key(&file_per_item) {
                         file_per_item
+                    } else {
+                        // Dependency not linked yet: prefer item-in-module
+                        // (`io::sync::write_all`) over one-item-per-file
+                        // (`io::sync::write_all::write_all`), which poisons
+                        // intra-module calls after a premature `use`.
+                        item_in_module
                     };
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     self.aliases.insert(local, qualified);
@@ -7467,20 +7489,26 @@ impl Compiler {
                     .or_default()
                     .push(name.to_string());
                 let (fixed_arity, has_rest) = fn_arity_from_args(args);
-                let table_key =
-                    if self.checker.is_overloaded(name) || self.checker.is_overloaded(&qualified) {
-                        overload_fn_key(&qualified, fixed_arity, has_rest)
+                let table_key = if self.checker.is_overloaded(name)
+                    || self.checker.is_overloaded(&qualified)
+                {
+                    if let Some((decl_id, fa, rest)) =
+                        self.checker.overload_decl_at(span.start, span.end)
+                    {
+                        overload_fn_key(&qualified, fa, rest, decl_id)
                     } else {
-                        qualified.clone()
-                    };
+                        overload_fn_key(&qualified, fixed_arity, has_rest, 0)
+                    }
+                } else {
+                    qualified.clone()
+                };
                 let (fn_offset, _) = self.bind_function_entry(table_key.clone());
                 let fn_offset = fn_offset as u32;
                 self.fn_arities
                     .insert(table_key.clone(), (fixed_arity as u32, has_rest));
-                if table_key != qualified {
-                    self.fn_arities
-                        .insert(qualified.clone(), (fixed_arity as u32, has_rest));
-                }
+                // Overloads share the unmangled FQN; do not mirror arity
+                // under `qualified` (last decl would win and poison
+                // fallbacks that lack `selected_overload_at`).
                 if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
                     self.test_cases.push((desc, fn_offset));
                 }
@@ -7764,7 +7792,7 @@ impl Compiler {
                 let fqn = self.qualify_static_fqn(name);
                 self.emit_static_initializer(&fqn, init);
             }
-            // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::*) ---
+            // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::{…}) ---
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
@@ -8263,10 +8291,24 @@ impl Compiler {
                         | crate::typechecking::PreludeFn::Char => {
                             self.emit_prelude_host_call(arg_slice, kind.as_str());
                         }
+                        crate::typechecking::PreludeFn::Sin
+                        | crate::typechecking::PreludeFn::Cos
+                        | crate::typechecking::PreludeFn::Tan
+                        | crate::typechecking::PreludeFn::Sqrt
+                        | crate::typechecking::PreludeFn::Floor
+                        | crate::typechecking::PreludeFn::Ceil
+                        | crate::typechecking::PreludeFn::Exp
+                        | crate::typechecking::PreludeFn::Ln
+                        | crate::typechecking::PreludeFn::Pow => {
+                            self.emit_prelude_host_call(
+                                arg_slice,
+                                kind.math_native_name().expect("scalar math native"),
+                            );
+                        }
                     }
                     return bytecode;
                 }
-                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
                 {
@@ -8288,7 +8330,7 @@ impl Compiler {
                     }
                     return bytecode;
                 }
-                // `open` / `read` / … after `use io::*` (or `use io::read as …`).
+                // `open` / `read` / … after `use io::{…}` (or `use io::read as …`).
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.io_fn_in_scope(fname)
                 {
@@ -8461,10 +8503,10 @@ impl Compiler {
                         .cloned();
                     if let Some(fqn_base) = fqn {
                         let nargs = args.as_ref().map(|items| items.len()).unwrap_or(0);
-                        let fqn = if let Some((fa, is_rest)) =
+                        let fqn = if let Some((fa, is_rest, id)) =
                             self.checker.selected_overload_at(span.start, span.end)
                         {
-                            let keyed = overload_fn_key(&fqn_base, fa, is_rest);
+                            let keyed = overload_fn_key(&fqn_base, fa, is_rest, id);
                             if self.functions.contains_key(&keyed) {
                                 keyed
                             } else {
@@ -8474,11 +8516,46 @@ impl Compiler {
                             // Forward call inside an impl that later gained
                             // more overloads — TC may not have recorded a
                             // selection (set had size 1 at infer time).
-                            self.checker
-                                .select_overload(&fqn_base, nargs)
-                                .map(|c| overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest))
-                                .filter(|k| self.functions.contains_key(k))
-                                .unwrap_or(fqn_base)
+                            // Prefer arg types so same-arity overloads match
+                            // the checker path (`select_overload_for_args`).
+                            let arg_tys: Vec<Ty> = args
+                                .as_ref()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|a| {
+                                            let value = match a.1.as_ref() {
+                                                Expression::NamedArg(_, v) => v,
+                                                _ => a,
+                                            };
+                                            self.codegen_expr_ty(value)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            // Only pass types when every arg resolved; a
+                            // partial vec would shift positions under unify.
+                            let tys = if arg_tys.len() == nargs {
+                                arg_tys.as_slice()
+                            } else {
+                                &[]
+                            };
+                            match self.checker.select_overload_for_args(&fqn_base, nargs, tys) {
+                                crate::typechecking::infer::OverloadSelect::Selected(c) => {
+                                    let keyed = overload_fn_key(
+                                        &fqn_base,
+                                        c.fixed_arity,
+                                        c.is_rest,
+                                        c.id,
+                                    );
+                                    if self.functions.contains_key(&keyed) {
+                                        keyed
+                                    } else {
+                                        fqn_base
+                                    }
+                                }
+                                _ => fqn_base,
+                            }
                         } else {
                             fqn_base
                         };
@@ -8626,7 +8703,7 @@ impl Compiler {
                         || self.native.contains_key(&n)
                     {
                         n
-                    } else if !self.namespace.is_empty() {
+                    } else if !self.namespace.is_empty() && !n.contains("::") {
                         let qualified = format!("{}::{}", self.namespace, n);
                         if self.functions.contains_key(&qualified)
                             || self
@@ -8643,16 +8720,16 @@ impl Compiler {
                     };
 
                     // Arity-overload table key (when the typechecker selected one).
-                    let n = if let Some((fa, is_rest)) =
+                    let n = if let Some((fa, is_rest, id)) =
                         self.checker.selected_overload_at(span.start, span.end)
                     {
-                        let keyed = overload_fn_key(&n, fa, is_rest);
+                        let keyed = overload_fn_key(&n, fa, is_rest, id);
                         if self.functions.contains_key(&keyed) {
                             keyed
                         } else {
                             // Try bare-name key when FQN wasn't used at registration.
                             let simple = n.rsplit("::").next().unwrap_or(&n);
-                            let keyed_simple = overload_fn_key(simple, fa, is_rest);
+                            let keyed_simple = overload_fn_key(simple, fa, is_rest, id);
                             if self.functions.contains_key(&keyed_simple) {
                                 keyed_simple
                             } else {
@@ -8740,6 +8817,11 @@ impl Compiler {
                         let lookup_name = strip_overload_key(&n).to_string();
                         let is_generic =
                             self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
+                        // Only box bare `T` args for the shared dict ABI. Nested
+                        // params like `[T]` (e.g. `collections::sort`) keep the
+                        // native representation even when not monomorphized.
+                        let box_generic_args =
+                            is_generic && self.generic_has_toplevel_type_param_args(&lookup_name);
                         let arg_slice = args.as_deref().unwrap_or(&[]);
                         self.consume_spread_emit_ids(arg_slice);
                         let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
@@ -8784,7 +8866,7 @@ impl Compiler {
                         }
 
                         // Partial application → MakeFn (not CALL).
-                        let (fa, is_rest) = self
+                        let (fa, is_rest, _id) = self
                             .checker
                             .selected_overload_at(span.start, span.end)
                             .or_else(|| {
@@ -8795,15 +8877,15 @@ impl Compiler {
                                 } else {
                                     names.len()
                                 };
-                                Some((fixed, rest))
+                                Some((fixed, rest, 0))
                             })
                             .or_else(|| {
                                 self.fn_arities
                                     .get(&lookup_name)
                                     .or_else(|| self.fn_arities.get(&n))
-                                    .map(|(a, r)| (*a as usize, *r))
+                                    .map(|(a, r)| (*a as usize, *r, 0))
                             })
-                            .unwrap_or((0, false));
+                            .unwrap_or((0, false, 0));
                         let fill_mask =
                             self.checker
                                 .partial_fill_at(span.start, span.end)
@@ -8842,7 +8924,7 @@ impl Compiler {
                             &lookup_name,
                             arg_slice,
                             &mut bytecode,
-                            is_generic,
+                            box_generic_args,
                         );
 
                         // ── Dictionary-passing calling convention ──────────────────
@@ -9221,10 +9303,10 @@ impl Compiler {
                         }
                     } else {
                         // Monomorphic function in value position → MakeFn.
-                        let (fa, is_rest, entry_key) = if let Some((fa, is_rest)) =
+                        let (fa, is_rest, entry_key) = if let Some((fa, is_rest, id)) =
                             self.checker.selected_overload_at(span.start, span.end)
                         {
-                            let keyed = overload_fn_key(&resolved_n, fa, is_rest);
+                            let keyed = overload_fn_key(&resolved_n, fa, is_rest, id);
                             (fa, is_rest, keyed)
                         } else if self.checker.is_overloaded(&resolved_n) {
                             // Ambiguous — typechecker should have diagnosed.
@@ -9870,27 +9952,48 @@ impl Compiler {
                 bytecode.push_const_pool(idx);
             }
             Expression::String(str) => {
+                use crate::typechecking::subst::apply_ty_prune;
                 let escaped = unescape_coil_string(str);
-                //     while let Some(captures) = re.captures(escaped.as_str()) {
-                //         let unicode = captures.name("code").unwrap().as_str();
-                //
-                //         escaped = escaped.replace(
-                //             format!("\\u{}", unicode).as_str(),
-                //             char::from_u32(
-                //                 captures
-                //                     .name("code")
-                //                     .unwrap()
-                //                     .as_str()
-                //                     .parse()
-                //                     .unwrap_or_default(),
-                //             )
-                //             .unwrap_or_default()
-                //             .to_string()
-                //             .as_str(),
-                //         )
-                //     }
-                // }
-                self.emit_raw_string_literal(&mut bytecode, &escaped);
+                let span_ty = self
+                    .checker
+                    .lookup_for_codegen_span(span.start, span.end)
+                    .map(|ty| apply_ty_prune(self.checker.subst(), &ty));
+                // Single-byte string literals typed as `byte` emit CONST.
+                let as_byte = span_ty
+                    .as_ref()
+                    .is_some_and(|ty| matches!(ty, Ty::Con(n) if n == "byte"));
+                // String literals typed as `[byte]` / `[byte; N]` emit CONST*N + MakeArray.
+                let as_bytes = span_ty.as_ref().is_some_and(|ty| {
+                    matches!(
+                        ty,
+                        Ty::Array { element, .. }
+                            if matches!(element.as_ref(), Ty::Con(n) if n == "byte")
+                    )
+                });
+                if as_byte {
+                    match escaped.as_bytes() {
+                        [b] => {
+                            bytecode.push(Byte::new_with_value(
+                                Instruction::CONST,
+                                Value::from(*b as i64).raw() as _,
+                            ));
+                        }
+                        _ => {
+                            self.emit_raw_string_literal(&mut bytecode, &escaped);
+                        }
+                    }
+                } else if as_bytes {
+                    let bytes = escaped.as_bytes();
+                    for &b in bytes {
+                        bytecode.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::from(b as i64).raw() as _,
+                        ));
+                    }
+                    bytecode.push_make_array(bytes.len() as u32);
+                } else {
+                    self.emit_raw_string_literal(&mut bytecode, &escaped);
+                }
             }
             Expression::Variable(name, _ty) => {
                 if unlikely(self.context.variables.contains(&name.to_string())) {
@@ -10094,7 +10197,7 @@ impl Compiler {
                     // Key fixed-arity overloads; keep bare name for
                     // single decls and for C-varargs (not overload members).
                     let table_name = if !decl.variadic && self.checker.is_overloaded(decl.name) {
-                        overload_fn_key(&fn_name, nfixed, false)
+                        overload_fn_key(&fn_name, nfixed, false, 0)
                     } else {
                         fn_name.clone()
                     };
@@ -10135,7 +10238,7 @@ impl Compiler {
                                             arg.0.into_range(),
                                         );
                                         m.push(DiagLabel::new(
-                                            "use Int/Ptr after `use ffi::types::*;`, a bare type name, [T], (T, U), or an extern struct".to_string(),
+                                            "use Int/Ptr after `use ffi::types::{Int, Ptr, …}`, a bare type name, [T], (T, U), or an extern struct".to_string(),
                                             arg.0.into_range(),
                                         ));
                                         m
@@ -10860,9 +10963,24 @@ impl Compiler {
                         // positions. Cleared after the body emits.
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
-                        if let Some(map) = self.context.match_bindings.clone() {
-                            for (name, slot) in map {
-                                self.record_debug_local(&name, slot);
+                        let binding_slots: Vec<(String, u32)> = self
+                            .context
+                            .match_bindings
+                            .as_ref()
+                            .map(|m| m.iter().map(|(n, s)| (n.clone(), *s)).collect())
+                            .unwrap_or_default();
+                        let max_binding_slot = binding_slots.iter().map(|(_, s)| *s).max();
+                        for (name, slot) in &binding_slots {
+                            self.record_debug_local(name, *slot);
+                        }
+                        // JumpIfMatch/Unpack leave payloads at these slots via
+                        // stack/locals overlap. Reserve them in `variables` so
+                        // arm-body temps (`alloc_temp_slot`) cannot STORE over
+                        // the bindings.
+                        if let Some(max_slot) = max_binding_slot {
+                            while (self.context.variables.len() as u32) <= max_slot {
+                                let pad = format!("__match{}", self.context.variables.len());
+                                let _ = self.context.variables.intern(pad);
                             }
                         }
 
@@ -11071,6 +11189,31 @@ impl Compiler {
                 // Payload left on stack for the caller (e.g. StorePop).
             }
             Expression::Cast(expr, ty_ann) => {
+                use crate::typechecking::subst::apply_ty_prune;
+                use crate::typechecking::ty::{ArrayLength, Ty};
+
+                let dst_ty = self
+                    .checker
+                    .lookup_for_codegen_span(span.start, span.end)
+                    .map(|ty| apply_ty_prune(self.checker.subst(), &ty));
+                let src_ty = self.codegen_expr_ty(expr);
+                let string_to_bytes = matches!(
+                    (src_ty.as_ref(), dst_ty.as_ref()),
+                    (
+                        Some(Ty::Con(s)),
+                        Some(Ty::Array {
+                            element,
+                            length: ArrayLength::Dynamic,
+                            ..
+                        })
+                    ) if s == "string"
+                        && matches!(element.as_ref(), Ty::Con(n) if n == "byte")
+                );
+                if string_to_bytes {
+                    self.emit_host_native_invoke("to_bytes", std::slice::from_ref(expr));
+                    return bytecode;
+                }
+
                 bytecode.append(&mut self.do_compile(expr));
                 let src_ty = self.codegen_expr_ty(expr);
                 let dst_name = primitive_name_from_type_ann(ty_ann);
@@ -11230,6 +11373,9 @@ impl Compiler {
         self.current_function_qualified = None;
         self.current_function_table_key = None;
         self.fn_bytecode_spans.clear();
+        // `use` aliases are per-module; leftovers from a prior
+        // `compile_module` would otherwise redirect bare names.
+        self.aliases.clear();
         if self.bytecode.len() <= PROLOGUE_BYTECODE_LEN {
             self.fn_debug_locals.clear();
         }

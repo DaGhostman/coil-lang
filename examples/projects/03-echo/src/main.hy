@@ -5,13 +5,17 @@
 //
 // Expected output: ok
 
-use io::*;
-use io::net::tcp::*;
-use io::sync::*;
-use protocol::*;
-use server::*;
-use client::*;
-use string::*;
+use io::{close, stdout};
+use io::net::tcp::{connect, listen};
+use io::sync::{accept_wait, read_exact, write_all};
+
+use protocol::{encode_frame, payload_eq};
+
+use server::{echo_reply};
+
+use client::{client_port, request_body};
+
+use string::{format, to_bytes};
 
 async fn greeting_bytes() {
     yield 65;

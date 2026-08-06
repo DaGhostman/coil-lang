@@ -140,6 +140,28 @@ pub fn unescape_coil_string(s: &str) -> String {
     out
 }
 
+/// Decode a coil string literal to its UTF-8 bytes (after escapes).
+pub fn string_literal_as_bytes(raw: &str) -> Vec<u8> {
+    unescape_coil_string(raw).into_bytes()
+}
+
+/// If `raw` (coil string-literal contents) unescapes to exactly one UTF-8 byte,
+/// return that byte. Used for static `string` → `byte` literal coercion.
+pub fn string_literal_as_single_byte(raw: &str) -> Result<u8, StringLiteralByteError> {
+    match string_literal_as_bytes(raw).as_slice() {
+        [b] => Ok(*b),
+        [] => Err(StringLiteralByteError::Empty),
+        _ => Err(StringLiteralByteError::NotSingleByte),
+    }
+}
+
+/// Why a string literal cannot coerce to `byte`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringLiteralByteError {
+    Empty,
+    NotSingleByte,
+}
+
 fn primitive_name_from_type_ann(ty: &Output) -> Option<&'static str> {
     match ty.1.as_ref() {
         Expression::Type(name) => primitive_type_name(&Ty::Con((*name).into())),
@@ -589,16 +611,18 @@ fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>, ba
     max_slot + 1
 }
 
-/// Bytecode table key for an arity overload: `name#2` or `name#rest1`.
-fn overload_fn_key(name: &str, fixed_arity: usize, is_rest: bool) -> String {
+/// Bytecode table key for an overload: `name#2.0` or `name#rest1.0`.
+///
+/// `id` distinguishes same-arity typed overloads (`sum#1.0` vs `sum#1.1`).
+fn overload_fn_key(name: &str, fixed_arity: usize, is_rest: bool, id: u32) -> String {
     if is_rest {
-        format!("{name}#rest{fixed_arity}")
+        format!("{name}#rest{fixed_arity}.{id}")
     } else {
-        format!("{name}#{fixed_arity}")
+        format!("{name}#{fixed_arity}.{id}")
     }
 }
 
-/// Strip `#N` / `#restN` suffix from an overload table key.
+/// Strip `#N.id` / `#restN.id` (or legacy `#N`) suffix from an overload table key.
 fn strip_overload_key(name: &str) -> &str {
     match name.rfind('#') {
         Some(i) => &name[..i],
@@ -692,7 +716,7 @@ pub struct Compiler {
     /// imported names (e.g. `spawn(run_jobs, …)` after `use pool::worker::run_jobs`)
     /// still packs the real arity.
     fn_arities: HashMap<String, (u32, bool)>,
-    /// Top-level items per namespace (for `use foo::*` glob expansion).
+    /// Top-level items per namespace (legacy; disk `::*` no longer expands).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
     /// Let-slot holding each extern library handle.

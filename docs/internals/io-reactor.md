@@ -18,12 +18,12 @@ They share a lifecycle (cloned onto pool workers) but **never** put blocking IO 
 | `drive()` | Non-blocking `poll_once` on registered async waiters |
 | `wait_ready()` | Block until ≥1 registered waiter is ready (batch); no-op when none registered |
 | **`block_on(coro)`** (prelude) | Resume until `done`; calls `wait_ready` between resumes |
-| Userland `io::sync::*` | Coil loops over L0 + `await_*` (`stdlib/io/sync.hy`) — top-level park path |
+| Userland `io::sync::{write_all, …}` | Coil loops over L0 + `await_*` (`stdlib/io/sync.hy`) — top-level park path |
 
 Preferred DX — async work, sync boundary:
 
 ```coil
-use io::*;
+use io::{Stream};
 async fn copy(Stream a, Stream b) -> Result<(), IoError> {
     // L0 + await_* …
 }

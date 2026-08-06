@@ -1,4 +1,4 @@
-use gc::*;
+use gc::{collect, get, root, unroot, upgrade, weak};
 use io::{stdout};
 use io::sync::{write_all};
 use string::{to_bytes};

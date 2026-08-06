@@ -46,7 +46,7 @@ machine = { path = "...", default-features = false, features = ["time"] }
 # or: features = ["crypto"] / ["regex"]
 ```
 
-The `compiler` and root `coil` crates mirror the same feature names. With a feature disabled, the corresponding `use crypto::*` / `use time::*` / `use regex::*` will not resolve.
+The `compiler` and root `coil` crates mirror the same feature names. With a feature disabled, the corresponding virtual module imports (e.g. `use crypto::{sha256};`, `use time::{timestamp};`, `use regex::{compile};`) will not resolve.
 
 ## Build the project
 

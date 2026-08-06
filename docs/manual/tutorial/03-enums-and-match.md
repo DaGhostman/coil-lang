@@ -109,13 +109,14 @@ fn unwrap(Option o) -> int {
 }
 ```
 
-Arm bodies may also be brace blocks when you need more than one expression
-(for example calling a method on `self` before yielding a value):
+Arm bodies may also be brace blocks. A brace body accepts statements such as
+`let`, `return`, `if`, and loops, followed by an optional bare expression whose
+value becomes the arm's value:
 
 ```coil
 Mode::Other(n) => {
-    self.get();
-    n
+    let adjusted = self.get() + n;
+    adjusted
 }
 ```
 

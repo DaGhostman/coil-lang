@@ -3,7 +3,16 @@
 // Expected output:
 //   board:3 done:1 | 1:write tests [Doing] | 2:ship demo [Todo] | 3:nap [Done] |
 
-use board::*;
+use board::{
+    Task,
+    add_task,
+    advance_task,
+    board_len,
+    count_done,
+    empty_board,
+    status_name,
+};
+
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};

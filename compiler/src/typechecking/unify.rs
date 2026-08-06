@@ -2,7 +2,9 @@
 
 use super::env::substitute_vars;
 use super::subst::{Subst, apply_ty, compose};
-use super::ty::{Ty, TyVarId, ftv_ty, option_inner, result_ok_err};
+use super::ty::{
+    Ty, TyVarId, ftv_ty, option_inner, peel_constructor_refinement, result_ok_err,
+};
 
 /// Failure modes for unification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,7 +337,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             unify_with(subst, c_owner, &sum)
         }
 
-        // Two constructors: same tag and unifiable owners.
+        // Two constructors: join at the owning enum. Same tag keeps the
+        // refinement path via owner unify; different tags (e.g. `Rank::Mid`
+        // vs `Rank::Low`) still unify so generics / arrays / assignment see
+        // one enum type rather than incompatible `::vN` refinements.
         (
             Ty::Constructor {
                 owner: o1,
@@ -348,20 +353,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                 arity: a2,
             },
         ) => {
-            if t1 != t2 || a1 != a2 {
-                return Err(UnifyError::Mismatch {
-                    left: Ty::Constructor {
-                        owner: o1.clone(),
-                        tag: t1,
-                        arity: a1,
-                    },
-                    right: Ty::Constructor {
-                        owner: o2.clone(),
-                        tag: t2,
-                        arity: a2,
-                    },
-                });
-            }
+            let _ = (t1, a1, t2, a2);
             unify_with(subst, o1.as_ref(), o2.as_ref())
         }
 
@@ -540,6 +532,9 @@ fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Sub
 
 /// Bind `var` to `ty` after the occurs check.
 fn bind_var(subst: &Subst, var: TyVarId, ty: Ty) -> Result<Subst, UnifyError> {
+    // Do not pin a polymorphic param to a single variant tag — otherwise
+    // `min(Rank::Mid, Rank::Low)` binds `T` to `::v1` and rejects `::v0`.
+    let ty = peel_constructor_refinement(ty);
     if ftv_ty(&ty).contains(&var) {
         return Err(UnifyError::Occurs { var, ty });
     }
@@ -1042,6 +1037,36 @@ mod tests {
             unify(&c_bad, &s).unwrap_err(),
             UnifyError::Mismatch { .. }
         ));
+    }
+
+    #[test]
+    fn unify_constructors_different_tags_join_at_owner() {
+        let s = sum(
+            "Rank",
+            vec![
+                ("Low", EnumVariantPayloadTy::Unit),
+                ("Mid", EnumVariantPayloadTy::Unit),
+                ("High", EnumVariantPayloadTy::Unit),
+            ],
+        );
+        let mid = ctor(s.clone(), 1, 0);
+        let low = ctor(s.clone(), 0, 0);
+        assert!(unify(&mid, &low).is_ok());
+    }
+
+    #[test]
+    fn bind_var_peels_constructor_refinement() {
+        let s = sum(
+            "Rank",
+            vec![
+                ("Low", EnumVariantPayloadTy::Unit),
+                ("Mid", EnumVariantPayloadTy::Unit),
+            ],
+        );
+        let mid = ctor(s.clone(), 1, 0);
+        let subst = unify(&v(0), &mid).unwrap();
+        let bound = apply_ty_prune(&subst, &v(0));
+        assert_eq!(bound, Ty::Con("Rank".into()));
     }
 
     #[test]

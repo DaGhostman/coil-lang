@@ -64,6 +64,7 @@ impl Checker {
             spread_expanded_bases: std::collections::HashSet::new(),
             overload_sets: std::collections::HashMap::new(),
             selected_overloads_by_span: std::collections::HashMap::new(),
+            overload_decl_by_span: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -341,18 +342,9 @@ impl Checker {
 
     /// Apply a `use` against virtual modules. Returns `true` when handled
     /// (caller should not treat it as a disk-module function import).
+    ///
+    /// Wildcard `use …::*` is rejected in `infer` (`E0124`) before this runs.
     pub fn apply_virtual_use(&mut self, path: &[String], name: &str, alias: Option<&str>) -> bool {
-        if name == "*" {
-            let Some(exports) = self.virtual_modules.resolve_glob(path) else {
-                return false;
-            };
-            let exports: Vec<_> = exports.to_vec();
-            for export in exports {
-                let local = export.short_name().to_string();
-                self.bind_virtual_export(local, export);
-            }
-            return true;
-        }
         let Some(export) = self.virtual_modules.resolve_item(path, name) else {
             return false;
         };
@@ -573,7 +565,7 @@ impl Checker {
         self.enum_arities.insert(name, arities);
     }
 
-    /// Scheme for a virtual `io` host native (inserted on `use io::*`).
+    /// Scheme for a virtual `io` host native (inserted on `use io::{…}`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
         #[cfg(feature = "tls")]
         use crate::typechecking::ty::record;
@@ -687,7 +679,7 @@ impl Checker {
         }
     }
 
-    /// Scheme for a virtual `thread` host native (inserted on `use thread::*`).
+    /// Scheme for a virtual `thread` host native (inserted on `use thread::{…}`).
     pub fn thread_fn_scheme(&mut self, kind: ThreadBuiltin) -> Scheme {
         use crate::typechecking::ty::{
             mutex_ty, receiver_ty, rwlock_ty, sender_ty, thread_ty, tuple,
@@ -816,7 +808,7 @@ impl Checker {
         }
     }
 
-    /// Scheme for a virtual `gc` host native (inserted on `use gc::*`).
+    /// Scheme for a virtual `gc` host native (inserted on `use gc::{…}`).
     pub fn gc_fn_scheme(&mut self, kind: GcBuiltin) -> Scheme {
         use crate::typechecking::ty::{root_app_ty, weak_app_ty};
         let fun = |params: &[Ty], ret: Ty| {
@@ -1269,8 +1261,14 @@ impl Checker {
         self.current_tuple_pack = None;
         self.spread_call_arity.clear();
         self.spread_expanded_bases.clear();
-        self.overload_sets.clear();
+        // Keep module-qualified overload families across multi-file
+        // `check_program` calls so importers can type-dispatch after deps
+        // were checked. Drop bare keys (entry registrations + prior `use`
+        // aliases) so they do not leak into the next module.
+        self.overload_sets.retain(|k, _| k.contains("::"));
+        // Declaration/call span tables are per-module.
         self.selected_overloads_by_span.clear();
+        self.overload_decl_by_span.clear();
         self.partial_fills_by_span.clear();
         self.partial_filled_tys_by_span.clear();
         self.lambda_uncaptured_outer = None;
@@ -1327,7 +1325,10 @@ impl Checker {
         self.main_decl_span = None;
         self.generics.generic_type_ctors.clear();
         self.generics.register_builtin_type_ctors();
-        self.generics.generic_fns.clear();
+        // Keep module-qualified generic names so importers still see
+        // `num::min` as generic after `num` was checked (dict-passing ABI).
+        self.generics.generic_fns.retain(|k| k.contains("::"));
+        self.fn_dict_arity.retain(|k, _| k.contains("::"));
         self.var_kinds.clear();
         self.current_typeclass = None;
         self.current_assoc_projections = None;
@@ -2030,7 +2031,22 @@ impl Checker {
                 int()
             }
             Expression::Float(_) => float(),
-            Expression::String(_) => string(),
+            Expression::String(s) => {
+                // Under an expected `byte`, a string literal whose UTF-8
+                // encoding is exactly one byte types as `byte`. Under an
+                // expected `[byte]` / `[byte; N]`, the whole literal becomes
+                // that byte array (length must match for fixed `N`).
+                if let Some(exp) = self.current_expected.clone() {
+                    let exp = apply_ty_prune(&self.subst, &exp);
+                    if Self::is_byte_ty(&exp) {
+                        return self.coerce_string_literal_to_byte(s, &range);
+                    }
+                    if Self::is_byte_array_ty(&exp).is_some() {
+                        return self.coerce_string_literal_to_bytes(s, &exp, &range);
+                    }
+                }
+                string()
+            }
             Expression::Bool(_) => boolean(),
 
             // ---- Names ----
@@ -2038,8 +2054,10 @@ impl Checker {
                 // When `name` has multiple overload candidates and appears in
                 // value position, try to narrow using `current_expected`.
                 if self.is_overloaded(name) {
-                    let candidates: Vec<OverloadCandidate> =
-                        self.overload_sets.get(*name).cloned().unwrap_or_default();
+                    let candidates: Vec<OverloadCandidate> = self
+                        .overload_candidates(name)
+                        .map(|c| c.to_vec())
+                        .unwrap_or_default();
                     // If exactly one candidate matches current_expected, pick it.
                     let expected = self.current_expected.clone();
                     let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
@@ -2064,7 +2082,7 @@ impl Checker {
                         let candidate = matching[0].clone();
                         self.selected_overloads_by_span.insert(
                             (range.start, range.end),
-                            (candidate.fixed_arity, candidate.is_rest),
+                            (candidate.fixed_arity, candidate.is_rest, candidate.id),
                         );
                         return self.instantiate_ty(&candidate.scheme);
                     } else if matching.len() > 1 || expected.is_none() {
@@ -2074,13 +2092,7 @@ impl Checker {
                         // (len > 1), so ambiguous.
                         let arities: Vec<String> = candidates
                             .iter()
-                            .map(|c| {
-                                if c.is_rest {
-                                    format!("{}+ args (rest)", c.fixed_arity)
-                                } else {
-                                    format!("{} args", c.fixed_arity)
-                                }
-                            })
+                            .map(|c| Self::overload_sig_label(c))
                             .collect();
                         return self.error_with_help(
                             ErrorCode::AmbiguousOverload,
@@ -2101,13 +2113,7 @@ impl Checker {
                     // confusing TypeMismatch downstream).
                     let arities: Vec<String> = candidates
                         .iter()
-                        .map(|c| {
-                            if c.is_rest {
-                                format!("{}+ args (rest)", c.fixed_arity)
-                            } else {
-                                format!("{} args", c.fixed_arity)
-                            }
-                        })
+                        .map(|c| Self::overload_sig_label(c))
                         .collect();
                     let expected_pretty = expected
                         .as_ref()
@@ -2170,6 +2176,25 @@ impl Checker {
             Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
             Expression::Use { path, name, alias } => {
+                let module_ns = path.join("::");
+                if name == "*" {
+                    // Prelude is injected automatically; every other module —
+                    // virtual or userland — requires explicit imports.
+                    let mod_label = if module_ns.is_empty() {
+                        "<entry>".to_string()
+                    } else {
+                        module_ns.clone()
+                    };
+                    return self.error_with_help(
+                        ErrorCode::WildcardImport,
+                        format!("wildcard import `use {}::*` is not allowed", mod_label),
+                        range,
+                        Some(format!(
+                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
+                            mod_label
+                        )),
+                    );
+                }
                 if self.apply_virtual_use(path, name, alias.as_deref()) {
                     // Bind FFI callables into the value env so Call sites
                     // resolve; enums/traits/tags are scope-only.
@@ -2200,11 +2225,21 @@ impl Checker {
                     return unit_ty();
                 }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
-                // Disk module: insert a polymorphic type variable so
-                // calls to the local name pass type-checking. Codegen
-                // resolves the FQN via `self.aliases`.
-                self.env
-                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                let fqn = if module_ns.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{module_ns}::{name}")
+                };
+                // Prefer the defining module's real scheme (incl. generics with
+                // bounds) over a dummy Var so call sites get dict-passing ABI.
+                self.reexport_module_item(&fqn, &local);
+                // Re-export overload families under the local alias so
+                // `use num::{abs}` can still type-dispatch.
+                if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
+                    if cands.len() > 1 {
+                        self.overload_sets.insert(local, cands);
+                    }
+                }
                 unit_ty()
             }
             Expression::Module(_, _) => unit_ty(),
@@ -2271,6 +2306,7 @@ impl Checker {
                         self.register_overload_candidate(
                             decl.name,
                             OverloadCandidate {
+                    id: 0,
                                 fixed_arity: nfixed,
                                 is_rest: false,
                                 scheme: Scheme::mono(fn_ty),
@@ -2284,7 +2320,11 @@ impl Checker {
             }
 
             Expression::Expr(e) | Expression::Group(e) | Expression::Statement(e) => self.infer(e),
-            Expression::ExprStatement(e) => self.infer(e),
+            // Semicolon form discards the value (same as a Rust statement).
+            Expression::ExprStatement(e) => {
+                let _ = self.infer(e);
+                unit_ty()
+            }
 
             // ---- Blocks ----
             // Program runs in the current frame (the global frame from
@@ -2562,15 +2602,38 @@ impl Checker {
                             let fqn = format!("{}::{}", owner, method);
                             let user_argc = method_args.len();
                             let scheme = if self.is_overloaded(&fqn) {
-                                match self.select_overload(&fqn, user_argc).cloned() {
-                                    Some(c) => {
+                                let prelim_tys: Vec<Ty> = method_args
+                                    .iter()
+                                    .map(|a| {
+                                        let value = match a.1.as_ref() {
+                                            Expression::NamedArg(_, v) => v,
+                                            _ => a,
+                                        };
+                                        let ty = self.infer(value);
+                                        apply_ty_prune(&self.subst, &ty)
+                                    })
+                                    .collect();
+                                match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                                    OverloadSelect::Selected(c) => {
+                                        let c = c.clone();
                                         self.selected_overloads_by_span.insert(
                                             (range.start, range.end),
-                                            (c.fixed_arity, c.is_rest),
+                                            (c.fixed_arity, c.is_rest, c.id),
                                         );
                                         c.scheme
                                     }
-                                    None => {
+                                    OverloadSelect::Ambiguous => {
+                                        return self.error_with_help(
+                                            ErrorCode::AmbiguousOverload,
+                                            format!(
+                                                "Ambiguous overload: call to `{}` matches multiple candidates",
+                                                fqn
+                                            ),
+                                            range,
+                                            Some(self.ambiguous_overload_help(&fqn)),
+                                        );
+                                    }
+                                    OverloadSelect::NoMatch => {
                                         return self.error(
                                             ErrorCode::WrongArity,
                                             format!(
@@ -2733,15 +2796,38 @@ impl Checker {
                         let fqn = format!("{}::{}", owner, method);
                         let user_argc = method_args.len();
                         let (scheme, selected) = if self.is_overloaded(&fqn) {
-                            match self.select_overload(&fqn, user_argc).cloned() {
-                                Some(c) => {
+                            let prelim_tys: Vec<Ty> = method_args
+                                .iter()
+                                .map(|a| {
+                                    let value = match a.1.as_ref() {
+                                        Expression::NamedArg(_, v) => v,
+                                        _ => a,
+                                    };
+                                    let ty = self.infer(value);
+                                    apply_ty_prune(&self.subst, &ty)
+                                })
+                                .collect();
+                            match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                                OverloadSelect::Selected(c) => {
+                                    let c = c.clone();
                                     self.selected_overloads_by_span.insert(
                                         (range.start, range.end),
-                                        (c.fixed_arity, c.is_rest),
+                                        (c.fixed_arity, c.is_rest, c.id),
                                     );
                                     (c.scheme, true)
                                 }
-                                None => {
+                                OverloadSelect::Ambiguous => {
+                                    return self.error_with_help(
+                                        ErrorCode::AmbiguousOverload,
+                                        format!(
+                                            "Ambiguous overload: call to `{}` matches multiple candidates",
+                                            fqn
+                                        ),
+                                        range,
+                                        Some(self.ambiguous_overload_help(&fqn)),
+                                    );
+                                }
+                                OverloadSelect::NoMatch => {
                                     let available: Vec<String> = self
                                         .overload_sets
                                         .get(&fqn)
@@ -3003,9 +3089,18 @@ impl Checker {
                         PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
                         PreludeFn::Ord => self.infer_ord(arg_slice, range),
                         PreludeFn::Char => self.infer_char(arg_slice, range),
+                        PreludeFn::Sin
+                        | PreludeFn::Cos
+                        | PreludeFn::Tan
+                        | PreludeFn::Sqrt
+                        | PreludeFn::Floor
+                        | PreludeFn::Ceil
+                        | PreludeFn::Exp
+                        | PreludeFn::Ln
+                        | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
                     };
                 }
-                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
                     if has_named {
                         return self.error_with_help(
@@ -3027,37 +3122,41 @@ impl Checker {
                         ErrorCode::UnknownValue,
                         format!("Cannot find value `{}` in this scope", ident),
                         range,
-                        Some(format!(
-                            "import it with `use ffi::{};` or `use ffi::*;`",
-                            ident
-                        )),
+                        Some(
+                            "import it with `use ffi::{dload, declare, invoke}`".to_string(),
+                        ),
                     );
                 }
 
-                // ── Overload-dispatch: select candidate by argc ───────────────
+                // ── Overload-dispatch: select by argc + argument types ─────
                 // Must happen before `has_named` and `fn_has_rest` branches so
                 // the correct candidate's param_names / is_rest are used.
                 if self.is_overloaded(&ident) {
                     let argc = raw_args.len();
-                    // Clone candidate to avoid borrow conflict with `self`.
-                    let candidate_opt = self.select_overload(&ident, argc).cloned();
+                    // Preliminary arg types for same-arity disambiguation.
+                    // Named args contribute their value type in source order;
+                    // reordering happens after the candidate is chosen.
+                    let prelim_tys: Vec<Ty> = raw_args
+                        .iter()
+                        .map(|a| {
+                            let value = match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v,
+                                _ => a,
+                            };
+                            let ty = self.infer(value);
+                            apply_ty_prune(&self.subst, &ty)
+                        })
+                        .collect();
+                    let candidate_opt = self
+                        .select_overload_for_args(&ident, argc, &prelim_tys);
                     match candidate_opt {
-                        None => {
-                            // No candidate accepts this arity — emit a
+                        OverloadSelect::NoMatch => {
+                            // No candidate accepts this arity/types — emit a
                             // "no overload" error listing the available arities.
                             let available: Vec<String> = self
-                                .overload_sets
-                                .get(&ident)
+                                .overload_candidates(&ident)
                                 .map(|cs| {
-                                    cs.iter()
-                                        .map(|c| {
-                                            if c.is_rest {
-                                                format!("{}+ args (rest)", c.fixed_arity)
-                                            } else {
-                                                format!("{} args", c.fixed_arity)
-                                            }
-                                        })
-                                        .collect()
+                                    cs.iter().map(|c| Self::overload_sig_label(c)).collect()
                                 })
                                 .unwrap_or_default();
                             return self.error_with_help(
@@ -3069,14 +3168,26 @@ impl Checker {
                                     if argc == 1 { "" } else { "s" }
                                 ),
                                 range,
-                                Some(format!("available arities: {}", available.join(", "))),
+                                Some(format!("available overloads: {}", available.join(", "))),
                             );
                         }
-                        Some(candidate) => {
+                        OverloadSelect::Ambiguous => {
+                            return self.error_with_help(
+                                ErrorCode::AmbiguousOverload,
+                                format!(
+                                    "Ambiguous overload: call to `{}` matches multiple candidates",
+                                    ident
+                                ),
+                                range,
+                                Some(self.ambiguous_overload_help(&ident)),
+                            );
+                        }
+                        OverloadSelect::Selected(candidate) => {
+                            let candidate = candidate.clone();
                             // Record the selection for codegen.
                             self.selected_overloads_by_span.insert(
                                 (range.start, range.end),
-                                (candidate.fixed_arity, candidate.is_rest),
+                                (candidate.fixed_arity, candidate.is_rest, candidate.id),
                             );
                             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
                                 let (fun_ty, constraints, mapping) =
@@ -3521,11 +3632,43 @@ impl Checker {
             }
 
             Expression::Cast(expr, ty_ann) => {
-                let src_ty = self.infer(expr);
                 let dst_ty = self.parse_type_name(ty_ann);
-                let src_ty = apply_ty_prune(&self.subst, &src_ty);
                 let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
+                // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
+                // in-range `65 as byte` type the operand as the target when it
+                // is a coercible literal.
+                let prev_expected = self.current_expected.take();
+                if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
+                    self.current_expected = Some(dst_ty.clone());
+                }
+                let src_ty = self.infer(expr);
+                self.current_expected = prev_expected;
+                let src_ty = apply_ty_prune(&self.subst, &src_ty);
                 let range = expr.0.into_range();
+                if Self::is_byte_array_ty(&dst_ty).is_some() {
+                    if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
+                        return dst_ty;
+                    }
+                    if Self::is_string_ty(&src_ty) {
+                        // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
+                        // `[byte; N]` still requires a literal (length known).
+                        if matches!(
+                            Self::is_byte_array_ty(&dst_ty),
+                            Some(crate::typechecking::ty::ArrayLength::Dynamic)
+                        ) {
+                            return dst_ty;
+                        }
+                        return self.error_with_help(
+                            ErrorCode::TypeMismatch,
+                            "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
+                            range,
+                            Some(
+                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]`"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
                 match (
                     Self::primitive_cast_name(&src_ty),
                     Self::primitive_cast_name(&dst_ty),
@@ -3551,11 +3694,20 @@ impl Checker {
                         ErrorCode::TypeMismatch,
                         format!("cannot cast `{from}` to `{to}`"),
                         range,
-                        Some("allowed casts: int↔float, int↔byte, int↔bool".to_string()),
+                        Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
+                    ),
+                    (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        "cannot cast `string` to `byte`".to_string(),
+                        range,
+                        Some(
+                            "only a string literal whose UTF-8 encoding is exactly one byte coerces to `byte` (e.g. `\"/\"`, `\"\\n\"`)"
+                                .to_string(),
+                        ),
                     ),
                     _ => self.error_with_help(
                         ErrorCode::TypeMismatch,
-                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
                             .to_string(),
                         ty_ann.0.into_range(),
                         None,
@@ -3652,7 +3804,7 @@ impl Checker {
 
             // ---- Userland FFI builtins ----
             //
-            // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::*`.
+            // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::{…}`.
             Expression::Dload(path) => self.infer_ffi_dload(std::slice::from_ref(path), range),
             // `done(h)` — true when coroutine handle `h` is Done.
             Expression::Done(handle) => {
@@ -3674,24 +3826,55 @@ impl Checker {
             }
             // Array literal (static length from item count)
             Expression::Array(items) => {
+                let expected_elem = self.current_expected.clone().and_then(|exp| {
+                    let exp = apply_ty_prune(&self.subst, &exp);
+                    match exp {
+                        Ty::Array { element, .. } => Some(*element),
+                        _ => None,
+                    }
+                });
                 let mut elem_ty: Option<Ty> = None;
                 for item in items {
+                    let prev_expected = self.current_expected.take();
+                    if let Some(ref e) = expected_elem {
+                        self.current_expected = Some(e.clone());
+                    }
                     let t = self.infer(item);
-                    let t_pruned = apply_ty_prune(&self.subst, &t);
+                    self.current_expected = prev_expected;
+                    // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
+                    // `[Rank; 2]`, not a stuck `::v0` element type.
+                    let t_pruned =
+                        crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
+                            &self.subst, &t,
+                        ));
                     match &elem_ty {
                         None => elem_ty = Some(t_pruned),
                         Some(prev) => {
                             let prev_pruned = apply_ty_prune(&self.subst, prev);
-                            if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
-                                let _ = self.error_with_help(
-                                    ErrorCode::TypeMismatch, format!(
-                                        "array element type mismatch: expected `{}`, found `{}`",
-                                        prev_pruned,
-                                        t_pruned
-                                    ),
-                                    range.clone(),
-                                    Some("an array literal requires every element to have the same type".to_string()),
-                                );
+                            match unify_with(&self.subst, &prev_pruned, &t_pruned) {
+                                Ok(s) => {
+                                    self.subst = compose(&s, &self.subst);
+                                    elem_ty = Some(apply_ty_prune(
+                                        &self.subst,
+                                        &crate::typechecking::ty::peel_constructor_refinement(
+                                            prev_pruned,
+                                        ),
+                                    ));
+                                }
+                                Err(_) => {
+                                    let _ = self.error_with_help(
+                                        ErrorCode::TypeMismatch,
+                                        format!(
+                                            "array element type mismatch: expected `{}`, found `{}`",
+                                            prev_pruned, t_pruned
+                                        ),
+                                        range.clone(),
+                                        Some(
+                                            "an array literal requires every element to have the same type"
+                                                .to_string(),
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -5514,6 +5697,18 @@ impl Checker {
     ) -> Ty {
         let lt = Self::peel_comparison_ty(&self.infer(lhs));
         let rt = Self::peel_comparison_ty(&self.infer(rhs));
+        let lt = apply_ty_prune(&self.subst, &lt);
+        let rt = apply_ty_prune(&self.subst, &rt);
+        // `b == "/"` — single-byte string literal compares as `byte`.
+        if Self::is_byte_ty(&lt) && Self::is_string_ty(&rt) {
+            if self.try_mark_string_literal_as_byte(rhs) {
+                return boolean();
+            }
+        } else if Self::is_byte_ty(&rt) && Self::is_string_ty(&lt) {
+            if self.try_mark_string_literal_as_byte(lhs) {
+                return boolean();
+            }
+        }
         let unified = self.unify(&lt, &rt, &range, "comparison operands");
         if let Ty::Var(var) = apply_ty_prune(&self.subst, &unified) {
             if self.user_dict_index(var, class).is_none() {
@@ -6681,6 +6876,43 @@ impl Checker {
         result_app_ty(string(), string())
     }
 
+    /// Scalar `prelude::math` natives: unary `float -> float`, or `pow(float, float) -> float`.
+    fn infer_math(&mut self, kind: PreludeFn, args: &[Output], range: Range<usize>) -> Ty {
+        let expected_arity = if kind == PreludeFn::Pow { 2 } else { 1 };
+        if args.len() != expected_arity {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!(
+                    "{} expects {} argument{}, got {}",
+                    kind.as_str(),
+                    expected_arity,
+                    if expected_arity == 1 { "" } else { "s" },
+                    args.len()
+                ),
+                range,
+                Some(format!(
+                    "use `{}({})` with float arguments",
+                    kind.as_str(),
+                    if expected_arity == 1 { "x" } else { "base, exponent" }
+                )),
+            );
+        }
+
+        for arg in args {
+            let arg_ty = self.infer(arg);
+            self.unify(
+                &arg_ty,
+                &float(),
+                &arg.0.into_range(),
+                &format!("{} argument", kind.as_str()),
+            );
+        }
+        float()
+    }
+
     /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
     fn infer_dot(&mut self, args: &[Output], id: Option<NodeId>, range: Range<usize>) -> Ty {
         use crate::typechecking::aggregate_arith::{
@@ -7611,7 +7843,31 @@ impl Checker {
                 Err(None) => {}
             }
         }
-        // Array literals of in-range integer literals coerce to `[byte]` / `[byte; N]`.
+        // Single UTF-8-byte string literals coerce to `byte`.
+        if Self::is_byte_ty(&expected)
+            && Self::is_string_ty(&actual)
+            && let Some(expr) = expr
+        {
+            if self.try_mark_string_literal_as_byte(expr) {
+                return expected;
+            }
+            if let Expression::String(s) = unwrap_expr_wrappers(expr).1.as_ref() {
+                return self.string_literal_byte_mismatch(s, range);
+            }
+        }
+        // String literals coerce to `[byte]` / `[byte; N]` (UTF-8 bytes).
+        if Self::is_byte_array_ty(&expected).is_some()
+            && Self::is_string_ty(&actual)
+            && let Some(expr) = expr
+        {
+            if self.try_mark_string_literal_as_bytes(expr, &expected) {
+                return expected.clone();
+            }
+            if let Expression::String(s) = unwrap_expr_wrappers(expr).1.as_ref() {
+                return self.coerce_string_literal_to_bytes(s, &expected, range);
+            }
+        }
+        // Array literals of in-range integer / single-byte string literals coerce to `[byte]`.
         if let (
             Ty::Array {
                 element: exp_elem,
@@ -7623,7 +7879,7 @@ impl Checker {
             },
         ) = (&expected, &actual)
             && Self::is_byte_ty(exp_elem)
-            && Self::is_int_ty(act_elem)
+            && (Self::is_int_ty(act_elem) || Self::is_string_ty(act_elem))
             && (exp_len == act_len
                 || matches!(exp_len, ArrayLength::Dynamic)
                 || matches!(act_len, ArrayLength::Dynamic))
@@ -7632,8 +7888,13 @@ impl Checker {
         {
             let mut ok = true;
             for item in items {
+                if Self::byte_literal_coercion(item).is_ok() {
+                    continue;
+                }
+                if self.try_mark_string_literal_as_byte(item) {
+                    continue;
+                }
                 match Self::byte_literal_coercion(item) {
-                    Ok(()) => {}
                     Err(Some(n)) => {
                         let _ = self.error_with_help(
                             ErrorCode::TypeMismatch,
@@ -7643,9 +7904,14 @@ impl Checker {
                         );
                         ok = false;
                     }
-                    Err(None) => {
-                        ok = false;
-                        break;
+                    _ => {
+                        if let Expression::String(s) = unwrap_expr_wrappers(item).1.as_ref() {
+                            let _ = self.string_literal_byte_mismatch(s, &item.0.into_range());
+                            ok = false;
+                        } else {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -7708,8 +7974,144 @@ impl Checker {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::BYTE)
     }
 
+    fn is_string_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::STRING)
+    }
+
     fn is_int_ty(ty: &Ty) -> bool {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::INT)
+    }
+
+    /// `[byte]` or `[byte; N]` — returns the length constraint when so.
+    fn is_byte_array_ty(ty: &Ty) -> Option<&ArrayLength> {
+        match ty {
+            Ty::Array { element, length } if Self::is_byte_ty(element) => Some(length),
+            _ => None,
+        }
+    }
+
+    fn byte_array_tys_compatible(src: &Ty, dst: &Ty) -> bool {
+        match (Self::is_byte_array_ty(src), Self::is_byte_array_ty(dst)) {
+            (Some(src_len), Some(dst_len)) => match (src_len, dst_len) {
+                (ArrayLength::Dynamic, _) | (_, ArrayLength::Dynamic) => true,
+                (ArrayLength::Static(a), ArrayLength::Static(b)) => a == b,
+            },
+            _ => false,
+        }
+    }
+
+    /// Type a string literal as `byte` when its UTF-8 encoding is one byte.
+    fn coerce_string_literal_to_byte(&mut self, raw: &str, range: &Range<usize>) -> Ty {
+        match crate::codegen::string_literal_as_single_byte(raw) {
+            Ok(_) => crate::typechecking::ty::byte(),
+            Err(err) => self.string_literal_byte_error(err, range),
+        }
+    }
+
+    /// Type a string literal as `[byte]` / `[byte; N]` from its UTF-8 bytes.
+    fn coerce_string_literal_to_bytes(
+        &mut self,
+        raw: &str,
+        expected: &Ty,
+        range: &Range<usize>,
+    ) -> Ty {
+        let bytes = crate::codegen::string_literal_as_bytes(raw);
+        let Some(length) = Self::is_byte_array_ty(expected) else {
+            return string();
+        };
+        match length {
+            ArrayLength::Static(n) if *n != bytes.len() => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "string literal has {} byte{}, but expected `[byte; {}]`",
+                    bytes.len(),
+                    if bytes.len() == 1 { "" } else { "s" },
+                    n
+                ),
+                range.clone(),
+                Some("fixed-length `[byte; N]` requires a string literal with exactly N UTF-8 bytes".to_string()),
+            ),
+            ArrayLength::Static(_) => expected.clone(),
+            ArrayLength::Dynamic => {
+                // Prefer a fixed length for the literal; assignment to `[byte]`
+                // accepts `[byte; N]` via array length flexibility.
+                crate::typechecking::ty::array_fixed(crate::typechecking::ty::byte(), bytes.len())
+            }
+        }
+    }
+
+    /// If `expr` is a single-byte string literal, retarget its codegen span to `byte`.
+    fn try_mark_string_literal_as_byte(&mut self, expr: &Output) -> bool {
+        let node = unwrap_expr_wrappers(expr);
+        let Expression::String(s) = node.1.as_ref() else {
+            return false;
+        };
+        if crate::codegen::string_literal_as_single_byte(s).is_err() {
+            return false;
+        }
+        self.codegen_types_by_span.insert(
+            (node.0.start, node.0.end),
+            crate::typechecking::ty::byte(),
+        );
+        true
+    }
+
+    /// If `expr` is a string literal compatible with `expected` byte-array type,
+    /// retarget its codegen span to that array type.
+    fn try_mark_string_literal_as_bytes(&mut self, expr: &Output, expected: &Ty) -> bool {
+        let node = unwrap_expr_wrappers(expr);
+        let Expression::String(s) = node.1.as_ref() else {
+            return false;
+        };
+        let Some(length) = Self::is_byte_array_ty(expected) else {
+            return false;
+        };
+        let bytes = crate::codegen::string_literal_as_bytes(s);
+        match length {
+            ArrayLength::Static(n) if *n != bytes.len() => return false,
+            _ => {}
+        }
+        let ty = match length {
+            ArrayLength::Static(_) => expected.clone(),
+            ArrayLength::Dynamic => {
+                crate::typechecking::ty::array_fixed(crate::typechecking::ty::byte(), bytes.len())
+            }
+        };
+        self.codegen_types_by_span
+            .insert((node.0.start, node.0.end), ty);
+        true
+    }
+
+    fn string_literal_byte_mismatch(&mut self, raw: &str, range: &Range<usize>) -> Ty {
+        match crate::codegen::string_literal_as_single_byte(raw) {
+            Ok(_) => crate::typechecking::ty::byte(),
+            Err(err) => self.string_literal_byte_error(err, range),
+        }
+    }
+
+    fn string_literal_byte_error(
+        &mut self,
+        err: crate::codegen::StringLiteralByteError,
+        range: &Range<usize>,
+    ) -> Ty {
+        use crate::codegen::StringLiteralByteError;
+        match err {
+            StringLiteralByteError::Empty => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "empty string literal cannot coerce to `byte`".to_string(),
+                range.clone(),
+                Some("use a single-byte literal such as `\"/\"` or `\"\\n\"`".to_string()),
+            ),
+            StringLiteralByteError::NotSingleByte => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "string literal must be exactly one UTF-8 byte to coerce to `byte`".to_string(),
+                range.clone(),
+                Some(
+                    "multi-byte characters (e.g. `\"é\"`) are not a single `byte`; compare bytes from `to_bytes` instead"
+                        .to_string(),
+                ),
+            ),
+        }
     }
 
     /// `Ok(())` if `expr` is an integer literal in `0..=255`.
@@ -9505,7 +9907,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `dload` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::dload;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{dload}`".to_string()),
             );
         }
         if let Some(path) = args.first() {
@@ -9528,7 +9930,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `declare` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::declare;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{declare}`".to_string()),
             );
         }
         if args.len() == 4 || args.len() == 5 {
@@ -9546,7 +9948,7 @@ impl Checker {
                         args[2].0.into_range(),
                     );
                     m.push(Label::new(
-                        "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                        "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::{Int, Float, …}`"
                             .to_string(),
                         args[2].0.into_range(),
                     ));
@@ -9589,7 +9991,7 @@ impl Checker {
                 ErrorCode::UnknownValue,
                 "Cannot find value `invoke` in this scope".to_string(),
                 range.clone(),
-                Some("import it with `use ffi::invoke;` or `use ffi::*;`".to_string()),
+                Some("import it with `use ffi::{invoke}`".to_string()),
             );
         }
         let mut ret_ty = int();
@@ -9693,7 +10095,7 @@ impl Checker {
                 if let Some(id) = self.c_struct_id(name) {
                     return Some((tag::STRUCT, id));
                 }
-                // In-scope `use ffi::types::*` tags (`Int`, `Ptr`, …).
+                // In-scope `use ffi::types::{…}` tags (`Int`, `Ptr`, …).
                 if self.ffi_tag_in_scope(name) {
                     return tag_from_variant_name(name).map(|t| (t, 0));
                 }
@@ -9739,7 +10141,7 @@ impl Checker {
             expr.0.into_range(),
         );
         m.push(Label::new(
-            "use `Int`/`Ptr` after `use ffi::types::*;`, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
+            "use `Int`/`Ptr` after `use ffi::types::{Int, Ptr, …}`, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
         ));
         self.messages.push(m);
@@ -10037,6 +10439,7 @@ impl Checker {
                     self.register_overload_candidate(
                         &fqn,
                         OverloadCandidate {
+                    id: 0,
                             fixed_arity,
                             is_rest: has_rest,
                             scheme: scheme.clone(),
@@ -10179,7 +10582,7 @@ impl Checker {
         self_ty: Option<&Ty>,
         is_coro: bool,
         // When set, this is an inherent `impl` method. Bare `name` must
-        // not shadow imports (`use thread::*;` → `send`); recursion uses
+        // not shadow imports (`use thread::{send}` → `send`); recursion uses
         // `self.name(...)` / `Owner::name(...)` instead.
         method_owner: Option<&str>,
         is_static_method: bool,
@@ -10304,7 +10707,7 @@ impl Checker {
 
         // Monomorphic recursion: bind a fresh α so the body can call this
         // function. Inherent methods bind `Owner::name` only — never the
-        // bare name — so `use thread::*;`/`send` is not shadowed by
+        // bare name — so `use thread::{send}` is not shadowed by
         // `impl Foo { fn send(...) { send(...) } }`.
         let alpha = self.counter.fresh();
 
@@ -10536,8 +10939,6 @@ impl Checker {
 
         // If generic, build a poly scheme and re-insert into env.
         if is_generic {
-            self.generic_fns.insert(name.to_string());
-            self.generics.generic_fns.insert(name.to_string());
             let mut bounds = param_vars;
             bounds.extend(fn_assoc_projections.iter().map(|p| p.var));
             let mut kinds = param_kinds;
@@ -10549,14 +10950,33 @@ impl Checker {
                 fn_assoc_projections,
                 fun_ty.clone(),
             );
-            self.env.insert_top(name.to_string(), scheme);
+            // Non-entry modules also register under `module::name` so later
+            // files can `use` the real poly scheme (not a dummy Var).
+            let fqn = if self.current_module.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{}", self.current_module, name)
+            };
+            self.generic_fns.insert(name.to_string());
+            self.generics.generic_fns.insert(name.to_string());
+            if fqn != name {
+                self.generic_fns.insert(fqn.clone());
+                self.generics.generic_fns.insert(fqn.clone());
+            }
+            self.env.insert_top(name.to_string(), scheme.clone());
+            if fqn != name {
+                self.env.insert_top(fqn.clone(), scheme);
+            }
 
             // Every constraint is a trailing dictionary argument. Builtin
             // classes use compiler-generated implementation thunks, while
             // user classes use source-declared methods; their calling ABI is
             // intentionally identical.
-            self.fn_dict_arity
-                .insert(name.to_string(), resolved_param_constraints.len());
+            let dict_n = resolved_param_constraints.len();
+            self.fn_dict_arity.insert(name.to_string(), dict_n);
+            if fqn != name {
+                self.fn_dict_arity.insert(fqn, dict_n);
+            }
         }
 
         // ── Overload-set registration ──────────────────────────────────────
@@ -10575,9 +10995,17 @@ impl Checker {
                 Some(s) => s.clone(),
                 None => Scheme::mono(fun_ty.clone()),
             };
+            // Non-entry modules register under `module::name` so same-arity
+            // helpers in `bytes` / `text` (e.g. `starts_with`) do not collide.
+            let overload_key = if self.current_module.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{}", self.current_module, name)
+            };
             self.register_overload_candidate(
-                name,
+                &overload_key,
                 OverloadCandidate {
+                    id: 0, // assigned in register_overload_candidate
                     fixed_arity: fixed_arity_for_overload,
                     is_rest: has_rest,
                     scheme: candidate_scheme,
@@ -10591,20 +11019,29 @@ impl Checker {
     }
 
     /// Insert `candidate` into `overload_sets[key]`, emitting
-    /// [`ErrorCode::DuplicateOverload`] on any arity-range overlap.
+    /// [`ErrorCode::DuplicateOverload`] on arity-range or parameter-type overlap.
+    ///
+    /// Same fixed arity is allowed when parameter types are distinct (e.g.
+    /// `sum(int)` vs `sum(float)`). Identical / unifiable parameter lists at
+    /// the same arity still conflict.
     pub(crate) fn register_overload_candidate(
         &mut self,
         key: &str,
-        new_candidate: OverloadCandidate,
+        mut new_candidate: OverloadCandidate,
         range: &Range<usize>,
     ) {
         let candidates = self.overload_sets.entry(key.to_string()).or_default();
+        new_candidate.id = candidates.len() as u32;
         let mut conflict = false;
         for existing in candidates.iter() {
             let overlap = if existing.is_rest && new_candidate.is_rest {
                 true
             } else if !existing.is_rest && !new_candidate.is_rest {
-                existing.fixed_arity == new_candidate.fixed_arity
+                if existing.fixed_arity != new_candidate.fixed_arity {
+                    false
+                } else {
+                    Self::schemes_params_overlap(&existing.scheme, &new_candidate.scheme)
+                }
             } else {
                 let (fixed_n, rest_k) = if existing.is_rest {
                     (new_candidate.fixed_arity, existing.fixed_arity)
@@ -10621,10 +11058,19 @@ impl Checker {
                         key
                     )
                 } else if !existing.is_rest && !new_candidate.is_rest {
-                    format!(
-                        "Duplicate function `{}` with arity {}",
-                        key, new_candidate.fixed_arity
-                    )
+                    if existing.fixed_arity == new_candidate.fixed_arity
+                        && Self::schemes_params_overlap(&existing.scheme, &new_candidate.scheme)
+                    {
+                        format!(
+                            "Duplicate function `{}` with arity {} and overlapping parameter types",
+                            key, new_candidate.fixed_arity
+                        )
+                    } else {
+                        format!(
+                            "Duplicate function `{}` with arity {}",
+                            key, new_candidate.fixed_arity
+                        )
+                    }
                 } else {
                     let (fixed_n, rest_k) = if existing.is_rest {
                         (new_candidate.fixed_arity, existing.fixed_arity)
@@ -10638,7 +11084,7 @@ impl Checker {
                 };
                 let mut err = Message::error(ErrorCode::DuplicateOverload, msg_text, range.clone());
                 err.with_help(
-                    "choose distinct arities, or make the fixed overload have fewer params than the rest's fixed prefix"
+                    "choose distinct arities or parameter types, or make the fixed overload have fewer params than the rest's fixed prefix"
                         .to_string(),
                 );
                 self.messages.push(err);
@@ -10646,7 +11092,54 @@ impl Checker {
             }
         }
         if !conflict {
+            self.overload_decl_by_span.insert(
+                (range.start, range.end),
+                (
+                    new_candidate.id,
+                    new_candidate.fixed_arity,
+                    new_candidate.is_rest,
+                ),
+            );
             candidates.push(new_candidate);
+        }
+    }
+
+    /// True when two function schemes have unifiable parameter lists (same shape).
+    fn schemes_params_overlap(a: &Scheme, b: &Scheme) -> bool {
+        let pa = Self::fun_param_tys(&a.ty);
+        let pb = Self::fun_param_tys(&b.ty);
+        if pa.len() != pb.len() {
+            return false;
+        }
+        let empty = crate::typechecking::subst::Subst::default();
+        pa.iter()
+            .zip(pb.iter())
+            .all(|(x, y)| crate::typechecking::unify::unify_with(&empty, x, y).is_ok())
+    }
+
+    /// Peel `a -> b -> … -> r` into parameter types (left-to-right).
+    fn fun_param_tys(ty: &Ty) -> Vec<Ty> {
+        let mut params = Vec::new();
+        let mut cur = ty;
+        while let Ty::Fun(arg, ret) = cur {
+            params.push((**arg).clone());
+            cur = ret;
+        }
+        params
+    }
+
+    /// Human-readable overload signature for diagnostics: `(int, int)` or `(int…)+ (rest)`.
+    fn overload_sig_label(c: &OverloadCandidate) -> String {
+        let params = Self::fun_param_tys(&c.scheme.ty);
+        let sig = params
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if c.is_rest {
+            format!("({})+ (rest)", sig)
+        } else {
+            format!("({})", sig)
         }
     }
 
@@ -10867,42 +11360,131 @@ impl Checker {
 
     /// All registered overload candidates for `fn_name`, if any.
     pub fn overload_candidates(&self, fn_name: &str) -> Option<&[OverloadCandidate]> {
-        self.overload_sets.get(fn_name).map(|v| v.as_slice())
+        self.overload_sets
+            .get(fn_name)
+            .or_else(|| {
+                if self.current_module.is_empty() {
+                    None
+                } else {
+                    self.overload_sets
+                        .get(&format!("{}::{}", self.current_module, fn_name))
+                }
+            })
+            .map(|v| v.as_slice())
     }
 
     /// True when `fn_name` has more than one overload candidate.
     pub fn is_overloaded(&self, fn_name: &str) -> bool {
-        self.overload_sets
-            .get(fn_name)
+        self.overload_candidates(fn_name)
             .map_or(false, |v| v.len() > 1)
     }
 
-    /// Select the best overload candidate for a call with `argc` arguments.
+    /// Select an overload by arity only (no argument types).
     ///
-    /// Resolution order:
-    /// 1. Fixed candidate whose `fixed_arity == argc`.
-    /// 2. Rest candidate whose `fixed_arity <= argc`.
-    /// 3. `None` — caller emits a missing-arity diagnostic.
+    /// Returns [`None`] on no match **or** ambiguity — callers that need to
+    /// distinguish those cases should use [`Self::select_overload_for_args`].
     pub fn select_overload(&self, fn_name: &str, argc: usize) -> Option<&OverloadCandidate> {
-        let candidates = self.overload_sets.get(fn_name)?;
-        // Prefer exact fixed match.
-        if let Some(c) = candidates
-            .iter()
-            .find(|c| !c.is_rest && c.fixed_arity == argc)
-        {
-            return Some(c);
+        match self.select_overload_for_args(fn_name, argc, &[]) {
+            OverloadSelect::Selected(c) => Some(c),
+            OverloadSelect::NoMatch | OverloadSelect::Ambiguous => None,
         }
-        // Fall back to rest candidate that can accept `argc`.
-        candidates
+    }
+
+    /// Like [`Self::select_overload`], but disambiguate same-arity candidates
+    /// with `arg_tys` (left-to-right parameter positions).
+    ///
+    /// Empty `arg_tys` only succeeds when a single candidate matches `argc`.
+    pub fn select_overload_for_args(
+        &self,
+        fn_name: &str,
+        argc: usize,
+        arg_tys: &[Ty],
+    ) -> OverloadSelect<'_> {
+        let Some(candidates) = self.overload_candidates(fn_name) else {
+            return OverloadSelect::NoMatch;
+        };
+        let arity_ok: Vec<&OverloadCandidate> = candidates
             .iter()
-            .find(|c| c.is_rest && c.fixed_arity <= argc)
+            .filter(|c| {
+                if c.is_rest {
+                    c.fixed_arity <= argc
+                } else {
+                    c.fixed_arity == argc
+                }
+            })
+            .collect();
+        if arity_ok.is_empty() {
+            return OverloadSelect::NoMatch;
+        }
+        let fixed: Vec<&OverloadCandidate> =
+            arity_ok.iter().copied().filter(|c| !c.is_rest).collect();
+        let pool: Vec<&OverloadCandidate> = if !fixed.is_empty() {
+            fixed
+        } else {
+            arity_ok
+        };
+        if pool.len() == 1 {
+            return OverloadSelect::Selected(pool[0]);
+        }
+        if arg_tys.is_empty() {
+            return OverloadSelect::Ambiguous;
+        }
+        let empty = crate::typechecking::subst::Subst::default();
+        let mut matches: Vec<&OverloadCandidate> = Vec::new();
+        for c in &pool {
+            let params = Self::fun_param_tys(&c.scheme.ty);
+            let n = params.len().min(arg_tys.len());
+            let ok = (0..n).all(|i| {
+                crate::typechecking::unify::unify_with(&empty, &params[i], &arg_tys[i]).is_ok()
+            });
+            if ok {
+                matches.push(*c);
+            }
+        }
+        match matches.len() {
+            0 => OverloadSelect::NoMatch,
+            1 => OverloadSelect::Selected(matches[0]),
+            _ => {
+                // Prefer a unique all-concrete candidate over generics.
+                let concrete: Vec<_> = matches
+                    .iter()
+                    .copied()
+                    .filter(|c| {
+                        Self::fun_param_tys(&c.scheme.ty)
+                            .iter()
+                            .all(|t| matches!(t, Ty::Con(_)))
+                    })
+                    .collect();
+                if concrete.len() == 1 {
+                    OverloadSelect::Selected(concrete[0])
+                } else {
+                    OverloadSelect::Ambiguous
+                }
+            }
+        }
+    }
+
+    fn ambiguous_overload_help(&self, fn_name: &str) -> String {
+        let available: Vec<String> = self
+            .overload_candidates(fn_name)
+            .map(|cs| cs.iter().map(|c| Self::overload_sig_label(c)).collect())
+            .unwrap_or_default();
+        format!(
+            "available overloads: {}; arguments do not uniquely select one",
+            available.join(", ")
+        )
     }
 
     /// The call-site selection result for the call spanning `(start, end)`.
     ///
-    /// Returns `(fixed_arity, is_rest)` of the chosen candidate.
-    pub fn selected_overload_at(&self, start: usize, end: usize) -> Option<(usize, bool)> {
+    /// Returns `(fixed_arity, is_rest, candidate_id)` of the chosen candidate.
+    pub fn selected_overload_at(&self, start: usize, end: usize) -> Option<(usize, bool, u32)> {
         self.selected_overloads_by_span.get(&(start, end)).copied()
+    }
+
+    /// Declaration-site overload identity for mangling the function table key.
+    pub fn overload_decl_at(&self, start: usize, end: usize) -> Option<(u32, usize, bool)> {
+        self.overload_decl_by_span.get(&(start, end)).copied()
     }
 
     /// Fill bitmask for a partial-application call site, if any.
@@ -11014,6 +11596,10 @@ impl Checker {
     }
 
     /// Infer a call argument, skipping ID consumption for spread-expanded indices.
+    ///
+    /// Clears `current_expected` so an outer context (e.g. `return` typed as
+    /// `[byte]`) does not coerce string/int literals inside the argument list
+    /// before parameter types are applied via `coerce_or_unify`.
     fn infer_call_arg(&mut self, arg: &Output) -> Ty {
         if let Expression::Index(target, Some(index_expr)) = arg.1.as_ref() {
             if self
@@ -11027,7 +11613,10 @@ impl Checker {
                 return ty;
             }
         }
-        self.infer(arg)
+        let prev_expected = self.current_expected.take();
+        let ty = self.infer(arg);
+        self.current_expected = prev_expected;
+        ty
     }
 
     /// Infer call arguments, reordering named args and packing rest.
@@ -12050,7 +12639,7 @@ impl Checker {
                     format!("Cannot find enum `{}` in this scope", enum_name),
                     range,
                     Some(
-                        "import tags with `use ffi::types::*;` (or write `ffi::types::Int`)"
+                        "import tags with `use ffi::types::{Int, Ptr, …}` (or write `ffi::types::Int`)"
                             .to_string(),
                     ),
                 );
@@ -14424,13 +15013,43 @@ impl Checker {
 
     /// Whether `name` is a generic function (has type params).
     pub fn is_generic_fn(&self, name: &str) -> bool {
+        // Exact keys only: defining modules register bare + FQN; importers get
+        // the local alias via [`Self::reexport_module_item`]. A `::{name}`
+        // suffix scan would mis-tag when another module exports the same local.
         self.generics.generic_fns.contains(name)
+    }
+
+    /// Bind `local` to the defining module's scheme for `fqn` when known;
+    /// otherwise insert a fresh monomorphic placeholder (historical disk-module
+    /// ABI). Marks generic aliases so codegen emits dictionaries.
+    fn reexport_module_item(&mut self, fqn: &str, local: &str) {
+        if let Some(scheme) = self.env.lookup(fqn).cloned() {
+            self.env.insert_top(local.to_string(), scheme);
+        } else if self.env.lookup(local).is_none() {
+            self.env
+                .insert_top(local.to_string(), Scheme::mono(Ty::Var(self.counter.fresh())));
+        }
+        // Only the exact defining FQN — never a `::{local}` suffix heuristic
+        // (another module's generic with the same short name would mis-tag).
+        if self.generics.generic_fns.contains(fqn) {
+            self.generics.generic_fns.insert(local.to_string());
+            self.generic_fns.insert(local.to_string());
+            if let Some(arity) = self.fn_dict_arity.get(fqn).copied() {
+                self.fn_dict_arity.insert(local.to_string(), arity);
+            }
+        } else {
+            self.generics.generic_fns.remove(local);
+            self.generic_fns.remove(local);
+            self.fn_dict_arity.remove(local);
+        }
     }
 
     /// Number of *user-defined* trait dict slots expected by a generic
     /// function.  Returns 0 for non-generic functions or functions whose
     /// constraints are all built-in classes (Num / Ord / Eq / Show).
     pub fn dict_arity_for(&self, fn_name: &str) -> usize {
+        // Exact key only (see [`Self::is_generic_fn`]); re-export copies arity
+        // under the local alias when the defining FQN is generic.
         self.fn_dict_arity.get(fn_name).copied().unwrap_or(0)
     }
 

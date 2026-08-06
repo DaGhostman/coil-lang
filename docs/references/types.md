@@ -17,7 +17,13 @@ coil uses **Hindley–Milner (Algorithm W)** type inference with optional annota
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
-Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`). `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
+Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`).
+
+**Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\""`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce to `byte`.
+
+**String literals** also coerce to `[byte]` / `[byte; N]` (UTF-8 bytes) under an expected byte-array type, via `"…" as [byte]`, and as `[byte]` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal strings may use `s as [byte]` (lowers to `to_bytes`); fixed `[byte; N]` still needs a literal.
+
+`byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
 Strings support `+` / `+=` with other strings. `string::format(...)` returns `string` and validates literal format specifiers (`%i` accepts `byte`).
 
@@ -114,7 +120,11 @@ Constructors in expressions and patterns use qualified form: `Option::Some(42)` 
 
 ### Constructor types (`Ty::Constructor`)
 
-Applying a variant yields a constructor type carrying tag and arity, unified against the parent sum (or applied `Ty::App` for polymorphic enums).
+Applying a variant yields a constructor type carrying tag and arity. Unification
+joins constructors with their parent sum (or applied `Ty::App` for polymorphic
+enums). Distinct tags of the same enum also join at the owner, and binding a
+type variable peels the refinement — so `min(Rank::Mid, Rank::Low)` and
+`[Rank::Low, Rank::Mid]` type-check as the parent enum without annotations.
 
 ---
 
@@ -356,7 +366,7 @@ Unification is structural (Robinson) with an occurs check.
 | `Ty::Array` | `Ty::Array` | Unify elements; lengths compatible if either is `Dynamic` or both `Static` with same N |
 | `Ty::Record` | `Ty::Record` | Same fields (sorted by name); unify each field type |
 | `Ty::Sum` | `Ty::Sum` | Same enum name; same variant names, shapes, arities; unify payload types |
-| `Ty::Constructor` | `Ty::Sum` / other constructor | Tag, arity, owner must match |
+| `Ty::Constructor` | `Ty::Sum` / other constructor | Owner must unify; distinct tags of the same enum join at the parent (refinements peel when binding a `Ty::Var`) |
 | `Ty::Var` | anything | Bind variable (if occurs check passes) |
 | Otherwise | | `Type mismatch` error |
 

@@ -1,4 +1,4 @@
-//! Host-backed PCRE2 regex (`use regex::*`).
+//! Host-backed PCRE2 regex (`use regex::{compile, …}`).
 //!
 //! See [`REGEX_WIRING`] for pipeline `HostInvoke` registry names and arities.
 

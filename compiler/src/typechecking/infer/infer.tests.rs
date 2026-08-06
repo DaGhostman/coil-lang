@@ -377,7 +377,7 @@
     #[test]
     fn write_all_with_string_bytes_ok() {
         assert_ok(
-            r#"use io::{stdout, write_all}; use string::to_bytes; write_all(stdout(), to_bytes("hello"));"#,
+            r#"use io::{stdout, write}; use string::to_bytes; write(stdout(), to_bytes("hello"));"#,
             result_app_ty(unit_ty(), Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into())),
         );
     }
@@ -535,11 +535,11 @@ fn main() {
     #[test]
     fn rank_n_param_accepts_polymorphic_id() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
             fn id<T>(T x) -> T { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { write_all(stdout(), to_bytes(format("%i", app(id, 1)))); }
+            fn main() { write(stdout(), to_bytes(format("%i", app(id, 1)))); }
         "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
@@ -549,11 +549,11 @@ use string::{format, to_bytes};
     #[test]
     fn rank_n_rejects_escaping_skolem() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
             fn inc(int x) -> int { return x; }
             fn app(forall T. T -> T f, int x) -> int { return f(x); }
-            fn main() { write_all(stdout(), to_bytes(format("%i", app(inc, 1)))); }
+            fn main() { write(stdout(), to_bytes(format("%i", app(inc, 1)))); }
         "#;
         let msgs = assert_messages(src);
         assert!(
@@ -1775,9 +1775,9 @@ use string::{format, to_bytes};
     #[test]
     fn format_string_percent_i_requires_int() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%i", "hello")));"#,
+write(stdout(), to_bytes(format("%i", "hello")));"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("requires int")),
@@ -1852,9 +1852,9 @@ write_all(stdout(), to_bytes(format("%i", "hello")));"#,
     #[test]
     fn format_percent_v_accepts_int() {
         let (mut c, _) = check(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%v", 42)));"#,
+write(stdout(), to_bytes(format("%v", 42)));"#,
         );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -1863,9 +1863,9 @@ write_all(stdout(), to_bytes(format("%v", 42)));"#,
     #[test]
     fn format_percent_v_accepts_structural_tuple_and_record() {
         let (mut c, _) = check(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-write_all(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
+write(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
         );
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -1874,9 +1874,9 @@ write_all(stdout(), to_bytes(format("%v%v", (1, true), { a: 3, b: "x" })));"#,
     #[test]
     fn format_percent_i_on_open_type_errors() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%i", x))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%i", x))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| {
@@ -1891,9 +1891,9 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%i", x))); } fn main() { b
     #[test]
     fn format_percent_v_without_show_errors() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", x))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%v", x))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
@@ -1905,9 +1905,9 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", x))); } fn main() { b
     #[test]
     fn format_percent_v_rejects_structural_tuple_with_open_type() {
         let msgs = assert_messages(
-            r#"use io::{stdout, write_all};
+            r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", (x, 1)))); } fn main() { bad(1); }"#,
+fn bad<T>(T x) { write(stdout(), to_bytes(format("%v", (x, 1)))); } fn main() { bad(1); }"#,
         );
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
@@ -1922,7 +1922,7 @@ fn bad<T>(T x) { write_all(stdout(), to_bytes(format("%v", (x, 1)))); } fn main(
     fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
         // Two Result::Ok arms with different inner patterns are both reachable.
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
         fn unwrap(Result r) -> int {
             return match r {
@@ -1932,7 +1932,7 @@ use string::{format, to_bytes};
             };
         }
         fn main() {
-            write_all(stdout(), to_bytes(format("%i", unwrap(Result::Ok(Option::Some(42))))));
+            write(stdout(), to_bytes(format("%i", unwrap(Result::Ok(Option::Some(42))))));
         }
         "#;
         let (mut c, _) = check(src);
@@ -2059,13 +2059,13 @@ use string::{format, to_bytes};
         // variants share index `"0"`; match refinement must make this
         // typecheck (and `%v` must resolve Show).
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 #[derive(Show, Eq)]
 enum Box { S(string), B(bool) }
 fn main() {
-    write_all(stdout(), to_bytes(format("%v,", Box::S("x"))));
-    write_all(stdout(), to_bytes(format("%z", Box::S("x") == Box::S("x"))));
+    write(stdout(), to_bytes(format("%v,", Box::S("x"))));
+    write(stdout(), to_bytes(format("%z", Box::S("x") == Box::S("x"))));
 }
 "#;
         let mut ast = Pratt::default().parse(src).expect("parse");
@@ -3592,15 +3592,15 @@ fn main() {
     #[test]
     fn declare_struct_ret_recorded_for_invoke_typing() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 extern struct Point {
     x: int32,
     y: int32,
 };
 
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int32};
 
 fn main() -> Result<(), Error> {
     let lib = dload("sum")?;
@@ -3611,8 +3611,8 @@ fn main() -> Result<(), Error> {
         Point,
     )?;
     let p = invoke(lib, make_id, (3, 4))?;
-    write_all(stdout(), to_bytes(format("%i", p.x)));
-    write_all(stdout(), to_bytes(format("%i", p.y)));
+    write(stdout(), to_bytes(format("%i", p.x)));
+    write(stdout(), to_bytes(format("%i", p.y)));
 }
 "#;
         let (c, _) = check(src);
@@ -3726,13 +3726,13 @@ fn c() {
     #[test]
     fn coalesce_option_and_result_typecheck() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let a = Option::None ?? "bar";
     let b = Result::Err("boom") ?? 7;
-    write_all(stdout(), to_bytes(format("%s", a)));
-    write_all(stdout(), to_bytes(format("%i", b)));
+    write(stdout(), to_bytes(format("%s", a)));
+    write(stdout(), to_bytes(format("%i", b)));
 }
 "#;
         let (c, _) = check(src);
@@ -3759,12 +3759,12 @@ fn main() {
     #[test]
     fn optional_access_on_option_ok() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let o = Option::Some({ v: 1 });
     let n = o?.v;
-    write_all(stdout(), to_bytes(format("%i", n ?? 0)));
+    write(stdout(), to_bytes(format("%i", n ?? 0)));
 }
 "#;
         let (c, _) = check(src);
@@ -3793,11 +3793,11 @@ fn main() {
     #[test]
     fn prelude_injects_option_without_import() {
         let src = r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let o = Option::Some(1);
-    write_all(stdout(), to_bytes(format("%i", match o { Option::Some(v) => v, Option::None => 0 })));
+    write(stdout(), to_bytes(format("%i", match o { Option::Some(v) => v, Option::None => 0 })));
 }
 "#;
         let (c, _) = check(src);
@@ -3909,8 +3909,8 @@ fn main() {
     #[test]
     fn use_ffi_types_glob_brings_int_tag_into_scope() {
         let src = r#"
-use ffi::*;
-use ffi::types::*;
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int};
 fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (Int, Int), Int)?;
@@ -3930,7 +3930,7 @@ fn main() -> Result<(), Error> {
     #[test]
     fn ffi_types_qualified_path_works_without_import() {
         let src = r#"
-use ffi::*;
+use ffi::{declare, dload, invoke, Error};
 fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int)?;
@@ -3948,7 +3948,7 @@ fn main() -> Result<(), Error> {
     #[test]
     fn ffi_error_kind_field_is_matchable() {
         let src = r#"
-use ffi::*;
+use ffi::{dload, Error, ErrorKind};
 fn main() {
     let r = dload("missing");
     let _ = match r {
@@ -4606,6 +4606,88 @@ trait Pointer<P: * -> *> {
     // ---- byte / [byte] ----
 
     #[test]
+    fn byte_array_annotation_accepts_string_literal() {
+        let (mut c, _) = check(r#"let b: [byte] = "Hi";"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("b")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("b");
+        match ty {
+            Ty::Array { element, .. } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_array_fixed_rejects_wrong_string_length() {
+        let msgs = assert_messages(r#"let b: [byte; 2] = "Hi!";"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("expected `[byte; 2]`")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_annotation_accepts_single_byte_string_literal() {
+        let (mut c, _) = check(r#"let b: byte = "/";"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert_eq!(
+            c.codegen_var_type("b")
+                .map(|t| apply_ty_prune(c.subst(), t)),
+            Some(crate::typechecking::ty::byte())
+        );
+    }
+
+    #[test]
+    fn byte_annotation_rejects_multi_byte_string_literal() {
+        let msgs = assert_messages(r#"let b: byte = "é";"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("exactly one UTF-8 byte")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_array_literal_coerces_from_string_literals() {
+        let (mut c, _) = check(r#"let buf: [byte] = ["a", "b", "\n"];"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("buf")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("buf");
+        match ty {
+            Ty::Array { element, .. } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_compares_with_single_byte_string_literal() {
+        let (mut c, _) = check(
+            r#"
+fn main() {
+    let b: byte = "/";
+    let ok = b == "/";
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
     fn byte_annotation_accepts_in_range_literal() {
         let (mut c, _) = check("let b: byte = 42;");
         let msgs = c.take_messages();
@@ -4632,10 +4714,10 @@ trait Pointer<P: * -> *> {
     fn byte_return_accepts_in_range_literal_arithmetic() {
         let (mut c, _) = check(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn f() -> byte { return 1 + 1; }
-fn main() { write_all(stdout(), to_bytes(format("%i", f()))); }
+fn main() { write(stdout(), to_bytes(format("%i", f()))); }
 "#,
         );
         let msgs = c.take_messages();
@@ -4705,10 +4787,10 @@ fn f() -> byte {
     fn write_all_accepts_named_byte_array() {
         let (mut c, _) = check(
             r#"
-use io::*;
+use io::{stdin, write};
 fn main() {
     let data: [byte] = [1, 2];
-    write_all(stdin(), data);
+    write(stdin(), data);
 }
 "#,
         );
@@ -4732,7 +4814,7 @@ fn main() {
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
 
-        let (mut c, _) = check("use io::*; let e = IoError::Other;");
+        let (mut c, _) = check("use io::{IoError}; let e = IoError::Other;");
         let msgs = c.take_messages();
         assert!(
             msgs.is_empty(),
@@ -4745,10 +4827,10 @@ fn main() {
     fn write_all_rejects_unannotated_int_array_variable() {
         let msgs = assert_messages(
             r#"
-use io::*;
+use io::{stdin, write};
 fn main() {
     let data = [1, 2];
-    write_all(stdin(), data);
+    write(stdin(), data);
 }
 "#,
         );
@@ -4783,10 +4865,10 @@ test("ok") {
     fn test_case_rejects_main_alongside_cases() {
         let msgs = assert_messages(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 test("a") { assert(true)?; }
-fn main() { write_all(stdout(), to_bytes("x")); }
+fn main() { write(stdout(), to_bytes("x")); }
 "#,
         );
         assert!(
@@ -4963,7 +5045,7 @@ fn main() {
         assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
     }
 
-    /// Duplicate fixed arity is a `DuplicateOverload` error.
+    /// Duplicate fixed arity with the same parameter types is a `DuplicateOverload` error.
     #[test]
     fn overload_duplicate_fixed_arity_is_error() {
         let msgs = assert_messages(
@@ -4979,6 +5061,28 @@ fn main() { let a = f(1); }
             "expected DuplicateOverload, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    /// Same arity with distinct parameter types is allowed and dispatches by type.
+    #[test]
+    fn overload_same_arity_distinct_types_dispatch() {
+        let (mut c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(float x) -> float { return x; }
+fn main() {
+    let a = f(1);
+    let b = f(1.5);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
     }
 
     #[test]
@@ -5156,6 +5260,27 @@ fn main() { let f = add; }
         );
     }
 
+    /// Same-arity overloads that both unify with a polymorphic argument → AmbiguousOverload.
+    #[test]
+    fn ambiguous_overload_at_call_site() {
+        let msgs = assert_messages(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(float x) -> float { return x; }
+fn g<T>(T x) -> int {
+    return f(x);
+}
+fn main() {}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::AmbiguousOverload)),
+            "expected AmbiguousOverload at call site, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     /// Lambda bodies cannot close over outer locals unless listed in `use`.
     #[test]
     fn lambda_uncaptured_outer_is_error() {
@@ -5231,7 +5356,7 @@ fn main() { let g = add(a: 1); }
     fn spawn_rejects_non_sendable_thread_argument() {
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn, Thread};
 fn noop() -> int { return 0; }
 fn work(Thread t) -> int { return 1; }
 fn main() {
@@ -5252,7 +5377,7 @@ fn main() {
     fn spawn_rejects_zero_and_too_many_arguments() {
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn};
 fn main() {
     let _ = spawn();
 }
@@ -5267,7 +5392,7 @@ fn main() {
 
         let msgs = assert_messages(
             r#"
-use thread::*;
+use thread::{spawn};
 fn work(int a, int b) -> int { return a + b; }
 fn main() {
     let _ = spawn(work, 1, 2);
@@ -5286,7 +5411,7 @@ fn main() {
     fn spawn_accepts_sendable_int_argument() {
         let (mut c, _) = check(
             r#"
-use thread::*;
+use thread::{spawn};
 fn work(int n) -> int { return n + 1; }
 fn main() {
     let t = spawn(work, 41);
@@ -5348,5 +5473,177 @@ fn main() {
                 .contains("unknown host native `no_such_native`"),
             "got: {}",
             msgs[0].message()
+        );
+    }
+    #[test]
+    fn module_qualified_type_overloads_resolve_bare_calls() {
+        // Namespaced registration + within-module bare calls (as in `stdlib/num.hy`).
+        let mut c = Checker::new();
+        c.set_current_module("num");
+        let src = r#"
+fn min(int a, int b) -> int { return a; }
+fn min(float a, float b) -> float { return a; }
+fn max(int a, int b) -> int { return a; }
+fn max(float a, float b) -> float { return a; }
+fn clamp(int x, int lo, int hi) -> int { return min(max(x, lo), hi); }
+fn clamp(float x, float lo, float hi) -> float { return min(max(x, lo), hi); }
+"#;
+        let parser = Pratt::default();
+        let ast = parser.parse(src).expect("parse");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.overload_candidates("min").map(|v| v.len()),
+            Some(2),
+            "bare lookup should see num::min via current_module"
+        );
+        assert_eq!(c.overload_candidates("num::min").map(|v| v.len()), Some(2));
+        assert_eq!(c.overload_candidates("clamp").map(|v| v.len()), Some(2));
+    }
+
+    /// Same-arity overloads with no unifying candidate report WrongArity and
+    /// list the available signatures (type mismatch is not a separate code).
+    #[test]
+    fn type_overload_no_matching_param_types_is_wrong_arity() {
+        let msgs = assert_messages(
+            r#"
+fn show(int x) -> int { return x; }
+fn show(float x) -> float { return x; }
+fn main() { let a = show(true); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+            "expected WrongArity for unmatched type overload, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("No overload of `show`")
+                    || m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("(int)") || h.contains("available overloads"))
+            }),
+            "expected overload help mentioning available signatures, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.message(), m.help().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// After checking a defining module, `use mod::{generic}` must re-bind the
+    /// real poly scheme (not a dummy Var) and mark the local alias generic.
+    #[test]
+    fn use_reexports_cross_module_generic_scheme() {
+        let mut c = Checker::new();
+        c.set_current_module("num");
+        let def = r#"
+fn min<T: Ord>(T a, T b) -> T {
+    if a < b { return a; }
+    return b;
+}
+"#;
+        let parser = Pratt::default();
+        let ast = parser.parse(def).expect("parse def");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics in def module: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_generic_fn("num::min"),
+            "defining module must register qualified generic"
+        );
+
+        c.set_current_module("");
+        let importer = r#"
+use num::{min};
+fn main() {
+    let a = min(3, 1);
+    let b = min(3.0, 1.0);
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics after use re-export: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_generic_fn("min"),
+            "imported alias must stay generic for dict-passing ABI"
+        );
+        assert!(
+            c.env().lookup("min").is_some(),
+            "imported alias must bind a real scheme"
+        );
+        let scheme = c.env().lookup("min").unwrap();
+        assert!(
+            !scheme.bounds.is_empty(),
+            "re-export must keep Ord bound, got {:?}",
+            scheme
+        );
+    }
+
+    /// `reexport_module_item` must not mark a local alias generic just because
+    /// some *other* module registered `…::{same_local}` as generic.
+    #[test]
+    fn reexport_generic_mark_ignores_other_module_suffix() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("gen");
+        let gen_src = r#"
+fn foo<T: Ord>(T a, T b) -> T {
+    if a < b { return a; }
+    return b;
+}
+"#;
+        let ast = parser.parse(gen_src).expect("parse gen");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(c.is_generic_fn("gen::foo"));
+
+        c.set_current_module("plain");
+        let plain_src = r#"
+fn foo(int a) -> int {
+    return a;
+}
+"#;
+        let ast = parser.parse(plain_src).expect("parse plain");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(!c.is_generic_fn("plain::foo"));
+
+        c.set_current_module("");
+        let importer = r#"
+use plain::{foo};
+fn main() {
+    let x = foo(1);
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(
+            !c.is_generic_fn("foo"),
+            "importing non-generic plain::foo must not inherit gen::foo's generic tag"
+        );
+        assert_eq!(c.dict_arity_for("foo"), 0);
+        assert!(
+            c.is_generic_fn("gen::foo"),
+            "defining FQN must remain generic for other importers"
         );
     }

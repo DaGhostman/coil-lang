@@ -140,7 +140,7 @@ attr_param  ::= type_fn_sig IDENT          // first param: `fn(...args) -> T tar
 type_fn_sig ::= 'fn' '(' '...' IDENT ')' '->' type_annotation
 ```
 
-Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.hy`, `fn_value.hy`, and `lambda.hy`.
+Arity overloads (same name, different arities / rest ranges), **type overloads** (same arity, distinct parameter types — e.g. `show(int)` / `show(float)`), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.hy`, `examples/type_overload.hy`, `fn_value.hy`, and `lambda.hy`.
 
 
 Call sites may use named arguments (`name: expr`) after any positional
@@ -298,11 +298,13 @@ Examples: `type PointPair = (int, int);`, `type Pair<T> = (T, T);`
 ```
 use_stmt ::= 'use' use_path ';'
 use_path ::= IDENT ('::' IDENT)* '::' '{' use_item (',' use_item)* ','? '}'
-           | IDENT ('::' IDENT)* ('::' '*')?
            | IDENT ('::' IDENT)* ('as' IDENT)?
 use_item ::= IDENT ('as' IDENT)?
 mod_stmt ::= 'mod' IDENT ';'
 ```
+
+(`use path::*` is still parsed but always rejected at typecheck with `E0124`;
+prelude is auto-injected — no source `use prelude::*` needed.)
 
 Brace groups (`use math::{add, mul};`) desugar to multiple single-item `use`s.
 See [Modules reference](modules.md).
@@ -372,7 +374,7 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
-Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::*;` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
+Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::{send, recv};` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
 
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
 parse path — see [Traits and impl](#traits-and-impl) above.
@@ -473,7 +475,7 @@ atom ::= match_expr
        | group
 ```
 
-`dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::*` (not keyword atoms).
+`dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::{dload, declare, invoke};` (not keyword atoms).
 
 Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `float as int` truncates toward zero (not `round`/`floor`); see [Built-ins](casts.md).
 

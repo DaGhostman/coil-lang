@@ -1,5 +1,5 @@
 // Pure unit test: save encode/decode roundtrip (no file IO).
-use save::*;
+use save::{decode_save, encode_save};
 
 test("encode decode hall without key") {
     let p0 = encode_save(0, 0);

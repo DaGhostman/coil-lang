@@ -1,5 +1,5 @@
 // Pure unit tests: URL parse (no sockets).
-use http::url::*;
+use http::url::{parse_url};
 
 test("parse http url with defaults") {
     let u = match parse_url("http://example.com/path") {

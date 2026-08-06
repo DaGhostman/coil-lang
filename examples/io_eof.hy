@@ -1,7 +1,8 @@
 // EOF is Ok(None) from a non-blocking `read` on an empty file.
-use io::*;
-use io::sync::*;
-use string::*;
+use io::{close, open, read, stdout};
+use io::sync::{write_all};
+
+use string::{format, to_bytes};
 
 fn make_empty(string path) {
     let s = open(path, "w")?;

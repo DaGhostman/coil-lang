@@ -1,5 +1,5 @@
 // Unit test: adding tasks grows the board.
-use board::*;
+use board::{add_task, board_len, count_done, empty_board};
 
 test("empty board has length 0") {
     let b = empty_board();

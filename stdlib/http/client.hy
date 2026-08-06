@@ -1,11 +1,37 @@
 // HTTP/1.1 client: get / post / request.
 // Depends only on `http::url` (request/response impls live there) to avoid
 // multi-glob import bugs across sibling http::* modules.
-use io::*;
+use io::{Stream, close};
 use io::net::tcp::connect as tcp_connect;
 use io::net::tls::client::enable as tls_enable;
-use io::sync::*;
-use http::url::*;
+use io::sync::{read_to_end, write_all};
+
+use http::url::{
+    Headers,
+    HttpError,
+    Response,
+    Url,
+    build_request_head,
+    build_request_head_extras,
+    concat_bytes,
+    empty_headers,
+    extras_sanitize,
+    format_extra_headers_str,
+    headers_have_crlf,
+    http_err_bad_url,
+    http_err_unsupported_scheme,
+    http_fail_bytes,
+    http_fail_stream,
+    http_fail_unit,
+    parse_response,
+    parse_url,
+    request_line_ok,
+    response_body_len,
+    response_status,
+    url_host,
+    url_port,
+    url_scheme,
+};
 
 fn open_stream(Url u) -> Result<Stream, HttpError> {
     let scheme = url_scheme(u)?;

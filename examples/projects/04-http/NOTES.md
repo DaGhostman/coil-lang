@@ -33,8 +33,8 @@ cd examples/projects/04-http && coil test
 | `src/main.hy` | Client `get("http://127.0.0.1:41250/")` |
 
 Impl detail: request/response helpers live in `url.hy` so `client` depends on a
-**single** sibling module. Globbing `http::request` + `http::response` (each
-`use http::url::*`) can hide `url` symbols.
+**single** sibling module. Importing overlapping facades that each pull from
+`http::url` can hide `url` symbols — prefer one explicit import path.
 
 ## Limitations (v1)
 

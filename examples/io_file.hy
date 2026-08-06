@@ -1,8 +1,9 @@
 // File round-trip via virtual `io` module.
 // Writes two bytes, reads them back with read_to_end, prints length.
-use io::*;
-use io::sync::*;
-use string::*;
+use io::{close, open, stdout};
+use io::sync::{read_to_end, write_all};
+
+use string::{format, to_bytes};
 
 fn write_file(string path, [byte] data) {
     let s = open(path, "w")?;

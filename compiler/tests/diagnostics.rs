@@ -269,6 +269,62 @@ fn main() { let a = f(1, 2, 3); }
 }
 
 #[test]
+fn type_overload_unmatched_arg_type_has_stable_wrong_arity() {
+    let msgs = check_messages(
+        r#"
+fn show(int x) -> int { return x; }
+fn show(float x) -> float { return x; }
+fn main() { let a = show(true); }
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::WrongArity)),
+        "expected WrongArity (E0120) when no type overload matches, got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter().any(|m| m.message().contains("No overload of `show`")),
+        "expected 'No overload of show' message, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn userland_wildcard_import_has_stable_error_code() {
+    let msgs = check_messages("use foo::*;\nfn main() {}\n");
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
+        "expected WildcardImport (E0124), got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.message().contains("wildcard import") && m.message().contains("foo")),
+        "expected message mentioning wildcard import of foo, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn virtual_wildcard_import_is_rejected() {
+    let msgs = check_messages("use io::*;\nfn main() {}\n");
+    assert!(
+        msgs
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
+        "virtual `use io::*` must emit WildcardImport, got: {:?}",
+        msgs.iter()
+            .map(|m| (m.code(), m.message()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn lambda_cannot_capture_without_use() {
     let msgs = check_messages(
         r#"
@@ -293,11 +349,11 @@ fn main() {
 fn defer_cannot_capture_without_use() {
     let msgs = check_messages(
         r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let y = 10;
-    defer { write_all(stdout(), to_bytes(format("%i", y))); }
+    defer { write(stdout(), to_bytes(format("%i", y))); }
 }
 "#,
     );
@@ -313,10 +369,10 @@ fn main() {
 fn defer_undefined_variable_is_rejected() {
     let msgs = check_messages(
         r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
-    defer { write_all(stdout(), to_bytes(format("%i", totally_undefined_var))); }
+    defer { write(stdout(), to_bytes(format("%i", totally_undefined_var))); }
 }
 "#,
     );
@@ -1530,7 +1586,8 @@ fn ffi_dload_without_use_errors() {
 fn declare_wrong_arity_errors() {
     let msgs = check_messages(
         r#"
-        use ffi::*;
+        use ffi::{dload, declare};
+        use ffi::types::{Int};
         fn main() {
             let lib = match dload("x.so") {
                 Result::Ok(h) => h,
@@ -1554,7 +1611,7 @@ fn declare_wrong_arity_errors() {
 fn invoke_wrong_arity_errors() {
     let msgs = check_messages(
         r#"
-        use ffi::*;
+        use ffi::{dload, invoke};
         fn main() {
             let lib = match dload("x.so") {
                 Result::Ok(h) => h,
@@ -2152,7 +2209,7 @@ fn main() { let t = spawn(work); }
 fn spawn_non_sendable_argument_reports_diagnostic() {
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{spawn, Thread};
 fn noop() -> int { return 0; }
 fn work(Thread t) -> int { return 1; }
 fn main() {
@@ -2204,7 +2261,7 @@ fn primitive_cast_rejects_negative_literal_int_as_byte() {
 fn env_exec_call_emits_trusted_inputs_warning() {
     let msgs = compile_messages(
         r#"
-use env::*;
+use env::{exec};
 fn main() {
     let _ = exec("true", []);
 }
@@ -2222,7 +2279,7 @@ fn main() {
 fn env_exit_call_emits_process_termination_warning() {
     let msgs = compile_messages(
         r#"
-use env::*;
+use env::{exit};
 fn main() {
     exit(0);
 }
@@ -2328,12 +2385,12 @@ fn main() {
 #[test]
 fn method_named_send_does_not_shadow_thread_send() {
     // Regression: inherent `fn send` used to bind bare `send` for
-    // monomorphic recursion, shadowing `use thread::*;` and turning
+    // monomorphic recursion, shadowing `use thread::{send}` and turning
     // `send(self.channel, data)` into a self-type mismatch
     // (expected Sender, found Wrapper) while checking function type.
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{send, Sender, Thread};
 
 class ThreadWrapper {
     thread: Thread,
@@ -2360,7 +2417,7 @@ fn main() {}
 fn self_channel_field_passes_sender_to_thread_send() {
     let (_ty, msgs) = check(
         r#"
-use thread::*;
+use thread::{send, Sender, Thread};
 
 class ThreadWrapper {
     thread: Thread,
@@ -2387,7 +2444,7 @@ fn main() {}
 fn gc_get_rejects_weak_handle() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{get, weak};
 fn main() {
     let w = weak(1);
     let _ = get(w);
@@ -2405,7 +2462,7 @@ fn main() {
 fn gc_upgrade_rejects_root_handle() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{root, upgrade};
 fn main() {
     let r = root(1);
     let _ = upgrade(r);
@@ -2423,7 +2480,7 @@ fn main() {
 fn gc_root_get_roundtrip_typechecks() {
     let (_ty, msgs) = check(
         r#"
-use gc::*;
+use gc::{get, root, upgrade, weak};
 fn main() {
     let r = root(1);
     let n: int = get(r);

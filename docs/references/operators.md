@@ -20,6 +20,8 @@ Associativity:
 | Precedence | Operators / forms | Notes |
 |------------|-------------------|-------|
 | **Primary (postfix)** | `expr++`, `expr--`, `expr.field`, `expr?.field`, `expr[index]`, `expr?` | Tightest — postfix on atoms |
+| **Call (postfix)** | `f(args)` | Function / method call |
+| **Cast (postfix)** | `expr as T` | Binds tighter than `*` / `+` and assignment (`c = m as byte` → RHS cast) |
 | **Prefix unary** | `-expr`, `+expr`, `~expr` | Numeric negation, no-op plus, bitwise NOT |
 | **Exponentiation** | `**` | Right-associative |
 | **Multiplicative** | `*`, `/`, `%` | Right-associative |
@@ -39,7 +41,6 @@ Forms **not** in the Pratt table but still tight-binding:
 
 | Form | Binding |
 |------|---------|
-| Function call `f(x)` | Atom — binds to identifier immediately |
 | Qualified construct `E::V(...)` | Atom |
 | Grouping `(expr)` | Atom |
 | `match`, `new`, literals | Atoms |
@@ -159,6 +160,8 @@ Short-circuit behavior follows VM evaluation order (both operands evaluated eage
 | `<`, `<=`, `>`, `>=` | Same type (`int` or `float`) | `bool` |
 
 Float and int comparisons use separate opcode families (`LE` vs `LEF`, etc.) selected at codegen from inferred types.
+
+`==` / `!=` on arrays and tuples are **structural** (length + element-wise, recursively). Strings compare by UTF-8 content. Enums, classes, and records stay pointer-identity unless a user `Eq` instance is dispatched.
 
 ---
 

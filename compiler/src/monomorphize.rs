@@ -850,7 +850,7 @@ mod tests {
     use parser::Pratt;
 
     fn plan(src: &str) -> MonoPlan {
-        let src = format!("use io::{{stdout, write_all}}; use string::{{format, to_bytes}}; {src}");
+        let src = format!("use io::{{stdout, write}}; use string::{{format, to_bytes}}; {src}");
         let ast = Pratt::default().parse(src.as_str()).expect("parse failed");
         let mut checker = Checker::new();
         let _ = checker.check_program(&ast);
@@ -861,7 +861,7 @@ mod tests {
     fn plans_ground_bounded_generic_call() {
         let plan = plan(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.fn_name, "add");
@@ -876,7 +876,7 @@ mod tests {
         // *element* ground type (one slot per formal), not the packed array.
         let plan = plan(
             "fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", twice_first(21)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", twice_first(21)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.fn_name, "twice_first");
@@ -888,7 +888,7 @@ mod tests {
     fn plans_named_arg_ground_bounded_generic_call() {
         let plan = plan(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { write_all(stdout(), to_bytes(format(\"%i\", add(b: 2, a: 1)))); }",
+             fn main() { write(stdout(), to_bytes(format(\"%i\", add(b: 2, a: 1)))); }",
         );
         assert_eq!(plan.specializations.len(), 1);
         assert_eq!(plan.specializations[0].key.subst, vec!["int"]);

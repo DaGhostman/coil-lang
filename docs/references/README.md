@@ -2,7 +2,7 @@
 
 Lookup docs for language constructs and compiler-provided APIs. For a guided introduction, start with the [manual](../manual/getting-started.md).
 
-Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, `regex`, and `gc` require an explicit `use`.
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets prelude auto-injected (`inject_prelude_scope` — `prelude`, `prelude::ops`, `prelude::test`, `prelude::math`; no source `use` needed). FFI, `io`, `string`, `thread`, `time`, `env`, `crypto`, `regex`, and `gc` require an explicit `use` with concrete or brace imports (`use io::{stdout, open};`). `use path::*` is always rejected (`E0124`).
 
 ## Language
 
@@ -25,7 +25,7 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [format](format.md) | Intrinsic | `string::format(...)` builds a formatted string |
 | [string](string.md) | Virtual module | `format` / UTF-8 byte conversions |
 | [arrays](arrays.md) | Expression | `arr[] =` append and `len` |
-| [math](math.md) | Prelude | `dot` / `matmul` / `cross` / `Matrix` |
+| [math](math.md) | Prelude | IEEE float math plus `dot` / `matmul` / `cross` / `Matrix` |
 | [FFI](ffi.md) | Virtual module | `dload` / `declare` / `invoke` / `extern` |
 | [done](done.md) | Expression | Coroutine finished? |
 | [io](io.md) | Virtual module | Non-blocking streams, TCP, UDP |
@@ -42,7 +42,11 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [gc](gc.md) | Virtual module | `Root` / `Weak` pins |
 | [ord / char](ord-char.md) | Prelude | Single-byte string ↔ `byte` |
 | [host natives](host-natives.md) | Embedder API | Rust closures via `HostInvoke` |
-| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs a full stdlib |
+| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins; see also [`stdlib/`](../../stdlib/) userland |
+
+Userland packages under `stdlib/` (include in `[module].roots`): `bytes`, `text`,
+`collections`, `num`, `random`, `path`, `json`, `io::sync` / `io::file`, `http`.
+See [`stdlib/README.md`](../../stdlib/README.md).
 
 ## Related
 

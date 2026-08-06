@@ -1,6 +1,6 @@
 // URL parse for the HTTP client (byte-scan; no string slice/index).
-// Note: avoid `x < 0` — use explicit sentinels with `==` (coil int compare quirk).
-use io::*;
+use io::{Stream, from_bytes, to_bytes};
+use conv::{int_to_dec};
 
 enum HttpError {
     BadUrl,
@@ -87,24 +87,20 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
     if nn == 0 {
         return 0;
     }
-    // Guard empty hay explicitly (see coil compare quirks with zero).
-    if hn == 0 {
-        return 999999;
-    }
     if nn > hn {
         return 999999;
     }
     let i = 0;
     while i + nn <= hn {
-        let ok = 1;
+        let ok = true;
         let j = 0;
         while j < nn {
             if hay[i + j] != needle[j] {
-                ok = 0;
+                ok = false;
             }
             j = j + 1;
         }
-        if ok == 1 {
+        if ok {
             return i;
         }
         i = i + 1;
@@ -115,8 +111,8 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
 fn parse_port_digits([byte] b, int start, int end) -> int {
     let n = 0;
     let i = start;
-    let zero: byte = 48;
-    let nine: byte = 57;
+    let zero: byte = "0";
+    let nine: byte = "9";
     if start >= end {
         return 999999;
     }
@@ -128,7 +124,7 @@ fn parse_port_digits([byte] b, int start, int end) -> int {
         if c > nine {
             return 999999;
         }
-        n = n * 10 + ((c as int) - 48);
+        n = n * 10 + ((c as int) - (("0" as byte) as int));
         i = i + 1;
     }
     return n;
@@ -146,8 +142,8 @@ fn http_err_bad_response() -> Result<(), HttpError> {
 // Plain int return — keep raise/`?` out of build_request_head* (concat poison).
 fn bytes_have_crlf([byte] b) -> int {
     let i = 0;
-    let cr: byte = 13;
-    let lf: byte = 10;
+    let cr: byte = "\r";
+    let lf: byte = "\n";
     while i < len(b) {
         if b[i] == cr {
             return 1;
@@ -182,25 +178,25 @@ fn str_reject_crlf(string s) -> Result<string, HttpError> {
 // True (1) if the first header line of an HTTP message contains "HTTP/1.1"
 // (rejects method/path CRLF injection, which truncates the request line).
 fn request_line_ok([byte] head) -> int {
-    let cr: byte = 13;
-    let lf: byte = 10;
+    let cr: byte = "\r";
+    let lf: byte = "\n";
     let i = 0;
     let n = len(head);
     while i + 1 < n {
         if head[i] == cr {
             if head[i + 1] == lf {
-                let needle: [byte] = [72, 84, 84, 80, 47, 49, 46, 49];
+                let needle: [byte] = "HTTP/1.1";
                 let j = 0;
                 while j + 8 <= i {
-                    let ok = 1;
+                    let ok = true;
                     let k = 0;
                     while k < 8 {
                         if head[j + k] != needle[k] {
-                            ok = 0;
+                            ok = false;
                         }
                         k = k + 1;
                     }
-                    if ok == 1 {
+                    if ok {
                         return 1;
                     }
                     j = j + 1;
@@ -217,9 +213,9 @@ fn request_line_ok([byte] head) -> int {
 // Rebuilds extras (to_bytes invalidates the input string).
 fn extras_sanitize(string extras) -> Result<string, HttpError> {
     let b = to_bytes(extras);
-    let cr: byte = 13;
-    let lf: byte = 10;
-    let colon: byte = 58;
+    let cr: byte = "\r";
+    let lf: byte = "\n";
+    let colon: byte = ":";
     let line_start = 0;
     let i = 0;
     let n = len(b);
@@ -294,7 +290,7 @@ fn http_fail_unit() -> Result<(), HttpError> {
 
 fn parse_url(string s) -> Result<Url, HttpError> {
     let b = to_bytes(s);
-    let sep: [byte] = [58, 47, 47]; // ://
+    let sep: [byte] = "://";
     let sep_at = find_bytes(b, sep);
     if sep_at == 999999 {
         http_err_bad_url()?;
@@ -306,9 +302,9 @@ fn parse_url(string s) -> Result<Url, HttpError> {
         http_err_bad_url()?;
     }
 
-    let slash: byte = 47;
-    let qmark: byte = 63;
-    let colon: byte = 58;
+    let slash: byte = "/";
+    let qmark: byte = "?";
+    let colon: byte = ":";
 
     let i = rest_start;
     let host_end = len(b);
@@ -420,35 +416,6 @@ fn parse_url(string s) -> Result<Url, HttpError> {
 
 // --- request builders (kept in url for single-import client graph) ---
 // Serialize an HTTP/1.1 request message to `[byte]`.
-
-fn digit_char(int d) -> string {
-    if d == 0 { return "0"; }
-    if d == 1 { return "1"; }
-    if d == 2 { return "2"; }
-    if d == 3 { return "3"; }
-    if d == 4 { return "4"; }
-    if d == 5 { return "5"; }
-    if d == 6 { return "6"; }
-    if d == 7 { return "7"; }
-    if d == 8 { return "8"; }
-    return "9";
-}
-
-// Decimal int → string without `format` (avoids Result-mode SEGV in deps).
-// Only non-negative lengths/ports are expected.
-fn int_to_dec(int n) -> string {
-    if n == 0 {
-        return "0";
-    }
-    let x = n;
-    let rev = "";
-    while x > 0 {
-        let d = x % 10;
-        rev = digit_char(d) + rev;
-        x = x / 10;
-    }
-    return rev;
-}
 
 fn host_header_value(Url u) -> Result<string, HttpError> {
     let host = url_host(u)?;
@@ -746,8 +713,8 @@ fn header_get(Response r, string name) -> string {
 }
 
 fn find_header_end([byte] buf) -> int {
-    let cr: byte = 13;
-    let lf: byte = 10;
+    let cr: byte = "\r";
+    let lf: byte = "\n";
     let i = 0;
     let n = len(buf);
     while i + 3 < n {
@@ -778,8 +745,8 @@ fn bytes_slice_resp([byte] src, int start, int end) -> [byte] {
 }
 
 fn find_crlf([byte] buf, int from) -> int {
-    let cr: byte = 13;
-    let lf: byte = 10;
+    let cr: byte = "\r";
+    let lf: byte = "\n";
     let i = from;
     while i + 1 < len(buf) {
         if buf[i] == cr {
@@ -793,7 +760,7 @@ fn find_crlf([byte] buf, int from) -> int {
 }
 
 fn parse_status_code([byte] line) -> Result<int, HttpError> {
-    let sp: byte = 32;
+    let sp: byte = " ";
     let i = 0;
     let n = len(line);
     while i < n {
@@ -816,7 +783,7 @@ fn parse_status_code([byte] line) -> Result<int, HttpError> {
     let code = 0;
     let j = start;
     while j < i {
-        code = code * 10 + ((line[j] as int) - 48);
+        code = code * 10 + ((line[j] as int) - (("0" as byte) as int));
         j = j + 1;
     }
     return code;
@@ -830,7 +797,7 @@ fn parse_int_bytes([byte] b) -> Result<int, HttpError> {
     let v = 0;
     let i = 0;
     while i < n {
-        v = v * 10 + ((b[i] as int) - 48);
+        v = v * 10 + ((b[i] as int) - (("0" as byte) as int));
         i = i + 1;
     }
     return v;
@@ -858,8 +825,8 @@ fn parse_status_line([byte] header_bytes) -> Result<int, HttpError> {
 }
 
 fn append_header_line([string] names, [string] values, [byte] line) -> Result<int, HttpError> {
-    let colon: byte = 58;
-    let sp: byte = 32;
+    let colon: byte = ":";
+    let sp: byte = " ";
     let cpos = find_byte(line, colon);
     if cpos == 999999 {
         http_err_bad_response()?;

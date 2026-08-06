@@ -75,3 +75,35 @@ fn main() {
             other => panic!("expected Lambda, got {:?}", other),
         }
     }
+
+    #[test]
+    fn lambda_block_body_allows_let_and_return_statements() {
+        let ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let f = fn (int x) { let y = x + 1; return y; };
+}
+"#,
+            )
+            .expect("parse failed");
+        match find_lambda(ast.1.as_ref()) {
+            Some(Expression::Lambda { body, .. }) => match body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 2);
+                    assert!(matches!(
+                        children[0].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Fragment(_))
+                    ));
+                    assert!(matches!(
+                        children[1].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Return(_))
+                    ));
+                }
+                other => panic!("expected lambda Block, got {:?}", other),
+            },
+            other => panic!("expected Lambda, got {:?}", other),
+        }
+    }

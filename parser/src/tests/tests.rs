@@ -663,6 +663,56 @@
     }
 
     #[test]
+    fn match_arm_brace_body_allows_let_and_trailing_value() {
+        let ast = expr_ast!("match x { Option::Some(v) => { let y = v + 1; y }, _ => 0 }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 2);
+                    assert!(matches!(
+                        children[0].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Fragment(_))
+                    ));
+                    assert!(matches!(
+                        children[1].1.as_ref(),
+                        Expression::Identifier("y")
+                    ));
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_arm_brace_body_allows_return_statement() {
+        let ast = expr_ast!("match x { Option::Some(v) => { return v; }, _ => 0 }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => match arms[0].body.1.as_ref() {
+                Expression::Block(children) => {
+                    assert_eq!(children.len(), 1);
+                    assert!(matches!(
+                        children[0].1.as_ref(),
+                        Expression::Statement(inner)
+                            if matches!(inner.1.as_ref(), Expression::Return(_))
+                    ));
+                }
+                other => panic!("expected Block arm body, got {:?}", other),
+            },
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn match_arm_brace_body_allows_field_access_like_self_method() {
         // Regression: `{ self.get() }` used to parse as a dict and fail with
         // `found '.' expected ':'` because dict fields require `name: value`.
@@ -979,6 +1029,46 @@
             "expected Cast, got {:?}",
             inner
         );
+    }
+
+    #[test]
+    fn string_literal_allows_escaped_quote() {
+        let e = expr_ast!(r#""\"""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"\""#),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_literal_allows_escaped_quote_amid_text() {
+        let e = expr_ast!(r#""say \"hi\"""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"say \"hi\""#),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_literal_backslash_before_close_is_escape() {
+        // `"\\""` → content `\\` then closing quote — a string holding one `\`.
+        let e = expr_ast!(r#""\\""#);
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::String(s) => assert_eq!(s, r#"\\"#),
+            other => panic!("expected String, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2037,3 +2127,59 @@
             "display should retain test name: {displayed}"
         );
     }
+
+    #[test]
+    fn assign_cast_byte_parses_cast_on_rhs() {
+        let e = expr_ast!("c = m as byte");
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Assignment(_, value) => {
+                let rhs = match value.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    matches!(rhs, Expression::Cast(_, _)),
+                    "expected Cast on RHS, got {rhs:?}"
+                );
+            }
+            Expression::Cast(expr, _) => {
+                let inner = match expr.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    !matches!(inner, Expression::Assignment(_, _)),
+                    "cast bound to whole assign, not RHS"
+                );
+                panic!("unexpected top-level Cast");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_binds_tighter_than_add() {
+        let e = expr_ast!("1 + 2 as float");
+        let inner = match e {
+            Expression::Expr(inner) => inner.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Add(_, rhs) => {
+                let rhs = match rhs.1.as_ref() {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    matches!(rhs, Expression::Cast(_, _)),
+                    "expected 1 + (2 as float), got rhs={rhs:?}"
+                );
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
