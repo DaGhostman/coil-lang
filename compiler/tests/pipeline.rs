@@ -1998,13 +1998,10 @@ use string::{format, to_bytes};
     assert_eq!(output, "1,2,42");
 }
 
-/// Resuming an already-Done coroutine always yields the sentinel
-/// `Value::default()` (`0`) — never the coroutine's last `return`
-/// value — since there's no error-handling protocol yet to signal
-/// "resumed after completion" and returning the stale value again
-/// would be a worse form of undefined behavior.
+/// WP-M6: resuming an already-Done coroutine panics instead of returning a
+/// stale sentinel value.
 #[test]
-fn resume_after_done_returns_default_not_last_return_value() {
+fn resume_after_done_panics() {
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -2015,12 +2012,19 @@ use string::{format, to_bytes};
         fn main() {
             let h = counter();
             write(stdout(), to_bytes(format("%i,", resume h))); // return 42 (completes)
-            write(stdout(), to_bytes(format("%i,", resume h))); // Done -> 0, not 42
-            write(stdout(), to_bytes(format("%i", resume h)));  // Done -> 0, not 42
+            write(stdout(), to_bytes(format("%i,", resume h))); // panics
+            write(stdout(), to_bytes(format("%i", resume h)));
         }
     "#;
     let output = run_example_src(src);
-    assert_eq!(output, "42,0,0");
+    assert!(
+        output.starts_with("42,"),
+        "expected first resume output before panic, got: {output:?}"
+    );
+    assert!(
+        output.contains("panic:") && output.contains("resumed after completion"),
+        "expected resume-after-done panic, got: {output:?}"
+    );
 }
 
 fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {

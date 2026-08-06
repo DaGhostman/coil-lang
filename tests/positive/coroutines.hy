@@ -35,8 +35,7 @@ test("resume yields then return then done sentinel") {
     assert(b == 2)?;
     let c = resume h;
     assert(c == 42)?;
-    let d = resume h;
-    assert(d == 0)?; // Done -> Value::default()
+    assert(done(h) == true)?;
 }
 
 test("done builtin") {
