@@ -14,6 +14,9 @@ virtual modules alike. Prelude is auto-injected.
 | `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / find_from / replace / pad / eq |
 | `text` | `use text::{trim, split, …};` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::{sort, …};` | Stable mergesort / `reverse` / `collect_ints` (range → array) |
+| `collections::map` | `use collections::map::{HashMap, HashSet};` | `HashMap` / `HashSet` (chaining; methods with `Eq`+`Hash`) |
+| `collections::list` | `use collections::list::{List};` | Mutable singly-linked list |
+| `collections::tree` | `use collections::tree::{TreeMap};` | Mutable BST map over `Ord`+`Eq` |
 | `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
 | `random` | `use random::{u64, range, …};` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::{join, dirname, …};` | `join` / `dirname` / `basename` / `extension` |

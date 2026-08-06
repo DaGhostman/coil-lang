@@ -9,7 +9,7 @@ Still not provided as **compiler builtins** (HostInvoke / opcodes):
 
 | Category | Examples | Userland alternative |
 |----------|----------|----------------------|
-| Collections API | `sort`; range→array materialize | `collections::{sort,collect_ints}` (stable mergesort) |
+| Collections API | `sort`; range→array; `HashMap` / `HashSet` / `List` / `TreeMap` | `collections::{sort,collect_ints}`; `collections::map` / `list` / `tree` (see [collections-vm-split](../internals/collections-vm-split.md)) |
 | String ops | slice, trim, split, replace, lines | `text::*` (byte-oriented) |
 | Bytes ops | find, replace, pad, repeat | `bytes::*` |
 | ASCII / parse | digit classify; `parse_int` / `int_to_dec` | `ascii::*`, `conv::*` |

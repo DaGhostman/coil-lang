@@ -7865,7 +7865,17 @@ impl Compiler {
                 // the call frame, one per user constraint, in constraint order.
                 // Every trait constraint (including builtin Num/Ord/Eq/Show)
                 // gets a trailing `__dictN` slot for dictionary dispatch.
-                let dict_arity = self.checker.dict_arity_for(name);
+                // Prefer the qualified FQN: bare names are dropped by
+                // `fn_dict_arity.retain(|k| k.contains("::"))` across modules,
+                // while inherent methods always register `Owner::method`.
+                let dict_arity = {
+                    let via_fqn = self.checker.dict_arity_for(&qualified);
+                    if via_fqn > 0 {
+                        via_fqn
+                    } else {
+                        self.checker.dict_arity_for(name)
+                    }
+                };
                 for dict_idx in 0..dict_arity {
                     self.context.variables.intern(format!("__dict{}", dict_idx));
                 }
@@ -8885,18 +8895,116 @@ impl Compiler {
                             fqn_base
                         };
                         if let Some(offset) = self.functions.get(&fqn).copied() {
-                            // Push receiver first (slot 0), then args
-                            // (reordered when any arg is named; rest packed).
+                            // Same ABI as free generics: box top-level type
+                            // params, append trait dictionaries, unbox returns.
+                            let lookup_name = strip_overload_key(&fqn).to_string();
+                            let is_generic = self.checker.is_generic_fn(&lookup_name);
+                            let box_generic_args = is_generic
+                                && self.generic_has_toplevel_type_param_args(&lookup_name);
+                            // Stage the receiver into a temp *before* user args.
+                            // Leaving it on the operand stack while arg staging
+                            // `STORE`s into temps clobbers it (locals and the
+                            // operand stack share memory) — nested calls like
+                            // `self.inner.put(x, true)` then mutate the wrong object.
                             bytecode.append(&mut self.do_compile(recv));
-                            let nargs = if let Some(items) = args {
-                                self.emit_call_args_with_rest(&fqn, items, &mut bytecode, false)
+                            let recv_tmp = self.alloc_temp_slot();
+                            bytecode.push_store_pop(recv_tmp);
+                            let arg_slice = args.as_deref().unwrap_or(&[]);
+                            self.consume_spread_emit_ids(arg_slice);
+                            let (fixed, rest, pack_rest) =
+                                self.split_call_args_for_rest(&lookup_name, arg_slice);
+                            let mut arg_temps: Vec<u32> = Vec::new();
+                            for arg in &fixed {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                if box_generic_args {
+                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    }
+                                }
+                                let tmp = self.alloc_temp_slot();
+                                bytecode.push_store_pop(tmp);
+                                arg_temps.push(tmp);
+                            }
+                            let nargs = if pack_rest {
+                                for arg in &rest {
+                                    self.append_with_existential_pack(&mut bytecode, arg);
+                                    if box_generic_args {
+                                        if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                            Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                        }
+                                    }
+                                }
+                                if self.checker.fn_tuple_rest(&lookup_name) {
+                                    bytecode.push_make_tuple(rest.len() as u32);
+                                } else {
+                                    bytecode.push_make_array(rest.len() as u32);
+                                }
+                                let tmp = self.alloc_temp_slot();
+                                bytecode.push_store_pop(tmp);
+                                arg_temps.push(tmp);
+                                (fixed.len() + 1) as u32
+                            } else {
+                                fixed.len() as u32
+                            };
+                            bytecode.push_load(recv_tmp);
+                            for tmp in &arg_temps {
+                                bytecode.push_load(*tmp);
+                            }
+                            let dict_count = if is_generic {
+                                let mut call_arg_tys: Vec<Ty> = Vec::new();
+                                if let Some(ty) = recv_ty.clone() {
+                                    call_arg_tys.push(ty);
+                                }
+                                for arg in &fixed {
+                                    call_arg_tys.push(self.codegen_expr_ty(arg).expect(
+                                        "typechecked method argument must have a codegen type",
+                                    ));
+                                }
+                                if pack_rest {
+                                    call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                                }
+                                let mut forwarded = 0;
+                                if let Some(indices) = self_id
+                                    .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                    .or_else(|| {
+                                        self.checker
+                                            .forwarded_dicts_for_span(span.start, span.end)
+                                    })
+                                    .map(<[usize]>::to_vec)
+                                {
+                                    for dict_index in indices {
+                                        if let Some(slot) =
+                                            self.lookup_slot(&format!("__dict{}", dict_index))
+                                        {
+                                            bytecode.push_load(slot);
+                                            forwarded += 1;
+                                        }
+                                    }
+                                }
+                                let call_ret_ty = self.codegen_expr_ty(ast);
+                                forwarded
+                                    + Self::emit_call_site_dicts(
+                                        &mut bytecode,
+                                        &lookup_name,
+                                        &call_arg_tys,
+                                        call_ret_ty.as_ref(),
+                                        &self.checker,
+                                        &self.functions,
+                                    )
                             } else {
                                 0
                             };
                             bytecode.push(
-                                Byte::new(Instruction::CALL)
-                                    .with_call_packed(1 + nargs, offset as u32),
+                                Byte::new(Instruction::CALL).with_call_packed(
+                                    1 + nargs + dict_count as u32,
+                                    offset as u32,
+                                ),
                             );
+                            if is_generic && self.generic_return_is_boxed(&lookup_name) {
+                                if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                                    Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                                }
+                            }
                         } else {
                             let mut message = Message::error(
                                 ErrorCode::UnknownFunction,
