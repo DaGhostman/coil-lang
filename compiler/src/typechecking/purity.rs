@@ -657,7 +657,7 @@ fn main() { return; }
         let set = pure_set(
             r#"
 fn bump(int n) -> int {
-    let a: [int] = [0];
+    let a = [0];
     a[0] = n;
     if n <= 1 { return a[0]; }
     return bump(n - 1) + bump(n - 2);

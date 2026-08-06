@@ -4786,12 +4786,12 @@ fn f() -> byte {
     }
 
     #[test]
-    fn write_all_accepts_named_byte_array() {
+    fn write_all_accepts_named_byte_vec() {
         let (mut c, _) = check(
             r#"
 use io::{stdin, write};
 fn main() {
-    let data: [byte] = [1, 2];
+    let data = Vec::from([1 as byte, 2 as byte]);
     write(stdin(), data);
 }
 "#,
