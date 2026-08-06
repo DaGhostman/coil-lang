@@ -1,4 +1,4 @@
-// Array literals, index, mutation, append (`arr[] =`), len, for-in.
+// Array literals, index, mutation, Vec push, len, for-in.
 test("literal index") {
     let a = [10, 20, 30];
     assert(a[0] == 10)?;
@@ -24,21 +24,22 @@ test("len of literal") {
     assert(len(a) == 4)?;
 }
 
-test("append grows array") {
-    let a = [1];
-    a[] = 2;
-    a[] = 3;
+test("push grows vec") {
+    let a = Vec::from([1]);
+    a.push(2);
+    a.push(3);
     assert(len(a) == 3)?;
     assert(a[0] == 1)?;
     assert(a[1] == 2)?;
     assert(a[2] == 3)?;
 }
 
-test("empty then append") {
-    let a = [0];
-    a[0] = 7;
-    a[] = 8;
+test("empty then push") {
+    let a: Vec<int> = Vec::new();
+    a.push(7);
+    a.push(8);
     assert(len(a) == 2)?;
+    assert(a[0] == 7)?;
     assert(a[1] == 8)?;
 }
 

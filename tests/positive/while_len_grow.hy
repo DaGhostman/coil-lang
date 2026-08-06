@@ -1,8 +1,8 @@
 // LICM must not hoist the LOAD that feeds ArrayLen in `while len(a) < n`.
 test("while len grows without empty stack") {
-    let a: [int] = [];
+    let a: Vec<int> = Vec::new();
     while len(a) < 5 {
-        a[] = len(a);
+        a.push(len(a));
     }
     assert(len(a) == 5)?;
     assert(a[0] == 0)?;
