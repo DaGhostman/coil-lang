@@ -177,3 +177,57 @@ fn collect_hy_files(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn upsert_indexes_function_definition() {
+        let dir = std::env::temp_dir().join(format!("coil-project-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.hy");
+        let src = "fn helper() -> int { return 1; }\nfn main() { let x = helper(); }\n";
+        fs::write(&path, src).unwrap();
+
+        let mut index = ProjectIndex::new(dir.clone());
+        index.upsert_file(path.clone(), src.to_string());
+        let symbols = index.symbols_for(&path).expect("indexed");
+        let defs = symbols.definitions("helper");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, crate::SymbolKind::Function);
+
+        let refs = symbols.references("helper");
+        assert!(!refs.is_empty(), "expected a reference site for helper()");
+        let hit = &refs[0];
+        let resolved = index.resolve_definition(&path, hit.range.clone(), "helper");
+        assert!(
+            resolved.iter().any(|(f, r)| f == &path && *r == defs[0].name_range),
+            "resolve_definition should return helper's def, got: {resolved:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_replaces_stale_source() {
+        let dir = std::env::temp_dir().join(format!("coil-project-index-upd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.hy");
+
+        let mut index = ProjectIndex::new(dir.clone());
+        index.upsert_file(path.clone(), "fn old() {}\n".into());
+        assert!(index.symbols_for(&path).unwrap().definitions("old").len() == 1);
+
+        index.upsert_file(path.clone(), "fn neu() {}\n".into());
+        let symbols = index.symbols_for(&path).unwrap();
+        assert!(symbols.definitions("old").is_empty());
+        assert_eq!(symbols.definitions("neu").len(), 1);
+        assert_eq!(index.source_for(&path), Some("fn neu() {}\n"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
