@@ -128,3 +128,121 @@ pub const VEC_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
     ("vec_remove", 2, host_vec_remove),
     ("vec_from_array", 1, host_vec_from_array),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::Object;
+
+    fn make_array(heap: &mut Heap, elems: &[i64]) -> Value {
+        let elements: Vec<Value> = elems.iter().copied().map(Value::from).collect();
+        let (obj, _) = heap.alloc(ObjArray { elements }, Object::Array);
+        Value::from(obj.addr())
+    }
+
+    fn array_ints(heap: &Heap, v: Value) -> Vec<i64> {
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::Array(gc)) => gc.as_ref().elements.iter().map(|e| e.as_int()).collect(),
+            _ => panic!("expected array"),
+        }
+    }
+
+    fn option_tag(heap: &Heap, v: Value) -> u32 {
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::Enum(gc)) => gc.as_ref().tag,
+            _ => panic!("expected Option enum"),
+        }
+    }
+
+    fn option_some_int(heap: &Heap, v: Value) -> i64 {
+        use crate::memory::Member;
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::Enum(gc)) => {
+                assert_eq!(gc.as_ref().tag, 1, "expected Option::Some");
+                match gc.as_ref().payload[0] {
+                    Member::Value(inner) => inner.as_int(),
+                    Member::Object(_) => panic!("expected int Option payload"),
+                }
+            }
+            _ => panic!("expected Option enum"),
+        }
+    }
+
+    #[test]
+    fn with_capacity_and_reserve_raise_capacity() {
+        let mut heap = Heap::default();
+        let v = host_vec_with_capacity(&mut heap, &[Value::from(8i64)]);
+        assert!(host_vec_capacity(&mut heap, &[v]).as_int() >= 8);
+        host_vec_reserve(&mut heap, &[v, Value::from(64i64)]);
+        assert!(host_vec_capacity(&mut heap, &[v]).as_int() >= 64);
+    }
+
+    #[test]
+    fn pop_empty_is_none_and_nonempty_is_some() {
+        let mut heap = Heap::default();
+        let v = make_array(&mut heap, &[7, 8]);
+        let some = host_vec_pop(&mut heap, &[v]);
+        assert_eq!(option_some_int(&heap, some), 8);
+        assert_eq!(array_ints(&heap, v), vec![7]);
+        let _ = host_vec_pop(&mut heap, &[v]);
+        let none = host_vec_pop(&mut heap, &[v]);
+        assert_eq!(option_tag(&heap, none), 0);
+    }
+
+    #[test]
+    fn insert_clamps_negative_and_past_end() {
+        let mut heap = Heap::default();
+        let v = make_array(&mut heap, &[2, 3]);
+        host_vec_insert(
+            &mut heap,
+            &[v, Value::from(-5i64), Value::from(1i64)],
+        );
+        host_vec_insert(
+            &mut heap,
+            &[v, Value::from(99i64), Value::from(4i64)],
+        );
+        assert_eq!(array_ints(&heap, v), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn remove_oob_and_invalid_handle_are_none() {
+        let mut heap = Heap::default();
+        let v = make_array(&mut heap, &[10]);
+        let neg = host_vec_remove(&mut heap, &[v, Value::from(-1i64)]);
+        assert_eq!(option_tag(&heap, neg), 0);
+        let oob = host_vec_remove(&mut heap, &[v, Value::from(3i64)]);
+        assert_eq!(option_tag(&heap, oob), 0);
+        let bad = host_vec_remove(&mut heap, &[Value::from(0i64), Value::from(0i64)]);
+        assert_eq!(option_tag(&heap, bad), 0);
+    }
+
+    #[test]
+    fn clear_and_from_array_copy() {
+        let mut heap = Heap::default();
+        let src = make_array(&mut heap, &[1, 2]);
+        let dst = host_vec_from_array(&mut heap, &[src]);
+        host_vec_clear(&mut heap, &[dst]);
+        assert_eq!(array_ints(&heap, dst), Vec::<i64>::new());
+        assert_eq!(array_ints(&heap, src), vec![1, 2]);
+        let empty = host_vec_from_array(&mut heap, &[Value::from(0i64)]);
+        assert_eq!(array_ints(&heap, empty), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn wiring_names_are_stable() {
+        let names: Vec<&str> = VEC_WIRING.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            names,
+            [
+                "vec_with_capacity",
+                "vec_capacity",
+                "vec_reserve",
+                "vec_clear",
+                "vec_pop",
+                "vec_insert",
+                "vec_remove",
+                "vec_from_array",
+            ]
+        );
+    }
+}
