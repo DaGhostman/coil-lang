@@ -156,6 +156,11 @@ pub struct Checker {
     /// `use` of virtual exports. Reset + re-injected each `check_program`.
     scope_bindings: HashMap<String, BuiltinExport>,
 
+    /// Local names bound by disk-module `use` (e.g. `io::sync::write_all`).
+    /// Like virtual imports, these are file-level globals — not lambda/defer
+    /// captures — and must be rebound after `take_and_isolate`.
+    disk_imports: HashSet<String>,
+
     /// Type of the surrounding `match`'s LHS, if any. Used by
     /// [`Expression::Default`] arms.
     current_match_lhs: Option<Ty>,
