@@ -1321,6 +1321,69 @@ mod tests {
     }
 
     #[test]
+    fn write_from_rejects_negative_and_past_end_offset() {
+        let path = std::env::temp_dir().join("coil_io_write_from_bad.bin");
+        let mut heap = Heap::default();
+        let buf = make_byte_array(&mut heap, b"abcd");
+        let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open");
+        assert_eq!(
+            stream_write_from(&mut heap, w, buf, -1).unwrap_err(),
+            IoErrorTag::InvalidInput
+        );
+        assert_eq!(
+            stream_write_from(&mut heap, w, buf, 5).unwrap_err(),
+            IoErrorTag::InvalidInput
+        );
+        stream_close(&mut heap, w).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_from_at_len_is_empty_write() {
+        let path = std::env::temp_dir().join("coil_io_write_from_at_len.bin");
+        let mut heap = Heap::default();
+        let buf = make_byte_array(&mut heap, b"xyz");
+        let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open");
+        assert_eq!(stream_write_from(&mut heap, w, buf, 3).expect("write"), 0);
+        stream_close(&mut heap, w).unwrap();
+        let r = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open r");
+        let got = stream_read_to_end(&mut heap, r).expect("read");
+        stream_close(&mut heap, r).unwrap();
+        assert_eq!(array_bytes(&heap, got), b"");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_from_mid_offset_writes_suffix() {
+        let path = std::env::temp_dir().join("coil_io_write_from_mid.bin");
+        let mut heap = Heap::default();
+        let buf = make_byte_array(&mut heap, b"XXXhello");
+        let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open");
+        let n = stream_write_from(&mut heap, w, buf, 3).expect("write_from");
+        assert_eq!(n, 5);
+        stream_close(&mut heap, w).unwrap();
+        let r = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open r");
+        let got = stream_read_to_end(&mut heap, r).expect("read");
+        stream_close(&mut heap, r).unwrap();
+        assert_eq!(array_bytes(&heap, got), b"hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_exact_empty_buffer_returns_zero() {
+        let path = std::env::temp_dir().join("coil_io_read_exact_empty.bin");
+        {
+            let _f = std::fs::File::create(&path).unwrap();
+        }
+        let mut heap = Heap::default();
+        let s = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open");
+        let buf = make_byte_array(&mut heap, &[]);
+        assert_eq!(stream_read_exact(&mut heap, s, buf).expect("read_exact"), Some(0));
+        stream_close(&mut heap, s).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn empty_file_read_returns_eof_none() {
         let path = std::env::temp_dir().join("coil_io_unit_eof.bin");
         {
