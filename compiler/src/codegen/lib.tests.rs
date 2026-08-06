@@ -2791,6 +2791,27 @@ fn main() { write(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
         );
     }
 
+    /// `return match { … => self(...) }` arms must also emit TailCall.
+    #[test]
+    fn tail_match_self_calls_emit_tail_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn bounce(Option o) -> int { \
+return match o { \
+Option::None => bounce(Option::Some(0)), \
+Option::Some(_) => bounce(Option::None), \
+}; \
+} \
+fn main() { write(stdout(), to_bytes(format(\"%i\", bounce(Option::None)))); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            "expected TailCall from tail-match self calls; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Tiny `add` is inlined at direct call sites (arithmetic in main bytecode).
     #[test]
     fn tiny_add_inlined_at_call_site() {
@@ -4101,6 +4122,27 @@ fn main() {
             "UnboxValue operand should be ValueTag::Int ({}), got: {:?}",
             common::ValueTag::Int as u32,
             unbox_ops
+        );
+    }
+
+    /// Generic functions returning ADTs must not emit a primitive UnboxValue
+    /// on the call result (that would turn a valid heap object into garbage).
+    #[test]
+    fn generic_fn_returning_option_does_not_unbox_enum() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn some_of<T>(T x) -> Option<T> { return Option::Some(x); } \
+fn main() { let _ = some_of(7); }",
+        );
+        let opcodes: Vec<_> = bc.iter().map(|b| b.bytecode()).collect();
+        let last_call = opcodes
+            .iter()
+            .rposition(|op| matches!(op, Instruction::CALL | Instruction::TailCall))
+            .expect("expected a CALL to some_of");
+        assert!(
+            !matches!(opcodes.get(last_call + 1), Some(Instruction::UnboxValue)),
+            "Option return must not be UnboxValue'd after CALL; near: {:?}",
+            &opcodes[last_call.saturating_sub(2)..(last_call + 3).min(opcodes.len())]
         );
     }
 
