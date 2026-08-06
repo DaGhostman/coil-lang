@@ -25,11 +25,11 @@ enum Json {
     JsonInt(int),
     JsonFloat(float),
     JsonStr(string),
-    JsonArray([Json]),
-    JsonObject([string], [Json]),
+    JsonArray(Vec<Json>),
+    JsonObject(Vec<string>, Vec<Json>),
 }
 
-fn skip_ws([byte] b, int i) -> int {
+fn skip_ws(Vec<byte> b, int i) -> int {
     while i < len(b) {
         if !is_space(b[i]) {
             break;
@@ -40,10 +40,10 @@ fn skip_ws([byte] b, int i) -> int {
 }
 
 /// Append every byte of `extra` onto `out` (in-place growth; avoids concat copies).
-fn append_bytes([byte] out, [byte] extra) -> [byte] {
+fn append_bytes(Vec<byte> out, Vec<byte> extra) -> Vec<byte> {
     let i = 0;
     while i < len(extra) {
-        out[] = extra[i];
+        out.push(extra[i]);
         i = i + 1;
     }
     return out;
@@ -91,7 +91,7 @@ fn float_to_dec(float f) -> string {
     return body;
 }
 
-fn parse_literal([byte] b, int i, string lit, Json val) -> Result<(Json, int), JsonError> {
+fn parse_literal(Vec<byte> b, int i, string lit, Json val) -> Result<(Json, int), JsonError> {
     let lb = to_bytes(lit);
     let n = len(lb);
     if i + n > len(b) {
@@ -108,20 +108,20 @@ fn parse_literal([byte] b, int i, string lit, Json val) -> Result<(Json, int), J
 }
 
 /// Encode a Unicode scalar (0..=0x10FFFF, non-surrogate) as UTF-8 into `out`.
-fn append_utf8([byte] out, int cp) -> Result<[byte], JsonError> {
+fn append_utf8(Vec<byte> out, int cp) -> Result<Vec<byte>, JsonError> {
     if cp < 0 {
         raise JsonError::JsonBadEscape;
     }
     if cp <= 127 {
         let b: byte = cp as byte;
-        out[] = b;
+        out.push(b);
         return out;
     }
     if cp <= 2047 {
         let t0: int = 192 + (cp / 64);
         let t1: int = 128 + (cp % 64);
-        out[] = t0 as byte;
-        out[] = t1 as byte;
+        out.push(t0 as byte);
+        out.push(t1 as byte);
         return out;
     }
     if cp >= 55296 {
@@ -133,9 +133,9 @@ fn append_utf8([byte] out, int cp) -> Result<[byte], JsonError> {
         let t0: int = 224 + (cp / 4096);
         let t1: int = 128 + ((cp / 64) % 64);
         let t2: int = 128 + (cp % 64);
-        out[] = t0 as byte;
-        out[] = t1 as byte;
-        out[] = t2 as byte;
+        out.push(t0 as byte);
+        out.push(t1 as byte);
+        out.push(t2 as byte);
         return out;
     }
     if cp > 1114111 {
@@ -145,14 +145,14 @@ fn append_utf8([byte] out, int cp) -> Result<[byte], JsonError> {
     let t1: int = 128 + ((cp / 4096) % 64);
     let t2: int = 128 + ((cp / 64) % 64);
     let t3: int = 128 + (cp % 64);
-    out[] = t0 as byte;
-    out[] = t1 as byte;
-    out[] = t2 as byte;
-    out[] = t3 as byte;
+    out.push(t0 as byte);
+    out.push(t1 as byte);
+    out.push(t2 as byte);
+    out.push(t3 as byte);
     return out;
 }
 
-fn parse_hex4([byte] b, int i) -> Result<(int, int), JsonError> {
+fn parse_hex4(Vec<byte> b, int i) -> Result<(int, int), JsonError> {
     if i + 4 > len(b) {
         raise JsonError::JsonUnexpectedEnd;
     }
@@ -169,7 +169,7 @@ fn parse_hex4([byte] b, int i) -> Result<(int, int), JsonError> {
     return (v, i + 4);
 }
 
-fn append_escape([byte] out, [byte] b, int i) -> Result<([byte], int), JsonError> {
+fn append_escape(Vec<byte> out, Vec<byte> b, int i) -> Result<(Vec<byte>, int), JsonError> {
     let q: byte = "\"";
     let bs: byte = "\\";
     let sl: byte = "/";
@@ -184,35 +184,35 @@ fn append_escape([byte] out, [byte] b, int i) -> Result<([byte], int), JsonError
     }
     let e = b[i];
     if e == q {
-        out[] = 34;
+        out.push(34);
         return (out, i + 1);
     }
     if e == bs {
-        out[] = 92;
+        out.push(92);
         return (out, i + 1);
     }
     if e == sl {
-        out[] = 47;
+        out.push(47);
         return (out, i + 1);
     }
     if e == bch {
-        out[] = 8;
+        out.push(8);
         return (out, i + 1);
     }
     if e == fch {
-        out[] = 12;
+        out.push(12);
         return (out, i + 1);
     }
     if e == nch {
-        out[] = "\n";
+        out.push("\n");
         return (out, i + 1);
     }
     if e == rch {
-        out[] = "\r";
+        out.push("\r");
         return (out, i + 1);
     }
     if e == tch {
-        out[] = "\t";
+        out.push("\t");
         return (out, i + 1);
     }
     if e == uch {
@@ -224,7 +224,7 @@ fn append_escape([byte] out, [byte] b, int i) -> Result<([byte], int), JsonError
     raise JsonError::JsonBadEscape;
 }
 
-fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
+fn parse_string_raw(Vec<byte> b, int i) -> Result<(string, int), JsonError> {
     let q: byte = "\"";
     let bs: byte = "\\";
     if i >= len(b) {
@@ -234,7 +234,7 @@ fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
         raise JsonError::JsonBadString;
     }
     i = i + 1;
-    let out: [byte] = [];
+    let out: Vec<byte> = Vec::new();
     while i < len(b) {
         let c = b[i];
         if c == q {
@@ -254,14 +254,14 @@ fn parse_string_raw([byte] b, int i) -> Result<(string, int), JsonError> {
             if c < ctrl {
                 raise JsonError::JsonBadString;
             }
-            out[] = c;
+            out.push(c);
             i = i + 1;
         }
     }
     raise JsonError::JsonUnexpectedEnd;
 }
 
-fn parse_int_bytes([byte] b) -> Result<int, JsonError> {
+fn parse_int_bytes(Vec<byte> b) -> Result<int, JsonError> {
     let minus: byte = "-";
     let i = 0;
     let neg = 0;
@@ -290,7 +290,7 @@ fn parse_int_bytes([byte] b) -> Result<int, JsonError> {
     return n;
 }
 
-fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
+fn parse_float_bytes(Vec<byte> b) -> Result<float, JsonError> {
     let minus: byte = "-";
     let dot: byte = ".";
     let e_lo: byte = "e";
@@ -386,7 +386,7 @@ fn parse_float_bytes([byte] b) -> Result<float, JsonError> {
     return val;
 }
 
-fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
+fn parse_number(Vec<byte> b, int i) -> Result<(Json, int), JsonError> {
     let minus: byte = "-";
     let dot: byte = ".";
     let e_lo: byte = "e";
@@ -489,7 +489,7 @@ fn parse_number([byte] b, int i) -> Result<(Json, int), JsonError> {
 
 /// Recursive descent entry — arrays/objects call back into this function.
 #[max_depth(256)]
-fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
+fn parse_value(Vec<byte> b, int i) -> Result<(Json, int), JsonError> {
     let q: byte = "\"";
     let lbr: byte = "[";
     let rbr: byte = "]";
@@ -530,7 +530,7 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
     }
     if c == lbr {
         i = skip_ws(b, i + 1);
-        let items: [Json] = [];
+        let items: Vec<Json> = Vec::new();
         if i < len(b) {
             if b[i] == rbr {
                 return (Json::JsonArray(items), i + 1);
@@ -540,7 +540,7 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
         while done == 0 {
             let pair = parse_value(b, i)?;
             let (jv, ni) = pair;
-            items[] = jv;
+            items.push(jv);
             i = skip_ws(b, ni);
             if i >= len(b) {
                 raise JsonError::JsonUnexpectedEnd;
@@ -563,8 +563,8 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
     }
     if c == lbrace {
         i = skip_ws(b, i + 1);
-        let keys: [string] = [];
-        let vals: [Json] = [];
+        let keys: Vec<string> = Vec::new();
+        let vals: Vec<Json> = Vec::new();
         if i < len(b) {
             if b[i] == rbrace {
                 return (Json::JsonObject(keys, vals), i + 1);
@@ -583,8 +583,8 @@ fn parse_value([byte] b, int i) -> Result<(Json, int), JsonError> {
             }
             let vp = parse_value(b, i + 1)?;
             let (jv, after_val) = vp;
-            keys[] = key;
-            vals[] = jv;
+            keys.push(key);
+            vals.push(jv);
             i = skip_ws(b, after_val);
             if i >= len(b) {
                 raise JsonError::JsonUnexpectedEnd;
@@ -620,20 +620,20 @@ fn parse(string s) -> Result<Json, JsonError> {
     return v;
 }
 
-fn append_u_escape([byte] out, int cp) -> [byte] {
-    out[] = 92;
-    out[] = 117;
-    out[] = hex_digit((cp / 4096) % 16);
-    out[] = hex_digit((cp / 256) % 16);
-    out[] = hex_digit((cp / 16) % 16);
-    out[] = hex_digit(cp % 16);
+fn append_u_escape(Vec<byte> out, int cp) -> Vec<byte> {
+    out.push(92);
+    out.push(117);
+    out.push(hex_digit((cp / 4096) % 16));
+    out.push(hex_digit((cp / 256) % 16));
+    out.push(hex_digit((cp / 16) % 16));
+    out.push(hex_digit(cp % 16));
     return out;
 }
 
-fn escape_string(string s) -> [byte] {
+fn escape_string(string s) -> Vec<byte> {
     let b = to_bytes(s);
-    let out: [byte] = [];
-    out[] = 34;
+    let out: Vec<byte> = Vec::new();
+    out.push(34);
     let i = 0;
     let q: byte = "\"";
     let bs: byte = "\\";
@@ -644,28 +644,28 @@ fn escape_string(string s) -> [byte] {
         let c = b[i];
         let special = 0;
         if c == q {
-            out[] = 92;
-            out[] = 34;
+            out.push(92);
+            out.push(34);
             special = 1;
         }
         if c == bs {
-            out[] = 92;
-            out[] = 92;
+            out.push(92);
+            out.push(92);
             special = 1;
         }
         if c == lf {
-            out[] = 92;
-            out[] = 110;
+            out.push(92);
+            out.push(110);
             special = 1;
         }
         if c == cr {
-            out[] = 92;
-            out[] = 114;
+            out.push(92);
+            out.push(114);
             special = 1;
         }
         if c == tab {
-            out[] = 92;
-            out[] = 116;
+            out.push(92);
+            out.push(116);
             special = 1;
         }
         if special == 0 {
@@ -673,26 +673,26 @@ fn escape_string(string s) -> [byte] {
             if ci < 32 {
                 out = append_u_escape(out, ci);
             } else {
-                out[] = c;
+                out.push(c);
             }
         }
         i = i + 1;
     }
-    out[] = 34;
+    out.push(34);
     return out;
 }
 
 #[max_depth(256)]
-fn stringify_bytes(Json v) -> [byte] {
-    let out: [byte] = [];
+fn stringify_bytes(Json v) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let kind = 0;
     let bool_v = false;
     let int_v = 0;
     let float_v = 0.0;
     let str_v = "";
-    let arr: [Json] = [];
-    let keys: [string] = [];
-    let vals: [Json] = [];
+    let arr: Vec<Json> = Vec::new();
+    let keys: Vec<string> = Vec::new();
+    let vals: Vec<Json> = Vec::new();
     match v {
         Json::JsonNull => {
             kind = 0;
@@ -749,30 +749,30 @@ fn stringify_bytes(Json v) -> [byte] {
         return escape_string(str_v);
     }
     if kind == 5 {
-        out[] = 91;
+        out.push(91);
         let i = 0;
         while i < len(arr) {
             if i > 0 {
-                out[] = 44;
+                out.push(44);
             }
             out = append_bytes(out, stringify_bytes(arr[i]));
             i = i + 1;
         }
-        out[] = 93;
+        out.push(93);
         return out;
     }
-    out[] = 123;
+    out.push(123);
     let i = 0;
     while i < len(keys) {
         if i > 0 {
-            out[] = 44;
+            out.push(44);
         }
         out = append_bytes(out, escape_string(keys[i]));
-        out[] = ":";
+        out.push(":");
         out = append_bytes(out, stringify_bytes(vals[i]));
         i = i + 1;
     }
-    out[] = 125;
+    out.push(125);
     return out;
 }
 
@@ -823,10 +823,10 @@ fn json_str(string s) -> Json {
     return Json::JsonStr(s);
 }
 
-fn json_array([Json] items) -> Json {
+fn json_array(Vec<Json> items) -> Json {
     return Json::JsonArray(items);
 }
 
-fn json_object([string] keys, [Json] vals) -> Json {
+fn json_object(Vec<string> keys, Vec<Json> vals) -> Json {
     return Json::JsonObject(keys, vals);
 }

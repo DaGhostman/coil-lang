@@ -1,12 +1,12 @@
 // Collection helpers (userland): sort, reverse, range materialize.
 
 /// Stable-ish bubble sort for `Ord` elements (new array; input unchanged).
-fn sort<T: Ord>([T] arr) -> [T] {
+fn sort<T: Ord>(Vec<T> arr) -> Vec<T> {
     let n = len(arr);
-    let out: [T] = [];
+    let out: Vec<T> = Vec::new();
     let i = 0;
     while i < n {
-        out[] = arr[i];
+        out.push(arr[i]);
         i = i + 1;
     }
     let a = 0;
@@ -26,31 +26,31 @@ fn sort<T: Ord>([T] arr) -> [T] {
 }
 
 /// Reverse a copy of `arr`.
-fn reverse<T>([T] arr) -> [T] {
+fn reverse<T>(Vec<T> arr) -> Vec<T> {
     let n = len(arr);
-    let out: [T] = [];
+    let out: Vec<T> = Vec::new();
     let i = n;
     while i > 0 {
         i = i - 1;
-        out[] = arr[i];
+        out.push(arr[i]);
     }
     return out;
 }
 
 /// Materialize a lazy `Range<int>` into a dynamic array.
-fn collect_ints(Range<int> r) -> [int] {
-    let out: [int] = [];
+fn collect_ints(Range<int> r) -> Vec<int> {
+    let out: Vec<int> = Vec::new();
     for x in r {
-        out[] = x;
+        out.push(x);
     }
     return out;
 }
 
 /// Materialize a lazy inclusive `RangeInclusive<int>`.
-fn collect_ints_inclusive(RangeInclusive<int> r) -> [int] {
-    let out: [int] = [];
+fn collect_ints_inclusive(RangeInclusive<int> r) -> Vec<int> {
+    let out: Vec<int> = Vec::new();
     for x in r {
-        out[] = x;
+        out.push(x);
     }
     return out;
 }

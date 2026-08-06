@@ -36,8 +36,8 @@ fn join(string a, string b) -> Result<string, IoError> {
     if b_starts {
         return from_bytes(bytes_concat(ab, bb))?;
     }
-    let slash: [byte] = [];
-    slash[] = 47;
+    let slash: Vec<byte> = Vec::new();
+    slash.push(47);
     return from_bytes(bytes_concat(bytes_concat(ab, slash), bb))?;
 }
 

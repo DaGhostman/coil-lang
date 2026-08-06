@@ -15,7 +15,7 @@ use bytes::{
 };
 use ascii::{is_space};
 
-fn utf8_ok([byte] b) -> Result<string, string> {
+fn utf8_ok(Vec<byte> b) -> Result<string, string> {
     return match from_bytes(b) {
         Result::Ok(s) => s,
         Result::Err(_) => raise "utf8",
@@ -83,12 +83,12 @@ fn find(string hay, string needle) -> int {
 }
 
 /// Split `s` on every occurrence of `sep` (byte-exact). Empty sep → `[s]`.
-fn split(string s, string sep) -> Result<[string], string> {
-    let out: [string] = [];
+fn split(string s, string sep) -> Result<Vec<string>, string> {
+    let out: Vec<string> = Vec::new();
     let hay = to_bytes(s);
     let needle = to_bytes(sep);
     if len(needle) == 0 {
-        out[] = s;
+        out.push(s);
         return out;
     }
     let start = 0;
@@ -98,12 +98,12 @@ fn split(string s, string sep) -> Result<[string], string> {
         let rel = bytes_find(rest, needle);
         if rel < 0 {
             let part = utf8_ok(rest)?;
-            out[] = part;
+            out.push(part);
             done = true;
         }
         if rel >= 0 {
             let part = utf8_ok(bytes_slice(hay, start, start + rel))?;
-            out[] = part;
+            out.push(part);
             start = start + rel + len(needle);
         }
     }
@@ -130,7 +130,7 @@ fn replace(string s, string old, string new) -> Result<string, string> {
 }
 
 /// Join strings with `sep` between adjacent parts.
-fn join([string] parts, string sep) -> string {
+fn join(Vec<string> parts, string sep) -> string {
     let out = "";
     let i = 0;
     while i < len(parts) {
@@ -173,9 +173,9 @@ fn pad_right(string s, int width, string fill) -> Result<string, string> {
 }
 
 /// Split on LF and strip one optional CR from each resulting line.
-fn lines(string s) -> Result<[string], string> {
+fn lines(string s) -> Result<Vec<string>, string> {
     let b = to_bytes(s);
-    let out: [string] = [];
+    let out: Vec<string> = Vec::new();
     let start = 0;
     let i = 0;
     let n = len(b);
@@ -191,7 +191,7 @@ fn lines(string s) -> Result<[string], string> {
                 Result::Ok(x) => x,
                 Result::Err(_) => raise "utf8",
             };
-            out[] = piece;
+            out.push(piece);
             start = i + 1;
         }
         i = i + 1;
@@ -207,7 +207,7 @@ fn lines(string s) -> Result<[string], string> {
             Result::Ok(x) => x,
             Result::Err(_) => raise "utf8",
         };
-        out[] = piece;
+        out.push(piece);
     }
     return out;
 }
@@ -225,7 +225,7 @@ fn eq(string a, string b) -> bool {
 /// ASCII lower-case A..=Z only; other bytes unchanged.
 fn to_lower(string s) -> Result<string, string> {
     let b = to_bytes(s);
-    let out: [byte] = [];
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     let a_up: byte = "A";
     let z_up: byte = "Z";
@@ -235,14 +235,14 @@ fn to_lower(string s) -> Result<string, string> {
             if c <= z_up {
                 let n = (c as int) + 32;
                 let lo = n as byte;
-                out[] = lo;
+                out.push(lo);
             }
             if c > z_up {
-                out[] = c;
+                out.push(c);
             }
         }
         if c < a_up {
-            out[] = c;
+            out.push(c);
         }
         i = i + 1;
     }
@@ -252,7 +252,7 @@ fn to_lower(string s) -> Result<string, string> {
 /// ASCII upper-case a..=z only; other bytes unchanged.
 fn to_upper(string s) -> Result<string, string> {
     let b = to_bytes(s);
-    let out: [byte] = [];
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     let a_lo: byte = "a";
     let z_lo: byte = "z";
@@ -262,14 +262,14 @@ fn to_upper(string s) -> Result<string, string> {
             if c <= z_lo {
                 let n = (c as int) - 32;
                 let up = n as byte;
-                out[] = up;
+                out.push(up);
             }
             if c > z_lo {
-                out[] = c;
+                out.push(c);
             }
         }
         if c < a_lo {
-            out[] = c;
+            out.push(c);
         }
         i = i + 1;
     }
