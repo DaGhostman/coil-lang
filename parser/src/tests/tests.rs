@@ -589,7 +589,7 @@
                 assert_eq!(arms.len(), 2);
 
                 let MatchArm { pattern, body } = &arms[0];
-                match pattern {
+                match &pattern.1 {
                     Pattern::Constructor {
                         enum_name,
                         variant_name,
@@ -607,7 +607,7 @@
                 }
 
                 let MatchArm { pattern, body } = &arms[1];
-                match pattern {
+                match &pattern.1 {
                     Pattern::Constructor {
                         enum_name,
                         variant_name,
@@ -618,7 +618,7 @@
                         match payload {
                             PatternPayload::Tuple(parts) => {
                                 assert_eq!(parts.len(), 1);
-                                match &parts[0] {
+                                match &parts[0].1 {
                                     Pattern::Binding { name } => assert_eq!(*name, "v"),
                                     other => panic!("expected Binding(v), got {:?}", other),
                                 }
@@ -769,7 +769,7 @@
             other => other,
         };
         match inner {
-            Expression::Match { arms, .. } => match &arms[0].pattern {
+            Expression::Match { arms, .. } => match &arms[0].pattern.1 {
                 Pattern::Constructor {
                     enum_name,
                     variant_name,
@@ -782,11 +782,11 @@
                             assert_eq!(fields.len(), 2);
                             assert_eq!(fields[0].name, "x");
                             assert_eq!(fields[1].name, "y");
-                            match &fields[0].pattern {
+                            match &fields[0].pattern.1 {
                                 Pattern::Binding { name } => assert_eq!(*name, "x"),
                                 other => panic!("expected Binding(x), got {:?}", other),
                             }
-                            match &fields[1].pattern {
+                            match &fields[1].pattern.1 {
                                 Pattern::Binding { name } => assert_eq!(*name, "y"),
                                 other => panic!("expected Binding(y), got {:?}", other),
                             }
@@ -810,7 +810,7 @@
         match inner1 {
             Expression::Match { arms, .. } => {
                 assert_eq!(arms.len(), 1);
-                assert!(matches!(arms[0].pattern, Pattern::Wildcard));
+                assert!(matches!(arms[0].pattern.1, Pattern::Wildcard));
             }
             other => panic!("expected Match, got {:?}", other),
         }
@@ -823,7 +823,7 @@
         match inner2 {
             Expression::Match { arms, .. } => {
                 assert_eq!(arms.len(), 1);
-                assert!(matches!(arms[0].pattern, Pattern::Wildcard));
+                assert!(matches!(arms[0].pattern.1, Pattern::Wildcard));
             }
             other => panic!("expected Match, got {:?}", other),
         }
@@ -839,7 +839,7 @@
         match inner {
             Expression::Match { arms, .. } => {
                 assert_eq!(arms.len(), 1);
-                match &arms[0].pattern {
+                match &arms[0].pattern.1 {
                     Pattern::Constructor {
                         enum_name,
                         variant_name,
@@ -850,7 +850,7 @@
                         match payload {
                             PatternPayload::Tuple(parts) => {
                                 assert_eq!(parts.len(), 1);
-                                match &parts[0] {
+                                match &parts[0].1 {
                                     Pattern::Constructor {
                                         enum_name: inner_enum,
                                         variant_name: inner_variant,
@@ -861,7 +861,7 @@
                                         match inner_payload {
                                             PatternPayload::Tuple(inner_parts) => {
                                                 assert_eq!(inner_parts.len(), 1);
-                                                match &inner_parts[0] {
+                                                match &inner_parts[0].1 {
                                                     Pattern::Binding { name } => {
                                                         assert_eq!(*name, "v")
                                                     }

@@ -1339,3 +1339,44 @@
             other => panic!("expected Function, got {:?}", other),
         }
     }
+
+    #[test]
+    fn nested_array_type_annotation_parses() {
+        use chumsky::Parser;
+
+        let option_array = Pratt::default()
+            .type_annotation()
+            .parse("[Option<int>]")
+            .into_result()
+            .expect("parse [Option<int>] failed");
+        match option_array.1.as_ref() {
+            Expression::Array(items) if items.len() == 1 => match items[0].1.as_ref() {
+                Expression::TypeApp { name, args } => {
+                    assert_eq!(*name, "Option");
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(args[0].1.as_ref(), Expression::Type("int")));
+                }
+                other => panic!("expected TypeApp element, got {:?}", other),
+            },
+            other => panic!("expected [Option<int>], got {:?}", other),
+        }
+
+        let nested = Pratt::default()
+            .type_annotation()
+            .parse("[[int; N]; M]")
+            .into_result()
+            .expect("parse [[int; N]; M] failed");
+        match nested.1.as_ref() {
+            Expression::Array(outer) if outer.len() == 2 => {
+                match outer[0].1.as_ref() {
+                    Expression::Array(inner) if inner.len() == 2 => {
+                        assert!(matches!(inner[0].1.as_ref(), Expression::Type("int")));
+                        assert!(matches!(inner[1].1.as_ref(), Expression::Type("N")));
+                    }
+                    other => panic!("expected inner [int; N], got {:?}", other),
+                }
+                assert!(matches!(outer[1].1.as_ref(), Expression::Type("M")));
+            }
+            other => panic!("expected [[int; N]; M], got {:?}", other),
+        }
+    }

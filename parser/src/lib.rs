@@ -5,7 +5,8 @@
 use ast::{
     AdjustOp, AssignOp, AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload,
     Expression, FieldModifier, LetFieldPattern, LetPattern, MatchArm, Output, Pattern,
-    PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
+    PatternField, PatternOutput, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam,
+    Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -178,16 +179,19 @@ impl<'pratt> Pratt<'pratt> {
             + 'pratt,
     {
         use chumsky::Parser;
-        let array_type = text::ident()
-            .padded()
-            .map_with(output!(Type))
+        let array_type = type_ann
+            .clone()
             .then(
                 op!(";")
                     .ignore_then(
-                        text::int(10)
-                            .to_slice()
-                            .from_str::<i64>()
-                            .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
+                        choice((
+                            text::int(10)
+                                .to_slice()
+                                .from_str::<i64>()
+                                .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0))
+                                .map_with(|n, e| (e.span(), Box::new(Expression::Integer(n)))),
+                            text::ident().padded().map_with(output!(Type)),
+                        )),
                     )
                     .or_not(),
             )
@@ -195,10 +199,7 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(elem, n_opt), e| match n_opt {
                 Some(n) => (
                     e.span(),
-                    Box::new(Expression::Array(vec![
-                        elem,
-                        (e.span(), Box::new(Expression::Integer(n))),
-                    ])),
+                    Box::new(Expression::Array(vec![elem, n])),
                 ),
                 None => (e.span(), Box::new(Expression::Array(vec![elem]))),
             });
@@ -2998,24 +2999,16 @@ impl<'pratt> Pratt<'pratt> {
     /// A match-arm pattern: wildcard, binding, or qualified constructor (tuple or record payload).
     fn pattern(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, Pattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    ) -> impl Parser<'pratt, &'pratt str, PatternOutput<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         recursive(|pattern_parser| {
-            // Record-pattern field. Two shapes:
-            //   - `name`            → shorthand: desugars to
-            //                         `PatternField { name, pattern: Binding(name) }`
-            //   - `name : pattern`  → explicit binding / sub-pattern.
-            //
-            // Duplicate field names are deduplicated silently (the
-            // first wins). The typechecker reports the rest as
-            // "extra field".
             let record_pattern_field = text::ident()
                 .padded()
                 .then(op!(":").ignore_then(pattern_parser.clone()).or_not())
-                .map_with(|(name, sub_pat), _| {
+                .map_with(|(name, sub_pat), e| {
                     let pattern = match sub_pat {
                         Some(p) => p,
-                        None => Pattern::Binding { name },
+                        None => (e.span(), Pattern::Binding { name }),
                     };
                     PatternField { name, pattern }
                 })
@@ -3062,25 +3055,27 @@ impl<'pratt> Pratt<'pratt> {
                 .then(text::ident().padded())
                 .then(payload_choice)
                 .map_with(
-                    |((enum_name, variant_name), payload), _| Pattern::Constructor {
-                        enum_name,
-                        variant_name,
-                        payload,
+                    |((enum_name, variant_name), payload), e| {
+                        (
+                            e.span(),
+                            Pattern::Constructor {
+                                enum_name,
+                                variant_name,
+                                payload,
+                            },
+                        )
                     },
                 );
 
             choice((
-                // `_` and `default` both parse to the same wildcard
-                // node — the literal token is discarded (Decision C).
-                just("_").padded().to(Pattern::Wildcard),
-                keyword!("default").to(Pattern::Wildcard),
+                just("_")
+                    .padded()
+                    .map_with(|_, e| (e.span(), Pattern::Wildcard)),
+                keyword!("default").map_with(|_, e| (e.span(), Pattern::Wildcard)),
                 constructor,
-                // Bare identifier — binds the scrutinee. Tried after
-                // `constructor` so a name followed by `::` is taken
-                // as a constructor, not a binding.
                 text::ident()
                     .padded()
-                    .map_with(|name, _| Pattern::Binding { name }),
+                    .map_with(|name, e| (e.span(), Pattern::Binding { name })),
             ))
         })
     }

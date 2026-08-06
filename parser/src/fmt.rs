@@ -2,6 +2,7 @@
 //!
 //! Preserves `//` comments and emits attached `///` docs on declarations.
 
+use chumsky::span::SimpleSpan;
 use crate::ast::{
     AdjustOp, AssignOp, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
     ExternStructDecl, Expression, FieldModifier, LetPattern, Output, Pattern, RecordFieldDecl,
@@ -1694,8 +1695,8 @@ impl Formatter {
         }
     }
 
-    fn fmt_pattern(&mut self, pattern: &Pattern<'_>) {
-        self.push_str(&pattern.to_string());
+    fn fmt_pattern(&mut self, pattern: &(SimpleSpan, Pattern<'_>)) {
+        self.push_str(&pattern.1.to_string());
     }
 
     fn fmt_let_pattern(&mut self, pattern: &LetPattern<'_>) {
