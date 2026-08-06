@@ -368,6 +368,7 @@ Bare `[T]` (no `; N`) is rejected at typecheck (`E0119`).
 | `match` exhaustiveness | Checked post-inference; non-exhaustive match → diagnostic |
 | Format strings | `string::format("%i", x)` validates specifier vs argument type |
 | `impl` methods | `self` is implicit first parameter of owner class type |
+| API style | Prefer inherent/`impl` methods over free functions for type-tied ops (`m.insert` not `insert(m)`); virtual-module host primitives (`io::read`) stay free fns |
 
 ---
 
@@ -845,7 +846,7 @@ binder (rigid variables) and rejects escaping skolems. A polymorphic
 generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
-See `examples/generics.hy`, `examples/trait_dict.hy`,
+See `examples/generics.hy`, `examples/typeclass_dict.hy`,
 `examples/existential_show.hy`, `examples/hkt_container.hy`,
 `examples/hkt_bifunctor.hy`, `examples/multiparam.hy`,
 `examples/constraint_kind.hy`, `examples/superclass_ord.hy`,
