@@ -1995,10 +1995,16 @@ impl Compiler {
         self.context.stack_array_locals.get(name).copied()
     }
 
-    /// Reserve `n` consecutive locals for a fixed array binding `name`.
+    /// Whether a fixed `[T; N]` local should use multi-slot stack layout.
     ///
-    /// Used for literal `[T; N]` locals with `1 <= N <= 3` (packed STORE width).
-    /// Larger or non-literal inits stay as a single heap `MakeArray` slot.
+    /// Any `N >= 1` qualifies: each element is one `Value` (immediate scalar or
+    /// heap pointer). Nested array *elements* still compile to heap `MakeArray`
+    /// and occupy a pointer slot in the outer spine.
+    fn stack_array_bind_len(ty: &crate::typechecking::Ty) -> Option<usize> {
+        Self::fixed_array_len(ty).filter(|&n| n >= 1)
+    }
+
+    /// Reserve `n` consecutive locals for a fixed array binding `name`.
     fn alloc_stack_array_slots(&mut self, name: &str, n: usize) -> u32 {
         let base = self.alloc_binding_slot(name);
         for i in 1..n {
@@ -2020,10 +2026,44 @@ impl Compiler {
         bytecode.push_make_array(n as u32);
     }
 
-    /// Store `n` stacked values (TOS = last element) into slots `base..base+n`.
-    fn emit_store_stack_array(&mut self, bytecode: &mut Vec<Byte>, base: u32, n: usize) {
-        for i in (0..n).rev() {
-            bytecode.push_store_pop(base + i as u32);
+    /// Emit a multi-slot stack-array init: one Value per slot, store immediately.
+    ///
+    /// Forward `emit; STORE` (not reverse bulk store) so values never pile into
+    /// the destination slot range. Shared-stack + post-STORE seek would otherwise
+    /// re-pop those slots when lower packs adjacent STOREs.
+    ///
+    /// Returns `true` for array literals and copies from another multi-slot local.
+    fn try_emit_stack_array_init(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        rhs: &Output,
+        base: u32,
+        n: usize,
+    ) -> bool {
+        let rhs_node = unwrap_expr_output(rhs);
+        match rhs_node.1.as_ref() {
+            Expression::Array(items) if items.len() == n => {
+                for (i, item) in items.iter().enumerate() {
+                    let mut bc = self.do_compile(item);
+                    bytecode.append(&mut bc);
+                    bytecode.push_store_pop(base + i as u32);
+                }
+                true
+            }
+            Expression::Identifier(src) => {
+                if let Some((src_base, src_n)) = self.stack_array_info(src)
+                    && src_n == n
+                {
+                    for i in 0..n {
+                        bytecode.push_load(src_base + i as u32);
+                        bytecode.push_store_pop(base + i as u32);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -6449,6 +6489,15 @@ impl Compiler {
                 )
             }
             Expression::Index(arr, Some(idx)) => {
+                if let Expression::Identifier(name) = arr.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(i) = idx.1.as_ref()
+                    && *i >= 0
+                    && (*i as usize) < n
+                {
+                    bytecode.push_load(base + *i as u32);
+                    return self.is_float_ty(target);
+                }
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(arr));
@@ -6587,6 +6636,23 @@ impl Compiler {
         }
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
+            // Const index into a multi-slot stack array → read/op/write slots.
+            // The heap path below boxes via Identifier escape and StoreIndex
+            // would mutate only that temporary.
+            if let Expression::Identifier(name) = arr.1.as_ref()
+                && let Some((base, n)) = self.stack_array_info(name)
+                && let Expression::Integer(i) = idx.1.as_ref()
+                && *i >= 0
+                && (*i as usize) < n
+            {
+                let slot = base + *i as u32;
+                let is_float = self.is_float_ty(target);
+                bytecode.push_load(slot);
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Self::binop_for_assign_op(op, is_float)));
+                bytecode.push_store_pop(slot);
+                return;
+            }
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -6638,6 +6704,21 @@ impl Compiler {
         };
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
+            if let Expression::Identifier(name) = arr.1.as_ref()
+                && let Some((base, n)) = self.stack_array_info(name)
+                && let Expression::Integer(i) = idx.1.as_ref()
+                && *i >= 0
+                && (*i as usize) < n
+            {
+                let slot = base + *i as u32;
+                let is_float = self.is_float_ty(target);
+                let instr = match op {
+                    parser::ast::AdjustOp::Inc => Instruction::INC,
+                    parser::ast::AdjustOp::Dec => Instruction::DEC,
+                };
+                bytecode.push(Byte::new(instr).with_inc_dec(slot, prefix, is_float));
+                return;
+            }
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -7588,33 +7669,66 @@ impl Compiler {
                             }
                             is_binding = true;
                         } else {
-                            // Fixed `[T; N]` locals: N consecutive slots (stack).
-                            // Detect before emitting the RHS so we do not leave a
-                            // heap MakeArray on the operand stack.
-                            let bind_ty = self
-                                .codegen_var_type_for(&name)
-                                .or_else(|| self.codegen_expr_ty(&children[1]));
-                            let fixed_n = bind_ty
-                                .as_ref()
-                                .and_then(|ty| Self::fixed_array_len(ty));
+                            // Fixed `[T; N]` locals (`N >= 1`): N consecutive slots.
+                            // Element Values may be immediates or heap pointers;
+                            // nested array *elements* compile to MakeArray and
+                            // occupy one pointer slot each in the outer spine.
+                            // Layout decision is structural where possible: array
+                            // literal length, or copy from a known multi-slot local.
+                            // Flat `codegen_var_type` is last-wins across functions
+                            // (sibling tests often reuse `a`/`b`), so it must not be
+                            // the sole source of `N`.
                             let rhs_node = unwrap_expr_output(&children[1]);
-                            if let Some(n) = fixed_n.filter(|&n| (1..=3).contains(&n))
-                                && let Expression::Array(items) = rhs_node.1.as_ref()
-                                && items.len() == n
-                                && items.iter().all(|it| {
-                                    matches!(
-                                        unwrap_expr_output(it).1.as_ref(),
-                                        Expression::Integer(_)
+                            let bind_ty = self
+                                .expr_codegen_ty(rhs_node)
+                                .or_else(|| self.codegen_expr_ty(&children[1]))
+                                .or_else(|| {
+                                    self.checker.lookup_for_codegen_span(
+                                        children[0].0.start,
+                                        children[0].0.end,
                                     )
                                 })
-                            {
-                                for item in items {
-                                    let mut bc = self.do_compile(item);
-                                    bytecode.append(&mut bc);
+                                .or_else(|| self.codegen_var_type_for(&name));
+                            let fixed_n = bind_ty
+                                .as_ref()
+                                .and_then(|ty| Self::stack_array_bind_len(ty));
+                            let stack_n = match rhs_node.1.as_ref() {
+                                Expression::Array(items) if items.len() >= 1 => Some(items.len()),
+                                Expression::Identifier(src) => {
+                                    self.stack_array_info(src).map(|(_, sn)| sn)
                                 }
-                                let base = self.alloc_stack_array_slots(&name, n);
-                                self.emit_store_stack_array(&mut bytecode, base, n);
-                                is_binding = true;
+                                _ => None,
+                            }
+                            .or(fixed_n);
+                            if let Some(n) = stack_n {
+                                let can_stack = match rhs_node.1.as_ref() {
+                                    Expression::Array(items) if items.len() == n => true,
+                                    Expression::Identifier(src) => self
+                                        .stack_array_info(src)
+                                        .is_some_and(|(_, sn)| sn == n),
+                                    _ => false,
+                                };
+                                if can_stack {
+                                    let base = self.alloc_stack_array_slots(&name, n);
+                                    let ok = self.try_emit_stack_array_init(
+                                        &mut bytecode,
+                                        &children[1],
+                                        base,
+                                        n,
+                                    );
+                                    debug_assert!(ok, "can_stack implies init emit");
+                                    is_binding = true;
+                                } else if rhs_is_match {
+                                    self.emit_binding_rhs(&children[1]);
+                                    let slot = self.alloc_binding_slot(&name);
+                                    self.bytecode.push_store_pop(slot);
+                                    is_binding = true;
+                                } else {
+                                    self.append_binding_rhs(&mut bytecode, &children[1]);
+                                    let slot = self.alloc_binding_slot(&name);
+                                    bytecode.push_store_pop(slot);
+                                    is_binding = true;
+                                }
                             } else {
                                 if rhs_is_match {
                                     self.emit_binding_rhs(&children[1]);
@@ -10357,8 +10471,30 @@ impl Compiler {
                                     self.messages.push(message);
                                 }
                             }
-                            self.append_binding_rhs(&mut bytecode, value);
-                            bytecode.push_store_pop(symbol as u32);
+                            // Multi-slot stack array: rewrite slots in place.
+                            if let Some((base, n)) = self.stack_array_info(name) {
+                                let ok = self.try_emit_stack_array_init(
+                                    &mut bytecode,
+                                    value,
+                                    base,
+                                    n,
+                                );
+                                if !ok {
+                                    // Heap `[T; N]` (e.g. call return): box into slots.
+                                    self.append_binding_rhs(&mut bytecode, value);
+                                    let tmp = self.alloc_temp_slot();
+                                    bytecode.push_store_pop(tmp);
+                                    for i in 0..n {
+                                        bytecode.push_load(tmp);
+                                        bytecode.push_const(i as i32);
+                                        bytecode.push_index();
+                                        bytecode.push_store_pop(base + i as u32);
+                                    }
+                                }
+                            } else {
+                                self.append_binding_rhs(&mut bytecode, value);
+                                bytecode.push_store_pop(symbol as u32);
+                            }
                         } else {
                             let mut message = Message::error(
                                 ErrorCode::UnknownValue,

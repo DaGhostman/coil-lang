@@ -3397,7 +3397,7 @@ let _ = take(a); \
             "expected multi-slot LOADs for escape/index; got {loads}; ops={:?}",
             main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
-        // Init should be three CONST + three STORE, not a single MakeArray local.
+        // Init is forward CONST;STORE per element — only escape MakeArray.
         let make_arrays = main_bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::MakeArray))
@@ -3405,6 +3405,55 @@ let _ = take(a); \
         assert_eq!(
             make_arrays, 1,
             "only the escape path should MakeArray; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let stores = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert!(
+            stores >= 3,
+            "expected per-element STOREs for stack init; got {stores}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float / large-N / nested: outer spine is multi-slot; nested elems MakeArray.
+    #[test]
+    fn stack_array_scalars_and_nested_heap_elems() {
+        use common::Instruction;
+        let mut pipeline = crate::Pipeline::new();
+        let (bc, _pool) = pipeline
+            .compile_src(
+                "fn main() { \
+let f = [1.5, 2.5, 3.5, 4.5]; \
+let _x = f[2]; \
+let nested = [[1, 2], [3, 4]]; \
+let _y = nested[0]; \
+}",
+            )
+            .expect("compile");
+        let main_off = pipeline.compiler_mut().get_function("main") as usize;
+        let main_bc = &bc[main_off..];
+        // Nested inners → MakeArray; outer nested spine is stack (no third MakeArray
+        // for the outer literal). Escape of nested[0] may MakeArray the outer row
+        // when indexing produces a value — row is heap already from inner lit.
+        let make_arrays = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .count();
+        assert!(
+            make_arrays >= 2,
+            "expected MakeArray for nested row literals; got {make_arrays}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Float local: no MakeArray for the 4-float init (only nested rows).
+        // Const index f[2] is a LOAD, not Index.
+        assert!(
+            !main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Index)),
+            "const index on stack float array should avoid Index; ops={:?}",
             main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
