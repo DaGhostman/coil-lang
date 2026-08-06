@@ -1,47 +1,5 @@
 //! Project manifest (`coil.toml`) parsing and module path resolution.
-//!
-//! A `coil.toml` at the project root declares search roots for `use`
-//! resolution and an optional entry point. The pipeline maps `a::b::c`
-//! paths to `<root>/a/b/c.hy` files on disk.
-//!
-//! ## Format
-//!
-//! ```toml
-//! [module]
-//! roots = ["./src", "./vendor", "./builtins"]
-//!
-//! [entry]
-//! # Optional. Default = the file passed to the compiler.
-//! file = "./src/main.hy"
-//! ```
-//!
-//! The parser is intentionally minimal (no nested tables,
-//! no inline tables, no arrays of tables). The grammar is:
-//!
-//! ```text
-//! file   := section* ; zero or more sections
-//! section := '[' ident ']' '\n' (entry '\n')*
-//! entry  := key '=' value '\n'
-//! key    := ident (no quotes, no spaces)
-//! value  := string | array
-//! string := '"' char* '"'
-//! array  := '[' (string (',' string)*)? ']'
-//! ```
-//!
-//! Comments start with `#` and run to end of line. Whitespace
-//! at line boundaries is ignored.
-//!
-//! ## Discovery algorithm
-//!
-//! Given `use a::b::c;` and a manifest with roots
-//! `["./src", "./vendor"]`, we search each root in order
-//! and return the first file that exists:
-//!
-//! 1. `./src/a/b/c.hy`
-//! 2. `./vendor/a/b/c.hy`
-//!
-//! The first match wins. If no root contains the file, the
-//! pipeline emits a "module not found" diagnostic.
+//! Format and discovery rules: `docs/references/project-config.md`.
 
 use std::path::{Path, PathBuf};
 

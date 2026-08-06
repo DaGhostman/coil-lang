@@ -52,10 +52,7 @@ pub struct Pipeline {
     processed: Vec<PathBuf>,
     /// FIFO queue of files to process. Drained front-to-back.
     worklist: VecDeque<WorkItem>,
-    /// `use`/`mod` edges: file → modules it depends on (must compile first).
-    /// Built during discovery; used to topo-sort the compile pass. Discovery
-    /// re-enqueues scanned files and can destroy plain LIFO order, so
-    /// `pop_back` alone is not enough (e.g. entry before `io::sync`).
+    /// `use`/`mod` edges for topo-sort compile order (discovery can reorder worklist).
     module_deps: HashMap<PathBuf, Vec<PathBuf>>,
     /// Native functions registered by the host. The
     /// pipeline tracks these so it can register them
