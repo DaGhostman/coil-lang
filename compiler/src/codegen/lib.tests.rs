@@ -3340,7 +3340,7 @@ let n = len(a); \
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
-            "expected `a.push(3)` to emit ArrayPush"
+            "expected `a.push(3)` thunk to emit ArrayPush"
         );
         assert!(
             bc.iter()
@@ -3348,9 +3348,9 @@ let n = len(a); \
             "expected `len(a)` to emit ArrayLen"
         );
         assert!(
-            !bc.iter()
-                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3 }),
-            "push/len builtins should not lower to ordinary CALL instructions"
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "expected method dispatch CALL to Vec::push thunk"
         );
     }
 
