@@ -1569,11 +1569,17 @@ fn match_param_decrease(expr: &Output<'_>, param: &str) -> Option<MeasureStep> {
 fn match_param_half(expr: &Output<'_>, param: &str) -> bool {
     let expr = peel(expr);
     match expr.1.as_ref() {
-        Expression::Div(lhs, rhs) | Expression::Shr(lhs, rhs) => {
+        Expression::Div(lhs, rhs) => {
             let lhs = peel(lhs);
             let rhs = peel(rhs);
             matches!(lhs.1.as_ref(), Expression::Identifier(p) if *p == param)
                 && matches!(rhs.1.as_ref(), Expression::Integer(2))
+        }
+        Expression::Shr(lhs, rhs) => {
+            let lhs = peel(lhs);
+            let rhs = peel(rhs);
+            matches!(lhs.1.as_ref(), Expression::Identifier(p) if *p == param)
+                && matches!(rhs.1.as_ref(), Expression::Integer(1))
         }
         _ => false,
     }
@@ -2053,10 +2059,58 @@ fn main() {
 
     #[test]
     fn measure_depth_helpers() {
-        use MeasureStep::Subtract;
+        use MeasureStep::{Half, Subtract};
         assert_eq!(measure_depth(2, 2, Subtract(1)), 1);
         assert_eq!(measure_depth(10, 2, Subtract(1)), 9);
         assert_eq!(measure_depth(32, 2, Subtract(1)), 31);
+        assert_eq!(measure_depth(16, 1, Half), 5); // 16→8→4→2→1
+        assert_eq!(measure_depth(1, 1, Half), 1);
+    }
+
+    #[test]
+    fn half_measure_recursion_is_proven() {
+        let ast = parse(
+            r#"
+fn dig(int n) -> int {
+    if n <= 1 { return 1; }
+    return 1 + dig(n / 2);
+}
+fn main() {
+    let x = dig(16);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report
+            .bounds
+            .iter()
+            .find(|b| b.fn_name == "dig")
+            .expect("dig bound");
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 5);
+    }
+
+    #[test]
+    fn shr_one_measure_recursion_is_proven() {
+        let ast = parse(
+            r#"
+fn dig(int n) -> int {
+    if n <= 1 { return 0; }
+    return 1 + dig(n >> 1);
+}
+fn main() {
+    let x = dig(8);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "dig").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 4); // 8→4→2→1
     }
 
     #[test]
