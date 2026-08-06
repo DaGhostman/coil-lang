@@ -33,10 +33,10 @@ test("parse scalars") {
 }
 
 test("stringify object") {
-    let keys: [string] = [];
-    keys[] = "a";
-    let vals: [Json] = [];
-    vals[] = json_int(1);
+    let keys: Vec<string> = Vec::new();
+    keys.push("a");
+    let vals: Vec<Json> = Vec::new();
+    vals.push(json_int(1));
     let o = json_object(keys, vals);
     let s2 = match stringify(o) {
         Result::Ok(x) => x,

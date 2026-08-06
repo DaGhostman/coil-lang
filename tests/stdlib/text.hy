@@ -40,10 +40,10 @@ test("replace split once and join") {
     assert(pair[0] == "key")?;
     assert(pair[1] == "value=rest")?;
 
-    let parts: [string] = [];
-    parts[] = "a";
-    parts[] = "b";
-    parts[] = "c";
+    let parts: Vec<string> = Vec::new();
+    parts.push("a");
+    parts.push("b");
+    parts.push("c");
     assert(join(parts, "::") == "a::b::c")?;
 }
 
