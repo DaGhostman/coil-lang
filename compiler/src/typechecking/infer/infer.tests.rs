@@ -1949,6 +1949,76 @@ use string::{format, to_bytes};
         );
     }
 
+    #[test]
+    fn match_identical_nested_patterns_reports_unreachable() {
+        let src = r#"
+fn unwrap(Result r) -> int {
+    return match r {
+        Result::Ok(Option::Some(v)) => v,
+        Result::Ok(Option::Some(_)) => 0,
+        Result::Ok(Option::None) => -1,
+        Result::Err(_) => -2,
+    };
+}
+fn main() { let _ = unwrap(Result::Ok(Option::Some(1))); }
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Unreachable arm")),
+            "expected unreachable for duplicate nested coverage, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn match_second_tuple_field_distinction_remains_reachable() {
+        let src = r#"
+enum Inner { A, B }
+enum Outer { V(Inner, Inner) }
+fn classify(Outer p) -> int {
+    return match p {
+        Outer::V(Inner::A, Inner::B) => 1,
+        Outer::V(Inner::A, Inner::A) => 2,
+        Outer::V(_, _) => 0,
+    };
+}
+fn main() { let _ = classify(Outer::V(Inner::A, Inner::A)); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            !msgs.iter().any(|m| m.message().contains("Unreachable arm")),
+            "CoverageTree must distinguish second tuple field, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn builtin_len_named_arg_typechecks() {
+        let src = r#"
+fn main() {
+    let n = len(value: [1, 2, 3]);
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected named `len(value: …)` to typecheck, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn builtin_len_unknown_named_arg_errors() {
+        let msgs = assert_messages("fn main() { let n = len(xs: [1]); }");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Unknown named argument")),
+            "expected unknown named arg diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
     // ---- Field access ----
 
     #[test]

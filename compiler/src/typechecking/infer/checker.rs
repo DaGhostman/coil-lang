@@ -3210,9 +3210,9 @@ impl Checker {
 
                 if ident == "len" {
                     if has_named {
-                        let (_, reordered) =
+                        let (tys, reordered) =
                             self.infer_and_reorder_call_args("len", raw_args, &range);
-                        return self.infer_len_call(Some(&reordered), id, range);
+                        return self.infer_len_call_from_tys(&tys, &reordered, id, range);
                     }
                     return self.infer_len_call(args.as_deref(), id, range);
                 }
@@ -6936,6 +6936,35 @@ impl Checker {
         }
 
         let target_ty = self.infer(&args[0]);
+        self.finish_len_call(target_ty, args, id, range)
+    }
+
+    /// Named-arg path: arguments were already inferred during reorder.
+    fn infer_len_call_from_tys(
+        &mut self,
+        tys: &[Ty],
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        if tys.len() != 1 || args.len() != 1 {
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("len expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `len(value: …)`".to_string()),
+            );
+        }
+        self.finish_len_call(tys[0].clone(), args, id, range)
+    }
+
+    fn finish_len_call(
+        &mut self,
+        target_ty: Ty,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
         let resolved = apply_ty_prune(&self.subst, &target_ty);
         if Self::is_structural_len_ty(&resolved) {
             return int();
