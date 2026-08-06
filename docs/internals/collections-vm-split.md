@@ -20,10 +20,10 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 
 | Type | Module | Representation |
 |------|--------|----------------|
-| `HashMap<K,V>` | `collections::map` | Separate chaining: `heads: [int]` + parallel `keys` / `vals` / `next` / `live` |
+| `HashMap<K,V>` | `collections::map` | Separate chaining: `heads: Vec<int>` + parallel `keys` / `vals` / `next` / `live` Vecs |
 | `HashSet<T>` | `collections::map` | `HashMap<T, bool>` wrapper (same module — userland class types are not importable across modules yet) |
 | `List<T>` | `collections::list` | Mutable singly-linked `Node` class (`Option<Node<T>>`) |
-| `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel arrays + child indices (avoids `Option` field moves) |
+| `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel Vecs + child indices (avoids `Option` field moves) |
 
 Constrained ops (`insert` / `get_or` / …) are **inherent methods** on
 `impl HashMap<K: Eq + Hash, V>` (and the Ord analogues for `TreeMap`). The

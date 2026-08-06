@@ -1,11 +1,11 @@
-// HashMap — separate chaining over parallel arrays (no Default on K/V).
+// HashMap — separate chaining over parallel Vecs (no Default on K/V).
 
 class HashMap<K, V> {
-    heads: [int],
-    keys: [K],
-    vals: [V],
-    next: [int],
-    live: [int],
+    heads: Vec<int>,
+    keys: Vec<K>,
+    vals: Vec<V>,
+    next: Vec<int>,
+    live: Vec<int>,
     len: int,
     cap: int,
 }
@@ -19,16 +19,16 @@ impl HashMap<K, V> {
         if n < 8 {
             n = 8;
         }
-        let heads: [int] = [];
+        let heads: Vec<int> = Vec::new();
         let i = 0;
         while i < n {
-            heads[] = 0 - 1;
+            heads.push(0 - 1);
             i = i + 1;
         }
-        let keys: [K] = [];
-        let vals: [V] = [];
-        let next: [int] = [];
-        let live: [int] = [];
+        let keys: Vec<K> = Vec::new();
+        let vals: Vec<V> = Vec::new();
+        let next: Vec<int> = Vec::new();
+        let live: Vec<int> = Vec::new();
         return new HashMap(heads, keys, vals, next, live, 0, n);
     }
 
@@ -54,7 +54,7 @@ impl HashMap<K, V> {
             self.heads[i] = 0 - 1;
             i = i + 1;
         }
-        let n = len(self.live);
+        let n = self.live.len();
         let j = 0;
         while j < n {
             self.live[j] = 0;
@@ -92,28 +92,28 @@ impl HashMap<K: Eq + Hash, V> {
         if new_cap < 8 {
             new_cap = 8;
         }
-        let heads: [int] = [];
+        let heads: Vec<int> = Vec::new();
         let i = 0;
         while i < new_cap {
-            heads[] = 0 - 1;
+            heads.push(0 - 1);
             i = i + 1;
         }
-        let keys: [K] = [];
-        let vals: [V] = [];
-        let next: [int] = [];
-        let live: [int] = [];
-        let old_n = len(self.keys);
+        let keys: Vec<K> = Vec::new();
+        let vals: Vec<V> = Vec::new();
+        let next: Vec<int> = Vec::new();
+        let live: Vec<int> = Vec::new();
+        let old_n = self.keys.len();
         let j = 0;
         while j < old_n {
             if self.live[j] == 1 {
                 let k = self.keys[j];
                 let v = self.vals[j];
                 let h = self.hash_of(k) & (new_cap - 1);
-                let slot = len(keys);
-                keys[] = k;
-                vals[] = v;
-                next[] = heads[h];
-                live[] = 1;
+                let slot = keys.len();
+                keys.push(k);
+                vals.push(v);
+                next.push(heads[h]);
+                live.push(1);
                 heads[h] = slot;
             }
             j = j + 1;
@@ -137,11 +137,11 @@ impl HashMap<K: Eq + Hash, V> {
             self.grow();
         }
         let h = self.bucket(k);
-        let slot = len(self.keys);
-        self.keys[] = k;
-        self.vals[] = v;
-        self.next[] = self.heads[h];
-        self.live[] = 1;
+        let slot = self.keys.len();
+        self.keys.push(k);
+        self.vals.push(v);
+        self.next.push(self.heads[h]);
+        self.live.push(1);
         self.heads[h] = slot;
         self.len = self.len + 1;
         return true;
