@@ -1978,6 +1978,52 @@ impl Compiler {
         }
     }
 
+    /// Static length of a fixed `[T; N]` type, if any.
+    fn fixed_array_len(ty: &crate::typechecking::Ty) -> Option<usize> {
+        use crate::typechecking::{Ty, ty::ArrayLength};
+        match ty {
+            Ty::Array {
+                length: ArrayLength::Static(n),
+                ..
+            } => Some(*n),
+            Ty::Readonly(inner) => Self::fixed_array_len(inner),
+            _ => None,
+        }
+    }
+
+    fn stack_array_info(&self, name: &str) -> Option<(u32, usize)> {
+        self.context.stack_array_locals.get(name).copied()
+    }
+
+    /// Reserve `n` consecutive locals for a fixed array binding `name`.
+    fn alloc_stack_array_slots(&mut self, name: &str, n: usize) -> u32 {
+        let base = self.alloc_binding_slot(name);
+        for i in 1..n {
+            let pad = format!("__arrpad_{name}_{i}");
+            let slot = self.context.variables.intern(pad) as u32;
+            debug_assert_eq!(slot, base + i as u32, "stack array slots must be consecutive");
+        }
+        self.context
+            .stack_array_locals
+            .insert(name.to_string(), (base, n));
+        base
+    }
+
+    /// Push elements of a multi-slot local then `MakeArray` (escape to heap).
+    fn emit_box_stack_array(&mut self, bytecode: &mut Vec<Byte>, base: u32, n: usize) {
+        for i in 0..n {
+            bytecode.push_load(base + i as u32);
+        }
+        bytecode.push_make_array(n as u32);
+    }
+
+    /// Store `n` stacked values (TOS = last element) into slots `base..base+n`.
+    fn emit_store_stack_array(&mut self, bytecode: &mut Vec<Byte>, base: u32, n: usize) {
+        for i in (0..n).rev() {
+            bytecode.push_store_pop(base + i as u32);
+        }
+    }
+
     /// Flatten `...expr` spread nodes for codegen using inferred types.
     fn flatten_call_args_for_emit<'a>(&self, args: &[Output<'a>]) -> Vec<Output<'a>> {
         use crate::typechecking::subst::apply_ty_prune;
@@ -6442,25 +6488,39 @@ impl Compiler {
                 // discard_statement_value to keep or POP.
             }
             Expression::Index(arr, Some(idx)) => {
-                // Always stash the RHS — `StoreIndex` pops value/index/array.
-                // Dropping with POP when `leave_value_on_stack == false` left
-                // StoreIndex without a value (stack underflow / wrong write).
-                let tmp_arr = self.alloc_temp_slot();
-                let tmp_idx = self.alloc_temp_slot();
-                let tmp_val = self.alloc_temp_slot();
-                bytecode.push_store_pop(tmp_val);
-                bytecode.append(&mut self.do_compile(arr));
-                bytecode.push_store_pop(tmp_arr);
-                bytecode.append(&mut self.do_compile(idx));
-                bytecode.push_store_pop(tmp_idx);
-                bytecode.push_load(tmp_arr);
-                bytecode.push_load(tmp_idx);
-                bytecode.push_load(tmp_val);
-                bytecode.push(Byte::new(Instruction::StoreIndex));
-                if leave_value_on_stack {
-                    // StoreIndex leaves the value on the stack; keep it.
+                // Const store into a multi-slot stack array → direct STORE.
+                if let Expression::Identifier(name) = arr.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(i) = idx.1.as_ref()
+                    && *i >= 0
+                    && (*i as usize) < n
+                {
+                    let slot = base + *i as u32;
+                    if leave_value_on_stack {
+                        bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    }
+                    bytecode.push_store_pop(slot);
                 } else {
-                    bytecode.push_pop();
+                    // Always stash the RHS — `StoreIndex` pops value/index/array.
+                    // Dropping with POP when `leave_value_on_stack == false` left
+                    // StoreIndex without a value (stack underflow / wrong write).
+                    let tmp_arr = self.alloc_temp_slot();
+                    let tmp_idx = self.alloc_temp_slot();
+                    let tmp_val = self.alloc_temp_slot();
+                    bytecode.push_store_pop(tmp_val);
+                    bytecode.append(&mut self.do_compile(arr));
+                    bytecode.push_store_pop(tmp_arr);
+                    bytecode.append(&mut self.do_compile(idx));
+                    bytecode.push_store_pop(tmp_idx);
+                    bytecode.push_load(tmp_arr);
+                    bytecode.push_load(tmp_idx);
+                    bytecode.push_load(tmp_val);
+                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                    if leave_value_on_stack {
+                        // StoreIndex leaves the value on the stack; keep it.
+                    } else {
+                        bytecode.push_pop();
+                    }
                 }
             }
             Expression::Index(_, None) => {}
@@ -7525,13 +7585,53 @@ impl Compiler {
                             }
                             is_binding = true;
                         } else {
-                            let slot = self.alloc_binding_slot(&name);
-                            if rhs_is_match {
-                                self.bytecode.push_store_pop(slot);
+                            // Fixed `[T; N]` locals: N consecutive slots (stack).
+                            let bind_ty = self
+                                .codegen_var_type_for(&name)
+                                .or_else(|| self.codegen_expr_ty(&children[1]));
+                            let fixed_n = bind_ty
+                                .as_ref()
+                                .and_then(|ty| Self::fixed_array_len(ty));
+                            if let Some(n) = fixed_n.filter(|&n| n > 0) {
+                                if let Expression::Array(items) = children[1].1.as_ref()
+                                    && items.len() == n
+                                {
+                                    for item in items {
+                                        if rhs_is_match {
+                                            self.emit_binding_rhs(item);
+                                        } else {
+                                            let mut bc = self.do_compile(item);
+                                            bytecode.append(&mut bc);
+                                        }
+                                    }
+                                    let base = self.alloc_stack_array_slots(&name, n);
+                                    if rhs_is_match {
+                                        let mut tmp = Vec::new();
+                                        self.emit_store_stack_array(&mut tmp, base, n);
+                                        self.bytecode.append(&mut tmp);
+                                    } else {
+                                        self.emit_store_stack_array(&mut bytecode, base, n);
+                                    }
+                                    is_binding = true;
+                                } else {
+                                    // Non-literal RHS: keep heap ObjArray in one slot.
+                                    let slot = self.alloc_binding_slot(&name);
+                                    if rhs_is_match {
+                                        self.bytecode.push_store_pop(slot);
+                                    } else {
+                                        bytecode.push_store_pop(slot);
+                                    }
+                                    is_binding = true;
+                                }
                             } else {
-                                bytecode.push_store_pop(slot);
+                                let slot = self.alloc_binding_slot(&name);
+                                if rhs_is_match {
+                                    self.bytecode.push_store_pop(slot);
+                                } else {
+                                    bytecode.push_store_pop(slot);
+                                }
+                                is_binding = true;
                             }
-                            is_binding = true;
                         }
                     }
                 }
@@ -7624,6 +7724,7 @@ impl Compiler {
                 // at slot 1 read garbage. Extern preload slots live in
                 // the entry frame (bytecode before `main`).
                 let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                let prev_stack_arrays = std::mem::take(&mut self.context.stack_array_locals);
                 let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
                 let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
                 let prev_fn_qualified = self.current_function_qualified.take();
@@ -7632,6 +7733,7 @@ impl Compiler {
                 self.current_function_table_key = Some(table_key.clone());
                 self.push_const_env();
                 self.context.variables = Interner::default();
+                self.context.stack_array_locals.clear();
                 self.expr_depth = 0;
                 if self.compiling_method {
                     let slot = self.context.variables.intern("self".to_string()) as u32;
@@ -7690,6 +7792,7 @@ impl Compiler {
                 self.bytecode
                     .record_func_with_sp(table_key.clone(), entry, body_start, body_end, entry_sp);
                 self.context.variables = prev_fn_vars;
+                self.context.stack_array_locals = prev_stack_arrays;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
 
@@ -7872,11 +7975,21 @@ impl Compiler {
             // opcode carries no operand (the index is at the top
             // of the operand stack at dispatch time).
             Expression::Index(target, Some(index)) => {
-                let mut target_bc = self.do_compile(target);
-                bytecode.append(&mut target_bc);
-                let mut index_bc = self.do_compile(index);
-                bytecode.append(&mut index_bc);
-                bytecode.push_index();
+                // Const index into a multi-slot stack array → direct LOAD.
+                if let Expression::Identifier(name) = target.1.as_ref()
+                    && let Some((base, n)) = self.stack_array_info(name)
+                    && let Expression::Integer(idx) = index.1.as_ref()
+                    && *idx >= 0
+                    && (*idx as usize) < n
+                {
+                    bytecode.push_load(base + *idx as u32);
+                } else {
+                    let mut target_bc = self.do_compile(target);
+                    bytecode.append(&mut target_bc);
+                    let mut index_bc = self.do_compile(index);
+                    bytecode.append(&mut index_bc);
+                    bytecode.push_index();
+                }
             }
             Expression::Index(_, None) => {}
             Expression::Readonly(inner) => {
@@ -9349,7 +9462,12 @@ impl Compiler {
                 {
                     bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot));
                 } else if let Some(slot) = self.lookup_slot(n) {
-                    bytecode.push_load(slot);
+                    if let Some((base, len)) = self.stack_array_info(n) {
+                        // Escape multi-slot local to a heap ObjArray.
+                        self.emit_box_stack_array(&mut bytecode, base, len);
+                    } else {
+                        bytecode.push_load(slot);
+                    }
                 } else {
                     // Not a local variable — check if it's a generic function
                     // escaping into a non-call position (e.g. `let f = id;`).
@@ -10165,19 +10283,31 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::ArrayPush));
                 }
                 Expression::Index(arr, Some(idx)) => {
-                    let tmp_arr = self.alloc_temp_slot();
-                    let tmp_idx = self.alloc_temp_slot();
-                    let tmp_val = self.alloc_temp_slot();
-                    self.append_binding_rhs(&mut bytecode, value);
-                    bytecode.push_store_pop(tmp_val);
-                    bytecode.append(&mut self.do_compile(arr));
-                    bytecode.push_store_pop(tmp_arr);
-                    bytecode.append(&mut self.do_compile(idx));
-                    bytecode.push_store_pop(tmp_idx);
-                    bytecode.push_load(tmp_arr);
-                    bytecode.push_load(tmp_idx);
-                    bytecode.push_load(tmp_val);
-                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                    if let Expression::Identifier(name) = arr.1.as_ref()
+                        && let Some((base, n)) = self.stack_array_info(name)
+                        && let Expression::Integer(i) = idx.1.as_ref()
+                        && *i >= 0
+                        && (*i as usize) < n
+                    {
+                        self.append_binding_rhs(&mut bytecode, value);
+                        bytecode.push_store_pop(base + *i as u32);
+                        // Leave value on stack like StoreIndex.
+                        bytecode.push_load(base + *i as u32);
+                    } else {
+                        let tmp_arr = self.alloc_temp_slot();
+                        let tmp_idx = self.alloc_temp_slot();
+                        let tmp_val = self.alloc_temp_slot();
+                        self.append_binding_rhs(&mut bytecode, value);
+                        bytecode.push_store_pop(tmp_val);
+                        bytecode.append(&mut self.do_compile(arr));
+                        bytecode.push_store_pop(tmp_arr);
+                        bytecode.append(&mut self.do_compile(idx));
+                        bytecode.push_store_pop(tmp_idx);
+                        bytecode.push_load(tmp_arr);
+                        bytecode.push_load(tmp_idx);
+                        bytecode.push_load(tmp_val);
+                        bytecode.push(Byte::new(Instruction::StoreIndex));
+                    }
                 }
                 Expression::Identifier(name) => {
                     let resolved = self

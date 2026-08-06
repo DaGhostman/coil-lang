@@ -1,40 +1,71 @@
-# Array append (`arr[] =`) and `len`
+# Arrays and `Vec`
 
-Append with empty index assignment; query length with `len`.
+coil splits fixed-size arrays from growable vectors (Rust-style).
 
-```coil
-arr[] = value   // append (assignment target only)
-len(value)
-```
+## Fixed arrays — `[T; N]`
 
-| Form | Argument types | Returns | Behavior |
-|------|----------------|---------|----------|
-| `arr[] = v` | `[T]`, `T` | `[T]` (discarded in statement form) | Appends in place; promotes fixed `[T; N]` bindings to dynamic `[T]` |
-| `len` | `[T]`, `string`, tuple, dict, or `T: Length` | `int` | Structural length, or `Length::len` for custom types |
-
-`len` of a string, array, tuple, or dict **literal** (and of fixed-size array/tuple types) folds to a compile-time integer when the length is statically known. Custom types implement `Length`:
+Homogeneous, fixed length. `N` is part of the type and is **inferred** from
+literals when possible; otherwise it must be written explicitly.
 
 ```coil
-impl Length for Pair {
-    fn len(Pair p) -> int { return 2; }
-}
+let a = [1, 2, 3];          // [int; 3]
+let b: [int; 3] = [0, 0, 0];
+a[1] = 9;                   // element assign only
 ```
 
-Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
+| Rule | Behavior |
+|------|----------|
+| Literal `[e, …]` | Infers `[T; N]` with `N =` element count |
+| Annotation `[T]` | **Error** — use `[T; N]` or `Vec<T>` |
+| Empty `[]` | Only under `Vec<T>` or `[T; 0]` |
+| Growth | **Forbidden** — no `arr[] =`; use `Vec` |
+
+Locals of type `[T; N]` are laid out as **N consecutive frame slots** (stack).
+Escaping into a single-value context (call, return, store into a heap object)
+boxes into a non-growable heap array.
+
+`len(a)` folds to `N` when the length is static. Element-wise zip / LA helpers
+still require fixed lengths.
+
+## `Vec<T>` — growable heap vector
 
 ```coil
-use io::{stdout, write_all};
-use string::{format, to_bytes};
-let a = [1, 2];
-a[] = 3;
-write_all(stdout(), to_bytes(format("%i", len(a)))); // 3
-write_all(stdout(), to_bytes(format("%i", a[2])));  // 3
-write_all(stdout(), to_bytes(format("%i", len("foo")))); // 3 (folded)
+let v: Vec<int> = Vec::new();
+v.push(1);
+v.push(2);
+let x = v[0];
+v[0] = 7;
+match v.pop() {
+    Option::Some(n) => { /* … */ },
+    Option::None => { /* … */ },
+};
 ```
+
+### Methods
+
+| Method | Notes |
+|--------|--------|
+| `Vec::new()` | Empty vector |
+| `Vec::with_capacity(n)` | Empty with reserved capacity |
+| `Vec::from(arr)` | Copy a fixed `[T; N]` into a `Vec` |
+| `v.push(x)` | Append |
+| `v.pop()` | `Option<T>` |
+| `v.insert(i, x)` | Insert at index (clamped to `len`) |
+| `v.remove(i)` | `Option<T>` |
+| `v.clear()` | Drop all elements |
+| `v.reserve(n)` | Ensure capacity for `len + n` |
+| `v.capacity()` / `v.len()` | Ints |
+| `v[i]` / `v[i] = x` | Index get/set |
+
+Rest parameters `T... xs` pack into `Vec<T>`. Spread accepts both `[T; N]` and
+`Vec<T>`.
+
+IO buffers (`to_bytes`, `read`/`write`) use `Vec<byte>`.
 
 ---
 
 ## Related
 
-- [Syntax](syntax.md)
 - [Types](types.md)
+- [Syntax](syntax.md)
+- Example: `examples/vec.hy`
