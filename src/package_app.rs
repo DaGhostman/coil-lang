@@ -208,8 +208,9 @@ mod tests {
             Err(LoadErr::Version(_))
         ));
 
-        let other_major = ArchivedProgram {
-            version: pack_archive_version(1, 0),
+        // Same major with a newer minor than the runtime must be rejected.
+        let other_minor = ArchivedProgram {
+            version: pack_archive_version(1, 99),
             static_slot_count: 0,
             constants: vec![],
             strings: vec![],
@@ -217,7 +218,7 @@ mod tests {
             source_files: vec![],
             debug_locs: vec![],
         };
-        let bytes = rkyv::to_bytes::<Error>(&other_major).unwrap();
+        let bytes = rkyv::to_bytes::<Error>(&other_minor).unwrap();
         assert!(matches!(
             load_archive_bytes(bytes.as_slice()),
             Err(LoadErr::Version(_))

@@ -2496,7 +2496,8 @@ fn fib(
         let hover = hover(
             &document,
             Position {
-                line: 8,
+                // `if n <= 2` — character 7 is the binding `n` (0-based).
+                line: 9,
                 character: 7,
             },
         )
