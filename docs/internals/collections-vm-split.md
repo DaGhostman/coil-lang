@@ -7,7 +7,7 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 | Primitive | Role for collections |
 |-----------|----------------------|
 | `Hash` / `Eq` / `Ord` traits | Key constraints (`hash()`, `==`, `<` / `>`) |
-| Dynamic arrays `[T]`, `arr[] =`, `len` | Buckets, chains, growable storage |
+| Dynamic arrays `[T]`, `Vec::push`, `len` | Buckets, chains, growable storage |
 | Classes + field mutation | Mutable map / list / set handles |
 | Recursive enums | Persistent trees / functional lists |
 | Bit ops (`&`, `<<`) and `%` | Bucket index from hash |
@@ -26,9 +26,11 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 | `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel Vecs + child indices (avoids `Option` field moves) |
 
 Constrained ops (`insert` / `get_or` / …) are **inherent methods** on
-`impl HashMap<K: Eq + Hash, V>` (and the Ord analogues for `TreeMap`). The
-compiler applies `impl` type-param bounds to method schemes and emits
-dictionary arguments on inherent method `CALL` (same ABI as free generics).
+`impl HashMap<K: Eq + Hash, V>` (and the Ord analogues for `TreeMap`). **Rule:**
+type-tied operations should be methods, not free functions — the compiler
+applies `impl` type-param bounds to method schemes and emits dictionary
+arguments on inherent method `CALL` (same ABI as free generics). Free generic
+fns returning enums remain codegen-fragile; methods are the supported path.
 
 **`Option` field caveat:** matching a class field of type `Option<_>` moves the value out — write it back (`t.root = Option::Some(root)`) before returning, and copy child links to a `let` before nested `match` so the field is restored.
 
