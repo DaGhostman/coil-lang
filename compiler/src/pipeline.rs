@@ -1093,7 +1093,8 @@ impl Pipeline {
                 Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
-        if !self.compiler.get_messages().is_empty() {
+        // Warnings are kept for callers to inspect; only hard errors fail.
+        if self.had_errors() {
             return Err(());
         }
 
@@ -1432,9 +1433,9 @@ fn main() {
         let mut pipeline = Pipeline::with_reporter(config, Box::new(shared.clone()));
 
         // Unknown value → E0100.
-        let src = r#"use io::{stdout, write_all};
+        let src = r#"use io::{stdout, write};
 use string::{format, to_bytes};
-fn main() { write_all(stdout(), to_bytes(format("%i", missing))); }"#;
+fn main() { write(stdout(), to_bytes(format("%i", missing))); }"#;
         let _ = pipeline.compile_src(src);
         pipeline.finish_reporting().unwrap();
 
