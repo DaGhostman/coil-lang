@@ -1,7 +1,4 @@
 // HashMap — separate chaining over parallel arrays (no Default on K/V).
-//
-// Constrained ops are free functions: inherent `impl` bounds are not yet
-// applied to method schemes (see docs/internals/collections-vm-split.md).
 
 class HashMap<K, V> {
     heads: [int],
@@ -14,6 +11,31 @@ class HashMap<K, V> {
 }
 
 impl HashMap<K, V> {
+    static fn with_capacity(int cap) -> HashMap<K, V> {
+        let n = 1;
+        while n < cap {
+            n = n + n;
+        }
+        if n < 8 {
+            n = 8;
+        }
+        let heads: [int] = [];
+        let i = 0;
+        while i < n {
+            heads[] = 0 - 1;
+            i = i + 1;
+        }
+        let keys: [K] = [];
+        let vals: [V] = [];
+        let next: [int] = [];
+        let live: [int] = [];
+        return new HashMap(heads, keys, vals, next, live, 0, n);
+    }
+
+    static fn new() -> HashMap<K, V> {
+        return HashMap::with_capacity(8);
+    }
+
     fn size() -> int {
         return self.len;
     }
@@ -25,165 +47,142 @@ impl HashMap<K, V> {
     fn capacity() -> int {
         return self.cap;
     }
-}
 
-fn hashmap_with_capacity<K, V>(int cap) -> HashMap<K, V> {
-    let n = 1;
-    while n < cap {
-        n = n + n;
+    fn clear() {
+        let i = 0;
+        while i < self.cap {
+            self.heads[i] = 0 - 1;
+            i = i + 1;
+        }
+        let n = len(self.live);
+        let j = 0;
+        while j < n {
+            self.live[j] = 0;
+            j = j + 1;
+        }
+        self.len = 0;
     }
-    if n < 8 {
-        n = 8;
+}
+
+impl HashMap<K: Eq + Hash, V> {
+    fn hash_of(K k) -> int {
+        return k.hash();
     }
-    let heads: [int] = [];
-    let i = 0;
-    while i < n {
-        heads[] = 0 - 1;
-        i = i + 1;
+
+    fn bucket(K k) -> int {
+        return self.hash_of(k) & (self.cap - 1);
     }
-    let keys: [K] = [];
-    let vals: [V] = [];
-    let next: [int] = [];
-    let live: [int] = [];
-    return new HashMap(heads, keys, vals, next, live, 0, n);
-}
 
-fn hashmap_new<K, V>() -> HashMap<K, V> {
-    return hashmap_with_capacity(8);
-}
-
-fn hashmap_hash_of<K: Hash>(K k) -> int {
-    return k.hash();
-}
-
-fn hashmap_bucket<K: Hash, V>(HashMap<K, V> m, K k) -> int {
-    return hashmap_hash_of(k) & (m.cap - 1);
-}
-
-fn hashmap_find<K: Eq + Hash, V>(HashMap<K, V> m, K k) -> int {
-    let h = hashmap_bucket(m, k);
-    let idx = m.heads[h];
-    while idx >= 0 {
-        if m.live[idx] == 1 {
-            if m.keys[idx] == k {
-                return idx;
+    fn find(K k) -> int {
+        let h = self.bucket(k);
+        let idx = self.heads[h];
+        while idx >= 0 {
+            if self.live[idx] == 1 {
+                if self.keys[idx] == k {
+                    return idx;
+                }
             }
+            idx = self.next[idx];
         }
-        idx = m.next[idx];
+        return 0 - 1;
     }
-    return 0 - 1;
-}
 
-fn hashmap_grow<K: Eq + Hash, V>(HashMap<K, V> m) {
-    let new_cap = m.cap + m.cap;
-    if new_cap < 8 {
-        new_cap = 8;
-    }
-    let heads: [int] = [];
-    let i = 0;
-    while i < new_cap {
-        heads[] = 0 - 1;
-        i = i + 1;
-    }
-    let keys: [K] = [];
-    let vals: [V] = [];
-    let next: [int] = [];
-    let live: [int] = [];
-    let old_n = len(m.keys);
-    let j = 0;
-    while j < old_n {
-        if m.live[j] == 1 {
-            let k = m.keys[j];
-            let v = m.vals[j];
-            let h = hashmap_hash_of(k) & (new_cap - 1);
-            let slot = len(keys);
-            keys[] = k;
-            vals[] = v;
-            next[] = heads[h];
-            live[] = 1;
-            heads[h] = slot;
+    fn grow() {
+        let new_cap = self.cap + self.cap;
+        if new_cap < 8 {
+            new_cap = 8;
         }
-        j = j + 1;
+        let heads: [int] = [];
+        let i = 0;
+        while i < new_cap {
+            heads[] = 0 - 1;
+            i = i + 1;
+        }
+        let keys: [K] = [];
+        let vals: [V] = [];
+        let next: [int] = [];
+        let live: [int] = [];
+        let old_n = len(self.keys);
+        let j = 0;
+        while j < old_n {
+            if self.live[j] == 1 {
+                let k = self.keys[j];
+                let v = self.vals[j];
+                let h = self.hash_of(k) & (new_cap - 1);
+                let slot = len(keys);
+                keys[] = k;
+                vals[] = v;
+                next[] = heads[h];
+                live[] = 1;
+                heads[h] = slot;
+            }
+            j = j + 1;
+        }
+        self.heads = heads;
+        self.keys = keys;
+        self.vals = vals;
+        self.next = next;
+        self.live = live;
+        self.cap = new_cap;
     }
-    m.heads = heads;
-    m.keys = keys;
-    m.vals = vals;
-    m.next = next;
-    m.live = live;
-    m.cap = new_cap;
-}
 
-/// Insert or replace. Returns `true` when a new key was inserted.
-fn hashmap_insert<K: Eq + Hash, V>(HashMap<K, V> m, K k, V v) -> bool {
-    let found = hashmap_find(m, k);
-    if found >= 0 {
-        m.vals[found] = v;
+    /// Insert or replace. Returns `true` when a new key was inserted.
+    fn insert(K k, V v) -> bool {
+        let found = self.find(k);
+        if found >= 0 {
+            self.vals[found] = v;
+            return false;
+        }
+        if (self.len + self.len) >= self.cap {
+            self.grow();
+        }
+        let h = self.bucket(k);
+        let slot = len(self.keys);
+        self.keys[] = k;
+        self.vals[] = v;
+        self.next[] = self.heads[h];
+        self.live[] = 1;
+        self.heads[h] = slot;
+        self.len = self.len + 1;
+        return true;
+    }
+
+    fn contains(K k) -> bool {
+        return self.find(k) >= 0;
+    }
+
+    /// Return the value for `k`, or `fallback` when absent.
+    fn get_or(K k, V fallback) -> V {
+        let found = self.find(k);
+        if found >= 0 {
+            return self.vals[found];
+        }
+        return fallback;
+    }
+
+    /// Remove `k`. Returns `true` when a live entry was removed.
+    fn remove(K k) -> bool {
+        let h = self.bucket(k);
+        let idx = self.heads[h];
+        let prev = 0 - 1;
+        while idx >= 0 {
+            if self.live[idx] == 1 {
+                if self.keys[idx] == k {
+                    if prev < 0 {
+                        self.heads[h] = self.next[idx];
+                    } else {
+                        self.next[prev] = self.next[idx];
+                    }
+                    self.live[idx] = 0;
+                    self.len = self.len - 1;
+                    return true;
+                }
+            }
+            prev = idx;
+            idx = self.next[idx];
+        }
         return false;
     }
-    if (m.len + m.len) >= m.cap {
-        hashmap_grow(m);
-    }
-    let h = hashmap_bucket(m, k);
-    let slot = len(m.keys);
-    m.keys[] = k;
-    m.vals[] = v;
-    m.next[] = m.heads[h];
-    m.live[] = 1;
-    m.heads[h] = slot;
-    m.len = m.len + 1;
-    return true;
-}
-
-fn hashmap_contains<K: Eq + Hash, V>(HashMap<K, V> m, K k) -> bool {
-    return hashmap_find(m, k) >= 0;
-}
-
-/// Return the value for `k`, or `fallback` when absent.
-fn hashmap_get_or<K: Eq + Hash, V>(HashMap<K, V> m, K k, V fallback) -> V {
-    let found = hashmap_find(m, k);
-    if found >= 0 {
-        return m.vals[found];
-    }
-    return fallback;
-}
-
-/// Remove `k`. Returns `true` when a live entry was removed.
-fn hashmap_remove<K: Eq + Hash, V>(HashMap<K, V> m, K k) -> bool {
-    let h = hashmap_bucket(m, k);
-    let idx = m.heads[h];
-    let prev = 0 - 1;
-    while idx >= 0 {
-        if m.live[idx] == 1 {
-            if m.keys[idx] == k {
-                if prev < 0 {
-                    m.heads[h] = m.next[idx];
-                } else {
-                    m.next[prev] = m.next[idx];
-                }
-                m.live[idx] = 0;
-                m.len = m.len - 1;
-                return true;
-            }
-        }
-        prev = idx;
-        idx = m.next[idx];
-    }
-    return false;
-}
-
-fn hashmap_clear<K, V>(HashMap<K, V> m) {
-    let i = 0;
-    while i < m.cap {
-        m.heads[i] = 0 - 1;
-        i = i + 1;
-    }
-    let n = len(m.live);
-    let j = 0;
-    while j < n {
-        m.live[j] = 0;
-        j = j + 1;
-    }
-    m.len = 0;
 }
 
 // ---- HashSet (same module so the HashMap type is in scope) ----
@@ -193,6 +192,14 @@ class HashSet<T> {
 }
 
 impl HashSet<T> {
+    static fn with_capacity(int cap) -> HashSet<T> {
+        return new HashSet(HashMap::with_capacity(cap));
+    }
+
+    static fn new() -> HashSet<T> {
+        return HashSet::with_capacity(8);
+    }
+
     fn size() -> int {
         return self.inner.len;
     }
@@ -200,28 +207,22 @@ impl HashSet<T> {
     fn is_empty() -> bool {
         return self.inner.len == 0;
     }
+
+    fn clear() {
+        self.inner.clear();
+    }
 }
 
-fn hashset_with_capacity<T>(int cap) -> HashSet<T> {
-    return new HashSet(hashmap_with_capacity(cap));
-}
+impl HashSet<T: Eq + Hash> {
+    fn insert(T x) -> bool {
+        return self.inner.insert(x, true);
+    }
 
-fn hashset_new<T>() -> HashSet<T> {
-    return hashset_with_capacity(8);
-}
+    fn contains(T x) -> bool {
+        return self.inner.contains(x);
+    }
 
-fn hashset_insert<T: Eq + Hash>(HashSet<T> s, T x) -> bool {
-    return hashmap_insert(s.inner, x, true);
-}
-
-fn hashset_contains<T: Eq + Hash>(HashSet<T> s, T x) -> bool {
-    return hashmap_contains(s.inner, x);
-}
-
-fn hashset_remove<T: Eq + Hash>(HashSet<T> s, T x) -> bool {
-    return hashmap_remove(s.inner, x);
-}
-
-fn hashset_clear<T>(HashSet<T> s) {
-    hashmap_clear(s.inner);
+    fn remove(T x) -> bool {
+        return self.inner.remove(x);
+    }
 }
