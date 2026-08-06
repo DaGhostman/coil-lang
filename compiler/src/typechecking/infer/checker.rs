@@ -2790,7 +2790,8 @@ impl Checker {
                                     .map(|(_, s)| s.clone())
                                     .expect("method present")
                             };
-                            let fun_ty = self.instantiate_ty(&scheme);
+                            let (fun_ty, constraints, _mapping) =
+                                self.instantiate_scheme_mapped(&scheme);
                             let mut arg_tys = vec![recv_ty];
                             let (tys, ordered_exprs) =
                                 self.infer_and_reorder_call_args(&fqn, method_args, &range);
@@ -2800,14 +2801,18 @@ impl Checker {
                             let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
                             arg_exprs.push(recv.clone());
                             arg_exprs.extend(ordered_exprs);
-                            return self.apply_function(
+                            let result = self.apply_function(
                                 Some(&fqn),
                                 &fun_ty,
                                 &arg_tys,
                                 Some(&arg_exprs),
                                 id,
-                                range,
+                                range.clone(),
                             );
+                            if !constraints.is_empty() {
+                                self.discharge_constraints(id, &constraints, &range);
+                            }
+                            return result;
                         }
                         return self.error_with_help(
                             ErrorCode::GenericTypeError,
@@ -3011,7 +3016,8 @@ impl Checker {
                             (scheme, false)
                         };
                         let _ = selected;
-                        let fun_ty = self.instantiate_ty(&scheme);
+                        let (fun_ty, constraints, _mapping) =
+                            self.instantiate_scheme_mapped(&scheme);
                         let mut arg_tys = vec![recv_ty];
                         let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
                         arg_exprs.push(recv.clone());
@@ -3026,14 +3032,18 @@ impl Checker {
                                 arg_exprs.push(arg.clone());
                             }
                         }
-                        return self.apply_function(
+                        let result = self.apply_function(
                             Some(&fqn),
                             &fun_ty,
                             &arg_tys,
                             Some(&arg_exprs),
                             id,
-                            range,
+                            range.clone(),
                         );
+                        if !constraints.is_empty() {
+                            self.discharge_constraints(id, &constraints, &range);
+                        }
+                        return result;
                     }
 
                     // Ground trait method: `recv.into()` / `recv.show()` via a
@@ -10601,11 +10611,45 @@ impl Checker {
                 .insert_top(owner.to_string(), Scheme::mono(Ty::Con(owner.to_string())));
         }
 
+        // `impl Foo<T: Eq + Hash>` bounds apply to every method body and to
+        // the poly scheme / dictionary arity at call sites.
+        let mut impl_constraints: Vec<Constraint> = Vec::new();
+        if pushed {
+            let bound_vars: Vec<(String, TyVarId)> = {
+                let frame = self
+                    .type_params_in_scope
+                    .last()
+                    .expect("type-param frame just pushed");
+                type_params
+                    .iter()
+                    .map(|tp| {
+                        (
+                            tp.name.to_string(),
+                            *frame
+                                .get(tp.name)
+                                .expect("type param registered in frame"),
+                        )
+                    })
+                    .collect()
+            };
+            for (tp, (_name, var)) in type_params.iter().zip(bound_vars.iter()) {
+                for bound in &tp.bounds {
+                    if let Some(constraint) =
+                        self.constraint_from_bound(bound, Ty::Var(*var), range)
+                    {
+                        impl_constraints.push(constraint);
+                    }
+                }
+            }
+        }
+        let prev_constraints_len = self.active_constraints.len();
+        self.active_constraints
+            .extend(impl_constraints.iter().cloned());
+
         let prev_impl_owner = self.impl_owner.replace(owner.to_string());
-        self.push_scope();
-        // Do not bind `self` on the impl frame — instance methods get it
-        // from `infer_function(..., Some(owner_ty))`, and static methods
-        // must not see a receiver.
+        // Register method schemes on the outer env (not a temporary frame).
+        // Call-site dict emission looks them up by `Owner::method` FQN;
+        // a push/pop around the loop used to drop those schemes.
 
         for method in methods {
             if let Expression::Method(vis, body) = method.1.as_ref() {
@@ -10652,8 +10696,25 @@ impl Checker {
                     let scheme = if param_vars.is_empty() {
                         Scheme::mono(fun_ty.clone())
                     } else {
-                        Scheme::poly(param_vars.clone(), Vec::new(), fun_ty.clone())
+                        Scheme::poly(
+                            param_vars.clone(),
+                            impl_constraints.clone(),
+                            fun_ty.clone(),
+                        )
                     };
+                    // Env lookup feeds `emit_call_site_dicts` at method CALL.
+                    self.env.insert_top(fqn.clone(), scheme.clone());
+                    if !impl_constraints.is_empty() {
+                        let dict_n = impl_constraints.len();
+                        // Bare name: method compile looks up dict arity by
+                        // the function's short name; FQN: call sites / env.
+                        self.fn_dict_arity.insert((*name).to_string(), dict_n);
+                        self.fn_dict_arity.insert(fqn.clone(), dict_n);
+                        self.generic_fns.insert((*name).to_string());
+                        self.generic_fns.insert(fqn.clone());
+                        self.generics.generic_fns.insert((*name).to_string());
+                        self.generics.generic_fns.insert(fqn.clone());
+                    }
                     // Arity overloads keyed by FQN — user-arg count only
                     // (`self` is packed separately at CALL sites).
                     let has_rest = self.fn_has_rest.get(*name).copied().unwrap_or(false);
@@ -10666,7 +10727,7 @@ impl Checker {
                     self.register_overload_candidate(
                         &fqn,
                         OverloadCandidate {
-                    id: 0,
+                            id: 0,
                             fixed_arity,
                             is_rest: has_rest,
                             scheme: scheme.clone(),
@@ -10694,8 +10755,8 @@ impl Checker {
             }
         }
 
-        self.pop_scope();
         self.impl_owner = prev_impl_owner;
+        self.active_constraints.truncate(prev_constraints_len);
         self.pop_type_params_for_type_parsing(pushed);
         let _ = range;
     }
