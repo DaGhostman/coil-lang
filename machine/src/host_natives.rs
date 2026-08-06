@@ -722,15 +722,18 @@ mod tests {
             "math_ln",
             "math_pow",
         ];
+        let math_end = math_start + expected.len();
         assert_eq!(
-            registrations[math_start..]
+            registrations[math_start..math_end]
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
             expected
         );
+        // Vec helpers are append-only after math_libm (stable HostInvoke ids).
+        assert_eq!(registrations[math_end].0, "vec_with_capacity");
 
-        for (offset, native) in natives[math_start..].iter().enumerate() {
+        for (offset, native) in natives[math_start..math_end].iter().enumerate() {
             let signature = native.signature();
             assert_eq!(signature.ret, FfiType::Float);
             let expected_arity = if offset + 1 == expected.len() { 2 } else { 1 };
