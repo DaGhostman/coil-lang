@@ -12,7 +12,8 @@ fn make_empty(string path) {
 
 fn read_once(string path) {
     let s = open(path, "r")?;
-    let buf: [byte] = [0, 0, 0, 0];
+    let z: byte = 0;
+    let buf = Vec::from([z, z, z, z]);
     let r = read(s, buf)?;
     close(s)?;
     return r;
