@@ -3327,12 +3327,12 @@ fn main() { let h = tick(2); write(stdout(), to_bytes(format(\"%i\", resume h)))
     // ============================================================
 
     #[test]
-    fn array_append_and_len_emit_array_opcodes() {
+    fn vec_push_and_len_emit_array_opcodes() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-let a = [1, 2]; \
-a[] = 3; \
+let a = Vec::from([1, 2]); \
+a.push(3); \
 let n = len(a); \
 }",
         );
@@ -3340,7 +3340,7 @@ let n = len(a); \
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
-            "expected `a[] = 3` to emit ArrayPush"
+            "expected `a.push(3)` to emit ArrayPush"
         );
         assert!(
             bc.iter()
@@ -4312,7 +4312,7 @@ fn main() {
         let src = "\
 use io::{stdin, read}; \
 fn main() { \
-  let buf: [byte] = [0]; \
+  let buf = Vec::from([0 as byte]); \
   let _ = read(stdin(), buf); \
 }";
         let mut ast = Pratt::default().parse(src).expect("parse failed");
@@ -5284,7 +5284,7 @@ fn main() {
     }
 
     /// `bytes_slice`-shaped loop: `while i < end` with nested `i < len(src)` and
-    /// `out[] = src[i]` must exit past the back-edge (BinSlotSlotJmpf pool target).
+    /// `out.push(src[i])` must exit past the back-edge (BinSlotSlotJmpf pool target).
     #[test]
     fn bytes_slice_while_exit_targets_past_back_edge() {
         use common::Instruction;
@@ -5293,12 +5293,12 @@ fn main() {
 use io::{stdout};
 
 use string::{format, to_bytes};
-fn bytes_slice([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn bytes_slice(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     while i < end {
         if i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
         }
         i = i + 1;
     }
