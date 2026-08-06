@@ -17,3 +17,17 @@ test("list push pop") {
     xs.clear();
     assert(xs.is_empty())?;
 }
+
+test("list empty peek and clear reuse") {
+    let xs = List::new();
+    assert(xs.peek_front_or(-7) == -7)?;
+    assert(xs.pop_front_or(-7) == -7)?;
+    xs.push_front(1);
+    xs.push_front(2);
+    xs.clear();
+    assert(xs.is_empty())?;
+    assert(xs.peek_front_or(0) == 0)?;
+    xs.push_front(5);
+    assert(xs.size() == 1)?;
+    assert(xs.peek_front_or(0) == 5)?;
+}
