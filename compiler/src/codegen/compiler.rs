@@ -8897,32 +8897,64 @@ impl Compiler {
                         if let Some(offset) = self.functions.get(&fqn).copied() {
                             // Same ABI as free generics: box top-level type
                             // params, append trait dictionaries, unbox returns.
-                            let is_generic = self.checker.is_generic_fn(&fqn);
+                            let lookup_name = strip_overload_key(&fqn).to_string();
+                            let is_generic = self.checker.is_generic_fn(&lookup_name);
                             let box_generic_args = is_generic
-                                && self.generic_has_toplevel_type_param_args(&fqn);
-                            // Push receiver first (slot 0), then args
-                            // (reordered when any arg is named; rest packed).
+                                && self.generic_has_toplevel_type_param_args(&lookup_name);
+                            // Stage the receiver into a temp *before* user args.
+                            // Leaving it on the operand stack while arg staging
+                            // `STORE`s into temps clobbers it (locals and the
+                            // operand stack share memory) — nested calls like
+                            // `self.inner.put(x, true)` then mutate the wrong object.
                             bytecode.append(&mut self.do_compile(recv));
-                            // Receiver is `Self` / `Owner<…>`, not a bare
-                            // type param — never box it for the shared ABI.
+                            let recv_tmp = self.alloc_temp_slot();
+                            bytecode.push_store_pop(recv_tmp);
                             let arg_slice = args.as_deref().unwrap_or(&[]);
-                            let nargs = if args.is_some() {
-                                self.emit_call_args_with_rest(
-                                    &fqn,
-                                    arg_slice,
-                                    &mut bytecode,
-                                    box_generic_args,
-                                )
+                            self.consume_spread_emit_ids(arg_slice);
+                            let (fixed, rest, pack_rest) =
+                                self.split_call_args_for_rest(&lookup_name, arg_slice);
+                            let mut arg_temps: Vec<u32> = Vec::new();
+                            for arg in &fixed {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                if box_generic_args {
+                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    }
+                                }
+                                let tmp = self.alloc_temp_slot();
+                                bytecode.push_store_pop(tmp);
+                                arg_temps.push(tmp);
+                            }
+                            let nargs = if pack_rest {
+                                for arg in &rest {
+                                    self.append_with_existential_pack(&mut bytecode, arg);
+                                    if box_generic_args {
+                                        if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                            Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                        }
+                                    }
+                                }
+                                if self.checker.fn_tuple_rest(&lookup_name) {
+                                    bytecode.push_make_tuple(rest.len() as u32);
+                                } else {
+                                    bytecode.push_make_array(rest.len() as u32);
+                                }
+                                let tmp = self.alloc_temp_slot();
+                                bytecode.push_store_pop(tmp);
+                                arg_temps.push(tmp);
+                                (fixed.len() + 1) as u32
                             } else {
-                                0
+                                fixed.len() as u32
                             };
+                            bytecode.push_load(recv_tmp);
+                            for tmp in &arg_temps {
+                                bytecode.push_load(*tmp);
+                            }
                             let dict_count = if is_generic {
                                 let mut call_arg_tys: Vec<Ty> = Vec::new();
                                 if let Some(ty) = recv_ty.clone() {
                                     call_arg_tys.push(ty);
                                 }
-                                let (fixed, rest, pack_rest) =
-                                    self.split_call_args_for_rest(&fqn, arg_slice);
                                 for arg in &fixed {
                                     call_arg_tys.push(self.codegen_expr_ty(arg).expect(
                                         "typechecked method argument must have a codegen type",
@@ -8953,7 +8985,7 @@ impl Compiler {
                                 forwarded
                                     + Self::emit_call_site_dicts(
                                         &mut bytecode,
-                                        &fqn,
+                                        &lookup_name,
                                         &call_arg_tys,
                                         call_ret_ty.as_ref(),
                                         &self.checker,
@@ -8968,7 +9000,7 @@ impl Compiler {
                                     offset as u32,
                                 ),
                             );
-                            if is_generic && self.generic_return_is_boxed(&fqn) {
+                            if is_generic && self.generic_return_is_boxed(&lookup_name) {
                                 if let Some(call_ty) = self.codegen_expr_ty(ast) {
                                     Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                                 }
