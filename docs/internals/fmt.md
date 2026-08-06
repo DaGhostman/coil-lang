@@ -37,8 +37,9 @@ Class and enum bodies are always multiline when non-empty and use trailing comma
 
 Adjacent `use` statements are kept together without blank separator lines.
 Imports with the same namespace are grouped, such as
-`use io::{stdout, write_all};`. Different nested namespaces are grouped only
-when each import has more than three path segments.
+`use io::{stdout, open};`. Brace-group forms (`use io::{stdout, open};`) round-trip
+through the same grouping. Different nested namespaces are grouped only when each
+import has more than three path segments.
 
 ## Comments and docs
 

@@ -1198,6 +1198,14 @@ impl Formatter {
                     self.fmt_output(val);
                 }
             }
+            // Brace-group `use path::{a, b}` parses as Fragment([Use, Use, …]).
+            Expression::Use { .. }
+                if items
+                    .iter()
+                    .all(|item| matches!(item.1.as_ref(), Expression::Use { .. })) =>
+            {
+                self.fmt_use_group(items);
+            }
             _ => {
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -1970,12 +1978,30 @@ mod tests {
 
     #[test]
     fn groups_use_statements_by_namespace() {
-        let src = "use io::stdout;\nuse io::write_all;\nfn main() { return; }\n";
+        let src = "use io::stdout;\nuse io::open;\nfn main() { return; }\n";
         let formatted = format_source(src).unwrap();
-        assert!(formatted.contains("use io::{stdout, write_all};"));
+        assert!(formatted.contains("use io::{stdout, open};"));
         assert!(formatted.contains("};\n\nfn main"));
         assert!(!formatted.contains("stdout;\n\nuse"));
         Pratt::default().parse(&formatted).expect("grouped use parses");
+    }
+
+    #[test]
+    fn brace_group_use_formats_without_comma_after_semicolon() {
+        let src = "use io::{stdout, open};\nfn main() { return; }\n";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("use io::{stdout, open};"),
+            "expected regrouped brace import, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(";,"),
+            "must not emit comma after semicolon:\n{formatted}"
+        );
+        Pratt::default()
+            .parse(&formatted)
+            .expect("brace-group format must reparse");
+        assert_eq!(formatted, format_source(&formatted).unwrap());
     }
 
     #[test]
