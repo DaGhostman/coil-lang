@@ -44,6 +44,7 @@ impl Checker {
             current_module: String::new(),
             virtual_modules: VirtualModules::new(),
             scope_bindings: HashMap::new(),
+            disk_imports: HashSet::new(),
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
             methods: std::collections::HashMap::new(),
@@ -1340,6 +1341,7 @@ impl Checker {
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
         self.inject_prelude_scope();
+        self.disk_imports.clear();
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -2237,8 +2239,13 @@ impl Checker {
                 // `use num::{abs}` can still type-dispatch.
                 if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
                     if cands.len() > 1 {
-                        self.overload_sets.insert(local, cands);
+                        self.overload_sets.insert(local.clone(), cands);
                     }
+                }
+                // Disk imports are file-level globals — track for lambda/defer
+                // rebind after `take_and_isolate`.
+                if name != "*" {
+                    self.disk_imports.insert(local);
                 }
                 unit_ty()
             }
@@ -4040,30 +4047,12 @@ impl Checker {
                     uncaptured.remove(n);
                 }
 
-                let virtual_callables: Vec<(String, BuiltinExport)> = self
-                    .scope_bindings
-                    .iter()
-                    .filter(|(_, e)| {
-                        matches!(
-                            e,
-                            BuiltinExport::FfiFn { .. }
-                                | BuiltinExport::IoFn { .. }
-                                | BuiltinExport::StringFn { .. }
-                                | BuiltinExport::ThreadFn { .. }
-                                | BuiltinExport::GcFn { .. }
-                                | BuiltinExport::HostFn { .. }
-                        )
-                    })
-                    .map(|(k, e)| (k.clone(), e.clone()))
-                    .collect();
+                let import_rebinds =
+                    self.snapshot_file_level_imports(&mut uncaptured, range.clone());
 
                 let saved_frames = self.env.take_and_isolate();
                 let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
-                for (local, export) in virtual_callables {
-                    if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
-                        self.env.insert_top(local, scheme);
-                    }
-                }
+                self.rebind_file_level_imports(import_rebinds);
                 for (n, ty) in &cap_bindings {
                     self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
@@ -4227,33 +4216,14 @@ impl Checker {
                     uncaptured.remove(n);
                 }
 
-                // File-level virtual-module imports are global names, not
-                // closure captures. Rebind their callable schemes after
-                // isolating the value environment, just as `defer` does.
-                let virtual_callables: Vec<(String, BuiltinExport)> = self
-                    .scope_bindings
-                    .iter()
-                    .filter(|(_, e)| {
-                        matches!(
-                            e,
-                            BuiltinExport::FfiFn { .. }
-                                | BuiltinExport::IoFn { .. }
-                                | BuiltinExport::StringFn { .. }
-                                | BuiltinExport::ThreadFn { .. }
-                                | BuiltinExport::GcFn { .. }
-                                | BuiltinExport::HostFn { .. }
-                        )
-                    })
-                    .map(|(k, e)| (k.clone(), e.clone()))
-                    .collect();
+                // File-level imports are global names, not closure captures.
+                // Rebind virtual + disk-module schemes after isolating the env.
+                let import_rebinds =
+                    self.snapshot_file_level_imports(&mut uncaptured, range.clone());
 
                 let saved_frames = self.env.take_and_isolate();
                 let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
-                for (local, export) in virtual_callables {
-                    if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
-                        self.env.insert_top(local, scheme);
-                    }
-                }
+                self.rebind_file_level_imports(import_rebinds);
                 for (n, ty) in &cap_bindings {
                     self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
                     self.record_codegen_var_type(n.clone(), ty.clone());
@@ -5451,6 +5421,52 @@ impl Checker {
     // ============================================================
     //  Helpers
     // ============================================================
+
+    /// File-level imports (virtual + disk) are globals, not closure captures.
+    /// Snapshot their schemes, drop them from `uncaptured`, then rebind after
+    /// `take_and_isolate`.
+    fn snapshot_file_level_imports(
+        &mut self,
+        uncaptured: &mut HashSet<String>,
+        range: Range<usize>,
+    ) -> Vec<(String, Scheme)> {
+        let mut rebinds = Vec::new();
+        let virtual_callables: Vec<(String, BuiltinExport)> = self
+            .scope_bindings
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    BuiltinExport::FfiFn { .. }
+                        | BuiltinExport::IoFn { .. }
+                        | BuiltinExport::StringFn { .. }
+                        | BuiltinExport::ThreadFn { .. }
+                        | BuiltinExport::GcFn { .. }
+                        | BuiltinExport::HostFn { .. }
+                )
+            })
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        for (local, export) in virtual_callables {
+            uncaptured.remove(&local);
+            if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                rebinds.push((local, scheme));
+            }
+        }
+        for name in self.disk_imports.clone() {
+            uncaptured.remove(&name);
+            if let Some(scheme) = self.env.lookup(&name).cloned() {
+                rebinds.push((name, scheme));
+            }
+        }
+        rebinds
+    }
+
+    fn rebind_file_level_imports(&mut self, rebinds: Vec<(String, Scheme)>) {
+        for (local, scheme) in rebinds {
+            self.env.insert_top(local, scheme);
+        }
+    }
 
     /// Process a [`Expression::Fragment`] (the body of a `let x = expr`
     /// declaration, or the body of a Block that consists entirely of

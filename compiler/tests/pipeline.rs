@@ -2996,6 +2996,91 @@ fn example_lambda_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Disk-module imports (e.g. `io::sync::write_all`) are file-level globals.
+/// After `take_and_isolate` they must be rebound like virtual imports — not
+/// treated as missing captures inside lambdas.
+#[test]
+fn disk_import_usable_inside_lambda_without_capture() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+fn main() {
+    let f = fn () => write_all(stdout(), to_bytes("ok"));
+    f()?;
+}
+"#,
+    );
+    assert_eq!(output, "ok");
+}
+
+/// Aliased disk imports must rebind under the local alias name.
+#[test]
+fn disk_import_alias_usable_inside_lambda() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all as wa};
+use string::{to_bytes};
+fn main() {
+    let f = fn () => wa(stdout(), to_bytes("ok"));
+    f()?;
+}
+"#,
+    );
+    assert_eq!(output, "ok");
+}
+
+/// Same rebind rule for `defer` bodies that call disk-module imports.
+#[test]
+fn disk_import_usable_inside_defer_without_capture() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+fn main() {
+    defer { write_all(stdout(), to_bytes("d")); }
+    write_all(stdout(), to_bytes("a"));
+}
+"#,
+    );
+    assert_eq!(output, "ad");
+}
+
+/// Disk-import rebind must not suppress explicit-capture checks for locals.
+#[test]
+fn disk_import_lambda_still_requires_local_capture() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+fn main() {
+    let y = 1;
+    let f = fn () => write_all(stdout(), to_bytes(format("%i", y)));
+    f()?;
+}
+"#,
+    );
+    assert!(
+        result.is_err(),
+        "local `y` must still require `use (y)`: {:?}",
+        pipeline.messages()
+    );
+    assert!(
+        pipeline.messages().iter().any(|m| {
+            m.message().contains("cannot capture `y` without `use (y)`")
+                || m.message().contains("list `y` in the enclosing `use")
+                || m.message().contains("list `y` in the lambda's `use")
+        }),
+        "expected capture diagnostic for `y`, got: {:?}",
+        pipeline.messages()
+    );
+}
+
 /// Nested typed lambdas must keep Fragment/Argument NodeIds lockstep with
 /// codegen (`assign_fn_arg_node_ids`); a desync surfaces as wrong results or
 /// compile failure rather than Identifier span prefer.
@@ -5338,10 +5423,10 @@ fn main() {
 }
 "#,
     );
-    // In-memory compile_src treats any diagnostic (incl. warnings) as Err.
+    // Warnings stay inspectable; only hard errors fail `compile_src`.
     assert!(
-        result.is_err(),
-        "expected Err from warning diagnostics: {:?}",
+        result.is_ok(),
+        "warning-only E0123 must not fail compile_src: {:?}",
         pipeline.messages()
     );
     assert!(
@@ -5360,6 +5445,7 @@ fn main() {
         "E0123 should be warning-only: {:?}",
         pipeline.messages()
     );
+    assert!(!pipeline.had_errors());
 }
 
 #[test]
@@ -5381,8 +5467,8 @@ fn main() {
 "#,
     );
     assert!(
-        result.is_err(),
-        "expected Err from warning diagnostics: {:?}",
+        result.is_ok(),
+        "warning-only E0123 must not fail compile_src: {:?}",
         pipeline.messages()
     );
     assert!(
@@ -5399,6 +5485,33 @@ fn main() {
             .iter()
             .any(|m| *m.kind() == reporting::MessageKind::ERROR),
         "E0123 should be warning-only: {:?}",
+        pipeline.messages()
+    );
+    assert!(!pipeline.had_errors());
+}
+
+/// Hard errors must still fail `compile_src` after the warning-only change.
+#[test]
+fn compile_src_still_fails_on_hard_errors() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+fn main() {
+    let _ = totally_undefined_var;
+}
+"#,
+    );
+    assert!(
+        result.is_err(),
+        "unknown identifier must fail compile_src"
+    );
+    assert!(pipeline.had_errors());
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| *m.kind() == reporting::MessageKind::ERROR),
+        "expected at least one error: {:?}",
         pipeline.messages()
     );
 }

@@ -605,10 +605,10 @@ fn main() { return; }
     fn io_fn_is_not_pure() {
         let set = pure_set(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn speak(int n) -> int {
-    write_all(stdout(), to_bytes(format("%i", n)));
+    write(stdout(), to_bytes(format("%i", n)));
     return n;
 }
 fn main() { return; }
@@ -632,10 +632,10 @@ fn main() { return; }
     fn impurity_propagates_through_callees() {
         let set = pure_set(
             r#"
-use io::{stdout, write_all};
+use io::{stdout, write};
 use string::{format, to_bytes};
 fn leaf(int n) -> int {
-    write_all(stdout(), to_bytes(format("%i", n)));
+    write(stdout(), to_bytes(format("%i", n)));
     return n;
 }
 fn rec(int n) -> int {

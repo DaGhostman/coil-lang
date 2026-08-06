@@ -11,7 +11,7 @@ fn quiet_pipeline() -> Pipeline {
     Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()))
 }
 
-const IO_STRING_IMPORTS: &str = "use io::{stdout, write_all};\nuse string::{format, to_bytes};\n";
+const IO_STRING_IMPORTS: &str = "use io::{stdout, write};\nuse string::{format, to_bytes};\n";
 
 fn with_io_string_imports(src: String) -> String {
     format!("{IO_STRING_IMPORTS}{src}")
@@ -20,36 +20,36 @@ fn with_io_string_imports(src: String) -> String {
 fn small_program(a: i32, b: i32, kind: u8) -> String {
     with_io_string_imports(match kind % 10 {
         0 => format!(
-            "fn main() {{\n    write_all(stdout(), to_bytes(format(\"%i\", {a} + {b})));\n}}\n"
+            "fn main() {{\n    write(stdout(), to_bytes(format(\"%i\", {a} + {b})));\n}}\n"
         ),
         1 => format!(
-            "fn main() {{\n    let x = {a};\n    let y = x + {b};\n    write_all(stdout(), to_bytes(format(\"%i\", y)));\n}}\n"
+            "fn main() {{\n    let x = {a};\n    let y = x + {b};\n    write(stdout(), to_bytes(format(\"%i\", y)));\n}}\n"
         ),
         2 => format!(
-            "fn main() {{\n    if {a} < {b} {{\n        write_all(stdout(), to_bytes(format(\"%i\", 1)));\n    }} else {{\n        write_all(stdout(), to_bytes(format(\"%i\", 0)));\n    }}\n}}\n"
+            "fn main() {{\n    if {a} < {b} {{\n        write(stdout(), to_bytes(format(\"%i\", 1)));\n    }} else {{\n        write(stdout(), to_bytes(format(\"%i\", 0)));\n    }}\n}}\n"
         ),
         3 => format!(
             "enum Color {{\n    Red,\n    Blue,\n}}\n\
-             fn main() {{\n    let c = Color::Red;\n    write_all(stdout(), to_bytes(format(\"%z\", c == Color::Red)));\n}}\n"
+             fn main() {{\n    let c = Color::Red;\n    write(stdout(), to_bytes(format(\"%z\", c == Color::Red)));\n}}\n"
         ),
         4 => format!(
-            "fn main() {{\n    let a = [{a}, {b}, {a} + {b}];\n    write_all(stdout(), to_bytes(format(\"%i\", a[0] + a[2])));\n}}\n"
+            "fn main() {{\n    let a = [{a}, {b}, {a} + {b}];\n    write(stdout(), to_bytes(format(\"%i\", a[0] + a[2])));\n}}\n"
         ),
         5 => format!(
-            "fn main() {{\n    let t = ({a}, {b});\n    write_all(stdout(), to_bytes(format(\"%i\", t[0] * t[1])));\n}}\n"
+            "fn main() {{\n    let t = ({a}, {b});\n    write(stdout(), to_bytes(format(\"%i\", t[0] * t[1])));\n}}\n"
         ),
         6 => format!(
-            "fn main() {{\n    let d = {{ x: {a}, y: {b} }};\n    write_all(stdout(), to_bytes(format(\"%i\", d.x + d.y)));\n}}\n"
+            "fn main() {{\n    let d = {{ x: {a}, y: {b} }};\n    write(stdout(), to_bytes(format(\"%i\", d.x + d.y)));\n}}\n"
         ),
         7 => format!(
             "fn add(int x, int y) -> int {{\n    return x + y;\n}}\n\
-             fn main() {{\n    write_all(stdout(), to_bytes(format(\"%i\", add({a}, {b}))));\n}}\n"
+             fn main() {{\n    write(stdout(), to_bytes(format(\"%i\", add({a}, {b}))));\n}}\n"
         ),
         8 => format!(
-            "fn main() {{\n    let i = 0;\n    let s = 0;\n    while i < 3 {{\n        s = s + {a};\n        i = i + 1;\n    }}\n    write_all(stdout(), to_bytes(format(\"%i\", s + {b})));\n}}\n"
+            "fn main() {{\n    let i = 0;\n    let s = 0;\n    while i < 3 {{\n        s = s + {a};\n        i = i + 1;\n    }}\n    write(stdout(), to_bytes(format(\"%i\", s + {b})));\n}}\n"
         ),
         _ => format!(
-            "fn main() {{\n    write_all(stdout(), to_bytes(format(\"%s\", format(\"%i:%i\", {a}, {b}))));\n}}\n"
+            "fn main() {{\n    write(stdout(), to_bytes(format(\"%s\", format(\"%i:%i\", {a}, {b}))));\n}}\n"
         ),
     })
 }
@@ -57,15 +57,15 @@ fn small_program(a: i32, b: i32, kind: u8) -> String {
 fn ill_typed_program(kind: u8, a: i32) -> String {
     with_io_string_imports(match kind % 10 {
         0 => format!("fn main() {{ let x: int = \"{a}\"; }}\n"),
-        1 => "fn main() { write_all(stdout(), to_bytes(format(\"%i\", nope))); }\n".to_string(),
+        1 => "fn main() { write(stdout(), to_bytes(format(\"%i\", nope))); }\n".to_string(),
         2 => "fn main() { missing(1); }\n".to_string(),
         3 => format!("fn main() {{ let x = {a}; x[0]; }}\n"),
-        4 => "fn main() { let a = [1, 2]; write_all(stdout(), to_bytes(format(\"%i\", a[9]))); }\n"
+        4 => "fn main() { let a = [1, 2]; write(stdout(), to_bytes(format(\"%i\", a[9]))); }\n"
             .to_string(),
-        5 => "fn main() { write_all(stdout(), to_bytes(format(\"%s\", 1))); }\n".to_string(),
-        6 => "fn main() { write_all(stdout(), to_bytes(format(\"%z\", 1 && 2))); }\n".to_string(),
+        5 => "fn main() { write(stdout(), to_bytes(format(\"%s\", 1))); }\n".to_string(),
+        6 => "fn main() { write(stdout(), to_bytes(format(\"%z\", 1 && 2))); }\n".to_string(),
         7 => "fn main() { const x = 1; x = 2; }\n".to_string(),
-        8 => "fn main() { write_all(stdout(), to_bytes(format(\"%i\", 1 + 2.0))); }\n".to_string(),
+        8 => "fn main() { write(stdout(), to_bytes(format(\"%i\", 1 + 2.0))); }\n".to_string(),
         // Wrong *types* (arity-only mismatches are currently accepted).
         _ => "fn f(int a, int b) -> int { return a + b; }\nfn main() { f(\"x\", \"y\"); }\n"
             .to_string(),

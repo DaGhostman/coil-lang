@@ -2818,7 +2818,8 @@
     #[test]
     fn wide_load_store_slot_past_255() {
         let slot = 300u32;
-        let mut vm = Machine::<512>::default();
+        // Default operand stack is 256 slots; wide local 300 needs a larger buffer.
+        let mut vm = Machine::<512>::with_operand_capacity(512);
         vm.run(&[
             const_int(42),
             Byte::new(Instruction::STORE).with_load_store_wide(slot),
