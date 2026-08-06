@@ -53,7 +53,7 @@ Single compilation path: stack codegen in `compiler/src/lib.rs` — no register 
    Incompatible ABI/layout changes bump archive **major** (reset minor). Loaders accept same major with archive minor ≤ runtime minor.
 2. **Virtual module natives** — use `HostInvoke`, not new opcodes for `io`/`thread`/etc.
 3. **Reject benchmark-shaped opcodes** unless pattern is universal (see AGENTS.md user preferences).
-4. **New language features** — full HM integration + `docs/` updates + minimal runnable example.
+4. **New language features** — full HM integration + `docs/` updates + minimal runnable example. Prefer **method-based APIs** (`impl` methods on classes) over free functions for operations tied to a receiver type; free generic fns returning enums are codegen-fragile (see [limitations.md](docs/internals/limitations.md)).
 
 `STORE` vs deprecated `StorePop`: compiler emits `STORE` only. Match bindings skip store (value already in slot via `UNPACK`/`JUMP_IF_MATCH`) but codegen must reserve those slots in `variables` so arm-body temps cannot clobber them.
 
@@ -98,6 +98,8 @@ Explicit `use`: `ffi`, `io`, `thread`, `regex`, `crypto`, `time`, `env`, `string
 Cargo features `crypto`, `time`, `regex`, `tls` gate modules (default on).
 
 Prefer compiler builtins over userland for core type machinery.
+
+**API shape:** inherent and trait methods over free functions for type-tied ops (`map.insert(k, v)` not `insert(map, k, v)`). Virtual-module free fns are fine for host primitives (`io::read`); stdlib and new language surface should default to methods.
 
 ## Useful tools
 
