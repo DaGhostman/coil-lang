@@ -2005,6 +2005,24 @@ mod tests {
     }
 
     #[test]
+    fn brace_group_use_with_aliases_round_trips() {
+        let src = "use io::{stdout as out, open as o};\nfn main() { return; }\n";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("use io::{stdout as out, open as o};"),
+            "expected aliased brace import, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(";,"),
+            "must not emit comma after semicolon:\n{formatted}"
+        );
+        Pratt::default()
+            .parse(&formatted)
+            .expect("aliased brace-group format must reparse");
+        assert_eq!(formatted, format_source(&formatted).unwrap());
+    }
+
+    #[test]
     fn groups_deep_use_statements_only_past_three_segments() {
         let deep = "use a::b::c::one;\nuse a::b::d::two;\nfn main() { return; }\n";
         let formatted = format_source(deep).unwrap();
