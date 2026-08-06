@@ -25,7 +25,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0104` | `NotAFunction` | Value is not callable |
 | `E0105` | `TooManyArguments` | Too many arguments |
 | `E0106` | `UndeclaredAssignment` | Assignment to undeclared variable |
-| `E0107` | `InvalidAssignment` | Invalid assignment target |
+| `E0107` | `InvalidAssignment` | Invalid assignment target (includes removed `arr[] =` append — use `Vec::push`) |
 | `E0108` | `VariableRedeclaration` | Variable redeclaration |
 | `E0109` | `ConstantRedeclaration` | Constant redeclaration |
 | `E0110` | `UnknownType` | Unknown type name |
@@ -37,7 +37,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0116` | `InvalidOptionalAccess` | `?.` on non-Option (e.g. Result) |
 | `E0117` | `ConflictingErrorType` | Mixed Option/Result modes or conflicting `E` in one function |
 | `E0118` | `UnreachableCode` | Code after a diverging statement (warning) |
-| `E0119` | `GenericTypeError` | Other type error |
+| `E0119` | `GenericTypeError` | Other type error (includes rejected dynamic `[T]` — use `[T; N]` or `Vec<T>`) |
 | `E0120`–`E0122` | Overload family | Wrong arity / duplicate / ambiguous overload |
 | `E0123` | `DeferNeverRuns` | `defer` never runs on function exit (warning) |
 | `E0124` | `WildcardImport` | `use path::*` is banned (virtual and userland) — list names explicitly; prelude is auto-injected |

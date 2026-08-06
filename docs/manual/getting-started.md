@@ -313,7 +313,7 @@ The language includes:
 - **Control flow:** `if` / `else`, `while` loops
 - **Enums** with unit, tuple, and record-shaped variants
 - **`match`** with constructors, wildcards, and nested record patterns
-- **Tuples** `(a, b)`, **arrays** `[T]` / `[T; N]`, **dicts** `{ key: value }`
+- **Tuples** `(a, b)`, **fixed arrays** `[T; N]`, **`Vec<T>`**, **dicts** `{ key: value }`
 - **Type aliases** `type Point = (int, int);`
 - **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [Modules](../references/modules.md))
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`

@@ -83,9 +83,9 @@ test("post body concat grows by body length") {
         Result::Ok(m) => m,
         Result::Err(_) => panic "build",
     };
-    let body: [byte] = [];
-    body[] = 65;
-    body[] = 66;
+    let body: Vec<byte> = Vec::new();
+    body.push(65);
+    body.push(66);
     let msg = concat_bytes(head, body);
     if len(msg) != len(head) + 2 { panic "concat len"; }
 }
@@ -208,18 +208,18 @@ test("reject method with crlf") {
 }
 
 test("reject header name with crlf") {
-    let names: [string] = [];
-    let values: [string] = [];
-    names[] = "X-Evil\r\nHost";
-    values[] = "ok";
+    let names: Vec<string> = Vec::new();
+    let values: Vec<string> = Vec::new();
+    names.push("X-Evil\r\nHost");
+    values.push("ok");
     assert(headers_have_crlf(names, values) == 1, "header name CRLF")?;
 }
 
 test("reject header value with crlf") {
-    let names: [string] = [];
-    let values: [string] = [];
-    names[] = "X-Trace";
-    values[] = "a\r\nb";
+    let names: Vec<string> = Vec::new();
+    let values: Vec<string> = Vec::new();
+    names.push("X-Trace");
+    values.push("a\r\nb");
     assert(headers_have_crlf(names, values) == 1, "header value CRLF")?;
 }
 

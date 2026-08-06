@@ -79,13 +79,15 @@ a `Matrix` — see [Built-ins](../../references/math.md).
 
 ## Arrays
 
-An **array** is a homogeneous collection — every element has the same type.
+An **array** is a homogeneous **fixed-length** collection — every element has
+the same type, and length `N` is part of the type (`[T; N]`).
 
 ### Array literals
 
 ```coil
-let nums = [1, 2, 3];
-let empty: [int] = [];
+let nums = [1, 2, 3];          // infers [int; 3]
+let empty: [int; 0] = [];
+let buf: Vec<int> = Vec::new(); // empty growable vector
 ```
 
 All elements in a literal must share one type. Mixing types is a compile error:
@@ -94,12 +96,13 @@ All elements in a literal must share one type. Mixing types is a compile error:
 let bad = [1, "x"];   // error: array element type mismatch
 ```
 
-### Array types: dynamic and fixed-length
+### Array types: fixed-length only
 
 | Syntax | Meaning |
 |--------|---------|
-| `[T]` | Dynamic length — size known only at runtime |
 | `[T; N]` | Fixed length `N` — size is part of the type |
+| `[T]` | **Error** (`E0119`) — use `[T; N]` or `Vec<T>` |
+| `Vec<T>` | Growable heap vector |
 
 Examples:
 
@@ -108,18 +111,20 @@ fn sum_fixed([int; 3] arr) -> int {
     return arr[0] + arr[1] + arr[2];
 }
 
-fn head([int] arr) -> int {
+fn head(Vec<int> arr) -> int {
     return arr[0];
 }
 ```
 
-A literal like `[1, 2, 3]` infers the fixed type `[int; 3]`. Function parameters annotated as `[int]` are dynamic — useful when data comes from external sources (SQL rows, JSON arrays) whose length is not known statically.
+A literal like `[1, 2, 3]` infers `[int; 3]`. Locals of type `[T; N]` use
+**N stack slots**; escaping (call / return / heap store) boxes into a
+non-growable heap array. Prefer `Vec<T>` when length is unknown statically
+(IO buffers, builders, rest packs).
 
 ### Element-wise arithmetic on numeric arrays
 
 Fixed-length `[T; N]` arrays zip element-wise when lengths match.
-Dynamic `[T] ⊕ [T]` is a **hard type error** — promote to `[T; N]`
-(literals already do) or broadcast a scalar:
+Broadcast a scalar when one side is a single value:
 
 ```coil
 [1, 2] + [3, 4];   // [4, 6]  (literal → [int; 2])
@@ -128,7 +133,7 @@ Dynamic `[T] ⊕ [T]` is a **hard type error** — promote to `[T; N]`
 
 ### Array indexing
 
-Indexing uses the same `arr[i]` syntax as tuples.
+Indexing uses the same `arr[i]` syntax as tuples (also works on `Vec`).
 
 **Fixed-length arrays** (`[T; N]`):
 
@@ -143,28 +148,29 @@ Indexing uses the same `arr[i]` syntax as tuples.
   let _ = arr[i];        // OK
   ```
 
-**Dynamic-length arrays** (`[T]`):
+**`Vec<T>`:** no compile-time out-of-bounds check on variable indices.
 
-- No compile-time out-of-bounds check. Runtime access may return a sentinel value if the index is invalid.
+### Growing collections with `Vec` and `len`
 
-### Growing arrays with `arr[] =` and `len`
-
-`arr[] = value` appends in place (empty index is only legal on the left of `=`). `len(arr)` returns the current runtime length.
+`arr[] = value` append is **removed** — use `Vec` methods instead.
+`len(v)` returns the current length (`v.len()` also works on `Vec`).
 
 ```coil
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
-    let a = [1, 2];
-    a[] = 3;
-    a[] = 4;
+    let a = Vec::from([1, 2]);
+    a.push(3);
+    a.push(4);
     write_all(stdout(), to_bytes(format("%i", len(a)))); // 4
     write_all(stdout(), to_bytes(format("%i", a[3])));  // 4
 }
 ```
 
-The appended value must match the element type. After append, a fixed literal array such as `[int; 2]` is treated as dynamic `[int]` for later indexing checks.
+Useful `Vec` API: `Vec::new` / `with_capacity` / `from`, plus `push`, `pop`,
+`insert`, `remove`, `clear`, `reserve`, `capacity`, `len`, and index get/set.
+See [Arrays and Vec](../../references/arrays.md) and `examples/vec.hy`.
 
 ---
 
@@ -254,19 +260,20 @@ See `examples/aliases.hy` for a complete runnable example.
 
 ## Choosing the right aggregate
 
-| Feature | Tuple `(a, b)` | Array `[T]` / `[T; N]` | Dict `{ k: v }` | Enum record variant |
-|---------|----------------|------------------------|-----------------|---------------------|
+| Feature | Tuple `(a, b)` | Array `[T; N]` / `Vec<T>` | Dict `{ k: v }` | Enum record variant |
+|---------|----------------|--------------------------|-----------------|---------------------|
 | Element types | Heterogeneous | Homogeneous | Named fields, any types per field | Named fields, fixed by enum declaration |
-| Size | Fixed at compile time | Fixed (`[T; N]`) or dynamic (`[T]`) | Fixed by literal | Fixed by variant declaration |
-| Access | Index `t[i]` | Index `arr[i]` | Field `d.foo` | Field `p.x` or pattern match |
-| Type identity | Structural `(int, string)` | Structural `[int; 3]` | Structural `{ foo: int }` | Nominal — tied to enum name |
+| Size | Fixed at compile time | Fixed (`[T; N]`) or runtime (`Vec`) | Fixed by literal | Fixed by variant declaration |
+| Access | Index `t[i]` | Index `arr[i]` / `v[i]` | Field `d.foo` | Field `p.x` or pattern match |
+| Type identity | Structural `(int, string)` | Structural `[int; 3]` / nominal `Vec<int>` | Structural `{ foo: int }` | Nominal — tied to enum name |
 | Variants | None | None | None | Multiple variants (sum type) |
-| Typical use | Return multiple values | Collections, buffers | Ad-hoc structs, config maps | Domain types with tagged variants |
+| Typical use | Return multiple values | Fixed buffers / growable collections | Ad-hoc structs, config maps | Domain types with tagged variants |
 
 **Rule of thumb:**
 
 - Use a **tuple** when you need a small, fixed bundle of different types (coordinates, `(value, error)` pairs).
-- Use an **array** when all elements share one type and you need indexing.
+- Use an **array** `[T; N]` when all elements share one type and the length is known.
+- Use a **`Vec<T>`** when the collection must grow or the length is only known at runtime.
 - Use a **dict** when you want named fields without declaring an enum.
 - Use an **enum record variant** when the value is part of a larger sum type with distinct cases (`Some` / `None`, `Ok` / `Err`).
 
@@ -281,7 +288,7 @@ use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};
 type Row = (string, int);
-type Table = [Row];
+type Table = [Row; 2];
 
 fn main() {
     let people: Table = [("alice", 30), ("bob", 25)];
@@ -291,6 +298,8 @@ fn main() {
     }
 }
 ```
+
+For a growable table, use `type Table = Vec<Row>;` and `Vec::from([...])`.
 
 See `examples/nested_aggregates.hy` for a complete runnable program (aliases + `for` + let-destructure).
 
@@ -302,10 +311,11 @@ You can nest the other way too: tuples of arrays, arrays of dicts, dicts whose f
 
 | File | Demonstrates |
 |------|--------------|
-| `examples/array_grow.hy` | Growing arrays with `arr[] =` and `len` |
+| `examples/array_grow.hy` | `Vec::from` + `push` / `len` (growable buffers) |
+| `examples/vec.hy` | Fixed `[T; N]` stack locals + `Vec` methods |
 | `examples/dict.hy` | Dict literals and field access |
 | `examples/aliases.hy` | Type aliases with tuples |
-| `examples/nested_aggregates.hy` | `[(string, int)]` tables with aliases |
+| `examples/nested_aggregates.hy` | `[Row; N]` tables with aliases |
 | `examples/record.hy` | Enum record variants (contrast with dicts) |
 
 Run any example from the project root:

@@ -33,9 +33,9 @@ fn range(int lo, int hi) -> Result<int, CryptoError> {
 }
 
 /// Fill a new buffer of `n` random bytes (`n <= 0` → empty).
-fn bytes(int n) -> Result<[byte], CryptoError> {
+fn bytes(int n) -> Result<Vec<byte>, CryptoError> {
     if n <= 0 {
-        let empty: [byte] = [];
+        let empty: Vec<byte> = Vec::new();
         return empty;
     }
     return random_bytes(n)?;

@@ -21,7 +21,8 @@ required) covers:
 
 | Source | `Item` | Notes |
 |--------|--------|-------|
-| `[T]` / `[T; N]` | `T` | Index loop (`len` / `Index`) |
+| `[T; N]` | `T` | Index loop (`len` / `Index`) |
+| `Vec<T>` | `T` | Index loop (`len` / `Index`) |
 | Homogeneous `(A, …, A)` | `A` | Materialised to a temp array; hetero → diagnostic |
 | Homogeneous `{ k: V, … }` | `(string, V)` | `DictEntries` then array path; hetero values → diagnostic |
 | `coroutine<Y, S>` | `Y` | Resume/Done; completion value excluded from the body |

@@ -10,13 +10,13 @@ fn main() {
     let z: byte = 0;
     let a: byte = 120;
     let b: byte = 121;
-    let payload: [byte] = [a, b];
+    let payload = Vec::from([a, b]);
     // Nested arity>1: outer native id must precede nested open()'s HostInvoke.
     write_all(open(path, "w")?, payload)?;
     let r = open(path, "r")?;
     let got = match read_to_end(r) {
         Result::Ok(buf) => buf,
-        Result::Err(_) => [z],
+        Result::Err(_) => Vec::from([z]),
     };
     close(r)?;
     write_all(stdout(), to_bytes(format("%i", len(got))));

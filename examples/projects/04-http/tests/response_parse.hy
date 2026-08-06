@@ -65,8 +65,8 @@ test("content-length truncates longer rest") {
         Result::Err(_) => panic "parse failed",
     };
     assert(len(r.body) == 1, "body len")?;
-    let x: [byte] = [];
-    x[] = 88;
+    let x: Vec<byte> = Vec::new();
+    x.push(88);
     if find_bytes(r.body, x) != 0 { panic "first byte X"; }
 }
 

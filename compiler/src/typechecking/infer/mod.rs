@@ -59,7 +59,7 @@ pub struct ExistentialPack {
 /// Runtime lowering strategy for `for x in expr` (unified Iterator protocol).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForInKind {
-    /// Index loop over `[T]` / `[T; N]` (observationally `ArrayIter`).
+    /// Index loop over `[T; N]` / `Vec<T>` (observationally `ArrayIter`).
     Array,
     /// Materialise homogeneous tuple elements into a temp array, then array path.
     Tuple { arity: usize },
@@ -220,7 +220,7 @@ pub struct Checker {
     fn_param_names: std::collections::HashMap<String, Vec<String>>,
 
     /// Whether the last parameter of `fn_name` is a rest pack (`T... name`).
-    /// When true, call sites pack trailing args into a single `[T]` (P4).
+    /// When true, call sites pack trailing args into a single `Vec<T>` (P4).
     fn_has_rest: std::collections::HashMap<String, bool>,
 
     /// When the last parameter is bare `... name`, trailing args pack into a

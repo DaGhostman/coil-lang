@@ -10,9 +10,10 @@ fn echo_once() {
     let server = bind("127.0.0.1", 0)?;
     let port = local_port(server)?;
     let client = bind("127.0.0.1", 0)?;
-    let msg: [byte] = [72, 105]; // "Hi"
+    let msg = to_bytes("Hi");
     send_to(client, msg, "127.0.0.1", port)?;
-    let buf: [byte] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let z: byte = 0;
+    let buf = Vec::from([z, z, z, z, z, z, z, z]);
     let t = recv_from_wait(server, buf)?;
     close(server)?;
     close(client)?;

@@ -24,7 +24,7 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [print](print.md) | Migration note | Removed statement; use `io` + `string` |
 | [format](format.md) | Intrinsic | `string::format(...)` builds a formatted string |
 | [string](string.md) | Virtual module | `format` / UTF-8 byte conversions |
-| [arrays](arrays.md) | Expression | `arr[] =` append and `len` |
+| [arrays](arrays.md) | Types / expression | Fixed `[T; N]`, growable `Vec<T>`, `len` |
 | [math](math.md) | Prelude | IEEE float math plus `dot` / `matmul` / `cross` / `Matrix` |
 | [FFI](ffi.md) | Virtual module | `dload` / `declare` / `invoke` / `extern` |
 | [done](done.md) | Expression | Coroutine finished? |

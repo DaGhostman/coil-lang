@@ -17,19 +17,19 @@ class Url {
 }
 
 class Headers {
-    names: [string],
-    values: [string],
+    names: Vec<string>,
+    values: Vec<string>,
 }
 
 fn empty_headers() -> Headers {
-    let names: [string] = [];
-    let values: [string] = [];
+    let names: Vec<string> = Vec::new();
+    let values: Vec<string> = Vec::new();
     return new Headers(names, values);
 }
 
 fn header_add(Headers h, string name, string value) {
-    h.names[] = name;
-    h.values[] = value;
+    h.names.push(name);
+    h.values.push(value);
     return h;
 }
 
@@ -62,26 +62,26 @@ fn header_value_at(Headers h, int i) -> Result<string, HttpError> {
 }
 
 
-fn bytes_slice([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn bytes_slice(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     while i < end {
         if i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
         }
         i = i + 1;
     }
     return out;
 }
 
-fn bytes_to_string([byte] b) -> Result<string, HttpError> {
+fn bytes_to_string(Vec<byte> b) -> Result<string, HttpError> {
     return match from_bytes(b) {
         Result::Ok(s) => s,
         Result::Err(_) => raise HttpError::BadUrl,
     };
 }
 
-fn find_bytes([byte] hay, [byte] needle) -> int {
+fn find_bytes(Vec<byte> hay, Vec<byte> needle) -> int {
     let hn = len(hay);
     let nn = len(needle);
     if nn == 0 {
@@ -108,7 +108,7 @@ fn find_bytes([byte] hay, [byte] needle) -> int {
     return 999999;
 }
 
-fn parse_port_digits([byte] b, int start, int end) -> int {
+fn parse_port_digits(Vec<byte> b, int start, int end) -> int {
     let n = 0;
     let i = start;
     let zero: byte = "0";
@@ -140,7 +140,7 @@ fn http_err_bad_response() -> Result<(), HttpError> {
 
 // Reject CR (13) / LF (10) so path/host/method/headers cannot inject request lines.
 // Plain int return — keep raise/`?` out of build_request_head* (concat poison).
-fn bytes_have_crlf([byte] b) -> int {
+fn bytes_have_crlf(Vec<byte> b) -> int {
     let i = 0;
     let cr: byte = "\r";
     let lf: byte = "\n";
@@ -177,7 +177,7 @@ fn str_reject_crlf(string s) -> Result<string, HttpError> {
 
 // True (1) if the first header line of an HTTP message contains "HTTP/1.1"
 // (rejects method/path CRLF injection, which truncates the request line).
-fn request_line_ok([byte] head) -> int {
+fn request_line_ok(Vec<byte> head) -> int {
     let cr: byte = "\r";
     let lf: byte = "\n";
     let i = 0;
@@ -185,7 +185,7 @@ fn request_line_ok([byte] head) -> int {
     while i + 1 < n {
         if head[i] == cr {
             if head[i + 1] == lf {
-                let needle: [byte] = "HTTP/1.1";
+                let needle = to_bytes("HTTP/1.1");
                 let j = 0;
                 while j + 8 <= i {
                     let ok = true;
@@ -253,7 +253,7 @@ fn extras_sanitize(string extras) -> Result<string, HttpError> {
     };
 }
 
-fn headers_have_crlf([string] names, [string] values) -> int {
+fn headers_have_crlf(Vec<string> names, Vec<string> values) -> int {
     let i = 0;
     let n = len(names);
     while i < n {
@@ -280,7 +280,7 @@ fn http_fail_stream() -> Result<Stream, HttpError> {
     raise HttpError::Io;
 }
 
-fn http_fail_bytes() -> Result<[byte], HttpError> {
+fn http_fail_bytes() -> Result<Vec<byte>, HttpError> {
     raise HttpError::Io;
 }
 
@@ -290,7 +290,7 @@ fn http_fail_unit() -> Result<(), HttpError> {
 
 fn parse_url(string s) -> Result<Url, HttpError> {
     let b = to_bytes(s);
-    let sep: [byte] = "://";
+    let sep = to_bytes("://");
     let sep_at = find_bytes(b, sep);
     if sep_at == 999999 {
         http_err_bad_url()?;
@@ -415,7 +415,7 @@ fn parse_url(string s) -> Result<Url, HttpError> {
 
 
 // --- request builders (kept in url for single-import client graph) ---
-// Serialize an HTTP/1.1 request message to `[byte]`.
+// Serialize an HTTP/1.1 request message to `Vec<byte>`.
 
 fn host_header_value(Url u) -> Result<string, HttpError> {
     let host = url_host(u)?;
@@ -465,16 +465,16 @@ fn body_len_str(int body_len) -> string {
     return int_to_dec(body_len);
 }
 
-fn concat_bytes([byte] a, [byte] b) -> [byte] {
-    let out: [byte] = [];
+fn concat_bytes(Vec<byte> a, Vec<byte> b) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = 0;
     while i < len(a) {
-        out[] = a[i];
+        out.push(a[i]);
         i = i + 1;
     }
     let j = 0;
     while j < len(b) {
-        out[] = b[j];
+        out.push(b[j]);
         j = j + 1;
     }
     return out;
@@ -573,7 +573,7 @@ fn is_reserved_request_header(string name) -> int {
     return 0;
 }
 
-fn format_extra_headers_str([string] names, [string] values) -> string {
+fn format_extra_headers_str(Vec<string> names, Vec<string> values) -> string {
     // Precondition: caller ensures there is at least one non-reserved header.
     let first = 999999;
     let i = 0;
@@ -600,16 +600,16 @@ fn format_extra_headers_str([string] names, [string] values) -> string {
     return acc;
 }
 
-fn format_extra_headers(Headers headers) -> [byte] {
+fn format_extra_headers(Headers headers) -> Vec<byte> {
     let s = format_extra_headers_str(headers.names, headers.values);
     if s == "__NONE__" {
-        let empty: [byte] = [];
+        let empty: Vec<byte> = Vec::new();
         return empty;
     }
     return to_bytes(s);
 }
 
-fn build_request_head(string method, Url u, Headers headers, int body_len) -> Result<[byte], HttpError> {
+fn build_request_head(string method, Url u, Headers headers, int body_len) -> Result<Vec<byte>, HttpError> {
     // Inline Host construction (avoid nested Result `?` through host_header_value).
     // No raise/`?` here — poisons Ok-path string concat. Callers use has_crlf / parse_url.
     let host = u.host;
@@ -635,7 +635,7 @@ fn build_request_head(string method, Url u, Headers headers, int body_len) -> Re
     return concat_bytes(to_bytes(prefix), to_bytes(rest));
 }
 
-fn build_request_head_extras(string method, Url u, string extras, int body_len) -> Result<[byte], HttpError> {
+fn build_request_head_extras(string method, Url u, string extras, int body_len) -> Result<Vec<byte>, HttpError> {
     // Inserts non-empty `extras` ("Name: value\r\n" lines) after Host.
     // Caller must not pass the "__NONE__" / "__CRLF__" sentinels.
     // Header CRLF is rejected in format_extra_headers_str. No raise/`?` here.
@@ -675,12 +675,12 @@ fn req_empty_headers() -> Headers {
 
 class Response {
     status: int,
-    header_names: [string],
-    header_values: [string],
-    body: [byte],
+    header_names: Vec<string>,
+    header_values: Vec<string>,
+    body: Vec<byte>,
 }
 
-fn make_response(int status, [string] names, [string] values, [byte] body) -> Response {
+fn make_response(int status, Vec<string> names, Vec<string> values, Vec<byte> body) -> Response {
     return new Response(status, names, values, body);
 }
 
@@ -712,7 +712,7 @@ fn header_get(Response r, string name) -> string {
     return "";
 }
 
-fn find_header_end([byte] buf) -> int {
+fn find_header_end(Vec<byte> buf) -> int {
     let cr: byte = "\r";
     let lf: byte = "\n";
     let i = 0;
@@ -732,19 +732,19 @@ fn find_header_end([byte] buf) -> int {
     return 999999;
 }
 
-fn bytes_slice_resp([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn bytes_slice_resp(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     while i < end {
         if i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
         }
         i = i + 1;
     }
     return out;
 }
 
-fn find_crlf([byte] buf, int from) -> int {
+fn find_crlf(Vec<byte> buf, int from) -> int {
     let cr: byte = "\r";
     let lf: byte = "\n";
     let i = from;
@@ -759,7 +759,7 @@ fn find_crlf([byte] buf, int from) -> int {
     return 999999;
 }
 
-fn parse_status_code([byte] line) -> Result<int, HttpError> {
+fn parse_status_code(Vec<byte> line) -> Result<int, HttpError> {
     let sp: byte = " ";
     let i = 0;
     let n = len(line);
@@ -789,7 +789,7 @@ fn parse_status_code([byte] line) -> Result<int, HttpError> {
     return code;
 }
 
-fn parse_int_bytes([byte] b) -> Result<int, HttpError> {
+fn parse_int_bytes(Vec<byte> b) -> Result<int, HttpError> {
     let n = len(b);
     if n == 0 {
         http_err_bad_response()?;
@@ -803,7 +803,7 @@ fn parse_int_bytes([byte] b) -> Result<int, HttpError> {
     return v;
 }
 
-fn find_byte([byte] line, byte needle) -> int {
+fn find_byte(Vec<byte> line, byte needle) -> int {
     let k = 0;
     while k < len(line) {
         if line[k] == needle {
@@ -814,7 +814,7 @@ fn find_byte([byte] line, byte needle) -> int {
     return 999999;
 }
 
-fn parse_status_line([byte] header_bytes) -> Result<int, HttpError> {
+fn parse_status_line(Vec<byte> header_bytes) -> Result<int, HttpError> {
     let eol = find_crlf(header_bytes, 0);
     let line_end = len(header_bytes);
     if eol != 999999 {
@@ -824,7 +824,7 @@ fn parse_status_line([byte] header_bytes) -> Result<int, HttpError> {
     return parse_status_code(line)?;
 }
 
-fn append_header_line([string] names, [string] values, [byte] line) -> Result<int, HttpError> {
+fn append_header_line(Vec<string> names, Vec<string> values, Vec<byte> line) -> Result<int, HttpError> {
     let colon: byte = ":";
     let sp: byte = " ";
     let cpos = find_byte(line, colon);
@@ -841,12 +841,12 @@ fn append_header_line([string] names, [string] values, [byte] line) -> Result<in
     let val_b = bytes_slice_resp(line, val_start, len(line));
     let name = bytes_to_string(name_b)?;
     let value = bytes_to_string(val_b)?;
-    names[] = name;
-    values[] = value;
+    names.push(name);
+    values.push(value);
     return 0;
 }
 
-fn content_length_from([string] names, [string] values) -> Result<int, HttpError> {
+fn content_length_from(Vec<string> names, Vec<string> values) -> Result<int, HttpError> {
     let i = 0;
     while i < len(names) {
         if header_name_eq_ci(names[i], "Content-Length") == 1 {
@@ -857,7 +857,7 @@ fn content_length_from([string] names, [string] values) -> Result<int, HttpError
     return 999999;
 }
 
-fn parse_response([byte] raw) -> Result<Response, HttpError> {
+fn parse_response(Vec<byte> raw) -> Result<Response, HttpError> {
     let sep = find_header_end(raw);
     if sep == 999999 {
         http_err_bad_response()?;
@@ -867,8 +867,8 @@ fn parse_response([byte] raw) -> Result<Response, HttpError> {
 
     let status = parse_status_line(header_bytes)?;
 
-    let names: [string] = [];
-    let values: [string] = [];
+    let names: Vec<string> = Vec::new();
+    let values: Vec<string> = Vec::new();
     let eol0 = find_crlf(header_bytes, 0);
     let pos = 0;
     if eol0 != 999999 {

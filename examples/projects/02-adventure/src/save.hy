@@ -6,7 +6,7 @@ class SaveData {
     has_key: int,
 }
 
-fn encode_save(int room, int has_key) -> [byte] {
+fn encode_save(int room, int has_key) -> Vec<byte> {
     let z: byte = 0;
     let one: byte = 1;
     let two: byte = 2;
@@ -24,12 +24,13 @@ fn encode_save(int room, int has_key) -> [byte] {
     if room == 0 {
         hi = z;
     }
-    let payload: [byte] = [hi];
-    payload[] = lo;
+    let payload: Vec<byte> = Vec::new();
+    payload.push(hi);
+    payload.push(lo);
     return payload;
 }
 
-fn decode_save([byte] got) -> SaveData {
+fn decode_save(Vec<byte> got) -> SaveData {
     if len(got) < 2 {
         panic "save too short";
     }

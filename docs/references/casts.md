@@ -12,9 +12,9 @@ Examples: `n as byte`, `f as int`, `flag as bool`, `"/" as byte`. The same matri
 
 A **string literal** whose UTF-8 encoding is exactly one byte coerces to `byte` under an expected `byte` (or via `"/" as byte`). Escapes like `"\n"` and `"\""` work; multi-byte literals are a type error for `byte`.
 
-The same literal also coerces to **`[byte]` / `[byte; N]`** (full UTF-8 byte sequence) under an expected byte-array type or via `"hi" as [byte]` / `"hi" as [byte; 2]`. Fixed `[byte; N]` requires exactly `N` decoded bytes. Literals rewrite at compile time to `CONST` + `MakeArray`.
+The same literal also coerces to **`Vec<byte>` / `[byte; N]`** (full UTF-8 byte sequence) under an expected byte-buffer type or via `"hi" as Vec<byte>` / `"hi" as [byte; 2]`. Fixed `[byte; N]` requires exactly `N` decoded bytes. Literals rewrite at compile time to `CONST` + `MakeArray` (or the `Vec` path when the expectation is `Vec<byte>`).
 
-A **non-literal** `string` may use `s as [byte]` (dynamic only), which lowers to `string::to_bytes`. Fixed `[byte; N]` still requires a literal (or call `to_bytes` and check length yourself). `[byte] as string` is not a total cast — keep fallible `from_bytes`.
+A **non-literal** `string` may use `s as Vec<byte>`, which lowers to `string::to_bytes`. Fixed `[byte; N]` still requires a literal (or call `to_bytes` and check length yourself). `Vec<byte> as string` is not a total cast — keep fallible `from_bytes`.
 
 ---
 

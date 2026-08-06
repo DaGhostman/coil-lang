@@ -1,7 +1,7 @@
 // Collection helpers (userland): sort, reverse, range materialize.
 
 /// Merge `buf[lo..mid)` and `buf[mid..hi)` via `tmp` scratch (stable).
-fn merge_range<T: Ord>([T] buf, [T] tmp, int lo, int mid, int hi) -> int {
+fn merge_range<T: Ord>(Vec<T> buf, Vec<T> tmp, int lo, int mid, int hi) -> int {
     let i = lo;
     while i < hi {
         tmp[i] = buf[i];
@@ -44,15 +44,15 @@ fn min_int(int a, int b) -> int {
     return b;
 }
 
-/// Stable bottom-up mergesort for `Ord` elements (new array; input unchanged).
-fn sort<T: Ord>([T] arr) -> [T] {
+/// Stable bottom-up mergesort for `Ord` elements (new vector; input unchanged).
+fn sort<T: Ord>(Vec<T> arr) -> Vec<T> {
     let n = len(arr);
-    let out: [T] = [];
-    let tmp: [T] = [];
+    let out: Vec<T> = Vec::new();
+    let tmp: Vec<T> = Vec::new();
     let copy_i = 0;
     while copy_i < n {
-        out[] = arr[copy_i];
-        tmp[] = arr[copy_i];
+        out.push(arr[copy_i]);
+        tmp.push(arr[copy_i]);
         copy_i = copy_i + 1;
     }
     let width = 1;
@@ -73,31 +73,31 @@ fn sort<T: Ord>([T] arr) -> [T] {
 }
 
 /// Reverse a copy of `arr`.
-fn reverse<T>([T] arr) -> [T] {
+fn reverse<T>(Vec<T> arr) -> Vec<T> {
     let n = len(arr);
-    let out: [T] = [];
+    let out: Vec<T> = Vec::new();
     let i = n;
     while i > 0 {
         i = i - 1;
-        out[] = arr[i];
+        out.push(arr[i]);
     }
     return out;
 }
 
-/// Materialize a lazy `Range<int>` into a dynamic array.
-fn collect_ints(Range<int> r) -> [int] {
-    let out: [int] = [];
+/// Materialize a lazy `Range<int>` into a dynamic vector.
+fn collect_ints(Range<int> r) -> Vec<int> {
+    let out: Vec<int> = Vec::new();
     for x in r {
-        out[] = x;
+        out.push(x);
     }
     return out;
 }
 
 /// Materialize a lazy inclusive `RangeInclusive<int>`.
-fn collect_ints_inclusive(RangeInclusive<int> r) -> [int] {
-    let out: [int] = [];
+fn collect_ints_inclusive(RangeInclusive<int> r) -> Vec<int> {
+    let out: Vec<int> = Vec::new();
     for x in r {
-        out[] = x;
+        out.push(x);
     }
     return out;
 }

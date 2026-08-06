@@ -3327,12 +3327,12 @@ fn main() { let h = tick(2); write(stdout(), to_bytes(format(\"%i\", resume h)))
     // ============================================================
 
     #[test]
-    fn array_append_and_len_emit_array_opcodes() {
+    fn vec_push_and_len_emit_array_opcodes() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-let a = [1, 2]; \
-a[] = 3; \
+let a = Vec::from([1, 2]); \
+a.push(3); \
 let n = len(a); \
 }",
         );
@@ -3340,7 +3340,7 @@ let n = len(a); \
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
-            "expected `a[] = 3` to emit ArrayPush"
+            "expected `a.push(3)` thunk to emit ArrayPush"
         );
         assert!(
             bc.iter()
@@ -3348,14 +3348,116 @@ let n = len(a); \
             "expected `len(a)` to emit ArrayLen"
         );
         assert!(
-            !bc.iter()
-                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3 }),
-            "push/len builtins should not lower to ordinary CALL instructions"
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "expected method dispatch CALL to Vec::push thunk"
         );
     }
 
-    /// Literal `len("…")` must const-fold to an immediate; the only
-    /// `ArrayLen` in the program is the built-in `Length__string__len` thunk.
+    
+    /// Fixed `[T; N]` locals use consecutive LOAD/STORE for const indices;
+    /// escaping the local into a call boxes via MakeArray.
+    #[test]
+    fn fixed_array_local_uses_slots_and_boxes_on_escape() {
+        use common::Instruction;
+        let mut pipeline = crate::Pipeline::new();
+        let (bc, _pool) = pipeline
+            .compile_src(
+                "fn take([int; 3] xs) -> int { return xs[0]; } \
+fn main() { \
+let a = [10, 20, 30]; \
+a[1] = 99; \
+let x = a[1]; \
+let _ = take(a); \
+}",
+            )
+            .expect("compile");
+        let main_off = pipeline.compiler_mut().get_function("main") as usize;
+        let main_bc = &bc[main_off..];
+        assert!(
+            !main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::StoreIndex)),
+            "const store on stack-array local should avoid StoreIndex; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeArray)),
+            "escaping stack-array local into take(a) must MakeArray; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let loads = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LOAD))
+            .count();
+        assert!(
+            loads >= 3,
+            "expected multi-slot LOADs for escape/index; got {loads}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Init is forward CONST;STORE per element — only escape MakeArray.
+        let make_arrays = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .count();
+        assert_eq!(
+            make_arrays, 1,
+            "only the escape path should MakeArray; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let stores = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert!(
+            stores >= 3,
+            "expected per-element STOREs for stack init; got {stores}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float / large-N / nested: outer spine is multi-slot; nested elems MakeArray.
+    #[test]
+    fn stack_array_scalars_and_nested_heap_elems() {
+        use common::Instruction;
+        let mut pipeline = crate::Pipeline::new();
+        let (bc, _pool) = pipeline
+            .compile_src(
+                "fn main() { \
+let f = [1.5, 2.5, 3.5, 4.5]; \
+let _x = f[2]; \
+let nested = [[1, 2], [3, 4]]; \
+let _y = nested[0]; \
+}",
+            )
+            .expect("compile");
+        let main_off = pipeline.compiler_mut().get_function("main") as usize;
+        let main_bc = &bc[main_off..];
+        // Nested inners → MakeArray; outer nested spine is stack (no third MakeArray
+        // for the outer literal). Escape of nested[0] may MakeArray the outer row
+        // when indexing produces a value — row is heap already from inner lit.
+        let make_arrays = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .count();
+        assert!(
+            make_arrays >= 2,
+            "expected MakeArray for nested row literals; got {make_arrays}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Float local: no MakeArray for the 4-float init (only nested rows).
+        // Const index f[2] is a LOAD, not Index.
+        assert!(
+            !main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Index)),
+            "const index on stack float array should avoid Index; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn len_of_string_literal_folds_without_array_len() {
         use common::Instruction;
@@ -4312,7 +4414,7 @@ fn main() {
         let src = "\
 use io::{stdin, read}; \
 fn main() { \
-  let buf: [byte] = [0]; \
+  let buf = Vec::from([0 as byte]); \
   let _ = read(stdin(), buf); \
 }";
         let mut ast = Pratt::default().parse(src).expect("parse failed");
@@ -5284,7 +5386,7 @@ fn main() {
     }
 
     /// `bytes_slice`-shaped loop: `while i < end` with nested `i < len(src)` and
-    /// `out[] = src[i]` must exit past the back-edge (BinSlotSlotJmpf pool target).
+    /// `out.push(src[i])` must exit past the back-edge (BinSlotSlotJmpf pool target).
     #[test]
     fn bytes_slice_while_exit_targets_past_back_edge() {
         use common::Instruction;
@@ -5293,12 +5395,12 @@ fn main() {
 use io::{stdout};
 
 use string::{format, to_bytes};
-fn bytes_slice([byte] src, int start, int end) -> [byte] {
-    let out: [byte] = [];
+fn bytes_slice(Vec<byte> src, int start, int end) -> Vec<byte> {
+    let out: Vec<byte> = Vec::new();
     let i = start;
     while i < end {
         if i < len(src) {
-            out[] = src[i];
+            out.push(src[i]);
         }
         i = i + 1;
     }

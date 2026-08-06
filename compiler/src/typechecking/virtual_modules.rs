@@ -707,6 +707,9 @@ impl VirtualModules {
                 BuiltinExport::Enum {
                     name: common::BUILTIN_RESULT_ENUM,
                 },
+                BuiltinExport::OpaqueType {
+                    name: common::BUILTIN_VEC_TYPE,
+                },
                 BuiltinExport::TypeClass { name: "Iterator" },
                 BuiltinExport::TypeClass {
                     name: "IntoIterator",

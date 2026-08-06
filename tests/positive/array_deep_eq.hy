@@ -9,16 +9,16 @@ test("array deep equality") {
     assert(a != c)?;
 }
 
-test("int array deep equality") {
-    let a: [int] = [];
-    a[] = 1;
-    a[] = 2;
-    let b: [int] = [];
-    b[] = 1;
-    b[] = 2;
-    let c: [int] = [];
-    c[] = 1;
-    c[] = 3;
+test("int vec deep equality") {
+    let a: Vec<int> = Vec::new();
+    a.push(1);
+    a.push(2);
+    let b: Vec<int> = Vec::new();
+    b.push(1);
+    b.push(2);
+    let c: Vec<int> = Vec::new();
+    c.push(1);
+    c.push(3);
     assert(a == b)?;
     assert(!(a == c))?;
 }

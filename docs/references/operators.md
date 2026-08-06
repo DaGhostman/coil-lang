@@ -73,11 +73,10 @@ Homogeneous numeric tuples and arrays support the same operators
 |------|-------|--------|
 | `(T,…,T)` | `(T,…,T)` (same arity) | zip |
 | `[T; N]` | `[T; N]` | zip |
-| `[T]` | `[T]` / `[T; N]` | **hard error** (length not known at compile time) |
 | aggregate | scalar `T` (or reverse) | broadcast |
 
 `T` must be numeric (`int` / `float` / `byte`, or a `Num`-bounded type
-parameter).
+parameter). Dynamic-length `[T]` is not a vector type (use fixed `[T; N]`).
 `*` and `**` are element-wise (not dot product / matrix power). Unary `-`
 negates each element. Compound assign (`+=`, `**=`, …) follows the same
 rules with the LHS shape fixed.
@@ -249,10 +248,10 @@ a = b ?? c        // a = (b ?? c)
 
 | Form | Example | Precedence |
 |------|---------|------------|
-| Postfix index | `arr[i]`, `t[0]` | Primary |
-| Empty index append | `arr[] = v` (LHS only) | Primary |
+| Postfix index | `arr[i]`, `v[i]`, `t[0]` | Primary |
 
-`arr[]` with no index expression is only valid as the target of `=` / `+=` — it appends to a dynamic array.
+Empty index `arr[]` (append assignment) is **removed** — use `vec.push(v)` on a
+`Vec<T>` (`E0107`). See [Arrays and Vec](arrays.md).
 
 ---
 

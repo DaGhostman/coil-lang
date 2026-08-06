@@ -2190,20 +2190,22 @@ fn main() {
     }
 
     #[test]
-    fn array_append_promotes_static_array_to_dynamic_for_later_indexing() {
-        let src = "fn main() { let arr = [0, 1]; arr[] = 2; let _ = arr[2]; }";
+    fn vec_push_grows_for_later_indexing() {
+        let src = "fn main() { let arr = Vec::from([0, 1]); arr.push(2); let _ = arr[2]; }";
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
     }
 
     #[test]
-    fn array_append_rejects_element_type_mismatch() {
-        let src = "fn main() { let arr = [0, 1]; arr[] = \"x\"; }";
+    fn array_append_assignment_is_rejected() {
+        let src = "fn main() { let arr = [0, 1]; arr[] = 2; }";
         let (_c, msgs) = check_warn(src);
-        let found = msgs.iter().any(|m| m.message().contains("Type mismatch"));
+        let found = msgs
+            .iter()
+            .any(|m| m.message().contains("append assignment `arr[] = value` is no longer supported"));
         assert!(
             found,
-            "expected append element type mismatch, got: {:?}",
+            "expected append assignment rejection, got: {:?}",
             msgs
         );
     }
@@ -4784,12 +4786,12 @@ fn f() -> byte {
     }
 
     #[test]
-    fn write_all_accepts_named_byte_array() {
+    fn write_all_accepts_named_byte_vec() {
         let (mut c, _) = check(
             r#"
 use io::{stdin, write};
 fn main() {
-    let data: [byte] = [1, 2];
+    let data = Vec::from([1 as byte, 2 as byte]);
     write(stdin(), data);
 }
 "#,

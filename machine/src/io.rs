@@ -321,7 +321,7 @@ pub fn stream_close(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
     })?
 }
 
-/// Non-blocking read into an existing `[byte]` array. Returns:
+/// Non-blocking read into an existing `Vec<byte>` buffer. Returns:
 /// - `Ok(Some(n))` bytes written into the buffer
 /// - `Ok(None)` EOF
 /// - `Err(WouldBlock)` / other
@@ -525,7 +525,7 @@ pub fn stream_read_exact(
     Ok(Some(filled))
 }
 
-/// Block until EOF; return a new `[byte]` with all data.
+/// Block until EOF; return a new `Vec<byte>` with all data.
 pub fn stream_read_to_end(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     let mut acc: Vec<u8> = Vec::new();
     let chunk_size = 4096usize;
@@ -1172,7 +1172,7 @@ pub fn value_as_string(heap: &Heap, v: Value) -> Result<String, IoErrorTag> {
     }
 }
 
-/// Read a heap `[byte]` array into a Rust `Vec<u8>`.
+/// Read a heap `Vec<byte>` (Array carrier) into a Rust `Vec<u8>`.
 pub fn value_as_bytes(heap: &Heap, v: Value) -> Result<Vec<u8>, IoErrorTag> {
     match heap.find_object_by_addr(v.raw() as u64) {
         Some(Object::Array(arr_gc)) => Ok(arr_gc
@@ -1194,7 +1194,7 @@ pub fn value_as_bytes(heap: &Heap, v: Value) -> Result<Vec<u8>, IoErrorTag> {
     }
 }
 
-/// Decode `[byte]` as UTF-8 into a heap string.
+/// Decode `Vec<byte>` as UTF-8 into a heap string.
 ///
 /// Invalid UTF-8 → `Err(InvalidInput)`.
 pub fn from_bytes(heap: &mut Heap, buf: Value) -> Result<Value, IoErrorTag> {
@@ -1204,9 +1204,9 @@ pub fn from_bytes(heap: &mut Heap, buf: Value) -> Result<Value, IoErrorTag> {
     Ok(Value::from(gc.as_ptr() as *mut u8 as u64))
 }
 
-/// Encode a heap string as a fresh `[byte]` array (UTF-8).
+/// Encode a heap string as a fresh `Vec<byte>` (UTF-8).
 ///
-/// Non-string input yields an empty array (defensive — the typechecker
+/// Non-string input yields an empty buffer (defensive — the typechecker
 /// rejects this case).
 pub fn to_bytes(heap: &mut Heap, s: Value) -> Value {
     let bytes = match value_as_string(heap, s) {

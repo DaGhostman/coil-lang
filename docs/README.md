@@ -38,20 +38,20 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; named holes on partials allowed) |
 | Arity / type overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.hy`, `type_overload.hy`, `fn_value.hy`, `lambda.hy`) |
-| Rest parameters (`T... xs` / tuple `... xs`) | Supported (trailing only; `T...` packs to `[T]`, bare `...` packs to a tuple) |
-| Call-site spread (`f(...pack)`) | Supported (tuple and array operands) |
+| Rest parameters (`T... xs` / tuple `... xs`) | Supported (trailing only; `T...` packs to `Vec<T>`, bare `...` packs to a tuple) |
+| Call-site spread (`f(...pack)`) | Supported (tuple, `[T; N]`, and `Vec<T>` operands) |
 | User-defined `attr` decorators | Supported (`attr` decl + `#[name(...)]` on `fn`, methods, class constructors) |
 | Let destructuring (`let (a, b) = …`, `let { x, y } = …`) | Supported (tuple / record; no enum ctor patterns in `let`) |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
-| Tuples, arrays (`arr[] =` / `len`), dicts (anonymous records) | Supported |
+| Tuples, fixed arrays (`[T; N]` / `len`), `Vec<T>`, dicts (anonymous records) | Supported |
 | Type aliases (`type Name = T;`, lexically scoped) | Supported |
 | Generics and traits | Supported: generic functions/enums/aliases/classes, higher-kinded type parameters, associated types/GATs, existentials, coherence checks |
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `coil.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, C varargs `...`, struct/callback returns) | Supported (requires libffi) |
-| IO streams (`use io::{…};`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
+| IO streams (`use io::{…};`, `Vec<byte>`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
@@ -81,12 +81,12 @@ Docs are split into three trees:
 | [02 — Types & Variables](manual/tutorial/02-types-and-variables.md) | Primitives, inference, annotations |
 | [03 — Enums & Match](manual/tutorial/03-enums-and-match.md) | Sum types and pattern matching |
 | [04 — Records & Fields](manual/tutorial/04-records-and-fields.md) | Record variants, field access, nested patterns |
-| [05 — Aggregates](manual/tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
+| [05 — Aggregates](manual/tutorial/05-aggregates.md) | Tuples, `[T; N]`, `Vec<T>`, dicts, type aliases |
 | [06 — Modules](manual/tutorial/06-modules.md) | `use`, `mod`, `coil.toml` |
 | [07 — FFI](manual/tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
 | [08 — Coroutines](manual/tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](manual/tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
-| [10 — IO streams](manual/tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
+| [10 — IO streams](manual/tutorial/10-io-streams.md) | `byte` / `Vec<byte>`, `Stream`, files, sync adapters, TCP |
 | [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::{spawn, join, …}`, channels, mutexes |
 | [Examples catalog](manual/examples.md) | Every file in `examples/`, expected output |
 | [Showcase projects](../examples/projects/README.md) | Multi-file apps + co-located tests |

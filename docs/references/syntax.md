@@ -127,7 +127,7 @@ class_bound     ::= IDENT
 where_clause    ::= 'where' where_constraint (',' where_constraint)*
 where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
 arg_list      ::= '(' (arg (',' arg)*)? ')'
-arg           ::= type_annotation '...'? IDENT   // `T... name` → `[T]`; bare `... name` → tuple pack
+arg           ::= type_annotation '...'? IDENT   // `T... name` → `Vec<T>`; bare `... name` → tuple pack
 ```
 
 ### Attribute declarations
@@ -146,7 +146,7 @@ Arity overloads (same name, different arities / rest ranges), **type overloads**
 
 Call sites may use named arguments (`name: expr`) after any positional
 prefix. Rest parameters are positional-only and pack trailing values
-into one array (`T... xs` → `[T]`) or tuple (`... xs` → `(T1, …, Tn)`).
+into one vector (`T... xs` → `Vec<T>`) or tuple (`... xs` → `(T1, …, Tn)`).
 Call-site spread forwards packed values as separate arguments:
 
 ```
@@ -158,7 +158,7 @@ call_arg    ::= expr | '...' expr
 |---------------------|-----------|
 | Tuple `(T1, …, Tn)` | Each element becomes one argument |
 | Fixed array `[T; N]` | Each element becomes one argument |
-| Dynamic `[T]` | Compile error (use tuple or `[T; N]`) |
+| `Vec<T>` | Each element becomes one argument |
 | Other | Compile error |
 
 Examples:
@@ -438,15 +438,10 @@ statement ::= while_stmt
 
 `static let` / `static const` are top-level declarations only; initializers run in the program prologue before `main`.
 
-### Array append (`arr[] =`)
+### Empty index (`arr[]`) — removed
 
-Empty index `arr[]` is valid **only** as an assignment target and appends to a dynamic array:
-
-```coil
-arr[] = value;
-```
-
-Using `arr[]` as an rvalue is a compile error. See [Built-ins — Array append](arrays.md).
+`arr[] = value` (append assignment) is **no longer supported** (`E0107`).
+Use `vec.push(value)` on a `Vec<T>`. See [Arrays and Vec](arrays.md).
 
 ### `readonly` expressions
 
@@ -485,7 +480,7 @@ Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `fl
 |------|--------|-------|
 | Group | `(expr)` | Single expr — **not** a 1-tuple |
 | Tuple | `(e1, e2)` or `(e,)` | Comma required for tuple |
-| Array | `[e1, e2, ...]` or `[]` | Homogeneous elements |
+| Array | `[e1, e2, ...]` or `[]` | Homogeneous; literal → `[T; N]`; empty `[]` needs `Vec<T>` / `[T; 0]` |
 | Dict | `{ name: expr, ... }` | Anonymous record |
 | Construct | `Enum::Variant(...)` | Qualified constructor |
 | Call | `f(args)` | Args are positional `expr` and/or named `name: expr` (positional prefix, then named; no positional after named). Includes user functions and FFI-wrapped extern fns |
@@ -574,21 +569,23 @@ match p {
 Used in function signatures, `let`, enum payloads, and type aliases:
 
 ```
-type_annotation ::= array_type | tuple_type | type_projection | IDENT
-array_type      ::= '[' type (';' INT)? ']'
+type_annotation ::= array_type | tuple_type | type_projection | type_app | IDENT
+array_type      ::= '[' type ';' INT ']'
 tuple_type      ::= '(' type (',' type)+ ')'
+type_app        ::= IDENT '<' type (',' type)* '>'
 type_projection ::= IDENT '::' IDENT type_arg_list?
 ```
 
 | Form | Meaning |
 |------|---------|
 | `int` | Primitive or type constructor name |
-| `[int]` | Dynamic-length array |
-| `[int; 5]` | Static-length array (length 5) |
+| `[int; 5]` | Fixed-length array (length 5); `N` inferred from literals when possible |
+| `Vec<int>` | Growable heap vector |
 | `(int, string)` | Tuple type (comma required) |
 | `C::Elem` | Associated type projection |
 | `P::Ref<A>` | Generic associated type projection with type arguments |
 
+Bare `[int]` (no `; N`) is a type error (`E0119`) — use `[int; N]` or `Vec<int>`.
 Primitive names are case-insensitive in the typechecker (`String` ≡ `string`).
 
 ---
