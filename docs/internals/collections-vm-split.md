@@ -25,16 +25,17 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 | `List<T>` | `collections::list` | Mutable singly-linked `Node` class (`Option<Node<T>>`) |
 | `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel arrays + child indices (avoids `Option` field moves) |
 
-Constrained ops (`insert` / `get_or` / …) are **free functions** with `T: Eq + Hash` or `T: Ord + Eq` bounds. Inherent `impl` bounds are parsed but not applied to method schemes (see below), and inherent method calls do not yet emit dictionary arguments.
+Constrained ops (`insert` / `get_or` / …) are **inherent methods** on
+`impl HashMap<K: Eq + Hash, V>` (and the Ord analogues for `TreeMap`). The
+compiler applies `impl` type-param bounds to method schemes and emits
+dictionary arguments on inherent method `CALL` (same ABI as free generics).
 
 **`Option` field caveat:** matching a class field of type `Option<_>` moves the value out — write it back (`t.root = Option::Some(root)`) before returning, and copy child links to a `let` before nested `match` so the field is restored.
 
-## Known language gaps (hoist candidates)
+## Known language gaps (remaining)
 
 | Gap | Impact | Recommended hoist |
 |-----|--------|-------------------|
-| `impl Foo<T: Eq>` bounds ignored in `infer_impl` | Methods cannot use `==` / `.hash()` on `T` | Apply binder bounds to `active_constraints` + `Scheme::poly` + `fn_dict_arity` |
-| Inherent method `CALL` skips dict args | Even with fixed schemes, `m.insert(k,v)` would not pass `Eq`/`Hash` dictionaries | Mirror free-fn `emit_call_site_dicts` on method calls |
 | `[Option<T>]` / `[Foo<K,V>]` parse error | No array-of-generic without a `type` alias | Parser: allow nested generics in array element types |
 | Free `fn f<T>(T) -> Option<T>` corrupts string/int payloads | Blocks `get → Option` as a free fn | Codegen/unbox for generic enum returns (methods returning `Option` are OK) |
 | Functional `List` recursion can panic on stack | Prefer mutable class list for now | VM stack / `max_depth` interaction audit |
@@ -47,9 +48,19 @@ Constrained ops (`insert` / `get_or` / …) are **free functions** with `T: Eq +
 ## API shape
 
 ```coil
-use collections::map::{HashMap, hashmap_new, hashmap_insert, hashmap_get_or, hashset_new};
-use collections::list::{List, list_new, list_push_front, list_pop_front_or};
-use collections::tree::{TreeMap, treemap_new, treemap_insert, treemap_get_or};
+use collections::map::{HashMap, HashSet};
+use collections::list::{List};
+use collections::tree::{TreeMap};
+
+let m = HashMap::new();
+m.insert(1, "a");
+let v = m.get_or(1, "?");
+
+let xs = List::new();
+xs.push_front(1);
+
+let t = TreeMap::new();
+t.insert(2, 20);
 ```
 
 Existing `collections::{sort, reverse, collect_ints, …}` stays in `stdlib/collections.hy`.
