@@ -1,5 +1,7 @@
 # Test health report (2026-07-18)
 
+> **Historical snapshot** — see CI for current test status. For open issues see [limitations.md](limitations.md).
+
 Investigation of `main` after PRs #8–#17. This document records what was
 broken, what looked flaky, incomplete implementations, and fixes applied.
 

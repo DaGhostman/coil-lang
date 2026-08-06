@@ -659,8 +659,6 @@ See `examples/range.hy`.
 `collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric
 `Ord` types.
 
-Full design lock-in: [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md).
-
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 
 ---
