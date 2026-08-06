@@ -7865,7 +7865,17 @@ impl Compiler {
                 // the call frame, one per user constraint, in constraint order.
                 // Every trait constraint (including builtin Num/Ord/Eq/Show)
                 // gets a trailing `__dictN` slot for dictionary dispatch.
-                let dict_arity = self.checker.dict_arity_for(name);
+                // Prefer the qualified FQN: bare names are dropped by
+                // `fn_dict_arity.retain(|k| k.contains("::"))` across modules,
+                // while inherent methods always register `Owner::method`.
+                let dict_arity = {
+                    let via_fqn = self.checker.dict_arity_for(&qualified);
+                    if via_fqn > 0 {
+                        via_fqn
+                    } else {
+                        self.checker.dict_arity_for(name)
+                    }
+                };
                 for dict_idx in 0..dict_arity {
                     self.context.variables.intern(format!("__dict{}", dict_idx));
                 }
@@ -8885,18 +8895,84 @@ impl Compiler {
                             fqn_base
                         };
                         if let Some(offset) = self.functions.get(&fqn).copied() {
+                            // Same ABI as free generics: box top-level type
+                            // params, append trait dictionaries, unbox returns.
+                            let is_generic = self.checker.is_generic_fn(&fqn);
+                            let box_generic_args = is_generic
+                                && self.generic_has_toplevel_type_param_args(&fqn);
                             // Push receiver first (slot 0), then args
                             // (reordered when any arg is named; rest packed).
                             bytecode.append(&mut self.do_compile(recv));
-                            let nargs = if let Some(items) = args {
-                                self.emit_call_args_with_rest(&fqn, items, &mut bytecode, false)
+                            // Receiver is `Self` / `Owner<…>`, not a bare
+                            // type param — never box it for the shared ABI.
+                            let arg_slice = args.as_deref().unwrap_or(&[]);
+                            let nargs = if args.is_some() {
+                                self.emit_call_args_with_rest(
+                                    &fqn,
+                                    arg_slice,
+                                    &mut bytecode,
+                                    box_generic_args,
+                                )
+                            } else {
+                                0
+                            };
+                            let dict_count = if is_generic {
+                                let mut call_arg_tys: Vec<Ty> = Vec::new();
+                                if let Some(ty) = recv_ty.clone() {
+                                    call_arg_tys.push(ty);
+                                }
+                                let (fixed, rest, pack_rest) =
+                                    self.split_call_args_for_rest(&fqn, arg_slice);
+                                for arg in &fixed {
+                                    call_arg_tys.push(self.codegen_expr_ty(arg).expect(
+                                        "typechecked method argument must have a codegen type",
+                                    ));
+                                }
+                                if pack_rest {
+                                    call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                                }
+                                let mut forwarded = 0;
+                                if let Some(indices) = self_id
+                                    .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                    .or_else(|| {
+                                        self.checker
+                                            .forwarded_dicts_for_span(span.start, span.end)
+                                    })
+                                    .map(<[usize]>::to_vec)
+                                {
+                                    for dict_index in indices {
+                                        if let Some(slot) =
+                                            self.lookup_slot(&format!("__dict{}", dict_index))
+                                        {
+                                            bytecode.push_load(slot);
+                                            forwarded += 1;
+                                        }
+                                    }
+                                }
+                                let call_ret_ty = self.codegen_expr_ty(ast);
+                                forwarded
+                                    + Self::emit_call_site_dicts(
+                                        &mut bytecode,
+                                        &fqn,
+                                        &call_arg_tys,
+                                        call_ret_ty.as_ref(),
+                                        &self.checker,
+                                        &self.functions,
+                                    )
                             } else {
                                 0
                             };
                             bytecode.push(
-                                Byte::new(Instruction::CALL)
-                                    .with_call_packed(1 + nargs, offset as u32),
+                                Byte::new(Instruction::CALL).with_call_packed(
+                                    1 + nargs + dict_count as u32,
+                                    offset as u32,
+                                ),
                             );
+                            if is_generic && self.generic_return_is_boxed(&fqn) {
+                                if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                                    Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                                }
+                            }
                         } else {
                             let mut message = Message::error(
                                 ErrorCode::UnknownFunction,
