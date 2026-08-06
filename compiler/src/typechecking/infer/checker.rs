@@ -2791,14 +2791,19 @@ impl Checker {
                             };
                             let fun_ty = self.instantiate_ty(&scheme);
                             let mut arg_tys = vec![recv_ty];
-                            let (tys, _) =
+                            let (tys, ordered_exprs) =
                                 self.infer_and_reorder_call_args(&fqn, method_args, &range);
                             arg_tys.extend(tys);
+                            // Align exprs with `[self, …args]` for coerce_or_unify
+                            // (byte / string literal coercion on method args).
+                            let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
+                            arg_exprs.push(recv.clone());
+                            arg_exprs.extend(ordered_exprs);
                             return self.apply_function(
                                 Some(&fqn),
                                 &fun_ty,
                                 &arg_tys,
-                                None,
+                                Some(&arg_exprs),
                                 id,
                                 range,
                             );
@@ -3007,16 +3012,27 @@ impl Checker {
                         let _ = selected;
                         let fun_ty = self.instantiate_ty(&scheme);
                         let mut arg_tys = vec![recv_ty];
+                        let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
+                        arg_exprs.push(recv.clone());
                         if self.fn_has_rest(&fqn) {
-                            let (tys, _) =
+                            let (tys, ordered_exprs) =
                                 self.infer_and_reorder_call_args(&fqn, method_args, &range);
                             arg_tys.extend(tys);
+                            arg_exprs.extend(ordered_exprs);
                         } else if let Some(a) = args {
                             for arg in a {
                                 arg_tys.push(self.infer(arg));
+                                arg_exprs.push(arg.clone());
                             }
                         }
-                        return self.apply_function(Some(&fqn), &fun_ty, &arg_tys, None, id, range);
+                        return self.apply_function(
+                            Some(&fqn),
+                            &fun_ty,
+                            &arg_tys,
+                            Some(&arg_exprs),
+                            id,
+                            range,
+                        );
                     }
 
                     // Ground trait method: `recv.into()` / `recv.show()` via a
@@ -6858,6 +6874,8 @@ impl Checker {
         match strip_readonly(ty) {
             Ty::Array { .. } | Ty::Tuple(_) | Ty::Record { .. } => true,
             Ty::Con(name) if name == "string" || name == crate::typechecking::ty::STRING => true,
+            // `Vec<T>` shares the array runtime carrier — same ArrayLen path.
+            other if vec_element_ty(other).is_some() => true,
             _ => false,
         }
     }
