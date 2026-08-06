@@ -23,7 +23,8 @@ let s = format("%i-%s", 42, "x");
 For stdout, combine `string` with `io`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 write_all(stdout(), to_bytes(format("%i", 42)));

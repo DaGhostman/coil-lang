@@ -38,7 +38,8 @@ Each parameter requires a type name before the parameter name: `Type param`.
 ### On return types
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
@@ -54,7 +55,8 @@ The `-> RetType` clause is optional. Functions with no meaningful return value m
 From `examples/aliases.hy`, annotations on both parameter and `let`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 type Point = (int, int);
 
@@ -90,7 +92,8 @@ Built-in primitive names are matched **case-insensitively** at typecheck time: `
 `void` appears primarily in foreign-function signatures:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() -> void {
     write_all(stdout(), to_bytes("Hello, World!"));
@@ -152,7 +155,8 @@ The typechecker emits diagnostics anchored to your source. Common messages:
 You referenced a name that was never bound, or it is out of scope (e.g. a `let` inside an inner block):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%i", x)));   // error: x not declared
@@ -189,7 +193,8 @@ return "text";          // inside fn f() -> int { ... }
 `string::format` validates each `%` specifier against the corresponding argument:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 write_all(stdout(), to_bytes(format("%i", "hello")));   // %i requires int
 write_all(stdout(), to_bytes(format("%s", 42)));        // %s requires string
@@ -228,7 +233,8 @@ At run time, a `let x = expr;` binding:
 This matters when you bind several variables in sequence:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let x = 5;
 let y = 10;
@@ -287,7 +293,8 @@ Implications for you as a programmer:
 coil supports class declarations and `impl` blocks for methods. From `examples/classes.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 class Foo {
     name: String,
@@ -346,7 +353,8 @@ Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — 
 A small program that combines annotations, inference, and checked output:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn clamp(int lo, int hi, int v) -> int {
     if v < lo {

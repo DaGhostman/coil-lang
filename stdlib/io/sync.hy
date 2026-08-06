@@ -1,7 +1,7 @@
 // Blocking IO adapters over L0 + `await_*` (userland; not host natives).
 use io::{
     read,
-    write,
+    write_from,
     await_readable as wait_readable,
     await_writable as wait_writable,
     stdout,
@@ -16,13 +16,7 @@ fn write_all(Stream s, Vec<byte> buf) -> Result<int, IoError> {
     let offset = 0;
     let total = len(buf);
     while offset < total {
-        let rest: Vec<byte> = Vec::new();
-        let i = offset;
-        while i < total {
-            rest.push(buf[i]);
-            i = i + 1;
-        }
-        match write(s, rest) {
+        match write_from(s, buf, offset) {
             Result::Ok(n) => {
                 if n == 0 {
                     wait_writable(s)?;
@@ -46,6 +40,7 @@ fn read_exact(Stream s, Vec<byte> buf) -> Result<Option<int>, IoError> {
     let need = len(buf);
     let filled = 0;
     while filled < need {
+        // Scratch length must equal remaining: L0 `read` fills the whole buffer.
         let remaining = need - filled;
         let scratch: Vec<byte> = Vec::new();
         let i = 0;
@@ -80,15 +75,15 @@ fn read_exact(Stream s, Vec<byte> buf) -> Result<Option<int>, IoError> {
 
 fn read_to_end(Stream s) -> Result<Vec<byte>, IoError> {
     let acc: Vec<byte> = Vec::new();
-    let chunk_size = 256;
+    let chunk_size = 4096;
+    let scratch: Vec<byte> = Vec::new();
+    let i = 0;
+    while i < chunk_size {
+        scratch.push(0);
+        i = i + 1;
+    }
     let done = false;
     while !done {
-        let scratch: Vec<byte> = Vec::new();
-        let i = 0;
-        while i < chunk_size {
-            scratch.push(0);
-            i = i + 1;
-        }
         match read(s, scratch)? {
             Option::None => {
                 done = true;
@@ -181,6 +176,7 @@ fn eprintln(string s) -> Result<int, IoError> {
 /// The trailing LF is not included; a lone CR before LF is stripped.
 fn read_line(Stream s) -> Result<Option<string>, IoError> {
     let acc: Vec<byte> = Vec::new();
+    // One-byte reads: a larger scratch would consume past LF without pushback.
     let scratch: Vec<byte> = Vec::new();
     scratch.push(0);
     let done = false;

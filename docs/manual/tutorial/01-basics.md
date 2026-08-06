@@ -5,7 +5,8 @@ This chapter introduces the core syntax of coil: literals, variables, functions,
 Every coil program is a `.hy` file. The runtime looks for a top-level `main` function as the entry point:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes("hello"));
@@ -75,7 +76,8 @@ coil has four primitive literal forms.
 | `bool` | `true`, `false`       | Boolean literals                           |
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     write_all(stdout(), to_bytes(format("%i", 42)));
@@ -121,7 +123,8 @@ x = 20;
 From `examples/let_test.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 5;
@@ -140,7 +143,8 @@ Assignment requires an existing binding. Assigning to an undeclared name is a co
 Compound assignment (`+=`, `-=`, `*=`, and the other arithmetic/bitwise forms) updates a binding in place and evaluates to the new value:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let x = 5;
 x += 3;
@@ -150,7 +154,8 @@ write_all(stdout(), to_bytes(format("%i", x)));   // 8
 Increment and decrement follow C-like rules: prefix forms (`++x`, `--x`) evaluate to the new value; postfix forms (`x++`, `x--`) evaluate to the old value. They work on variables, dict fields, and array elements.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let y = 0;
 write_all(stdout(), to_bytes(format("%i", y++)));   // 0
@@ -186,7 +191,8 @@ add(3, 4);
 From `examples/call_test.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
@@ -226,7 +232,8 @@ If execution reaches the end of a function body without hitting `return`, the fu
 Conditions must be boolean expressions:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 if n <= 2 {
     return 1;
@@ -282,7 +289,8 @@ For this example, `sum` becomes `18` (`0 + 1 + 2 + 4 + 5 + 6`).
 A block `{ ... }` groups zero or more statements. Blocks create scope for `let` bindings declared inside them:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 1;
@@ -303,7 +311,8 @@ Function bodies, `if` branches, `while` bodies, and `defer` bodies are all block
 Schedule cleanup (or other exit work) with `defer`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn example() {
     defer {
@@ -318,7 +327,8 @@ A `defer` block runs when the **enclosing function** exits — via `return` / `r
 Outer locals are **not** visible inside a defer unless you list them in an explicit `use (…)` capture list (same rule as lambdas):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn log_on_exit(int n) {
     defer use (n) {
@@ -340,7 +350,8 @@ Use `defer` for resource teardown, logging, or paired setup/teardown logic witho
 Write a string to stdout with `io::write_all` and `string::to_bytes`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 write_all(stdout(), to_bytes("hello"));
 write_all(stdout(), to_bytes("FIZ"));
@@ -351,7 +362,8 @@ write_all(stdout(), to_bytes("FIZ"));
 When the format string contains conversion specifiers, call `string::format` first:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 write_all(stdout(), to_bytes(format("%i", 42)));
 write_all(stdout(), to_bytes(format("%i", x + y)));
@@ -374,7 +386,8 @@ The compiler **type-checks** every specifier against its argument. A mismatch is
 Example mixing integers from `examples/const.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sum(int a, int b) -> int {
     return a + b;
@@ -389,7 +402,8 @@ fn main() {
 Common type errors:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 write_all(stdout(), to_bytes(format("%i", "hello")));  // error: %i requires int
 write_all(stdout(), to_bytes(format("%s", 42)));       // error: %s requires string
@@ -415,7 +429,8 @@ Understanding the distinction keeps programs predictable.
 Function calls, arithmetic, and comparisons are expressions and can nest:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 return fib(n - 1) + fib(n - 2);
 write_all(stdout(), to_bytes(format("%u", 2 + 2 + sum(2 + 2))));
@@ -457,7 +472,8 @@ The following examples build on each other. Read them in order, then run them lo
 Recursive functions, `if`, and formatted integer output:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fib(int n) -> int {
     if n <= 2 {
@@ -483,7 +499,8 @@ Running this prints `55` (the 10th Fibonacci number). Notice:
 Multiple bindings and reassignment:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn main() {
     let x = 5;
@@ -502,7 +519,8 @@ Output: `51020`.
 Combine function calls with expression statements and `%u` formatting:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int {
     return a + b;
@@ -517,7 +535,8 @@ fn main() {
 And nested arithmetic with a helper:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sum(int a, int b) -> int {
     return a + b;
@@ -534,7 +553,8 @@ fn main() {
 Independent `if` checks (not `else if`) so multiples of both 3 and 5 write both fragments:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn fizbuz(int n) {
     if (n % 3) == 0 {
@@ -604,7 +624,8 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 
 5. Fix the type errors in this snippet (there are three):
    ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
    fn main() {
        write_all(stdout(), to_bytes(format("%f", 3)));

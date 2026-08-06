@@ -5,6 +5,7 @@ use string::{to_bytes, from_bytes};
 use bytes::{
     slice as bytes_slice,
     find as bytes_find,
+    find_from as bytes_find_from,
     replace as bytes_replace,
     pad_left as bytes_pad_left,
     pad_right as bytes_pad_right,
@@ -37,30 +38,28 @@ fn trim(string s) -> Result<string, string> {
     let b = to_bytes(s);
     let lo = 0;
     let hi = len(b);
-    while lo < hi {
-        if is_space(b[lo]) {
-            lo = lo + 1;
-        }
-        if lo < hi {
-            if is_space(b[lo]) == false {
-                break;
-            }
-        }
+    let cont = 1;
+    while cont == 1 {
         if lo >= hi {
-            break;
+            cont = 0;
+        } else {
+            if is_space(b[lo]) {
+                lo = lo + 1;
+            } else {
+                cont = 0;
+            }
         }
     }
-    while hi > lo {
-        if is_space(b[hi - 1]) {
-            hi = hi - 1;
-        }
-        if hi > lo {
-            if is_space(b[hi - 1]) == false {
-                break;
-            }
-        }
+    cont = 1;
+    while cont == 1 {
         if hi <= lo {
-            break;
+            cont = 0;
+        } else {
+            if is_space(b[hi - 1]) {
+                hi = hi - 1;
+            } else {
+                cont = 0;
+            }
         }
     }
     return utf8_ok(bytes_slice(b, lo, hi))?;
@@ -93,18 +92,18 @@ fn split(string s, string sep) -> Result<Vec<string>, string> {
     }
     let start = 0;
     let done = false;
+    let hn = len(hay);
     while !done {
-        let rest = bytes_slice(hay, start, len(hay));
-        let rel = bytes_find(rest, needle);
-        if rel < 0 {
-            let part = utf8_ok(rest)?;
+        let at = bytes_find_from(hay, needle, start);
+        if at < 0 {
+            let part = utf8_ok(bytes_slice(hay, start, hn))?;
             out.push(part);
             done = true;
         }
-        if rel >= 0 {
-            let part = utf8_ok(bytes_slice(hay, start, start + rel))?;
+        if at >= 0 {
+            let part = utf8_ok(bytes_slice(hay, start, at))?;
             out.push(part);
-            start = start + rel + len(needle);
+            start = at + len(needle);
         }
     }
     return out;

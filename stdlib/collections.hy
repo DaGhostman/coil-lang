@@ -1,26 +1,73 @@
 // Collection helpers (userland): sort, reverse, range materialize.
 
-/// Stable-ish bubble sort for `Ord` elements (new array; input unchanged).
+/// Merge `buf[lo..mid)` and `buf[mid..hi)` via `tmp` scratch (stable).
+fn merge_range<T: Ord>(Vec<T> buf, Vec<T> tmp, int lo, int mid, int hi) -> int {
+    let i = lo;
+    while i < hi {
+        tmp[i] = buf[i];
+        i = i + 1;
+    }
+    let a = lo;
+    let b = mid;
+    let k = lo;
+    while a < mid {
+        if b < hi {
+            if tmp[b] < tmp[a] {
+                buf[k] = tmp[b];
+                b = b + 1;
+            } else {
+                buf[k] = tmp[a];
+                a = a + 1;
+            }
+            k = k + 1;
+        } else {
+            break;
+        }
+    }
+    while a < mid {
+        buf[k] = tmp[a];
+        a = a + 1;
+        k = k + 1;
+    }
+    while b < hi {
+        buf[k] = tmp[b];
+        b = b + 1;
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn min_int(int a, int b) -> int {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+/// Stable bottom-up mergesort for `Ord` elements (new vector; input unchanged).
 fn sort<T: Ord>(Vec<T> arr) -> Vec<T> {
     let n = len(arr);
     let out: Vec<T> = Vec::new();
-    let i = 0;
-    while i < n {
-        out.push(arr[i]);
-        i = i + 1;
+    let tmp: Vec<T> = Vec::new();
+    let copy_i = 0;
+    while copy_i < n {
+        out.push(arr[copy_i]);
+        tmp.push(arr[copy_i]);
+        copy_i = copy_i + 1;
     }
-    let a = 0;
-    while a < n {
-        let b = 0;
-        while b + 1 < n {
-            if out[b] > out[b + 1] {
-                let tmp = out[b];
-                out[b] = out[b + 1];
-                out[b + 1] = tmp;
+    let width = 1;
+    while width < n {
+        let pos = 0;
+        while pos < n {
+            let lo = pos;
+            let mid = min_int(pos + width, n);
+            let hi = min_int(pos + width + width, n);
+            if mid < hi {
+                merge_range(out, tmp, lo, mid, hi);
             }
-            b = b + 1;
+            pos = pos + width + width;
         }
-        a = a + 1;
+        width = width + width;
     }
     return out;
 }
@@ -37,7 +84,7 @@ fn reverse<T>(Vec<T> arr) -> Vec<T> {
     return out;
 }
 
-/// Materialize a lazy `Range<int>` into a dynamic array.
+/// Materialize a lazy `Range<int>` into a dynamic vector.
 fn collect_ints(Range<int> r) -> Vec<int> {
     let out: Vec<int> = Vec::new();
     for x in r {

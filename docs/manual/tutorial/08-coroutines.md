@@ -7,7 +7,8 @@ coil supports **stackful coroutines** via `async fn`, `yield`, `resume`, and (Ph
 An `async fn` returns a **handle** with type `coroutine<Y>` when it only yields values out, or `coroutine<Y, S>` when it also receives values on resume (`S` defaults to `unit` when unused).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn counter() {
     yield 0;
@@ -29,7 +30,8 @@ Calling an async function emits `MakeCoro` — it allocates a suspended coroutin
 `resume h` continues the coroutine until the next `yield` or `return`. The yielded (or returned) value becomes the result of the `resume` expression — `resume` has a single static result type covering both.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn two_step() {
     yield 10;
@@ -53,7 +55,8 @@ Resuming an already-**done** coroutine always returns `0` (`Value::default()`) �
 Use `done(h)` to ask whether a handle has completed (returns `bool`):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let h = two_step();
 write_all(stdout(), to_bytes(format("%z", done(h)))); // false
@@ -66,7 +69,8 @@ write_all(stdout(), to_bytes(format("%z", done(h)))); // true
 `resume h` can be used inline anywhere an expression is expected, including inside `string::format`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 write_all(stdout(), to_bytes(format("%i,", resume h)));
 ```
@@ -90,7 +94,8 @@ The send type `S` in `coroutine<Y, S>` is inferred from binding-yield patterns a
 Example (`examples/coro_send.hy`):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn ping() {
     let msg = yield "ready";
@@ -111,7 +116,8 @@ Output: `hello`
 Delegate to another coroutine; values and sends propagate through the delegate chain.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn inner() {
     yield 0;
@@ -140,7 +146,8 @@ value and discarding intermediate yields. Use it as the sync boundary for
 async IO work (see [IO reactor](../../internals/io-reactor.md)):
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 
 async fn greet() -> int {
@@ -159,7 +166,8 @@ fn main() {
 Two handles are independent — resuming one does not advance the other, even when both handles come from the same (possibly parameterized) `async fn`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn counter(int base) {
     yield base;
@@ -190,7 +198,8 @@ Coroutines participate: the loop resumes until `done`, binding each
 `break` / `continue` work as usual.
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn counter() {
     yield 0;

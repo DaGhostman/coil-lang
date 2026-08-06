@@ -59,7 +59,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `prelude::test` | `assert` | Yes (every file) |
 | `ffi` | `dload`, `declare`, `invoke` | No — `use ffi::{dload, declare, invoke};` |
 | `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — `use ffi::types::{Int, Ptr, …};` |
-| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters, stream timeouts | No — `use io::{stdout, open, …};` |
+| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `write_from` / `close`, `from_bytes` / `to_bytes`, stream timeouts | No — `use io::{stdout, open, …};` (blocking helpers: `io::sync`) |
 | `io::net::tcp` | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, address helpers, `set_nodelay`, `shutdown` | No — `use io::net::tcp::{connect, listen, …};` |
 | `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — `use io::net::udp::{bind, send_to, …};` |
 | `io::net::tls` | *(none)* | Parent namespace only — import `client` / `server` (feature `tls`) |
@@ -219,7 +219,8 @@ scanning dependencies, but no names are imported from a wildcard `use`.
 Brace-group example — `src/foo.hy`:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn sadge() { write_all(stdout(), to_bytes(format("%i", 100))); }
 fn greet() { write_all(stdout(), to_bytes(format("%i", 200))); }

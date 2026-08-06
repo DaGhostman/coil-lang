@@ -1,5 +1,5 @@
 use bytes::{
-    slice, concat, eq, find, rfind, contains, starts_with, ends_with,
+    slice, concat, eq, find, find_from, rfind, contains, starts_with, ends_with,
     replace, repeat, pad_left, pad_right,
 };
 use string::{to_bytes};
@@ -17,6 +17,14 @@ test("find contains affixes") {
     assert(contains(to_bytes("abcdef"), to_bytes("de")))?;
     assert(starts_with(to_bytes("abcdef"), to_bytes("ab")))?;
     assert(ends_with(to_bytes("abcdef"), to_bytes("ef")))?;
+}
+
+test("find_from skips prefix") {
+    assert(find_from(to_bytes("ababab"), to_bytes("ab"), 1) == 2)?;
+    assert(find_from(to_bytes("ababab"), to_bytes("ab"), 2) == 2)?;
+    assert(find_from(to_bytes("ababab"), to_bytes("ab"), 4) == 4)?;
+    assert(find_from(to_bytes("ababab"), to_bytes("ab"), 5) == -1)?;
+    assert(find_from(to_bytes("abc"), to_bytes(""), 2) == 2)?;
 }
 
 test("rfind and replace") {

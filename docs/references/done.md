@@ -19,7 +19,8 @@ done(handle_expr)
 ### Example
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 let h = counter();
 write_all(stdout(), to_bytes(format("%z", done(h)))); // false

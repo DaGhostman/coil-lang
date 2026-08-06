@@ -46,6 +46,7 @@ pub fn build_standard_host_natives(
     push_packed_la(&mut out, &mut register_id);
     // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
     push_io_wait_ready(&mut out, &mut register_id);
+    push_io_write_from(&mut out, &mut register_id);
     push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
     push_math_libm(&mut out, &mut register_id);
     // Append-only after math_libm: Vec helpers.
@@ -174,6 +175,26 @@ fn push_io_wait_ready(
     register_id("wait_ready", id);
     out.push(Arc::new(HostClosureFn::new(sig, |heap, _args| {
         Ok(Some(crate::io::io_wait_ready(heap)))
+    })));
+}
+
+/// Write `buf[offset..]` without allocating a Coil suffix array.
+fn push_io_write_from(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    use crate::io::{as_result_int, stream_write_from};
+    let sig = FfiSignature::from_parts(
+        "write_from".to_string(),
+        vec![FfiType::Int, FfiType::Int, FfiType::Int],
+        FfiType::Int,
+    )
+    .expect("write_from signature");
+    let id = out.len();
+    register_id("write_from", id);
+    out.push(Arc::new(HostClosureFn::new(sig, |heap, args| {
+        let r = stream_write_from(heap, args[0], args[1], args[2].as_int());
+        Ok(Some(as_result_int(heap, r)))
     })));
 }
 
@@ -701,20 +722,44 @@ mod tests {
             "math_ln",
             "math_pow",
         ];
+        let math_end = math_start + expected.len();
         assert_eq!(
-            registrations[math_start..]
+            registrations[math_start..math_end]
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
             expected
         );
+        // Vec helpers are append-only after math_libm (stable HostInvoke ids).
+        assert_eq!(registrations[math_end].0, "vec_with_capacity");
 
-        for (offset, native) in natives[math_start..].iter().enumerate() {
+        for (offset, native) in natives[math_start..math_end].iter().enumerate() {
             let signature = native.signature();
             assert_eq!(signature.ret, FfiType::Float);
             let expected_arity = if offset + 1 == expected.len() { 2 } else { 1 };
             assert_eq!(signature.args, vec![FfiType::Float; expected_arity]);
             assert_eq!(registrations[math_start + offset].1, math_start + offset);
         }
+    }
+
+    #[test]
+    fn write_from_is_registered_immediately_after_wait_ready() {
+        let mut registrations = Vec::new();
+        let natives = build_standard_host_natives(|name, id| {
+            registrations.push((name.to_string(), id));
+        });
+        let wait = registrations
+            .iter()
+            .position(|(name, _)| name == "wait_ready")
+            .expect("wait_ready");
+        let write_from = registrations
+            .iter()
+            .position(|(name, _)| name == "write_from")
+            .expect("write_from");
+        assert_eq!(write_from, wait + 1);
+        assert_eq!(registrations[write_from].1, write_from);
+        let sig = natives[write_from].signature();
+        assert_eq!(sig.args, vec![FfiType::Int, FfiType::Int, FfiType::Int]);
+        assert_eq!(sig.ret, FfiType::Int);
     }
 }

@@ -33,7 +33,8 @@ literal     ::= string | int | float | 'true' | 'false'
 Examples:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 #[derive(Show, Eq, Ord)]
 enum Color { Red, Blue }
@@ -173,7 +174,8 @@ attr wrap<T>(fn(...args) -> T target, ...args) -> T {
 ```
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
@@ -502,7 +504,8 @@ binding_yield ::= 'let' IDENT '=' yield_expr
 Examples:
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 async fn ping() {
     let msg = yield "ready";
@@ -641,7 +644,8 @@ Construction needs only `Ord`. **`for` iteration** steps with `+1` /
 range value but are not iterable yet).
 
 ```coil
-use io::{stdout, write_all};
+use io::{stdout};
+use io::sync::{write_all};
 use string::{format, to_bytes};
 for x in 0..5 { write_all(stdout(), to_bytes(format("%i", x))); }   // 01234
 let r = 0..=3;

@@ -13,7 +13,7 @@ use io::sync::{write_all, read_to_end};   // optional blocking adapters (userlan
 | `IoError` | Builtin enum | `WouldBlock`, `NotFound`, `PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other`, `NotADirectory`, `AlreadyExists`, `TimedOut`, `Truncated`, `Certificate`, `Handshake` |
 | `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
-| `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
+| `open` / `close` / `read` / `write` / `write_from` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF); `write_from(s, buf, offset)` writes `buf[offset..]` without allocating a suffix array |
 | `await_readable` / `await_writable` | Async await | Top-level parks VM; inside a coro registers + yields (batch via `wait_ready`) |
 | `drive` | `() -> int` | Poll async waiters once (non-blocking) |
 | `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready |
@@ -31,7 +31,7 @@ Blocking helpers live in stdlib (`stdlib/io/sync.hy`), not as host natives:
 
 | Function | Notes |
 |----------|-------|
-| `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops |
+| `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops (`write_all` uses `write_from`) |
 | `accept_wait` | `accept` + `await_readable` |
 | `recv_from_wait` | `recv_from` + `await_readable` |
 | `print` / `println` / `eprintln` | UTF-8 stdout/stderr helpers |
