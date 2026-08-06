@@ -1,0 +1,73 @@
+{
+  "name": "coil-debug",
+  "displayName": "Coil Debug",
+  "description": "Debug Adapter Protocol support for the Coil language",
+  "version": "0.1.0",
+  "publisher": "coil-lang",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Debuggers"],
+  "activationEvents": ["onDebug"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "coil",
+        "label": "Coil",
+        "languages": ["hy"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to the entry .hy file"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for resolving relative paths"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at program entry before running"
+              },
+              "adapterExecutable": {
+                "type": "string",
+                "description": "Path to coil-debug (defaults to workspace target/debug/coil-debug or PATH)"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "coil",
+            "request": "launch",
+            "name": "Coil: Launch current file",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false
+          },
+          {
+            "type": "coil",
+            "request": "launch",
+            "name": "Coil: Launch file",
+            "program": "${workspaceFolder}/examples/fib.hy",
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": false
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}
