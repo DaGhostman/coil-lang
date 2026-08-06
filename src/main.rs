@@ -47,9 +47,10 @@ enum Command {
         show_ast: bool,
     },
     Debug {
-        filename: String,
+        filename: Option<String>,
         script: Option<String>,
         batch: bool,
+        dap: bool,
     },
     /// Re-exec `coil-fmt` (paths / `--check` forwarded via argv).
     Fmt,
@@ -74,7 +75,7 @@ fn print_help() {
          \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
          \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \x20 coil [--log-json | --log-lsp] dissect <file.hy> [--fn <pat>] [--il] [--ast]\n\
-         \x20 coil [--log-json | --log-lsp] debug <file.hy> [-x <script>] [--batch]\n\
+         \x20 coil [--log-json | --log-lsp] debug [<file.hy> | --dap] [-x <script>] [--batch]\n\
          \x20 coil fmt [--check] <file.hy|dir>...\n\
          \x20 coil lsp\n\
          \n\
@@ -86,7 +87,7 @@ fn print_help() {
          \x20 test       Compile and run every .hy file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
          \x20 dissect    In-memory compile and dump filtered bytecode / IL / AST (no archive file)\n\
-         \x20 debug      GDB-style debugger (REPL; optional -x script / --batch)\n\
+         \x20 debug      GDB-style debugger (REPL; --dap for IDE; optional -x script / --batch)\n\
          \x20 fmt        Format `.hy` sources (re-execs `coil-fmt`; preserves `//` and `///`)\n\
          \x20 lsp        Start the Coil language server over stdin/stdout\n\
          \n\
@@ -102,6 +103,7 @@ fn print_help() {
          \x20 --ast                With `dissect`, also print the entry-file AST\n\
          \x20 -x <script>          With `debug`, run commands from a script file\n\
          \x20 --batch              With `debug`, non-interactive (use -x or stdin); exit after script\n\
+         \x20 --dap                With `debug`, Debug Adapter Protocol over stdio\n\
          \x20 --check              With `fmt`, exit 1 if files would change (no writes)\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
@@ -122,6 +124,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut show_il = false;
     let mut show_ast = false;
     let mut batch = false;
+    let mut dap = false;
     let mut check = false;
     let mut fn_pat: Option<String> = None;
     let mut script: Option<String> = None;
@@ -143,6 +146,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--il" => show_il = true,
             "--ast" => show_ast = true,
             "--batch" => batch = true,
+            "--dap" => dap = true,
             "--check" => check = true,
             "--fn" => {
                 i += 1;
@@ -208,7 +212,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     }
 
     let has_dissect_flags = fn_pat.is_some() || show_il || show_ast;
-    let has_debug_flags = script.is_some() || batch;
+    let has_debug_flags = script.is_some() || batch || dap;
     let has_fmt_flags = check;
 
     let command = match positionals.as_slice() {
@@ -371,7 +375,18 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
         [cmd] if cmd == "dissect" => return Err("dissect requires an entry .hy file"),
-        [cmd] if cmd == "debug" => return Err("debug requires an entry .hy file"),
+        [cmd] if cmd == "debug" => {
+            if dap {
+                Command::Debug {
+                    filename: None,
+                    script: None,
+                    batch: false,
+                    dap: true,
+                }
+            } else {
+                return Err("debug requires an entry .hy file (or use --dap)");
+            }
+        }
         [cmd, filename] if cmd == "package" => {
             if filename == "package"
                 || filename == "compile"
@@ -443,10 +458,14 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if has_dissect_flags {
                 return Err("--fn, --il, and --ast are only valid with `dissect`");
             }
+            if dap {
+                return Err("--dap cannot be combined with a positional .hy file");
+            }
             Command::Debug {
-                filename: filename.clone(),
+                filename: Some(filename.clone()),
                 script,
                 batch,
+                dap,
             }
         }
         [cmd, filename] if cmd == "dissect" => {
@@ -1268,9 +1287,10 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Debug {
-                filename: "examples/fib.hy".into(),
+                filename: Some("examples/fib.hy".into()),
                 script: Some("cmds.txt".into()),
                 batch: true,
+                dap: false,
             }
         );
     }

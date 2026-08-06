@@ -1,18 +1,17 @@
-//! `coil-debug` — GDB-style interactive / scripted debugger.
-
-mod debug_cmd;
+//! `coil-debug` binary entry.
 
 use std::process::exit;
 
-use debug_cmd::{DebugArgs, cmd_debug};
+use coil_debug::{DebugArgs, cmd_dap, cmd_debug};
 use reporting::ReportConfig;
 
 fn print_help() {
     eprintln!(
         "Usage:\n\
-         \x20 coil-debug [--log-json | --log-lsp] <file.hy> [-x <script>] [--batch]\n\
+         \x20 coil-debug [--log-json | --log-lsp] [--dap] [<file.hy>] [-x <script>] [--batch]\n\
          \n\
          Options:\n\
+         \x20 --dap         Debug Adapter Protocol over stdio (program from DAP launch)\n\
          \x20 -x <script>   Run commands from a script file\n\
          \x20 --batch       Non-interactive; exit after script / stdin\n\
          \x20 --log-json    Emit SARIF 2.1 diagnostics on stdout\n\
@@ -21,10 +20,11 @@ fn print_help() {
     );
 }
 
-fn parse_args(args: &[String]) -> Result<(ReportConfig, DebugArgs), String> {
+fn parse_args(args: &[String]) -> Result<Option<(ReportConfig, DebugArgs)>, String> {
     let mut log_json = false;
     let mut log_lsp = false;
     let mut batch = false;
+    let mut dap = false;
     let mut script: Option<String> = None;
     let mut filename: Option<String> = None;
     let mut i = 1usize;
@@ -35,6 +35,7 @@ fn parse_args(args: &[String]) -> Result<(ReportConfig, DebugArgs), String> {
                 print_help();
                 exit(0);
             }
+            "--dap" => dap = true,
             "--log-json" => log_json = true,
             "--log-lsp" => log_lsp = true,
             "--batch" => batch = true,
@@ -57,22 +58,31 @@ fn parse_args(args: &[String]) -> Result<(ReportConfig, DebugArgs), String> {
         }
         i += 1;
     }
+
+    if dap {
+        if filename.is_some() || script.is_some() || batch || log_json || log_lsp {
+            return Err("--dap cannot be combined with REPL flags or a positional file".into());
+        }
+        return Ok(None);
+    }
+
     let filename = filename.ok_or_else(|| "debug requires an entry .hy file".to_string())?;
     let config = ReportConfig::from_cli_flags(log_json, log_lsp).map_err(|e| e.to_string())?;
-    Ok((
+    Ok(Some((
         config,
         DebugArgs {
             filename,
             script,
             batch,
         },
-    ))
+    )))
 }
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match parse_args(&raw) {
-        Ok((config, args)) => cmd_debug(config, args),
+        Ok(None) => cmd_dap(),
+        Ok(Some((config, args))) => cmd_debug(config, args),
         Err(msg) => {
             eprintln!("coil-debug: {msg}");
             print_help();
