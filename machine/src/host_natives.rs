@@ -21,6 +21,7 @@ use crate::REGEX_WIRING;
 #[cfg(feature = "time")]
 use crate::TIME_WIRING;
 use crate::GC_WIRING;
+use crate::vec_ops::VEC_WIRING;
 
 /// Build the standard host-native table in stable order.
 ///
@@ -47,6 +48,8 @@ pub fn build_standard_host_natives(
     push_io_wait_ready(&mut out, &mut register_id);
     push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
     push_math_libm(&mut out, &mut register_id);
+    // Append-only after math_libm: Vec helpers.
+    push_wiring(&mut out, &mut register_id, VEC_WIRING, "vec");
     out
 }
 

@@ -432,6 +432,26 @@ pub fn weak_app_ty(inner: Ty) -> Ty {
     )
 }
 
+/// Build `Vec<T>` as a type application.
+pub fn vec_app_ty(inner: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_VEC_TYPE.into())),
+        vec![inner],
+    )
+}
+
+/// Element type of `Vec<T>`, if `ty` is (or peels to) that application.
+pub fn vec_element_ty(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::App(head, args) if args.len() == 1 => match head.as_ref() {
+            Ty::Con(n) if n == common::BUILTIN_VEC_TYPE => Some(&args[0]),
+            _ => None,
+        },
+        Ty::Readonly(inner) => vec_element_ty(inner),
+        _ => None,
+    }
+}
+
 /// Drop variant-tag refinement, yielding the owning enum type.
 ///
 /// Construct sites infer `Ty::Constructor { tag, owner, … }`. Comparisons

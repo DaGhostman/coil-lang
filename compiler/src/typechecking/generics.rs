@@ -262,6 +262,9 @@ impl Generics {
         self.generic_type_ctors
             .insert(common::BUILTIN_WEAK_TYPE.into(), vec!["T".into()]);
         self.register_nominal_type(common::BUILTIN_WEAK_TYPE, GC_MODULE);
+        self.generic_type_ctors
+            .insert(common::BUILTIN_VEC_TYPE.into(), vec!["T".into()]);
+        self.register_nominal_type(common::BUILTIN_VEC_TYPE, PRELUDE_MODULE);
     }
 
     pub fn register_nominal_type(&mut self, name: &str, module: &str) {
