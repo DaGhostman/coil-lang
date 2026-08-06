@@ -696,9 +696,9 @@ impl Checker {
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
         #[cfg(feature = "tls")]
         use crate::typechecking::ty::record;
-        use crate::typechecking::ty::{array, boolean, byte, stream_ty, tuple};
+        use crate::typechecking::ty::{boolean, byte, stream_ty, tuple};
         let stream = stream_ty();
-        let bytes = array(byte());
+        let bytes = vec_app_ty(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
         let opt_int = option_app_ty(int());
         let res_opt_int = result_app_ty(opt_int, io_err.clone());
@@ -773,8 +773,8 @@ impl Checker {
     /// `format` is checked by the call-special path because its arity and
     /// argument types are determined by the literal specifiers.
     pub fn string_fn_scheme(kind: StringBuiltin) -> Scheme {
-        use crate::typechecking::ty::{array, byte};
-        let bytes = array(byte());
+        use crate::typechecking::ty::byte;
+        let bytes = vec_app_ty(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
         let fun = |params: &[Ty], ret: Ty| {
             params
@@ -982,7 +982,7 @@ impl Checker {
         use crate::typechecking::ty::regex_ty;
         #[cfg(any(feature = "crypto", feature = "regex"))]
         use crate::typechecking::ty::tuple;
-        use crate::typechecking::ty::{array, boolean, record};
+        use crate::typechecking::ty::{boolean, record};
         #[cfg(feature = "crypto")]
         use common::BUILTIN_CRYPTO_ERROR_ENUM;
         #[cfg(feature = "regex")]
@@ -1011,7 +1011,7 @@ impl Checker {
         let res_bool_io = result_app_ty(boolean(), io_err.clone());
         let res_unit_io = result_app_ty(unit_ty(), io_err.clone());
         let res_string_io = result_app_ty(string(), io_err.clone());
-        let res_strs_io = result_app_ty(array(string()), io_err.clone());
+        let res_strs_io = result_app_ty(vec_app_ty(string()), io_err.clone());
         let res_meta_io = result_app_ty(
             record(vec![
                 ("size".into(), int()),
@@ -1031,12 +1031,12 @@ impl Checker {
         let res_unit_time = result_app_ty(unit_ty(), time_err);
 
         let res_string_env = result_app_ty(string(), env_err.clone());
-        let res_strs_env = result_app_ty(array(string()), env_err.clone());
+        let res_strs_env = result_app_ty(vec_app_ty(string()), env_err.clone());
         let res_unit_env = result_app_ty(unit_ty(), env_err.clone());
         let res_int_env = result_app_ty(int(), env_err);
 
         #[cfg(feature = "crypto")]
-        let bytes = array(byte());
+        let bytes = vec_app_ty(byte());
         #[cfg(feature = "crypto")]
         let res_bytes_crypto = result_app_ty(bytes.clone(), crypto_err.clone());
         #[cfg(feature = "crypto")]
@@ -1057,13 +1057,14 @@ impl Checker {
         #[cfg(feature = "regex")]
         let res_span_regex = result_app_ty(span.clone(), regex_err.clone());
         #[cfg(feature = "regex")]
-        let res_spans_regex = result_app_ty(array(span), regex_err.clone());
+        let res_spans_regex = result_app_ty(vec_app_ty(span), regex_err.clone());
         #[cfg(feature = "regex")]
-        let res_caps_regex = result_app_ty(array(string()), regex_err.clone());
+        let res_caps_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
         #[cfg(feature = "regex")]
-        let res_caps_all_regex = result_app_ty(array(array(string())), regex_err.clone());
+        let res_caps_all_regex =
+            result_app_ty(vec_app_ty(vec_app_ty(string())), regex_err.clone());
         #[cfg(feature = "regex")]
-        let res_strs_regex = result_app_ty(array(string()), regex_err.clone());
+        let res_strs_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
         #[cfg(feature = "regex")]
         let res_string_regex = result_app_ty(string(), regex_err.clone());
 
@@ -1110,7 +1111,7 @@ impl Checker {
             "env_cwd" => fun(&[], res_string_env),
             "env_remove_var" | "env_set_cwd" => fun(&[string()], res_unit_env.clone()),
             "env_set_var" => fun(&[string(), string()], res_unit_env.clone()),
-            "env_exec" => fun(&[string(), array(string())], res_int_env),
+            "env_exec" => fun(&[string(), vec_app_ty(string())], res_int_env),
             "env_exit" => fun(&[int()], unit_ty()),
 
             #[cfg(feature = "crypto")]
@@ -1999,12 +2000,12 @@ impl Checker {
 
         // Read::read / Write::write — stream IO groundwork.
         {
-            use crate::typechecking::ty::{array, byte};
+            use crate::typechecking::ty::byte;
             let var = self.counter.fresh();
             let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
             let res_opt_int = result_app_ty(option_app_ty(int()), io_err.clone());
             let res_int = result_app_ty(int(), io_err);
-            let bytes = array(byte());
+            let bytes = vec_app_ty(byte());
             self.typeclass_method_schemes.insert(
                 ("Read".to_string(), "read".to_string()),
                 Scheme::poly(
@@ -2081,9 +2082,9 @@ impl Checker {
         }
         // Serialize / Deserialize / Default / Hash / String
         {
-            use crate::typechecking::ty::{array, byte};
+            use crate::typechecking::ty::byte;
             let var = self.counter.fresh();
-            let bytes = array(byte());
+            let bytes = vec_app_ty(byte());
             self.typeclass_method_schemes.insert(
                 ("Serialize".to_string(), "serialize".to_string()),
                 Scheme::poly(

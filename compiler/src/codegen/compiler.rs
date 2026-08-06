@@ -4694,7 +4694,8 @@ impl Compiler {
 
         // Read/Write for Stream — lower to the same HostInvoke natives as
         // free functions `read` / `write`. Args may arrive boxed via the
-        // dictionary ABI; unbox then call.
+        // dictionary ABI; unbox then call. `Vec<byte>` shares the Array
+        // carrier tag with dynamic arrays.
         for (class, method, native_name, arity) in [
             ("Read", "read", "read", 2u32),
             ("Write", "write", "write", 2u32),
