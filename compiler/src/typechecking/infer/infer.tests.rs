@@ -1,16 +1,54 @@
 
     use super::*;
+    use crate::typechecking::env::{instantiate, TyVarCounter};
+    use crate::typechecking::subst::apply_ty_prune;
     use crate::typechecking::ty::EnumVariantPayloadTy;
     use parser::Pratt;
+
+    fn is_bare_expr_source(trimmed: &str) -> bool {
+        if trimmed.contains('\n')
+            || trimmed.contains(';')
+            || trimmed.contains('{')
+            || trimmed.contains('}')
+        {
+            return false;
+        }
+        const STMT_PREFIXES: &[&str] = &[
+            "let ", "use ", "class ", "enum ", "trait ", "impl ", "test(",
+            "fn ", "if ", "while ", "for ", "return ", "async ", "match ", "defer ",
+        ];
+        !STMT_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+    }
+
+    fn peel_fn_return(ty: Ty) -> Ty {
+        match ty {
+            Ty::Fun(_, ret) => peel_fn_return(*ret),
+            other => other,
+        }
+    }
 
     /// Parse and infer `src`, returning the checker state and inferred type.
     ///
     /// The top-level parser expects declarations / statements. Bare
-    /// expressions need a trailing `;`. Heuristically add one when the
-    /// source doesn't already look like a complete statement.
+    /// expressions are wrapped in a probe function so we infer the
+    /// expression type instead of `unit` from `expr;`.
     fn check(src: &str) -> (Checker, Ty) {
         let mut c = Checker::new();
         let trimmed = src.trim();
+        if is_bare_expr_source(trimmed) {
+            let wrapped = format!("fn __coil_check_expr__() {{ return {}; }}", trimmed);
+            let ast = Pratt::default().parse(wrapped.as_str()).unwrap_or_else(|msg| {
+                panic!("parse failed for `{}`: {:?}", src, msg);
+            });
+            let _ = c.check_program(&ast);
+            let scheme = c
+                .env()
+                .lookup("__coil_check_expr__")
+                .expect("bare-expr probe fn should be registered");
+            let mut counter = TyVarCounter::new();
+            let fn_ty = apply_ty_prune(&c.subst(), &instantiate(scheme, &mut counter));
+            return (c, peel_fn_return(fn_ty));
+        }
         // Add `;` if the source doesn't end with a terminator. We don't
         // try to be clever about keywords — even `let x = 1; ...; expr`
         // needs the trailing `expr;`.
