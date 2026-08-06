@@ -20,9 +20,22 @@ a[1] = 9;                   // element assign only
 | Empty `[]` | Only under `Vec<T>` or `[T; 0]` |
 | Growth | **Forbidden** — no `arr[] =`; use `Vec` |
 
-Locals of type `[T; N]` are laid out as **N consecutive frame slots** (stack).
+Locals of type `[T; N]` (`N ≥ 1`) are laid out as **N consecutive frame slots**.
+Each slot holds one `Value`:
+
+| Element `T` | Slot contents |
+|-------------|---------------|
+| `int` / `float` / `bool` / `byte` | Immediate bits (fully on the stack) |
+| `string`, class, enum, `Vec`, … | Heap pointer |
+| Nested `[U; M]` | Heap pointer to an `ObjArray` row (nested data is **not** flattened) |
+
 Escaping into a single-value context (call, return, store into a heap object)
-boxes into a non-growable heap array.
+boxes the spine into a non-growable heap array. Copying or assigning one stack
+array local into another copies slots without boxing (forward per-element
+`STORE`, so values never pile into the destination slot range).
+
+`[T; 0]` stays a single empty heap array. Params/returns of `[T; N]` still pass
+one heap pointer at the call boundary today.
 
 `len(a)` folds to `N` when the length is static. Element-wise zip / LA helpers
 still require fixed lengths.
