@@ -13,6 +13,8 @@ coil is a **statically typed** scripting language with Hindley–Milner inferenc
 
 **Do not invent stdlib APIs** — check [docs/references/not-builtins.md](docs/references/not-builtins.md). Compiler builtins live in virtual modules, not user `.hy` files.
 
+**Prefer method-based APIs** — operations on a type should be `impl` methods (`m.insert(k, v)`), not free functions (`insert(m, k, v)`). Virtual-module host primitives (`io::read`) stay as free fns; stdlib collections and new language surface default to methods.
+
 ## Quick workflow
 
 ```bash
@@ -62,7 +64,7 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 | Types | Primitives `int` `float` `string` `bool` `byte`; arrays `[T]` / `[T; N]`; tuples; dicts as anonymous records |
 | Enums | `enum E { A, B(T) }`; `match e { … }` with record/nested patterns |
 | Errors | Built-in `Option`/`Result`; `raise`, `?`, `??`, `?.` |
-| Classes | `class C { … }`, `impl C { … }`, `new C(…)` |
+| Classes | `class C { … }`, `impl C { … }`, `new C(…)` — prefer methods for type-tied ops |
 | Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
 | FFI | `extern { … }` blocks or `use ffi::{dload, declare, invoke}` + `ffi::types::{Int, …}` |
 | Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
@@ -131,6 +133,7 @@ Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) 
 4. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
 5. **Stale `out.hyc`** — only from `coil compile`; delete before `coil run` if sources changed.
 6. **Type errors** — read diagnostic `E####`; index in [docs/references/error-codes.md](docs/references/error-codes.md).
+7. **Free fn vs method** — use `impl` methods for collection/container ops; free generic fns returning `Option`/`Result` can mis-codegen — see [limitations.md](docs/internals/limitations.md).
 
 ## Debugging programs
 

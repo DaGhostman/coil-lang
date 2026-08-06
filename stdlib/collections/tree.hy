@@ -1,5 +1,6 @@
 // Mutable BST over Ord+Eq keys, index-linked nodes (no Option field matches).
 
+/// Mutable binary search tree keyed by `Ord`+`Eq`, stored as parallel Vecs.
 class TreeMap<K, V> {
     keys: Vec<K>,
     vals: Vec<V>,
@@ -10,6 +11,7 @@ class TreeMap<K, V> {
 }
 
 impl TreeMap<K, V> {
+    /// Empty map with default storage.
     static fn new() -> TreeMap<K, V> {
         let keys: Vec<K> = Vec::new();
         let vals: Vec<V> = Vec::new();
@@ -18,10 +20,12 @@ impl TreeMap<K, V> {
         return new TreeMap(keys, vals, left, right, 0 - 1, 0);
     }
 
+    /// Alias for `new`.
     static fn empty() -> TreeMap<K, V> {
         return TreeMap::new();
     }
 
+    /// Number of key-value pairs.
     fn size() -> int {
         return self.len;
     }
@@ -32,6 +36,7 @@ impl TreeMap<K, V> {
 }
 
 impl TreeMap<K: Ord + Eq, V> {
+    /// Insert or update; returns `true` when a new key was added.
     fn insert(K k, V v) -> bool {
         if self.root < 0 {
             let slot = self.keys.len();
@@ -79,6 +84,7 @@ impl TreeMap<K: Ord + Eq, V> {
         }
     }
 
+    /// True when `k` is present.
     fn contains(K k) -> bool {
         let cur = self.root;
         while cur >= 0 {
@@ -94,6 +100,7 @@ impl TreeMap<K: Ord + Eq, V> {
         return false;
     }
 
+    /// Value for `k`, or `fallback` when absent.
     fn get_or(K k, V fallback) -> V {
         let cur = self.root;
         while cur >= 0 {

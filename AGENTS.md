@@ -7,29 +7,30 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 | Write / edit `.hy` | `.cursor/skills/coil-language` · `docs/manual/` · `docs/references/` |
 | Compiler, VM, pipeline | `.cursor/skills/coil-contributor` · `docs/internals/` |
 | Hangs, panics, breakpoints | `.cursor/skills/coil-debug` · `docs/internals/debugger.md` |
+| Known gaps / workarounds | `docs/internals/limitations.md` |
 
 ## User preferences
 
-- Run tests with 64MB limit: `ulimit -v 65536 && cargo run -- test` (leak smoke).
-- Soft CPU baseline: `./scripts/poop_baseline.sh` — not a hard CI gate.
-- Large tasks: scoped sub-agents on disjoint modules; avoid over-parallelizing.
-- VM perf: prefer alloc reduction, hot-loop tuning, bounds-check elimination, `promise!` over new opcodes or IL opts; reject benchmark-shaped opcodes unless universal.
-- Language features: draft plans first; full HM integration; update `docs/`; minimal runnable example with expected output.
+- Tests: `ulimit -v 65536 && cargo run -- test` (leak smoke). Soft CPU: `./scripts/poop_baseline.sh`.
+- Large tasks: scoped sub-agents on disjoint modules.
+- VM perf: alloc reduction, hot-loop tuning, bounds-check elimination, `promise!` — not benchmark-shaped opcodes unless universal.
+- Language features: draft plans; full HM; update `docs/`; minimal runnable example.
+- **Method-based APIs** — prefer inherent/`impl` methods over free functions for type-tied operations (stdlib, new language surface, codegen fixes). Free generic fns returning enums are fragile today; see `docs/internals/limitations.md`.
 - Granular conventional commits; stage only related files.
 - Prefer compiler virtual modules over userland for core machinery.
-- Dev install: `cargo build` at the repo root builds `coil`, `coil-debug`, `coil-dissect`, `coil-fmt`, `coil-lsp`, and `coil-embed` side-by-side (`coil debug` / `coil dissect` / `coil fmt` / `coil lsp` dispatch helpers; `coil package` defaults to `coil-embed`).
-- Prefer `coil dissect` for IL/bytecode inspection; do not reintroduce verbose debug-build dumps now that dissect covers that.
-- `coil fmt`: preserve `//` comments and `///` docblocks (for docs/LSP); wrap long conditions, call chains, and args/tuples/arrays/dicts; trailing commas on multi-line lists.
+- `cargo build` builds `coil` + `coil-debug` / `coil-dissect` / `coil-fmt` / `coil-lsp` / `coil-embed` (`coil package` defaults to embed).
+- IL inspection: `coil dissect` — no verbose debug-build dumps.
+- `coil fmt`: preserve `//` and `///`; wrap long lines; trailing commas on multi-line lists.
 
 ## Invariants (do not break)
 
-- **Append-only opcodes** in `common/src/opcode.rs` (`#[repr(u8)]` discriminants). New variants at the end only — then bump archive **minor** (`ARCHIVE_MINOR` in `common/src/archive.rs`), `promise!` ceiling in `machine/src/vm.rs`, and `instruction_from_u8_covers_last_appended_variant`. Incompatible ABI/layout changes bump **major** (reset minor). Load check: same major and archive minor ≤ runtime minor.
-- **Virtual-module natives** via `HostInvoke` — not new opcodes for `io` / `thread` / etc. Host native wiring lives in `machine` (not the compiler pipeline).
-- **Feature gates**: machine debugger API behind `feature = "debugger"` (or `cfg(test)`); compiler dissect behind `feature = "dissect"` — enabled by helper binaries / tests, not the default `coil` binary.
-- **Lint gate**: `cargo check --workspace` (not clippy — pre-existing `Gc::payload_mut` deny).
+- **Append-only opcodes** (`common/src/opcode.rs`). New variants at end → bump archive **minor**, `promise!` in `machine/src/vm.rs`, `instruction_from_u8_covers_last_appended_variant`. ABI break → **major** (reset minor).
+- **Virtual-module natives** via `HostInvoke` — host wiring in `machine/`.
+- **Feature gates**: debugger `feature = "debugger"`; dissect `feature = "dissect"` on helper binaries, not default `coil`.
+- **Lint gate**: `cargo check --workspace` (not clippy — `Gc::payload_mut` deny).
 
-Codegen / IL / match / `STORE` rules and typechecker limitations: `.cursor/skills/coil-contributor/reference.md`. Pipeline stages: `docs/internals/pipeline.md`.
+Codegen / match / `STORE`: `.cursor/skills/coil-contributor/reference.md`. Pipeline: `docs/internals/pipeline.md`.
 
 ## Cloud agents
 
-Pre-installed: `poop`, `valgrind`, `heaptrack`, `hyperfine`, `lua` (`.cursor/Dockerfile`). Use `--release` for benchmarks/`poop`.
+Pre-installed: `poop`, `valgrind`, `heaptrack`, `hyperfine`, `lua` (`.cursor/Dockerfile`). Use `--release` for benchmarks.

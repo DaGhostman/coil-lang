@@ -7,6 +7,10 @@ This tree is **userland** Coil (`.hy`) layered on top — include `./stdlib` in
 Import **explicitly** — `use path::*` is banned (`E0124`) for userland and
 virtual modules alike. Prelude is auto-injected.
 
+**API style:** prefer **method-based APIs** — operations on a type are `impl`
+methods (`m.insert(k, v)`), not module-level free functions (`insert(m, k, v)`).
+Virtual-module host primitives (`io::read`) stay as free fns.
+
 | Module | Import | Role |
 |--------|--------|------|
 | `ascii` | `use ascii::{is_digit, …};` | ASCII classify / decimal digit helpers |

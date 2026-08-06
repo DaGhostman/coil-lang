@@ -9,9 +9,9 @@ The language targets embeddable scripting: you get real type checking and infere
 ```coil
 use io::{stdout};
 use io::sync::{write_all};
-use string::{format, to_bytes};
+use string::{to_bytes};
 fn main() {
-    write_all(stdout(), to_bytes("Hello, world!"));
+    write_all(stdout(), to_bytes("hello"));
 }
 ```
 
@@ -88,7 +88,7 @@ Docs are split into three trees:
 | [09 — Error handling](manual/tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 | [10 — IO streams](manual/tutorial/10-io-streams.md) | `byte` / `Vec<byte>`, `Stream`, files, sync adapters, TCP |
 | [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::{spawn, join, …}`, channels, mutexes |
-| [Examples catalog](manual/examples.md) | Every file in `examples/`, expected output |
+| [Examples catalog](manual/examples.md) | Runnable demos in `examples/` (see catalog for expected output) |
 | [Showcase projects](../examples/projects/README.md) | Multi-file apps + co-located tests |
 
 Classes (`class`, `impl`, `new`) — see [02 — Types & Variables](manual/tutorial/02-types-and-variables.md) and `examples/classes.hy`. Full API index: [References](references/README.md).

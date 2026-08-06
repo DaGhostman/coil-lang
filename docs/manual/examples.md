@@ -1259,26 +1259,26 @@ clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>
 
 ---
 
-### `examples/trait_dict.hy`
+### `examples/typeclass_dict.hy`
 
 **Demonstrates:** User trait dictionaries, method sugar, and dictionary
 forwarding through a nested generic call.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/trait_dict.hy` |
+| **Run** | `cargo run -- examples/typeclass_dict.hy` |
 | **Output** | `4242` |
 
 ---
 
-### `examples/trait_default.hy`
+### `examples/typeclass_default.hy`
 
 **Demonstrates:** An omitted default method calling a sibling implementation
 through the same dictionary.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/trait_default.hy` |
+| **Run** | `cargo run -- examples/typeclass_default.hy` |
 | **Output** | `42` |
 
 ---
@@ -2059,8 +2059,8 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `hkt_bifunctor.hy` | Types | `42` |
 | `multiparam.hy` | Types | `42` |
 | `into.hy` | Types | `32` |
-| `trait_dict.hy` | Types | `4242` |
-| `trait_default.hy` | Types | `42` |
+| `typeclass_dict.hy` | Types | `4242` |
+| `typeclass_default.hy` | Types | `42` |
 | `superclass_ord.hy` | Types | `truetruefalse` |
 | `constraint_kind.hy` | Types | `42` |
 | `assoc_type.hy` | Types | `42` |

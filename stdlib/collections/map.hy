@@ -1,5 +1,6 @@
 // HashMap — separate chaining over parallel Vecs (no Default on K/V).
 
+/// Open-addressed hash table with separate chaining (parallel Vec storage).
 class HashMap<K, V> {
     heads: Vec<int>,
     keys: Vec<K>,
@@ -11,6 +12,7 @@ class HashMap<K, V> {
 }
 
 impl HashMap<K, V> {
+    /// Create a map with bucket count rounded up to the next power of two (min 8).
     static fn with_capacity(int cap) -> HashMap<K, V> {
         let n = 1;
         while n < cap {
@@ -32,10 +34,13 @@ impl HashMap<K, V> {
         return new HashMap(heads, keys, vals, next, live, 0, n);
     }
 
+    /// Empty map with default capacity 8.
     static fn new() -> HashMap<K, V> {
         return HashMap::with_capacity(8);
     }
 
+    /// Number of live key-value pairs.
+    /// Number of live key-value pairs.
     fn size() -> int {
         return self.len;
     }
@@ -44,10 +49,12 @@ impl HashMap<K, V> {
         return self.len == 0;
     }
 
+    /// Bucket count (power of two).
     fn capacity() -> int {
         return self.cap;
     }
 
+    /// Remove all entries without shrinking buckets.
     fn clear() {
         let i = 0;
         while i < self.cap {
@@ -147,6 +154,7 @@ impl HashMap<K: Eq + Hash, V> {
         return true;
     }
 
+    /// True when `k` is present.
     fn contains(K k) -> bool {
         return self.find(k) >= 0;
     }
@@ -187,19 +195,23 @@ impl HashMap<K: Eq + Hash, V> {
 
 // ---- HashSet (same module so the HashMap type is in scope) ----
 
+/// Set of unique values backed by `HashMap<T, bool>`.
 class HashSet<T> {
     inner: HashMap<T, bool>,
 }
 
 impl HashSet<T> {
+    /// Create a set with bucket count rounded up to the next power of two (min 8).
     static fn with_capacity(int cap) -> HashSet<T> {
         return new HashSet(HashMap::with_capacity(cap));
     }
 
+    /// Empty set with default capacity 8.
     static fn new() -> HashSet<T> {
         return HashSet::with_capacity(8);
     }
 
+    /// Number of elements.
     fn size() -> int {
         return self.inner.len;
     }
@@ -208,20 +220,24 @@ impl HashSet<T> {
         return self.inner.len == 0;
     }
 
+    /// Remove all elements.
     fn clear() {
         self.inner.clear();
     }
 }
 
 impl HashSet<T: Eq + Hash> {
+    /// Insert `x`; returns `true` when newly added.
     fn insert(T x) -> bool {
         return self.inner.insert(x, true);
     }
 
+    /// True when `x` is present.
     fn contains(T x) -> bool {
         return self.inner.contains(x);
     }
 
+    /// Remove `x`; returns `true` when an element was removed.
     fn remove(T x) -> bool {
         return self.inner.remove(x);
     }

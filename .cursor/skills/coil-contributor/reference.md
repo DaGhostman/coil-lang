@@ -25,6 +25,7 @@
 ## Codegen notes
 
 - `BlockBuilder`: thin wrapper over `IlBuilder` labels; no absolute PC patching in emitters.
+- **Method-based APIs** — prefer inherent/`impl` methods over free functions for type-tied ops (stdlib, new language surface). Free generic fns returning enums are codegen-fragile; see `docs/internals/limitations.md`.
 - `ConstEnv`: scalar const folding; constant branch/loop elimination; loop unroll ≤8.
 - Tiny direct-call inlining; one-level self-`CALL` peel; `TailCall` for eligible recursion.
 - Match: threaded layout, `JumpIfMatch`, nested records use `UnpackAt` (slot-based).
@@ -38,6 +39,8 @@
 - GC: addr index O(1) lookup; mark walks intrusive list.
 
 ## Typechecker limitations (known)
+
+See [docs/internals/limitations.md](docs/internals/limitations.md) for the full inventory. Summary:
 
 - `codegen_var_types` side table still used for some Identifier paths.
 - Path completeness (`E0111`) for concrete non-unit returns on named fns.
