@@ -1633,7 +1633,10 @@ fn rewrite_expr_inline<'a>(
                 methods: rewrite_outputs(methods, target, subs, decoratee_args),
             },
         ),
-        Expression::Statement(_inner) => rewrite_stmt_inline(expr, target, subs, decoratee_args),
+        Expression::Statement(inner) => at(
+            span,
+            Expression::Statement(rewrite_expr_inline(inner, target, subs, decoratee_args)),
+        ),
         Expression::ExprStatement(inner) => at(span, Expression::ExprStatement(rw(inner))),
     }
 }
