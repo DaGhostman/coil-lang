@@ -156,7 +156,7 @@ test("write_all empty buffer") {
         Result::Ok(v) => v,
         Result::Err(_) => panic "open w",
     };
-    let empty: [byte] = [];
+    let empty: Vec<byte> = Vec::new();
     match write_all(s, empty) {
         Result::Ok(_) => 0,
         Result::Err(_) => panic "write_all",
