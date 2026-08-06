@@ -10,6 +10,18 @@ class TreeMap<K, V> {
 }
 
 impl TreeMap<K, V> {
+    static fn new() -> TreeMap<K, V> {
+        let keys: [K] = [];
+        let vals: [V] = [];
+        let left: [int] = [];
+        let right: [int] = [];
+        return new TreeMap(keys, vals, left, right, 0 - 1, 0);
+    }
+
+    static fn empty() -> TreeMap<K, V> {
+        return TreeMap::new();
+    }
+
     fn size() -> int {
         return self.len;
     }
@@ -19,104 +31,81 @@ impl TreeMap<K, V> {
     }
 }
 
-fn treemap_new<K, V>() -> TreeMap<K, V> {
-    let keys: [K] = [];
-    let vals: [V] = [];
-    let left: [int] = [];
-    let right: [int] = [];
-    return new TreeMap(keys, vals, left, right, 0 - 1, 0);
-}
-
-fn treemap_empty<K, V>() -> TreeMap<K, V> {
-    return treemap_new();
-}
-
-fn treemap_insert<K: Ord + Eq, V>(TreeMap<K, V> t, K k, V v) -> bool {
-    if t.root < 0 {
-        let slot = len(t.keys);
-        t.keys[] = k;
-        t.vals[] = v;
-        t.left[] = 0 - 1;
-        t.right[] = 0 - 1;
-        t.root = slot;
-        t.len = 1;
-        return true;
-    }
-    let cur = t.root;
-    let steps = 0;
-    while steps < 100000 {
-        steps = steps + 1;
-        if k == t.keys[cur] {
-            t.vals[cur] = v;
-            return false;
-        }
-        if k < t.keys[cur] {
-            let child = t.left[cur];
-            if child < 0 {
-                let slot = len(t.keys);
-                t.keys[] = k;
-                t.vals[] = v;
-                t.left[] = 0 - 1;
-                t.right[] = 0 - 1;
-                t.left[cur] = slot;
-                t.len = t.len + 1;
-                return true;
-            }
-            cur = child;
-        } else {
-            let child = t.right[cur];
-            if child < 0 {
-                let slot = len(t.keys);
-                t.keys[] = k;
-                t.vals[] = v;
-                t.left[] = 0 - 1;
-                t.right[] = 0 - 1;
-                t.right[cur] = slot;
-                t.len = t.len + 1;
-                return true;
-            }
-            cur = child;
-        }
-    }
-    return false;
-}
-
-fn treemap_contains<K: Ord + Eq, V>(TreeMap<K, V> t, K k) -> bool {
-    let cur = t.root;
-    let steps = 0;
-    while cur >= 0 {
-        if steps >= 100000 {
-            return false;
-        }
-        steps = steps + 1;
-        if k == t.keys[cur] {
+impl TreeMap<K: Ord + Eq, V> {
+    fn insert(K k, V v) -> bool {
+        if self.root < 0 {
+            let slot = len(self.keys);
+            self.keys[] = k;
+            self.vals[] = v;
+            self.left[] = 0 - 1;
+            self.right[] = 0 - 1;
+            self.root = slot;
+            self.len = 1;
             return true;
         }
-        if k < t.keys[cur] {
-            cur = t.left[cur];
-        } else {
-            cur = t.right[cur];
+        let cur = self.root;
+        while true {
+            if k == self.keys[cur] {
+                self.vals[cur] = v;
+                return false;
+            }
+            if k < self.keys[cur] {
+                let child = self.left[cur];
+                if child < 0 {
+                    let slot = len(self.keys);
+                    self.keys[] = k;
+                    self.vals[] = v;
+                    self.left[] = 0 - 1;
+                    self.right[] = 0 - 1;
+                    self.left[cur] = slot;
+                    self.len = self.len + 1;
+                    return true;
+                }
+                cur = child;
+            } else {
+                let child = self.right[cur];
+                if child < 0 {
+                    let slot = len(self.keys);
+                    self.keys[] = k;
+                    self.vals[] = v;
+                    self.left[] = 0 - 1;
+                    self.right[] = 0 - 1;
+                    self.right[cur] = slot;
+                    self.len = self.len + 1;
+                    return true;
+                }
+                cur = child;
+            }
         }
     }
-    return false;
-}
 
-fn treemap_get_or<K: Ord + Eq, V>(TreeMap<K, V> t, K k, V fallback) -> V {
-    let cur = t.root;
-    let steps = 0;
-    while cur >= 0 {
-        if steps >= 100000 {
-            return fallback;
+    fn contains(K k) -> bool {
+        let cur = self.root;
+        while cur >= 0 {
+            if k == self.keys[cur] {
+                return true;
+            }
+            if k < self.keys[cur] {
+                cur = self.left[cur];
+            } else {
+                cur = self.right[cur];
+            }
         }
-        steps = steps + 1;
-        if k == t.keys[cur] {
-            return t.vals[cur];
-        }
-        if k < t.keys[cur] {
-            cur = t.left[cur];
-        } else {
-            cur = t.right[cur];
-        }
+        return false;
     }
-    return fallback;
+
+    fn get_or(K k, V fallback) -> V {
+        let cur = self.root;
+        while cur >= 0 {
+            if k == self.keys[cur] {
+                return self.vals[cur];
+            }
+            if k < self.keys[cur] {
+                cur = self.left[cur];
+            } else {
+                cur = self.right[cur];
+            }
+        }
+        return fallback;
+    }
 }
