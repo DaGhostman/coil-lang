@@ -44,7 +44,16 @@ fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    run_example_multifile(path)
+    // Deep attr inlining can overflow the default libtest thread stack in debug
+    // builds; match the main-thread headroom used by `coil` CLI.
+    const STACK: usize = 4 * 1024 * 1024;
+    let path = path.to_string();
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || run_example_multifile(&path))
+        .expect("pipeline example thread")
+        .join()
+        .expect("pipeline example thread join")
 }
 
 /// Compile and run in-memory source.
