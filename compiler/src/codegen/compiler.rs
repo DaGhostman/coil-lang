@@ -1996,6 +1996,9 @@ impl Compiler {
     }
 
     /// Reserve `n` consecutive locals for a fixed array binding `name`.
+    ///
+    /// Used for literal `[T; N]` locals with `1 <= N <= 3` (packed STORE width).
+    /// Larger or non-literal inits stay as a single heap `MakeArray` slot.
     fn alloc_stack_array_slots(&mut self, name: &str, n: usize) -> u32 {
         let base = self.alloc_binding_slot(name);
         for i in 1..n {
@@ -7558,19 +7561,19 @@ impl Compiler {
                             // Returned/captured PolyFn (`let f = capture_show(0)`).
                             self.polyfn_vars.insert(name.clone());
                         }
-                        // Compile the RHS BEFORE interning the binding name.
-                        // Match payload slots use `variables.len()` as the first
-                        // free slot; interning early (e.g. `let v = match e`)
-                        // reserved a hole and made bindings land one slot too
-                        // high while JumpIfMatch still pushed at the real
-                        // cursor.
                         let rhs_is_match = Self::rhs_is_match_expr(&children[1]);
-                        if rhs_is_match {
-                            self.emit_binding_rhs(&children[1]);
-                        } else {
-                            self.append_binding_rhs(&mut bytecode, &children[1]);
-                        }
                         if is_const {
+                            // Compile the RHS BEFORE interning the binding name.
+                            // Match payload slots use `variables.len()` as the first
+                            // free slot; interning early (e.g. `let v = match e`)
+                            // reserved a hole and made bindings land one slot too
+                            // high while JumpIfMatch still pushed at the real
+                            // cursor.
+                            if rhs_is_match {
+                                self.emit_binding_rhs(&children[1]);
+                            } else {
+                                self.append_binding_rhs(&mut bytecode, &children[1]);
+                            }
                             if let Some(val) = crate::const_fold::eval_expr(&children[1], self.const_env())
                             {
                                 self.const_env_mut().insert(name.clone(), val);
@@ -7586,44 +7589,38 @@ impl Compiler {
                             is_binding = true;
                         } else {
                             // Fixed `[T; N]` locals: N consecutive slots (stack).
+                            // Detect before emitting the RHS so we do not leave a
+                            // heap MakeArray on the operand stack.
                             let bind_ty = self
                                 .codegen_var_type_for(&name)
                                 .or_else(|| self.codegen_expr_ty(&children[1]));
                             let fixed_n = bind_ty
                                 .as_ref()
                                 .and_then(|ty| Self::fixed_array_len(ty));
-                            if let Some(n) = fixed_n.filter(|&n| n > 0) {
-                                if let Expression::Array(items) = children[1].1.as_ref()
-                                    && items.len() == n
-                                {
-                                    for item in items {
-                                        if rhs_is_match {
-                                            self.emit_binding_rhs(item);
-                                        } else {
-                                            let mut bc = self.do_compile(item);
-                                            bytecode.append(&mut bc);
-                                        }
-                                    }
-                                    let base = self.alloc_stack_array_slots(&name, n);
-                                    if rhs_is_match {
-                                        let mut tmp = Vec::new();
-                                        self.emit_store_stack_array(&mut tmp, base, n);
-                                        self.bytecode.append(&mut tmp);
-                                    } else {
-                                        self.emit_store_stack_array(&mut bytecode, base, n);
-                                    }
-                                    is_binding = true;
-                                } else {
-                                    // Non-literal RHS: keep heap ObjArray in one slot.
-                                    let slot = self.alloc_binding_slot(&name);
-                                    if rhs_is_match {
-                                        self.bytecode.push_store_pop(slot);
-                                    } else {
-                                        bytecode.push_store_pop(slot);
-                                    }
-                                    is_binding = true;
+                            let rhs_node = unwrap_expr_output(&children[1]);
+                            if let Some(n) = fixed_n.filter(|&n| (1..=3).contains(&n))
+                                && let Expression::Array(items) = rhs_node.1.as_ref()
+                                && items.len() == n
+                                && items.iter().all(|it| {
+                                    matches!(
+                                        unwrap_expr_output(it).1.as_ref(),
+                                        Expression::Integer(_)
+                                    )
+                                })
+                            {
+                                for item in items {
+                                    let mut bc = self.do_compile(item);
+                                    bytecode.append(&mut bc);
                                 }
+                                let base = self.alloc_stack_array_slots(&name, n);
+                                self.emit_store_stack_array(&mut bytecode, base, n);
+                                is_binding = true;
                             } else {
+                                if rhs_is_match {
+                                    self.emit_binding_rhs(&children[1]);
+                                } else {
+                                    self.append_binding_rhs(&mut bytecode, &children[1]);
+                                }
                                 let slot = self.alloc_binding_slot(&name);
                                 if rhs_is_match {
                                     self.bytecode.push_store_pop(slot);

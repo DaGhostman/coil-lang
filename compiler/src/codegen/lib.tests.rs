@@ -3354,8 +3354,61 @@ let n = len(a); \
         );
     }
 
-    /// Literal `len("…")` must const-fold to an immediate; the only
-    /// `ArrayLen` in the program is the built-in `Length__string__len` thunk.
+    
+    /// Fixed `[T; N]` locals use consecutive LOAD/STORE for const indices;
+    /// escaping the local into a call boxes via MakeArray.
+    #[test]
+    fn fixed_array_local_uses_slots_and_boxes_on_escape() {
+        use common::Instruction;
+        let mut pipeline = crate::Pipeline::new();
+        let (bc, _pool) = pipeline
+            .compile_src(
+                "fn take([int; 3] xs) -> int { return xs[0]; } \
+fn main() { \
+let a = [10, 20, 30]; \
+a[1] = 99; \
+let x = a[1]; \
+let _ = take(a); \
+}",
+            )
+            .expect("compile");
+        let main_off = pipeline.compiler_mut().get_function("main") as usize;
+        let main_bc = &bc[main_off..];
+        assert!(
+            !main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::StoreIndex)),
+            "const store on stack-array local should avoid StoreIndex; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeArray)),
+            "escaping stack-array local into take(a) must MakeArray; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let loads = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LOAD))
+            .count();
+        assert!(
+            loads >= 3,
+            "expected multi-slot LOADs for escape/index; got {loads}; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Init should be three CONST + three STORE, not a single MakeArray local.
+        let make_arrays = main_bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .count();
+        assert_eq!(
+            make_arrays, 1,
+            "only the escape path should MakeArray; ops={:?}",
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn len_of_string_literal_folds_without_array_len() {
         use common::Instruction;
