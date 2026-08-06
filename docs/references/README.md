@@ -45,7 +45,7 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins; see also [`stdlib/`](../../stdlib/) userland |
 
 Userland packages under `stdlib/` (include in `[module].roots`): `bytes`, `text`,
-`collections`, `num`, `random`, `path`, `json`, `io::sync` / `io::file`, `http`.
+`collections`, `num`, `random`, `path`, `io::sync` / `io::file`, `http`.
 See [`stdlib/README.md`](../../stdlib/README.md).
 
 ## Related

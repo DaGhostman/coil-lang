@@ -17,7 +17,6 @@ virtual modules alike. Prelude is auto-injected.
 | `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
 | `random` | `use random::{u64, range, …};` | CSPRNG wrappers over virtual `crypto` |
 | `path` | `use path::{join, dirname, …};` | `join` / `dirname` / `basename` / `extension` |
-| `json` | `use json::{parse, stringify, …};` | Minimal JSON parse / stringify (`\uXXXX` BMP; `object_get`) |
 | `io::sync` | `use io::sync::{write_all, …};` | Blocking adapters + `print` / `println` / `read_line` (`write_all` via `io::write_from`) |
 | `io::file` | `use io::file::{read_text, …};` | Whole-file `read_bytes` / `write_text` / … |
 | `http` | `use http::client::{get, …};` | HTTP/1.1 client (existing) |
@@ -27,11 +26,6 @@ virtual modules alike. Prelude is auto-injected.
 - Prefer **byte offsets** for `text::slice` / `find` (mid-codepoint slices error on decode).
 - Byte constants use single-byte string literals (`"/"`, `"\n"`) under `byte` /
   `[byte]` expected types; whole strings coerce to `[byte]` / `[byte; N]` too.
-- `json` enum constructors are globally unique (`JsonNull`, …); prefer `json_int` /
-  `json_object` helpers. Import functions explicitly; construct via helpers.
-  Supports `\" \\ \/ \b \f \n \r \t \uXXXX` (BMP only — no surrogate pairs).
-  Float emit is fixed 6-frac-digit (trailing zeros trimmed). Objects are parallel
-  key/value arrays — use `object_get`. Nesting capped by `#[max_depth(256)]`.
 - `num` is named so workspace `examples/src/math.hy` does not shadow it.
 - IEEE float math (`sin`, `cos`, `tan`, `sqrt`, `floor`, `ceil`, `exp`, `ln`)
   is auto-imported from virtual `prelude::math`. `pow` is userland in `num`
