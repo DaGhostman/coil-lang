@@ -304,7 +304,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         Expression::Match { scrutinee, arms } => {
             pre_walk(scrutinee, table);
             for arm in arms {
-                pre_walk_pattern(&arm.pattern, table);
+                pre_walk_pattern(&arm.pattern.1, table);
                 pre_walk(&arm.body, table);
             }
         }
@@ -409,12 +409,12 @@ pub fn pre_walk_pattern(pattern: &Pattern, _table: &mut IdTable) {
             PatternPayload::Unit => {}
             PatternPayload::Tuple(parts) => {
                 for p in parts {
-                    pre_walk_pattern(p, _table);
+                    pre_walk_pattern(&p.1, _table);
                 }
             }
             PatternPayload::Record(fields) => {
                 for pf in fields {
-                    pre_walk_pattern(&pf.pattern, _table);
+                    pre_walk_pattern(&pf.pattern.1, _table);
                 }
             }
         },

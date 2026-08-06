@@ -503,20 +503,13 @@ struct PendingExhaustive {
     match_range: Range<usize>,
 }
 
-/// What the inner pattern covers (only meaningful for Constructor
-/// arms). For the codegen's test chain (which inspects only the
-/// FIRST inner pattern), this captures the first non-trivial
-/// inner pattern's tag.
+/// Coverage tree for match exhaustiveness (full inner-pattern shape).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum InnerCoverage {
-    /// No inner pattern to test (Unit payload, or Wildcard/Binding
-    /// which always match).
+enum CoverageTree {
     Any,
-    /// The inner pattern is a Constructor with the given tag.
-    /// Multiple inner tags across multiple arms of the same outer
-    /// tag are all reachable; two arms with the same outer AND
-    /// same inner tag are still duplicates.
-    Tag(u32),
+    Tag(u32, Vec<CoverageTree>),
+    Tuple(Vec<CoverageTree>),
+    Record(BTreeMap<String, CoverageTree>),
 }
 
 /// Per-arm coverage info, captured at the match site.
@@ -527,9 +520,8 @@ struct ArmCoverage {
     /// catches.
     tag: Option<u32>,
     /// The inner pattern's coverage, when this arm's pattern is a
-    /// Constructor with a payload. See [`InnerCoverage`]. For
-    /// non-constructor arms this is [`InnerCoverage::Any`].
-    inner: InnerCoverage,
+    /// Constructor with a payload coverage tree.
+    inner: CoverageTree,
     /// True if the arm was a wildcard (`_`) or a binding (`name`).
     /// Such arms cover all remaining cases (Rust-style).
     is_catchall: bool,

@@ -138,6 +138,7 @@ impl Checker {
         };
         checker.register_builtin_enums();
         checker.register_builtin_vec();
+        checker.register_builtin_call_sigs();
         checker
     }
 
@@ -273,6 +274,30 @@ impl Checker {
                 .or_default()
                 .insert(name.to_string(), (Visibility::Public, scheme));
         }
+    }
+
+    /// Parameter names for builtins that support named arguments at call sites.
+    fn register_builtin_call_sigs(&mut self) {
+        self.fn_param_names
+            .insert("len".into(), vec!["value".into()]);
+        self.fn_param_names
+            .insert("string::format".into(), vec!["fmt".into(), "args".into()]);
+        self.fn_param_names
+            .insert("string::from_bytes".into(), vec!["bytes".into()]);
+        self.fn_param_names
+            .insert("string::to_bytes".into(), vec!["s".into()]);
+        self.fn_param_names
+            .insert("assert".into(), vec!["cond".into(), "msg".into()]);
+        self.fn_param_names
+            .insert("block_on".into(), vec!["handle".into()]);
+        self.fn_param_names
+            .insert("dload".into(), vec!["path".into()]);
+        self.fn_param_names
+            .insert("declare".into(), vec!["lib".into(), "name".into(), "sig".into()]);
+        self.fn_param_names.insert(
+            "invoke".into(),
+            vec!["lib".into(), "name".into(), "args".into()],
+        );
     }
 
     /// Reset scope bindings and inject the auto-prelude.
@@ -1468,6 +1493,7 @@ impl Checker {
         self.register_builtin_enums();
         // `fn_param_names` was cleared above — reinstall Vec method ABI.
         self.register_builtin_vec();
+        self.register_builtin_call_sigs();
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
         self.inject_prelude_scope();
@@ -3184,25 +3210,49 @@ impl Checker {
 
                 if ident == "len" {
                     if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            "Named arguments are not supported on `len`".to_string(),
-                            range,
-                            Some("use positional arguments: `len(value)`".to_string()),
-                        );
+                        let (_, reordered) =
+                            self.infer_and_reorder_call_args("len", raw_args, &range);
+                        return self.infer_len_call(Some(&reordered), id, range);
                     }
                     return self.infer_len_call(args.as_deref(), id, range);
                 }
                 if let Some(kind) = self.string_fn_for_call(&ident) {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("string helpers take positional arguments only".to_string()),
-                        );
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    let arg_slice = if has_named {
+                        let (_, reordered) =
+                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                        return match kind {
+                            StringBuiltin::Format => {
+                                self.infer_string_format_call(reordered.as_slice(), range)
+                            }
+                            StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                                if kind == StringBuiltin::FromBytes
+                                    && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                                {
+                                    self.register_builtin_io_error();
+                                }
+                                let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                                let flat_args = self.flatten_spread_call_args(reordered.as_slice());
+                                let arg_tys: Vec<Ty> = flat_args
+                                    .iter()
+                                    .map(|arg| self.infer_call_arg(arg))
+                                    .collect();
+                                self.apply_function(
+                                    Some(&ident),
+                                    &fun_ty,
+                                    &arg_tys,
+                                    if flat_args.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&flat_args)
+                                    },
+                                    id,
+                                    range,
+                                )
+                            }
+                        };
+                    } else {
+                        args.as_deref().unwrap_or(&[])
+                    };
                     return match kind {
                         StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
                         StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
@@ -3235,12 +3285,27 @@ impl Checker {
                 // `assert` from `prelude::test` (auto-imported or via `use`).
                 if let Some(kind) = self.prelude_fn_in_scope(&ident) {
                     if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("use positional arguments".to_string()),
-                        );
+                        let (_, reordered) =
+                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                        return match kind {
+                            PreludeFn::Assert => self.infer_assert(&reordered, range),
+                            PreludeFn::BlockOn => self.infer_block_on(&reordered, range),
+                            PreludeFn::Dot => self.infer_dot(&reordered, id, range),
+                            PreludeFn::MatMul => self.infer_matmul(&reordered, id, range),
+                            PreludeFn::Cross => self.infer_cross(&reordered, id, range),
+                            PreludeFn::Matrix => self.infer_matrix_ctor(&reordered, id, range),
+                            PreludeFn::Ord => self.infer_ord(&reordered, range),
+                            PreludeFn::Char => self.infer_char(&reordered, range),
+                            PreludeFn::Sin
+                            | PreludeFn::Cos
+                            | PreludeFn::Tan
+                            | PreludeFn::Sqrt
+                            | PreludeFn::Floor
+                            | PreludeFn::Ceil
+                            | PreludeFn::Exp
+                            | PreludeFn::Ln
+                            | PreludeFn::Pow => self.infer_math(kind, &reordered, range),
+                        };
                     }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
@@ -3266,12 +3331,13 @@ impl Checker {
                 // `dload` / `declare` / `invoke` after `use ffi::{…}`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
                     if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("FFI builtins take positional arguments only".to_string()),
-                        );
+                        let (_, reordered) =
+                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                        return match kind {
+                            FfiBuiltin::Dload => self.infer_ffi_dload(&reordered, range),
+                            FfiBuiltin::Declare => self.infer_ffi_declare(&reordered, range),
+                            FfiBuiltin::Invoke => self.infer_ffi_invoke(&reordered, range),
+                        };
                     }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
@@ -12108,14 +12174,14 @@ impl Checker {
                 || args.len() >= fixed_count
                 || fixed_count == 0);
 
-        // `filled_mask` is a u32 on the VM stack (MakeFn / CallIndirect); cap
+        // `filled_mask` is a u64 on the VM stack (MakeFn / CallIndirect); cap
         // fixed arity so bit shifts never wrap. Abort early — continuing would
         // emit a truncated mask and mis-bind partials.
-        if fixed_count > 32 {
+        if fixed_count > 64 {
             let msg = Message::error(
                 ErrorCode::WrongArity,
                 format!(
-                    "Function `{}` has {} fixed parameters; at most 32 are supported for partial application",
+                    "Function `{}` has {} fixed parameters; at most 64 are supported for partial application",
                     fn_name, fixed_count
                 ),
                 range.clone(),
@@ -13424,8 +13490,8 @@ impl Checker {
             // error anchoring — it's close enough that ariadne
             // points near the offending pattern instead of at byte
             // 0 of the source.
-            let pattern_range = arm.body.0.into_range();
-            let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee, &pattern_range);
+            let pattern_range = arm.pattern.0.into_range();
+            let pat_ty = self.infer_pattern(&arm.pattern.1, &resolved_scrutinee, &pattern_range);
 
             // Narrow an Identifier scrutinee to the matched variant so
             // `p.0` / `p.field` inside the arm use tagged field lookup
@@ -13436,7 +13502,7 @@ impl Checker {
                     enum_name,
                     variant_name,
                     ..
-                } = &arm.pattern
+                } = &arm.pattern.1
             {
                 if let Some(tag) = self
                     .enum_tags
@@ -13491,7 +13557,7 @@ impl Checker {
             );
 
             // Step 4: capture coverage info.
-            let arm_cov = self.arm_coverage(&arm.pattern, &arm.body.0.into_range());
+            let arm_cov = self.arm_coverage(&arm.pattern.1, &pattern_range);
             coverage.push(arm_cov);
 
             // Step 5: infer body, unify with result.
@@ -13678,7 +13744,7 @@ impl Checker {
                     PatternPayload::Tuple(parts) => {
                         let expected_tys = expected_payload.field_types();
                         for (sub_pat, expected_ty) in parts.iter().zip(expected_tys.iter()) {
-                            let _ = self.infer_pattern(sub_pat, expected_ty, pattern_range);
+                            let _ = self.infer_pattern(&sub_pat.1, expected_ty, pattern_range);
                         }
                     }
                     PatternPayload::Record(fields) => {
@@ -13690,7 +13756,7 @@ impl Checker {
                         let mut pattern_site: std::collections::HashMap<&str, &Pattern> =
                             std::collections::HashMap::with_capacity(fields.len());
                         for pf in fields {
-                            if pattern_site.insert(pf.name, &pf.pattern).is_some() {
+                            if pattern_site.insert(pf.name, &pf.pattern.1).is_some() {
                                 return self.error_with_help(
                                     ErrorCode::DuplicateField,
                                     format!(
@@ -13950,31 +14016,61 @@ impl Checker {
     /// The codegen's inner `JUMP_IF_MATCH` test chain guarantees
     /// this at runtime; the typechecker just needs to stay out of
     /// the way.
-    fn inner_coverage(
-        payload: &parser::ast::PatternPayload<'_>,
+    fn pattern_coverage(
+        pattern: &Pattern,
         enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
-    ) -> InnerCoverage {
-        use parser::ast::PatternPayload;
-        let first = match payload {
-            PatternPayload::Unit => return InnerCoverage::Any,
-            PatternPayload::Tuple(parts) => parts.first(),
-            PatternPayload::Record(fields) => fields.first().map(|f| &f.pattern),
-        };
-        let Some(first) = first else {
-            return InnerCoverage::Any;
-        };
-        match first {
-            Pattern::Wildcard | Pattern::Binding { .. } => InnerCoverage::Any,
+    ) -> CoverageTree {
+        match pattern {
+            Pattern::Wildcard | Pattern::Binding { .. } => CoverageTree::Any,
             Pattern::Constructor {
                 enum_name,
                 variant_name,
+                payload,
                 ..
-            } => enum_tags
-                .get(enum_name.to_string().as_str())
-                .and_then(|t| t.get(variant_name.to_string().as_str()).copied())
-                .map(InnerCoverage::Tag)
-                .unwrap_or(InnerCoverage::Any),
+            } => {
+                let tag = enum_tags
+                    .get(enum_name.to_string().as_str())
+                    .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
+                let inner = Self::payload_coverage(payload, enum_tags);
+                tag.map(|t| CoverageTree::Tag(t, vec![inner]))
+                    .unwrap_or(CoverageTree::Any)
+            }
         }
+    }
+
+    fn payload_coverage(
+        payload: &parser::ast::PatternPayload<'_>,
+        enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
+    ) -> CoverageTree {
+        use parser::ast::PatternPayload;
+        match payload {
+            PatternPayload::Unit => CoverageTree::Any,
+            PatternPayload::Tuple(parts) => CoverageTree::Tuple(
+                parts
+                    .iter()
+                    .map(|p| Self::pattern_coverage(&p.1, enum_tags))
+                    .collect(),
+            ),
+            PatternPayload::Record(fields) => CoverageTree::Record(
+                fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.to_string(),
+                            Self::pattern_coverage(&f.pattern.1, enum_tags),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Payload coverage for constructor arms (full inner tree).
+    fn inner_coverage(
+        payload: &parser::ast::PatternPayload<'_>,
+        enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
+    ) -> CoverageTree {
+        Self::payload_coverage(payload, enum_tags)
     }
 
     /// Capture per-arm coverage info for the deferred
@@ -13983,13 +14079,13 @@ impl Checker {
         match pattern {
             Pattern::Wildcard => ArmCoverage {
                 tag: None,
-                inner: InnerCoverage::Any,
+                inner: CoverageTree::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
             Pattern::Binding { .. } => ArmCoverage {
                 tag: None,
-                inner: InnerCoverage::Any,
+                inner: CoverageTree::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
@@ -14044,7 +14140,7 @@ impl Checker {
         // them at runtime. Only when both the outer tag AND the
         // inner coverage match an earlier arm is the arm truly
         // unreachable.
-        let mut seen: BTreeMap<u32, BTreeSet<InnerCoverage>> = BTreeMap::new();
+        let mut seen: BTreeMap<u32, BTreeSet<CoverageTree>> = BTreeMap::new();
         let mut has_catchall = false;
         for arm in &pending.arms {
             if arm.is_catchall {
