@@ -206,6 +206,11 @@ impl DebugSession {
         self.machine.panicked()
     }
 
+    /// Capture program stdout/stderr writes into `buf` (keeps DAP stdio clean).
+    pub fn set_print_capture(&mut self, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        self.machine.set_shared_print(buf);
+    }
+
     pub fn breakpoints(&self) -> Vec<BreakpointInfo> {
         self.breakpoints
             .iter()
@@ -308,6 +313,11 @@ impl DebugSession {
         names: &[&str],
     ) -> Result<Vec<BreakpointInfo>, String> {
         self.breakpoints.retain(|b| b.source.is_some());
+        // Empty replacement still must drop cleared fn BPs from the VM.
+        if names.is_empty() {
+            self.sync_vm_breakpoints();
+            return Ok(Vec::new());
+        }
         names.iter().map(|n| self.set_function_breakpoint(n)).collect()
     }
 
@@ -420,10 +430,11 @@ impl DebugSession {
         if depth == 0 {
             return Vec::new();
         }
+        // Top frame first for display; `index` is the machine frame id so DAP
+        // scopes/variables can pass it straight to `locals_for_frame`.
         (0..depth)
             .rev()
-            .enumerate()
-            .map(|(index, frame_idx)| {
+            .map(|frame_idx| {
                 let ip = self.machine.debug_frame_ip(frame_idx).unwrap_or(0);
                 let name = symbol_at_pc(&self.artifacts.functions, ip)
                     .unwrap_or("<unknown>")
@@ -434,7 +445,7 @@ impl DebugSession {
                     .map(|(p, l, c)| (Some(p), Some(l), Some(c)))
                     .unwrap_or((None, None, None));
                 StackFrameInfo {
-                    index,
+                    index: frame_idx,
                     name,
                     pc: ip,
                     path,
@@ -714,6 +725,21 @@ fn source_matches(stored: &Option<String>, requested: &str) -> bool {
 mod tests {
     use super::*;
     use common::DebugLoc;
+    use machine::StopReason;
+
+    fn fib_path() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/fib.hy")
+            .canonicalize()
+            .expect("examples/fib.hy")
+            .display()
+            .to_string()
+    }
+
+    fn compile_fib() -> DebugSession {
+        let config = ReportConfig::from_cli_flags(false, false).expect("report config");
+        DebugSession::compile(config, &fib_path(), Box::new(std::io::sink())).expect("compile fib")
+    }
 
     #[test]
     fn line_index_maps_known_loc() {
@@ -735,5 +761,167 @@ mod tests {
         let pcs = idx.pcs_for_line(Some(&path), 2, &path);
         assert!(pcs.contains(&3), "pcs={pcs:?}");
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn line_index_resolves_basename_hint() {
+        let text = "fn main() {\n    return;\n}\n";
+        let tmp = std::env::temp_dir().join(format!("coil_dbg_base_{}", std::process::id()));
+        fs::write(&tmp, text).unwrap();
+        let path = tmp.display().to_string();
+        let mut debug = ProgramDebug {
+            source_files: vec![path.clone()],
+            debug_locs: vec![DebugLoc::unknown(); 4],
+        };
+        let ret_off = text.find("return").unwrap() as u32;
+        debug.debug_locs[2] = DebugLoc {
+            file: 0,
+            start_byte: ret_off,
+            end_byte: ret_off + 6,
+        };
+        let idx = LineIndex::build(&debug, None);
+        let base = Path::new(&path).file_name().unwrap().to_str().unwrap();
+        let pcs = idx.pcs_for_line(Some(base), 2, &path);
+        assert!(pcs.contains(&2), "pcs={pcs:?}");
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn function_breakpoint_exposes_fib_locals_via_frame_id() {
+        let mut session = compile_fib();
+        session.set_function_breakpoint("fib").expect("break fib");
+        let reason = session.start();
+        assert!(
+            matches!(reason, StopReason::Breakpoint { .. }),
+            "reason={reason:?}"
+        );
+        let frames = session.stack_frames();
+        assert!(frames.len() >= 2, "expected recursive/caller stack, got {frames:?}");
+        assert!(
+            frames[0].name.contains("fib"),
+            "top frame should be fib, got {:?}",
+            frames[0].name
+        );
+        let locals = session
+            .locals_for_frame(frames[0].index)
+            .expect("locals for top DAP frame id");
+        assert!(
+            locals.iter().any(|l| l.name == "n"),
+            "expected local n, got {locals:?}"
+        );
+        let n = session.read_variable("n").expect("print n");
+        assert_eq!(n.name, "n");
+        assert!(!n.value.is_empty());
+    }
+
+    #[test]
+    fn replace_line_breakpoints_marks_unverified_and_clears_prior() {
+        let mut session = compile_fib();
+        let entry = session.entry.clone();
+        let first = session.replace_line_breakpoints(&entry, &[1, 999_999]);
+        assert_eq!(first.len(), 2);
+        assert!(!first[1].verified);
+        assert!(first[1].pc.is_none());
+        let second = session.replace_line_breakpoints(&entry, &[]);
+        assert!(second.is_empty());
+        assert!(
+            session.breakpoints().is_empty(),
+            "empty replace should clear line BPs for source"
+        );
+    }
+
+    #[test]
+    fn replace_function_breakpoints_empty_syncs_vm_so_continue_finishes() {
+        let mut session = compile_fib();
+        session.set_function_breakpoint("fib").expect("break fib");
+        let reason = session.start();
+        assert!(matches!(reason, StopReason::Breakpoint { .. }));
+        session
+            .replace_function_breakpoints(&[])
+            .expect("clear fn breakpoints");
+        assert!(session.breakpoints().is_empty());
+        let reason = session.continue_exec().expect("continue");
+        assert!(
+            matches!(reason, StopReason::Halt),
+            "empty fn replace must sync VM; reason={reason:?}"
+        );
+    }
+
+    #[test]
+    fn replace_function_breakpoints_replaces_fn_only() {
+        let mut session = compile_fib();
+        let entry = session.entry.clone();
+        let line = session.replace_line_breakpoints(&entry, &[17]);
+        let line_verified = line.iter().any(|r| r.verified);
+        session
+            .replace_function_breakpoints(&["fib"])
+            .expect("fn breakpoints");
+        assert!(
+            session.breakpoints().iter().any(|b| b.label.contains("fib")),
+            "expected fib BP"
+        );
+        session
+            .replace_function_breakpoints(&[])
+            .expect("clear fn breakpoints");
+        let remaining = session.breakpoints();
+        if line_verified {
+            assert!(
+                remaining.iter().any(|b| b.label.contains(':')),
+                "line BP should survive fn replace, got {remaining:?}"
+            );
+        } else {
+            assert!(remaining.is_empty(), "got {remaining:?}");
+        }
+    }
+
+    #[test]
+    fn continue_before_start_errors() {
+        let mut session = compile_fib();
+        let err = session.continue_exec().expect_err("not started");
+        assert!(err.contains("not started"), "err={err}");
+    }
+
+    #[test]
+    fn unknown_function_breakpoint_errors() {
+        let mut session = compile_fib();
+        let err = session
+            .set_function_breakpoint("no_such_fn_zz")
+            .expect_err("missing fn");
+        assert!(
+            err.contains("no function") || err.contains("no code"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn source_matches_basename_and_suffix() {
+        assert!(source_matches(
+            &Some("examples/fib.hy".into()),
+            "examples/fib.hy"
+        ));
+        assert!(source_matches(
+            &Some("/abs/examples/fib.hy".into()),
+            "fib.hy"
+        ));
+        assert!(source_matches(
+            &Some("fib.hy".into()),
+            "/workspace/examples/fib.hy"
+        ));
+        assert!(!source_matches(&None, "fib.hy"));
+        assert!(!source_matches(
+            &Some("other.hy".into()),
+            "fib.hy"
+        ));
+    }
+
+    #[test]
+    fn resolve_path_joins_base_dir() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let resolved = resolve_path("fib.hy", Some(&base));
+        assert!(
+            resolved.exists(),
+            "expected fib.hy under examples, got {}",
+            resolved.display()
+        );
     }
 }

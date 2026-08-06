@@ -4,6 +4,7 @@ mod protocol;
 
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use machine::StopReason;
 use reporting::ReportConfig;
@@ -24,10 +25,14 @@ struct DapServer {
     exited: bool,
     /// Session started but paused before main (stopOnEntry).
     paused_at_entry: bool,
+    /// Captures inferior stdout so it does not corrupt the DAP stdio stream.
+    print_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl DapServer {
     fn new() -> Self {
+        let print_buf = Arc::new(Mutex::new(Vec::new()));
+        machine::io::set_shared_print_redirect(Some(Arc::clone(&print_buf)));
         Self {
             seq: 1,
             session: None,
@@ -36,6 +41,7 @@ impl DapServer {
             pending_start: false,
             exited: false,
             paused_at_entry: false,
+            print_buf,
         }
     }
 
@@ -128,7 +134,8 @@ impl DapServer {
                     io::Error::new(io::ErrorKind::Other, e.to_string())
                 })?;
                 match DebugSession::compile(config, &path_str, Box::new(io::stderr())) {
-                    Ok(session) => {
+                    Ok(mut session) => {
+                        session.set_print_capture(Arc::clone(&self.print_buf));
                         self.session = Some(session);
                     }
                     Err(()) => {
@@ -408,6 +415,28 @@ impl DapServer {
         Ok(true)
     }
 
+    fn flush_captured_output<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let bytes = {
+            let mut guard = self
+                .print_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *guard)
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.send_event(
+            writer,
+            "output",
+            Some(json!({
+                "category": "stdout",
+                "output": text,
+            })),
+        )
+    }
+
     fn start_or_stop_on_entry<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
         if self.stop_on_entry {
             self.paused_at_entry = true;
@@ -431,6 +460,7 @@ impl DapServer {
     }
 
     fn emit_stop_or_exit<W: Write>(&mut self, writer: &mut W, reason: &StopReason) -> io::Result<()> {
+        self.flush_captured_output(writer)?;
         match reason {
             StopReason::Halt => {
                 if !self.exited {
@@ -518,6 +548,8 @@ pub fn run_dap_server() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::protocol::{Message, read_message, write_message};
+    use super::resolve_program_path;
+    use std::path::PathBuf;
 
     #[test]
     fn initialize_response_shape() {
@@ -533,5 +565,26 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let decoded = read_message(&mut cursor).unwrap().unwrap();
         assert_eq!(decoded.command.as_deref(), Some("initialize"));
+    }
+
+    #[test]
+    fn resolve_program_path_prefers_cwd_relative() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let resolved = resolve_program_path("fib.hy", Some(&examples));
+        assert!(
+            resolved.exists(),
+            "cwd-relative fib.hy missing: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn resolve_program_path_keeps_absolute_existing() {
+        let abs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/fib.hy")
+            .canonicalize()
+            .unwrap();
+        let resolved = resolve_program_path(abs.to_str().unwrap(), None);
+        assert_eq!(resolved, abs);
     }
 }
