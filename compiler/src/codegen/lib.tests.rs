@@ -3495,8 +3495,8 @@ fn main() {
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
         assert_eq!(
-            array_lens, 1,
-            "literal len(string) should fold; only Length__string__len thunk keeps ArrayLen; ops={:?}",
+            array_lens, 2,
+            "Length thunks (string + vec) keep ArrayLen; literal len folds to CONST; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -3525,8 +3525,8 @@ fn main() {
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
         assert_eq!(
-            array_lens, 1,
-            "custom Length must not add structural ArrayLen beyond string thunk; ops={:?}",
+            array_lens, 2,
+            "custom Length uses CallIndirect; string/vec thunks keep ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -4769,8 +4769,10 @@ fn main() {
         );
         let make_array = bc
             .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
-            .expect("expected MakeArray for rest packing");
+            .find(|b| {
+                matches!(b.bytecode(), Instruction::MakeArray) && b.operand_u32() == 3
+            })
+            .expect("expected MakeArray(3) for rest packing");
         assert_eq!(
             make_array.operand_u32(),
             3,

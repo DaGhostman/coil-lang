@@ -6413,6 +6413,22 @@ impl Compiler {
         )
     }
 
+    /// `Length::len` instance FQN for a receiver type, if registered.
+    fn len_instance_method_fqn(&self, ty: &Ty) -> Option<String> {
+        let pruned = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty);
+        let head = match &pruned {
+            Ty::Con(name) => name.clone(),
+            Ty::Constructor { owner, .. } => match owner.as_ref() {
+                Ty::Con(name) => name.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.checker
+            .instance_method_fqn("Length", &[Ty::Con(head)], "len")
+            .map(str::to_string)
+    }
+
     /// Static length from a value's type (fixed arrays, tuples, records).
     fn static_len_of(&self, node: &Output) -> Option<usize> {
         use crate::typechecking::ty::{ArrayLength, strip_readonly};
@@ -8673,6 +8689,22 @@ impl Compiler {
                     .expect("BlockBuilder::finalize: defer after label bound");
             }
             Expression::Call { name, args } => {
+                // Fold `len(literal)` before trait dispatch so string/tuple
+                // lengths become CONST instead of Length thunk + ArrayLen.
+                if let Expression::Identifier(raw) = name.1.as_ref()
+                    && *raw == "len"
+                    && let Some(ConstValue::Int(n)) =
+                        crate::const_fold::eval_expr(ast, self.const_env())
+                {
+                    if let Some(items) = args.as_ref() {
+                        for arg in items {
+                            self.discard_compile(arg);
+                        }
+                    }
+                    self.emit_const_value(&ConstValue::Int(n), &mut bytecode);
+                    return bytecode;
+                }
+
                 if let Expression::Identifier(fname) = name.1.as_ref() {
                     if let Some(kind) = self.string_builtin_for_call(fname) {
                         let arg_slice = args.as_deref().unwrap_or(&[]);
@@ -9199,19 +9231,16 @@ impl Compiler {
                                         &ty,
                                     )
                                 });
-                                let structural = arg_ty.as_ref().is_some_and(|ty| {
-                                    Checker::is_structural_len_ty_for_codegen(ty)
-                                });
-                                if structural || arg_ty.is_none() {
+                                let structural = arg_ty
+                                    .as_ref()
+                                    .is_some_and(Checker::is_structural_len_ty_for_codegen);
+                                if structural {
                                     bytecode.append(&mut self.do_compile(&items[0]));
                                     bytecode.push(Byte::new(Instruction::ArrayLen));
                                     return bytecode;
                                 }
                                 if let Some(ty) = arg_ty.as_ref()
-                                    && let Some(fqn) = self
-                                        .checker
-                                        .instance_method_fqn("Length", std::slice::from_ref(ty), "len")
-                                        .map(str::to_string)
+                                    && let Some(fqn) = self.len_instance_method_fqn(ty)
                                     && let Some(&offset) = self.functions.get(&fqn)
                                 {
                                     bytecode.append(&mut self.do_compile(&items[0]));
@@ -9222,9 +9251,14 @@ impl Compiler {
                                     );
                                     return bytecode;
                                 }
-                                // Bound Length calls are handled earlier via
-                                // BoundMethodCall; if we get here without an
-                                // instance, fall through to report unknown fn.
+                                if structural {
+                                    bytecode.append(&mut self.do_compile(&items[0]));
+                                    bytecode.push(Byte::new(Instruction::ArrayLen));
+                                    return bytecode;
+                                }
+                                bytecode.append(&mut self.do_compile(&items[0]));
+                                bytecode.push(Byte::new(Instruction::ArrayLen));
+                                return bytecode;
                             } else {
                                 let mut message = Message::error(
                                     ErrorCode::TooManyArguments,
