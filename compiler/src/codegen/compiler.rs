@@ -4778,6 +4778,101 @@ impl Compiler {
         }
     }
 
+    /// Emit intrinsic bodies for builtin `Vec<T>` methods and register
+    /// them in the function / method tables so `v.push(x)` / `Vec::new()`
+    /// lower to direct `CALL`s.
+    fn emit_vec_method_thunks(&mut self) {
+        let owner = common::BUILTIN_VEC_TYPE;
+        let methods = self.context.methods.entry(owner.to_string()).or_default();
+        for name in [
+            "push",
+            "pop",
+            "insert",
+            "remove",
+            "clear",
+            "reserve",
+            "capacity",
+            "len",
+            "new",
+            "with_capacity",
+            "from",
+        ] {
+            methods.insert(name.to_string(), format!("{owner}::{name}"));
+        }
+
+        let emit_host = |compiler: &mut Self, fqn: String, native: &str, slots: &[u32]| {
+            if compiler.functions.contains_key(&fqn) {
+                return;
+            }
+            let Some(native_id) = compiler.native_id(native) else {
+                return;
+            };
+            compiler.bind_function_entry(fqn);
+            compiler
+                .bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+            for &slot in slots {
+                compiler.bytecode.push_load(slot);
+            }
+            compiler
+                .bytecode
+                .push_make_tuple(slots.len() as u32);
+            compiler
+                .bytecode
+                .push_host_invoke(slots.len() as u32);
+            compiler.bytecode.push_return();
+        };
+
+        // static fn new() -> Vec<T>
+        {
+            let fqn = format!("{owner}::new");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_make_array(0);
+                self.bytecode.push_return();
+            }
+        }
+
+        // static fn with_capacity(n) -> Vec<T>
+        emit_host(self, format!("{owner}::with_capacity"), "vec_with_capacity", &[0]);
+
+        // static fn from(arr) -> Vec<T>
+        emit_host(self, format!("{owner}::from"), "vec_from_array", &[0]);
+
+        // fn push(x)
+        {
+            let fqn = format!("{owner}::push");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode.push_load(1);
+                self.bytecode
+                    .push(Byte::new(Instruction::ArrayPush));
+                self.bytecode.push_pop();
+                self.bytecode.push_const(0);
+                self.bytecode.push_return();
+            }
+        }
+
+        // fn len() / capacity() / clear() / pop() / remove(i) / reserve(n) / insert(i, x)
+        {
+            let fqn = format!("{owner}::len");
+            if !self.functions.contains_key(&fqn) {
+                self.bind_function_entry(fqn);
+                self.bytecode.push_load(0);
+                self.bytecode
+                    .push(Byte::new(Instruction::ArrayLen));
+                self.bytecode.push_return();
+            }
+        }
+        emit_host(self, format!("{owner}::capacity"), "vec_capacity", &[0]);
+        emit_host(self, format!("{owner}::clear"), "vec_clear", &[0]);
+        emit_host(self, format!("{owner}::pop"), "vec_pop", &[0]);
+        emit_host(self, format!("{owner}::remove"), "vec_remove", &[0, 1]);
+        emit_host(self, format!("{owner}::reserve"), "vec_reserve", &[0, 1]);
+        emit_host(self, format!("{owner}::insert"), "vec_insert", &[0, 1, 2]);
+    }
+
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
     /// emission at generic call boundaries.
     fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
@@ -4799,6 +4894,11 @@ impl Compiler {
             Ty::Constructor { owner, .. } => Self::ty_to_value_tag(owner),
             Ty::Tuple(_) => Some(ValueTag::Tuple),
             Ty::Array { .. } => Some(ValueTag::Array),
+            Ty::App(head, _)
+                if matches!(head.as_ref(), Ty::Con(n) if n == common::BUILTIN_VEC_TYPE) =>
+            {
+                Some(ValueTag::Array)
+            }
             Ty::Record { .. } => Some(ValueTag::Record),
             // Open type vars — boxing is required but we don't know the tag yet
             Ty::Var(_) => None,
@@ -11429,6 +11529,7 @@ impl Compiler {
             self.par_spec_args.clear();
         }
         self.emit_builtin_dict_thunks();
+        self.emit_vec_method_thunks();
         // Builtin dictionary thunks are emitted immediately after the
         // prologue and before user code. Keep `program_start_offset`
         // pointing at the first user byte so `extern` prologue JMPs
