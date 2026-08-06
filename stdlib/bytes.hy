@@ -1,6 +1,21 @@
 // Byte-buffer helpers (userland). Indices are byte offsets; no UTF-8 awareness.
 use string::{to_bytes, from_bytes};
 
+/// True when `a[ao..ao+n)` equals `b[bo..bo+n)` (caller guarantees bounds).
+fn region_eq([byte] a, int ao, [byte] b, int bo, int n) -> bool {
+    let i = 0;
+    let ok = true;
+    while ok && i < n {
+        if a[ao + i] != b[bo + i] {
+            ok = false;
+        }
+        if ok {
+            i = i + 1;
+        }
+    }
+    return ok;
+}
+
 /// Copy `src[start..end)` into a new buffer (clamped to `src` bounds).
 fn slice([byte] src, int start, int end) -> [byte] {
     let out: [byte] = [];
@@ -38,42 +53,39 @@ fn eq([byte] a, [byte] b) -> bool {
     if len(a) != len(b) {
         return false;
     }
-    let i = 0;
-    while i < len(a) {
-        if a[i] != b[i] {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return region_eq(a, 0, b, 0, len(a));
 }
 
-/// First index of `needle` in `hay`, or `-1` if missing. Empty needle → `0`.
-fn find([byte] hay, [byte] needle) -> int {
+/// First index of `needle` in `hay` at or after `start`, or `-1`.
+/// Empty needle → `start` clamped into `[0, len(hay)]`.
+fn find_from([byte] hay, [byte] needle, int start) -> int {
     let hn = len(hay);
     let nn = len(needle);
+    let i = start;
+    if i < 0 {
+        i = 0;
+    }
+    if i > hn {
+        i = hn;
+    }
     if nn == 0 {
-        return 0;
+        return i;
     }
     if nn > hn {
         return -1;
     }
-    let i = 0;
     while i + nn <= hn {
-        let ok = true;
-        let j = 0;
-        while j < nn {
-            if hay[i + j] != needle[j] {
-                ok = false;
-            }
-            j = j + 1;
-        }
-        if ok {
+        if region_eq(hay, i, needle, 0, nn) {
             return i;
         }
         i = i + 1;
     }
     return -1;
+}
+
+/// First index of `needle` in `hay`, or `-1` if missing. Empty needle → `0`.
+fn find([byte] hay, [byte] needle) -> int {
+    return find_from(hay, needle, 0);
 }
 
 /// Last index of `needle` in `hay`, or `-1` if missing. Empty needle → `len(hay)`.
@@ -88,15 +100,7 @@ fn rfind([byte] hay, [byte] needle) -> int {
     }
     let i = hn - nn;
     while i >= 0 {
-        let ok = true;
-        let j = 0;
-        while j < nn {
-            if hay[i + j] != needle[j] {
-                ok = false;
-            }
-            j = j + 1;
-        }
-        if ok {
+        if region_eq(hay, i, needle, 0, nn) {
             return i;
         }
         i = i - 1;
@@ -115,7 +119,7 @@ fn starts_with([byte] buf, [byte] prefix) -> bool {
     if n > len(buf) {
         return false;
     }
-    return eq(slice(buf, 0, n), prefix);
+    return region_eq(buf, 0, prefix, 0, n);
 }
 
 /// True when `buf` ends with `suffix`.
@@ -125,7 +129,7 @@ fn ends_with([byte] buf, [byte] suffix) -> bool {
     if n > m {
         return false;
     }
-    return eq(slice(buf, m - n, m), suffix);
+    return region_eq(buf, m - n, suffix, 0, n);
 }
 
 /// Copy every byte of `src` into a new buffer.
@@ -147,14 +151,11 @@ fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
     }
     let out: [byte] = [];
     let i = 0;
+    let on = len(old);
     while i < len(hay) {
-        let matches = i + len(old) <= len(hay);
-        let j = 0;
-        while matches && j < len(old) {
-            if hay[i + j] != old[j] {
-                matches = false;
-            }
-            j = j + 1;
+        let matches = i + on <= len(hay);
+        if matches {
+            matches = region_eq(hay, i, old, 0, on);
         }
         if matches {
             let k = 0;
@@ -162,7 +163,7 @@ fn replace([byte] hay, [byte] old, [byte] new) -> [byte] {
                 out[] = new[k];
                 k = k + 1;
             }
-            i = i + len(old);
+            i = i + on;
         } else {
             out[] = hay[i];
             i = i + 1;

@@ -11,7 +11,7 @@ virtual modules alike. Prelude is auto-injected.
 |--------|--------|------|
 | `ascii` | `use ascii::{is_digit, …};` | ASCII classify / decimal digit helpers |
 | `conv` | `use conv::{parse_int, …};` | `int_to_dec` / `parse_int` / `parse_float` |
-| `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / replace / pad / eq |
+| `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / find_from / replace / pad / eq |
 | `text` | `use text::{trim, split, …};` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::{sort, …};` | Stable mergesort / `reverse` / `collect_ints` (range → array) |
 | `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
