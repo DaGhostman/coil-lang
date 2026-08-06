@@ -10057,6 +10057,8 @@ impl Compiler {
                     // Value left on stack for expression result; ExprStatement POPs.
                 }
                 Expression::Index(arr, None) => {
+                    // Unreachable when typecheck rejects `arr[] =`; kept for
+                    // AST completeness. Prefer `vec.push(value)` for `Vec`.
                     bytecode.append(&mut self.do_compile(arr));
                     self.append_binding_rhs(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::ArrayPush));

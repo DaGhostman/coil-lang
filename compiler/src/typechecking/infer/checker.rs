@@ -17,7 +17,8 @@ use crate::typechecking::ty::{
     EnumVariantPayloadTy, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
     list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
     result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
-    strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty,
+    strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty, vec_app_ty,
+    vec_element_ty,
 };
 use crate::typechecking::unify::{UnifyError, unify_with};
 use crate::typechecking::virtual_modules::{
@@ -136,6 +137,7 @@ impl Checker {
             open_assoc_projections: HashMap::new(),
         };
         checker.register_builtin_enums();
+        checker.register_builtin_vec();
         checker
     }
 
@@ -147,6 +149,130 @@ impl Checker {
         // Registering its variants (esp. `Other`) globally would collide
         // with user enums that use the same constructor names. Tags are
         // installed on first `use io::…` that binds `IoError` or an IO fn.
+    }
+
+    /// Synthetic `Vec<T>` class + inherent methods (host natives / method sugar).
+    ///
+    /// Idempotent: safe to call from [`Self::new`] and again from
+    /// [`Self::check_program`] after `fn_param_names` is cleared.
+    fn register_builtin_vec(&mut self) {
+        use common::BUILTIN_VEC_TYPE;
+
+        // Drop prior overload candidates so re-entry does not duplicate.
+        self.overload_sets.retain(|k, _| !k.starts_with("Vec::"));
+
+        self.classes
+            .insert(BUILTIN_VEC_TYPE.to_string(), Vec::new());
+        if self.env.lookup(BUILTIN_VEC_TYPE).is_none() {
+            self.env.insert_top(
+                BUILTIN_VEC_TYPE.to_string(),
+                Scheme::mono(Ty::Con(BUILTIN_VEC_TYPE.into())),
+            );
+        }
+
+        let fun = |params: &[Ty], ret: Ty| {
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
+        };
+
+        let unit = unit_ty();
+        let dummy = 0..0;
+
+        // Instance methods: scheme includes `self` as the first Fun param.
+        // `fixed_arity` / `fn_param_names` count user args only (not self).
+        let instance: &[(&str, usize, &[&str])] = &[
+            ("push", 1, &["x"]),
+            ("pop", 0, &[]),
+            ("insert", 2, &["i", "x"]),
+            ("remove", 1, &["i"]),
+            ("clear", 0, &[]),
+            ("reserve", 1, &["n"]),
+            ("capacity", 0, &[]),
+            ("len", 0, &[]),
+        ];
+
+        for &(name, arity, params) in instance {
+            let t = self.counter.fresh();
+            let vec_t = vec_app_ty(Ty::Var(t));
+            let opt_t = option_app_ty(Ty::Var(t));
+            let ty = match name {
+                "push" => fun(&[vec_t, Ty::Var(t)], unit.clone()),
+                "pop" => fun(&[vec_t], opt_t),
+                "insert" => fun(&[vec_t, int(), Ty::Var(t)], unit.clone()),
+                "remove" => fun(&[vec_t, int()], opt_t),
+                "clear" => fun(&[vec_t], unit.clone()),
+                "reserve" => fun(&[vec_t, int()], unit.clone()),
+                "capacity" | "len" => fun(&[vec_t], int()),
+                _ => unreachable!("unknown Vec instance method"),
+            };
+            let fqn = format!("{}::{}", BUILTIN_VEC_TYPE, name);
+            let scheme = Scheme::poly(vec![t], vec![], ty);
+            self.fn_param_names.insert(
+                fqn.clone(),
+                params.iter().map(|s| (*s).to_string()).collect(),
+            );
+            self.register_overload_candidate(
+                &fqn,
+                OverloadCandidate {
+                    id: 0,
+                    fixed_arity: arity,
+                    is_rest: false,
+                    scheme: scheme.clone(),
+                    param_names: params.iter().map(|s| (*s).to_string()).collect(),
+                },
+                &dummy,
+            );
+            self.methods
+                .entry(BUILTIN_VEC_TYPE.to_string())
+                .or_default()
+                .insert(name.to_string(), (Visibility::Public, scheme));
+        }
+
+        // Static methods.
+        let statics: &[(&str, usize, &[&str])] = &[
+            ("new", 0, &[]),
+            ("with_capacity", 1, &["n"]),
+            ("from", 1, &["arr"]),
+        ];
+
+        for &(name, arity, params) in statics {
+            let t = self.counter.fresh();
+            let vec_t = vec_app_ty(Ty::Var(t));
+            let ty = match name {
+                // Nullary sealed: call site `Vec::new()` applies unit.
+                "new" => fun(&[unit.clone()], vec_t),
+                "with_capacity" => fun(&[int()], vec_t),
+                "from" => fun(&[array(Ty::Var(t))], vec_t),
+                _ => unreachable!("unknown Vec static method"),
+            };
+            let fqn = format!("{}::{}", BUILTIN_VEC_TYPE, name);
+            let scheme = Scheme::poly(vec![t], vec![], ty);
+            self.fn_param_names.insert(
+                fqn.clone(),
+                params.iter().map(|s| (*s).to_string()).collect(),
+            );
+            self.register_overload_candidate(
+                &fqn,
+                OverloadCandidate {
+                    id: 0,
+                    fixed_arity: arity,
+                    is_rest: false,
+                    scheme: scheme.clone(),
+                    param_names: params.iter().map(|s| (*s).to_string()).collect(),
+                },
+                &dummy,
+            );
+            self.static_methods
+                .entry(BUILTIN_VEC_TYPE.to_string())
+                .or_default()
+                .insert(name.to_string());
+            self.methods
+                .entry(BUILTIN_VEC_TYPE.to_string())
+                .or_default()
+                .insert(name.to_string(), (Visibility::Public, scheme));
+        }
     }
 
     /// Reset scope bindings and inject the auto-prelude.
@@ -1338,6 +1464,8 @@ impl Checker {
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
+        // `fn_param_names` was cleared above — reinstall Vec method ABI.
+        self.register_builtin_vec();
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
         self.inject_prelude_scope();
@@ -3670,7 +3798,7 @@ impl Checker {
                             "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
                             range,
                             Some(
-                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]`"
+                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]` / `Vec<byte>`"
                                     .to_string(),
                             ),
                         );
@@ -3835,10 +3963,10 @@ impl Checker {
             Expression::Array(items) => {
                 let expected_elem = self.current_expected.clone().and_then(|exp| {
                     let exp = apply_ty_prune(&self.subst, &exp);
-                    match exp {
-                        Ty::Array { element, .. } => Some(*element),
-                        _ => None,
+                    if let Ty::Array { element, .. } = &exp {
+                        return Some(element.as_ref().clone());
                     }
+                    vec_element_ty(&exp).cloned()
                 });
                 let mut elem_ty: Option<Ty> = None;
                 for item in items {
@@ -3888,11 +4016,56 @@ impl Checker {
                 }
                 let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                 let len = items.len();
-                if len > 0 {
-                    array_fixed(element, len)
-                } else {
-                    array(element)
+                if len == 0 {
+                    if let Some(exp) = self.current_expected.clone() {
+                        let exp = apply_ty_prune(&self.subst, &exp);
+                        if let Some(vec_elem) = vec_element_ty(&exp) {
+                            let _ = unify_with(&self.subst, vec_elem, &element);
+                            return apply_ty_prune(&self.subst, &exp);
+                        }
+                        if let Ty::Array {
+                            element: arr_elem,
+                            length,
+                        } = &exp
+                        {
+                            match length {
+                                ArrayLength::Static(0) => {
+                                    let _ = unify_with(&self.subst, arr_elem.as_ref(), &element);
+                                    return array_fixed(
+                                        apply_ty_prune(&self.subst, arr_elem.as_ref()),
+                                        0,
+                                    );
+                                }
+                                ArrayLength::Static(n) => {
+                                    return self.error_with_help(
+                                        ErrorCode::TypeMismatch,
+                                        format!(
+                                            "empty array literal `[]` cannot satisfy `[_; {}]`",
+                                            n
+                                        ),
+                                        range,
+                                        Some(format!(
+                                            "expected {} element{}, or annotate as `Vec<T>` / `[T; 0]`",
+                                            n,
+                                            if *n == 1 { "" } else { "s" }
+                                        )),
+                                    );
+                                }
+                                ArrayLength::Dynamic => {}
+                            }
+                        }
+                    }
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "empty array literal `[]` requires a type annotation".to_string(),
+                        range,
+                        Some(
+                            "annotate as `Vec<T>` (growable) or `[T; 0]` (fixed empty array)"
+                                .to_string(),
+                        ),
+                    );
                 }
+                array_fixed(element, len)
             }
             // Index: static-length OOB check for literal indices
             Expression::Index(target, index_expr) => {
@@ -3901,9 +4074,9 @@ impl Checker {
                 let Some(index_expr) = index_expr else {
                     return self.error_with_help(
                         ErrorCode::CannotIndex,
-                        "empty index `arr[]` is only valid as an assignment target".to_string(),
+                        "empty index `arr[]` is not valid".to_string(),
                         range,
-                        Some("use `arr[] = value` to append to a dynamic array".to_string()),
+                        Some("use `vec.push(value)` to append to a `Vec`".to_string()),
                     );
                 };
                 let index_ty = self.infer(index_expr);
@@ -3944,6 +4117,9 @@ impl Checker {
                             }
                         }
                         (**element).clone()
+                    }
+                    other if vec_element_ty(other).is_some() => {
+                        vec_element_ty(other).expect("checked").clone()
                     }
                     Ty::Tuple(tys) => {
                         // Tuple indexing: same diagnostic on constant
@@ -6552,9 +6728,9 @@ impl Checker {
                 let Some(idx) = idx else {
                     return self.error_with_help(
                         ErrorCode::InvalidAssignment,
-                        "empty index `arr[]` is only valid as an assignment target".to_string(),
+                        "empty index `arr[]` is not a valid assignment target".to_string(),
                         range,
-                        Some("use `arr[] = value` to append to a dynamic array".to_string()),
+                        Some("use `vec.push(value)` to append to a `Vec`".to_string()),
                     );
                 };
                 self.check_readonly_external_mutation(&target_ty, range.clone());
@@ -6579,6 +6755,9 @@ impl Checker {
                         }
                         (**element).clone()
                     }
+                    other if vec_element_ty(other).is_some() => {
+                        vec_element_ty(other).expect("checked").clone()
+                    }
                     Ty::Tuple(_) => self.error_with_help(
                         ErrorCode::InvalidAssignment,
                         "Invalid assignment target".to_string(),
@@ -6589,7 +6768,10 @@ impl Checker {
                         ErrorCode::InvalidAssignment,
                         "Invalid assignment target".to_string(),
                         range,
-                        Some("only array elements may be indexed for assignment".to_string()),
+                        Some(
+                            "only array or `Vec` elements may be indexed for assignment"
+                                .to_string(),
+                        ),
                     ),
                 }
             }
@@ -7998,11 +8180,18 @@ impl Checker {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::INT)
     }
 
-    /// `[byte]` or `[byte; N]` — returns the length constraint when so.
-    fn is_byte_array_ty(ty: &Ty) -> Option<&ArrayLength> {
+    /// `[byte]`, `[byte; N]`, or `Vec<byte>` — returns the length constraint when so.
+    /// `Vec<byte>` is treated as dynamic length.
+    fn is_byte_array_ty(ty: &Ty) -> Option<ArrayLength> {
         match ty {
-            Ty::Array { element, length } if Self::is_byte_ty(element) => Some(length),
-            _ => None,
+            Ty::Array { element, length } if Self::is_byte_ty(element) => Some(*length),
+            _ => {
+                if vec_element_ty(ty).is_some_and(|e| Self::is_byte_ty(e)) {
+                    Some(ArrayLength::Dynamic)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -8036,7 +8225,7 @@ impl Checker {
             return string();
         };
         match length {
-            ArrayLength::Static(n) if *n != bytes.len() => self.error_with_help(
+            ArrayLength::Static(n) if n != bytes.len() => self.error_with_help(
                 ErrorCode::TypeMismatch,
                 format!(
                     "string literal has {} byte{}, but expected `[byte; {}]`",
@@ -8049,8 +8238,8 @@ impl Checker {
             ),
             ArrayLength::Static(_) => expected.clone(),
             ArrayLength::Dynamic => {
-                // Prefer a fixed length for the literal; assignment to `[byte]`
-                // accepts `[byte; N]` via array length flexibility.
+                // Prefer a fixed length for the literal; assignment to `[byte]` /
+                // `Vec<byte>` accepts `[byte; N]` via array length flexibility.
                 crate::typechecking::ty::array_fixed(crate::typechecking::ty::byte(), bytes.len())
             }
         }
@@ -8084,7 +8273,7 @@ impl Checker {
         };
         let bytes = crate::codegen::string_literal_as_bytes(s);
         match length {
-            ArrayLength::Static(n) if *n != bytes.len() => return false,
+            ArrayLength::Static(n) if n != bytes.len() => return false,
             _ => {}
         }
         let ty = match length {
@@ -9440,12 +9629,14 @@ impl Checker {
                         *n as usize,
                     );
                 }
-                // Dynamic `[T]` — single element-type annotation.
-                if let Some(first) = items.first() {
-                    let elem_ty = self.parse_type_name(first);
-                    return crate::typechecking::ty::array(elem_ty);
-                }
-                crate::typechecking::ty::array(self.parse_type_name_str("int"))
+                // Dynamic `[T]` annotations are rejected — use `[T; N]` or `Vec<T>`.
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    "dynamic array type `[T]` is not allowed".to_string(),
+                    ann.0.into_range(),
+                    Some("use a fixed-length `[T; N]` or growable `Vec<T>`".to_string()),
+                );
+                Ty::Var(self.counter.fresh())
             }
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
@@ -11345,7 +11536,7 @@ impl Checker {
                             out.push((name.to_string(), pack));
                         } else {
                             let elem = self.parse_type_name(ty.as_ref().expect("typed rest"));
-                            out.push((name.to_string(), array(elem)));
+                            out.push((name.to_string(), vec_app_ty(elem)));
                         }
                     } else {
                         out.push((
@@ -11951,11 +12142,7 @@ impl Checker {
                     }
                 }
                 let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                let rest_ty = if rest_elems.is_empty() {
-                    array(element)
-                } else {
-                    array_fixed(element, rest_elems.len())
-                };
+                let rest_ty = vec_app_ty(element);
                 tys.push(rest_ty);
             }
             // Stand-in for apply_function's expression hooks (array packing
@@ -14590,7 +14777,7 @@ impl Checker {
                 range,
             );
             msg.with_help(
-                "mutations through fields, indices, or `arr[] =` will still succeed".to_string(),
+                "mutations through fields, indices, or `vec.push` will still succeed".to_string(),
             );
             self.messages.push(msg);
         }
@@ -14614,51 +14801,14 @@ impl Checker {
         value: &Output,
         range: Range<usize>,
     ) -> Ty {
-        let array_ty = self.infer(arr);
-        let value_ty = self.infer(value);
-        let resolved = apply_ty_prune(&self.subst, &array_ty);
-        self.check_readonly_external_mutation(&resolved, range.clone());
-        match resolved {
-            Ty::Array { element, .. } => {
-                self.coerce_or_unify(
-                    element.as_ref(),
-                    &value_ty,
-                    Some(value),
-                    &value.0.into_range(),
-                    "array append",
-                );
-                let elem = apply_ty_prune(&self.subst, element.as_ref());
-                let dynamic = array(elem);
-                if let Expression::Identifier(name) = arr.1.as_ref() {
-                    self.env
-                        .insert_top(name.to_string(), Scheme::mono(dynamic.clone()));
-                    self.record_codegen_var_type(name.to_string(), dynamic.clone());
-                }
-                dynamic
-            }
-            Ty::Var(v) => {
-                let elem = Ty::Var(self.counter.fresh());
-                let dynamic = array(elem.clone());
-                self.unify(&Ty::Var(v), &dynamic, &arr.0.into_range(), "append array");
-                self.unify(&elem, &value_ty, &value.0.into_range(), "append element");
-                let dynamic = apply_ty_prune(&self.subst, &dynamic);
-                if let Expression::Identifier(name) = arr.1.as_ref() {
-                    self.env
-                        .insert_top(name.to_string(), Scheme::mono(dynamic.clone()));
-                    self.record_codegen_var_type(name.to_string(), dynamic.clone());
-                }
-                dynamic
-            }
-            other => self.error_with_help(
-                ErrorCode::InvalidAssignment,
-                "append assignment requires an array".to_string(),
-                range,
-                Some(format!(
-                    "found `{}`; use `arr[] = value` on a `[T]` binding",
-                    other
-                )),
-            ),
-        }
+        let _ = self.infer(arr);
+        let _ = self.infer(value);
+        self.error_with_help(
+            ErrorCode::InvalidAssignment,
+            "append assignment `arr[] = value` is no longer supported".to_string(),
+            range,
+            Some("use `vec.push(value)` on a `Vec<T>` instead".to_string()),
+        )
     }
 
     /// For-in lowering info recorded during typecheck (by Loop node id).
@@ -14796,6 +14946,9 @@ impl Checker {
     fn builtin_for_in_kind(&mut self, te: &Ty, range: &Range<usize>) -> Option<(Ty, ForInKind)> {
         match te {
             Ty::Array { element, .. } => Some((element.as_ref().clone(), ForInKind::Array)),
+            other if vec_element_ty(other).is_some() => {
+                Some((vec_element_ty(other)?.clone(), ForInKind::Array))
+            }
             Ty::Tuple(elems) => {
                 if elems.is_empty() {
                     let _ = self.error_with_help(
