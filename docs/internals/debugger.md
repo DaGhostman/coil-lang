@@ -10,6 +10,9 @@ the VM through a stop engine gated behind an attached `DebugController`
 cargo build   # coil + coil-debug (+ coil-dissect / coil-embed)
 coil debug examples/fib.hy
 coil debug examples/fib.hy -x cmds.txt --batch
+# DAP mode for IDE integration (program path from launch request):
+coil debug --dap
+coil-debug --dap
 # or invoke the helper directly:
 coil-debug examples/fib.hy -x cmds.txt --batch
 ```
@@ -19,6 +22,48 @@ coil-debug examples/fib.hy -x cmds.txt --batch
 | (none) | Interactive `(coil) ` REPL on stdin |
 | `-x <script>` | Run commands from a file (`#` comments; one command per line) |
 | `--batch` | Non-interactive; exit after script (or stdin if no `-x`); non-zero on panic / script error |
+| `--dap` | Debug Adapter Protocol over **stdio** (see below); no positional `.hy` |
+
+## IDE debugging (DAP)
+
+`coil-debug --dap` speaks the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
+over stdin/stdout (Content-Length framing). Cursor / VS Code can attach via the
+in-repo extension in [`editors/vscode/`](../../editors/vscode/).
+
+**Launch args** (DAP `launch` request):
+
+| Field | Meaning |
+|-------|---------|
+| `program` | Absolute or workspace-relative path to entry `.hy` |
+| `cwd` | Optional working directory for resolving paths |
+| `stopOnEntry` | Optional; stop before executing `main` |
+
+**Supported (v1):** breakpoints (line + function), continue, step in/over/out,
+stack trace, locals. **Not supported:** attach, evaluate, conditional breakpoints,
+multi-thread.
+
+Line breakpoints follow the same `debug_locs` coverage limits as the REPL (see
+[debug-info.md](debug-info.md)); unmapped lines return `verified: false`. Function
+breakpoints (`setFunctionBreakpoints`) are more reliable when line info is sparse.
+
+Sample `.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "coil",
+      "request": "launch",
+      "name": "Coil: Launch current file",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
+```
+
+Build the extension: `cd editors/vscode && npm install && npm run compile`.
 
 ## Commands
 
