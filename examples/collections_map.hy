@@ -5,12 +5,12 @@
 use io::{stdout};
 use io::sync::{write_all};
 use string::{format, to_bytes};
-use collections::map::{hashmap_new, hashmap_insert, hashmap_get_or};
+use collections::map::{HashMap};
 
 fn main() {
-    let m = hashmap_new();
-    hashmap_insert(m, 1, "a");
-    hashmap_insert(m, 2, "b");
-    hashmap_insert(m, 1, "A");
-    write_all(stdout(), to_bytes(format("%s,%i", hashmap_get_or(m, 1, "?"), m.size())));
+    let m = HashMap::new();
+    m.insert(1, "a");
+    m.insert(2, "b");
+    m.insert(1, "A");
+    write_all(stdout(), to_bytes(format("%s,%i", m.get_or(1, "?"), m.size())));
 }
