@@ -1081,6 +1081,59 @@ fn main() {
     assert_eq!(output, "Ada36Grace40");
 }
 
+#[test]
+fn builtin_len_named_arg_prints_3() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    write(stdout(), to_bytes(format("%i", len(value: [1, 2, 3]))));
+}
+"#,
+    );
+    assert_eq!(output, "3");
+}
+
+#[test]
+fn format_operand_string_concat_prints() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let n = 7;
+    write(stdout(), to_bytes("n=" + format("%i", n)));
+    write(stdout(), to_bytes(format("%i", n) + "!"));
+}
+"#,
+    );
+    assert_eq!(output, "n=77!");
+}
+
+#[test]
+fn pure_arg_reorder_preserves_identifier_args() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn effect() -> int {
+    write(stdout(), to_bytes(format("%i,", 7)));
+    return 2;
+}
+fn sink(int a, int b) -> int {
+    write(stdout(), to_bytes(format("%i,", a + b)));
+    return a + b;
+}
+fn main() {
+    let cached = 10;
+    write(stdout(), to_bytes(format("%i", sink(effect(), cached))));
+}
+"#,
+    );
+    assert_eq!(output, "7,12,12");
+}
+
 /// Rest packing with a named fixed prefix + trailing positionals (P4 + P2).
 #[test]
 fn rest_after_named_fixed_prefix_packs_trailing() {
@@ -3292,6 +3345,7 @@ fn attr_on_async_fn_rejected_at_compile_time() {
 use io::{stdout, write};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    yield 99;
     return target(...args);
 }
 #[log(message = "coro")]
@@ -3306,7 +3360,7 @@ fn main() {
     );
     assert!(
         result.is_err(),
-        "decorating async fn with user attrs is not supported yet"
+        "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }
 
