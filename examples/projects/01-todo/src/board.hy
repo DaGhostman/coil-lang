@@ -10,20 +10,20 @@ class Task {
     status: int,
 }
 
-fn empty_board() -> [Task] {
+fn empty_board() -> Vec<Task> {
     let seed = new Task(0, "", 0);
-    let board = [seed];
+    let board = Vec::from([seed]);
     return board;
 }
 
-fn add_task([Task] board, string title) {
+fn add_task(Vec<Task> board, string title) {
     let id = len(board);
     let t = new Task(id, title, 0);
-    board[] = t;
+    board.push(t);
     return board;
 }
 
-fn advance_task([Task] board, int id) -> Task {
+fn advance_task(Vec<Task> board, int id) -> Task {
     let n = len(board) - 1;
     if id < 1 {
         panic "bad id";
@@ -42,7 +42,7 @@ fn advance_task([Task] board, int id) -> Task {
     return t;
 }
 
-fn count_done([Task] board) -> int {
+fn count_done(Vec<Task> board) -> int {
     let n = 0;
     let i = 1;
     while i < len(board) {
@@ -55,7 +55,7 @@ fn count_done([Task] board) -> int {
     return n;
 }
 
-fn board_len([Task] board) -> int {
+fn board_len(Vec<Task> board) -> int {
     return len(board) - 1;
 }
 

@@ -50,22 +50,24 @@ fn run_echo() {
     let frame = encode_frame(body);
     write_all(client, frame)?;
 
-    let s0: [byte] = [0];
-    let s1: [byte] = [0];
-    let s2: [byte] = [0];
+    let z: byte = 0;
+    let s0 = Vec::from([z]);
+    let s1 = Vec::from([z]);
+    let s2 = Vec::from([z]);
     read_exact(server, s0)?;
     read_exact(server, s1)?;
     read_exact(server, s2)?;
 
-    let inbound: [byte] = [s0[0]];
-    inbound[] = s1[0];
-    inbound[] = s2[0];
+    let inbound: Vec<byte> = Vec::new();
+    inbound.push(s0[0]);
+    inbound.push(s1[0]);
+    inbound.push(s2[0]);
     let reply = echo_reply(inbound);
     write_all(server, reply)?;
 
-    let c0: [byte] = [0];
-    let c1: [byte] = [0];
-    let c2: [byte] = [0];
+    let c0 = Vec::from([z]);
+    let c1 = Vec::from([z]);
+    let c2 = Vec::from([z]);
     read_exact(client, c0)?;
     read_exact(client, c1)?;
     read_exact(client, c2)?;
@@ -74,9 +76,10 @@ fn run_echo() {
     close(server)?;
     close(listener)?;
 
-    let back: [byte] = [c0[0]];
-    back[] = c1[0];
-    back[] = c2[0];
+    let back: Vec<byte> = Vec::new();
+    back.push(c0[0]);
+    back.push(c1[0]);
+    back.push(c2[0]);
     if payload_eq(back, body) == 1 {
         return "ok";
     }
