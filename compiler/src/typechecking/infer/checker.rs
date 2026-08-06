@@ -9706,6 +9706,14 @@ impl Checker {
     }
 
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
+        self.parse_type_name_inner(ann, false)
+    }
+
+    fn parse_return_type_name(&mut self, ann: &Output) -> Ty {
+        self.parse_type_name_inner(ann, true)
+    }
+
+    fn parse_type_name_inner(&mut self, ann: &Output, allow_dynamic_slice: bool) -> Ty {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => {
                 let range = ann.0.into_range();
@@ -9754,13 +9762,19 @@ impl Checker {
                         *n as usize,
                     );
                 }
-                // Dynamic `[T]` annotations are rejected — use `[T; N]` or `Vec<T>`.
-                let _ = self.error_with_help(
-                    ErrorCode::GenericTypeError,
-                    "dynamic array type `[T]` is not allowed".to_string(),
-                    ann.0.into_range(),
-                    Some("use a fixed-length `[T; N]` or growable `Vec<T>`".to_string()),
-                );
+                if items.len() == 1 {
+                    let elem_ty = self.parse_type_name_inner(&items[0], allow_dynamic_slice);
+                    if matches!(&elem_ty, Ty::Con(name) if name == "byte") || allow_dynamic_slice {
+                        return crate::typechecking::ty::array(elem_ty);
+                    }
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "dynamic array type `[T]` is not allowed".to_string(),
+                        ann.0.into_range(),
+                        Some("use a fixed-length `[T; N]` or growable `Vec<T>`".to_string()),
+                    );
+                    return Ty::Var(self.counter.fresh());
+                }
                 Ty::Var(self.counter.fresh())
             }
             Expression::Tuple(items) => {
@@ -11050,7 +11064,7 @@ impl Checker {
             // Honor `async fn -> T`: unify declared T with the yield/
             // return slot so annotation mismatches are diagnosed.
             if let Some(r) = returns {
-                let declared = self.parse_type_name(r);
+                let declared = self.parse_return_type_name(r);
                 self.unify(
                     &yield_ty,
                     &declared,
@@ -11063,7 +11077,7 @@ impl Checker {
         } else {
             (
                 match returns {
-                    Some(r) => self.parse_type_name(r),
+                    Some(r) => self.parse_return_type_name(r),
                     None => Ty::Var(self.counter.fresh()),
                 },
                 None,
@@ -11711,13 +11725,14 @@ impl Checker {
                                 .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                             out.push((name.to_string(), pack));
                         } else {
-                            let elem = self.parse_type_name(ty.as_ref().expect("typed rest"));
+                            let elem =
+                                self.parse_return_type_name(ty.as_ref().expect("typed rest"));
                             out.push((name.to_string(), vec_app_ty(elem)));
                         }
                     } else {
                         out.push((
                             name.to_string(),
-                            self.parse_type_name(ty.as_ref().expect("fixed param type")),
+                            self.parse_return_type_name(ty.as_ref().expect("fixed param type")),
                         ));
                     }
                 }
@@ -14202,6 +14217,15 @@ impl Checker {
                 Ty::Sum { variants, .. } => Some(variants.clone()),
                 other => self.poly_variants_from_app(other),
             },
+            Ty::Con(name) if self.enums.contains_key(name.as_str()) => {
+                let variant_names = self.enums.get(name.as_str()).cloned().unwrap_or_default();
+                let payloads = self
+                    .enum_payloads
+                    .get(name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                Some(variant_names.into_iter().zip(payloads).collect())
+            }
             other => self.poly_variants_from_app(other),
         };
 
