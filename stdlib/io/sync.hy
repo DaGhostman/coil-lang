@@ -12,6 +12,7 @@ use io::net::tcp::accept;
 use io::net::udp::recv_from;
 use string::{to_bytes as str_to_bytes};
 
+/// Write every byte of `buf` to `s`, parking on `WouldBlock` until done.
 fn write_all(Stream s, Vec<byte> buf) -> Result<int, IoError> {
     let offset = 0;
     let total = len(buf);
@@ -36,6 +37,7 @@ fn write_all(Stream s, Vec<byte> buf) -> Result<int, IoError> {
     return 0;
 }
 
+/// Fill `buf` from `s`; returns bytes read or `None` on EOF before fill.
 fn read_exact(Stream s, Vec<byte> buf) -> Result<Option<int>, IoError> {
     let need = len(buf);
     let filled = 0;
@@ -73,6 +75,7 @@ fn read_exact(Stream s, Vec<byte> buf) -> Result<Option<int>, IoError> {
     return Option::Some(filled);
 }
 
+/// Read from `s` until EOF into a new `Vec<byte>`.
 fn read_to_end(Stream s) -> Result<Vec<byte>, IoError> {
     let acc: Vec<byte> = Vec::new();
     let chunk_size = 4096;
@@ -105,6 +108,7 @@ fn read_to_end(Stream s) -> Result<Vec<byte>, IoError> {
     return acc;
 }
 
+/// Blocking `accept` on `listener`, parking on `WouldBlock`.
 fn accept_wait(Stream listener) -> Result<Stream, IoError> {
     let done = false;
     let out = listener;
@@ -125,6 +129,7 @@ fn accept_wait(Stream listener) -> Result<Stream, IoError> {
     return out;
 }
 
+/// Blocking UDP `recv_from`, parking on `WouldBlock`; returns `(n, host, port)`.
 fn recv_from_wait(Stream s, Vec<byte> buf) -> Result<(int, string, int), IoError> {
     let done = false;
     let out_n = 0;

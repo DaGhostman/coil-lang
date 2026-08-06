@@ -87,6 +87,7 @@ fn request_send(Vec<byte> head, Url u, Vec<byte> body) -> Result<Response, HttpE
     return parse_response(raw)?;
 }
 
+/// Send arbitrary HTTP/1.1 request with custom method, headers, and body.
 fn request(string method, string url, Headers headers, Vec<byte> body) -> Result<Response, HttpError> {
     let u = parse_url(url)?;
     let bl = len(body);
@@ -112,21 +113,25 @@ fn request(string method, string url, Headers headers, Vec<byte> body) -> Result
     return request_send(head, u, body)?;
 }
 
+/// HTTP GET `url`; returns parsed `Response` or `HttpError`.
 fn get(string url) -> Result<Response, HttpError> {
     let hs = empty_headers();
     let body: Vec<byte> = Vec::new();
     return request("GET", url, hs, body)?;
 }
 
+/// HTTP POST `url` with `body`; returns `Response` or `HttpError`.
 fn post(string url, Vec<byte> body) -> Result<Response, HttpError> {
     let hs = empty_headers();
     return request("POST", url, hs, body)?;
 }
 
+/// HTTP status code from `Response`.
 fn status_code(Response r) -> Result<int, HttpError> {
     return response_status(r)?;
 }
 
+/// Byte length of response body.
 fn body_len(Response r) -> Result<int, HttpError> {
     return response_body_len(r)?;
 }

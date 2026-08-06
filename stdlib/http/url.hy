@@ -2,6 +2,7 @@
 use io::{Stream, from_bytes, to_bytes};
 use conv::{int_to_dec};
 
+/// URL parse, response parse, scheme, or I/O failure.
 enum HttpError {
     BadUrl,
     BadResponse,
@@ -9,6 +10,7 @@ enum HttpError {
     Io,
 }
 
+/// Parsed `http`/`https` URL (scheme, host, port, path).
 class Url {
     scheme: string,
     host: string,
@@ -16,6 +18,7 @@ class Url {
     path: string,
 }
 
+/// Parallel name/value header pairs for requests.
 class Headers {
     names: Vec<string>,
     values: Vec<string>,
@@ -288,6 +291,7 @@ fn http_fail_unit() -> Result<(), HttpError> {
     raise HttpError::Io;
 }
 
+/// Parse `http://` or `https://` URL string.
 fn parse_url(string s) -> Result<Url, HttpError> {
     let b = to_bytes(s);
     let sep = to_bytes("://");
@@ -609,6 +613,7 @@ fn format_extra_headers(Headers headers) -> Vec<byte> {
     return to_bytes(s);
 }
 
+/// Serialize HTTP/1.1 request line + Host + Content-Length + Connection: close.
 fn build_request_head(string method, Url u, Headers headers, int body_len) -> Result<Vec<byte>, HttpError> {
     // Inline Host construction (avoid nested Result `?` through host_header_value).
     // No raise/`?` here — poisons Ok-path string concat. Callers use has_crlf / parse_url.
@@ -673,6 +678,7 @@ fn req_empty_headers() -> Headers {
 // --- response parse (kept in url for single-import client graph) ---
 // Response parse for HTTP/1.1 (byte-scan).
 
+/// Parsed HTTP response (status, headers, body).
 class Response {
     status: int,
     header_names: Vec<string>,
@@ -857,6 +863,7 @@ fn content_length_from(Vec<string> names, Vec<string> values) -> Result<int, Htt
     return 999999;
 }
 
+/// Parse raw HTTP/1.1 response bytes into `Response`.
 fn parse_response(Vec<byte> raw) -> Result<Response, HttpError> {
     let sep = find_header_end(raw);
     if sep == 999999 {

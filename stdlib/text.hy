@@ -65,18 +65,22 @@ fn trim(string s) -> Result<string, string> {
     return utf8_ok(bytes_slice(b, lo, hi))?;
 }
 
+/// True when `hay` contains `needle` as a byte-exact substring.
 fn contains(string hay, string needle) -> bool {
     return bytes_contains(to_bytes(hay), to_bytes(needle));
 }
 
+/// True when `s` begins with `prefix` (byte identity).
 fn starts_with(string s, string prefix) -> bool {
     return bytes_starts_with(to_bytes(s), to_bytes(prefix));
 }
 
+/// True when `s` ends with `suffix` (byte identity).
 fn ends_with(string s, string suffix) -> bool {
     return bytes_ends_with(to_bytes(s), to_bytes(suffix));
 }
 
+/// First byte offset of `needle` in `hay`, or `-1`. Empty needle → `0`.
 fn find(string hay, string needle) -> int {
     return bytes_find(to_bytes(hay), to_bytes(needle));
 }
