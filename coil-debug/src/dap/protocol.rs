@@ -149,4 +149,59 @@ mod tests {
         let decoded = read_message(&mut cursor).unwrap().unwrap();
         assert_eq!(decoded.event.as_deref(), Some("initialized"));
     }
+
+    #[test]
+    fn empty_reader_yields_none() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(read_message(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_content_length_errors() {
+        let raw = b"Content-Length: nope\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(&raw[..]);
+        let err = read_message(&mut cursor).expect_err("bad length");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn truncated_body_errors() {
+        let raw = b"Content-Length: 50\r\n\r\n{\"seq\":1}";
+        let mut cursor = std::io::Cursor::new(&raw[..]);
+        let err = read_message(&mut cursor).expect_err("truncated");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn error_response_shape() {
+        let msg = Message::error_response(3, 2, "launch", "compile failed");
+        assert_eq!(msg.success, Some(false));
+        assert_eq!(msg.message.as_deref(), Some("compile failed"));
+        assert_eq!(msg.request_seq, Some(2));
+        assert_eq!(msg.command.as_deref(), Some("launch"));
+    }
+
+    #[test]
+    fn request_roundtrip_preserves_arguments() {
+        let msg = Message::request(
+            1,
+            "setBreakpoints",
+            Some(serde_json::json!({ "breakpoints": [{ "line": 3 }] })),
+        );
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let decoded = read_message(&mut cursor).unwrap().unwrap();
+        assert_eq!(decoded.msg_type, "request");
+        assert_eq!(decoded.command.as_deref(), Some("setBreakpoints"));
+        let line = decoded
+            .arguments
+            .as_ref()
+            .and_then(|a| a.get("breakpoints"))
+            .and_then(|b| b.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|bp| bp.get("line"))
+            .and_then(|l| l.as_u64());
+        assert_eq!(line, Some(3));
+    }
 }
