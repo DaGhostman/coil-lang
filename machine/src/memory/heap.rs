@@ -937,6 +937,9 @@ pub struct ObjCoroutine {
     pub resume_ip: usize,
     /// Stack segment (args + locals + operands) relative to segment base 0.
     pub saved_stack: Vec<Value>,
+    /// Bitmask of `saved_stack` slots that hold heap pointers (for precise GC).
+    /// When zero, GC conservatively scans every slot.
+    pub saved_live_mask: u64,
     /// `(ip, sp_offset)` pairs; `sp_offset` is relative to the coroutine segment base.
     pub saved_frames: Vec<(usize, usize)>,
     /// Value from the resumer's `resume h with v` (delivered at the next binding yield).
@@ -991,7 +994,7 @@ pub struct ObjFn {
     /// Trailing rest parameter packs extra args into `[T]`.
     pub is_rest: bool,
     /// Bitmask of which fixed param slots are already filled (partial apply).
-    pub filled_mask: u32,
+    pub filled_mask: u64,
     /// Values for filled param slots (decl order among filled bits).
     pub captured_args: Vec<Value>,
     /// Explicit `use (x, y)` capture snapshot (leading frame locals).

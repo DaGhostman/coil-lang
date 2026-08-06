@@ -1562,9 +1562,9 @@
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Resuming a completed coroutine pushes 0 (MVP done protocol).
+    /// Resuming a completed coroutine panics.
     #[test]
-    fn coroutine_resume_after_done_returns_zero() {
+    fn coroutine_resume_after_done_panics() {
         let mut vm = Machine::<8>::default();
         vm.run(&[
             make_coro(0, 9),
@@ -1580,7 +1580,7 @@
             Byte::new(Instruction::YieldCoro),
             Byte::new(Instruction::RETURN),
         ]);
-        assert_eq!(vm.pop().as_int(), 0);
+        assert!(vm.panicked());
         assert_eq!(vm.pop().as_int(), 7);
     }
 
@@ -2219,6 +2219,39 @@
         let mut vm = Machine::<16>::default();
         vm.run(&code);
         assert_eq!(vm.pop().as_int(), 15);
+    }
+
+    #[test]
+    fn call_indirect_partial_mask_preserves_high_bit() {
+        let body_entry = 10u32;
+        let partial_mask = 1u64 << 32;
+        let constants = vec![partial_mask];
+        let code = vec![
+            const_int(42),
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 1, 33, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::RETURN),
+        ];
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(&code, &constants, &[], 0);
+        let addr = vm.pop().raw() as u64;
+        let fn_obj = vm
+            .heap()
+            .find_object_by_addr(addr)
+            .expect("partial ObjFn on heap");
+        if let crate::Object::Fn(gc) = fn_obj {
+            assert_eq!(gc.as_ref().filled_mask, partial_mask);
+            assert_eq!(gc.as_ref().captured_args.len(), 1);
+            assert_eq!(gc.as_ref().captured_args[0].as_int(), 42);
+        } else {
+            panic!("expected ObjFn");
+        }
     }
 
     #[test]
