@@ -41,6 +41,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0120`–`E0122` | Overload family | Wrong arity / duplicate / ambiguous overload |
 | `E0123` | `DeferNeverRuns` | `defer` never runs on function exit (warning) |
 | `E0124` | `WildcardImport` | `use path::*` is banned (virtual and userland) — list names explicitly; prelude is auto-injected |
+| `E0125` | `ExpressionNestingTooDeep` | A single expression recursed past the compiler's internal depth limit during typecheck or codegen (not the compiled program's own call stack — see `UnboundedRecursion`) |
 | `E0200`–`E0212` | Enum / match family | Duplicate enum, unknown variant, non-exhaustive match, field errors, … |
 | `E0300`–`E0301` | Format family | Specifier / arity mismatch |
 | `E0400`–`E0405` | Aggregate / FFI family | Index OOB, array element mismatch, `declare`/`invoke` arity, … |
