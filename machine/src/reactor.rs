@@ -43,6 +43,7 @@ pub struct Reactor {
     started: OnceLock<()>,
     inflight: AtomicUsize,
     shutdown: AtomicBool,
+    worker_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl Reactor {
@@ -56,6 +57,7 @@ impl Reactor {
             started: OnceLock::new(),
             inflight: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            worker_handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -70,21 +72,44 @@ impl Reactor {
     fn ensure_started(self: &Arc<Self>) {
         let reactor = Arc::clone(self);
         let _ = self.started.get_or_init(|| {
+            let mut handles = reactor
+                .worker_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for i in 0..reactor.n_workers {
                 let r = Arc::clone(&reactor);
                 let name = format!("coil-reactor-{i}");
-                thread::Builder::new()
+                let handle = thread::Builder::new()
                     .name(name)
                     // Nested join-help can be deep for recursive auto-par.
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || worker_loop(r))
                     .expect("coil reactor worker");
+                handles.push(handle);
             }
         });
     }
 
     fn notify(&self) {
         self.sleep_cvar.notify_one();
+    }
+
+    /// Stop worker threads and join them. Call once the owning root VM's run
+    /// has fully drained (its `live_threads` registry is empty) — workers
+    /// hold their own `Arc<Reactor>` clone, so without an explicit stop they
+    /// poll forever and the reactor is never dropped.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.sleep_cvar.notify_all();
+        let handles = std::mem::take(
+            &mut *self
+                .worker_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
     /// Submit `job` to the pool (starts workers lazily).
@@ -427,6 +452,35 @@ mod tests {
     fn worker_count_clamps_zero_to_one() {
         let r = Reactor::new(0);
         assert_eq!(r.worker_count(), 1);
+    }
+
+    #[test]
+    fn shutdown_joins_worker_threads() {
+        // Start workers, run one job through them, then stop: `shutdown`
+        // must return only once every pool thread has actually exited.
+        let reactor = Reactor::new(3);
+        let state = submit_const_job(&reactor, 5);
+        assert_eq!(
+            reactor.wait_join(&state).expect("job should complete"),
+            PortableValue::Immediate(5)
+        );
+        for _ in 0..50 {
+            if reactor.inflight() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        reactor.shutdown();
+        assert!(
+            reactor
+                .worker_handles
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "shutdown must drain the handle list it joined"
+        );
+        // Idempotent: a second shutdown on an already-stopped pool is a no-op.
+        reactor.shutdown();
     }
 
     #[test]

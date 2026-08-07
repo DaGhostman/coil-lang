@@ -1461,6 +1461,14 @@ impl<const S: usize> Machine<S> {
         // which looks like "recv never blocks" and "nothing after recv runs".
         // Only joins *this* Machine's registry (not a process-global list).
         crate::thread::join_undetached_threads(&self.live_threads);
+        // Reactor pool threads hold their own `Arc<Reactor>` clone and poll
+        // forever unless told to stop — otherwise every program that spawns
+        // a coil thread leaks `worker_cap` OS threads for the rest of the
+        // process. Skip if a detached job is still in flight (rare) rather
+        // than abandon queued work; that reactor just leaks as before.
+        if self.reactor.inflight() == 0 {
+            self.reactor.shutdown();
+        }
     }
 
     fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
