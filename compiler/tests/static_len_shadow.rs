@@ -33,21 +33,20 @@ test("nested array index") {
     let f0 = c.get_function("__zs_test_0");
     let f1 = c.get_function("__zs_test_1");
     let body = &bc[f0..f1];
-    // static_len path: LOAD a; POP; CONST <len>
-    let mut saw_len_const = false;
-    for w in body.windows(3) {
-        if matches!(*w[0].bytecode(), Instruction::LOAD)
-            && matches!(*w[1].bytecode(), Instruction::POP)
-            && matches!(*w[2].bytecode(), Instruction::CONST)
-        {
-            assert_eq!(
-                w[2].operand_u32(),
-                4,
-                "len(a) must const-fold to 4, not later nested outer len"
-            );
-            saw_len_const = true;
-            break;
-        }
-    }
-    assert!(saw_len_const, "expected static len LOAD/POP/CONST sequence");
+    // `len(a)` const-folds to CONST 4 (no LOAD/POP of `a` needed). A later
+    // test reuses name `a` with outer length 2 — that must not poison this fold.
+    let make_arr = body
+        .iter()
+        .position(|b| matches!(*b.bytecode(), Instruction::MakeArray))
+        .expect("array literal MakeArray");
+    assert!(
+        matches!(*body[make_arr + 1].bytecode(), Instruction::POP),
+        "expected POP of unused array after len fold"
+    );
+    assert!(
+        matches!(*body[make_arr + 2].bytecode(), Instruction::CONST)
+            && body[make_arr + 2].operand_u32() == 4,
+        "len(a) must const-fold to 4, not later nested outer len; got {:?}",
+        body[make_arr + 2].bytecode()
+    );
 }
