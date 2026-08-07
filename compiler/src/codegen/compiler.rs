@@ -938,6 +938,9 @@ impl Compiler {
                     | Instruction::Unpack
                     | Instruction::UnpackAt
                     | Instruction::Seek
+                    // Frame-slot operands the copy paths do not remap.
+                    | Instruction::INC
+                    | Instruction::DEC
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
                     | Instruction::PRINT
@@ -1014,7 +1017,26 @@ impl Compiler {
         }
     }
 
+    /// Inline a tiny direct call, or emit nothing at all.
+    ///
+    /// The attempt writes into a scratch buffer so a refusal cannot leave arg
+    /// prep or a partially copied body in `bytecode` — leaked ops would run
+    /// *and* be followed by the real `CALL`, clobbering caller slots.
     fn try_emit_inline_direct_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let mut scratch = Vec::new();
+        if self.try_inline_direct_call_into(fqn, args, &mut scratch) {
+            bytecode.append(&mut scratch);
+            return true;
+        }
+        false
+    }
+
+    fn try_inline_direct_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
@@ -1087,6 +1109,20 @@ impl Compiler {
                     return false;
                 };
                 bytecode.push_load(tmp);
+            } else if matches!(
+                byte.bytecode(),
+                Instruction::STORE | Instruction::StorePop
+            ) {
+                // Must be remapped like LOAD: a verbatim copy writes the
+                // *callee's* slot number into the caller's frame. Only
+                // parameter slots have a caller temp; locals refuse the inline.
+                let Some(slot) = byte.load_store_single_slot() else {
+                    return false;
+                };
+                let Some(&tmp) = temps.get(slot as usize) else {
+                    return false;
+                };
+                bytecode.push_store_pop(tmp);
             } else if matches!(
                 byte.bytecode(),
                 Instruction::BinSlotImm | Instruction::BinSlotSlot

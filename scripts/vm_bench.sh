@@ -32,6 +32,7 @@ declare -A EXPECTED=(
     ["examples/perf/nsieve.hy"]="1900"
     ["examples/perf/binary_trees.hy"]="135854"
     ["examples/perf/bool_guard.hy"]="45"
+    ["examples/inline_wrapped_call.hy"]="13"
 )
 
 # CPU-focused subset for poop / quick timing (no FFI, no modules).

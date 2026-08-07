@@ -6467,3 +6467,22 @@ fn main() {
     );
     assert_eq!(run_example_src(src), "abc");
 }
+
+/// A refused tiny-call inline must leave no bytecode behind.
+///
+/// `wrap_add`'s body contains an inlinable call, so the inliner starts copying
+/// it, reaches the callee's own local (no caller temp) and refuses. The
+/// partially copied body used to stay in the buffer and run ahead of the real
+/// `CALL`, storing into caller slots — that clobbered the already-computed left
+/// operand, so `(1 + 5) + (10 - 3)` printed `10` instead of `13`.
+///
+/// Only reproduces through the multi-file path the CLI uses; the in-memory
+/// single-file compile numbers temps differently and hides the clobber.
+#[test]
+fn example_inline_wrapped_call_prints_13() {
+    assert_eq!(
+        run_example("examples/inline_wrapped_call.hy").trim(),
+        "13",
+        "left operand was clobbered by a leaked inline body"
+    );
+}

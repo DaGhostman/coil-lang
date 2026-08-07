@@ -2071,6 +2071,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `perf/nsieve.hy` | Perf | `1900` |
 | `perf/binary_trees.hy` | Perf | `135854` |
 | `perf/bool_guard.hy` | Perf | `45` |
+| `inline_wrapped_call.hy` | Codegen | `13` |
 | `bench.hy` | Basics | `12\n` |
 | `call_test.hy` | Basics | `done` |
 | `gc.hy` | Basics | `Hello` |
