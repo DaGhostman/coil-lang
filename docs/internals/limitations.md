@@ -32,10 +32,11 @@ GVN has no SSA slot rename; effectful ops are barriers. Per-function `multi_op_j
 
 | Issue | Detail |
 |-------|--------|
-| Parallel `thread_join` / mutex hang | `example_thread_join_prints_42` and `example_thread_mutex_prints_2` pass alone (~tens of ms) but can hang indefinitely under heavy parallel `compiler` pipeline load. Workaround: re-run, or `cargo test -p compiler --test pipeline -- --test-threads=1` / run the thread tests alone. |
+| Parallel `thread_join` / mutex hang | `example_thread_join_prints_42` and `example_thread_mutex_prints_2` pass alone (~tens of ms) but can hang indefinitely — reproduced with a plain default-parallelism `cargo test -p compiler --test pipeline` (no extra load needed). Workaround: re-run, or `cargo test -p compiler --test pipeline -- --test-threads=1` / run the thread tests alone. |
 | Parallel heap corruption | Occasional `corrupted double-linked list` / SIGABRT when many pipeline VMs run concurrently. Usually clears on retry; serialize pipeline if it blocks a gate. |
 | Criterion vs `--all-targets` | Prefer `cargo test --workspace --lib --tests --bins` (CI and agent gate). `--all-targets` also builds `[[bench]]` targets; Criterion treats argv after `--` as its own CLI and aborts the suite. |
 | Optional feature suites | Full `cargo test` under `--no-default-features` (or a single of `crypto`/`time`/`regex`/`tls`) fails or hangs on tests that need the other libs. CI compile-gates those with `cargo check --workspace --lib --tests --bins …`; keep full tests on the default stack (plus `dissect` / `debugger`). |
+| `ulimit` leak-smoke wraps `cargo run` | `ulimit -v 65536 && cargo run --bin coil -- test` OOMs immediately (`memory allocation of N bytes failed`) — it's `cargo`'s own build-check machinery that exceeds 64MB, not the `coil test` binary. The compiled binary itself passes cleanly under the same cap (305/305). Invoke the built binary directly: `cargo build --bin coil && (ulimit -v 65536; ./target/debug/coil test)`. |
 
 ## Tracking
 
