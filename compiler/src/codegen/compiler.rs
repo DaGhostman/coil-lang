@@ -8632,6 +8632,11 @@ impl Compiler {
                             bytecode.push_pop();
                         }
                     }
+                    // Ctor args may stage temps above `tmp_inst` (binary / CALL
+                    // staging). STORE seeks the shared cursor past those temps,
+                    // so the instance is no longer TOS for MakeEnum/assignment.
+                    // Seek back so `tmp_inst` is the expression result.
+                    bytecode.push_seek(tmp_inst + 1);
                 }
             }
             Expression::Adjust { op, prefix, target } => {
