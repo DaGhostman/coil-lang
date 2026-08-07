@@ -30,6 +30,29 @@
         (bc, compiler.constants)
     }
 
+    // ---- Recursion-depth guard ----
+
+    #[test]
+    fn codegen_depth_guard_panics_with_expected_diagnostic_past_limit() {
+        // See the analogous typechecker test (infer_depth_guard_...) for why
+        // this seeds the counter directly rather than compiling a literally
+        // deep AST: dropping a deep Box<Expression> chain overflows the
+        // stack on its own, independent of do_compile's frame size.
+        let ast = Pratt::default().parse("1;").expect("trivial literal parses");
+        let mut compiler = Compiler::default();
+        compiler.codegen_depth = super::CODEGEN_RECURSION_LIMIT;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler.do_compile(&ast)));
+        assert!(result.is_err(), "expected the recursion-limit panic");
+        assert!(
+            compiler
+                .messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ExpressionNestingTooDeep)),
+            "expected an ExpressionNestingTooDeep diagnostic to be recorded before panicking"
+        );
+    }
+
     /// True when bytecode contains a strength-reduced `x << shift`
     /// (`LOAD; CONST; SHL` or fused `BinSlotImm(SHL, shift)`).
     fn bytecode_has_shl_by(bc: &[Byte], shift: i64) -> bool {

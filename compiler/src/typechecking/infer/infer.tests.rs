@@ -1121,6 +1121,32 @@ use string::{format, to_bytes};
         assert_eq!(ty, Ty::Con("Foo".into()));
     }
 
+    // ---- Recursion-depth guard ----
+
+    #[test]
+    fn infer_depth_guard_panics_with_expected_diagnostic_past_limit() {
+        // Exercise the guard directly (not via a literal deeply-nested AST):
+        // recursing 2000+ levels via `+` also overflows the stack while
+        // dropping the parsed AST itself (a well-known Box<T> recursive-Drop
+        // pitfall unrelated to infer_inner's own frame size), so a real
+        // pathologically-deep program isn't a safe way to test this in
+        // isolation. Seed `infer_depth` to the limit and confirm the very
+        // next `infer` call panics with a clean diagnostic instead of
+        // recursing further — this is the same code path a real deeply
+        // nested expression would hit.
+        let mut c = Checker::new();
+        let ast = Pratt::default().parse("1;").expect("trivial literal parses");
+        c.infer_depth = INFER_RECURSION_LIMIT;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.infer(&ast)));
+        assert!(result.is_err(), "expected the recursion-limit panic");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ExpressionNestingTooDeep)),
+            "expected an ExpressionNestingTooDeep diagnostic to be recorded before panicking"
+        );
+    }
+
     #[test]
     fn native_function_call_infers_correctly() {
         // After register_native, a call to the native should type-check

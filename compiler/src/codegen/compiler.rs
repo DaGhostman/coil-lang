@@ -7863,7 +7863,7 @@ impl Compiler {
         self.codegen_depth += 1;
         if self.codegen_depth > super::CODEGEN_RECURSION_LIMIT {
             self.messages.push(Message::error(
-                ErrorCode::GenericTypeError,
+                ErrorCode::ExpressionNestingTooDeep,
                 format!(
                     "expression nested too deeply (over {} levels) for codegen",
                     super::CODEGEN_RECURSION_LIMIT

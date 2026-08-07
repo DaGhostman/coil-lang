@@ -1965,7 +1965,7 @@ impl Checker {
         self.infer_depth += 1;
         if self.infer_depth > INFER_RECURSION_LIMIT {
             let _ = self.error_with_help(
-                ErrorCode::GenericTypeError,
+                ErrorCode::ExpressionNestingTooDeep,
                 format!(
                     "expression nested too deeply (over {INFER_RECURSION_LIMIT} levels) for the typechecker"
                 ),
