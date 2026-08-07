@@ -11,7 +11,6 @@ MEM_LIMIT_KB="${MEM_LIMIT_KB:-65536}"
 
 declare -A EXPECTED=(
     ["examples/fib.hy"]="55"
-    ["examples/fib_bench.hy"]="55"
     ["examples/option.hy"]="42"
     ["examples/result.hy"]="420-1"
     ["examples/tree.hy"]="6"
@@ -28,14 +27,29 @@ declare -A EXPECTED=(
     ["examples/perf/dict_hot.hy"]="6000"
     ["examples/perf/operators_loop.hy"]="149912"
     ["examples/perf/coro_ping.hy"]="124750"
+    ["examples/perf/mandelbrot.hy"]="625885"
+    ["examples/perf/tak.hy"]="7"
+    ["examples/perf/nsieve.hy"]="1900"
+    ["examples/perf/binary_trees.hy"]="135854"
+    ["examples/perf/bool_guard.hy"]="45"
 )
 
 # CPU-focused subset for poop / quick timing (no FFI, no modules).
 CPU_BENCH=(
-    examples/fib_bench.hy
+    examples/perf/mandelbrot.hy
+    examples/perf/tak.hy
+    examples/perf/nsieve.hy
+    examples/perf/binary_trees.hy
     examples/perf/numeric.hy
     examples/perf/operators_loop.hy
     examples/perf/match_sum.hy
+)
+
+CROSS_LANG=(
+    mandelbrot
+    tak
+    nsieve
+    binary_trees
 )
 
 run_example() {
@@ -72,15 +86,27 @@ echo "Example correctness: PASSED"
 
 if command -v poop >/dev/null 2>&1; then
     echo
-    echo "== poop benchmark (fib vs lua) =="
-    rm -f out.hyc
-    poop -d 6000 "$BIN examples/fib_bench.hy" "lua benchmarks/test.lua" || true
+    echo "== poop benchmark (coil run archive vs lua vs node) =="
+    POOP_DIR="${POOP_DIR:-/tmp/coil_vm_bench}"
+    mkdir -p "$POOP_DIR"
+    for name in "${CROSS_LANG[@]}"; do
+        echo "-- $name"
+        hyc="$POOP_DIR/${name}.hyc"
+        "$BIN" compile "examples/perf/${name}.hy" -o "$hyc" >/dev/null
+        cmds=("$BIN run $hyc" "lua benchmarks/${name}.lua")
+        if command -v node >/dev/null 2>&1; then
+            cmds+=("node benchmarks/${name}.js")
+        fi
+        poop -d 6000 "${cmds[@]}" || true
+    done
     echo
-    echo "== poop CPU bench subset =="
+    echo "== poop CPU bench subset (precompiled) =="
     for path in "${CPU_BENCH[@]}"; do
-        rm -f out.hyc
+        name="$(basename "$path" .hy)"
+        hyc="$POOP_DIR/${name}.hyc"
         echo "-- $path"
-        poop -d 3000 "$BIN $path" || true
+        "$BIN" compile "$path" -o "$hyc" >/dev/null
+        poop -d 3000 "$BIN run $hyc" || true
     done
 else
     echo
@@ -93,9 +119,13 @@ ls -lh "$BIN"
 
 if command -v valgrind >/dev/null 2>&1; then
     echo
-    echo "== callgrind on fib_bench.hy =="
-    rm -f out.hyc callgrind.out.*
-    valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" examples/fib_bench.hy >/dev/null 2>&1 || true
+    echo "== callgrind on mandelbrot (archive) =="
+    POOP_DIR="${POOP_DIR:-/tmp/coil_vm_bench}"
+    mkdir -p "$POOP_DIR"
+    hyc="$POOP_DIR/mandelbrot.hyc"
+    "$BIN" compile examples/perf/mandelbrot.hy -o "$hyc" >/dev/null
+    rm -f callgrind.out.*
+    valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" run "$hyc" >/dev/null 2>&1 || true
     if command -v callgrind_annotate >/dev/null 2>&1; then
         callgrind_annotate callgrind.out 2>/dev/null | head -20 || true
     fi

@@ -76,7 +76,7 @@ rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default r
 | Work type | Extra check |
 |-----------|-------------|
 | VM / alloc | valgrind memcheck on debug build |
-| Perf | `poop` on `examples/fib_bench.hy`; prefer alloc reduction over new opcodes |
+| Perf | `./scripts/poop_baseline.sh` (precompiled `coil run` on mandelbrot/tak/nsieve/binary_trees); prefer alloc reduction over new opcodes |
 | Debug info | `coil debug`, `coil dissect` |
 | Formatting | `coil fmt` |
 | Packaged apps | `coil package` defaults to `coil-embed` runner |
