@@ -5446,21 +5446,31 @@ impl Compiler {
             .map(|ty| apply_ty_prune(self.checker.subst(), ty))
     }
 
-    fn local_polyfn_call_needs_unbox(
-        &self,
-        local: &str,
-        call_ty: &Ty,
-        span: Option<(usize, usize)>,
-    ) -> bool {
+    fn local_polyfn_call_needs_unbox(&self, local: &str, span: Option<(usize, usize)>) -> bool {
         use crate::typechecking::subst::apply_ty_prune;
 
         if let Some(source) = self.polyfn_sources.get(local) {
             return self.generic_return_depends_on_type_param(source);
         }
-        if Self::ty_to_value_tag(call_ty).is_none() {
-            return false;
-        }
-        let Some(var_ty) = self.local_polyfn_var_ty(local, span) else {
+        // Prefer the binder / env type over the call-site identifier span:
+        // rank-n `f` at `f(x)` may already be recorded as `int -> int`, which
+        // would hide that the PolyFn ABI still returns a boxed type param.
+        let binder_ty = {
+            let mut found = None;
+            for frame in self.mono_codegen_var_types.iter().rev() {
+                if let Some(ty) = frame.get(local) {
+                    found = Some(apply_ty_prune(self.checker.subst(), ty));
+                    break;
+                }
+            }
+            found.or_else(|| {
+                self.checker
+                    .codegen_var_type(local)
+                    .map(|ty| apply_ty_prune(self.checker.subst(), ty))
+            })
+        };
+        let var_ty = binder_ty.or_else(|| self.local_polyfn_var_ty(local, span));
+        let Some(var_ty) = var_ty else {
             return false;
         };
         let pruned = apply_ty_prune(self.checker.subst(), &var_ty);
@@ -5480,9 +5490,57 @@ impl Compiler {
                 result.clone()
             }
         };
-        // Shared generic bodies box type-parameter results; a Var return
-        // means the value on the stack is still boxed at this call site.
         matches!(result_ty, Ty::Var(_))
+    }
+
+
+    /// Instantiate a (possibly `forall`) function type against concrete arg
+    /// types and return the result type after binding.
+    fn instantiate_polyfn_app_result(fun_ty: &Ty, arg_tys: &[Ty]) -> Option<Ty> {
+        let mut peeled = fun_ty;
+        while let Ty::Forall { body, .. } = peeled {
+            peeled = body.as_ref();
+        }
+        let mut map: HashMap<crate::typechecking::ty::TyVarId, Ty> = HashMap::new();
+        let mut current = peeled;
+        for arg in arg_tys {
+            match current {
+                Ty::Fun(param, ret) => {
+                    Self::bind_scheme_vars(param.as_ref(), arg, &mut map);
+                    current = ret.as_ref();
+                }
+                _ => return None,
+            }
+        }
+        Some(Self::apply_ty_var_map(current, &map))
+    }
+
+
+    fn apply_ty_var_map(
+        ty: &Ty,
+        map: &HashMap<crate::typechecking::ty::TyVarId, Ty>,
+    ) -> Ty {
+        match ty {
+            Ty::Var(v) => map.get(v).cloned().unwrap_or_else(|| ty.clone()),
+            Ty::Fun(a, r) => Ty::Fun(
+                Box::new(Self::apply_ty_var_map(a, map)),
+                Box::new(Self::apply_ty_var_map(r, map)),
+            ),
+            Ty::App(h, args) => Ty::App(
+                Box::new(Self::apply_ty_var_map(h, map)),
+                args.iter().map(|a| Self::apply_ty_var_map(a, map)).collect(),
+            ),
+            Ty::Tuple(items) => {
+                Ty::Tuple(items.iter().map(|t| Self::apply_ty_var_map(t, map)).collect())
+            }
+            Ty::Array { element, length } => Ty::Array {
+                element: Box::new(Self::apply_ty_var_map(element, map)),
+                length: length.clone(),
+            },
+            Ty::Forall { body, .. } => Self::apply_ty_var_map(body, map),
+            Ty::Readonly(inner) => Ty::Readonly(Box::new(Self::apply_ty_var_map(inner, map))),
+            other => other.clone(),
+        }
     }
 
     fn emit_mono_specializations_for_function<'compiler>(
@@ -9753,16 +9811,48 @@ impl Compiler {
                             Byte::new(Instruction::CallIndirect)
                                 .with_operand_u32(value_arity | (dict_count << 16)),
                         );
-                        // Generic→concrete unbox for polyfn call site.
-                        if let Some(call_ty) = self.codegen_expr_ty(ast) {
-                            if self.local_polyfn_call_needs_unbox(
-                                &identifier,
-                                &call_ty,
-                                Some((span.start, span.end)),
-                            ) {
-                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+// Generic→concrete unbox for polyfn call site.
+                        if self.local_polyfn_call_needs_unbox(
+                            &identifier,
+                            Some((span.start, span.end)),
+                        ) {
+                            let call_ty = self.codegen_expr_ty(ast);
+                            let unbox_ty = match call_ty {
+                                Some(t) if Self::ty_to_value_tag(&t).is_some() => Some(t),
+                                _ => {
+                                    let arg_tys: Vec<Ty> = flat_args
+                                        .iter()
+                                        .filter_map(|a| self.codegen_expr_ty(a))
+                                        .collect();
+                                    // Binder forall (not call-site instantiated Fun).
+                                    let binder = {
+                                        use crate::typechecking::subst::apply_ty_prune;
+                                        let mut found = None;
+                                        for frame in self.mono_codegen_var_types.iter().rev() {
+                                            if let Some(ty) = frame.get(&identifier) {
+                                                found = Some(apply_ty_prune(
+                                                    self.checker.subst(),
+                                                    ty,
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                        found.or_else(|| {
+                                            self.checker.codegen_var_type(&identifier).map(|ty| {
+                                                apply_ty_prune(self.checker.subst(), ty)
+                                            })
+                                        })
+                                    };
+                                    binder.and_then(|vt| {
+                                        Self::instantiate_polyfn_app_result(&vt, &arg_tys)
+                                    })
+                                }
+                            };
+                            if let Some(ty) = unbox_ty {
+                                Self::emit_unbox_if_needed(&mut bytecode, &ty);
                             }
                         }
+
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownFunction,
