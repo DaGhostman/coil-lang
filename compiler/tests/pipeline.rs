@@ -44,12 +44,12 @@ fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    // Deep attr/coroutine desugaring can use large individual typechecker
-    // stack frames; match the generous headroom set via `RUST_MIN_STACK` in
-    // `.cargo/config.toml` rather than the smaller value this used to hard
-    // code (a large-frame overflow can jump the guard page into adjacent
-    // memory instead of faulting cleanly — see docs/internals/limitations.md).
-    const STACK: usize = 32 * 1024 * 1024;
+    // Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
+    // thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
+    // actually runs with. infer_inner/do_compile no longer have oversized
+    // inline match arms (see docs/internals/limitations.md), so this is
+    // headroom rather than a load-bearing requirement.
+    const STACK: usize = 8 * 1024 * 1024;
     let path = path.to_string();
     // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
     // triage point at the offending example after a crash.
@@ -3437,10 +3437,11 @@ fn main() {
 
 #[test]
 fn attr_on_async_fn_rejected_at_compile_time() {
-    // Attr-body-crosses-yield desugaring for a coroutine target recurses deep
-    // enough (~1.5-2 MiB observed) to sit close to the default per-test
-    // thread stack; run on a dedicated thread with the same headroom as
-    // `run_example` (see docs/internals/limitations.md).
+    // Attr-body-crosses-yield desugaring for a coroutine target used to
+    // recurse deep enough (~1.5-2 MiB) to risk the default per-test thread
+    // stack before infer_inner/do_compile were split up; run on a dedicated
+    // thread with the same headroom as `run_example` regardless (see
+    // docs/internals/limitations.md).
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -3459,7 +3460,7 @@ fn main() {
 "#
     .to_string();
     let is_err = std::thread::Builder::new()
-        .stack_size(32 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || Pipeline::new().compile_src(&src).is_err())
         .expect("diagnostic thread")
         .join()
