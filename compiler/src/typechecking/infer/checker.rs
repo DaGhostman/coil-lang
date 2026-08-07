@@ -2725,1010 +2725,7 @@ impl Checker {
                 }
                 pruned
             }
-            Expression::Call { name, args } => {
-                if let Expression::Identifier(callee) = name.1.as_ref() {
-                    if let Some(arg_list) = args.as_deref() {
-                        if arg_list.len() == 1 {
-                            if let Expression::Spread(pack) = arg_list[0].1.as_ref() {
-                                if self.next_id_idx < self.ids.ids().len() {
-                                    self.next_id_idx += 1;
-                                }
-                                if let Some(ty) =
-                                    self.try_infer_spread_call_target(callee, pack, &range, id)
-                                {
-                                    return ty;
-                                }
-                            }
-                        }
-                    }
-                }
-                // Method call: `recv.method(args)` — Access callee.
-                if let Expression::Access(recv, method) = name.1.as_ref() {
-                    let method_args = args.as_deref().unwrap_or(&[]);
-                    let method_has_named = method_args
-                        .iter()
-                        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-
-                    let recv_ty = self.infer(recv);
-                    let resolved = apply_ty_prune(&self.subst, &recv_ty);
-
-                    // Named args on methods: only inherent class methods.
-                    if method_has_named {
-                        let class_owner = self.class_owner_from_ty(&resolved);
-                        if let Some(owner) = class_owner.as_ref()
-                            && self
-                                .methods
-                                .get(owner)
-                                .and_then(|m| m.get(*method))
-                                .is_some()
-                        {
-                            let fqn = format!("{}::{}", owner, method);
-                            let user_argc = method_args.len();
-                            let scheme = if self.is_overloaded(&fqn) {
-                                let prelim_tys: Vec<Ty> = method_args
-                                    .iter()
-                                    .map(|a| {
-                                        let value = match a.1.as_ref() {
-                                            Expression::NamedArg(_, v) => v,
-                                            _ => a,
-                                        };
-                                        let ty = self.infer(value);
-                                        apply_ty_prune(&self.subst, &ty)
-                                    })
-                                    .collect();
-                                match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
-                                    OverloadSelect::Selected(c) => {
-                                        let c = c.clone();
-                                        self.selected_overloads_by_span.insert(
-                                            (range.start, range.end),
-                                            (c.fixed_arity, c.is_rest, c.id),
-                                        );
-                                        c.scheme
-                                    }
-                                    OverloadSelect::Ambiguous => {
-                                        return self.error_with_help(
-                                            ErrorCode::AmbiguousOverload,
-                                            format!(
-                                                "Ambiguous overload: call to `{}` matches multiple candidates",
-                                                fqn
-                                            ),
-                                            range,
-                                            Some(self.ambiguous_overload_help(&fqn)),
-                                        );
-                                    }
-                                    OverloadSelect::NoMatch => {
-                                        return self.error(
-                                            ErrorCode::WrongArity,
-                                            format!(
-                                                "No overload of `{}` accepts {} argument{}",
-                                                fqn,
-                                                user_argc,
-                                                if user_argc == 1 { "" } else { "s" }
-                                            ),
-                                            range,
-                                        );
-                                    }
-                                }
-                            } else {
-                                self.methods
-                                    .get(owner)
-                                    .and_then(|m| m.get(*method))
-                                    .map(|(_, s)| s.clone())
-                                    .expect("method present")
-                            };
-                            let (fun_ty, constraints, _mapping) =
-                                self.instantiate_scheme_mapped(&scheme);
-                            let mut arg_tys = vec![recv_ty];
-                            let (tys, ordered_exprs) =
-                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
-                            arg_tys.extend(tys);
-                            // Align exprs with `[self, …args]` for coerce_or_unify
-                            // (byte / string literal coercion on method args).
-                            let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
-                            arg_exprs.push(recv.clone());
-                            arg_exprs.extend(ordered_exprs);
-                            let result = self.apply_function(
-                                Some(&fqn),
-                                &fun_ty,
-                                &arg_tys,
-                                Some(&arg_exprs),
-                                id,
-                                range.clone(),
-                            );
-                            if !constraints.is_empty() {
-                                self.discharge_constraints(id, &constraints, &range);
-                            }
-                            return result;
-                        }
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Named arguments are not supported on this call to `{}`",
-                                method
-                            ),
-                            range,
-                            Some(
-                                "named arguments are supported on ordinary functions and inherent methods"
-                                    .to_string(),
-                            ),
-                        );
-                    }
-
-                    if let Ty::Existential { class } = &resolved
-                        && let Some((owner, method_slot, scheme)) =
-                            self.existential_method_candidate(class, method)
-                    {
-                        let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                            }
-                        }
-                        let hint = ExistentialMethodCall {
-                            method_slot,
-                            arity: arg_tys.len(),
-                            has_receiver: true,
-                        };
-                        if let Some(call_id) = id {
-                            self.existential_method_calls.insert(call_id, hint.clone());
-                        }
-                        self.existential_method_calls_by_span
-                            .insert((range.start, range.end), hint);
-                        return self.apply_existential_method(
-                            &owner,
-                            method,
-                            &scheme,
-                            &arg_tys,
-                            args.as_deref(),
-                            id,
-                            range,
-                        );
-                    }
-                    if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
-                        let candidates = self.bound_method_candidates(method, Some(receiver_var));
-                        if let Some((dict_index, dict_class, class, method_slot, scheme)) =
-                            self.select_bound_method(candidates, method, &range)
-                        {
-                            self.bind_matching_abstract_constraints(
-                                Some(receiver_var),
-                                &dict_class,
-                            );
-                            let (fun_ty, constraints, mapping) =
-                                self.instantiate_scheme_mapped(&scheme);
-                            let mut arg_tys = vec![recv_ty];
-                            if let Some(a) = args {
-                                for arg in a {
-                                    arg_tys.push(self.infer(arg));
-                                }
-                            }
-                            if let Some(call_id) = id {
-                                self.bound_method_calls.insert(
-                                    call_id,
-                                    BoundMethodCall {
-                                        dict_index,
-                                        method_slot,
-                                        arity: arg_tys.len(),
-                                        has_receiver: true,
-                                    },
-                                );
-                            }
-                            self.bound_method_calls_by_span.insert(
-                                (range.start, range.end),
-                                BoundMethodCall {
-                                    dict_index,
-                                    method_slot,
-                                    arity: arg_tys.len(),
-                                    has_receiver: true,
-                                },
-                            );
-                            let result = self.apply_function(
-                                Some(&format!("{}::{}", class, method)),
-                                &fun_ty,
-                                &arg_tys,
-                                None,
-                                id,
-                                range.clone(),
-                            );
-                            if !constraints.is_empty() {
-                                self.discharge_constraints(id, &constraints, &range);
-                                self.pin_assoc_after_discharge(
-                                    &class,
-                                    &constraints,
-                                    Some(&scheme),
-                                    &mapping,
-                                    &range,
-                                );
-                            }
-                            return result;
-                        }
-                    }
-                    // Inherent class methods win over ground trait methods
-                    // (Rust-style): `impl Point { fn show() ... }` must not be
-                    // shadowed by prelude `Show::show` when no Show instance
-                    // exists for Point.
-                    let class_owner = self.class_owner_from_ty(&resolved);
-                    if let Some(owner) = class_owner.as_ref()
-                        && self
-                            .methods
-                            .get(owner)
-                            .and_then(|m| m.get(*method))
-                            .is_some()
-                    {
-                        if self.is_static_method(owner, method) {
-                            let fqn = format!("{}::{}", owner, method);
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!(
-                                    "`{}` is a static method; call it as `{}(...)`",
-                                    method, fqn
-                                ),
-                                range,
-                                Some("static methods have no `self` receiver".to_string()),
-                            );
-                        }
-                        let fqn = format!("{}::{}", owner, method);
-                        let user_argc = method_args.len();
-                        let (scheme, selected) = if self.is_overloaded(&fqn) {
-                            let prelim_tys: Vec<Ty> = method_args
-                                .iter()
-                                .map(|a| {
-                                    let value = match a.1.as_ref() {
-                                        Expression::NamedArg(_, v) => v,
-                                        _ => a,
-                                    };
-                                    let ty = self.infer(value);
-                                    apply_ty_prune(&self.subst, &ty)
-                                })
-                                .collect();
-                            match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
-                                OverloadSelect::Selected(c) => {
-                                    let c = c.clone();
-                                    self.selected_overloads_by_span.insert(
-                                        (range.start, range.end),
-                                        (c.fixed_arity, c.is_rest, c.id),
-                                    );
-                                    (c.scheme, true)
-                                }
-                                OverloadSelect::Ambiguous => {
-                                    return self.error_with_help(
-                                        ErrorCode::AmbiguousOverload,
-                                        format!(
-                                            "Ambiguous overload: call to `{}` matches multiple candidates",
-                                            fqn
-                                        ),
-                                        range,
-                                        Some(self.ambiguous_overload_help(&fqn)),
-                                    );
-                                }
-                                OverloadSelect::NoMatch => {
-                                    let available: Vec<String> = self
-                                        .overload_sets
-                                        .get(&fqn)
-                                        .map(|cs| {
-                                            cs.iter()
-                                                .map(|c| {
-                                                    if c.is_rest {
-                                                        format!("{}+ args (rest)", c.fixed_arity)
-                                                    } else {
-                                                        format!("{} args", c.fixed_arity)
-                                                    }
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    return self.error_with_help(
-                                        ErrorCode::WrongArity,
-                                        format!(
-                                            "No overload of `{}` accepts {} argument{}",
-                                            fqn,
-                                            user_argc,
-                                            if user_argc == 1 { "" } else { "s" }
-                                        ),
-                                        range,
-                                        Some(format!(
-                                            "available arities: {}",
-                                            available.join(", ")
-                                        )),
-                                    );
-                                }
-                            }
-                        } else {
-                            let scheme = self
-                                .methods
-                                .get(owner)
-                                .and_then(|m| m.get(*method))
-                                .map(|(_, s)| s.clone())
-                                .expect("method present");
-                            (scheme, false)
-                        };
-                        let _ = selected;
-                        let (fun_ty, constraints, _mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        let mut arg_tys = vec![recv_ty];
-                        let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
-                        arg_exprs.push(recv.clone());
-                        if self.fn_has_rest(&fqn) {
-                            let (tys, ordered_exprs) =
-                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
-                            arg_tys.extend(tys);
-                            arg_exprs.extend(ordered_exprs);
-                        } else if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                                arg_exprs.push(arg.clone());
-                            }
-                        }
-                        let result = self.apply_function(
-                            Some(&fqn),
-                            &fun_ty,
-                            &arg_tys,
-                            Some(&arg_exprs),
-                            id,
-                            range.clone(),
-                        );
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                        }
-                        return result;
-                    }
-
-                    // Ground trait method: `recv.into()` / `recv.show()` via a
-                    // concrete instance (no open bound). Pin the return type from
-                    // `current_expected` when present so `let y: T = x.into();`
-                    // (or `return x.into();` under `-> T`) can select among
-                    // multiple `Into` targets.
-                    if let Some((class, scheme)) =
-                        self.ground_trait_method_for_receiver(method, &recv_ty)
-                    {
-                        let (fun_ty, constraints, mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                            }
-                        }
-                        let result = self.apply_function(
-                            Some(&format!("{}::{}", class, method)),
-                            &fun_ty,
-                            &arg_tys,
-                            None,
-                            id,
-                            range.clone(),
-                        );
-                        if let Some(expected) = self.current_expected.clone() {
-                            self.unify(&result, &expected, &range, "expected type");
-                        }
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                            self.pin_assoc_after_discharge(
-                                &class,
-                                &constraints,
-                                Some(&scheme),
-                                &mapping,
-                                &range,
-                            );
-                        }
-                        return apply_ty_prune(&self.subst, &result);
-                    }
-
-                    if let Some(owner) = class_owner {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            format!("Cannot find method `{}` on class `{}`", method, owner),
-                            range,
-                        );
-                    }
-                    return self.error_with_help(
-                        ErrorCode::NotAFunction,
-                        format!("Cannot call method `{}` on non-class type", method),
-                        range,
-                        Some("method calls require a class instance receiver".to_string()),
-                    );
-                }
-
-                // First-class callee (`lambda(...)`, nested fn value, etc.).
-                if !matches!(
-                    name.1.as_ref(),
-                    Expression::Identifier(_)
-                        | Expression::Access(_, _)
-                        | Expression::QualifiedAccess { .. }
-                ) {
-                    let callee_ty = self.infer(name);
-                    let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
-                    let arg_tys: Vec<Ty> = flat_args
-                        .iter()
-                        .map(|arg| self.infer_call_arg(arg))
-                        .collect();
-                    return self.apply_function(
-                        None,
-                        &callee_ty,
-                        &arg_tys,
-                        args.as_deref(),
-                        id,
-                        range,
-                    );
-                }
-
-                let ident = match name.1.as_ref() {
-                    Expression::Identifier(n) => n.to_string(),
-                    Expression::QualifiedAccess { owner, member } => {
-                        let fqn = format!("{}::{}", owner, member);
-                        if self.static_slot_types.contains_key(&fqn) {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("`{}` is a static field, not a function", fqn),
-                                range,
-                                Some(
-                                    "read it as a value or assign with `Class::field = expr`"
-                                        .to_string(),
-                                ),
-                            );
-                        }
-                        // Parser may emit Call(QualifiedAccess) for module paths;
-                        // Class::static_method stays Construct, but accept Call too.
-                        if let Some(ty) = self.try_infer_static_method_call(
-                            owner,
-                            member,
-                            &parser::ast::EnumConstructPayload::Tuple(
-                                args.as_deref().unwrap_or(&[]).to_vec(),
-                            ),
-                            range.clone(),
-                            id,
-                        ) {
-                            return ty;
-                        }
-                        if self.has_method(owner, member) {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!(
-                                    "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
-                                    fqn, member
-                                ),
-                                range,
-                                Some(format!(
-                                    "or declare `static fn {}` to call it as `{}`",
-                                    member, fqn
-                                )),
-                            );
-                        }
-                        fqn
-                    }
-                    _ => {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            "Invalid call target".to_string(),
-                            range,
-                        );
-                    }
-                };
-
-                let raw_args = args.as_deref().unwrap_or(&[]);
-                let has_named = raw_args
-                    .iter()
-                    .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-
-                if ident == "len" {
-                    if has_named {
-                        let (tys, reordered) =
-                            self.infer_and_reorder_call_args("len", raw_args, &range);
-                        return self.infer_len_call_from_tys(&tys, &reordered, id, range);
-                    }
-                    return self.infer_len_call(args.as_deref(), id, range);
-                }
-                if let Some(kind) = self.string_fn_for_call(&ident) {
-                    let arg_slice = if has_named {
-                        let (_, reordered) =
-                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                        return match kind {
-                            StringBuiltin::Format => {
-                                self.infer_string_format_call(reordered.as_slice(), range)
-                            }
-                            StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
-                                if kind == StringBuiltin::FromBytes
-                                    && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
-                                {
-                                    self.register_builtin_io_error();
-                                }
-                                let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
-                                let flat_args = self.flatten_spread_call_args(reordered.as_slice());
-                                let arg_tys: Vec<Ty> = flat_args
-                                    .iter()
-                                    .map(|arg| self.infer_call_arg(arg))
-                                    .collect();
-                                self.apply_function(
-                                    Some(&ident),
-                                    &fun_ty,
-                                    &arg_tys,
-                                    if flat_args.is_empty() {
-                                        None
-                                    } else {
-                                        Some(&flat_args)
-                                    },
-                                    id,
-                                    range,
-                                )
-                            }
-                        };
-                    } else {
-                        args.as_deref().unwrap_or(&[])
-                    };
-                    return match kind {
-                        StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
-                        StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
-                            if kind == StringBuiltin::FromBytes
-                                && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
-                            {
-                                self.register_builtin_io_error();
-                            }
-                            let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
-                            let flat_args = self.flatten_spread_call_args(arg_slice);
-                            let arg_tys: Vec<Ty> = flat_args
-                                .iter()
-                                .map(|arg| self.infer_call_arg(arg))
-                                .collect();
-                            self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if flat_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&flat_args)
-                                },
-                                id,
-                                range,
-                            )
-                        }
-                    };
-                }
-                // `assert` from `prelude::test` (auto-imported or via `use`).
-                if let Some(kind) = self.prelude_fn_in_scope(&ident) {
-                    if has_named {
-                        let (_, reordered) =
-                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                        return match kind {
-                            PreludeFn::Assert => self.infer_assert(&reordered, range),
-                            PreludeFn::BlockOn => self.infer_block_on(&reordered, range),
-                            PreludeFn::Dot => self.infer_dot(&reordered, id, range),
-                            PreludeFn::MatMul => self.infer_matmul(&reordered, id, range),
-                            PreludeFn::Cross => self.infer_cross(&reordered, id, range),
-                            PreludeFn::Matrix => self.infer_matrix_ctor(&reordered, id, range),
-                            PreludeFn::Ord => self.infer_ord(&reordered, range),
-                            PreludeFn::Char => self.infer_char(&reordered, range),
-                            PreludeFn::Sin
-                            | PreludeFn::Cos
-                            | PreludeFn::Tan
-                            | PreludeFn::Sqrt
-                            | PreludeFn::Floor
-                            | PreludeFn::Ceil
-                            | PreludeFn::Exp
-                            | PreludeFn::Ln
-                            | PreludeFn::Pow => self.infer_math(kind, &reordered, range),
-                        };
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    return match kind {
-                        PreludeFn::Assert => self.infer_assert(arg_slice, range),
-                        PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
-                        PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
-                        PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
-                        PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
-                        PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
-                        PreludeFn::Ord => self.infer_ord(arg_slice, range),
-                        PreludeFn::Char => self.infer_char(arg_slice, range),
-                        PreludeFn::Sin
-                        | PreludeFn::Cos
-                        | PreludeFn::Tan
-                        | PreludeFn::Sqrt
-                        | PreludeFn::Floor
-                        | PreludeFn::Ceil
-                        | PreludeFn::Exp
-                        | PreludeFn::Ln
-                        | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
-                    };
-                }
-                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
-                if let Some(kind) = self.ffi_fn_in_scope(&ident) {
-                    if has_named {
-                        let (_, reordered) =
-                            self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                        return match kind {
-                            FfiBuiltin::Dload => self.infer_ffi_dload(&reordered, range),
-                            FfiBuiltin::Declare => self.infer_ffi_declare(&reordered, range),
-                            FfiBuiltin::Invoke => self.infer_ffi_invoke(&reordered, range),
-                        };
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    return match kind {
-                        FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
-                        FfiBuiltin::Declare => self.infer_ffi_declare(arg_slice, range),
-                        FfiBuiltin::Invoke => self.infer_ffi_invoke(arg_slice, range),
-                    };
-                }
-                if matches!(ident.as_str(), "dload" | "declare" | "invoke") {
-                    return self.error_with_help(
-                        ErrorCode::UnknownValue,
-                        format!("Cannot find value `{}` in this scope", ident),
-                        range,
-                        Some(
-                            "import it with `use ffi::{dload, declare, invoke}`".to_string(),
-                        ),
-                    );
-                }
-
-                // ── Overload-dispatch: select by argc + argument types ─────
-                // Must happen before `has_named` and `fn_has_rest` branches so
-                // the correct candidate's param_names / is_rest are used.
-                if self.is_overloaded(&ident) {
-                    let argc = raw_args.len();
-                    // Preliminary arg types for same-arity disambiguation.
-                    // Named args contribute their value type in source order;
-                    // reordering happens after the candidate is chosen.
-                    let prelim_tys: Vec<Ty> = raw_args
-                        .iter()
-                        .map(|a| {
-                            let value = match a.1.as_ref() {
-                                Expression::NamedArg(_, v) => v,
-                                _ => a,
-                            };
-                            let ty = self.infer(value);
-                            apply_ty_prune(&self.subst, &ty)
-                        })
-                        .collect();
-                    let candidate_opt = self
-                        .select_overload_for_args(&ident, argc, &prelim_tys);
-                    match candidate_opt {
-                        OverloadSelect::NoMatch => {
-                            // No candidate accepts this arity/types — emit a
-                            // "no overload" error listing the available arities.
-                            let available: Vec<String> = self
-                                .overload_candidates(&ident)
-                                .map(|cs| {
-                                    cs.iter().map(|c| Self::overload_sig_label(c)).collect()
-                                })
-                                .unwrap_or_default();
-                            return self.error_with_help(
-                                ErrorCode::WrongArity,
-                                format!(
-                                    "No overload of `{}` accepts {} argument{}",
-                                    ident,
-                                    argc,
-                                    if argc == 1 { "" } else { "s" }
-                                ),
-                                range,
-                                Some(format!("available overloads: {}", available.join(", "))),
-                            );
-                        }
-                        OverloadSelect::Ambiguous => {
-                            return self.error_with_help(
-                                ErrorCode::AmbiguousOverload,
-                                format!(
-                                    "Ambiguous overload: call to `{}` matches multiple candidates",
-                                    ident
-                                ),
-                                range,
-                                Some(self.ambiguous_overload_help(&ident)),
-                            );
-                        }
-                        OverloadSelect::Selected(candidate) => {
-                            let candidate = candidate.clone();
-                            // Record the selection for codegen.
-                            self.selected_overloads_by_span.insert(
-                                (range.start, range.end),
-                                (candidate.fixed_arity, candidate.is_rest, candidate.id),
-                            );
-                            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
-                                let (fun_ty, constraints, mapping) =
-                                    self.instantiate_scheme_mapped(&candidate.scheme);
-                                (fun_ty, constraints, mapping, Some(candidate.scheme.clone()))
-                            };
-                            let (arg_tys, ordered_args) = self
-                                .infer_and_reorder_call_args_with_candidate(
-                                    &ident, &candidate, raw_args, &range,
-                                );
-                            let result = self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if ordered_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&ordered_args)
-                                },
-                                id,
-                                range.clone(),
-                            );
-                            if !fresh_constraints.is_empty() {
-                                self.discharge_constraints(id, &fresh_constraints, &range);
-                                if let Some(scheme) = original_scheme.as_ref() {
-                                    self.pin_assoc_after_discharge(
-                                        "",
-                                        &fresh_constraints,
-                                        Some(scheme),
-                                        &fresh_mapping,
-                                        &range,
-                                    );
-                                }
-                            }
-                            return result;
-                        }
-                    }
-                }
-
-                // Named call-site args: skip trait UFCS and resolve an ordinary
-                // function (partial application is allowed — residual Fun is OK).
-                if has_named {
-                    let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                        Some(s) => {
-                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                            (fun_ty, constraints, mapping, Some(s))
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownFunction,
-                                format!("Cannot find function `{}`", ident),
-                                range,
-                            );
-                        }
-                    };
-                    let (arg_tys, ordered_args) =
-                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                    let result = if let Some(filled) = self
-                        .partial_filled_tys_by_span
-                        .get(&(range.start, range.end))
-                        .cloned()
-                    {
-                        let mask = self
-                            .partial_fills_by_span
-                            .get(&(range.start, range.end))
-                            .copied()
-                            .unwrap_or(0);
-                        let n = mask.count_ones();
-                        if !Self::is_prefix_fill_mask(mask, n) {
-                            self.apply_partial_with_mask(&fun_ty, &filled, &range)
-                        } else {
-                            self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if ordered_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&ordered_args)
-                                },
-                                id,
-                                range.clone(),
-                            )
-                        }
-                    } else {
-                        self.apply_function(
-                            Some(&ident),
-                            &fun_ty,
-                            &arg_tys,
-                            if ordered_args.is_empty() {
-                                None
-                            } else {
-                                Some(&ordered_args)
-                            },
-                            id,
-                            range.clone(),
-                        )
-                    };
-                    if !fresh_constraints.is_empty() {
-                        self.discharge_constraints(id, &fresh_constraints, &range);
-                        if let Some(scheme) = original_scheme.as_ref() {
-                            self.pin_assoc_after_discharge(
-                                "",
-                                &fresh_constraints,
-                                Some(scheme),
-                                &fresh_mapping,
-                                &range,
-                            );
-                        }
-                    }
-                    // Named under-apply is now allowed (residual Fun is returned
-                    // for partial application). Error only on unknown/duplicate
-                    // named args (handled inside infer_and_reorder_call_args).
-                    return result;
-                }
-
-                // Rest-parameter calls pack trailing args; skip UFCS trait
-                // resolution so we don't double-infer (NodeId alignment).
-                if self.fn_has_rest(&ident) {
-                    let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                        Some(s) => {
-                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                            (fun_ty, constraints, mapping, Some(s))
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownFunction,
-                                format!("Cannot find function `{}`", ident),
-                                range,
-                            );
-                        }
-                    };
-                    let (call_arg_tys, ordered_args) =
-                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                    let result = self.apply_function(
-                        Some(&ident),
-                        &fun_ty,
-                        &call_arg_tys,
-                        if ordered_args.is_empty() {
-                            None
-                        } else {
-                            Some(&ordered_args)
-                        },
-                        id,
-                        range.clone(),
-                    );
-                    if !fresh_constraints.is_empty() {
-                        self.discharge_constraints(id, &fresh_constraints, &range);
-                        if let Some(scheme) = original_scheme.as_ref() {
-                            self.pin_assoc_after_discharge(
-                                "",
-                                &fresh_constraints,
-                                Some(scheme),
-                                &fresh_mapping,
-                                &range,
-                            );
-                        }
-                    }
-                    return result;
-                }
-
-                // Bare/UFCS trait method call: `method(x)`.
-                // Resolve it before ordinary environment lookup because class
-                // methods are selected by the active bound, not by a global FQN.
-                let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
-                let arg_tys: Vec<Ty> = flat_args
-                    .iter()
-                    .map(|arg| self.infer_call_arg(arg))
-                    .collect();
-                if let Some(Ty::Existential { class }) =
-                    arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
-                    && let Some((owner, method_slot, scheme)) =
-                        self.existential_method_candidate(&class, &ident)
-                {
-                    let hint = ExistentialMethodCall {
-                        method_slot,
-                        arity: arg_tys.len(),
-                        has_receiver: false,
-                    };
-                    if let Some(call_id) = id {
-                        self.existential_method_calls.insert(call_id, hint.clone());
-                    }
-                    self.existential_method_calls_by_span
-                        .insert((range.start, range.end), hint);
-                    return self.apply_existential_method(
-                        &owner,
-                        &ident,
-                        &scheme,
-                        &arg_tys,
-                        args.as_deref(),
-                        id,
-                        range,
-                    );
-                }
-                let candidates = self.bound_method_candidates(&ident, None);
-                if !candidates.is_empty() {
-                    let receiver_var = arg_tys.first().and_then(|ty| {
-                        Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
-                    });
-                    let candidates = receiver_var
-                        .map(|v| self.bound_method_candidates(&ident, Some(v)))
-                        .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
-                    if let Some((dict_index, dict_class, class, method_slot, scheme)) =
-                        self.select_bound_method(candidates, &ident, &range)
-                    {
-                        self.bind_matching_abstract_constraints(receiver_var, &dict_class);
-                        let (fun_ty, constraints, mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        if let Some(call_id) = id {
-                            self.bound_method_calls.insert(
-                                call_id,
-                                BoundMethodCall {
-                                    dict_index,
-                                    method_slot,
-                                    arity: arg_tys.len(),
-                                    has_receiver: false,
-                                },
-                            );
-                        }
-                        self.bound_method_calls_by_span.insert(
-                            (range.start, range.end),
-                            BoundMethodCall {
-                                dict_index,
-                                method_slot,
-                                arity: arg_tys.len(),
-                                has_receiver: false,
-                            },
-                        );
-                        let result = self.apply_function(
-                            Some(&format!("{}::{}", class, ident)),
-                            &fun_ty,
-                            &arg_tys,
-                            args.as_deref(),
-                            id,
-                            range.clone(),
-                        );
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                            self.pin_assoc_after_discharge(
-                                &class,
-                                &constraints,
-                                Some(&scheme),
-                                &mapping,
-                                &range,
-                            );
-                        }
-                        return result;
-                    }
-                }
-
-                let scheme = self.env.lookup(&ident).cloned();
-                let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                    Some(s) => {
-                        let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                        (fun_ty, constraints, mapping, Some(s))
-                    }
-                    None => {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            format!("Cannot find function `{}`", ident),
-                            range,
-                        );
-                    }
-                };
-
-                // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
-                if self.extern_variadic.contains(ident.as_str()) {
-                    return self.apply_extern_variadic_call(
-                        &ident,
-                        &fun_ty,
-                        &arg_tys,
-                        args.as_deref(),
-                        range,
-                    );
-                }
-
-                if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
-                    return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
-                }
-
-                let result = self.apply_function(
-                    Some(&ident),
-                    &fun_ty,
-                    &arg_tys,
-                    if flat_args.is_empty() {
-                        None
-                    } else {
-                        Some(&flat_args)
-                    },
-                    id,
-                    range.clone(),
-                );
-                // Discharge trait constraints from the instantiated scheme.
-                // This verifies that each concrete type argument satisfies the
-                // required bound, or propagates the constraint if the caller is
-                // itself generic with the same bound.
-                if !fresh_constraints.is_empty() {
-                    self.discharge_constraints(id, &fresh_constraints, &range);
-                    if let Some(scheme) = original_scheme.as_ref() {
-                        self.pin_assoc_after_discharge(
-                            "",
-                            &fresh_constraints,
-                            Some(scheme),
-                            &fresh_mapping,
-                            &range,
-                        );
-                    }
-                }
-                result
-            }
+            Expression::Call { name, args } => self.infer_call_expr(name, args, id, range),
 
             // ---- Match / loop / if ----
             Expression::If(branches) => self.infer_if(branches),
@@ -5561,6 +4558,1018 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_call_expr(
+        &mut self,
+        name: &Output,
+        args: &Option<Vec<Output>>,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        if let Expression::Identifier(callee) = name.1.as_ref() {
+            if let Some(arg_list) = args.as_deref() {
+                if arg_list.len() == 1 {
+                    if let Expression::Spread(pack) = arg_list[0].1.as_ref() {
+                        if self.next_id_idx < self.ids.ids().len() {
+                            self.next_id_idx += 1;
+                        }
+                        if let Some(ty) =
+                            self.try_infer_spread_call_target(callee, pack, &range, id)
+                        {
+                            return ty;
+                        }
+                    }
+                }
+            }
+        }
+        // Method call: `recv.method(args)` — Access callee.
+        if let Expression::Access(recv, method) = name.1.as_ref() {
+            let method_args = args.as_deref().unwrap_or(&[]);
+            let method_has_named = method_args
+                .iter()
+                .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
+            let recv_ty = self.infer(recv);
+            let resolved = apply_ty_prune(&self.subst, &recv_ty);
+
+            // Named args on methods: only inherent class methods.
+            if method_has_named {
+                let class_owner = self.class_owner_from_ty(&resolved);
+                if let Some(owner) = class_owner.as_ref()
+                    && self
+                        .methods
+                        .get(owner)
+                        .and_then(|m| m.get(*method))
+                        .is_some()
+                {
+                    let fqn = format!("{}::{}", owner, method);
+                    let user_argc = method_args.len();
+                    let scheme = if self.is_overloaded(&fqn) {
+                        let prelim_tys: Vec<Ty> = method_args
+                            .iter()
+                            .map(|a| {
+                                let value = match a.1.as_ref() {
+                                    Expression::NamedArg(_, v) => v,
+                                    _ => a,
+                                };
+                                let ty = self.infer(value);
+                                apply_ty_prune(&self.subst, &ty)
+                            })
+                            .collect();
+                        match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                            OverloadSelect::Selected(c) => {
+                                let c = c.clone();
+                                self.selected_overloads_by_span.insert(
+                                    (range.start, range.end),
+                                    (c.fixed_arity, c.is_rest, c.id),
+                                );
+                                c.scheme
+                            }
+                            OverloadSelect::Ambiguous => {
+                                return self.error_with_help(
+                                    ErrorCode::AmbiguousOverload,
+                                    format!(
+                                        "Ambiguous overload: call to `{}` matches multiple candidates",
+                                        fqn
+                                    ),
+                                    range,
+                                    Some(self.ambiguous_overload_help(&fqn)),
+                                );
+                            }
+                            OverloadSelect::NoMatch => {
+                                return self.error(
+                                    ErrorCode::WrongArity,
+                                    format!(
+                                        "No overload of `{}` accepts {} argument{}",
+                                        fqn,
+                                        user_argc,
+                                        if user_argc == 1 { "" } else { "s" }
+                                    ),
+                                    range,
+                                );
+                            }
+                        }
+                    } else {
+                        self.methods
+                            .get(owner)
+                            .and_then(|m| m.get(*method))
+                            .map(|(_, s)| s.clone())
+                            .expect("method present")
+                    };
+                    let (fun_ty, constraints, _mapping) =
+                        self.instantiate_scheme_mapped(&scheme);
+                    let mut arg_tys = vec![recv_ty];
+                    let (tys, ordered_exprs) =
+                        self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                    arg_tys.extend(tys);
+                    // Align exprs with `[self, …args]` for coerce_or_unify
+                    // (byte / string literal coercion on method args).
+                    let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
+                    arg_exprs.push(recv.clone());
+                    arg_exprs.extend(ordered_exprs);
+                    let result = self.apply_function(
+                        Some(&fqn),
+                        &fun_ty,
+                        &arg_tys,
+                        Some(&arg_exprs),
+                        id,
+                        range.clone(),
+                    );
+                    if !constraints.is_empty() {
+                        self.discharge_constraints(id, &constraints, &range);
+                    }
+                    return result;
+                }
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Named arguments are not supported on this call to `{}`",
+                        method
+                    ),
+                    range,
+                    Some(
+                        "named arguments are supported on ordinary functions and inherent methods"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            if let Ty::Existential { class } = &resolved
+                && let Some((owner, method_slot, scheme)) =
+                    self.existential_method_candidate(class, method)
+            {
+                let mut arg_tys = vec![recv_ty];
+                if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                    }
+                }
+                let hint = ExistentialMethodCall {
+                    method_slot,
+                    arity: arg_tys.len(),
+                    has_receiver: true,
+                };
+                if let Some(call_id) = id {
+                    self.existential_method_calls.insert(call_id, hint.clone());
+                }
+                self.existential_method_calls_by_span
+                    .insert((range.start, range.end), hint);
+                return self.apply_existential_method(
+                    &owner,
+                    method,
+                    &scheme,
+                    &arg_tys,
+                    args.as_deref(),
+                    id,
+                    range,
+                );
+            }
+            if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
+                let candidates = self.bound_method_candidates(method, Some(receiver_var));
+                if let Some((dict_index, dict_class, class, method_slot, scheme)) =
+                    self.select_bound_method(candidates, method, &range)
+                {
+                    self.bind_matching_abstract_constraints(
+                        Some(receiver_var),
+                        &dict_class,
+                    );
+                    let (fun_ty, constraints, mapping) =
+                        self.instantiate_scheme_mapped(&scheme);
+                    let mut arg_tys = vec![recv_ty];
+                    if let Some(a) = args {
+                        for arg in a {
+                            arg_tys.push(self.infer(arg));
+                        }
+                    }
+                    if let Some(call_id) = id {
+                        self.bound_method_calls.insert(
+                            call_id,
+                            BoundMethodCall {
+                                dict_index,
+                                method_slot,
+                                arity: arg_tys.len(),
+                                has_receiver: true,
+                            },
+                        );
+                    }
+                    self.bound_method_calls_by_span.insert(
+                        (range.start, range.end),
+                        BoundMethodCall {
+                            dict_index,
+                            method_slot,
+                            arity: arg_tys.len(),
+                            has_receiver: true,
+                        },
+                    );
+                    let result = self.apply_function(
+                        Some(&format!("{}::{}", class, method)),
+                        &fun_ty,
+                        &arg_tys,
+                        None,
+                        id,
+                        range.clone(),
+                    );
+                    if !constraints.is_empty() {
+                        self.discharge_constraints(id, &constraints, &range);
+                        self.pin_assoc_after_discharge(
+                            &class,
+                            &constraints,
+                            Some(&scheme),
+                            &mapping,
+                            &range,
+                        );
+                    }
+                    return result;
+                }
+            }
+            // Inherent class methods win over ground trait methods
+            // (Rust-style): `impl Point { fn show() ... }` must not be
+            // shadowed by prelude `Show::show` when no Show instance
+            // exists for Point.
+            let class_owner = self.class_owner_from_ty(&resolved);
+            if let Some(owner) = class_owner.as_ref()
+                && self
+                    .methods
+                    .get(owner)
+                    .and_then(|m| m.get(*method))
+                    .is_some()
+            {
+                if self.is_static_method(owner, method) {
+                    let fqn = format!("{}::{}", owner, method);
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is a static method; call it as `{}(...)`",
+                            method, fqn
+                        ),
+                        range,
+                        Some("static methods have no `self` receiver".to_string()),
+                    );
+                }
+                let fqn = format!("{}::{}", owner, method);
+                let user_argc = method_args.len();
+                let (scheme, selected) = if self.is_overloaded(&fqn) {
+                    let prelim_tys: Vec<Ty> = method_args
+                        .iter()
+                        .map(|a| {
+                            let value = match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v,
+                                _ => a,
+                            };
+                            let ty = self.infer(value);
+                            apply_ty_prune(&self.subst, &ty)
+                        })
+                        .collect();
+                    match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                        OverloadSelect::Selected(c) => {
+                            let c = c.clone();
+                            self.selected_overloads_by_span.insert(
+                                (range.start, range.end),
+                                (c.fixed_arity, c.is_rest, c.id),
+                            );
+                            (c.scheme, true)
+                        }
+                        OverloadSelect::Ambiguous => {
+                            return self.error_with_help(
+                                ErrorCode::AmbiguousOverload,
+                                format!(
+                                    "Ambiguous overload: call to `{}` matches multiple candidates",
+                                    fqn
+                                ),
+                                range,
+                                Some(self.ambiguous_overload_help(&fqn)),
+                            );
+                        }
+                        OverloadSelect::NoMatch => {
+                            let available: Vec<String> = self
+                                .overload_sets
+                                .get(&fqn)
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|c| {
+                                            if c.is_rest {
+                                                format!("{}+ args (rest)", c.fixed_arity)
+                                            } else {
+                                                format!("{} args", c.fixed_arity)
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            return self.error_with_help(
+                                ErrorCode::WrongArity,
+                                format!(
+                                    "No overload of `{}` accepts {} argument{}",
+                                    fqn,
+                                    user_argc,
+                                    if user_argc == 1 { "" } else { "s" }
+                                ),
+                                range,
+                                Some(format!(
+                                    "available arities: {}",
+                                    available.join(", ")
+                                )),
+                            );
+                        }
+                    }
+                } else {
+                    let scheme = self
+                        .methods
+                        .get(owner)
+                        .and_then(|m| m.get(*method))
+                        .map(|(_, s)| s.clone())
+                        .expect("method present");
+                    (scheme, false)
+                };
+                let _ = selected;
+                let (fun_ty, constraints, _mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                let mut arg_tys = vec![recv_ty];
+                let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
+                arg_exprs.push(recv.clone());
+                if self.fn_has_rest(&fqn) {
+                    let (tys, ordered_exprs) =
+                        self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                    arg_tys.extend(tys);
+                    arg_exprs.extend(ordered_exprs);
+                } else if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                        arg_exprs.push(arg.clone());
+                    }
+                }
+                let result = self.apply_function(
+                    Some(&fqn),
+                    &fun_ty,
+                    &arg_tys,
+                    Some(&arg_exprs),
+                    id,
+                    range.clone(),
+                );
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                }
+                return result;
+            }
+
+            // Ground trait method: `recv.into()` / `recv.show()` via a
+            // concrete instance (no open bound). Pin the return type from
+            // `current_expected` when present so `let y: T = x.into();`
+            // (or `return x.into();` under `-> T`) can select among
+            // multiple `Into` targets.
+            if let Some((class, scheme)) =
+                self.ground_trait_method_for_receiver(method, &recv_ty)
+            {
+                let (fun_ty, constraints, mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                let mut arg_tys = vec![recv_ty];
+                if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                    }
+                }
+                let result = self.apply_function(
+                    Some(&format!("{}::{}", class, method)),
+                    &fun_ty,
+                    &arg_tys,
+                    None,
+                    id,
+                    range.clone(),
+                );
+                if let Some(expected) = self.current_expected.clone() {
+                    self.unify(&result, &expected, &range, "expected type");
+                }
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                    self.pin_assoc_after_discharge(
+                        &class,
+                        &constraints,
+                        Some(&scheme),
+                        &mapping,
+                        &range,
+                    );
+                }
+                return apply_ty_prune(&self.subst, &result);
+            }
+
+            if let Some(owner) = class_owner {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    format!("Cannot find method `{}` on class `{}`", method, owner),
+                    range,
+                );
+            }
+            return self.error_with_help(
+                ErrorCode::NotAFunction,
+                format!("Cannot call method `{}` on non-class type", method),
+                range,
+                Some("method calls require a class instance receiver".to_string()),
+            );
+        }
+
+        // First-class callee (`lambda(...)`, nested fn value, etc.).
+        if !matches!(
+            name.1.as_ref(),
+            Expression::Identifier(_)
+                | Expression::Access(_, _)
+                | Expression::QualifiedAccess { .. }
+        ) {
+            let callee_ty = self.infer(name);
+            let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+            let arg_tys: Vec<Ty> = flat_args
+                .iter()
+                .map(|arg| self.infer_call_arg(arg))
+                .collect();
+            return self.apply_function(
+                None,
+                &callee_ty,
+                &arg_tys,
+                args.as_deref(),
+                id,
+                range,
+            );
+        }
+
+        let ident = match name.1.as_ref() {
+            Expression::Identifier(n) => n.to_string(),
+            Expression::QualifiedAccess { owner, member } => {
+                let fqn = format!("{}::{}", owner, member);
+                if self.static_slot_types.contains_key(&fqn) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("`{}` is a static field, not a function", fqn),
+                        range,
+                        Some(
+                            "read it as a value or assign with `Class::field = expr`"
+                                .to_string(),
+                        ),
+                    );
+                }
+                // Parser may emit Call(QualifiedAccess) for module paths;
+                // Class::static_method stays Construct, but accept Call too.
+                if let Some(ty) = self.try_infer_static_method_call(
+                    owner,
+                    member,
+                    &parser::ast::EnumConstructPayload::Tuple(
+                        args.as_deref().unwrap_or(&[]).to_vec(),
+                    ),
+                    range.clone(),
+                    id,
+                ) {
+                    return ty;
+                }
+                if self.has_method(owner, member) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
+                            fqn, member
+                        ),
+                        range,
+                        Some(format!(
+                            "or declare `static fn {}` to call it as `{}`",
+                            member, fqn
+                        )),
+                    );
+                }
+                fqn
+            }
+            _ => {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    "Invalid call target".to_string(),
+                    range,
+                );
+            }
+        };
+
+        let raw_args = args.as_deref().unwrap_or(&[]);
+        let has_named = raw_args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
+        if ident == "len" {
+            if has_named {
+                let (tys, reordered) =
+                    self.infer_and_reorder_call_args("len", raw_args, &range);
+                return self.infer_len_call_from_tys(&tys, &reordered, id, range);
+            }
+            return self.infer_len_call(args.as_deref(), id, range);
+        }
+        if let Some(kind) = self.string_fn_for_call(&ident) {
+            let arg_slice = if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    StringBuiltin::Format => {
+                        self.infer_string_format_call(reordered.as_slice(), range)
+                    }
+                    StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                        if kind == StringBuiltin::FromBytes
+                            && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                        {
+                            self.register_builtin_io_error();
+                        }
+                        let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                        let flat_args = self.flatten_spread_call_args(reordered.as_slice());
+                        let arg_tys: Vec<Ty> = flat_args
+                            .iter()
+                            .map(|arg| self.infer_call_arg(arg))
+                            .collect();
+                        self.apply_function(
+                            Some(&ident),
+                            &fun_ty,
+                            &arg_tys,
+                            if flat_args.is_empty() {
+                                None
+                            } else {
+                                Some(&flat_args)
+                            },
+                            id,
+                            range,
+                        )
+                    }
+                };
+            } else {
+                args.as_deref().unwrap_or(&[])
+            };
+            return match kind {
+                StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
+                StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                    if kind == StringBuiltin::FromBytes
+                        && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                    {
+                        self.register_builtin_io_error();
+                    }
+                    let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                    let flat_args = self.flatten_spread_call_args(arg_slice);
+                    let arg_tys: Vec<Ty> = flat_args
+                        .iter()
+                        .map(|arg| self.infer_call_arg(arg))
+                        .collect();
+                    self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if flat_args.is_empty() {
+                            None
+                        } else {
+                            Some(&flat_args)
+                        },
+                        id,
+                        range,
+                    )
+                }
+            };
+        }
+        // `assert` from `prelude::test` (auto-imported or via `use`).
+        if let Some(kind) = self.prelude_fn_in_scope(&ident) {
+            if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    PreludeFn::Assert => self.infer_assert(&reordered, range),
+                    PreludeFn::BlockOn => self.infer_block_on(&reordered, range),
+                    PreludeFn::Dot => self.infer_dot(&reordered, id, range),
+                    PreludeFn::MatMul => self.infer_matmul(&reordered, id, range),
+                    PreludeFn::Cross => self.infer_cross(&reordered, id, range),
+                    PreludeFn::Matrix => self.infer_matrix_ctor(&reordered, id, range),
+                    PreludeFn::Ord => self.infer_ord(&reordered, range),
+                    PreludeFn::Char => self.infer_char(&reordered, range),
+                    PreludeFn::Sin
+                    | PreludeFn::Cos
+                    | PreludeFn::Tan
+                    | PreludeFn::Sqrt
+                    | PreludeFn::Floor
+                    | PreludeFn::Ceil
+                    | PreludeFn::Exp
+                    | PreludeFn::Ln
+                    | PreludeFn::Pow => self.infer_math(kind, &reordered, range),
+                };
+            }
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            return match kind {
+                PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
+                PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
+                PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
+                PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
+                PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
+                PreludeFn::Ord => self.infer_ord(arg_slice, range),
+                PreludeFn::Char => self.infer_char(arg_slice, range),
+                PreludeFn::Sin
+                | PreludeFn::Cos
+                | PreludeFn::Tan
+                | PreludeFn::Sqrt
+                | PreludeFn::Floor
+                | PreludeFn::Ceil
+                | PreludeFn::Exp
+                | PreludeFn::Ln
+                | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
+            };
+        }
+        // `dload` / `declare` / `invoke` after `use ffi::{…}`.
+        if let Some(kind) = self.ffi_fn_in_scope(&ident) {
+            if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    FfiBuiltin::Dload => self.infer_ffi_dload(&reordered, range),
+                    FfiBuiltin::Declare => self.infer_ffi_declare(&reordered, range),
+                    FfiBuiltin::Invoke => self.infer_ffi_invoke(&reordered, range),
+                };
+            }
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            return match kind {
+                FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
+                FfiBuiltin::Declare => self.infer_ffi_declare(arg_slice, range),
+                FfiBuiltin::Invoke => self.infer_ffi_invoke(arg_slice, range),
+            };
+        }
+        if matches!(ident.as_str(), "dload" | "declare" | "invoke") {
+            return self.error_with_help(
+                ErrorCode::UnknownValue,
+                format!("Cannot find value `{}` in this scope", ident),
+                range,
+                Some(
+                    "import it with `use ffi::{dload, declare, invoke}`".to_string(),
+                ),
+            );
+        }
+
+        // ── Overload-dispatch: select by argc + argument types ─────
+        // Must happen before `has_named` and `fn_has_rest` branches so
+        // the correct candidate's param_names / is_rest are used.
+        if self.is_overloaded(&ident) {
+            let argc = raw_args.len();
+            // Preliminary arg types for same-arity disambiguation.
+            // Named args contribute their value type in source order;
+            // reordering happens after the candidate is chosen.
+            let prelim_tys: Vec<Ty> = raw_args
+                .iter()
+                .map(|a| {
+                    let value = match a.1.as_ref() {
+                        Expression::NamedArg(_, v) => v,
+                        _ => a,
+                    };
+                    let ty = self.infer(value);
+                    apply_ty_prune(&self.subst, &ty)
+                })
+                .collect();
+            let candidate_opt = self
+                .select_overload_for_args(&ident, argc, &prelim_tys);
+            match candidate_opt {
+                OverloadSelect::NoMatch => {
+                    // No candidate accepts this arity/types — emit a
+                    // "no overload" error listing the available arities.
+                    let available: Vec<String> = self
+                        .overload_candidates(&ident)
+                        .map(|cs| {
+                            cs.iter().map(|c| Self::overload_sig_label(c)).collect()
+                        })
+                        .unwrap_or_default();
+                    return self.error_with_help(
+                        ErrorCode::WrongArity,
+                        format!(
+                            "No overload of `{}` accepts {} argument{}",
+                            ident,
+                            argc,
+                            if argc == 1 { "" } else { "s" }
+                        ),
+                        range,
+                        Some(format!("available overloads: {}", available.join(", "))),
+                    );
+                }
+                OverloadSelect::Ambiguous => {
+                    return self.error_with_help(
+                        ErrorCode::AmbiguousOverload,
+                        format!(
+                            "Ambiguous overload: call to `{}` matches multiple candidates",
+                            ident
+                        ),
+                        range,
+                        Some(self.ambiguous_overload_help(&ident)),
+                    );
+                }
+                OverloadSelect::Selected(candidate) => {
+                    let candidate = candidate.clone();
+                    // Record the selection for codegen.
+                    self.selected_overloads_by_span.insert(
+                        (range.start, range.end),
+                        (candidate.fixed_arity, candidate.is_rest, candidate.id),
+                    );
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
+                        let (fun_ty, constraints, mapping) =
+                            self.instantiate_scheme_mapped(&candidate.scheme);
+                        (fun_ty, constraints, mapping, Some(candidate.scheme.clone()))
+                    };
+                    let (arg_tys, ordered_args) = self
+                        .infer_and_reorder_call_args_with_candidate(
+                            &ident, &candidate, raw_args, &range,
+                        );
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
+                    }
+                    return result;
+                }
+            }
+        }
+
+        // Named call-site args: skip trait UFCS and resolve an ordinary
+        // function (partial application is allowed — residual Fun is OK).
+        if has_named {
+            let scheme = self.env.lookup(&ident).cloned();
+            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                Some(s) => {
+                    let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                    (fun_ty, constraints, mapping, Some(s))
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownFunction,
+                        format!("Cannot find function `{}`", ident),
+                        range,
+                    );
+                }
+            };
+            let (arg_tys, ordered_args) =
+                self.infer_and_reorder_call_args(&ident, raw_args, &range);
+            let result = if let Some(filled) = self
+                .partial_filled_tys_by_span
+                .get(&(range.start, range.end))
+                .cloned()
+            {
+                let mask = self
+                    .partial_fills_by_span
+                    .get(&(range.start, range.end))
+                    .copied()
+                    .unwrap_or(0);
+                let n = mask.count_ones();
+                if !Self::is_prefix_fill_mask(mask, n) {
+                    self.apply_partial_with_mask(&fun_ty, &filled, &range)
+                } else {
+                    self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    )
+                }
+            } else {
+                self.apply_function(
+                    Some(&ident),
+                    &fun_ty,
+                    &arg_tys,
+                    if ordered_args.is_empty() {
+                        None
+                    } else {
+                        Some(&ordered_args)
+                    },
+                    id,
+                    range.clone(),
+                )
+            };
+            if !fresh_constraints.is_empty() {
+                self.discharge_constraints(id, &fresh_constraints, &range);
+                if let Some(scheme) = original_scheme.as_ref() {
+                    self.pin_assoc_after_discharge(
+                        "",
+                        &fresh_constraints,
+                        Some(scheme),
+                        &fresh_mapping,
+                        &range,
+                    );
+                }
+            }
+            // Named under-apply is now allowed (residual Fun is returned
+            // for partial application). Error only on unknown/duplicate
+            // named args (handled inside infer_and_reorder_call_args).
+            return result;
+        }
+
+        // Rest-parameter calls pack trailing args; skip UFCS trait
+        // resolution so we don't double-infer (NodeId alignment).
+        if self.fn_has_rest(&ident) {
+            let scheme = self.env.lookup(&ident).cloned();
+            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                Some(s) => {
+                    let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                    (fun_ty, constraints, mapping, Some(s))
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownFunction,
+                        format!("Cannot find function `{}`", ident),
+                        range,
+                    );
+                }
+            };
+            let (call_arg_tys, ordered_args) =
+                self.infer_and_reorder_call_args(&ident, raw_args, &range);
+            let result = self.apply_function(
+                Some(&ident),
+                &fun_ty,
+                &call_arg_tys,
+                if ordered_args.is_empty() {
+                    None
+                } else {
+                    Some(&ordered_args)
+                },
+                id,
+                range.clone(),
+            );
+            if !fresh_constraints.is_empty() {
+                self.discharge_constraints(id, &fresh_constraints, &range);
+                if let Some(scheme) = original_scheme.as_ref() {
+                    self.pin_assoc_after_discharge(
+                        "",
+                        &fresh_constraints,
+                        Some(scheme),
+                        &fresh_mapping,
+                        &range,
+                    );
+                }
+            }
+            return result;
+        }
+
+        // Bare/UFCS trait method call: `method(x)`.
+        // Resolve it before ordinary environment lookup because class
+        // methods are selected by the active bound, not by a global FQN.
+        let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+        let arg_tys: Vec<Ty> = flat_args
+            .iter()
+            .map(|arg| self.infer_call_arg(arg))
+            .collect();
+        if let Some(Ty::Existential { class }) =
+            arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
+            && let Some((owner, method_slot, scheme)) =
+                self.existential_method_candidate(&class, &ident)
+        {
+            let hint = ExistentialMethodCall {
+                method_slot,
+                arity: arg_tys.len(),
+                has_receiver: false,
+            };
+            if let Some(call_id) = id {
+                self.existential_method_calls.insert(call_id, hint.clone());
+            }
+            self.existential_method_calls_by_span
+                .insert((range.start, range.end), hint);
+            return self.apply_existential_method(
+                &owner,
+                &ident,
+                &scheme,
+                &arg_tys,
+                args.as_deref(),
+                id,
+                range,
+            );
+        }
+        let candidates = self.bound_method_candidates(&ident, None);
+        if !candidates.is_empty() {
+            let receiver_var = arg_tys.first().and_then(|ty| {
+                Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
+            });
+            let candidates = receiver_var
+                .map(|v| self.bound_method_candidates(&ident, Some(v)))
+                .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
+            if let Some((dict_index, dict_class, class, method_slot, scheme)) =
+                self.select_bound_method(candidates, &ident, &range)
+            {
+                self.bind_matching_abstract_constraints(receiver_var, &dict_class);
+                let (fun_ty, constraints, mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                if let Some(call_id) = id {
+                    self.bound_method_calls.insert(
+                        call_id,
+                        BoundMethodCall {
+                            dict_index,
+                            method_slot,
+                            arity: arg_tys.len(),
+                            has_receiver: false,
+                        },
+                    );
+                }
+                self.bound_method_calls_by_span.insert(
+                    (range.start, range.end),
+                    BoundMethodCall {
+                        dict_index,
+                        method_slot,
+                        arity: arg_tys.len(),
+                        has_receiver: false,
+                    },
+                );
+                let result = self.apply_function(
+                    Some(&format!("{}::{}", class, ident)),
+                    &fun_ty,
+                    &arg_tys,
+                    args.as_deref(),
+                    id,
+                    range.clone(),
+                );
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                    self.pin_assoc_after_discharge(
+                        &class,
+                        &constraints,
+                        Some(&scheme),
+                        &mapping,
+                        &range,
+                    );
+                }
+                return result;
+            }
+        }
+
+        let scheme = self.env.lookup(&ident).cloned();
+        let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+            Some(s) => {
+                let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                (fun_ty, constraints, mapping, Some(s))
+            }
+            None => {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    format!("Cannot find function `{}`", ident),
+                    range,
+                );
+            }
+        };
+
+        // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
+        if self.extern_variadic.contains(ident.as_str()) {
+            return self.apply_extern_variadic_call(
+                &ident,
+                &fun_ty,
+                &arg_tys,
+                args.as_deref(),
+                range,
+            );
+        }
+
+        if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
+            return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
+        }
+
+        let result = self.apply_function(
+            Some(&ident),
+            &fun_ty,
+            &arg_tys,
+            if flat_args.is_empty() {
+                None
+            } else {
+                Some(&flat_args)
+            },
+            id,
+            range.clone(),
+        );
+        // Discharge trait constraints from the instantiated scheme.
+        // This verifies that each concrete type argument satisfies the
+        // required bound, or propagates the constraint if the caller is
+        // itself generic with the same bound.
+        if !fresh_constraints.is_empty() {
+            self.discharge_constraints(id, &fresh_constraints, &range);
+            if let Some(scheme) = original_scheme.as_ref() {
+                self.pin_assoc_after_discharge(
+                    "",
+                    &fresh_constraints,
+                    Some(scheme),
+                    &fresh_mapping,
+                    &range,
+                );
+            }
+        }
+        result
     }
 
     // ============================================================
