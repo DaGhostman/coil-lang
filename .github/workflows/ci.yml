@@ -12,12 +12,47 @@ env:
 
 jobs:
   test:
-    name: cargo test + CLI harness (${{ matrix.os }})
+    name: test (${{ matrix.os }}, ${{ matrix.features.id }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # Default feature stack on every OS.
+        features:
+          - id: default
+            flags: ""
+        # Optional / tooling gates on Linux only so the failing job name
+        # identifies which feature broke without doubling macOS cost.
+        include:
+          - os: ubuntu-latest
+            features:
+              id: no-default
+              flags: "--no-default-features"
+          - os: ubuntu-latest
+            features:
+              id: crypto
+              flags: "--no-default-features --features crypto"
+          - os: ubuntu-latest
+            features:
+              id: time
+              flags: "--no-default-features --features time"
+          - os: ubuntu-latest
+            features:
+              id: regex
+              flags: "--no-default-features --features regex"
+          - os: ubuntu-latest
+            features:
+              id: tls
+              flags: "--no-default-features --features tls"
+          - os: ubuntu-latest
+            features:
+              id: dissect
+              flags: "--features dissect"
+          - os: ubuntu-latest
+            features:
+              id: debugger
+              flags: "--features debugger"
     steps:
       - uses: actions/checkout@v4
 
@@ -38,22 +73,27 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features.id }}
 
       - name: Build all CLI binaries
+        if: matrix.features.id == 'default'
         run: cargo build
 
-      - name: Workspace tests
+      - name: Workspace tests (${{ matrix.features.id }})
         run: |
           # macOS runners occasionally hit EAGAIN (WouldBlock) while cargo
           # lists many test binaries in parallel; one retry clears it.
-          # default-members builds coil + coil-debug/dissect/fmt/embed together.
-          cargo test || cargo test
-          cargo test -p compiler --features dissect || cargo test -p compiler --features dissect
+          # --all-targets covers lib + bins + integration tests + examples.
+          cargo test --workspace --all-targets ${{ matrix.features.flags }} \
+            || cargo test --workspace --all-targets ${{ matrix.features.flags }}
 
       - name: Language harness (`coil test`)
+        if: matrix.features.id == 'default'
         run: |
           ./target/debug/coil test
 
       - name: Showcase project tests
+        if: matrix.features.id == 'default'
         run: |
           BIN=./target/debug/coil ./examples/projects/run-tests.sh
