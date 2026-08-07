@@ -44,11 +44,18 @@ fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    // Deep attr inlining can overflow the default libtest thread stack in debug
-    // builds; match the main-thread headroom used by `coil` CLI.
-    const STACK: usize = 4 * 1024 * 1024;
+    // Deep attr/coroutine desugaring can use large individual typechecker
+    // stack frames; match the generous headroom set via `RUST_MIN_STACK` in
+    // `.cargo/config.toml` rather than the smaller value this used to hard
+    // code (a large-frame overflow can jump the guard page into adjacent
+    // memory instead of faulting cleanly — see docs/internals/limitations.md).
+    const STACK: usize = 32 * 1024 * 1024;
     let path = path.to_string();
+    // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
+    // triage point at the offending example after a crash.
+    let thread_name = path.clone();
     std::thread::Builder::new()
+        .name(thread_name)
         .stack_size(STACK)
         .spawn(move || run_example_multifile(&path))
         .expect("pipeline example thread")
@@ -3430,9 +3437,11 @@ fn main() {
 
 #[test]
 fn attr_on_async_fn_rejected_at_compile_time() {
-    let mut pipeline = Pipeline::new();
-    let result = pipeline.compile_src(
-        r#"
+    // Attr-body-crosses-yield desugaring for a coroutine target recurses deep
+    // enough (~1.5-2 MiB observed) to sit close to the default per-test
+    // thread stack; run on a dedicated thread with the same headroom as
+    // `run_example` (see docs/internals/limitations.md).
+    let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
@@ -3447,10 +3456,16 @@ fn main() {
     let h = counter();
     write(stdout(), to_bytes(format("%i", resume h)));
 }
-"#,
-    );
+"#
+    .to_string();
+    let is_err = std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || Pipeline::new().compile_src(&src).is_err())
+        .expect("diagnostic thread")
+        .join()
+        .expect("diagnostic thread join");
     assert!(
-        result.is_err(),
+        is_err,
         "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }

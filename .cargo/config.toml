@@ -1,0 +1,12 @@
+# Some typechecker recursion (attr-decorator inlining over coroutine
+# targets, deeply nested match/generic expansion) uses large individual
+# stack frames. Rust's default per-test thread stack can sit close enough
+# to the edge that heavy parallel `cargo test` runs occasionally overflow
+# it — and a large-frame overflow can jump past the guard page into an
+# adjacent thread's stack or the heap instead of faulting cleanly, which is
+# what shows up as sporadic SIGSEGV / "corrupted double-linked list" /
+# stack-smashing aborts in unrelated tests. Give every test-harness thread
+# generous headroom rather than only the threads that self-report a need
+# for it. See docs/internals/limitations.md ("Test / CI reliability").
+[env]
+RUST_MIN_STACK = "33554432"
