@@ -28,6 +28,15 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 
 GVN has no SSA slot rename; effectful ops are barriers. Per-function `multi_op_join_convoy` can mis-sink on JMPF diamonds — whole-buffer pass required. Fuse-select intentionally conservative during JMP migration.
 
+## Test / CI reliability (high–medium)
+
+| Issue | Detail |
+|-------|--------|
+| Parallel `thread_join` / mutex hang | `example_thread_join_prints_42` and `example_thread_mutex_prints_2` pass alone (~tens of ms) but can hang indefinitely under heavy parallel `compiler` pipeline load. Workaround: re-run, or `cargo test -p compiler --test pipeline -- --test-threads=1` / run the thread tests alone. |
+| Parallel heap corruption | Occasional `corrupted double-linked list` / SIGABRT when many pipeline VMs run concurrently. Usually clears on retry; serialize pipeline if it blocks a gate. |
+| Criterion vs `--all-targets` | Prefer `cargo test --workspace --lib --tests --bins` (CI and agent gate). `--all-targets` also builds `[[bench]]` targets; Criterion treats argv after `--` as its own CLI and aborts the suite. |
+| Optional feature suites | Full `cargo test` under `--no-default-features` (or a single of `crypto`/`time`/`regex`/`tls`) fails or hangs on tests that need the other libs. CI compile-gates those with `cargo check --workspace --lib --tests --bins …`; keep full tests on the default stack (plus `dissect` / `debugger`). |
+
 ## Tracking
 
 Most items have no inline `TODO`/`FIXME` — knowledge lives here and in [.cursor/skills/coil-contributor/reference.md](../../.cursor/skills/coil-contributor/reference.md). Update this file when closing a limitation.
