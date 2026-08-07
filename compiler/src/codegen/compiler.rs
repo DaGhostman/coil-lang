@@ -1019,21 +1019,43 @@ impl Compiler {
 
     /// Inline a tiny direct call, or emit nothing at all.
     ///
-    /// The attempt writes into a scratch buffer so a refusal cannot leave arg
-    /// prep or a partially copied body in `bytecode` — leaked ops would run
-    /// *and* be followed by the real `CALL`, clobbering caller slots.
+    /// A refusal must leave `bytecode` byte-for-byte as it was: arg prep and
+    /// partially copied body ops would otherwise run *and* be followed by the
+    /// real `CALL`, and their `STORE`s would write caller slots.
+    ///
+    /// The attempt keeps writing into the caller's buffer rather than a scratch
+    /// one, because the diamond path flushes that buffer into `self.bytecode` to
+    /// hold both in program order — handing it an empty scratch would sink the
+    /// caller's prefix (e.g. method-receiver staging) *after* the inlined body.
     fn try_emit_inline_direct_call(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        let mut scratch = Vec::new();
-        if self.try_inline_direct_call_into(fqn, args, &mut scratch) {
-            bytecode.append(&mut scratch);
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        if self.try_inline_direct_call_into(fqn, args, bytecode) {
             return true;
         }
+        Self::restore_emit_attempt(bytecode, prefix);
         false
+    }
+
+    /// Snapshot a speculative emit target so [`Self::restore_emit_attempt`] can
+    /// undo a refused attempt. `None` means it was empty (the common case).
+    fn emit_attempt_prefix(bytecode: &[Byte]) -> Option<Vec<Byte>> {
+        if bytecode.is_empty() {
+            None
+        } else {
+            Some(bytecode.to_vec())
+        }
+    }
+
+    fn restore_emit_attempt(bytecode: &mut Vec<Byte>, prefix: Option<Vec<Byte>>) {
+        match prefix {
+            Some(p) => *bytecode = p,
+            None => bytecode.clear(),
+        }
     }
 
     fn try_inline_direct_call_into(
@@ -1146,6 +1168,22 @@ impl Compiler {
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        if self.try_self_unroll_call_into(fqn, args, bytecode) {
+            return true;
+        }
+        // The inner bail clears `bytecode` after flushing it into `self.bytecode`,
+        // which would drop the caller's prefix along with the attempt.
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_self_unroll_call_into(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
         let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
             return false;
         };
@@ -1201,6 +1239,27 @@ impl Compiler {
     /// immediate/slot base return, evaluate that check before `CALL` so base cases
     /// skip the frame. Nested/false path still `CALL`s.
     fn try_emit_predicate_peel_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+        is_indirect: bool,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        let rollback = self.bytecode.len();
+        if self.try_predicate_peel_call_into(fqn, args, bytecode, target_offset, is_indirect) {
+            return true;
+        }
+        // `remap_peel_ops_ok` pre-checks the slot remaps, so the emit-time bails
+        // are defensive — but without this they would leave arg prep plus a
+        // half-built diamond whose labels never bind.
+        self.bytecode.truncate(rollback);
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_predicate_peel_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
