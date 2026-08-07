@@ -3025,6 +3025,26 @@
     }
 
     #[test]
+    fn stack_dce_drops_dead_string_and_const_pool_pop() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::String { idx: 0, loc },
+            IlOp::Pop { loc },
+            IlOp::ConstPool { idx: 3, loc },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert_eq!(
+            ops.len(),
+            1,
+            "String;Pop and ConstPool;Pop are pure discards; got {names:?}"
+        );
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
     fn stack_dce_iterates_to_fixpoint() {
         // `Load; Const; Pop; Pop`: removing the inner pair exposes `Load; Pop`.
         let loc = common::DebugLoc::unknown();
