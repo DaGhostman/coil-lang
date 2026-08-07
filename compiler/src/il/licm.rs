@@ -1268,7 +1268,6 @@ mod tests {
         assert_ne!(stores[0], stores[1], "temps must be distinct; got {stores:?}");
     }
 
-
     #[test]
     fn hoists_cast_triple_reusing_its_slot() {
         // `LOAD 0; Cast; STORE 5` in the body: hoist the whole triple and keep
