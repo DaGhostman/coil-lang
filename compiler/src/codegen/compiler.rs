@@ -6887,9 +6887,31 @@ impl Compiler {
                         Expression::Identifier(name) => self.stack_array_info(name),
                         _ => None,
                     };
+                    let tmp_val = self.alloc_temp_slot();
+                    if stack_info.is_none() {
+                        // Heap array: only the RHS needs a temp. Array and index
+                        // push straight onto the stack in `StoreIndex` order.
+                        let depth_on_entry = self.expr_depth;
+                        bytecode.push_store_pop(tmp_val);
+                        bytecode.append(&mut self.do_compile(arr));
+                        // The array stays on the stack while `idx` compiles, so
+                        // temps allocated there must not land on top of it.
+                        self.expr_depth = depth_on_entry + 1;
+                        bytecode.append(&mut self.do_compile(idx));
+                        self.expr_depth = depth_on_entry;
+                        bytecode.push_load(tmp_val);
+                        bytecode.push(Byte::new(Instruction::StoreIndex));
+                        if leave_value_on_stack {
+                            // StoreIndex leaves the value on the stack; keep it.
+                        } else {
+                            bytecode.push_pop();
+                        }
+                        return;
+                    }
+                    // Stack array: `emit_unbox_stack_array` needs the boxed
+                    // address back, so keep it in a temp.
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
-                    let tmp_val = self.alloc_temp_slot();
                     bytecode.push_store_pop(tmp_val);
                     bytecode.append(&mut self.do_compile(arr));
                     bytecode.push_store_pop(tmp_arr);
@@ -9940,17 +9962,20 @@ impl Compiler {
                         // Leave value on stack like StoreIndex.
                         bytecode.push_load(base + *i as u32);
                     } else {
-                        let tmp_arr = self.alloc_temp_slot();
-                        let tmp_idx = self.alloc_temp_slot();
+                        // Only the RHS needs a temp: `StoreIndex` wants
+                        // array/index/value bottom-to-top but the RHS is
+                        // evaluated first. Array and index push straight onto
+                        // the stack, so evaluation order is unchanged.
                         let tmp_val = self.alloc_temp_slot();
+                        let depth_on_entry = self.expr_depth;
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push_store_pop(tmp_val);
                         bytecode.append(&mut self.do_compile(arr));
-                        bytecode.push_store_pop(tmp_arr);
+                        // The array stays on the stack while `idx` compiles, so
+                        // temps allocated there must not land on top of it.
+                        self.expr_depth = depth_on_entry + 1;
                         bytecode.append(&mut self.do_compile(idx));
-                        bytecode.push_store_pop(tmp_idx);
-                        bytecode.push_load(tmp_arr);
-                        bytecode.push_load(tmp_idx);
+                        self.expr_depth = depth_on_entry;
                         bytecode.push_load(tmp_val);
                         bytecode.push(Byte::new(Instruction::StoreIndex));
                     }
@@ -11654,6 +11679,22 @@ impl Compiler {
                     fqn_base
                 };
                 if let Some(offset) = self.functions.get(&fqn).copied() {
+                    // Inline `Vec::push` as ArrayPush — avoids CALL/frame for fill loops.
+                    if fqn == format!("{}::push", common::BUILTIN_VEC_TYPE)
+                        && args.as_ref().map(|a| a.len()) == Some(1)
+                    {
+                        bytecode.append(&mut self.do_compile(recv));
+                        let arg = &args.as_ref().unwrap()[0];
+                        let value = match arg.1.as_ref() {
+                            Expression::NamedArg(_, v) => v,
+                            _ => arg,
+                        };
+                        bytecode.append(&mut self.do_compile(value));
+                        bytecode.push(Byte::new(Instruction::ArrayPush));
+                        bytecode.push_pop();
+                        bytecode.push_const(0);
+                        return bytecode;
+                    }
                     // Same ABI as free generics: box top-level type
                     // params, append trait dictionaries, unbox returns.
                     let lookup_name = strip_overload_key(&fqn).to_string();
