@@ -423,6 +423,8 @@ dependencies = [
  "compiler",
  "machine",
  "reporting",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

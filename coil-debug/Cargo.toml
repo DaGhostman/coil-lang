@@ -13,6 +13,14 @@ machine = { path = "../machine", default-features = false, features = ["debugger
 compiler = { path = "../compiler", default-features = false, features = ["dissect"] }
 reporting = { path = "../reporting" }
 coil-cli = { path = "../coil-cli", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
 
 [features]
 default = ["crypto", "time", "regex", "tls"]
