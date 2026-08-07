@@ -207,11 +207,6 @@
         }
     }
 
-    /// Turn `{ 1; 2; 3; }` into `{ 1; 2; return 3; }` for probe typing.
-    fn block_as_return_probe(block: &str) -> Option<String> {
-        block_as_fn_body_return(block).map(|body| format!("{{ {body} }}"))
-    }
-
     fn inferred_expr_ty(src: &str) -> Ty {
         if let Some(ty) = probe_return_type(src) {
             return ty;
@@ -5949,4 +5944,186 @@ fn main() {
             c.is_generic_fn("gen::foo"),
             "defining FQN must remain generic for other importers"
         );
+    }
+
+    // ---- Edge cases / caveat regression ----
+
+    #[test]
+    fn dynamic_int_slice_in_let_binding_errors() {
+        let msgs = assert_messages("let xs: [int] = [1, 2];");
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("dynamic array type `[T]`")),
+            "expected dynamic-slice rejection, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn dynamic_non_byte_slice_in_fn_return_ok() {
+        let src = "fn rows() -> [int] { return [1, 2, 3]; }";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn dynamic_slice_fn_param_allows_runtime_index() {
+        let src = "fn at([int] xs, int i) -> int { return xs[i]; }";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn dynamic_string_slice_in_let_binding_errors() {
+        let msgs = assert_messages(r#"let xs: [string] = ["a"];"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("dynamic array type `[T]`")),
+            "expected dynamic-slice rejection for [string], got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn match_user_enum_non_exhaustive_reports_missing_variant() {
+        let src = "enum Color { Red, Green, Blue } \
+                   let c = Color::Red; \
+                   match c { Color::Red => 0 };";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Non-exhaustive match")),
+            "expected non-exhaustive match on user enum, got: {:?}",
+            msgs
+        );
+        let detail = msgs
+            .iter()
+            .find(|m| m.message().contains("Non-exhaustive"))
+            .unwrap();
+        assert!(
+            detail.message().contains("Green") || detail.message().contains("Blue"),
+            "expected missing variant names, got: {:?}",
+            detail.message()
+        );
+    }
+
+    #[test]
+    fn match_user_enum_exhaustive_ok() {
+        let src = "enum Color { Red, Green } \
+                   let c = Color::Red; \
+                   match c { Color::Red => 1, Color::Green => 2 };";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn match_user_enum_wildcard_suppresses_exhaustiveness_error() {
+        let src = "enum Color { Red, Green, Blue } \
+                   let c = Color::Red; \
+                   match c { _ => 0 };";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn diagnostic_ranges_valid_for_bare_expr_type_errors() {
+        for src in &["1 + true", "true + 1", r#""hi" + 1"#] {
+            let (mut c, _) = check(src);
+            let src_len = src.len();
+            for msg in c.take_messages() {
+                let r = msg.range();
+                assert!(
+                    r.start <= r.end && r.end <= src_len,
+                    "wrapped probe must not skew spans: {:?} for len {} (msg: {})",
+                    r,
+                    src_len,
+                    msg.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inferred_expr_ty_reads_trailing_program_expression() {
+        assert_eq!(
+            inferred_expr_ty("let x: int = 1; let y: int = 2; x + y"),
+            int()
+        );
+        assert_eq!(
+            inferred_expr_ty(r#"class Foo { v: int } let x = new Foo(7); x.v"#),
+            int()
+        );
+    }
+
+    #[test]
+    fn adjacent_enum_and_let_declarations_parse() {
+        let src = "enum E { A, B } let x = E::A; x";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+        let ty = inferred_expr_ty(src);
+        assert_ne!(ty, unit_ty(), "trailing enum binding should not be unit");
+        let scheme = c.env().lookup("x").expect("x bound");
+        let mut counter = TyVarCounter::new();
+        let bound = apply_ty_prune(c.subst(), &instantiate(scheme, &mut counter));
+        assert_eq!(ty, bound, "trailing expr type should match binding");
+    }
+
+    #[test]
+    fn block_trailing_expr_without_semi_is_block_value() {
+        assert_eq!(inferred_expr_ty("{ 1; 2; 3 }"), int());
+        assert_eq!(inferred_expr_ty("{ { 99 } }"), int());
+        // Contrast: a trailing `expr;` inside a block is a statement (unit).
+        let (_, ty) = check("fn f() { 42; }");
+        assert_eq!(ty, unit_ty());
+    }
+
+    #[test]
+    fn len_empty_string_literal_is_zero() {
+        assert_ok(r#"len("")"#, int());
+    }
+
+    #[test]
+    fn len_empty_fixed_array_literal_is_zero() {
+        let src = "fn f() -> int { let xs: [int; 0] = []; return len(xs); }";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn len_nested_call_on_literal() {
+        assert_ok(r#"len("abcd")"#, int());
+        assert_ok("len([1, 2, 3, 4])", int());
+    }
+
+    #[test]
+    fn expr_statement_at_program_level_is_unit() {
+        let (_, ty) = check("1 + 2;");
+        assert_eq!(ty, unit_ty());
+    }
+
+    #[test]
+    fn bare_expr_probe_does_not_break_error_diagnostic_count() {
+        let msgs_stmt = assert_messages("1 + true;");
+        let msgs_bare = assert_messages("1 + true");
+        assert!(!msgs_stmt.is_empty());
+        assert!(!msgs_bare.is_empty());
+        assert_eq!(msgs_stmt.len(), msgs_bare.len());
+    }
+
+    #[test]
+    fn rest_param_dynamic_slice_in_fn_sig_ok() {
+        let src = "fn sum(int... xs) -> int { return len(xs); }";
+        let (mut c, _) = check(src);
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+    }
+
+    #[test]
+    fn fixed_array_in_let_still_requires_static_length() {
+        let (mut c, _) = check("let xs: [int; 3] = [1, 2, 3];");
+        assert!(c.take_messages().is_empty(), "{:?}", c.take_messages());
+        let ty = c
+            .codegen_var_type("xs")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("xs");
+        assert_eq!(ty, array_fixed(int(), 3));
     }
