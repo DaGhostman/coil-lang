@@ -91,3 +91,20 @@ test("for in coroutine") {
     }
     assert(sum == 3)?;
 }
+
+async fn once() {
+    return 99;
+}
+
+test("done false before first resume") {
+    let h = counter();
+    assert(done(h) == false)?;
+}
+
+test("immediate return async completes on first resume") {
+    let h = once();
+    assert(done(h) == false)?;
+    let v = resume h;
+    assert(v == 99)?;
+    assert(done(h) == true)?;
+}
