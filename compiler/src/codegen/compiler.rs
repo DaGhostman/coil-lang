@@ -6039,6 +6039,16 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// True when compiling `idx` will only push (no `STORE` that seeks `tell`
+    /// past a live operand). Safe to leave the array under the index on the
+    /// shared locals/operand buffer; call/inline index exprs are not.
+    fn index_keeps_array_on_stack_safe(idx: &Expression<'_>) -> bool {
+        matches!(
+            idx,
+            Expression::Identifier(_) | Expression::Integer(_)
+        )
+    }
+
     /// Synthesize the packed rest-array type for a call's trailing args
     /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
     fn synthesize_rest_array_ty(&self, rest: &[Output<'_>]) -> crate::typechecking::Ty {
@@ -6984,17 +6994,30 @@ impl Compiler {
                     };
                     let tmp_val = self.alloc_temp_slot();
                     if stack_info.is_none() {
-                        // Heap array: only the RHS needs a temp. Array and index
-                        // push straight onto the stack in `StoreIndex` order.
-                        let depth_on_entry = self.expr_depth;
+                        // Heap array: RHS is always spilled. Leaving the array on
+                        // the operand stack is only safe when `idx` is a pure push
+                        // (ident/int): a call/inline that `STORE`s temps seeks
+                        // `tell` past the stranded array, so StoreIndex pops a
+                        // stale slot instead of the array pointer.
                         bytecode.push_store_pop(tmp_val);
-                        bytecode.append(&mut self.do_compile(arr));
-                        // The array stays on the stack while `idx` compiles, so
-                        // temps allocated there must not land on top of it.
-                        self.expr_depth = depth_on_entry + 1;
-                        bytecode.append(&mut self.do_compile(idx));
-                        self.expr_depth = depth_on_entry;
-                        bytecode.push_load(tmp_val);
+                        if Self::index_keeps_array_on_stack_safe(idx.1.as_ref()) {
+                            let depth_on_entry = self.expr_depth;
+                            bytecode.append(&mut self.do_compile(arr));
+                            self.expr_depth = depth_on_entry + 1;
+                            bytecode.append(&mut self.do_compile(idx));
+                            self.expr_depth = depth_on_entry;
+                            bytecode.push_load(tmp_val);
+                        } else {
+                            let tmp_arr = self.alloc_temp_slot();
+                            let tmp_idx = self.alloc_temp_slot();
+                            bytecode.append(&mut self.do_compile(arr));
+                            bytecode.push_store_pop(tmp_arr);
+                            bytecode.append(&mut self.do_compile(idx));
+                            bytecode.push_store_pop(tmp_idx);
+                            bytecode.push_load(tmp_arr);
+                            bytecode.push_load(tmp_idx);
+                            bytecode.push_load(tmp_val);
+                        }
                         bytecode.push(Byte::new(Instruction::StoreIndex));
                         if leave_value_on_stack {
                             // StoreIndex leaves the value on the stack; keep it.
@@ -10057,21 +10080,30 @@ impl Compiler {
                         // Leave value on stack like StoreIndex.
                         bytecode.push_load(base + *i as u32);
                     } else {
-                        // Only the RHS needs a temp: `StoreIndex` wants
-                        // array/index/value bottom-to-top but the RHS is
-                        // evaluated first. Array and index push straight onto
-                        // the stack, so evaluation order is unchanged.
+                        // RHS is evaluated first and spilled. Array may stay on
+                        // the operand stack only for push-only index exprs —
+                        // see `index_keeps_array_on_stack_safe`.
                         let tmp_val = self.alloc_temp_slot();
                         let depth_on_entry = self.expr_depth;
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push_store_pop(tmp_val);
-                        bytecode.append(&mut self.do_compile(arr));
-                        // The array stays on the stack while `idx` compiles, so
-                        // temps allocated there must not land on top of it.
-                        self.expr_depth = depth_on_entry + 1;
-                        bytecode.append(&mut self.do_compile(idx));
-                        self.expr_depth = depth_on_entry;
-                        bytecode.push_load(tmp_val);
+                        if Self::index_keeps_array_on_stack_safe(idx.1.as_ref()) {
+                            bytecode.append(&mut self.do_compile(arr));
+                            self.expr_depth = depth_on_entry + 1;
+                            bytecode.append(&mut self.do_compile(idx));
+                            self.expr_depth = depth_on_entry;
+                            bytecode.push_load(tmp_val);
+                        } else {
+                            let tmp_arr = self.alloc_temp_slot();
+                            let tmp_idx = self.alloc_temp_slot();
+                            bytecode.append(&mut self.do_compile(arr));
+                            bytecode.push_store_pop(tmp_arr);
+                            bytecode.append(&mut self.do_compile(idx));
+                            bytecode.push_store_pop(tmp_idx);
+                            bytecode.push_load(tmp_arr);
+                            bytecode.push_load(tmp_idx);
+                            bytecode.push_load(tmp_val);
+                        }
                         bytecode.push(Byte::new(Instruction::StoreIndex));
                     }
                 }
