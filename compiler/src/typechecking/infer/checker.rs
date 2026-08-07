@@ -2314,57 +2314,7 @@ impl Checker {
             }
 
             // ---- Assignment / compound assignment / adjust ----
-            Expression::CompoundAssign(target, op, value) => {
-                let target_ty = self.infer_mutable_lvalue(target, range.clone());
-                let val_ty = self.infer(value);
-                let op_name = Self::compound_op_name(*op);
-                if matches!(
-                    op,
-                    parser::ast::AssignOp::Shl
-                        | parser::ast::AssignOp::Shr
-                        | parser::ast::AssignOp::BitAnd
-                        | parser::ast::AssignOp::BitOr
-                        | parser::ast::AssignOp::BitXor
-                ) {
-                    let _ = unify_with(&self.subst, &target_ty, &int());
-                    let _ = unify_with(&self.subst, &val_ty, &int());
-                } else {
-                    let tp = apply_ty_prune(&self.subst, &target_ty);
-                    let vp = apply_ty_prune(&self.subst, &val_ty);
-                    if crate::typechecking::aggregate_arith::is_matrix_ty(&tp)
-                        || crate::typechecking::aggregate_arith::is_matrix_ty(&vp)
-                    {
-                        let result =
-                            self.infer_matrix_arith(tp.clone(), vp, id, range.clone(), op_name);
-                        let _ = self.unify(
-                            &target_ty,
-                            &result,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    } else if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
-                        || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
-                    {
-                        // Resolve as aggregate arith; result must match LHS shape.
-                        let result =
-                            self.infer_aggregate_arith(tp.clone(), vp, id, range.clone(), op_name);
-                        let _ = self.unify(
-                            &target_ty,
-                            &result,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    } else {
-                        self.unify(
-                            &target_ty,
-                            &val_ty,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    }
-                }
-                apply_ty_prune(&self.subst, &target_ty)
-            }
+            Expression::CompoundAssign(target, op, value) => self.infer_compound_assign(target, op, value, id, range),
 
             Expression::Assignment(name, value) => {
                 if let Expression::Index(arr, None) = name.1.as_ref() {
@@ -2880,122 +2830,25 @@ impl Checker {
                 returns,
                 where_constraints,
                 body,
-            } => {
-                if *is_static {
-                    return self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        "`static fn` is only allowed inside an `impl` block".to_string(),
-                        range,
-                        Some(
-                            "declare static methods as `impl Class { static fn ... }`".to_string(),
-                        ),
-                    );
-                }
-                if *name == "main" {
-                    self.main_decl_span = Some(range.clone());
-                }
-                let prev_overloadable = self.registering_overloadable_fn;
-                self.registering_overloadable_fn = self.current_typeclass.is_none();
-
-                let test_desc = parser::ast::attr_test_desc(attrs, name);
-                let prev_test_result_mode = if let Some(desc) = &test_desc {
-                    self.test_case_names.push(desc.clone());
-                    let prev = self.fn_result_mode.take();
-                    self.fn_result_mode = Some((unit_ty(), string()));
-                    prev
-                } else {
-                    None
-                };
-
-                self.infer_function(
-                    name,
-                    type_params,
-                    args,
-                    returns.as_ref(),
-                    where_constraints,
-                    body.as_ref(),
-                    &range,
-                    None,
-                    *is_coro,
-                    None,
-                    false,
-                );
-
-                if test_desc.is_some() {
-                    self.result_mode_fns.insert(name.to_string());
-                    self.fn_result_mode = prev_test_result_mode;
-                }
-
-                self.registering_overloadable_fn = prev_overloadable;
-                unit_ty()
-            }
+            } => self.infer_function_expr(
+                attrs,
+                name,
+                *is_coro,
+                *is_static,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                body,
+                range,
+            ),
 
             // ---- Anonymous lambdas ----
             Expression::Lambda {
                 args,
                 captures,
                 body,
-            } => {
-                // Resolve capture types from the outer env before isolating.
-                let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
-                for cap in captures {
-                    match self.env.lookup(cap).cloned() {
-                        Some(scheme) => {
-                            let ty = self.instantiate_ty(&scheme);
-                            cap_bindings.push((cap.to_string(), ty));
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownValue,
-                                format!("Cannot find value `{}` in this scope", cap),
-                                range,
-                            );
-                        }
-                    }
-                }
-                let arg_tys = self.parse_arg_list(args);
-                let mut uncaptured = self.env.all_names();
-                for (n, _) in &cap_bindings {
-                    uncaptured.remove(n);
-                }
-                for (n, _) in &arg_tys {
-                    uncaptured.remove(n);
-                }
-
-                // File-level imports are global names, not closure captures.
-                // Rebind virtual + disk-module schemes after isolating the env.
-                let import_rebinds =
-                    self.snapshot_file_level_imports(&mut uncaptured, range.clone());
-
-                let saved_frames = self.env.take_and_isolate();
-                let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
-                self.rebind_file_level_imports(import_rebinds);
-                for (n, ty) in &cap_bindings {
-                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
-                    self.record_codegen_var_type(n.clone(), ty.clone());
-                }
-                for (n, ty) in &arg_tys {
-                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
-                    self.record_codegen_var_type(n.clone(), ty.clone());
-                }
-                // Match codegen: consume Fragment + Argument IDs before body.
-                self.assign_fn_arg_node_ids(args, &arg_tys);
-
-                let ret_slot = Ty::Var(self.counter.fresh());
-                let prev_ret = self.current_return_ty.replace(ret_slot.clone());
-                let body_ty = self.infer(body);
-                self.unify(&ret_slot, &body_ty, &range, "lambda body");
-                self.current_return_ty = prev_ret;
-                self.lambda_uncaptured_outer = prev_uncaptured;
-                self.env.restore_frames(saved_frames);
-
-                let ret = apply_ty_prune(&self.subst, &ret_slot);
-                let mut fun_ty = ret;
-                for (_, arg_ty) in arg_tys.iter().rev() {
-                    fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
-                }
-                Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false)
-            }
+            } => self.infer_lambda(args, captures, body, range),
 
             // ---- `test("…") { … }` harness cases ----
             Expression::TestCase { name, body } => self.infer_test_case(name, body, &range),
@@ -3222,6 +3075,199 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_compound_assign(
+        &mut self,
+        target: &Output,
+        op: &parser::ast::AssignOp,
+        value: &Output,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        let target_ty = self.infer_mutable_lvalue(target, range.clone());
+        let val_ty = self.infer(value);
+        let op_name = Self::compound_op_name(*op);
+        if matches!(
+            op,
+            parser::ast::AssignOp::Shl
+                | parser::ast::AssignOp::Shr
+                | parser::ast::AssignOp::BitAnd
+                | parser::ast::AssignOp::BitOr
+                | parser::ast::AssignOp::BitXor
+        ) {
+            let _ = unify_with(&self.subst, &target_ty, &int());
+            let _ = unify_with(&self.subst, &val_ty, &int());
+        } else {
+            let tp = apply_ty_prune(&self.subst, &target_ty);
+            let vp = apply_ty_prune(&self.subst, &val_ty);
+            if crate::typechecking::aggregate_arith::is_matrix_ty(&tp)
+                || crate::typechecking::aggregate_arith::is_matrix_ty(&vp)
+            {
+                let result =
+                    self.infer_matrix_arith(tp.clone(), vp, id, range.clone(), op_name);
+                let _ = self.unify(
+                    &target_ty,
+                    &result,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            } else if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
+                || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
+            {
+                // Resolve as aggregate arith; result must match LHS shape.
+                let result =
+                    self.infer_aggregate_arith(tp.clone(), vp, id, range.clone(), op_name);
+                let _ = self.unify(
+                    &target_ty,
+                    &result,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            } else {
+                self.unify(
+                    &target_ty,
+                    &val_ty,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            }
+        }
+        apply_ty_prune(&self.subst, &target_ty)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_function_expr(
+        &mut self,
+        attrs: &[parser::ast::Attribute],
+        name: &str,
+        is_coro: bool,
+        is_static: bool,
+        type_params: &[TypeParam],
+        args: &Output,
+        returns: &Option<Output>,
+        where_constraints: &[parser::ast::WhereConstraint],
+        body: &Option<Output>,
+        range: Range<usize>,
+    ) -> Ty {
+        if is_static {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "`static fn` is only allowed inside an `impl` block".to_string(),
+                range,
+                Some(
+                    "declare static methods as `impl Class { static fn ... }`".to_string(),
+                ),
+            );
+        }
+        if name == "main" {
+            self.main_decl_span = Some(range.clone());
+        }
+        let prev_overloadable = self.registering_overloadable_fn;
+        self.registering_overloadable_fn = self.current_typeclass.is_none();
+
+        let test_desc = parser::ast::attr_test_desc(attrs, name);
+        let prev_test_result_mode = if let Some(desc) = &test_desc {
+            self.test_case_names.push(desc.clone());
+            let prev = self.fn_result_mode.take();
+            self.fn_result_mode = Some((unit_ty(), string()));
+            prev
+        } else {
+            None
+        };
+
+        self.infer_function(
+            name,
+            type_params,
+            args,
+            returns.as_ref(),
+            where_constraints,
+            body.as_ref(),
+            &range,
+            None,
+            is_coro,
+            None,
+            false,
+        );
+
+        if test_desc.is_some() {
+            self.result_mode_fns.insert(name.to_string());
+            self.fn_result_mode = prev_test_result_mode;
+        }
+
+        self.registering_overloadable_fn = prev_overloadable;
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_lambda(
+        &mut self,
+        args: &Output,
+        captures: &[&str],
+        body: &Output,
+        range: Range<usize>,
+    ) -> Ty {
+        // Resolve capture types from the outer env before isolating.
+        let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
+        for cap in captures {
+            match self.env.lookup(cap).cloned() {
+                Some(scheme) => {
+                    let ty = self.instantiate_ty(&scheme);
+                    cap_bindings.push((cap.to_string(), ty));
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownValue,
+                        format!("Cannot find value `{}` in this scope", cap),
+                        range,
+                    );
+                }
+            }
+        }
+        let arg_tys = self.parse_arg_list(args);
+        let mut uncaptured = self.env.all_names();
+        for (n, _) in &cap_bindings {
+            uncaptured.remove(n);
+        }
+        for (n, _) in &arg_tys {
+            uncaptured.remove(n);
+        }
+
+        // File-level imports are global names, not closure captures.
+        // Rebind virtual + disk-module schemes after isolating the env.
+        let import_rebinds =
+            self.snapshot_file_level_imports(&mut uncaptured, range.clone());
+
+        let saved_frames = self.env.take_and_isolate();
+        let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+        self.rebind_file_level_imports(import_rebinds);
+        for (n, ty) in &cap_bindings {
+            self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
+            self.record_codegen_var_type(n.clone(), ty.clone());
+        }
+        for (n, ty) in &arg_tys {
+            self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
+            self.record_codegen_var_type(n.clone(), ty.clone());
+        }
+        // Match codegen: consume Fragment + Argument IDs before body.
+        self.assign_fn_arg_node_ids(args, &arg_tys);
+
+        let ret_slot = Ty::Var(self.counter.fresh());
+        let prev_ret = self.current_return_ty.replace(ret_slot.clone());
+        let body_ty = self.infer(body);
+        self.unify(&ret_slot, &body_ty, &range, "lambda body");
+        self.current_return_ty = prev_ret;
+        self.lambda_uncaptured_outer = prev_uncaptured;
+        self.env.restore_frames(saved_frames);
+
+        let ret = apply_ty_prune(&self.subst, &ret_slot);
+        let mut fun_ty = ret;
+        for (_, arg_ty) in arg_tys.iter().rev() {
+            fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+        }
+        Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false)
     }
 
     #[inline(never)]
