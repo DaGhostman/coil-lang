@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, Visibility};
+use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, TypeParam, Visibility};
 use reporting::{ErrorCode, Label, Message};
 
 use crate::typechecking::env::{Env, TyVarCounter, instantiate_with_kinds};
@@ -3831,209 +3831,7 @@ impl Checker {
                 name,
                 type_params,
                 methods,
-            } => {
-                // Collect associated type declarations and method defs.
-                let mut assoc_types: Vec<AssocTypeDecl> = Vec::new();
-                let method_defs: Vec<TypeClassMethodDef> = methods
-                    .iter()
-                    .filter_map(|m| match m.1.as_ref() {
-                        Expression::AssocTypeDecl {
-                            name: aname,
-                            type_params: assoc_params,
-                        } => {
-                            if assoc_types.iter().any(|a| a.name == *aname) {
-                                self.messages.push(Message::error(
-                                    ErrorCode::GenericTypeError,
-                                    format!(
-                                        "Duplicate associated type `{}` in trait `{}`",
-                                        aname, name
-                                    ),
-                                    m.0.into_range(),
-                                ));
-                            } else {
-                                let param_kinds = assoc_params
-                                    .iter()
-                                    .map(|tp| self.resolve_type_param_kind(tp))
-                                    .collect::<Vec<_>>();
-                                assoc_types.push(AssocTypeDecl::new(
-                                    aname.to_string(),
-                                    assoc_params.iter().map(|tp| tp.name.to_string()).collect(),
-                                    param_kinds,
-                                ));
-                            }
-                            None
-                        }
-                        Expression::Function {
-                            docs: _,
-                            name: mname, body, ..
-                        } => {
-                            let has_default = body.as_ref().is_some_and(
-                                |b| !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty()),
-                            );
-                            Some(TypeClassMethodDef {
-                                name: mname.to_string(),
-                                has_default,
-                            })
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let param_names: Vec<String> =
-                    type_params.iter().map(|tp| tp.name.to_string()).collect();
-                let param_kinds: Vec<Kind> = type_params
-                    .iter()
-                    .map(|tp| Kind::from(tp.kind.clone()))
-                    .collect();
-                // Single-param classes: param bounds become direct superclasses
-                // (`trait Ordered<T: Equal>` → superclasses: ["Equal"]).
-                // Multi-param classes ignore param bounds for superclass
-                // wiring (use `where` for those constraints later).
-                let superclasses: Vec<String> = if type_params.len() == 1 {
-                    type_params[0]
-                        .bounds
-                        .iter()
-                        .map(|b| (*b).to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if let Some(previous) = self.generics.typeclass(name) {
-                    let is_prelude = Checker::is_builtin_class(name);
-                    if is_prelude && !self.builtin_name_in_scope(name) {
-                        // Short name was rebound (`use prelude::ops::Eq as …`);
-                        // allow the user trait to replace the builtin entry.
-                    } else {
-                        let mut msg = Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Duplicate trait `{}`", name),
-                            range.clone(),
-                        );
-                        if is_prelude && self.builtin_name_in_scope(name) {
-                            msg.with_help(format!(
-                                "`{}` is in the prelude; free the short name with `use {}::{} as OtherName;` before redefining, or pick a different name",
-                                name,
-                                previous.defined_module,
-                                name
-                            ));
-                        } else {
-                            msg.with_help(format!(
-                                "trait `{}` was already declared in module `{}`",
-                                name, previous.defined_module
-                            ));
-                        }
-                        self.messages.push(msg);
-                        for m in methods {
-                            let _ = self.infer(m);
-                        }
-                        return unit_ty();
-                    }
-                }
-                let def = TypeClassDef {
-                    name: name.to_string(),
-                    defined_module: self.current_module.clone(),
-                    type_params: param_names,
-                    param_kinds: param_kinds.clone(),
-                    superclasses,
-                    assoc_types: assoc_types.clone(),
-                    methods: method_defs.clone(),
-                };
-                self.generics.typeclasses.insert(name.to_string(), def);
-
-                // Build method schemes with trait parameters in scope.
-                // Applied associated types are recorded as explicit projection
-                // variables and quantified with the method scheme.
-                let mut param_frame = HashMap::new();
-                let mut param_vars = Vec::new();
-                let mut class_kinds = Vec::new();
-                for (i, type_param) in type_params.iter().enumerate() {
-                    let var = self.counter.fresh();
-                    let kind = param_kinds.get(i).cloned().unwrap_or(Kind::Type);
-                    self.set_var_kind(var, kind.clone());
-                    param_frame.insert(type_param.name.to_string(), var);
-                    param_vars.push(var);
-                    class_kinds.push(kind);
-                }
-                self.type_params_in_scope.push(param_frame);
-                self.current_typeclass = Some(name.to_string());
-                // ONE constraint over all class params (multi-param ready).
-                let class_constraints: Vec<Constraint> = vec![Constraint {
-                    class: name.to_string(),
-                    args: param_vars.iter().map(|v| Ty::Var(*v)).collect(),
-                }];
-                for method in methods {
-                    if let Expression::Function {
-                        docs: _,
-                        name: method_name,
-                        type_params: method_params,
-                        args,
-                        returns,
-                        ..
-                    } = method.1.as_ref()
-                    {
-                        // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
-                        let mut method_frame = HashMap::new();
-                        let mut method_vars = Vec::new();
-                        let mut method_kinds = Vec::new();
-                        for mp in method_params {
-                            let var = self.counter.fresh();
-                            let kind = self.resolve_type_param_kind(mp);
-                            self.set_var_kind(var, kind.clone());
-                            method_frame.insert(mp.name.to_string(), var);
-                            method_vars.push(var);
-                            method_kinds.push(kind);
-                        }
-                        let pushed_method = !method_frame.is_empty();
-                        if pushed_method {
-                            self.type_params_in_scope.push(method_frame);
-                        }
-                        let prev_assoc = self.current_assoc_projections.take();
-                        self.current_assoc_projections = Some(Vec::new());
-                        let arg_tys = self.parse_arg_list(args);
-                        let ret_ty = returns
-                            .as_ref()
-                            .map(|ret| self.parse_type_name(ret))
-                            .unwrap_or_else(unit_ty);
-                        let assoc_projections =
-                            self.current_assoc_projections.take().unwrap_or_default();
-                        self.current_assoc_projections = prev_assoc;
-                        let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
-                            Ty::Fun(Box::new(arg.clone()), Box::new(ret))
-                        });
-                        if pushed_method {
-                            self.type_params_in_scope.pop();
-                        }
-                        let mut all_bounds = param_vars.clone();
-                        all_bounds.extend(method_vars);
-                        all_bounds.extend(assoc_projections.iter().map(|p| p.var));
-                        let mut all_kinds = class_kinds.clone();
-                        all_kinds.extend(method_kinds);
-                        all_kinds.extend(std::iter::repeat_n(Kind::Type, assoc_projections.len()));
-                        self.typeclass_method_schemes.insert(
-                            (name.to_string(), method_name.to_string()),
-                            Scheme::poly_with_kinds_and_assoc(
-                                all_bounds,
-                                all_kinds,
-                                class_constraints.clone(),
-                                assoc_projections,
-                                fun_ty,
-                            ),
-                        );
-                    }
-                }
-
-                // Walk method bodies (ID alignment + default body typecheck).
-                // The class's own constraint is active so a default can call a
-                // sibling method through the same dictionary.
-                let active_len = self.active_constraints.len();
-                self.active_constraints.extend(class_constraints);
-                for m in methods {
-                    let _ = self.infer(m);
-                }
-                self.active_constraints.truncate(active_len);
-                self.type_params_in_scope.pop();
-                self.current_typeclass = None;
-                unit_ty()
-            }
+            } => self.infer_typeclass_decl(name, type_params, methods, range),
 
             Expression::TypeClassImpl {
                 class,
@@ -4103,6 +3901,217 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_typeclass_decl(
+        &mut self,
+        name: &str,
+        type_params: &[TypeParam],
+        methods: &[Output],
+        range: Range<usize>,
+    ) -> Ty {
+        // Collect associated type declarations and method defs.
+        let mut assoc_types: Vec<AssocTypeDecl> = Vec::new();
+        let method_defs: Vec<TypeClassMethodDef> = methods
+            .iter()
+            .filter_map(|m| match m.1.as_ref() {
+                Expression::AssocTypeDecl {
+                    name: aname,
+                    type_params: assoc_params,
+                } => {
+                    if assoc_types.iter().any(|a| a.name == *aname) {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Duplicate associated type `{}` in trait `{}`",
+                                aname, name
+                            ),
+                            m.0.into_range(),
+                        ));
+                    } else {
+                        let param_kinds = assoc_params
+                            .iter()
+                            .map(|tp| self.resolve_type_param_kind(tp))
+                            .collect::<Vec<_>>();
+                        assoc_types.push(AssocTypeDecl::new(
+                            aname.to_string(),
+                            assoc_params.iter().map(|tp| tp.name.to_string()).collect(),
+                            param_kinds,
+                        ));
+                    }
+                    None
+                }
+                Expression::Function {
+                    docs: _,
+                    name: mname, body, ..
+                } => {
+                    let has_default = body.as_ref().is_some_and(
+                        |b| !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty()),
+                    );
+                    Some(TypeClassMethodDef {
+                        name: mname.to_string(),
+                        has_default,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let param_names: Vec<String> =
+            type_params.iter().map(|tp| tp.name.to_string()).collect();
+        let param_kinds: Vec<Kind> = type_params
+            .iter()
+            .map(|tp| Kind::from(tp.kind.clone()))
+            .collect();
+        // Single-param classes: param bounds become direct superclasses
+        // (`trait Ordered<T: Equal>` → superclasses: ["Equal"]).
+        // Multi-param classes ignore param bounds for superclass
+        // wiring (use `where` for those constraints later).
+        let superclasses: Vec<String> = if type_params.len() == 1 {
+            type_params[0]
+                .bounds
+                .iter()
+                .map(|b| (*b).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(previous) = self.generics.typeclass(name) {
+            let is_prelude = Checker::is_builtin_class(name);
+            if is_prelude && !self.builtin_name_in_scope(name) {
+                // Short name was rebound (`use prelude::ops::Eq as …`);
+                // allow the user trait to replace the builtin entry.
+            } else {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("Duplicate trait `{}`", name),
+                    range.clone(),
+                );
+                if is_prelude && self.builtin_name_in_scope(name) {
+                    msg.with_help(format!(
+                        "`{}` is in the prelude; free the short name with `use {}::{} as OtherName;` before redefining, or pick a different name",
+                        name,
+                        previous.defined_module,
+                        name
+                    ));
+                } else {
+                    msg.with_help(format!(
+                        "trait `{}` was already declared in module `{}`",
+                        name, previous.defined_module
+                    ));
+                }
+                self.messages.push(msg);
+                for m in methods {
+                    let _ = self.infer(m);
+                }
+                return unit_ty();
+            }
+        }
+        let def = TypeClassDef {
+            name: name.to_string(),
+            defined_module: self.current_module.clone(),
+            type_params: param_names,
+            param_kinds: param_kinds.clone(),
+            superclasses,
+            assoc_types: assoc_types.clone(),
+            methods: method_defs.clone(),
+        };
+        self.generics.typeclasses.insert(name.to_string(), def);
+
+        // Build method schemes with trait parameters in scope.
+        // Applied associated types are recorded as explicit projection
+        // variables and quantified with the method scheme.
+        let mut param_frame = HashMap::new();
+        let mut param_vars = Vec::new();
+        let mut class_kinds = Vec::new();
+        for (i, type_param) in type_params.iter().enumerate() {
+            let var = self.counter.fresh();
+            let kind = param_kinds.get(i).cloned().unwrap_or(Kind::Type);
+            self.set_var_kind(var, kind.clone());
+            param_frame.insert(type_param.name.to_string(), var);
+            param_vars.push(var);
+            class_kinds.push(kind);
+        }
+        self.type_params_in_scope.push(param_frame);
+        self.current_typeclass = Some(name.to_string());
+        // ONE constraint over all class params (multi-param ready).
+        let class_constraints: Vec<Constraint> = vec![Constraint {
+            class: name.to_string(),
+            args: param_vars.iter().map(|v| Ty::Var(*v)).collect(),
+        }];
+        for method in methods {
+            if let Expression::Function {
+                docs: _,
+                name: method_name,
+                type_params: method_params,
+                args,
+                returns,
+                ..
+            } = method.1.as_ref()
+            {
+                // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
+                let mut method_frame = HashMap::new();
+                let mut method_vars = Vec::new();
+                let mut method_kinds = Vec::new();
+                for mp in method_params {
+                    let var = self.counter.fresh();
+                    let kind = self.resolve_type_param_kind(mp);
+                    self.set_var_kind(var, kind.clone());
+                    method_frame.insert(mp.name.to_string(), var);
+                    method_vars.push(var);
+                    method_kinds.push(kind);
+                }
+                let pushed_method = !method_frame.is_empty();
+                if pushed_method {
+                    self.type_params_in_scope.push(method_frame);
+                }
+                let prev_assoc = self.current_assoc_projections.take();
+                self.current_assoc_projections = Some(Vec::new());
+                let arg_tys = self.parse_arg_list(args);
+                let ret_ty = returns
+                    .as_ref()
+                    .map(|ret| self.parse_type_name(ret))
+                    .unwrap_or_else(unit_ty);
+                let assoc_projections =
+                    self.current_assoc_projections.take().unwrap_or_default();
+                self.current_assoc_projections = prev_assoc;
+                let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
+                    Ty::Fun(Box::new(arg.clone()), Box::new(ret))
+                });
+                if pushed_method {
+                    self.type_params_in_scope.pop();
+                }
+                let mut all_bounds = param_vars.clone();
+                all_bounds.extend(method_vars);
+                all_bounds.extend(assoc_projections.iter().map(|p| p.var));
+                let mut all_kinds = class_kinds.clone();
+                all_kinds.extend(method_kinds);
+                all_kinds.extend(std::iter::repeat_n(Kind::Type, assoc_projections.len()));
+                self.typeclass_method_schemes.insert(
+                    (name.to_string(), method_name.to_string()),
+                    Scheme::poly_with_kinds_and_assoc(
+                        all_bounds,
+                        all_kinds,
+                        class_constraints.clone(),
+                        assoc_projections,
+                        fun_ty,
+                    ),
+                );
+            }
+        }
+
+        // Walk method bodies (ID alignment + default body typecheck).
+        // The class's own constraint is active so a default can call a
+        // sibling method through the same dictionary.
+        let active_len = self.active_constraints.len();
+        self.active_constraints.extend(class_constraints);
+        for m in methods {
+            let _ = self.infer(m);
+        }
+        self.active_constraints.truncate(active_len);
+        self.type_params_in_scope.pop();
+        self.current_typeclass = None;
+        unit_ty()
     }
 
     #[inline(never)]
