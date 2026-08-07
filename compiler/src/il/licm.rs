@@ -2,14 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use common::Instruction;
+use common::{DebugLoc, Instruction};
 
 use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
 
 /// Hoist loop-invariant `Const` / `Load` / `BinSlotImm` / `BinSlotSlot` out of
 /// natural loops when header SP-in is Known. Also sinks repeated table-indexed
-/// `STRING` field-key literals into preheader temps (GetField/SetField loops).
+/// `STRING` field-key literals into preheader temps (GetField/SetField loops),
+/// and CSEs invariant `LOAD; CastIntToFloat` into a preheader temp.
 pub fn licm(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
         return;
@@ -17,7 +18,110 @@ pub fn licm(ops: &mut Vec<IlOp>) {
     if licm_string_keys(ops) {
         return;
     }
+    // Each pass clears one loop; a cast hoisted out of an inner loop becomes a
+    // candidate in the enclosing one, so iterate until it reaches the outermost
+    // level. Progress is monotone toward outer loops, hence the loop-count bound.
+    let mut hoisted = false;
+    for _ in 0..find_natural_loops(ops).len() + 1 {
+        if !licm_cast_int_to_float(ops) {
+            break;
+        }
+        hoisted = true;
+    }
+    if hoisted {
+        return;
+    }
     licm_stack_producers(ops);
+}
+
+/// CSE every invariant `LOAD slot; CastIntToFloat` in the innermost eligible
+/// loop: one preheader temp per distinct slot, reloaded in the body. Returns
+/// whether anything was rewritten.
+fn licm_cast_int_to_float(ops: &mut Vec<IlOp>) -> bool {
+    let info = sp::analyze(ops);
+    let mut loops = find_natural_loops(ops);
+    loops.sort_by_key(|l| std::cmp::Reverse(l.header));
+    for lp in &loops {
+        if !info.sp_before(lp.header).is_known() {
+            continue;
+        }
+        if loop_has_barrier(ops, lp) {
+            continue;
+        }
+        let stored = slots_stored_in_loop(ops, lp);
+        let mut found: Vec<(usize, u32, DebugLoc)> = Vec::new();
+        let mut i = lp.body_start();
+        while i + 1 < lp.latch {
+            if let IlOp::Load { slot, loc, .. } = &ops[i]
+                && !stored.contains(slot)
+                && is_cast_int_to_float(&ops[i + 1])
+            {
+                found.push((i, *slot, *loc));
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        if found.is_empty() {
+            continue;
+        }
+        let cast_op = ops[found[0].0 + 1].clone();
+        let loc = found[0].2;
+        // One temp per distinct slot, so repeated `x as float` share a cast.
+        let mut temps: HashMap<u32, u32> = HashMap::new();
+        let mut next_temp = max_slot_used(ops).saturating_add(1);
+        for (_, slot, _) in &found {
+            temps.entry(*slot).or_insert_with(|| {
+                let t = next_temp;
+                next_temp += 1;
+                t
+            });
+        }
+        let mut drop_cast: HashSet<usize> = HashSet::new();
+        for (idx, slot, loc) in &found {
+            ops[*idx] = IlOp::Load {
+                slot: temps[slot],
+                loc: *loc,
+            };
+            drop_cast.insert(idx + 1);
+        }
+        let mut rebuilt = Vec::with_capacity(ops.len());
+        for (idx, op) in ops.iter().enumerate() {
+            if !drop_cast.contains(&idx) {
+                rebuilt.push(op.clone());
+            }
+        }
+        *ops = rebuilt;
+        let header_label = lp.header_label;
+        let Some(lp2) = find_natural_loops(ops)
+            .into_iter()
+            .find(|l| l.header_label == header_label)
+        else {
+            // Undo is hard; leave the LOAD temp (still correct if preheader added).
+            return false;
+        };
+        // Sort: HashMap order is unspecified and bytecode must be deterministic.
+        let mut mats: Vec<(u32, u32)> = temps.into_iter().collect();
+        mats.sort_unstable();
+        let mut pre = Vec::with_capacity(mats.len() * 3);
+        for (slot, temp) in mats {
+            pre.push(IlOp::Load { slot, loc });
+            pre.push(cast_op.clone());
+            pre.push(IlOp::StorePop { slot: temp, loc });
+        }
+        insert_preheader_ops(ops, &lp2, pre);
+        return true;
+    }
+    false
+}
+
+fn is_cast_int_to_float(op: &IlOp) -> bool {
+    match op {
+        IlOp::Byte { byte, .. } => *byte.bytecode() == Instruction::CastIntToFloat,
+        other => other
+            .as_encode_byte()
+            .is_some_and(|b| *b.bytecode() == Instruction::CastIntToFloat),
+    }
 }
 
 fn licm_stack_producers(ops: &mut Vec<IlOp>) {
@@ -987,4 +1091,107 @@ mod tests {
             "in-loop key uses should LOAD the hoisted temp"
         );
     }
+
+    #[test]
+    fn cses_invariant_cast_int_to_float() {
+        // Loop: LOAD 0; CastIntToFloat; POP; JMP header — slot 0 never stored.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Byte {
+                byte: common::Byte::new(Instruction::CastIntToFloat),
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let loads: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                IlOp::Load { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        let casts = ops.iter().filter(|op| is_cast_int_to_float(op)).count();
+        let stores: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                IlOp::StorePop { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            casts, 1,
+            "CastIntToFloat once; loads={loads:?} stores={stores:?}"
+        );
+        assert!(
+            stores.iter().any(|s| *s >= 1) && loads.iter().any(|s| *s >= 1),
+            "hoisted float temp; loads={loads:?} stores={stores:?}"
+        );
+    }
+
+    #[test]
+    fn cses_two_invariant_casts_into_distinct_temps() {
+        // Loop casting two different invariant slots: each gets its own temp
+        // materialized in the preheader, and no cast remains in the body.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Byte {
+                byte: common::Byte::new(Instruction::CastIntToFloat),
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Byte {
+                byte: common::Byte::new(Instruction::CastIntToFloat),
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+        licm(&mut ops);
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .expect("loop header survives");
+        let casts_in_body = ops[header..].iter().filter(|op| is_cast_int_to_float(op)).count();
+        let casts_total = ops.iter().filter(|op| is_cast_int_to_float(op)).count();
+        assert_eq!(casts_in_body, 0, "no cast should remain in the loop body");
+        assert_eq!(casts_total, 2, "both casts materialize once in the preheader");
+        let stores: Vec<u32> = ops[..header]
+            .iter()
+            .filter_map(|op| match op {
+                IlOp::StorePop { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores.len(), 2, "one temp per distinct slot; got {stores:?}");
+        assert_ne!(stores[0], stores[1], "temps must be distinct; got {stores:?}");
+    }
+
 }
