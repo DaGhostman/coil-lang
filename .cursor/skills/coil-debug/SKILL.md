@@ -24,7 +24,7 @@ cargo build -q
 # Interactive REPL
 cargo run --quiet -- debug path/to/prog.hy
 
-# IDE / Cursor (DAP over stdio — install editors/vscode extension first)
+# DAP over stdio (any DAP client: nvim-dap, etc.)
 coil debug --dap
 
 # Scripted (preferred for agents)
@@ -37,7 +37,7 @@ Use `coil dissect` for bytecode/IL/AST dumps; use `--release` for faster runs.
 
 | Need | Commands |
 |------|----------|
-| IDE debug session | `coil debug --dap` (via VS Code/Cursor extension) |
+| IDE debug session | `coil debug --dap` (DAP client launches adapter) |
 | Stop in a function | `break fib` / `b Foo::method` then `run` |
 | Stop at a line | `break file.hy:12` or `break 12` (entry file) |
 | See how you got here | `bt` |

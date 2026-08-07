@@ -27,8 +27,9 @@ coil-debug examples/fib.hy -x cmds.txt --batch
 ## IDE debugging (DAP)
 
 `coil-debug --dap` speaks the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
-over stdin/stdout (Content-Length framing). Cursor / VS Code can attach via the
-in-repo extension in [`editors/vscode/`](../../editors/vscode/).
+over stdin/stdout (Content-Length framing). Point any DAP client (VS Code, Neovim
+`nvim-dap`, Helix, etc.) at the `coil-debug` binary with `--dap`; editor packages
+are not shipped in this repository.
 
 **Launch args** (DAP `launch` request):
 
@@ -45,25 +46,6 @@ multi-thread.
 Line breakpoints follow the same `debug_locs` coverage limits as the REPL (see
 [debug-info.md](debug-info.md)); unmapped lines return `verified: false`. Function
 breakpoints (`setFunctionBreakpoints`) are more reliable when line info is sparse.
-
-Sample `.vscode/launch.json`:
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "coil",
-      "request": "launch",
-      "name": "Coil: Launch current file",
-      "program": "${file}",
-      "cwd": "${workspaceFolder}"
-    }
-  ]
-}
-```
-
-Build the extension: `cd editors/vscode && npm install && npm run compile`.
 
 ## Commands
 
