@@ -1939,6 +1939,79 @@ mod tests {
         assert!(heap.find_object_by_addr(addr.wrapping_add(1)).is_none());
     }
 
+    /// Byte-threshold GC: under threshold → no collect; after a rooted sweep the
+    /// threshold scales with live bytes so a single surviving object does not
+    /// trigger on every subsequent alloc.
+    #[test]
+    fn should_collect_uses_byte_threshold_rescaled_by_sweep() {
+        let mut heap = Heap::default();
+        assert!(
+            !heap.should_collect(),
+            "fresh heap must sit under the default threshold"
+        );
+
+        let (keep, _) = heap.alloc(ObjString::from("keep"), Object::String);
+        let keep_addr = keep.addr();
+        // Force a collection, then root `keep` so it survives.
+        heap.set_gc_threshold_for_test(0);
+        assert!(heap.should_collect());
+        heap.trace(&[keep_addr]);
+        keep.mark_references(&mut Vec::new());
+        unsafe { heap.sweep() };
+
+        assert!(
+            !heap.should_collect(),
+            "after sweep, threshold must be live*growth so one survivor is quiet"
+        );
+        let quiet_size = heap.size();
+        // Grow past the rescaled threshold without roots — should_collect again.
+        while !heap.should_collect() {
+            let _ = heap.alloc(ObjString::from("pressure"), Object::String);
+            // Guard against runaway if rescale broke (would never trip).
+            assert!(
+                heap.size() < quiet_size.saturating_mul(8).max(4096),
+                "alloc_bytes grew without tripping should_collect"
+            );
+        }
+    }
+
+    /// Immortal arity-0 enums are seeded as GC roots and must not be swept,
+    /// even when nothing else references them.
+    #[test]
+    fn immortal_unit_enums_survive_sweep_as_roots() {
+        let mut heap = Heap::default();
+        let immortal = heap.immortal_unit_enum(7);
+        let immortal_addr = immortal.addr();
+        let again = heap.immortal_unit_enum(7);
+        assert_eq!(immortal_addr, again.addr());
+
+        let (junk, _) = heap.alloc(ObjString::from("junk"), Object::String);
+        let junk_addr = junk.addr();
+
+        let roots = heap.take_gc_roots();
+        assert!(
+            roots.contains(&immortal_addr),
+            "take_gc_roots must seed immortal enum addresses"
+        );
+        heap.trace(&roots);
+        unsafe { heap.sweep() };
+        heap.restore_gc_roots(roots);
+
+        assert!(
+            heap.find_object_by_addr(immortal_addr).is_some(),
+            "immortal enum must survive an otherwise empty-root sweep"
+        );
+        assert!(
+            heap.find_object_by_addr(junk_addr).is_none(),
+            "unrooted junk must still be collected"
+        );
+        assert_eq!(
+            heap.immortal_unit_enum(7).addr(),
+            immortal_addr,
+            "post-sweep lookup must reuse the same singleton"
+        );
+    }
+
     #[test]
     fn find_object_by_addr_clears_after_sweep() {
         let mut heap = Heap::default();
