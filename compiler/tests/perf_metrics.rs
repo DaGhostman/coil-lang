@@ -206,17 +206,24 @@ fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
         0,
         "no DUPLICATE should survive in the float inner loop"
     );
+    // Either fused form is fine: BinSlotSlot, or BinSlotSlotStore when the
+    // result is stored straight into a slot.
     let self_mulf = bc[start..end]
         .iter()
-        .filter(|b| {
-            *b.bytecode() == Instruction::BinSlotSlot && {
+        .filter(|b| match *b.bytecode() {
+            Instruction::BinSlotSlot => {
                 let (op, a, c) = b.bin_slot_slot_parts();
                 op == Instruction::MULF as u8 && a == c
             }
+            Instruction::BinSlotSlotStore => {
+                let (op, a, c, _) = b.bin_slot_slot_store_parts();
+                op == Instruction::MULF as u8 && a == c
+            }
+            _ => false,
         })
         .count();
     assert!(
         self_mulf >= 2,
-        "zr*zr and zi*zi should each be one BinSlotSlot MULF, got {self_mulf}"
+        "zr*zr and zi*zi should each fuse to one self-MULF op, got {self_mulf}"
     );
 }

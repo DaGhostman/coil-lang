@@ -2235,6 +2235,16 @@ impl<const S: usize> Machine<S> {
                         Instruction::NEQ => Value::from(
                             (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
                         ),
+                        Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
+                        Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
+                        Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
+                        Instruction::DIVF => Value::from(va.as_float() / vb.as_float()),
+                        Instruction::MODF => Value::from(va.as_float() % vb.as_float()),
+                        Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
+                        Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
+                        Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
+                        Instruction::GEQF => Value::from((va.as_float() >= vb.as_float()) as i64),
+                        Instruction::PowF => Value::from(va.as_float().powf(vb.as_float())),
                         _ => Value::default(),
                     };
                     let dest_idx = sp + dest;

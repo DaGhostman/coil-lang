@@ -447,7 +447,7 @@ fn try_fuse_load_const_op_store(window: &[Slot], pool: &mut Vec<u64>) -> Option<
     ))
 }
 
-/// `LOAD a; LOAD b; <int-bin>; STORE dest` → `BinSlotSlotStore`.
+/// `LOAD a; LOAD b; <bin>; STORE dest` → `BinSlotSlotStore`.
 fn try_fuse_load_load_op_store(window: &[Slot]) -> Option<Slot> {
     if window.len() < 4 {
         return None;
@@ -458,7 +458,7 @@ fn try_fuse_load_load_op_store(window: &[Slot]) -> Option<Slot> {
     let b3 = slot_as_byte(&window[3])?;
     let a = load_slot(&b0)?;
     let b = load_slot(&b1)?;
-    if !is_int_bin_op(*b2.bytecode()) {
+    if !is_bin_op(*b2.bytecode()) {
         return None;
     }
     let dest = store_slot_u8(&b3)?;
@@ -804,7 +804,7 @@ fn try_fuse_bin_slot_slot_store_local(b0: &Byte, b1: &Byte) -> Option<Byte> {
         return None;
     }
     let (op, a, b) = b0.bin_slot_slot_parts();
-    if !is_int_bin_op(Instruction::from(op)) {
+    if !is_bin_op(Instruction::from(op)) {
         return None;
     }
     let dest = store_slot_u8(b1)?;
