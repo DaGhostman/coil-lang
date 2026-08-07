@@ -2208,113 +2208,7 @@ impl Checker {
             Expression::Bool(_) => boolean(),
 
             // ---- Names ----
-            Expression::Identifier(name) => {
-                // When `name` has multiple overload candidates and appears in
-                // value position, try to narrow using `current_expected`.
-                if self.is_overloaded(name) {
-                    let candidates: Vec<OverloadCandidate> = self
-                        .overload_candidates(name)
-                        .map(|c| c.to_vec())
-                        .unwrap_or_default();
-                    // If exactly one candidate matches current_expected, pick it.
-                    let expected = self.current_expected.clone();
-                    let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
-                        // Prune so a solved `Ty::Var` expected type doesn't look
-                        // open; unify under `self.subst` (not empty) so existing
-                        // bindings are visible without mutating the running subst.
-                        let exp = apply_ty_prune(&self.subst, exp);
-                        candidates
-                            .iter()
-                            .filter(|c| {
-                                let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
-                                crate::typechecking::unify::unify_with(&self.subst, &fun_ty, &exp)
-                                    .is_ok()
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    if matching.len() == 1 {
-                        // Unique match — record and return its type.
-                        let candidate = matching[0].clone();
-                        self.selected_overloads_by_span.insert(
-                            (range.start, range.end),
-                            (candidate.fixed_arity, candidate.is_rest, candidate.id),
-                        );
-                        return self.instantiate_ty(&candidate.scheme);
-                    } else if matching.len() > 1 || expected.is_none() {
-                        // Multiple matches or no expected type — ambiguous.
-                        // For the single-candidate case there is no ambiguity even
-                        // without context, but we already checked `is_overloaded`
-                        // (len > 1), so ambiguous.
-                        let arities: Vec<String> = candidates
-                            .iter()
-                            .map(|c| Self::overload_sig_label(c))
-                            .collect();
-                        return self.error_with_help(
-                            ErrorCode::AmbiguousOverload,
-                            format!(
-                                "Ambiguous overload: `{}` has multiple candidates in value position",
-                                name
-                            ),
-                            range,
-                            Some(format!(
-                                "available overloads: {}; annotate the expected type to disambiguate",
-                                arities.join(", ")
-                            )),
-                        );
-                    }
-                    // matching.len() == 0 with an expected type — no candidate
-                    // unifies. Emit a dedicated diagnostic rather than falling
-                    // through to the last-registered scheme (wrong codegen key /
-                    // confusing TypeMismatch downstream).
-                    let arities: Vec<String> = candidates
-                        .iter()
-                        .map(|c| Self::overload_sig_label(c))
-                        .collect();
-                    let expected_pretty = expected
-                        .as_ref()
-                        .map(|e| apply_ty_prune(&self.subst, e).to_string())
-                        .unwrap_or_else(|| "?".into());
-                    return self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        format!(
-                            "No overload of `{}` matches expected type `{}`",
-                            name, expected_pretty
-                        ),
-                        range,
-                        Some(format!("available overloads: {}", arities.join(", "))),
-                    );
-                }
-
-                let scheme = self.env.lookup(name).cloned();
-                match scheme {
-                    Some(s) => self.instantiate_ty(&s),
-                    None => {
-                        if self
-                            .lambda_uncaptured_outer
-                            .as_ref()
-                            .is_some_and(|s| s.contains(*name))
-                        {
-                            return self.error_with_help(
-                                ErrorCode::UnknownValue,
-                                format!("cannot capture `{}` without `use ({})`", name, name),
-                                range,
-                                Some(format!(
-                                    "list `{}` in the enclosing `use (…)` capture list",
-                                    name
-                                )),
-                            );
-                        }
-                        self.error(
-                            ErrorCode::UnknownValue,
-                            format!("Cannot find value `{}` in this scope", name),
-                            range,
-                        )
-                    }
-                }
-            }
+            Expression::Identifier(name) => self.infer_identifier(name, range),
 
             // A bare type name (only valid as an annotation, but be
             // permissive).
@@ -3053,207 +2947,9 @@ impl Checker {
                 tuple_ty(elem_tys)
             }
             // Array literal (static length from item count)
-            Expression::Array(items) => {
-                let expected_elem = self.current_expected.clone().and_then(|exp| {
-                    let exp = apply_ty_prune(&self.subst, &exp);
-                    if let Ty::Array { element, .. } = &exp {
-                        return Some(element.as_ref().clone());
-                    }
-                    vec_element_ty(&exp).cloned()
-                });
-                let mut elem_ty: Option<Ty> = None;
-                for item in items {
-                    let prev_expected = self.current_expected.take();
-                    if let Some(ref e) = expected_elem {
-                        self.current_expected = Some(e.clone());
-                    }
-                    let t = self.infer(item);
-                    self.current_expected = prev_expected;
-                    // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
-                    // `[Rank; 2]`, not a stuck `::v0` element type.
-                    let t_pruned =
-                        crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
-                            &self.subst, &t,
-                        ));
-                    match &elem_ty {
-                        None => elem_ty = Some(t_pruned),
-                        Some(prev) => {
-                            let prev_pruned = apply_ty_prune(&self.subst, prev);
-                            match unify_with(&self.subst, &prev_pruned, &t_pruned) {
-                                Ok(s) => {
-                                    self.subst = compose(&s, &self.subst);
-                                    elem_ty = Some(apply_ty_prune(
-                                        &self.subst,
-                                        &crate::typechecking::ty::peel_constructor_refinement(
-                                            prev_pruned,
-                                        ),
-                                    ));
-                                }
-                                Err(_) => {
-                                    let _ = self.error_with_help(
-                                        ErrorCode::TypeMismatch,
-                                        format!(
-                                            "array element type mismatch: expected `{}`, found `{}`",
-                                            prev_pruned, t_pruned
-                                        ),
-                                        range.clone(),
-                                        Some(
-                                            "an array literal requires every element to have the same type"
-                                                .to_string(),
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                let len = items.len();
-                if len == 0 {
-                    if let Some(exp) = self.current_expected.clone() {
-                        let exp = apply_ty_prune(&self.subst, &exp);
-                        if let Some(vec_elem) = vec_element_ty(&exp) {
-                            let _ = unify_with(&self.subst, vec_elem, &element);
-                            return apply_ty_prune(&self.subst, &exp);
-                        }
-                        if let Ty::Array {
-                            element: arr_elem,
-                            length,
-                        } = &exp
-                        {
-                            match length {
-                                ArrayLength::Static(0) => {
-                                    let _ = unify_with(&self.subst, arr_elem.as_ref(), &element);
-                                    return array_fixed(
-                                        apply_ty_prune(&self.subst, arr_elem.as_ref()),
-                                        0,
-                                    );
-                                }
-                                ArrayLength::Static(n) => {
-                                    return self.error_with_help(
-                                        ErrorCode::TypeMismatch,
-                                        format!(
-                                            "empty array literal `[]` cannot satisfy `[_; {}]`",
-                                            n
-                                        ),
-                                        range,
-                                        Some(format!(
-                                            "expected {} element{}, or annotate as `Vec<T>` / `[T; 0]`",
-                                            n,
-                                            if *n == 1 { "" } else { "s" }
-                                        )),
-                                    );
-                                }
-                                ArrayLength::Dynamic => {}
-                            }
-                        }
-                    }
-                    return self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        "empty array literal `[]` requires a type annotation".to_string(),
-                        range,
-                        Some(
-                            "annotate as `Vec<T>` (growable) or `[T; 0]` (fixed empty array)"
-                                .to_string(),
-                        ),
-                    );
-                }
-                array_fixed(element, len)
-            }
+            Expression::Array(items) => self.infer_array_literal(items, range),
             // Index: static-length OOB check for literal indices
-            Expression::Index(target, index_expr) => {
-                let target_ty = self.infer(target);
-                let target_ty = apply_ty_prune(&self.subst, &target_ty);
-                let Some(index_expr) = index_expr else {
-                    return self.error_with_help(
-                        ErrorCode::CannotIndex,
-                        "empty index `arr[]` is not valid".to_string(),
-                        range,
-                        Some("use `vec.push(value)` to append to a `Vec`".to_string()),
-                    );
-                };
-                let index_ty = self.infer(index_expr);
-                let index_ty_pruned = apply_ty_prune(&self.subst, &index_ty);
-                // Constrain the index to be an `int` (the VM only
-                // supports integer indices).
-                let _ = unify_with(&self.subst, &index_ty_pruned, &int());
-                let resolved = apply_ty_prune(&self.subst, &target_ty);
-                // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
-                let resolved =
-                    if let Some(data) = crate::typechecking::aggregate_arith::unwrap_matrix_ty(&resolved) {
-                        data.clone()
-                    } else {
-                        resolved
-                    };
-                match &resolved {
-                    Ty::Array { element, length } => {
-                        // Out-of-bounds check: only fires when the
-                        // target is a *static-length* array and the
-                        // index is a literal integer.
-                        if let ArrayLength::Static(n) = length
-                            && let Expression::Integer(idx) = index_expr.1.as_ref()
-                        {
-                            let i = *idx;
-                            if i < 0 || (i as usize) >= *n {
-                                let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds,
-                                    format!(
-                                        "array index {} out of bounds for array of length {}",
-                                        i, n
-                                    ),
-                                    range.clone(),
-                                    Some(format!(
-                                        "indices are valid in [0..{}); the array has length {}",
-                                        n, n
-                                    )),
-                                );
-                            }
-                        }
-                        (**element).clone()
-                    }
-                    other if vec_element_ty(other).is_some() => {
-                        vec_element_ty(other).expect("checked").clone()
-                    }
-                    Ty::Tuple(tys) => {
-                        // Tuple indexing: same diagnostic on constant
-                        // out-of-bounds; dynamic fallback returns a
-                        // fresh ty var (the runtime pushes -1i64 for
-                        // OOB).
-                        if let Expression::Integer(idx) = index_expr.1.as_ref() {
-                            let i = *idx;
-                            if i < 0 || (i as usize) >= tys.len() {
-                                let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds,
-                                    format!(
-                                        "tuple index {} out of bounds for tuple of length {}",
-                                        i,
-                                        tys.len()
-                                    ),
-                                    range.clone(),
-                                    Some(format!(
-                                        "indices are valid in [0..{}); the tuple has length {}",
-                                        tys.len(),
-                                        tys.len()
-                                    )),
-                                );
-                            } else {
-                                return tys[i as usize].clone();
-                            }
-                        }
-                        Ty::Var(self.counter.fresh())
-                    }
-                    _ => {
-                        // Non-aggregate target: emit a diagnostic.
-                        let _ = self.error_with_help(
-                            ErrorCode::CannotIndex,
-                            "cannot index non-aggregate type".to_string(),
-                            range.clone(),
-                            Some(format!("type `{}` does not support indexing", resolved)),
-                        );
-                        Ty::Var(self.counter.fresh())
-                    }
-                }
-            }
+            Expression::Index(target, index_expr) => self.infer_index_expr(target, index_expr, range),
             // ---- Dict literals ----
             Expression::Dict(fields) => {
                 // Check for duplicate field names — diagnostic
@@ -3900,6 +3596,324 @@ impl Checker {
             // above and remove this arm.
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
+        }
+    }
+
+    #[inline(never)]
+    fn infer_index_expr(
+        &mut self,
+        target: &Output,
+        index_expr: &Option<Output>,
+        range: Range<usize>,
+    ) -> Ty {
+        let target_ty = self.infer(target);
+        let target_ty = apply_ty_prune(&self.subst, &target_ty);
+        let Some(index_expr) = index_expr else {
+            return self.error_with_help(
+                ErrorCode::CannotIndex,
+                "empty index `arr[]` is not valid".to_string(),
+                range,
+                Some("use `vec.push(value)` to append to a `Vec`".to_string()),
+            );
+        };
+        let index_ty = self.infer(index_expr);
+        let index_ty_pruned = apply_ty_prune(&self.subst, &index_ty);
+        // Constrain the index to be an `int` (the VM only
+        // supports integer indices).
+        let _ = unify_with(&self.subst, &index_ty_pruned, &int());
+        let resolved = apply_ty_prune(&self.subst, &target_ty);
+        // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
+        let resolved =
+            if let Some(data) = crate::typechecking::aggregate_arith::unwrap_matrix_ty(&resolved) {
+                data.clone()
+            } else {
+                resolved
+            };
+        match &resolved {
+            Ty::Array { element, length } => {
+                // Out-of-bounds check: only fires when the
+                // target is a *static-length* array and the
+                // index is a literal integer.
+                if let ArrayLength::Static(n) = length
+                    && let Expression::Integer(idx) = index_expr.1.as_ref()
+                {
+                    let i = *idx;
+                    if i < 0 || (i as usize) >= *n {
+                        let _ = self.error_with_help(
+                            ErrorCode::IndexOutOfBounds,
+                            format!(
+                                "array index {} out of bounds for array of length {}",
+                                i, n
+                            ),
+                            range.clone(),
+                            Some(format!(
+                                "indices are valid in [0..{}); the array has length {}",
+                                n, n
+                            )),
+                        );
+                    }
+                }
+                (**element).clone()
+            }
+            other if vec_element_ty(other).is_some() => {
+                vec_element_ty(other).expect("checked").clone()
+            }
+            Ty::Tuple(tys) => {
+                // Tuple indexing: same diagnostic on constant
+                // out-of-bounds; dynamic fallback returns a
+                // fresh ty var (the runtime pushes -1i64 for
+                // OOB).
+                if let Expression::Integer(idx) = index_expr.1.as_ref() {
+                    let i = *idx;
+                    if i < 0 || (i as usize) >= tys.len() {
+                        let _ = self.error_with_help(
+                            ErrorCode::IndexOutOfBounds,
+                            format!(
+                                "tuple index {} out of bounds for tuple of length {}",
+                                i,
+                                tys.len()
+                            ),
+                            range.clone(),
+                            Some(format!(
+                                "indices are valid in [0..{}); the tuple has length {}",
+                                tys.len(),
+                                tys.len()
+                            )),
+                        );
+                    } else {
+                        return tys[i as usize].clone();
+                    }
+                }
+                Ty::Var(self.counter.fresh())
+            }
+            _ => {
+                // Non-aggregate target: emit a diagnostic.
+                let _ = self.error_with_help(
+                    ErrorCode::CannotIndex,
+                    "cannot index non-aggregate type".to_string(),
+                    range.clone(),
+                    Some(format!("type `{}` does not support indexing", resolved)),
+                );
+                Ty::Var(self.counter.fresh())
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn infer_array_literal(&mut self, items: &[Output], range: Range<usize>) -> Ty {
+        let expected_elem = self.current_expected.clone().and_then(|exp| {
+            let exp = apply_ty_prune(&self.subst, &exp);
+            if let Ty::Array { element, .. } = &exp {
+                return Some(element.as_ref().clone());
+            }
+            vec_element_ty(&exp).cloned()
+        });
+        let mut elem_ty: Option<Ty> = None;
+        for item in items {
+            let prev_expected = self.current_expected.take();
+            if let Some(ref e) = expected_elem {
+                self.current_expected = Some(e.clone());
+            }
+            let t = self.infer(item);
+            self.current_expected = prev_expected;
+            // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
+            // `[Rank; 2]`, not a stuck `::v0` element type.
+            let t_pruned =
+                crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
+                    &self.subst, &t,
+                ));
+            match &elem_ty {
+                None => elem_ty = Some(t_pruned),
+                Some(prev) => {
+                    let prev_pruned = apply_ty_prune(&self.subst, prev);
+                    match unify_with(&self.subst, &prev_pruned, &t_pruned) {
+                        Ok(s) => {
+                            self.subst = compose(&s, &self.subst);
+                            elem_ty = Some(apply_ty_prune(
+                                &self.subst,
+                                &crate::typechecking::ty::peel_constructor_refinement(
+                                    prev_pruned,
+                                ),
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "array element type mismatch: expected `{}`, found `{}`",
+                                    prev_pruned, t_pruned
+                                ),
+                                range.clone(),
+                                Some(
+                                    "an array literal requires every element to have the same type"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+        let len = items.len();
+        if len == 0 {
+            if let Some(exp) = self.current_expected.clone() {
+                let exp = apply_ty_prune(&self.subst, &exp);
+                if let Some(vec_elem) = vec_element_ty(&exp) {
+                    let _ = unify_with(&self.subst, vec_elem, &element);
+                    return apply_ty_prune(&self.subst, &exp);
+                }
+                if let Ty::Array {
+                    element: arr_elem,
+                    length,
+                } = &exp
+                {
+                    match length {
+                        ArrayLength::Static(0) => {
+                            let _ = unify_with(&self.subst, arr_elem.as_ref(), &element);
+                            return array_fixed(
+                                apply_ty_prune(&self.subst, arr_elem.as_ref()),
+                                0,
+                            );
+                        }
+                        ArrayLength::Static(n) => {
+                            return self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "empty array literal `[]` cannot satisfy `[_; {}]`",
+                                    n
+                                ),
+                                range,
+                                Some(format!(
+                                    "expected {} element{}, or annotate as `Vec<T>` / `[T; 0]`",
+                                    n,
+                                    if *n == 1 { "" } else { "s" }
+                                )),
+                            );
+                        }
+                        ArrayLength::Dynamic => {}
+                    }
+                }
+            }
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "empty array literal `[]` requires a type annotation".to_string(),
+                range,
+                Some(
+                    "annotate as `Vec<T>` (growable) or `[T; 0]` (fixed empty array)"
+                        .to_string(),
+                ),
+            );
+        }
+        array_fixed(element, len)
+    }
+
+    #[inline(never)]
+    fn infer_identifier(&mut self, name: &str, range: Range<usize>) -> Ty {
+        // When `name` has multiple overload candidates and appears in
+        // value position, try to narrow using `current_expected`.
+        if self.is_overloaded(name) {
+            let candidates: Vec<OverloadCandidate> = self
+                .overload_candidates(name)
+                .map(|c| c.to_vec())
+                .unwrap_or_default();
+            // If exactly one candidate matches current_expected, pick it.
+            let expected = self.current_expected.clone();
+            let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
+                // Prune so a solved `Ty::Var` expected type doesn't look
+                // open; unify under `self.subst` (not empty) so existing
+                // bindings are visible without mutating the running subst.
+                let exp = apply_ty_prune(&self.subst, exp);
+                candidates
+                    .iter()
+                    .filter(|c| {
+                        let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
+                        crate::typechecking::unify::unify_with(&self.subst, &fun_ty, &exp)
+                            .is_ok()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            if matching.len() == 1 {
+                // Unique match — record and return its type.
+                let candidate = matching[0].clone();
+                self.selected_overloads_by_span.insert(
+                    (range.start, range.end),
+                    (candidate.fixed_arity, candidate.is_rest, candidate.id),
+                );
+                return self.instantiate_ty(&candidate.scheme);
+            } else if matching.len() > 1 || expected.is_none() {
+                // Multiple matches or no expected type — ambiguous.
+                // For the single-candidate case there is no ambiguity even
+                // without context, but we already checked `is_overloaded`
+                // (len > 1), so ambiguous.
+                let arities: Vec<String> = candidates
+                    .iter()
+                    .map(|c| Self::overload_sig_label(c))
+                    .collect();
+                return self.error_with_help(
+                    ErrorCode::AmbiguousOverload,
+                    format!(
+                        "Ambiguous overload: `{}` has multiple candidates in value position",
+                        name
+                    ),
+                    range,
+                    Some(format!(
+                        "available overloads: {}; annotate the expected type to disambiguate",
+                        arities.join(", ")
+                    )),
+                );
+            }
+            // matching.len() == 0 with an expected type — no candidate
+            // unifies. Emit a dedicated diagnostic rather than falling
+            // through to the last-registered scheme (wrong codegen key /
+            // confusing TypeMismatch downstream).
+            let arities: Vec<String> = candidates
+                .iter()
+                .map(|c| Self::overload_sig_label(c))
+                .collect();
+            let expected_pretty = expected
+                .as_ref()
+                .map(|e| apply_ty_prune(&self.subst, e).to_string())
+                .unwrap_or_else(|| "?".into());
+            return self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "No overload of `{}` matches expected type `{}`",
+                    name, expected_pretty
+                ),
+                range,
+                Some(format!("available overloads: {}", arities.join(", "))),
+            );
+        }
+
+        let scheme = self.env.lookup(name).cloned();
+        match scheme {
+            Some(s) => self.instantiate_ty(&s),
+            None => {
+                if self
+                    .lambda_uncaptured_outer
+                    .as_ref()
+                    .is_some_and(|s| s.contains(name))
+                {
+                    return self.error_with_help(
+                        ErrorCode::UnknownValue,
+                        format!("cannot capture `{}` without `use ({})`", name, name),
+                        range,
+                        Some(format!(
+                            "list `{}` in the enclosing `use (…)` capture list",
+                            name
+                        )),
+                    );
+                }
+                self.error(
+                    ErrorCode::UnknownValue,
+                    format!("Cannot find value `{}` in this scope", name),
+                    range,
+                )
+            }
         }
     }
 
