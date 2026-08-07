@@ -517,25 +517,26 @@ fn main() {
         );
     }
 
-    /// `x ** 2` strength-reduces to `x; DUP; MUL` (not `Pow`).
+    /// `x ** 2` strength-reduces to a self-multiply, not `Pow`. The `DUPLICATE`
+    /// is re-expanded to a second `LOAD` so it fuses into one `BinSlotSlot`.
     #[test]
-    fn pow_two_emits_dup_mul_not_pow() {
+    fn pow_two_emits_self_mul_not_pow() {
         use common::Instruction;
         let (bc, _pool) = compile_src("fn sq(int x) -> int { return x ** 2; }");
-        let has_pow = bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow));
-        let has_mul = bc.iter().any(|b| {
-            matches!(b.bytecode(), Instruction::MUL)
-                || (*b.bytecode() == Instruction::BinSlotSlot
-                    && b.bin_slot_slot_parts().0 == Instruction::MUL as u8)
-                || (*b.bytecode() == Instruction::BinReturn
-                    && b.bin_return_op() == Instruction::MUL as u8)
-        });
-        let has_dup = bc
-            .iter()
-            .any(|b| matches!(b.bytecode(), Instruction::DUPLICATE));
         assert!(
-            !has_pow && has_mul && has_dup,
-            "expected DUP+MUL for x**2; opcodes: {:?}",
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::Pow)),
+            "x**2 must not emit Pow; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let fused_self_mul = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot && {
+                let (op, a, c) = b.bin_slot_slot_parts();
+                op == Instruction::MUL as u8 && a == c
+            }
+        });
+        assert!(
+            fused_self_mul,
+            "expected BinSlotSlot MUL with both operands the same slot; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
