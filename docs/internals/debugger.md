@@ -10,6 +10,9 @@ the VM through a stop engine gated behind an attached `DebugController`
 cargo build   # coil + coil-debug (+ coil-dissect / coil-embed)
 coil debug examples/fib.hy
 coil debug examples/fib.hy -x cmds.txt --batch
+# DAP mode for IDE integration (program path from launch request):
+coil debug --dap
+coil-debug --dap
 # or invoke the helper directly:
 coil-debug examples/fib.hy -x cmds.txt --batch
 ```
@@ -19,6 +22,30 @@ coil-debug examples/fib.hy -x cmds.txt --batch
 | (none) | Interactive `(coil) ` REPL on stdin |
 | `-x <script>` | Run commands from a file (`#` comments; one command per line) |
 | `--batch` | Non-interactive; exit after script (or stdin if no `-x`); non-zero on panic / script error |
+| `--dap` | Debug Adapter Protocol over **stdio** (see below); no positional `.hy` |
+
+## IDE debugging (DAP)
+
+`coil-debug --dap` speaks the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
+over stdin/stdout (Content-Length framing). Point any DAP client (VS Code, Neovim
+`nvim-dap`, Helix, etc.) at the `coil-debug` binary with `--dap`; editor packages
+are not shipped in this repository.
+
+**Launch args** (DAP `launch` request):
+
+| Field | Meaning |
+|-------|---------|
+| `program` | Absolute or workspace-relative path to entry `.hy` |
+| `cwd` | Optional working directory for resolving paths |
+| `stopOnEntry` | Optional; stop before executing `main` |
+
+**Supported (v1):** breakpoints (line + function), continue, step in/over/out,
+stack trace, locals. **Not supported:** attach, evaluate, conditional breakpoints,
+multi-thread.
+
+Line breakpoints follow the same `debug_locs` coverage limits as the REPL (see
+[debug-info.md](debug-info.md)); unmapped lines return `verified: false`. Function
+breakpoints (`setFunctionBreakpoints`) are more reliable when line info is sparse.
 
 ## Commands
 
