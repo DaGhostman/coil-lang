@@ -268,6 +268,7 @@ mod tests {
             | WildcardImport
             | UnreachableCode
             | DeferNeverRuns
+            | ExpressionNestingTooDeep
             | DuplicateEnum
             | DuplicateConstructor
             | UnknownEnum
@@ -324,6 +325,7 @@ mod tests {
             AmbiguousOverload,
             UnreachableCode,
             DeferNeverRuns,
+            ExpressionNestingTooDeep,
             DuplicateEnum,
             DuplicateConstructor,
             UnknownEnum,
