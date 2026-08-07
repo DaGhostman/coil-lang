@@ -16,7 +16,7 @@ use crate::debug::{DebugLoc, ProgramDebug};
 pub const ARCHIVE_MAJOR: u16 = 2;
 
 /// Archive ABI minor. Bump on additive, append-only bytecode changes.
-pub const ARCHIVE_MINOR: u16 = 0;
+pub const ARCHIVE_MINOR: u16 = 1;
 
 /// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
 pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
@@ -175,9 +175,9 @@ mod tests {
     #[test]
     fn archive_version_matches_current_abi() {
         assert_eq!(ARCHIVE_MAJOR, 2);
-        assert_eq!(ARCHIVE_MINOR, 0);
-        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 0));
-        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.0");
+        assert_eq!(ARCHIVE_MINOR, 1);
+        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 1));
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.1");
     }
 
     #[test]

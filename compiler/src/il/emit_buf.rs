@@ -63,6 +63,10 @@ pub trait EmitBuf {
         self.push_byte(Byte::new(Instruction::UnboxValue).with_operand_u32(tag));
     }
 
+    fn push_seek(&mut self, slot: u32) {
+        self.push_byte(Byte::new(Instruction::Seek).with_operand_u32(slot));
+    }
+
     fn push_load_field(&mut self, index: u32) {
         self.push_byte(Byte::new(Instruction::LoadField).with_operand_u32(index));
     }

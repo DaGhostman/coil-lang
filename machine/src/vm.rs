@@ -1676,7 +1676,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinSlotSlotStore as u8);
+            promise!(*bc as u8 <= Instruction::Seek as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1718,6 +1718,13 @@ impl<const S: usize> Machine<S> {
                     if self.stack.tell() < need {
                         self.stack.seek(need);
                     }
+                }
+                Instruction::Seek => {
+                    // Frame-relative cursor: operands[31:0] = slot offset from `sp`.
+                    let slot = opcode.operand_u32() as usize;
+                    let abs = sp + slot;
+                    promise!(abs <= stack_cap);
+                    self.stack.seek(abs);
                 }
                 Instruction::LOAD => {
                     let count = opcode.load_store_count();

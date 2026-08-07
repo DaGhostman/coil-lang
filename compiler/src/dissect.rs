@@ -219,6 +219,7 @@ fn format_operands(
             let (bop, a, b, dest) = byte.bin_slot_slot_store_parts();
             format!("op={} a={a} b={b} dest={dest}", bin_op_name(bop))
         }
+        Instruction::Seek => format!("slot={}", byte.operand_u32()),
         Instruction::LogNotJmpf => {
             let t = byte.operand_u32() as usize;
             if (byte.operand_u32() & (1 << 16)) != 0 {
