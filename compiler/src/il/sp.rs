@@ -106,7 +106,7 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
     }
 }
 
-fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
+pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
     match insn {
         Instruction::LOAD
         | Instruction::CONST

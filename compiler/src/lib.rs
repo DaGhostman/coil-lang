@@ -3,7 +3,10 @@ mod block_builder;
 mod const_fold;
 #[cfg(any(test, feature = "dissect"))]
 mod dissect;
-mod il;
+// `il::tell` is exercised by `tests/cursor_model.rs`, which diffs it against the
+// real VM cursor; the rest of the IL stays crate-private.
+pub(crate) mod il;
+pub use il::tell;
 mod manifest;
 mod monomorphize;
 mod pipeline;

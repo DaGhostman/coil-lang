@@ -16,6 +16,7 @@ mod module;
 mod op;
 mod opt;
 mod sp;
+pub mod tell;
 
 pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;
