@@ -3537,6 +3537,58 @@ fn main() {
         );
     }
 
+    #[test]
+    fn len_of_array_literal_folds_without_extra_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let n = len([10, 20, 30]);
+}
+"#,
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+            "expected folded CONST for len([10, 20, 30]); ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn len_of_dict_and_tuple_literals_fold_to_const() {
+        use common::Instruction;
+        for src in [
+            r#"fn main() { let n = len({ a: 1, b: 2 }); }"#,
+            r#"fn main() { let n = len((1, 2, 3)); }"#,
+        ] {
+            let (bc, _pool) = compile_src(src);
+            assert!(
+                bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+                "expected folded CONST for literal len in `{src}`; ops={:?}",
+                bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn len_of_runtime_binding_keeps_array_len_path() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let s = "abc";
+    let n = len(s);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "runtime len(s) should use ArrayLen; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     // ============================================================
     // chained field-access codegen tests
     // ============================================================
