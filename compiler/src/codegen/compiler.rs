@@ -7860,6 +7860,27 @@ impl Compiler {
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
+        self.codegen_depth += 1;
+        if self.codegen_depth > super::CODEGEN_RECURSION_LIMIT {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "expression nested too deeply (over {} levels) for codegen",
+                    super::CODEGEN_RECURSION_LIMIT
+                ),
+                ast.0.into_range(),
+            ));
+            std::panic::panic_any(super::CodegenRecursionLimitExceeded);
+        }
+        let result = self.do_compile_inner(ast);
+        self.codegen_depth -= 1;
+        result
+    }
+
+    fn do_compile_inner<'compiler>(
+        &mut self,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> Vec<Byte> {
         let mut bytecode = vec![];
         let self_id = self.next_emit_id();
         let (span, child) = ast;
@@ -8917,1028 +8938,7 @@ impl Compiler {
                 bb.finalize()
                     .expect("BlockBuilder::finalize: defer after label bound");
             }
-            Expression::Call { name, args } => {
-                // Fold `len(literal)` before trait dispatch so string/tuple
-                // lengths become CONST instead of Length thunk + ArrayLen.
-                if let Expression::Identifier(raw) = name.1.as_ref()
-                    && *raw == "len"
-                    && let Some(ConstValue::Int(n)) =
-                        crate::const_fold::eval_expr(ast, self.const_env())
-                {
-                    if let Some(items) = args.as_ref() {
-                        for arg in items {
-                            self.discard_compile(arg);
-                        }
-                    }
-                    self.emit_const_value(&ConstValue::Int(n), &mut bytecode);
-                    return bytecode;
-                }
-
-                if let Expression::Identifier(fname) = name.1.as_ref() {
-                    if let Some(kind) = self.string_builtin_for_call(fname) {
-                        let arg_slice = args.as_deref().unwrap_or(&[]);
-                        match kind {
-                            crate::typechecking::StringBuiltin::Format => {
-                                if let Some((format, rest)) = arg_slice.split_first() {
-                                    let params = rest.to_vec();
-                                    self.emit_format_expression(format, Some(&params));
-                                }
-                            }
-                            crate::typechecking::StringBuiltin::FromBytes
-                            | crate::typechecking::StringBuiltin::ToBytes => {
-                                if let Some(native_name) = kind.native_name() {
-                                    self.emit_host_native_invoke(native_name, arg_slice);
-                                }
-                            }
-                        }
-                        return bytecode;
-                    }
-                } else if let Expression::QualifiedAccess { owner, member } = name.1.as_ref() {
-                    let fqn = format!("{}::{}", owner, member);
-                    if let Some(kind) = self.string_builtin_for_call(&fqn) {
-                        let arg_slice = args.as_deref().unwrap_or(&[]);
-                        match kind {
-                            crate::typechecking::StringBuiltin::Format => {
-                                if let Some((format, rest)) = arg_slice.split_first() {
-                                    let params = rest.to_vec();
-                                    self.emit_format_expression(format, Some(&params));
-                                }
-                            }
-                            crate::typechecking::StringBuiltin::FromBytes
-                            | crate::typechecking::StringBuiltin::ToBytes => {
-                                if let Some(native_name) = kind.native_name() {
-                                    self.emit_host_native_invoke(native_name, arg_slice);
-                                }
-                            }
-                        }
-                        return bytecode;
-                    }
-                }
-                // `assert` from `prelude::test` (auto-imported).
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(kind) = self.checker.prelude_fn_in_scope(fname)
-                {
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    match kind {
-                        crate::typechecking::PreludeFn::Assert => {
-                            self.emit_assert(arg_slice);
-                        }
-                        crate::typechecking::PreludeFn::BlockOn => {
-                            self.emit_block_on(arg_slice);
-                        }
-                        crate::typechecking::PreludeFn::Matrix => {
-                            // Zero-cost wrap: runtime is the nested data.
-                            if let Some(arg) = arg_slice.first() {
-                                bytecode.append(&mut self.do_compile(arg));
-                            }
-                        }
-                        crate::typechecking::PreludeFn::Dot
-                        | crate::typechecking::PreludeFn::MatMul
-                        | crate::typechecking::PreludeFn::Cross => {
-                            self.emit_linear_algebra(
-                                &mut bytecode,
-                                self_id,
-                                span.start,
-                                span.end,
-                                arg_slice,
-                            );
-                        }
-                        crate::typechecking::PreludeFn::Ord
-                        | crate::typechecking::PreludeFn::Char => {
-                            self.emit_prelude_host_call(arg_slice, kind.as_str());
-                        }
-                        crate::typechecking::PreludeFn::Sin
-                        | crate::typechecking::PreludeFn::Cos
-                        | crate::typechecking::PreludeFn::Tan
-                        | crate::typechecking::PreludeFn::Sqrt
-                        | crate::typechecking::PreludeFn::Floor
-                        | crate::typechecking::PreludeFn::Ceil
-                        | crate::typechecking::PreludeFn::Exp
-                        | crate::typechecking::PreludeFn::Ln
-                        | crate::typechecking::PreludeFn::Pow => {
-                            self.emit_prelude_host_call(
-                                arg_slice,
-                                kind.math_native_name().expect("scalar math native"),
-                            );
-                        }
-                    }
-                    return bytecode;
-                }
-                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
-                {
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    match kind {
-                        crate::typechecking::FfiBuiltin::Dload => {
-                            if let Some(path) = arg_slice.first() {
-                                let bc = self.do_compile(path);
-                                self.bytecode.extend(bc);
-                                self.bytecode.push(Byte::new(Instruction::FfiLoad));
-                            }
-                        }
-                        crate::typechecking::FfiBuiltin::Declare => {
-                            self.emit_ffi_declare(*span, arg_slice);
-                        }
-                        crate::typechecking::FfiBuiltin::Invoke => {
-                            self.emit_ffi_invoke(*span, arg_slice);
-                        }
-                    }
-                    return bytecode;
-                }
-                // `open` / `read` / … after `use io::{…}` (or `use io::read as …`).
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(kind) = self.checker.io_fn_in_scope(fname)
-                {
-                    self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
-                    return bytecode;
-                }
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(kind) = self.checker.thread_fn_in_scope(fname)
-                {
-                    self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
-                    return bytecode;
-                }
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(kind) = self.checker.gc_fn_in_scope(fname)
-                {
-                    self.emit_host_native_invoke(kind.native_name(), args.as_deref().unwrap_or(&[]));
-                    return bytecode;
-                }
-                if let Expression::Identifier(fname) = name.1.as_ref()
-                    && let Some(registry) = self.checker.host_fn_in_scope(fname)
-                {
-                    if registry == "env_exec" {
-                        self.messages.push(Message::warn(
-                            ErrorCode::GenericTypeError,
-                            "env::exec runs an external program with the given arguments; only use with trusted inputs"
-                                .to_string(),
-                            span.into_range(),
-                        ));
-                    } else if registry == "env_exit" {
-                        self.messages.push(Message::warn(
-                            ErrorCode::GenericTypeError,
-                            "env::exit terminates the process with the given exit code".to_string(),
-                            span.into_range(),
-                        ));
-                    }
-                    self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
-                    return bytecode;
-                }
-
-                if let Some(hint) = self_id
-                    .and_then(|id| self.checker.existential_method_call_at(id))
-                    .or_else(|| {
-                        self.checker
-                            .existential_method_call_for_span(span.start, span.end)
-                    })
-                    .cloned()
-                {
-                    if self.emit_existential_method_call(&mut bytecode, name, args.as_ref(), &hint)
-                    {
-                        return bytecode;
-                    }
-                }
-
-                if let Some(hint) = self_id
-                    .and_then(|id| self.checker.bound_method_call_at(id))
-                    .or_else(|| {
-                        self.checker
-                            .bound_method_call_for_span(span.start, span.end)
-                    })
-                    .cloned()
-                {
-                    if hint.has_receiver
-                        && let Expression::Access(recv, _) = name.1.as_ref()
-                    {
-                        bytecode.append(&mut self.do_compile(recv));
-                    }
-                    if let Some(items) = args {
-                        for arg in items {
-                            self.append_with_existential_pack(&mut bytecode, arg);
-                        }
-                    }
-                    let dict_name = format!("__dict{}", hint.dict_index);
-                    if let Some(dict_slot) = self.lookup_slot(&dict_name) {
-                        // Hidden trailing dictionary argument for sibling/default
-                        // dispatch inside the selected implementation.
-                        bytecode.push_load(dict_slot);
-                        bytecode.push_load(dict_slot);
-                        bytecode.push_const(hint.method_slot as i32);
-                        bytecode.push_index();
-                        bytecode.push(
-                            Byte::new(Instruction::CallIndirect)
-                                .with_operand_u32(hint.arity as u32 + 1),
-                        );
-                    } else {
-                        let mut message = Message::error(
-                            ErrorCode::UnknownFunction,
-                            "Missing trait dictionary".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(DiagLabel::new(
-                            format!("dictionary slot `{}` is not available", dict_name),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
-                    }
-                    return bytecode;
-                }
-
-                // Method call: `recv.method(args)`.
-                if let Expression::Access(recv, method) = name.1.borrow() {
-                    // Ground trait method (`recv.into()`, …): typechecker
-                    // discharged a concrete instance into `call_dicts_at`.
-                    // Emit receiver + args + dictionary, then CallIndirect to
-                    // the instance method (dict ABI, `dict_arity = 1`).
-                    let ground_trait = self_id
-                        .and_then(|id| self.checker.call_dicts_at(id))
-                        .or_else(|| self.checker.call_dicts_for_span(span.start, span.end))
-                        .and_then(|dicts| dicts.first())
-                        .and_then(|instance| {
-                            let fqn = instance.method_fqns.get(*method)?.clone();
-                            let offset = *self.functions.get(&fqn)?;
-                            Some((instance.class.clone(), instance.args.clone(), offset))
-                        });
-                    if let Some((class, inst_args, offset)) = ground_trait {
-                        bytecode.append(&mut self.do_compile(recv));
-                        // Box the receiver when the instance method prologue
-                        // expects an unbox (same contract as Eq/Ord direct calls).
-                        // Prefer `receiver_type` for identifiers/access; fall
-                        // back to `codegen_expr_ty` so inline receivers like
-                        // `new Celsius(0).into()` still get boxed.
-                        // Peel Constructor/Sum → Con so `ty_to_value_tag` matches
-                        // instance-head unbox tags (Con(enum) → Instance). Raw
-                        // Constructor types returned None and skipped boxing.
-                        if let Some(recv_ty) = self
-                            .receiver_type(recv)
-                            .or_else(|| self.codegen_expr_ty(recv))
-                        {
-                            let box_ty = Self::show_lookup_ty_for_instance(&recv_ty);
-                            Self::emit_box_if_needed(&mut bytecode, &box_ty);
-                        }
-                        let mut nargs = 1u32; // receiver
-                        if let Some(items) = args {
-                            for arg in items {
-                                self.append_with_existential_pack(&mut bytecode, arg);
-                                nargs += 1;
-                            }
-                        }
-                        if Self::emit_instance_dict(
-                            &mut bytecode,
-                            &class,
-                            &inst_args,
-                            &self.checker,
-                            &self.functions,
-                        ) {
-                            nargs += 1; // trailing dictionary
-                        }
-                        Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
-                        return bytecode;
-                    }
-
-                    // Same fallback as ground-trait calls: inline receivers
-                    // like `(new Point(1, 2)).sum()` are not identifiers, so
-                    // `receiver_type` alone used to leave `owner` empty.
-                    let recv_ty = self
-                        .receiver_type(recv)
-                        .or_else(|| self.codegen_expr_ty(recv));
-                    let owner = recv_ty
-                        .as_ref()
-                        .and_then(|ty| {
-                            Checker::class_name_of_ty(ty)
-                                .filter(|n| self.checker.is_class(n))
-                                .map(|n| n.to_string())
-                        })
-                        .unwrap_or_default();
-                    let fqn = self
-                        .context
-                        .methods
-                        .get(&owner)
-                        .and_then(|m| m.get(*method))
-                        .cloned();
-                    if let Some(fqn_base) = fqn {
-                        let nargs = args.as_ref().map(|items| items.len()).unwrap_or(0);
-                        let fqn = if let Some((fa, is_rest, id)) =
-                            self.checker.selected_overload_at(span.start, span.end)
-                        {
-                            let keyed = overload_fn_key(&fqn_base, fa, is_rest, id);
-                            if self.functions.contains_key(&keyed) {
-                                keyed
-                            } else {
-                                fqn_base.clone()
-                            }
-                        } else if self.checker.is_overloaded(&fqn_base) {
-                            // Forward call inside an impl that later gained
-                            // more overloads — TC may not have recorded a
-                            // selection (set had size 1 at infer time).
-                            // Prefer arg types so same-arity overloads match
-                            // the checker path (`select_overload_for_args`).
-                            let arg_tys: Vec<Ty> = args
-                                .as_ref()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(|a| {
-                                            let value = match a.1.as_ref() {
-                                                Expression::NamedArg(_, v) => v,
-                                                _ => a,
-                                            };
-                                            self.codegen_expr_ty(value)
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            // Only pass types when every arg resolved; a
-                            // partial vec would shift positions under unify.
-                            let tys = if arg_tys.len() == nargs {
-                                arg_tys.as_slice()
-                            } else {
-                                &[]
-                            };
-                            match self.checker.select_overload_for_args(&fqn_base, nargs, tys) {
-                                crate::typechecking::infer::OverloadSelect::Selected(c) => {
-                                    let keyed = overload_fn_key(
-                                        &fqn_base,
-                                        c.fixed_arity,
-                                        c.is_rest,
-                                        c.id,
-                                    );
-                                    if self.functions.contains_key(&keyed) {
-                                        keyed
-                                    } else {
-                                        fqn_base
-                                    }
-                                }
-                                _ => fqn_base,
-                            }
-                        } else {
-                            fqn_base
-                        };
-                        if let Some(offset) = self.functions.get(&fqn).copied() {
-                            // Same ABI as free generics: box top-level type
-                            // params, append trait dictionaries, unbox returns.
-                            let lookup_name = strip_overload_key(&fqn).to_string();
-                            let is_generic = self.checker.is_generic_fn(&lookup_name);
-                            let box_generic_args = is_generic
-                                && self.generic_has_toplevel_type_param_args(&lookup_name);
-                            // Stage the receiver into a temp *before* user args.
-                            // Leaving it on the operand stack while arg staging
-                            // `STORE`s into temps clobbers it (locals and the
-                            // operand stack share memory) — nested calls like
-                            // `self.inner.put(x, true)` then mutate the wrong object.
-                            bytecode.append(&mut self.do_compile(recv));
-                            let recv_tmp = self.alloc_temp_slot();
-                            bytecode.push_store_pop(recv_tmp);
-                            let arg_slice = args.as_deref().unwrap_or(&[]);
-                            self.consume_spread_emit_ids(arg_slice);
-                            let (fixed, rest, pack_rest) =
-                                self.split_call_args_for_rest(&lookup_name, arg_slice);
-                            let mut arg_temps: Vec<u32> = Vec::new();
-                            for arg in &fixed {
-                                self.append_with_existential_pack(&mut bytecode, arg);
-                                if box_generic_args {
-                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                    }
-                                }
-                                let tmp = self.alloc_temp_slot();
-                                bytecode.push_store_pop(tmp);
-                                arg_temps.push(tmp);
-                            }
-                            let nargs = if pack_rest {
-                                for arg in &rest {
-                                    self.append_with_existential_pack(&mut bytecode, arg);
-                                    if box_generic_args {
-                                        if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                            Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                        }
-                                    }
-                                }
-                                if self.checker.fn_tuple_rest(&lookup_name) {
-                                    bytecode.push_make_tuple(rest.len() as u32);
-                                } else {
-                                    bytecode.push_make_array(rest.len() as u32);
-                                }
-                                let tmp = self.alloc_temp_slot();
-                                bytecode.push_store_pop(tmp);
-                                arg_temps.push(tmp);
-                                (fixed.len() + 1) as u32
-                            } else {
-                                fixed.len() as u32
-                            };
-                            bytecode.push_load(recv_tmp);
-                            for tmp in &arg_temps {
-                                bytecode.push_load(*tmp);
-                            }
-                            let dict_count = if is_generic {
-                                let mut call_arg_tys: Vec<Ty> = Vec::new();
-                                if let Some(ty) = recv_ty.clone() {
-                                    call_arg_tys.push(ty);
-                                }
-                                for arg in &fixed {
-                                    call_arg_tys.push(self.codegen_expr_ty(arg).expect(
-                                        "typechecked method argument must have a codegen type",
-                                    ));
-                                }
-                                if pack_rest {
-                                    call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
-                                }
-                                let mut forwarded = 0;
-                                if let Some(indices) = self_id
-                                    .and_then(|id| self.checker.forwarded_dicts_at(id))
-                                    .or_else(|| {
-                                        self.checker
-                                            .forwarded_dicts_for_span(span.start, span.end)
-                                    })
-                                    .map(<[usize]>::to_vec)
-                                {
-                                    for dict_index in indices {
-                                        if let Some(slot) =
-                                            self.lookup_slot(&format!("__dict{}", dict_index))
-                                        {
-                                            bytecode.push_load(slot);
-                                            forwarded += 1;
-                                        }
-                                    }
-                                }
-                                let call_ret_ty = self.codegen_expr_ty(ast);
-                                forwarded
-                                    + Self::emit_call_site_dicts(
-                                        &mut bytecode,
-                                        &lookup_name,
-                                        &call_arg_tys,
-                                        call_ret_ty.as_ref(),
-                                        &self.checker,
-                                        &self.functions,
-                                    )
-                            } else {
-                                0
-                            };
-                            bytecode.push(
-                                Byte::new(Instruction::CALL).with_call_packed(
-                                    1 + nargs + dict_count as u32,
-                                    offset as u32,
-                                ),
-                            );
-                            if is_generic && self.generic_return_is_boxed(&lookup_name) {
-                                if let Some(call_ty) = self.codegen_expr_ty(ast) {
-                                    Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
-                                }
-                            }
-                        } else {
-                            let mut message = Message::error(
-                                ErrorCode::UnknownFunction,
-                                "Unknown method".to_string(),
-                                span.into_range(),
-                            );
-                            message.push(DiagLabel::new(
-                                format!("Unable to call unknown method '{}'", fqn),
-                                span.into_range(),
-                            ));
-                            self.messages.push(message);
-                        }
-                    } else {
-                        let mut message = Message::error(
-                            ErrorCode::UnknownFunction,
-                            "Unknown method".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(DiagLabel::new(
-                            format!("Unable to call method '{}' on '{}'", method, owner),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
-                    }
-                } else {
-                    if matches!(name.1.as_ref(), Expression::Lambda { .. }) {
-                        let arg_slice = args.as_deref().unwrap_or(&[]);
-                        self.consume_spread_emit_ids(arg_slice);
-                        let flat_args = self.flatten_call_args_for_emit(arg_slice);
-                        for arg in &flat_args {
-                            bytecode.append(&mut self.do_compile(arg));
-                        }
-                        bytecode.append(&mut self.do_compile(name));
-                        bytecode.push(
-                            Byte::new(Instruction::CallIndirect)
-                                .with_operand_u32(flat_args.len() as u32),
-                        );
-                        return bytecode;
-                    }
-                    if let Expression::Identifier(raw) = name.1.as_ref() {
-                        if *raw == "len" {
-                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
-                            if let Some(items) = args
-                                && items.len() == 1
-                            {
-                                // Prefer compile-time length when known from
-                                // literals / static types.
-                                if let Some(ConstValue::Int(n)) =
-                                    crate::const_fold::eval_expr(ast, self.const_env())
-                                {
-                                    self.discard_compile(&items[0]);
-                                    self.emit_const_value(
-                                        &ConstValue::Int(n),
-                                        &mut bytecode,
-                                    );
-                                    return bytecode;
-                                }
-                                if let Some(n) = self.static_len_of(&items[0]) {
-                                    bytecode.append(&mut self.do_compile(&items[0]));
-                                    bytecode.push_pop();
-                                    self.emit_const_value(
-                                        &ConstValue::Int(n as i64),
-                                        &mut bytecode,
-                                    );
-                                    return bytecode;
-                                }
-                                // Structural aggregates → ArrayLen. Custom types
-                                // with `Length` use the instance method below.
-                                let arg_ty = self.codegen_expr_ty(&items[0]).map(|ty| {
-                                    crate::typechecking::subst::apply_ty_prune(
-                                        self.checker.subst(),
-                                        &ty,
-                                    )
-                                });
-                                let structural = arg_ty
-                                    .as_ref()
-                                    .is_some_and(Checker::is_structural_len_ty_for_codegen);
-                                if structural {
-                                    bytecode.append(&mut self.do_compile(&items[0]));
-                                    bytecode.push(Byte::new(Instruction::ArrayLen));
-                                    return bytecode;
-                                }
-                                if let Some(ty) = arg_ty.as_ref()
-                                    && let Some(fqn) = self.len_instance_method_fqn(ty)
-                                    && let Some(&offset) = self.functions.get(&fqn)
-                                {
-                                    bytecode.append(&mut self.do_compile(&items[0]));
-                                    Self::emit_call_indirect(
-                                        &mut bytecode,
-                                        offset as u32,
-                                        1,
-                                    );
-                                    return bytecode;
-                                }
-                                if structural {
-                                    bytecode.append(&mut self.do_compile(&items[0]));
-                                    bytecode.push(Byte::new(Instruction::ArrayLen));
-                                    return bytecode;
-                                }
-                                bytecode.append(&mut self.do_compile(&items[0]));
-                                bytecode.push(Byte::new(Instruction::ArrayLen));
-                                return bytecode;
-                            } else {
-                                let mut message = Message::error(
-                                    ErrorCode::TooManyArguments,
-                                    "Invalid len call".to_string(),
-                                    span.into_range(),
-                                );
-                                message.push(DiagLabel::new(
-                                    format!("len expects 1 argument, got {}", provided),
-                                    span.into_range(),
-                                ));
-                                self.messages.push(message);
-                                return bytecode;
-                            }
-                        }
-                    }
-
-                    let identifier = self.resolve_variable_checked(name);
-                    let n = self
-                        .aliases
-                        .get(&identifier)
-                        .cloned()
-                        .unwrap_or_else(|| identifier.clone());
-                    // Non-entry modules register `ns::name`, but sibling
-                    // calls use the bare name. Typecheck inserts bare
-                    // names so TC can pass while codegen misses — retry
-                    // the current module FQN before reporting unknown.
-                    let n = if self.functions.contains_key(&n)
-                        || self.extern_runtime_functions.contains_key(&n)
-                        || self.native.contains_key(&n)
-                    {
-                        n
-                    } else if !self.namespace.is_empty() && !n.contains("::") {
-                        let qualified = format!("{}::{}", self.namespace, n);
-                        if self.functions.contains_key(&qualified)
-                            || self
-                                .checker
-                                .selected_overload_at(span.start, span.end)
-                                .is_some()
-                        {
-                            qualified
-                        } else {
-                            n
-                        }
-                    } else {
-                        n
-                    };
-
-                    // Arity-overload table key (when the typechecker selected one).
-                    let n = if let Some((fa, is_rest, id)) =
-                        self.checker.selected_overload_at(span.start, span.end)
-                    {
-                        let keyed = overload_fn_key(&n, fa, is_rest, id);
-                        if self.functions.contains_key(&keyed) {
-                            keyed
-                        } else {
-                            // Try bare-name key when FQN wasn't used at registration.
-                            let simple = n.rsplit("::").next().unwrap_or(&n);
-                            let keyed_simple = overload_fn_key(simple, fa, is_rest, id);
-                            if self.functions.contains_key(&keyed_simple) {
-                                keyed_simple
-                            } else {
-                                n
-                            }
-                        }
-                    } else {
-                        n
-                    };
-
-                    if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
-                        // Same discipline as HostInvoke: emit lib/fn_id first,
-                        // then compile args onto `self.bytecode`. Nested IO
-                        // HostInvoke writes directly to `self.bytecode` and
-                        // returns an empty slice — staging args into a side
-                        // Vec first left those bytes *before* the LOADs, so
-                        // MakeTuple packed the wrong stack values.
-                        let arity = if let Some(items) = args {
-                            items.len()
-                        } else {
-                            0
-                        };
-                        let variadic = self.checker.is_extern_variadic(&n);
-                        let depth_on_entry = self.expr_depth;
-                        self.bytecode.push_load(lib_slot);
-                        self.bytecode.push_load(fn_id_slot);
-                        self.expr_depth = depth_on_entry + 2;
-                        if let Some(items) = args {
-                            for arg in items {
-                                let mut arg_bc = self.do_compile(arg);
-                                self.bytecode.append(&mut arg_bc);
-                                self.expr_depth += 1;
-                            }
-                        }
-                        self.bytecode.push_make_tuple(arity as u32);
-                        let mut operand = arity as u32 & 0xFFFF;
-                        if variadic {
-                            let call_span = (span.start, span.end);
-                            let arg_refs: Vec<_> = args
-                                .as_ref()
-                                .map(|items| items.iter().collect())
-                                .unwrap_or_default();
-                            if let Some(tags) = resolve_variadic_ffi_tags(
-                                &self.checker,
-                                call_span,
-                                &arg_refs,
-                                &mut self.messages,
-                            ) {
-                                for &(tag, aux) in &tags {
-                                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
-                                }
-                                self.bytecode.push_make_tuple(tags.len() as u32);
-                                operand |= 1 << 16;
-                            }
-                        }
-                        self.bytecode
-                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
-                        self.expr_depth = depth_on_entry;
-                        self.emit_result_unwrap_or_panic();
-                    } else if let Some(&native_id) = self.native.get(&n) {
-                        // Same stack order as `emit_io_host_invoke`: id first,
-                        // then args (nested HostInvoke may write to `self.bytecode`).
-                        let arity = if let Some(items) = args {
-                            items.len()
-                        } else {
-                            0
-                        };
-                        let depth_on_entry = self.expr_depth;
-                        self.bytecode
-                            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-                        self.expr_depth = depth_on_entry + 1;
-                        if let Some(items) = args {
-                            for arg in items {
-                                let mut arg_bc = self.do_compile(arg);
-                                self.bytecode.append(&mut arg_bc);
-                                self.expr_depth += 1;
-                            }
-                        }
-                        self.bytecode.push_make_tuple(arity as u32);
-                        self.bytecode.push_host_invoke(arity as u32);
-                        self.expr_depth = depth_on_entry;
-                    } else if let Some(offset) = self.functions.get(&n).copied() {
-                        let mono_offset = self.mono_call_offset(&n, args.as_ref());
-                        let target_offset = mono_offset.unwrap_or(offset);
-                        let lookup_name = strip_overload_key(&n).to_string();
-                        let is_generic =
-                            self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
-                        // Only box bare `T` args for the shared dict ABI. Nested
-                        // params like `[T]` (e.g. `collections::sort`) keep the
-                        // native representation even when not monomorphized.
-                        let box_generic_args =
-                            is_generic && self.generic_has_toplevel_type_param_args(&lookup_name);
-                        let arg_slice = args.as_deref().unwrap_or(&[]);
-                        self.consume_spread_emit_ids(arg_slice);
-                        let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
-
-                        if self.try_emit_par_specialized_call(&n, Some(arg_slice), &mut bytecode) {
-                            return bytecode;
-                        }
-
-                        if !is_generic
-                            && !self.coroutine_fns.contains(&n)
-                            && !self.coroutine_fns.contains(&lookup_name)
-                            && self.try_emit_inline_direct_call(&n, Some(arg_slice), &mut bytecode)
-                        {
-                            return bytecode;
-                        }
-
-                        // One-level self-unroll: peel recursive callee body once;
-                        // nested self-calls remain CALL/Entry.
-                        if !is_generic
-                            && !self.coroutine_fns.contains(&n)
-                            && !self.coroutine_fns.contains(&lookup_name)
-                            && self.try_emit_self_unroll_call(&n, Some(arg_slice), &mut bytecode)
-                        {
-                            return bytecode;
-                        }
-
-                        // Caller-side base-case peel: cmp-jmp before CALL when
-                        // the callee opens with fused/unfused compare + imm/slot return.
-                        let peel_indirect = is_instance_method_fqn(&self.checker, &lookup_name);
-                        if !is_generic
-                            && !self.coroutine_fns.contains(&n)
-                            && !self.coroutine_fns.contains(&lookup_name)
-                            && self.try_emit_predicate_peel_call(
-                                &n,
-                                Some(arg_slice),
-                                &mut bytecode,
-                                target_offset as u32,
-                                peel_indirect,
-                            )
-                        {
-                            return bytecode;
-                        }
-
-                        // Partial application → MakeFn (not CALL).
-                        let (fa, is_rest, _id) = self
-                            .checker
-                            .selected_overload_at(span.start, span.end)
-                            .or_else(|| {
-                                let names = self.checker.fn_param_names(&lookup_name)?;
-                                let rest = self.checker.fn_has_rest(&lookup_name);
-                                let fixed = if rest {
-                                    names.len().saturating_sub(1)
-                                } else {
-                                    names.len()
-                                };
-                                Some((fixed, rest, 0))
-                            })
-                            .or_else(|| {
-                                self.fn_arities
-                                    .get(&lookup_name)
-                                    .or_else(|| self.fn_arities.get(&n))
-                                    .map(|(a, r)| (*a as usize, *r, 0))
-                            })
-                            .unwrap_or((0, false, 0));
-                        let fill_mask =
-                            self.checker
-                                .partial_fill_at(span.start, span.end)
-                                .or_else(|| {
-                                    // Spread args count as their expanded arity, not one slot.
-                                    let argc = flat_arg_slice.len();
-                                    if !is_rest && fa > 0 && argc < fa {
-                                        Some((1u32 << argc).wrapping_sub(1))
-                                    } else {
-                                        None
-                                    }
-                                });
-                        if let Some(mask) = fill_mask {
-                            // Emit filled values in declaration order (already
-                            // the order of `flat_arg_slice` after named reorder at TC).
-                            for arg in &flat_arg_slice {
-                                let value = match arg.1.as_ref() {
-                                    Expression::NamedArg(_, v) => v,
-                                    _ => arg,
-                                };
-                                bytecode.append(&mut self.do_compile(value));
-                            }
-                            let n_filled = mask.count_ones();
-                            bytecode.push_const(mask as i32);
-                            bytecode.push(
-                                Byte::new(Instruction::CodePtr)
-                                    .with_operand_u32(target_offset as u32),
-                            );
-                            bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
-                                make_fn_operand(0, n_filled, fa as u32, is_rest),
-                            ));
-                            return bytecode;
-                        }
-
-                        let value_arity = self.emit_call_args_with_rest(
-                            &lookup_name,
-                            arg_slice,
-                            &mut bytecode,
-                            box_generic_args,
-                        );
-
-                        // ── Dictionary-passing calling convention ──────────────────
-                        // For non-monomorphized generic calls, append one dict tuple
-                        // per constraint after the value args. Each dict is a
-                        // MakeTuple of method code offsets (CodePtr per method in
-                        // declaration order). Builtin and user instances share this
-                        // ABI; ground Num/Ord/Eq calls may still monomorphize away
-                        // from the shared body, but Show-bound calls always take
-                        // this path.
-                        let dict_count = if is_generic {
-                            let (fixed, rest, pack_rest) =
-                                self.split_call_args_for_rest(&lookup_name, arg_slice);
-                            let mut call_arg_tys: Vec<crate::typechecking::Ty> = fixed
-                                .iter()
-                                .map(|arg| {
-                                    self.codegen_expr_ty(arg).expect(
-                                        "typechecked call argument must have a codegen type",
-                                    )
-                                })
-                                .collect();
-                            // Rest-only generics (`T... xs`) have empty `fixed`;
-                            // bind `T` from the packed `[T]` / `[T; N]` arg.
-                            if pack_rest {
-                                call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
-                            }
-                            let mut forwarded = 0;
-                            if let Some(indices) = self_id
-                                .and_then(|id| self.checker.forwarded_dicts_at(id))
-                                .or_else(|| {
-                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
-                                })
-                                .map(<[usize]>::to_vec)
-                            {
-                                for dict_index in indices {
-                                    if let Some(slot) =
-                                        self.lookup_slot(&format!("__dict{}", dict_index))
-                                    {
-                                        bytecode.push_load(slot);
-                                        forwarded += 1;
-                                    }
-                                }
-                            }
-                            let call_ret_ty = self.codegen_expr_ty(ast);
-                            forwarded
-                                + Self::emit_call_site_dicts(
-                                    &mut bytecode,
-                                    &lookup_name,
-                                    &call_arg_tys,
-                                    call_ret_ty.as_ref(),
-                                    &self.checker,
-                                    &self.functions,
-                                )
-                        } else {
-                            0
-                        };
-
-                        let arity = value_arity + dict_count as u32;
-                        if is_instance_method_fqn(&self.checker, &lookup_name) {
-                            Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
-                        } else if self.coroutine_fns.contains(&lookup_name)
-                            || self.coroutine_fns.contains(&n)
-                        {
-                            bytecode.push(
-                                Byte::new(Instruction::MakeCoro)
-                                    .with_call_packed(arity, target_offset as u32),
-                            );
-                        } else {
-                            // Packed CALL: arity + target in one opcode.
-                            bytecode.push(
-                                Byte::new(Instruction::CALL)
-                                    .with_call_packed(arity, target_offset as u32),
-                            );
-                        }
-                        // Generic→concrete unbox: only when the return type
-                        // parameter was boxed as a top-level argument
-                        // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
-                        // not boxed at construction, so unboxing would zero
-                        // a valid immediate (Phase 5 HKT / Container::first).
-                        if is_generic && self.generic_return_is_boxed(&lookup_name) {
-                            if let Some(call_ty) = self.codegen_expr_ty(ast) {
-                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
-                            }
-                        }
-                    } else if let Some(slot) = self.lookup_slot(&identifier) {
-                        // Local holding a function value: escaped PolyFn
-                        // (`let f = show` / `return show`), rank-n parameter, or
-                        // a PolyFn returned from another call. Emit args, optional
-                        // application dictionaries, then CallIndirect.
-                        let arg_slice = args.as_deref().unwrap_or(&[]);
-                        self.consume_spread_emit_ids(arg_slice);
-                        let flat_args = self.flatten_call_args_for_emit(arg_slice);
-                        let value_arity = flat_args.len() as u32;
-                        let mut arg_tys = Vec::new();
-                        let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
-                        // Box for PolyFn locals — including those assigned from a
-                        // call that returns a captured PolyFn (no polyfn_sources
-                        // entry). Mono ObjFn / partials / lambdas stay unboxed.
-                        let needs_arg_box = self.local_call_needs_arg_boxing(&identifier);
-                        for arg in &flat_args {
-                            self.append_with_existential_pack(&mut bytecode, arg);
-                            if needs_arg_box {
-                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                    arg_tys.push(arg_ty);
-                                }
-                            }
-                        }
-                        let mut dict_count = 0u32;
-                        if let Some(source) = polyfn_source.as_ref() {
-                            if let Some(indices) = self_id
-                                .and_then(|id| self.checker.forwarded_dicts_at(id))
-                                .or_else(|| {
-                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
-                                })
-                                .map(<[usize]>::to_vec)
-                            {
-                                for dict_index in indices {
-                                    if let Some(dict_slot) =
-                                        self.lookup_slot(&format!("__dict{}", dict_index))
-                                    {
-                                        bytecode.push_load(dict_slot);
-                                        dict_count += 1;
-                                    }
-                                }
-                            }
-                            let call_ret_ty = self.codegen_expr_ty(ast);
-                            dict_count += Self::emit_call_site_dicts(
-                                &mut bytecode,
-                                source,
-                                &arg_tys,
-                                call_ret_ty.as_ref(),
-                                &self.checker,
-                                &self.functions,
-                            ) as u32;
-                        }
-                        // Pack value arity + application dict arity so the VM can
-                        // merge captured evidence with apply-site dictionaries.
-                        bytecode.push_load(slot);
-                        bytecode.push(
-                            Byte::new(Instruction::CallIndirect)
-                                .with_operand_u32(value_arity | (dict_count << 16)),
-                        );
-                        // Generic→concrete unbox for polyfn call site.
-                        if self.local_polyfn_call_needs_unbox(
-                            &identifier,
-                            Some((span.start, span.end)),
-                        ) {
-                            let call_ty = self.codegen_expr_ty(ast);
-                            let unbox_ty = match call_ty {
-                                Some(t) if Self::ty_to_value_tag(&t).is_some() => Some(t),
-                                _ => {
-                                    let arg_tys: Vec<Ty> = flat_args
-                                        .iter()
-                                        .filter_map(|a| self.codegen_expr_ty(a))
-                                        .collect();
-                                    // Binder forall (not call-site instantiated Fun).
-                                    let binder = {
-                                        use crate::typechecking::subst::apply_ty_prune;
-                                        let mut found = None;
-                                        for frame in self.mono_codegen_var_types.iter().rev() {
-                                            if let Some(ty) = frame.get(&identifier) {
-                                                found = Some(apply_ty_prune(
-                                                    self.checker.subst(),
-                                                    ty,
-                                                ));
-                                                break;
-                                            }
-                                        }
-                                        found.or_else(|| {
-                                            self.checker.codegen_var_type(&identifier).map(|ty| {
-                                                apply_ty_prune(self.checker.subst(), ty)
-                                            })
-                                        })
-                                    };
-                                    binder.and_then(|vt| {
-                                        Self::instantiate_polyfn_app_result(&vt, &arg_tys)
-                                    })
-                                }
-                            };
-                            if let Some(ty) = unbox_ty {
-                                Self::emit_unbox_if_needed(&mut bytecode, &ty);
-                            }
-                        }
-                    } else {
-                        let mut message = Message::error(
-                            ErrorCode::UnknownFunction,
-                            "Unknown function".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(DiagLabel::new(
-                            format!("Unable to call unknown function '{}'", n),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
-                    }
-                } // end non-method Call
-            }
+            Expression::Call { name, args } => bytecode.append(&mut self.compile_call_expr(name, args, ast, self_id, span)),
             Expression::Argument { ty, name: n, .. } => {
                 let slot = self.context.variables.intern(n.to_string()) as u32;
                 self.record_debug_local(n, slot);
@@ -11381,598 +10381,7 @@ impl Compiler {
             // --- Match codegen (threaded layout) ---
             // Forward: scrutinee, JUMP_IF_MATCH cascade, last-arm UNPACK/POP/STORE.
             // Reverse: arm bindings + bodies; non-first arms JMP to end.
-            Expression::Match { scrutinee, arms } => {
-                if arms.is_empty() {
-                    bytecode.append(&mut self.do_compile(scrutinee));
-                    bytecode.push_pop();
-                } else {
-                    let mut bb = BlockBuilder::new();
-                    let end_label = bb.fresh_label(self.bytecode.il_mut());
-
-                    let tag_groups = group_arms_by_outer_tag(arms, &self.checker);
-                    // Forward pass emits JUMP_IF_MATCH for every non-last
-                    // group, and also for the last group when any group is
-                    // multi-arm. Allocate labels for those targets — not
-                    // merely for `!is_last && Constructor` in source order
-                    // (that missed the last group's first arm when Err
-                    // followed two Ok arms, panicking at emit time).
-                    let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
-                    let mut arm_labels: Vec<Option<crate::block_builder::Label>> =
-                        vec![None; arms.len()];
-                    for (g_idx, group) in tag_groups.iter().enumerate() {
-                        let is_last_group = g_idx == tag_groups.len() - 1;
-                        if !is_last_group || any_multi_arm_group {
-                            let first_arm_idx = group.arm_indices[0];
-                            arm_labels[first_arm_idx] =
-                                Some(bb.fresh_label(self.bytecode.il_mut()));
-                        }
-                    }
-
-                    // Reset shared stack/locals cursor to the live-local height
-                    // before evaluating the scrutinee. Prior STORE high-water
-                    // (e.g. `let v = match` in a loop) would otherwise make
-                    // JumpIfMatch push payloads past `payload_base`.
-                    let seek_base = self.context.variables.len() as u32;
-                    self.bytecode.push_seek(seek_base);
-
-                    // Compile scrutinee before choosing payload_base —
-                    // HostInvoke arg staging (`alloc_temp_slot`) grows
-                    // `variables`, and bindings must start *after* those
-                    // temps or Unpack/JumpIfMatch collide with them
-                    // (e.g. `match try_recv(rx)` after print→write_all).
-                    let scrutinee_bc = self.do_compile(scrutinee);
-                    self.bytecode.extend(scrutinee_bc);
-
-                    // First payload slot after locals + scrutinee temps.
-                    // JumpIfMatch/Unpack push payloads onto the stack
-                    // above those locals, so bindings must start here —
-                    // not at the historical hardcoded slot 1.
-                    let payload_base = self.context.variables.len() as u32;
-
-                    // Forward pass: outer-tag dispatch + last-arm scrutinee consumer.
-                    for (g_idx, group) in tag_groups.iter().enumerate() {
-                        let is_last_group = g_idx == tag_groups.len() - 1;
-                        if !is_last_group || any_multi_arm_group {
-                            let first_arm_idx = group.arm_indices[0];
-                            let label = arm_labels[first_arm_idx]
-                                .expect("non-last group's first arm must have a Label");
-                            bb.emit_jump_to(
-                                label,
-                                BbJumpKind::JumpIfMatch {
-                                    tag: group.tag,
-                                    arity: 0,
-                                },
-                                self.bytecode.il_mut(),
-                            );
-                        } else {
-                            // Last group in a match with NO
-                            // multi-arm groups — emit the
-                            // scrutinee-consumer for the
-                            // last arm in source order (the
-                            // last element of the last
-                            // group's `arm_indices`). This
-                            // matches the pre-grouped
-                            // behavior: the very last arm
-                            // is reached by fall-through
-                            // from every preceding
-                            // JUMP_IF_MATCH miss, so the
-                            // scrutinee is still on the
-                            // stack and must be consumed
-                            // (UNPACK for Constructor, POP
-                            // for Wildcard, STORE 1 for
-                            // Binding).
-                            let last_arm_idx = *group
-                                .arm_indices
-                                .last()
-                                .expect("last group must have at least one arm");
-                            let last_arm = &arms[last_arm_idx];
-                            match &last_arm.pattern.1 {
-                                Pattern::Constructor {
-                                    enum_name,
-                                    variant_name,
-                                    ..
-                                } => {
-                                    let arity = self
-                                        .checker
-                                        .arity_for(enum_name, variant_name)
-                                        .expect(
-                                            "Match arm constructor: typechecker should have registered the arity",
-                                        );
-                                    self.bytecode.push(
-                                        Byte::new(Instruction::Unpack)
-                                            .with_operand_u32(arity as u32),
-                                    );
-                                }
-                                Pattern::Wildcard => {
-                                    // Wildcard arm — POP the
-                                    // scrutinee.
-                                    self.bytecode.push_pop();
-                                }
-                                Pattern::Binding { name } => {
-                                    // Binding arm — scrutinee already sits at
-                                    // `payload_base` (shared stack/locals). No
-                                    // STORE opcode; reverse pass records the
-                                    // binding slot.
-                                    let _ = name;
-                                }
-                            }
-                        }
-                    }
-
-                    // Step 3.5: For multi-arm groups WITH
-                    // runtime tests, emit the inner-pattern
-                    // test chain. This sits between the
-                    // forward pass (JUMP_IF_MATCH
-                    // dispatch + scrutinee-consumer) and the
-                    // reverse pass (binding + body emission).
-                    //
-                    // Why this pass is needed: when two or
-                    // more arms share the same OUTER variant
-                    // tag but differ on an INNER sub-pattern
-                    // (e.g. `Result::Ok(Option::Some(v))` vs
-                    // `Result::Ok(Option::None)`), a single
-                    // `JUMP_IF_MATCH` on the outer tag can't
-                    // disambiguate between them — both arms
-                    // match the outer tag. The inner-pattern
-                    // test chain adds a second dispatch step
-                    // (a runtime test on the inner payload)
-                    // to pick the right arm.
-                    //
-                    // Layout for a 3-arm group
-                    // `[arm_0, arm_1, arm_2]` sharing the
-                    // outer tag:
-                    //
-                    //   [REBIND arm_0_label here]
-                    //   POP/STORE for arm_0's sub-patterns
-                    //   JMP → pass_label_0
-                    //   POP/STORE for arm_1's sub-patterns
-                    //   JMP → pass_label_1
-                    //   POP/STORE for arm_2's sub-patterns
-                    //   (no JMP — pass_label is None)
-                    //   → arm_2 body (fall-through)
-                    //   JMP → end_label
-                    //   [bind pass_label_1 here] arm_1 body
-                    //   JMP → end_label
-                    //   [bind pass_label_0 here] arm_0 body
-                    //   [end_label: RETURN]
-                    //
-                    // The REBIND of `arm_0_label` redirects
-                    // the outer `JUMP_IF_MATCH` (emitted in
-                    // the forward pass) from landing at the
-                    // first arm's BODY to landing at the
-                    // START of the test chain. Each non-last
-                    // arm's `JMP → pass_label_N` then routes
-                    // a successful test to the arm's body
-                    // (bound later in the reverse pass). The
-                    // last arm's test chain falls through to
-                    // its body (no JMP needed).
-                    //
-                    // Multi-arm groups WITHOUT runtime tests
-                    // (every sub-pattern is `Wildcard` /
-                    // `Binding`, no nested `Constructor`) are
-                    // unaffected — the existing
-                    // first-arm-wins behavior is preserved.
-                    // Single-arm groups are also unaffected.
-                    let mut pass_labels: HashMap<usize, Option<crate::block_builder::Label>> =
-                        HashMap::new();
-                    let mut test_chain_first_arms: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    // All arms that participate in a test chain
-                    // group . The reverse pass uses
-                    // this set to decide whether to skip
-                    // POP/STORE/UNPACK emission in
-                    // `emit_pattern_binding` — the test chain
-                    // pass already consumed the values, so the
-                    // reverse pass should NOT re-emit them.
-                    // `test_chain_first_arms` (above) only tracks
-                    // the FIRST arm of each group (for label
-                    // re-binding); `test_chain_arms` tracks ALL
-                    // arms in all test chain groups.
-                    let mut test_chain_arms: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    // Per-arm binding map populated by
-                    // `emit_inner_test` for arms in test chain
-                    // groups. Keyed by arm_idx → name → slot.
-                    // The reverse pass consults this map to
-                    // install `self.context.match_bindings` for
-                    // test chain arms, instead of re-emitting
-                    // binding code (which would double-pop /
-                    // double-store the payload values).
-                    let mut match_bindings_per_arm: HashMap<usize, HashMap<String, u32>> =
-                        HashMap::new();
-
-                    for group in &tag_groups {
-                        // Only groups with multiple arms AND
-                        // at least one arm with a runtime test
-                        // trigger the new test-chain
-                        // emission.
-                        if group.arm_indices.len() <= 1 {
-                            continue;
-                        }
-                        let has_runtime_test = group
-                            .arm_indices
-                            .iter()
-                            .any(|&i| arm_has_runtime_test(&arms[i]));
-                        if !has_runtime_test {
-                            continue;
-                        }
-
-                        let first_arm_idx = group.arm_indices[0];
-                        let first_arm_label = arm_labels[first_arm_idx]
-                            .expect("non-last group's first arm must have a Label");
-
-                        // REBIND the first arm's label so the
-                        // outer JUMP_IF_MATCH lands at the
-                        // test chain start, not at the arm
-                        // body. `bind_label` is idempotent —
-                        // calling it again would re-patch the
-                        // JUMP_IF_MATCH, which is exactly
-                        // what we want here.
-                        bb.bind_label(first_arm_label, self.bytecode.il_mut());
-                        test_chain_first_arms.insert(first_arm_idx);
-                        for &arm_idx in &group.arm_indices {
-                            test_chain_arms.insert(arm_idx);
-                        }
-
-                        // Emit the test chain for each arm in
-                        // source order. Every arm gets a
-                        // `pass_label` JMP to its body —
-                        // including the last arm in the group.
-                        // Fall-through after the last arm is
-                        // only safe when that arm's body is
-                        // emitted immediately after the test
-                        // chain (i.e. the group is source-last).
-                        // With a later tag group (e.g. Ok/Ok
-                        // then Err), fall-through would land in
-                        // the wrong body's bytecode.
-                        for (rank, &arm_idx) in group.arm_indices.iter().enumerate() {
-                            let is_last_in_group = rank == group.arm_indices.len() - 1;
-
-                            let pass_label = Some(bb.fresh_label(self.bytecode.il_mut()));
-
-                            // `fail_label` is the NEXT arm's
-                            // body label (so the runtime
-                            // test can dispatch to the next
-                            // arm's test chain on failure).
-                            // For the LAST arm in the group
-                            // (and for any arm whose NEXT
-                            // sibling has no body label —
-                            // e.g. it's the last arm of the
-                            // entire match and was reached
-                            // by fall-through), fall back to
-                            // `end_label` so the jump is at
-                            // least well-formed (the
-                            // placeholder implementation
-                            // currently doesn't emit a JMP to
-                            // fail_label, but the operand
-                            // still needs to be consistent
-                            // with the placeholder value).
-                            let fail_label = if !is_last_in_group {
-                                let next_arm_idx = group.arm_indices[rank + 1];
-                                arm_labels[next_arm_idx].unwrap_or(end_label)
-                            } else {
-                                end_label
-                            };
-
-                            pass_labels.insert(arm_idx, pass_label);
-
-                            // Get the arm's payload (only
-                            // Constructor arms are candidates
-                            // for runtime tests, by the
-                            // definition of
-                            // `arm_has_runtime_test`).
-                            let (enum_name, variant_name, payload) = match &arms[arm_idx].pattern.1 {
-                                Pattern::Constructor {
-                                    enum_name,
-                                    variant_name,
-                                    payload,
-                                    ..
-                                } => (*enum_name, *variant_name, payload),
-                                _ => continue,
-                            };
-
-                            emit_inner_test(
-                                arm_idx,
-                                &self.checker,
-                                enum_name,
-                                variant_name,
-                                payload,
-                                &mut match_bindings_per_arm,
-                                &mut self.bytecode,
-                                &mut bb,
-                                pass_label,
-                                fail_label,
-                                payload_base,
-                            );
-                        }
-                    }
-
-                    // Step 4-8: emit each arm's binding code
-                    // and body. We go in REVERSE source order
-                    // so the bytecode layout is:
-                    //   [last arm body]
-                    //   [JMP end (skip remaining)]
-                    //   [second-to-last arm body]
-                    //   [JMP end]
-                    //   ...
-                    //   [first arm body]
-                    //
-                    // Each non-first arm body is preceded by
-                    // JMP-to-end so it doesn't fall through
-                    // into the next body.
-
-                    // We process arms in reverse order so the
-                    // LAST arm body comes first in the
-                    // bytecode, then non-last arms with
-                    // JMP-to-end after each.
-                    for i in (0..arms.len()).rev() {
-                        let arm = &arms[i];
-                        let is_first = i == 0;
-
-                        // If this arm has a pre-allocated
-                        // `Label` (it's a non-last constructor
-                        // arm), bind it to the current bytecode
-                        // position. This patches the
-                        // JUMP_IF_MATCH placeholder emitted in
-                        // the forward pass.
-                        //
-                        // The `Label` is `Copy`, so the
-                        // immutable borrow of `arm_labels`
-                        // ends after this `if let` expression,
-                        // and the mutable borrow of `bb` (via
-                        // `bind_label`) starts fresh. No
-                        // borrow conflict.
-                        //
-                        // Exception: for the FIRST arm of a
-                        // test-chain group, the label was
-                        // already REBOUND by the test chain
-                        // pass to the test-chain start. We
-                        // MUST NOT bind it again here — that
-                        // would redirect the outer
-                        // JUMP_IF_MATCH from the test-chain
-                        // start back to the arm body,
-                        // bypassing the test chain entirely.
-                        // The reverse pass for this arm binds
-                        // `pass_label_0` instead (the
-                        // forward-fallthrough target emitted
-                        // by `emit_inner_test`).
-                        if !test_chain_first_arms.contains(&i)
-                            && let Some(label) = arm_labels[i]
-                        {
-                            bb.bind_label(label, self.bytecode.il_mut());
-                        }
-
-                        // For arms in test chain groups,
-                        // bind the test chain's
-                        // `pass_label` to the start of
-                        // this arm's body. Every test-chain
-                        // arm (including the last) gets a
-                        // pass_label so dispatch works when
-                        // another tag group follows.
-                        if let Some(Some(label)) = pass_labels.get(&i) {
-                            bb.bind_label(*label, self.bytecode.il_mut());
-                        }
-
-                        // Per-arm binding slots (`payload_base` = first
-                        // payload). Payload order follows declaration
-                        // order; record patterns may list fields in any
-                        // source order.
-                        let mut arm_bindings: HashMap<String, u32> = HashMap::new();
-                        let mut next_slot: u32 = payload_base;
-                        // Test-chain arms: payload already on stack from
-                        // the forward pass — use `consume_values = false`
-                        // to record bindings without re-emitting UNPACK/POP.
-                        let in_test_chain = test_chain_arms.contains(&i);
-                        if let Some(bindings) = match_bindings_per_arm.get(&i) {
-                            // This arm is in a test chain
-                            // group AND the test chain recorded
-                            // bindings (Wildcard/Binding
-                            // sub-patterns at the OUTER level).
-                            // Use the recorded bindings and skip
-                            // the reverse-pass binding code
-                            // entirely.
-                            arm_bindings = bindings.clone();
-                        } else if in_test_chain {
-                            // Test chain arm without recorded
-                            // bindings — the test chain emitted
-                            // JUMP_IF_MATCH for nested
-                            // Constructor sub-patterns (no
-                            // STORE). Walk the pattern to RECORD
-                            // the bindings in `arm_bindings`
-                            // (the body needs them for
-                            // `Identifier` lookups), but with
-                            // `consume_values = false` so we
-                            // don't re-emit the bytecode (the
-                            // test chain handled the values).
-                            match &arm.pattern.1 {
-                                Pattern::Binding { name } => {
-                                    arm_bindings.insert(name.to_string(), payload_base);
-                                }
-                                Pattern::Constructor {
-                                    enum_name,
-                                    variant_name,
-                                    ..
-                                } => {
-                                    // Test-chain arm: the test
-                                    // chain pass already emitted
-                                    // POP / STORE / JUMP_IF_MATCH
-                                    // for the OUTER level. Walk
-                                    // the pattern with
-                                    // `consume_values = false` to
-                                    // RECORD the bindings (the
-                                    // body needs them for
-                                    // `Identifier` lookups) but
-                                    // skip the redundant bytecode
-                                    // emission. The function
-                                    // handles Tuple (UNPACK skip
-                                    // + sub-pattern walk) and
-                                    // Record (decl-order walk +
-                                    // sub-pattern walk) internally.
-                                    let decl_order =
-                                        self.checker.payload_tys_for(enum_name, variant_name);
-                                    emit_pattern_binding(
-                                        &self.checker,
-                                        &mut arm_bindings,
-                                        &mut next_slot,
-                                        &arm.pattern.1,
-                                        &decl_order,
-                                        &mut self.bytecode,
-                                        false,
-                                        true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
-                                    );
-                                }
-                                Pattern::Wildcard => {}
-                            }
-                        } else {
-                            // Not in a test chain: emit binding
-                            // code at the outer level (consume
-                            // the values via POP/STORE/UNPACK).
-                            match &arm.pattern.1 {
-                                Pattern::Binding { name } => {
-                                    // Binding arm: the forward pass
-                                    // already emitted STORE at
-                                    // `payload_base` for the
-                                    // scrutinee. Record the binding
-                                    // here so the body's
-                                    // `Identifier` lookup finds it.
-                                    arm_bindings.insert(name.to_string(), payload_base);
-                                }
-                                Pattern::Constructor {
-                                    enum_name,
-                                    variant_name,
-                                    ..
-                                } => {
-                                    // Non-test-chain arm: emit full
-                                    // binding code at the outer
-                                    // level (consume the values via
-                                    // POP/STORE/UNPACK). The
-                                    // function handles Tuple (emit
-                                    // UNPACK + sub-pattern walk) and
-                                    // Record (decl-order walk + per-
-                                    // field recursion — including
-                                    // unbounded-depth nested record
-                                    // patterns) internally.
-                                    let decl_order =
-                                        self.checker.payload_tys_for(enum_name, variant_name);
-                                    emit_pattern_binding(
-                                        &self.checker,
-                                        &mut arm_bindings,
-                                        &mut next_slot,
-                                        &arm.pattern.1,
-                                        &decl_order,
-                                        &mut self.bytecode,
-                                        true,
-                                        true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
-                                    );
-                                }
-                                Pattern::Wildcard => {
-                                    // No bindings — the forward pass
-                                    // already emitted POP for the
-                                    // scrutinee.
-                                }
-                            }
-                        } // close `else` for test chain arms
-
-                        // Install the per-arm bindings map so the
-                        // body's `Identifier` / `Assignment` lookups
-                        // resolve pattern bindings to
-                        // `payload_base`, `payload_base+1`, …
-                        // — matching the VM's payload-push
-                        // positions. Cleared after the body emits.
-                        let saved_bindings = self.context.match_bindings.take();
-                        self.context.match_bindings = Some(arm_bindings);
-                        let binding_slots: Vec<(String, u32)> = self
-                            .context
-                            .match_bindings
-                            .as_ref()
-                            .map(|m| m.iter().map(|(n, s)| (n.clone(), *s)).collect())
-                            .unwrap_or_default();
-                        let max_binding_slot = binding_slots.iter().map(|(_, s)| *s).max();
-                        for (name, slot) in &binding_slots {
-                            self.record_debug_local(name, *slot);
-                        }
-                        // JumpIfMatch/Unpack leave payloads at these slots via
-                        // stack/locals overlap. Reserve them in `variables` so
-                        // arm-body temps (`alloc_temp_slot`) cannot STORE over
-                        // the bindings.
-                        if let Some(max_slot) = max_binding_slot {
-                            while (self.context.variables.len() as u32) <= max_slot {
-                                let pad = format!("__match{}", self.context.variables.len());
-                                let _ = self.context.variables.intern(pad);
-                            }
-                        }
-
-                        // Per-arm binding types override the flat
-                        // `codegen_var_types` side-table so Access on
-                        // a reused binding name (`p.y` vs `p.h`) sees
-                        // this arm's payload type, not the last arm's.
-                        let mut arm_binding_tys = HashMap::new();
-                        collect_pattern_binding_types(
-                            &self.checker,
-                            &arm.pattern.1,
-                            &mut arm_binding_tys,
-                        );
-                        if let Pattern::Binding { name } = &arm.pattern.1 {
-                            if let Some(ty) = self.checker.codegen_var_type(name) {
-                                arm_binding_tys.insert(name.to_string(), ty.clone());
-                            }
-                        }
-                        self.mono_codegen_var_types.push(arm_binding_tys);
-
-                        // Emit the arm body unless it is the sole bound name
-                        // (`Ok(x) => x`): JumpIfMatch already left the payload
-                        // on the stack at the binding slot.
-                        if !Self::match_arm_body_is_identity_binding(&arm.pattern.1, &arm.body) {
-                            if self.match_tail_call {
-                                let mut arm_bc = Vec::new();
-                                if !self.try_emit_tail_call_expr(&arm.body, &mut arm_bc) {
-                                    arm_bc = self.do_compile(&arm.body);
-                                }
-                                self.bytecode.extend(arm_bc);
-                            } else {
-                                let body_bc = self.do_compile(&arm.body);
-                                self.bytecode.extend(body_bc);
-                            }
-                        }
-
-                        self.mono_codegen_var_types.pop();
-
-                        // Restore the prior `match_bindings`
-                        // (usually `None` — we only save/restore
-                        // to be safe if a match is nested inside
-                        // an arm body, which doesn't happen in
-                        // practice but the typechecker doesn't
-                        // prevent it).
-                        self.context.match_bindings = saved_bindings;
-
-                        // For non-first arms, emit a
-                        // JMP-to-end placeholder targeting
-                        // `end_label`. This is patched when we
-                        // bind `end_label` below.
-                        if !is_first {
-                            bb.emit_jump_to(
-                                end_label,
-                                BbJumpKind::Unconditional,
-                                self.bytecode.il_mut(),
-                            );
-                        }
-                    }
-
-                    // Peephole / fuse-select safety: DUPLICATE;POP at the join
-                    // (omitted for binding matches — see suppress_match_fusion_barrier).
-                    // Label binds are also IL fusion barriers for return-match sites.
-                    if !self.suppress_match_fusion_barrier {
-                        self.bytecode.push(Byte::new(Instruction::DUPLICATE));
-                        self.bytecode.push_pop();
-                    }
-                    bb.bind_label(end_label, self.bytecode.il_mut());
-
-                    // Validate: every label that had a
-                    // pending jump is bound.
-                    bb.finalize()
-                        .expect("BlockBuilder::finalize: all targeted labels bound");
-                }
-            }
+            Expression::Match { scrutinee, arms } => bytecode.append(&mut self.compile_match_expr(scrutinee, arms)),
             // Parser maps `_`/`default` to Pattern::Wildcard; arm consumes NodeId only.
             Expression::Default(_) => (),
 
@@ -12277,6 +10686,1639 @@ impl Compiler {
         bytecode
     }
 
+    #[inline(never)]
+    fn compile_match_expr<'compiler>(
+        &mut self,
+        scrutinee: &Output<'compiler>,
+        arms: &[MatchArm<'compiler>],
+    ) -> Vec<Byte> {
+        let mut bytecode = vec![];
+        if arms.is_empty() {
+            bytecode.append(&mut self.do_compile(scrutinee));
+            bytecode.push_pop();
+        } else {
+            let mut bb = BlockBuilder::new();
+            let end_label = bb.fresh_label(self.bytecode.il_mut());
+
+            let tag_groups = group_arms_by_outer_tag(arms, &self.checker);
+            // Forward pass emits JUMP_IF_MATCH for every non-last
+            // group, and also for the last group when any group is
+            // multi-arm. Allocate labels for those targets — not
+            // merely for `!is_last && Constructor` in source order
+            // (that missed the last group's first arm when Err
+            // followed two Ok arms, panicking at emit time).
+            let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
+            let mut arm_labels: Vec<Option<crate::block_builder::Label>> =
+                vec![None; arms.len()];
+            for (g_idx, group) in tag_groups.iter().enumerate() {
+                let is_last_group = g_idx == tag_groups.len() - 1;
+                if !is_last_group || any_multi_arm_group {
+                    let first_arm_idx = group.arm_indices[0];
+                    arm_labels[first_arm_idx] =
+                        Some(bb.fresh_label(self.bytecode.il_mut()));
+                }
+            }
+
+            // Reset shared stack/locals cursor to the live-local height
+            // before evaluating the scrutinee. Prior STORE high-water
+            // (e.g. `let v = match` in a loop) would otherwise make
+            // JumpIfMatch push payloads past `payload_base`.
+            let seek_base = self.context.variables.len() as u32;
+            self.bytecode.push_seek(seek_base);
+
+            // Compile scrutinee before choosing payload_base —
+            // HostInvoke arg staging (`alloc_temp_slot`) grows
+            // `variables`, and bindings must start *after* those
+            // temps or Unpack/JumpIfMatch collide with them
+            // (e.g. `match try_recv(rx)` after print→write_all).
+            let scrutinee_bc = self.do_compile(scrutinee);
+            self.bytecode.extend(scrutinee_bc);
+
+            // First payload slot after locals + scrutinee temps.
+            // JumpIfMatch/Unpack push payloads onto the stack
+            // above those locals, so bindings must start here —
+            // not at the historical hardcoded slot 1.
+            let payload_base = self.context.variables.len() as u32;
+
+            // Forward pass: outer-tag dispatch + last-arm scrutinee consumer.
+            for (g_idx, group) in tag_groups.iter().enumerate() {
+                let is_last_group = g_idx == tag_groups.len() - 1;
+                if !is_last_group || any_multi_arm_group {
+                    let first_arm_idx = group.arm_indices[0];
+                    let label = arm_labels[first_arm_idx]
+                        .expect("non-last group's first arm must have a Label");
+                    bb.emit_jump_to(
+                        label,
+                        BbJumpKind::JumpIfMatch {
+                            tag: group.tag,
+                            arity: 0,
+                        },
+                        self.bytecode.il_mut(),
+                    );
+                } else {
+                    // Last group in a match with NO
+                    // multi-arm groups — emit the
+                    // scrutinee-consumer for the
+                    // last arm in source order (the
+                    // last element of the last
+                    // group's `arm_indices`). This
+                    // matches the pre-grouped
+                    // behavior: the very last arm
+                    // is reached by fall-through
+                    // from every preceding
+                    // JUMP_IF_MATCH miss, so the
+                    // scrutinee is still on the
+                    // stack and must be consumed
+                    // (UNPACK for Constructor, POP
+                    // for Wildcard, STORE 1 for
+                    // Binding).
+                    let last_arm_idx = *group
+                        .arm_indices
+                        .last()
+                        .expect("last group must have at least one arm");
+                    let last_arm = &arms[last_arm_idx];
+                    match &last_arm.pattern.1 {
+                        Pattern::Constructor {
+                            enum_name,
+                            variant_name,
+                            ..
+                        } => {
+                            let arity = self
+                                .checker
+                                .arity_for(enum_name, variant_name)
+                                .expect(
+                                    "Match arm constructor: typechecker should have registered the arity",
+                                );
+                            self.bytecode.push(
+                                Byte::new(Instruction::Unpack)
+                                    .with_operand_u32(arity as u32),
+                            );
+                        }
+                        Pattern::Wildcard => {
+                            // Wildcard arm — POP the
+                            // scrutinee.
+                            self.bytecode.push_pop();
+                        }
+                        Pattern::Binding { name } => {
+                            // Binding arm — scrutinee already sits at
+                            // `payload_base` (shared stack/locals). No
+                            // STORE opcode; reverse pass records the
+                            // binding slot.
+                            let _ = name;
+                        }
+                    }
+                }
+            }
+
+            // Step 3.5: For multi-arm groups WITH
+            // runtime tests, emit the inner-pattern
+            // test chain. This sits between the
+            // forward pass (JUMP_IF_MATCH
+            // dispatch + scrutinee-consumer) and the
+            // reverse pass (binding + body emission).
+            //
+            // Why this pass is needed: when two or
+            // more arms share the same OUTER variant
+            // tag but differ on an INNER sub-pattern
+            // (e.g. `Result::Ok(Option::Some(v))` vs
+            // `Result::Ok(Option::None)`), a single
+            // `JUMP_IF_MATCH` on the outer tag can't
+            // disambiguate between them — both arms
+            // match the outer tag. The inner-pattern
+            // test chain adds a second dispatch step
+            // (a runtime test on the inner payload)
+            // to pick the right arm.
+            //
+            // Layout for a 3-arm group
+            // `[arm_0, arm_1, arm_2]` sharing the
+            // outer tag:
+            //
+            //   [REBIND arm_0_label here]
+            //   POP/STORE for arm_0's sub-patterns
+            //   JMP → pass_label_0
+            //   POP/STORE for arm_1's sub-patterns
+            //   JMP → pass_label_1
+            //   POP/STORE for arm_2's sub-patterns
+            //   (no JMP — pass_label is None)
+            //   → arm_2 body (fall-through)
+            //   JMP → end_label
+            //   [bind pass_label_1 here] arm_1 body
+            //   JMP → end_label
+            //   [bind pass_label_0 here] arm_0 body
+            //   [end_label: RETURN]
+            //
+            // The REBIND of `arm_0_label` redirects
+            // the outer `JUMP_IF_MATCH` (emitted in
+            // the forward pass) from landing at the
+            // first arm's BODY to landing at the
+            // START of the test chain. Each non-last
+            // arm's `JMP → pass_label_N` then routes
+            // a successful test to the arm's body
+            // (bound later in the reverse pass). The
+            // last arm's test chain falls through to
+            // its body (no JMP needed).
+            //
+            // Multi-arm groups WITHOUT runtime tests
+            // (every sub-pattern is `Wildcard` /
+            // `Binding`, no nested `Constructor`) are
+            // unaffected — the existing
+            // first-arm-wins behavior is preserved.
+            // Single-arm groups are also unaffected.
+            let mut pass_labels: HashMap<usize, Option<crate::block_builder::Label>> =
+                HashMap::new();
+            let mut test_chain_first_arms: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            // All arms that participate in a test chain
+            // group . The reverse pass uses
+            // this set to decide whether to skip
+            // POP/STORE/UNPACK emission in
+            // `emit_pattern_binding` — the test chain
+            // pass already consumed the values, so the
+            // reverse pass should NOT re-emit them.
+            // `test_chain_first_arms` (above) only tracks
+            // the FIRST arm of each group (for label
+            // re-binding); `test_chain_arms` tracks ALL
+            // arms in all test chain groups.
+            let mut test_chain_arms: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            // Per-arm binding map populated by
+            // `emit_inner_test` for arms in test chain
+            // groups. Keyed by arm_idx → name → slot.
+            // The reverse pass consults this map to
+            // install `self.context.match_bindings` for
+            // test chain arms, instead of re-emitting
+            // binding code (which would double-pop /
+            // double-store the payload values).
+            let mut match_bindings_per_arm: HashMap<usize, HashMap<String, u32>> =
+                HashMap::new();
+
+            for group in &tag_groups {
+                // Only groups with multiple arms AND
+                // at least one arm with a runtime test
+                // trigger the new test-chain
+                // emission.
+                if group.arm_indices.len() <= 1 {
+                    continue;
+                }
+                let has_runtime_test = group
+                    .arm_indices
+                    .iter()
+                    .any(|&i| arm_has_runtime_test(&arms[i]));
+                if !has_runtime_test {
+                    continue;
+                }
+
+                let first_arm_idx = group.arm_indices[0];
+                let first_arm_label = arm_labels[first_arm_idx]
+                    .expect("non-last group's first arm must have a Label");
+
+                // REBIND the first arm's label so the
+                // outer JUMP_IF_MATCH lands at the
+                // test chain start, not at the arm
+                // body. `bind_label` is idempotent —
+                // calling it again would re-patch the
+                // JUMP_IF_MATCH, which is exactly
+                // what we want here.
+                bb.bind_label(first_arm_label, self.bytecode.il_mut());
+                test_chain_first_arms.insert(first_arm_idx);
+                for &arm_idx in &group.arm_indices {
+                    test_chain_arms.insert(arm_idx);
+                }
+
+                // Emit the test chain for each arm in
+                // source order. Every arm gets a
+                // `pass_label` JMP to its body —
+                // including the last arm in the group.
+                // Fall-through after the last arm is
+                // only safe when that arm's body is
+                // emitted immediately after the test
+                // chain (i.e. the group is source-last).
+                // With a later tag group (e.g. Ok/Ok
+                // then Err), fall-through would land in
+                // the wrong body's bytecode.
+                for (rank, &arm_idx) in group.arm_indices.iter().enumerate() {
+                    let is_last_in_group = rank == group.arm_indices.len() - 1;
+
+                    let pass_label = Some(bb.fresh_label(self.bytecode.il_mut()));
+
+                    // `fail_label` is the NEXT arm's
+                    // body label (so the runtime
+                    // test can dispatch to the next
+                    // arm's test chain on failure).
+                    // For the LAST arm in the group
+                    // (and for any arm whose NEXT
+                    // sibling has no body label —
+                    // e.g. it's the last arm of the
+                    // entire match and was reached
+                    // by fall-through), fall back to
+                    // `end_label` so the jump is at
+                    // least well-formed (the
+                    // placeholder implementation
+                    // currently doesn't emit a JMP to
+                    // fail_label, but the operand
+                    // still needs to be consistent
+                    // with the placeholder value).
+                    let fail_label = if !is_last_in_group {
+                        let next_arm_idx = group.arm_indices[rank + 1];
+                        arm_labels[next_arm_idx].unwrap_or(end_label)
+                    } else {
+                        end_label
+                    };
+
+                    pass_labels.insert(arm_idx, pass_label);
+
+                    // Get the arm's payload (only
+                    // Constructor arms are candidates
+                    // for runtime tests, by the
+                    // definition of
+                    // `arm_has_runtime_test`).
+                    let (enum_name, variant_name, payload) = match &arms[arm_idx].pattern.1 {
+                        Pattern::Constructor {
+                            enum_name,
+                            variant_name,
+                            payload,
+                            ..
+                        } => (*enum_name, *variant_name, payload),
+                        _ => continue,
+                    };
+
+                    emit_inner_test(
+                        arm_idx,
+                        &self.checker,
+                        enum_name,
+                        variant_name,
+                        payload,
+                        &mut match_bindings_per_arm,
+                        &mut self.bytecode,
+                        &mut bb,
+                        pass_label,
+                        fail_label,
+                        payload_base,
+                    );
+                }
+            }
+
+            // Step 4-8: emit each arm's binding code
+            // and body. We go in REVERSE source order
+            // so the bytecode layout is:
+            //   [last arm body]
+            //   [JMP end (skip remaining)]
+            //   [second-to-last arm body]
+            //   [JMP end]
+            //   ...
+            //   [first arm body]
+            //
+            // Each non-first arm body is preceded by
+            // JMP-to-end so it doesn't fall through
+            // into the next body.
+
+            // We process arms in reverse order so the
+            // LAST arm body comes first in the
+            // bytecode, then non-last arms with
+            // JMP-to-end after each.
+            for i in (0..arms.len()).rev() {
+                let arm = &arms[i];
+                let is_first = i == 0;
+
+                // If this arm has a pre-allocated
+                // `Label` (it's a non-last constructor
+                // arm), bind it to the current bytecode
+                // position. This patches the
+                // JUMP_IF_MATCH placeholder emitted in
+                // the forward pass.
+                //
+                // The `Label` is `Copy`, so the
+                // immutable borrow of `arm_labels`
+                // ends after this `if let` expression,
+                // and the mutable borrow of `bb` (via
+                // `bind_label`) starts fresh. No
+                // borrow conflict.
+                //
+                // Exception: for the FIRST arm of a
+                // test-chain group, the label was
+                // already REBOUND by the test chain
+                // pass to the test-chain start. We
+                // MUST NOT bind it again here — that
+                // would redirect the outer
+                // JUMP_IF_MATCH from the test-chain
+                // start back to the arm body,
+                // bypassing the test chain entirely.
+                // The reverse pass for this arm binds
+                // `pass_label_0` instead (the
+                // forward-fallthrough target emitted
+                // by `emit_inner_test`).
+                if !test_chain_first_arms.contains(&i)
+                    && let Some(label) = arm_labels[i]
+                {
+                    bb.bind_label(label, self.bytecode.il_mut());
+                }
+
+                // For arms in test chain groups,
+                // bind the test chain's
+                // `pass_label` to the start of
+                // this arm's body. Every test-chain
+                // arm (including the last) gets a
+                // pass_label so dispatch works when
+                // another tag group follows.
+                if let Some(Some(label)) = pass_labels.get(&i) {
+                    bb.bind_label(*label, self.bytecode.il_mut());
+                }
+
+                // Per-arm binding slots (`payload_base` = first
+                // payload). Payload order follows declaration
+                // order; record patterns may list fields in any
+                // source order.
+                let mut arm_bindings: HashMap<String, u32> = HashMap::new();
+                let mut next_slot: u32 = payload_base;
+                // Test-chain arms: payload already on stack from
+                // the forward pass — use `consume_values = false`
+                // to record bindings without re-emitting UNPACK/POP.
+                let in_test_chain = test_chain_arms.contains(&i);
+                if let Some(bindings) = match_bindings_per_arm.get(&i) {
+                    // This arm is in a test chain
+                    // group AND the test chain recorded
+                    // bindings (Wildcard/Binding
+                    // sub-patterns at the OUTER level).
+                    // Use the recorded bindings and skip
+                    // the reverse-pass binding code
+                    // entirely.
+                    arm_bindings = bindings.clone();
+                } else if in_test_chain {
+                    // Test chain arm without recorded
+                    // bindings — the test chain emitted
+                    // JUMP_IF_MATCH for nested
+                    // Constructor sub-patterns (no
+                    // STORE). Walk the pattern to RECORD
+                    // the bindings in `arm_bindings`
+                    // (the body needs them for
+                    // `Identifier` lookups), but with
+                    // `consume_values = false` so we
+                    // don't re-emit the bytecode (the
+                    // test chain handled the values).
+                    match &arm.pattern.1 {
+                        Pattern::Binding { name } => {
+                            arm_bindings.insert(name.to_string(), payload_base);
+                        }
+                        Pattern::Constructor {
+                            enum_name,
+                            variant_name,
+                            ..
+                        } => {
+                            // Test-chain arm: the test
+                            // chain pass already emitted
+                            // POP / STORE / JUMP_IF_MATCH
+                            // for the OUTER level. Walk
+                            // the pattern with
+                            // `consume_values = false` to
+                            // RECORD the bindings (the
+                            // body needs them for
+                            // `Identifier` lookups) but
+                            // skip the redundant bytecode
+                            // emission. The function
+                            // handles Tuple (UNPACK skip
+                            // + sub-pattern walk) and
+                            // Record (decl-order walk +
+                            // sub-pattern walk) internally.
+                            let decl_order =
+                                self.checker.payload_tys_for(enum_name, variant_name);
+                            emit_pattern_binding(
+                                &self.checker,
+                                &mut arm_bindings,
+                                &mut next_slot,
+                                &arm.pattern.1,
+                                &decl_order,
+                                &mut self.bytecode,
+                                false,
+                                true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
+                            );
+                        }
+                        Pattern::Wildcard => {}
+                    }
+                } else {
+                    // Not in a test chain: emit binding
+                    // code at the outer level (consume
+                    // the values via POP/STORE/UNPACK).
+                    match &arm.pattern.1 {
+                        Pattern::Binding { name } => {
+                            // Binding arm: the forward pass
+                            // already emitted STORE at
+                            // `payload_base` for the
+                            // scrutinee. Record the binding
+                            // here so the body's
+                            // `Identifier` lookup finds it.
+                            arm_bindings.insert(name.to_string(), payload_base);
+                        }
+                        Pattern::Constructor {
+                            enum_name,
+                            variant_name,
+                            ..
+                        } => {
+                            // Non-test-chain arm: emit full
+                            // binding code at the outer
+                            // level (consume the values via
+                            // POP/STORE/UNPACK). The
+                            // function handles Tuple (emit
+                            // UNPACK + sub-pattern walk) and
+                            // Record (decl-order walk + per-
+                            // field recursion — including
+                            // unbounded-depth nested record
+                            // patterns) internally.
+                            let decl_order =
+                                self.checker.payload_tys_for(enum_name, variant_name);
+                            emit_pattern_binding(
+                                &self.checker,
+                                &mut arm_bindings,
+                                &mut next_slot,
+                                &arm.pattern.1,
+                                &decl_order,
+                                &mut self.bytecode,
+                                true,
+                                true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
+                            );
+                        }
+                        Pattern::Wildcard => {
+                            // No bindings — the forward pass
+                            // already emitted POP for the
+                            // scrutinee.
+                        }
+                    }
+                } // close `else` for test chain arms
+
+                // Install the per-arm bindings map so the
+                // body's `Identifier` / `Assignment` lookups
+                // resolve pattern bindings to
+                // `payload_base`, `payload_base+1`, …
+                // — matching the VM's payload-push
+                // positions. Cleared after the body emits.
+                let saved_bindings = self.context.match_bindings.take();
+                self.context.match_bindings = Some(arm_bindings);
+                let binding_slots: Vec<(String, u32)> = self
+                    .context
+                    .match_bindings
+                    .as_ref()
+                    .map(|m| m.iter().map(|(n, s)| (n.clone(), *s)).collect())
+                    .unwrap_or_default();
+                let max_binding_slot = binding_slots.iter().map(|(_, s)| *s).max();
+                for (name, slot) in &binding_slots {
+                    self.record_debug_local(name, *slot);
+                }
+                // JumpIfMatch/Unpack leave payloads at these slots via
+                // stack/locals overlap. Reserve them in `variables` so
+                // arm-body temps (`alloc_temp_slot`) cannot STORE over
+                // the bindings.
+                if let Some(max_slot) = max_binding_slot {
+                    while (self.context.variables.len() as u32) <= max_slot {
+                        let pad = format!("__match{}", self.context.variables.len());
+                        let _ = self.context.variables.intern(pad);
+                    }
+                }
+
+                // Per-arm binding types override the flat
+                // `codegen_var_types` side-table so Access on
+                // a reused binding name (`p.y` vs `p.h`) sees
+                // this arm's payload type, not the last arm's.
+                let mut arm_binding_tys = HashMap::new();
+                collect_pattern_binding_types(
+                    &self.checker,
+                    &arm.pattern.1,
+                    &mut arm_binding_tys,
+                );
+                if let Pattern::Binding { name } = &arm.pattern.1 {
+                    if let Some(ty) = self.checker.codegen_var_type(name) {
+                        arm_binding_tys.insert(name.to_string(), ty.clone());
+                    }
+                }
+                self.mono_codegen_var_types.push(arm_binding_tys);
+
+                // Emit the arm body unless it is the sole bound name
+                // (`Ok(x) => x`): JumpIfMatch already left the payload
+                // on the stack at the binding slot.
+                if !Self::match_arm_body_is_identity_binding(&arm.pattern.1, &arm.body) {
+                    if self.match_tail_call {
+                        let mut arm_bc = Vec::new();
+                        if !self.try_emit_tail_call_expr(&arm.body, &mut arm_bc) {
+                            arm_bc = self.do_compile(&arm.body);
+                        }
+                        self.bytecode.extend(arm_bc);
+                    } else {
+                        let body_bc = self.do_compile(&arm.body);
+                        self.bytecode.extend(body_bc);
+                    }
+                }
+
+                self.mono_codegen_var_types.pop();
+
+                // Restore the prior `match_bindings`
+                // (usually `None` — we only save/restore
+                // to be safe if a match is nested inside
+                // an arm body, which doesn't happen in
+                // practice but the typechecker doesn't
+                // prevent it).
+                self.context.match_bindings = saved_bindings;
+
+                // For non-first arms, emit a
+                // JMP-to-end placeholder targeting
+                // `end_label`. This is patched when we
+                // bind `end_label` below.
+                if !is_first {
+                    bb.emit_jump_to(
+                        end_label,
+                        BbJumpKind::Unconditional,
+                        self.bytecode.il_mut(),
+                    );
+                }
+            }
+
+            // Peephole / fuse-select safety: DUPLICATE;POP at the join
+            // (omitted for binding matches — see suppress_match_fusion_barrier).
+            // Label binds are also IL fusion barriers for return-match sites.
+            if !self.suppress_match_fusion_barrier {
+                self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                self.bytecode.push_pop();
+            }
+            bb.bind_label(end_label, self.bytecode.il_mut());
+
+            // Validate: every label that had a
+            // pending jump is bound.
+            bb.finalize()
+                .expect("BlockBuilder::finalize: all targeted labels bound");
+        }
+        bytecode
+    }
+
+    #[inline(never)]
+    fn compile_call_expr<'compiler>(
+        &mut self,
+        name: &Output<'compiler>,
+        args: &Option<Vec<Output<'compiler>>>,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span: &SimpleSpan,
+    ) -> Vec<Byte> {
+        let mut bytecode = vec![];
+        // Fold `len(literal)` before trait dispatch so string/tuple
+        // lengths become CONST instead of Length thunk + ArrayLen.
+        if let Expression::Identifier(raw) = name.1.as_ref()
+            && *raw == "len"
+            && let Some(ConstValue::Int(n)) =
+                crate::const_fold::eval_expr(ast, self.const_env())
+        {
+            if let Some(items) = args.as_ref() {
+                for arg in items {
+                    self.discard_compile(arg);
+                }
+            }
+            self.emit_const_value(&ConstValue::Int(n), &mut bytecode);
+            return bytecode;
+        }
+
+        if let Expression::Identifier(fname) = name.1.as_ref() {
+            if let Some(kind) = self.string_builtin_for_call(fname) {
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                match kind {
+                    crate::typechecking::StringBuiltin::Format => {
+                        if let Some((format, rest)) = arg_slice.split_first() {
+                            let params = rest.to_vec();
+                            self.emit_format_expression(format, Some(&params));
+                        }
+                    }
+                    crate::typechecking::StringBuiltin::FromBytes
+                    | crate::typechecking::StringBuiltin::ToBytes => {
+                        if let Some(native_name) = kind.native_name() {
+                            self.emit_host_native_invoke(native_name, arg_slice);
+                        }
+                    }
+                }
+                return bytecode;
+            }
+        } else if let Expression::QualifiedAccess { owner, member } = name.1.as_ref() {
+            let fqn = format!("{}::{}", owner, member);
+            if let Some(kind) = self.string_builtin_for_call(&fqn) {
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                match kind {
+                    crate::typechecking::StringBuiltin::Format => {
+                        if let Some((format, rest)) = arg_slice.split_first() {
+                            let params = rest.to_vec();
+                            self.emit_format_expression(format, Some(&params));
+                        }
+                    }
+                    crate::typechecking::StringBuiltin::FromBytes
+                    | crate::typechecking::StringBuiltin::ToBytes => {
+                        if let Some(native_name) = kind.native_name() {
+                            self.emit_host_native_invoke(native_name, arg_slice);
+                        }
+                    }
+                }
+                return bytecode;
+            }
+        }
+        // `assert` from `prelude::test` (auto-imported).
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(kind) = self.checker.prelude_fn_in_scope(fname)
+        {
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            match kind {
+                crate::typechecking::PreludeFn::Assert => {
+                    self.emit_assert(arg_slice);
+                }
+                crate::typechecking::PreludeFn::BlockOn => {
+                    self.emit_block_on(arg_slice);
+                }
+                crate::typechecking::PreludeFn::Matrix => {
+                    // Zero-cost wrap: runtime is the nested data.
+                    if let Some(arg) = arg_slice.first() {
+                        bytecode.append(&mut self.do_compile(arg));
+                    }
+                }
+                crate::typechecking::PreludeFn::Dot
+                | crate::typechecking::PreludeFn::MatMul
+                | crate::typechecking::PreludeFn::Cross => {
+                    self.emit_linear_algebra(
+                        &mut bytecode,
+                        self_id,
+                        span.start,
+                        span.end,
+                        arg_slice,
+                    );
+                }
+                crate::typechecking::PreludeFn::Ord
+                | crate::typechecking::PreludeFn::Char => {
+                    self.emit_prelude_host_call(arg_slice, kind.as_str());
+                }
+                crate::typechecking::PreludeFn::Sin
+                | crate::typechecking::PreludeFn::Cos
+                | crate::typechecking::PreludeFn::Tan
+                | crate::typechecking::PreludeFn::Sqrt
+                | crate::typechecking::PreludeFn::Floor
+                | crate::typechecking::PreludeFn::Ceil
+                | crate::typechecking::PreludeFn::Exp
+                | crate::typechecking::PreludeFn::Ln
+                | crate::typechecking::PreludeFn::Pow => {
+                    self.emit_prelude_host_call(
+                        arg_slice,
+                        kind.math_native_name().expect("scalar math native"),
+                    );
+                }
+            }
+            return bytecode;
+        }
+        // `dload` / `declare` / `invoke` after `use ffi::{…}`.
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
+        {
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            match kind {
+                crate::typechecking::FfiBuiltin::Dload => {
+                    if let Some(path) = arg_slice.first() {
+                        let bc = self.do_compile(path);
+                        self.bytecode.extend(bc);
+                        self.bytecode.push(Byte::new(Instruction::FfiLoad));
+                    }
+                }
+                crate::typechecking::FfiBuiltin::Declare => {
+                    self.emit_ffi_declare(*span, arg_slice);
+                }
+                crate::typechecking::FfiBuiltin::Invoke => {
+                    self.emit_ffi_invoke(*span, arg_slice);
+                }
+            }
+            return bytecode;
+        }
+        // `open` / `read` / … after `use io::{…}` (or `use io::read as …`).
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(kind) = self.checker.io_fn_in_scope(fname)
+        {
+            self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+            return bytecode;
+        }
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(kind) = self.checker.thread_fn_in_scope(fname)
+        {
+            self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+            return bytecode;
+        }
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(kind) = self.checker.gc_fn_in_scope(fname)
+        {
+            self.emit_host_native_invoke(kind.native_name(), args.as_deref().unwrap_or(&[]));
+            return bytecode;
+        }
+        if let Expression::Identifier(fname) = name.1.as_ref()
+            && let Some(registry) = self.checker.host_fn_in_scope(fname)
+        {
+            if registry == "env_exec" {
+                self.messages.push(Message::warn(
+                    ErrorCode::GenericTypeError,
+                    "env::exec runs an external program with the given arguments; only use with trusted inputs"
+                        .to_string(),
+                    span.into_range(),
+                ));
+            } else if registry == "env_exit" {
+                self.messages.push(Message::warn(
+                    ErrorCode::GenericTypeError,
+                    "env::exit terminates the process with the given exit code".to_string(),
+                    span.into_range(),
+                ));
+            }
+            self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
+            return bytecode;
+        }
+
+        if let Some(hint) = self_id
+            .and_then(|id| self.checker.existential_method_call_at(id))
+            .or_else(|| {
+                self.checker
+                    .existential_method_call_for_span(span.start, span.end)
+            })
+            .cloned()
+        {
+            if self.emit_existential_method_call(&mut bytecode, name, args.as_ref(), &hint)
+            {
+                return bytecode;
+            }
+        }
+
+        if let Some(hint) = self_id
+            .and_then(|id| self.checker.bound_method_call_at(id))
+            .or_else(|| {
+                self.checker
+                    .bound_method_call_for_span(span.start, span.end)
+            })
+            .cloned()
+        {
+            if hint.has_receiver
+                && let Expression::Access(recv, _) = name.1.as_ref()
+            {
+                bytecode.append(&mut self.do_compile(recv));
+            }
+            if let Some(items) = args {
+                for arg in items {
+                    self.append_with_existential_pack(&mut bytecode, arg);
+                }
+            }
+            let dict_name = format!("__dict{}", hint.dict_index);
+            if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                // Hidden trailing dictionary argument for sibling/default
+                // dispatch inside the selected implementation.
+                bytecode.push_load(dict_slot);
+                bytecode.push_load(dict_slot);
+                bytecode.push_const(hint.method_slot as i32);
+                bytecode.push_index();
+                bytecode.push(
+                    Byte::new(Instruction::CallIndirect)
+                        .with_operand_u32(hint.arity as u32 + 1),
+                );
+            } else {
+                let mut message = Message::error(
+                    ErrorCode::UnknownFunction,
+                    "Missing trait dictionary".to_string(),
+                    span.into_range(),
+                );
+                message.push(DiagLabel::new(
+                    format!("dictionary slot `{}` is not available", dict_name),
+                    span.into_range(),
+                ));
+                self.messages.push(message);
+            }
+            return bytecode;
+        }
+
+        // Method call: `recv.method(args)`.
+        if let Expression::Access(recv, method) = name.1.borrow() {
+            // Ground trait method (`recv.into()`, …): typechecker
+            // discharged a concrete instance into `call_dicts_at`.
+            // Emit receiver + args + dictionary, then CallIndirect to
+            // the instance method (dict ABI, `dict_arity = 1`).
+            let ground_trait = self_id
+                .and_then(|id| self.checker.call_dicts_at(id))
+                .or_else(|| self.checker.call_dicts_for_span(span.start, span.end))
+                .and_then(|dicts| dicts.first())
+                .and_then(|instance| {
+                    let fqn = instance.method_fqns.get(*method)?.clone();
+                    let offset = *self.functions.get(&fqn)?;
+                    Some((instance.class.clone(), instance.args.clone(), offset))
+                });
+            if let Some((class, inst_args, offset)) = ground_trait {
+                bytecode.append(&mut self.do_compile(recv));
+                // Box the receiver when the instance method prologue
+                // expects an unbox (same contract as Eq/Ord direct calls).
+                // Prefer `receiver_type` for identifiers/access; fall
+                // back to `codegen_expr_ty` so inline receivers like
+                // `new Celsius(0).into()` still get boxed.
+                // Peel Constructor/Sum → Con so `ty_to_value_tag` matches
+                // instance-head unbox tags (Con(enum) → Instance). Raw
+                // Constructor types returned None and skipped boxing.
+                if let Some(recv_ty) = self
+                    .receiver_type(recv)
+                    .or_else(|| self.codegen_expr_ty(recv))
+                {
+                    let box_ty = Self::show_lookup_ty_for_instance(&recv_ty);
+                    Self::emit_box_if_needed(&mut bytecode, &box_ty);
+                }
+                let mut nargs = 1u32; // receiver
+                if let Some(items) = args {
+                    for arg in items {
+                        self.append_with_existential_pack(&mut bytecode, arg);
+                        nargs += 1;
+                    }
+                }
+                if Self::emit_instance_dict(
+                    &mut bytecode,
+                    &class,
+                    &inst_args,
+                    &self.checker,
+                    &self.functions,
+                ) {
+                    nargs += 1; // trailing dictionary
+                }
+                Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                return bytecode;
+            }
+
+            // Same fallback as ground-trait calls: inline receivers
+            // like `(new Point(1, 2)).sum()` are not identifiers, so
+            // `receiver_type` alone used to leave `owner` empty.
+            let recv_ty = self
+                .receiver_type(recv)
+                .or_else(|| self.codegen_expr_ty(recv));
+            let owner = recv_ty
+                .as_ref()
+                .and_then(|ty| {
+                    Checker::class_name_of_ty(ty)
+                        .filter(|n| self.checker.is_class(n))
+                        .map(|n| n.to_string())
+                })
+                .unwrap_or_default();
+            let fqn = self
+                .context
+                .methods
+                .get(&owner)
+                .and_then(|m| m.get(*method))
+                .cloned();
+            if let Some(fqn_base) = fqn {
+                let nargs = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                let fqn = if let Some((fa, is_rest, id)) =
+                    self.checker.selected_overload_at(span.start, span.end)
+                {
+                    let keyed = overload_fn_key(&fqn_base, fa, is_rest, id);
+                    if self.functions.contains_key(&keyed) {
+                        keyed
+                    } else {
+                        fqn_base.clone()
+                    }
+                } else if self.checker.is_overloaded(&fqn_base) {
+                    // Forward call inside an impl that later gained
+                    // more overloads — TC may not have recorded a
+                    // selection (set had size 1 at infer time).
+                    // Prefer arg types so same-arity overloads match
+                    // the checker path (`select_overload_for_args`).
+                    let arg_tys: Vec<Ty> = args
+                        .as_ref()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|a| {
+                                    let value = match a.1.as_ref() {
+                                        Expression::NamedArg(_, v) => v,
+                                        _ => a,
+                                    };
+                                    self.codegen_expr_ty(value)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // Only pass types when every arg resolved; a
+                    // partial vec would shift positions under unify.
+                    let tys = if arg_tys.len() == nargs {
+                        arg_tys.as_slice()
+                    } else {
+                        &[]
+                    };
+                    match self.checker.select_overload_for_args(&fqn_base, nargs, tys) {
+                        crate::typechecking::infer::OverloadSelect::Selected(c) => {
+                            let keyed = overload_fn_key(
+                                &fqn_base,
+                                c.fixed_arity,
+                                c.is_rest,
+                                c.id,
+                            );
+                            if self.functions.contains_key(&keyed) {
+                                keyed
+                            } else {
+                                fqn_base
+                            }
+                        }
+                        _ => fqn_base,
+                    }
+                } else {
+                    fqn_base
+                };
+                if let Some(offset) = self.functions.get(&fqn).copied() {
+                    // Same ABI as free generics: box top-level type
+                    // params, append trait dictionaries, unbox returns.
+                    let lookup_name = strip_overload_key(&fqn).to_string();
+                    let is_generic = self.checker.is_generic_fn(&lookup_name);
+                    let box_generic_args = is_generic
+                        && self.generic_has_toplevel_type_param_args(&lookup_name);
+                    // Stage the receiver into a temp *before* user args.
+                    // Leaving it on the operand stack while arg staging
+                    // `STORE`s into temps clobbers it (locals and the
+                    // operand stack share memory) — nested calls like
+                    // `self.inner.put(x, true)` then mutate the wrong object.
+                    bytecode.append(&mut self.do_compile(recv));
+                    let recv_tmp = self.alloc_temp_slot();
+                    bytecode.push_store_pop(recv_tmp);
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    self.consume_spread_emit_ids(arg_slice);
+                    let (fixed, rest, pack_rest) =
+                        self.split_call_args_for_rest(&lookup_name, arg_slice);
+                    let mut arg_temps: Vec<u32> = Vec::new();
+                    for arg in &fixed {
+                        self.append_with_existential_pack(&mut bytecode, arg);
+                        if box_generic_args {
+                            if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                            }
+                        }
+                        let tmp = self.alloc_temp_slot();
+                        bytecode.push_store_pop(tmp);
+                        arg_temps.push(tmp);
+                    }
+                    let nargs = if pack_rest {
+                        for arg in &rest {
+                            self.append_with_existential_pack(&mut bytecode, arg);
+                            if box_generic_args {
+                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                }
+                            }
+                        }
+                        if self.checker.fn_tuple_rest(&lookup_name) {
+                            bytecode.push_make_tuple(rest.len() as u32);
+                        } else {
+                            bytecode.push_make_array(rest.len() as u32);
+                        }
+                        let tmp = self.alloc_temp_slot();
+                        bytecode.push_store_pop(tmp);
+                        arg_temps.push(tmp);
+                        (fixed.len() + 1) as u32
+                    } else {
+                        fixed.len() as u32
+                    };
+                    bytecode.push_load(recv_tmp);
+                    for tmp in &arg_temps {
+                        bytecode.push_load(*tmp);
+                    }
+                    let dict_count = if is_generic {
+                        let mut call_arg_tys: Vec<Ty> = Vec::new();
+                        if let Some(ty) = recv_ty.clone() {
+                            call_arg_tys.push(ty);
+                        }
+                        for arg in &fixed {
+                            call_arg_tys.push(self.codegen_expr_ty(arg).expect(
+                                "typechecked method argument must have a codegen type",
+                            ));
+                        }
+                        if pack_rest {
+                            call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                        }
+                        let mut forwarded = 0;
+                        if let Some(indices) = self_id
+                            .and_then(|id| self.checker.forwarded_dicts_at(id))
+                            .or_else(|| {
+                                self.checker
+                                    .forwarded_dicts_for_span(span.start, span.end)
+                            })
+                            .map(<[usize]>::to_vec)
+                        {
+                            for dict_index in indices {
+                                if let Some(slot) =
+                                    self.lookup_slot(&format!("__dict{}", dict_index))
+                                {
+                                    bytecode.push_load(slot);
+                                    forwarded += 1;
+                                }
+                            }
+                        }
+                        let call_ret_ty = self.codegen_expr_ty(ast);
+                        forwarded
+                            + Self::emit_call_site_dicts(
+                                &mut bytecode,
+                                &lookup_name,
+                                &call_arg_tys,
+                                call_ret_ty.as_ref(),
+                                &self.checker,
+                                &self.functions,
+                            )
+                    } else {
+                        0
+                    };
+                    bytecode.push(
+                        Byte::new(Instruction::CALL).with_call_packed(
+                            1 + nargs + dict_count as u32,
+                            offset as u32,
+                        ),
+                    );
+                    if is_generic && self.generic_return_is_boxed(&lookup_name) {
+                        if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                            Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                        }
+                    }
+                } else {
+                    let mut message = Message::error(
+                        ErrorCode::UnknownFunction,
+                        "Unknown method".to_string(),
+                        span.into_range(),
+                    );
+                    message.push(DiagLabel::new(
+                        format!("Unable to call unknown method '{}'", fqn),
+                        span.into_range(),
+                    ));
+                    self.messages.push(message);
+                }
+            } else {
+                let mut message = Message::error(
+                    ErrorCode::UnknownFunction,
+                    "Unknown method".to_string(),
+                    span.into_range(),
+                );
+                message.push(DiagLabel::new(
+                    format!("Unable to call method '{}' on '{}'", method, owner),
+                    span.into_range(),
+                ));
+                self.messages.push(message);
+            }
+        } else {
+            if matches!(name.1.as_ref(), Expression::Lambda { .. }) {
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                self.consume_spread_emit_ids(arg_slice);
+                let flat_args = self.flatten_call_args_for_emit(arg_slice);
+                for arg in &flat_args {
+                    bytecode.append(&mut self.do_compile(arg));
+                }
+                bytecode.append(&mut self.do_compile(name));
+                bytecode.push(
+                    Byte::new(Instruction::CallIndirect)
+                        .with_operand_u32(flat_args.len() as u32),
+                );
+                return bytecode;
+            }
+            if let Expression::Identifier(raw) = name.1.as_ref() {
+                if *raw == "len" {
+                    let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                    if let Some(items) = args
+                        && items.len() == 1
+                    {
+                        // Prefer compile-time length when known from
+                        // literals / static types.
+                        if let Some(ConstValue::Int(n)) =
+                            crate::const_fold::eval_expr(ast, self.const_env())
+                        {
+                            self.discard_compile(&items[0]);
+                            self.emit_const_value(
+                                &ConstValue::Int(n),
+                                &mut bytecode,
+                            );
+                            return bytecode;
+                        }
+                        if let Some(n) = self.static_len_of(&items[0]) {
+                            bytecode.append(&mut self.do_compile(&items[0]));
+                            bytecode.push_pop();
+                            self.emit_const_value(
+                                &ConstValue::Int(n as i64),
+                                &mut bytecode,
+                            );
+                            return bytecode;
+                        }
+                        // Structural aggregates → ArrayLen. Custom types
+                        // with `Length` use the instance method below.
+                        let arg_ty = self.codegen_expr_ty(&items[0]).map(|ty| {
+                            crate::typechecking::subst::apply_ty_prune(
+                                self.checker.subst(),
+                                &ty,
+                            )
+                        });
+                        let structural = arg_ty
+                            .as_ref()
+                            .is_some_and(Checker::is_structural_len_ty_for_codegen);
+                        if structural {
+                            bytecode.append(&mut self.do_compile(&items[0]));
+                            bytecode.push(Byte::new(Instruction::ArrayLen));
+                            return bytecode;
+                        }
+                        if let Some(ty) = arg_ty.as_ref()
+                            && let Some(fqn) = self.len_instance_method_fqn(ty)
+                            && let Some(&offset) = self.functions.get(&fqn)
+                        {
+                            bytecode.append(&mut self.do_compile(&items[0]));
+                            Self::emit_call_indirect(
+                                &mut bytecode,
+                                offset as u32,
+                                1,
+                            );
+                            return bytecode;
+                        }
+                        if structural {
+                            bytecode.append(&mut self.do_compile(&items[0]));
+                            bytecode.push(Byte::new(Instruction::ArrayLen));
+                            return bytecode;
+                        }
+                        bytecode.append(&mut self.do_compile(&items[0]));
+                        bytecode.push(Byte::new(Instruction::ArrayLen));
+                        return bytecode;
+                    } else {
+                        let mut message = Message::error(
+                            ErrorCode::TooManyArguments,
+                            "Invalid len call".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("len expects 1 argument, got {}", provided),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                        return bytecode;
+                    }
+                }
+            }
+
+            let identifier = self.resolve_variable_checked(name);
+            let n = self
+                .aliases
+                .get(&identifier)
+                .cloned()
+                .unwrap_or_else(|| identifier.clone());
+            // Non-entry modules register `ns::name`, but sibling
+            // calls use the bare name. Typecheck inserts bare
+            // names so TC can pass while codegen misses — retry
+            // the current module FQN before reporting unknown.
+            let n = if self.functions.contains_key(&n)
+                || self.extern_runtime_functions.contains_key(&n)
+                || self.native.contains_key(&n)
+            {
+                n
+            } else if !self.namespace.is_empty() && !n.contains("::") {
+                let qualified = format!("{}::{}", self.namespace, n);
+                if self.functions.contains_key(&qualified)
+                    || self
+                        .checker
+                        .selected_overload_at(span.start, span.end)
+                        .is_some()
+                {
+                    qualified
+                } else {
+                    n
+                }
+            } else {
+                n
+            };
+
+            // Arity-overload table key (when the typechecker selected one).
+            let n = if let Some((fa, is_rest, id)) =
+                self.checker.selected_overload_at(span.start, span.end)
+            {
+                let keyed = overload_fn_key(&n, fa, is_rest, id);
+                if self.functions.contains_key(&keyed) {
+                    keyed
+                } else {
+                    // Try bare-name key when FQN wasn't used at registration.
+                    let simple = n.rsplit("::").next().unwrap_or(&n);
+                    let keyed_simple = overload_fn_key(simple, fa, is_rest, id);
+                    if self.functions.contains_key(&keyed_simple) {
+                        keyed_simple
+                    } else {
+                        n
+                    }
+                }
+            } else {
+                n
+            };
+
+            if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
+                // Same discipline as HostInvoke: emit lib/fn_id first,
+                // then compile args onto `self.bytecode`. Nested IO
+                // HostInvoke writes directly to `self.bytecode` and
+                // returns an empty slice — staging args into a side
+                // Vec first left those bytes *before* the LOADs, so
+                // MakeTuple packed the wrong stack values.
+                let arity = if let Some(items) = args {
+                    items.len()
+                } else {
+                    0
+                };
+                let variadic = self.checker.is_extern_variadic(&n);
+                let depth_on_entry = self.expr_depth;
+                self.bytecode.push_load(lib_slot);
+                self.bytecode.push_load(fn_id_slot);
+                self.expr_depth = depth_on_entry + 2;
+                if let Some(items) = args {
+                    for arg in items {
+                        let mut arg_bc = self.do_compile(arg);
+                        self.bytecode.append(&mut arg_bc);
+                        self.expr_depth += 1;
+                    }
+                }
+                self.bytecode.push_make_tuple(arity as u32);
+                let mut operand = arity as u32 & 0xFFFF;
+                if variadic {
+                    let call_span = (span.start, span.end);
+                    let arg_refs: Vec<_> = args
+                        .as_ref()
+                        .map(|items| items.iter().collect())
+                        .unwrap_or_default();
+                    if let Some(tags) = resolve_variadic_ffi_tags(
+                        &self.checker,
+                        call_span,
+                        &arg_refs,
+                        &mut self.messages,
+                    ) {
+                        for &(tag, aux) in &tags {
+                            emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                        }
+                        self.bytecode.push_make_tuple(tags.len() as u32);
+                        operand |= 1 << 16;
+                    }
+                }
+                self.bytecode
+                    .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
+                self.expr_depth = depth_on_entry;
+                self.emit_result_unwrap_or_panic();
+            } else if let Some(&native_id) = self.native.get(&n) {
+                // Same stack order as `emit_io_host_invoke`: id first,
+                // then args (nested HostInvoke may write to `self.bytecode`).
+                let arity = if let Some(items) = args {
+                    items.len()
+                } else {
+                    0
+                };
+                let depth_on_entry = self.expr_depth;
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                self.expr_depth = depth_on_entry + 1;
+                if let Some(items) = args {
+                    for arg in items {
+                        let mut arg_bc = self.do_compile(arg);
+                        self.bytecode.append(&mut arg_bc);
+                        self.expr_depth += 1;
+                    }
+                }
+                self.bytecode.push_make_tuple(arity as u32);
+                self.bytecode.push_host_invoke(arity as u32);
+                self.expr_depth = depth_on_entry;
+            } else if let Some(offset) = self.functions.get(&n).copied() {
+                let mono_offset = self.mono_call_offset(&n, args.as_ref());
+                let target_offset = mono_offset.unwrap_or(offset);
+                let lookup_name = strip_overload_key(&n).to_string();
+                let is_generic =
+                    self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
+                // Only box bare `T` args for the shared dict ABI. Nested
+                // params like `[T]` (e.g. `collections::sort`) keep the
+                // native representation even when not monomorphized.
+                let box_generic_args =
+                    is_generic && self.generic_has_toplevel_type_param_args(&lookup_name);
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                self.consume_spread_emit_ids(arg_slice);
+                let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
+
+                if self.try_emit_par_specialized_call(&n, Some(arg_slice), &mut bytecode) {
+                    return bytecode;
+                }
+
+                if !is_generic
+                    && !self.coroutine_fns.contains(&n)
+                    && !self.coroutine_fns.contains(&lookup_name)
+                    && self.try_emit_inline_direct_call(&n, Some(arg_slice), &mut bytecode)
+                {
+                    return bytecode;
+                }
+
+                // One-level self-unroll: peel recursive callee body once;
+                // nested self-calls remain CALL/Entry.
+                if !is_generic
+                    && !self.coroutine_fns.contains(&n)
+                    && !self.coroutine_fns.contains(&lookup_name)
+                    && self.try_emit_self_unroll_call(&n, Some(arg_slice), &mut bytecode)
+                {
+                    return bytecode;
+                }
+
+                // Caller-side base-case peel: cmp-jmp before CALL when
+                // the callee opens with fused/unfused compare + imm/slot return.
+                let peel_indirect = is_instance_method_fqn(&self.checker, &lookup_name);
+                if !is_generic
+                    && !self.coroutine_fns.contains(&n)
+                    && !self.coroutine_fns.contains(&lookup_name)
+                    && self.try_emit_predicate_peel_call(
+                        &n,
+                        Some(arg_slice),
+                        &mut bytecode,
+                        target_offset as u32,
+                        peel_indirect,
+                    )
+                {
+                    return bytecode;
+                }
+
+                // Partial application → MakeFn (not CALL).
+                let (fa, is_rest, _id) = self
+                    .checker
+                    .selected_overload_at(span.start, span.end)
+                    .or_else(|| {
+                        let names = self.checker.fn_param_names(&lookup_name)?;
+                        let rest = self.checker.fn_has_rest(&lookup_name);
+                        let fixed = if rest {
+                            names.len().saturating_sub(1)
+                        } else {
+                            names.len()
+                        };
+                        Some((fixed, rest, 0))
+                    })
+                    .or_else(|| {
+                        self.fn_arities
+                            .get(&lookup_name)
+                            .or_else(|| self.fn_arities.get(&n))
+                            .map(|(a, r)| (*a as usize, *r, 0))
+                    })
+                    .unwrap_or((0, false, 0));
+                let fill_mask =
+                    self.checker
+                        .partial_fill_at(span.start, span.end)
+                        .or_else(|| {
+                            // Spread args count as their expanded arity, not one slot.
+                            let argc = flat_arg_slice.len();
+                            if !is_rest && fa > 0 && argc < fa {
+                                Some((1u32 << argc).wrapping_sub(1))
+                            } else {
+                                None
+                            }
+                        });
+                if let Some(mask) = fill_mask {
+                    // Emit filled values in declaration order (already
+                    // the order of `flat_arg_slice` after named reorder at TC).
+                    for arg in &flat_arg_slice {
+                        let value = match arg.1.as_ref() {
+                            Expression::NamedArg(_, v) => v,
+                            _ => arg,
+                        };
+                        bytecode.append(&mut self.do_compile(value));
+                    }
+                    let n_filled = mask.count_ones();
+                    bytecode.push_const(mask as i32);
+                    bytecode.push(
+                        Byte::new(Instruction::CodePtr)
+                            .with_operand_u32(target_offset as u32),
+                    );
+                    bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
+                        make_fn_operand(0, n_filled, fa as u32, is_rest),
+                    ));
+                    return bytecode;
+                }
+
+                let value_arity = self.emit_call_args_with_rest(
+                    &lookup_name,
+                    arg_slice,
+                    &mut bytecode,
+                    box_generic_args,
+                );
+
+                // ── Dictionary-passing calling convention ──────────────────
+                // For non-monomorphized generic calls, append one dict tuple
+                // per constraint after the value args. Each dict is a
+                // MakeTuple of method code offsets (CodePtr per method in
+                // declaration order). Builtin and user instances share this
+                // ABI; ground Num/Ord/Eq calls may still monomorphize away
+                // from the shared body, but Show-bound calls always take
+                // this path.
+                let dict_count = if is_generic {
+                    let (fixed, rest, pack_rest) =
+                        self.split_call_args_for_rest(&lookup_name, arg_slice);
+                    let mut call_arg_tys: Vec<crate::typechecking::Ty> = fixed
+                        .iter()
+                        .map(|arg| {
+                            self.codegen_expr_ty(arg).expect(
+                                "typechecked call argument must have a codegen type",
+                            )
+                        })
+                        .collect();
+                    // Rest-only generics (`T... xs`) have empty `fixed`;
+                    // bind `T` from the packed `[T]` / `[T; N]` arg.
+                    if pack_rest {
+                        call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                    }
+                    let mut forwarded = 0;
+                    if let Some(indices) = self_id
+                        .and_then(|id| self.checker.forwarded_dicts_at(id))
+                        .or_else(|| {
+                            self.checker.forwarded_dicts_for_span(span.start, span.end)
+                        })
+                        .map(<[usize]>::to_vec)
+                    {
+                        for dict_index in indices {
+                            if let Some(slot) =
+                                self.lookup_slot(&format!("__dict{}", dict_index))
+                            {
+                                bytecode.push_load(slot);
+                                forwarded += 1;
+                            }
+                        }
+                    }
+                    let call_ret_ty = self.codegen_expr_ty(ast);
+                    forwarded
+                        + Self::emit_call_site_dicts(
+                            &mut bytecode,
+                            &lookup_name,
+                            &call_arg_tys,
+                            call_ret_ty.as_ref(),
+                            &self.checker,
+                            &self.functions,
+                        )
+                } else {
+                    0
+                };
+
+                let arity = value_arity + dict_count as u32;
+                if is_instance_method_fqn(&self.checker, &lookup_name) {
+                    Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
+                } else if self.coroutine_fns.contains(&lookup_name)
+                    || self.coroutine_fns.contains(&n)
+                {
+                    bytecode.push(
+                        Byte::new(Instruction::MakeCoro)
+                            .with_call_packed(arity, target_offset as u32),
+                    );
+                } else {
+                    // Packed CALL: arity + target in one opcode.
+                    bytecode.push(
+                        Byte::new(Instruction::CALL)
+                            .with_call_packed(arity, target_offset as u32),
+                    );
+                }
+                // Generic→concrete unbox: only when the return type
+                // parameter was boxed as a top-level argument
+                // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
+                // not boxed at construction, so unboxing would zero
+                // a valid immediate (Phase 5 HKT / Container::first).
+                if is_generic && self.generic_return_is_boxed(&lookup_name) {
+                    if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                        Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                    }
+                }
+            } else if let Some(slot) = self.lookup_slot(&identifier) {
+                // Local holding a function value: escaped PolyFn
+                // (`let f = show` / `return show`), rank-n parameter, or
+                // a PolyFn returned from another call. Emit args, optional
+                // application dictionaries, then CallIndirect.
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                self.consume_spread_emit_ids(arg_slice);
+                let flat_args = self.flatten_call_args_for_emit(arg_slice);
+                let value_arity = flat_args.len() as u32;
+                let mut arg_tys = Vec::new();
+                let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
+                // Box for PolyFn locals — including those assigned from a
+                // call that returns a captured PolyFn (no polyfn_sources
+                // entry). Mono ObjFn / partials / lambdas stay unboxed.
+                let needs_arg_box = self.local_call_needs_arg_boxing(&identifier);
+                for arg in &flat_args {
+                    self.append_with_existential_pack(&mut bytecode, arg);
+                    if needs_arg_box {
+                        if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                            Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                            arg_tys.push(arg_ty);
+                        }
+                    }
+                }
+                let mut dict_count = 0u32;
+                if let Some(source) = polyfn_source.as_ref() {
+                    if let Some(indices) = self_id
+                        .and_then(|id| self.checker.forwarded_dicts_at(id))
+                        .or_else(|| {
+                            self.checker.forwarded_dicts_for_span(span.start, span.end)
+                        })
+                        .map(<[usize]>::to_vec)
+                    {
+                        for dict_index in indices {
+                            if let Some(dict_slot) =
+                                self.lookup_slot(&format!("__dict{}", dict_index))
+                            {
+                                bytecode.push_load(dict_slot);
+                                dict_count += 1;
+                            }
+                        }
+                    }
+                    let call_ret_ty = self.codegen_expr_ty(ast);
+                    dict_count += Self::emit_call_site_dicts(
+                        &mut bytecode,
+                        source,
+                        &arg_tys,
+                        call_ret_ty.as_ref(),
+                        &self.checker,
+                        &self.functions,
+                    ) as u32;
+                }
+                // Pack value arity + application dict arity so the VM can
+                // merge captured evidence with apply-site dictionaries.
+                bytecode.push_load(slot);
+                bytecode.push(
+                    Byte::new(Instruction::CallIndirect)
+                        .with_operand_u32(value_arity | (dict_count << 16)),
+                );
+                // Generic→concrete unbox for polyfn call site.
+                if self.local_polyfn_call_needs_unbox(
+                    &identifier,
+                    Some((span.start, span.end)),
+                ) {
+                    let call_ty = self.codegen_expr_ty(ast);
+                    let unbox_ty = match call_ty {
+                        Some(t) if Self::ty_to_value_tag(&t).is_some() => Some(t),
+                        _ => {
+                            let arg_tys: Vec<Ty> = flat_args
+                                .iter()
+                                .filter_map(|a| self.codegen_expr_ty(a))
+                                .collect();
+                            // Binder forall (not call-site instantiated Fun).
+                            let binder = {
+                                use crate::typechecking::subst::apply_ty_prune;
+                                let mut found = None;
+                                for frame in self.mono_codegen_var_types.iter().rev() {
+                                    if let Some(ty) = frame.get(&identifier) {
+                                        found = Some(apply_ty_prune(
+                                            self.checker.subst(),
+                                            ty,
+                                        ));
+                                        break;
+                                    }
+                                }
+                                found.or_else(|| {
+                                    self.checker.codegen_var_type(&identifier).map(|ty| {
+                                        apply_ty_prune(self.checker.subst(), ty)
+                                    })
+                                })
+                            };
+                            binder.and_then(|vt| {
+                                Self::instantiate_polyfn_app_result(&vt, &arg_tys)
+                            })
+                        }
+                    };
+                    if let Some(ty) = unbox_ty {
+                        Self::emit_unbox_if_needed(&mut bytecode, &ty);
+                    }
+                }
+            } else {
+                let mut message = Message::error(
+                    ErrorCode::UnknownFunction,
+                    "Unknown function".to_string(),
+                    span.into_range(),
+                );
+                message.push(DiagLabel::new(
+                    format!("Unable to call unknown function '{}'", n),
+                    span.into_range(),
+                ));
+                self.messages.push(message);
+            }
+        } // end non-method Call
+        bytecode
+    }
+
     /// Emit unfused absolute-offset bytecode for `ast` (no peephole pass).
     ///
     /// Multi-file compilation uses this so earlier module tails remain valid
@@ -12293,6 +12335,7 @@ impl Compiler {
         self.emit_idx = 0;
         self.temp_counter = 0;
         self.expr_depth = 0;
+        self.codegen_depth = 0;
         self.const_env_stack.clear();
         self.const_env_stack.push(HashMap::new());
         self.static_const_values.clear();
@@ -12565,7 +12608,18 @@ impl Compiler {
         module: &str,
         ast: &mut (SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
-        self.compile_unfused(module, ast);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.compile_unfused(module, ast);
+        }));
+        if let Err(payload) = result
+            && payload
+                .downcast_ref::<super::CodegenRecursionLimitExceeded>()
+                .is_none()
+        {
+            // Only swallow our own recursion-limit signal (message already
+            // recorded in `do_compile`) — any other panic is a real bug.
+            std::panic::resume_unwind(payload);
+        }
         Vec::new()
     }
 

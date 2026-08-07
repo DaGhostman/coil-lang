@@ -20,6 +20,17 @@ use parser::{
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
 };
 
+/// Max native recursion depth for [`compiler::Compiler::do_compile`]. Chosen
+/// well under what a debug-build stack of a few MiB can hold even with
+/// `do_compile`'s current per-call frame size — see
+/// docs/internals/limitations.md.
+const CODEGEN_RECURSION_LIMIT: u32 = 2000;
+
+/// Private unwind payload for `do_compile`'s recursion-limit panic. Caught in
+/// [`Compiler::compile_module`]; never lets user input abort the process the
+/// way a genuine native stack overflow does.
+struct CodegenRecursionLimitExceeded;
+
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
         $result.append(&mut $self.do_compile($rhs));
@@ -776,6 +787,11 @@ pub struct Compiler {
     /// memory).
     expr_depth: u32,
 
+    /// Native call-stack depth of [`Compiler::do_compile`]'s recursion,
+    /// guarded against a fixed limit — see the analogous `infer_depth` on
+    /// the typechecker's `Checker`.
+    codegen_depth: u32,
+
     /// Active loop labels: `(continue_target, break_target)`.
     loop_stack: Vec<(BbLabel, BbLabel)>,
 
@@ -916,6 +932,7 @@ impl Default for Compiler {
             temp_counter: 0,
             field_key_slots: HashMap::new(),
             expr_depth: 0,
+            codegen_depth: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
             fn_defers: Vec::new(),
