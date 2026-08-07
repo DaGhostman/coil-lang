@@ -1,6 +1,6 @@
 //! Bytecode-shape and dispatch-count regression guards for the VM perf pass.
 
-use common::{Byte, Instruction};
+use common::{Byte, FnDebugSym, Instruction};
 use compiler::Pipeline;
 use machine::{Machine, dispatch_count, reset_dispatch_count};
 
@@ -25,6 +25,27 @@ fn compile(path: &str) -> (Vec<Byte>, Vec<u64>, Vec<String>, u32, Pipeline) {
 
 fn count_opcodes(bytecode: &[Byte], op: Instruction) -> usize {
     bytecode.iter().filter(|b| *b.bytecode() == op).count()
+}
+
+/// Inclusive-exclusive PC range for `name` from sorted `fn_symbols`.
+fn fn_pc_range(syms: &[FnDebugSym], name: &str, bytecode_len: usize) -> (usize, usize) {
+    let idx = syms.iter().position(|s| s.name == name).unwrap_or_else(|| {
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        panic!("missing fn_symbol `{name}`; have {names:?}");
+    });
+    let start = syms[idx].entry_pc as usize;
+    let end = syms
+        .get(idx + 1)
+        .map(|s| s.entry_pc as usize)
+        .unwrap_or(bytecode_len);
+    (start, end)
+}
+
+fn count_opcodes_in(bytecode: &[Byte], start: usize, end: usize, op: Instruction) -> usize {
+    bytecode[start..end]
+        .iter()
+        .filter(|b| *b.bytecode() == op)
+        .count()
 }
 
 fn run_dispatch(
@@ -53,16 +74,18 @@ fn perf_numeric_uses_bin_slot_imm_jmpf_for_loop() {
 
 #[test]
 fn perf_operators_loop_inverts_not_into_bin_slot_jmpf() {
-    let (bc, _, _, _, _) = compile("examples/perf/operators_loop.hy");
-    // `if (!(i & 1))` inverts so the fused header is BinSlotImmJmpf(BITAND),
-    // not LogNotJmpf.
+    let (bc, _, _, _, pipeline) = compile("examples/perf/operators_loop.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "main", bc.len());
+    let main = &bc[start..end];
+    // Stdlib (`io::sync::write_all`, …) may emit LogNotJmpf; the user loop must not.
     assert_eq!(
-        count_opcodes(&bc, Instruction::LogNotJmpf),
+        count_opcodes_in(&bc, start, end, Instruction::LogNotJmpf),
         0,
-        "operators loop should not emit LogNotJmpf after if(!c) invert"
+        "main should not emit LogNotJmpf after if(!c) invert"
     );
     assert!(
-        bc.iter().any(|b| {
+        main.iter().any(|b| {
             matches!(*b.bytecode(), Instruction::BinSlotImmJmpf)
                 && b.bin_slot_imm_jmpf_parts().0 == Instruction::BITAND as u8
         }),
@@ -104,14 +127,18 @@ fn perf_fib_dispatch_regression() {
 
 #[test]
 fn perf_field_hot_reuses_repeated_string_keys() {
-    let (bc, _, _, _, _) = compile("examples/perf/field_hot.hy");
-    // Point::twice_x / hot loop reuses "x"/"y" — STRING count stays small vs
-    // naive per-access emit (200k iters × several fields would explode).
-    // Default Show/String (`typeof` FQN) add a couple of STRINGs beyond field keys.
-    let strings = count_opcodes(&bc, Instruction::STRING);
+    let (bc, _, _, _, pipeline) = compile("examples/perf/field_hot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    // Count STRING only in Point methods + main — not linked Show/String/io helpers.
+    let mut strings = 0usize;
+    for name in ["Point::sum", "Point::twice_x", "main"] {
+        let (start, end) = fn_pc_range(&syms, name, bc.len());
+        strings += count_opcodes_in(&bc, start, end, Instruction::STRING);
+    }
+    // Field keys "x"/"y" reused across methods/main; a few format/literals in main.
     assert!(
-        strings <= 12,
-        "field_hot should materialize field-name STRINGs once per key, got {strings}"
+        strings <= 10,
+        "field_hot user fns should reuse field-name STRINGs, got {strings}"
     );
     assert!(
         count_opcodes(&bc, Instruction::GetField) >= 1,
