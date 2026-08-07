@@ -2372,6 +2372,16 @@ impl Compiler {
         {
             return self.emit_call_args_stage_self_bc(&fixed, bytecode, box_generic);
         }
+        // Binary staging (`at + len(n)`) STORE-seeks past live prior args and
+        // buries them under the high-water mark. Stage every arg when any may
+        // clobber so CALL pops a clean [a0, a1, …] reload.
+        if !pack_rest
+            && fixed
+                .iter()
+                .any(|a| self.expr_may_clobber_operand_stack(a))
+        {
+            return self.emit_call_args_stage_all(&fixed, bytecode, box_generic);
+        }
 
         for arg in &fixed {
             self.append_with_existential_pack(bytecode, arg);
@@ -2610,6 +2620,36 @@ impl Compiler {
             }
             // HostInvoke/format/match emit onto self.bytecode — StorePop must
             // follow immediately there, not in the Call local vec.
+            if self.arg_emits_on_self_bytecode(arg) {
+                self.stage_call_arg_to_temp(arg, box_generic, &mut temps[i]);
+            } else {
+                self.append_with_existential_pack(bytecode, arg);
+                if box_generic {
+                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                    }
+                }
+                let tmp = self.alloc_temp_slot();
+                bytecode.push_store_pop(tmp);
+                temps[i] = tmp;
+            }
+        }
+        for &tmp in &temps {
+            bytecode.push_load(tmp);
+        }
+        args.len() as u32
+    }
+
+    /// Stage every arg into a temp, then `LOAD` in order. Used when an arg's
+    /// codegen may STORE-seek past live prior args (binary staging, nested CALL).
+    fn emit_call_args_stage_all(
+        &mut self,
+        args: &[Output<'_>],
+        bytecode: &mut Vec<Byte>,
+        box_generic: bool,
+    ) -> u32 {
+        let mut temps = vec![0u32; args.len()];
+        for (i, arg) in args.iter().enumerate() {
             if self.arg_emits_on_self_bytecode(arg) {
                 self.stage_call_arg_to_temp(arg, box_generic, &mut temps[i]);
             } else {
