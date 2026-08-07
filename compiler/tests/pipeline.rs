@@ -964,62 +964,13 @@ fn example_chained_prints_42_7() {
 
 #[test]
 fn example_match_with_two_ok_arms_dispatches_correctly() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/result.hy");
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-
-    let mut pipeline = compiler::Pipeline::new();
-    let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("result.hy should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
-
-    let shared = SharedBuf::new();
-    let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared.clone());
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
-    pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(
-        &bytecode,
-        &constants,
-        pipeline.strings(),
-        pipeline.static_slot_count(),
-    );
-
-    let _ = machine.restore_output();
-    let output = shared.into_utf8();
-
+    let output = run_example("examples/result.hy");
     assert_eq!(output, "420-1");
 }
 
 #[test]
 fn fizbuz_runs_to_completion() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/fizbuz.hy");
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-
-    let mut pipeline = compiler::Pipeline::new();
-    let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("fizbuz.hy should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
-
-    let shared = SharedBuf::new();
-    let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared);
-    pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(
-        &bytecode,
-        &constants,
-        pipeline.strings(),
-        pipeline.static_slot_count(),
-    );
-
-    let _ = shared;
+    let _output = run_example("examples/fizbuz.hy");
 }
 
 #[test]
@@ -4871,6 +4822,7 @@ fn tls_server_enable_non_tcp_is_err_via_host_invoke() {
 use io::{{open, stdout, IoError}};
 
 use io::net::tls::server::{{enable}};
+use io::sync::{{write_all}};
 use string::{{format, to_bytes}};
 
 fn classify(IoError e) -> int {{
@@ -4898,7 +4850,7 @@ fn main() {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     }};
-    write(stdout(), to_bytes(format("%i", code)));
+    write_all(stdout(), to_bytes(format("%i", code)));
 }}
 "#
     );
@@ -6071,8 +6023,8 @@ fn main() {
     assert_eq!(run_example_src(src), "10,20");
 }
 
-/// SetField / StoreIndex leave the RHS on the stack — statement forms must POP
-/// or later ops see a corrupted stack.
+/// SetField leaves the RHS on the stack — statement forms must POP.
+/// Const index stores into stack `[T; N]` locals use direct STORE (no StoreIndex).
 #[test]
 fn set_field_and_store_index_statements_pop_value() {
     let src = r#"
@@ -6096,27 +6048,18 @@ fn main() {
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
     let mut set_field_followed_by_pop = 0usize;
-    let mut store_index_followed_by_pop = 0usize;
     for w in bytecode.windows(2) {
         if matches!(w[0].bytecode(), common::Instruction::SetField)
             && matches!(w[1].bytecode(), common::Instruction::POP)
         {
             set_field_followed_by_pop += 1;
         }
-        if matches!(w[0].bytecode(), common::Instruction::StoreIndex)
-            && matches!(w[1].bytecode(), common::Instruction::POP)
-        {
-            store_index_followed_by_pop += 1;
-        }
     }
     assert!(
         set_field_followed_by_pop >= 2,
         "class field assignment statements need SetField; POP"
     );
-    assert!(
-        store_index_followed_by_pop >= 2,
-        "index assignment statements need StoreIndex; POP"
-    );
+    // Fixed-array const stores are direct STORE — heap StoreIndex is optional.
     assert_eq!(run_example_src(src), "7,30");
 }
 
@@ -6184,17 +6127,23 @@ fn main() {
 "#;
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
-    let lens = bytecode
+    let syms = pipeline.program_debug().fn_symbols;
+    let main_idx = syms.iter().position(|s| s.name == "main").expect("main");
+    let start = syms[main_idx].entry_pc as usize;
+    let end = syms
+        .get(main_idx + 1)
+        .map(|s| s.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let lens = bytecode[start..end]
         .iter()
         .filter(|b| matches!(b.bytecode(), common::Instruction::ArrayLen))
         .count();
-    // Loop hoist emits one ArrayLen; builtin `Length__string__len` may add another.
-    assert!(
-        (1..=2).contains(&lens),
-        "for-in should ArrayLen once before the loop (got {lens})"
+    assert_eq!(
+        lens, 1,
+        "main for-in should ArrayLen once before the loop (got {lens})"
     );
     assert!(
-        bytecode
+        bytecode[start..end]
             .iter()
             .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpf)),
         "loop header should fuse idx < len into BinSlotSlotJmpf"
