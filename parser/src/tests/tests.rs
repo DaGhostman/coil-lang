@@ -1032,6 +1032,28 @@
     }
 
     #[test]
+    fn unary_minus_binds_tighter_than_cast() {
+        let ast = expr_ast!("-1 as byte");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Cast(lhs, _) => {
+                let lhs = match lhs.1.as_ref() {
+                    Expression::Group(inner) | Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                assert!(
+                    matches!(lhs, Expression::Negate(_)),
+                    "expected Cast(Negate(_), _), got Cast({lhs}, _)"
+                );
+            }
+            other => panic!("expected Cast, got {other}"),
+        }
+    }
+
+    #[test]
     fn string_literal_allows_escaped_quote() {
         let e = expr_ast!(r#""\"""#);
         let inner = match e {

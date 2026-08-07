@@ -39,6 +39,8 @@ enum Precedence {
     Binary,
     Term,
     Factor,
+    /// `as` — below unary `-` so `-1 as byte` is `(-1) as byte` (Rust-like).
+    Cast,
     Negate,
     Unary,
     Call,
@@ -663,10 +665,10 @@ impl<'pratt> Pratt<'pratt> {
                     self.params(expr.clone()),
                     |lhs, args, e| (e.span(), Box::new(Expression::Call { name: lhs, args })),
                 ),
-                // `as` binds tighter than `*`/`+` and assignment so
-                // `c = m as byte` is `c = (m as byte)`, not `(c = m) as byte`.
+                // Below unary `-` so `-1 as byte` is `(-1) as byte`; still above
+                // `*`/`+`/assignment so `c = m as byte` stays `c = (m as byte)`.
                 postfix(
-                    Precedence::Unary as u16,
+                    Precedence::Cast as u16,
                     op!("as").ignore_then(self.type_annotation()),
                     |lhs, ty, e| (e.span(), Box::new(Expression::Cast(lhs, ty))),
                 ),
