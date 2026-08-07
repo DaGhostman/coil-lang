@@ -2751,91 +2751,7 @@ impl Checker {
                 }
             }
 
-            Expression::Cast(expr, ty_ann) => {
-                let dst_ty = self.parse_type_name(ty_ann);
-                let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
-                // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
-                // in-range `65 as byte` type the operand as the target when it
-                // is a coercible literal.
-                let prev_expected = self.current_expected.take();
-                if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
-                    self.current_expected = Some(dst_ty.clone());
-                }
-                let src_ty = self.infer(expr);
-                self.current_expected = prev_expected;
-                let src_ty = apply_ty_prune(&self.subst, &src_ty);
-                let range = expr.0.into_range();
-                if Self::is_byte_array_ty(&dst_ty).is_some() {
-                    if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
-                        return dst_ty;
-                    }
-                    if Self::is_string_ty(&src_ty) {
-                        // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
-                        // `[byte; N]` still requires a literal (length known).
-                        if matches!(
-                            Self::is_byte_array_ty(&dst_ty),
-                            Some(crate::typechecking::ty::ArrayLength::Dynamic)
-                        ) {
-                            return dst_ty;
-                        }
-                        return self.error_with_help(
-                            ErrorCode::TypeMismatch,
-                            "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
-                            range,
-                            Some(
-                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]` / `Vec<byte>`"
-                                    .to_string(),
-                            ),
-                        );
-                    }
-                }
-                match (
-                    Self::primitive_cast_name(&src_ty),
-                    Self::primitive_cast_name(&dst_ty),
-                ) {
-                    (Some(from), Some(to)) if from == to || Self::primitive_cast_allowed(from, to) => {
-                        // Expected-byte inference can type `(-1)` as `byte` before
-                        // this match (`from == to`); still reject out-of-range literals.
-                        if to == "byte"
-                            && (from == "int" || from == "byte")
-                            && let Err(Some(n)) = Self::byte_literal_coercion(expr)
-                        {
-                            return self.error_with_help(
-                                ErrorCode::TypeMismatch,
-                                format!("byte literal out of range: `{n}` is not in 0..=255"),
-                                range,
-                                Some(
-                                    "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
-                                        .to_string(),
-                                ),
-                            );
-                        }
-                        dst_ty
-                    }
-                    (Some(from), Some(to)) => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        format!("cannot cast `{from}` to `{to}`"),
-                        range,
-                        Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
-                    ),
-                    (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        "cannot cast `string` to `byte`".to_string(),
-                        range,
-                        Some(
-                            "only a string literal whose UTF-8 encoding is exactly one byte coerces to `byte` (e.g. `\"/\"`, `\"\\n\"`)"
-                                .to_string(),
-                        ),
-                    ),
-                    _ => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
-                            .to_string(),
-                        ty_ann.0.into_range(),
-                        None,
-                    ),
-                }
-            }
+            Expression::Cast(expr, ty_ann) => self.infer_cast(expr, ty_ann),
 
             Expression::TypeOf(inner) => {
                 let inner_ty = self.infer(inner);
@@ -3262,164 +3178,8 @@ impl Checker {
             Expression::AttrDecl { .. } => unit_ty(),
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
-            Expression::Access(receiver, field) => {
-                let receiver_ty = self.infer(receiver);
-                let resolved = apply_ty_prune(&self.subst, &receiver_ty);
-                match strip_readonly(&resolved) {
-                    Ty::Sum { name, variants } => {
-                        self.access_field_in_sum(name, variants, None, field, range)
-                    }
-                    Ty::Constructor { tag, owner, .. } => {
-                        // Resolve the owner to its variants.
-                        match owner.as_ref() {
-                            Ty::Sum { name, variants } => {
-                                self.access_field_in_sum(name, variants, Some(*tag), field, range)
-                            }
-                            _ => self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("Cannot access field `{}` on non-record type", field),
-                                range,
-                                Some(
-                                    "only values of record-shaped enum types expose fields"
-                                        .to_string(),
-                                ),
-                            ),
-                        }
-                    }
-                    Ty::App(head, args) if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
-                    {
-                        let name = match head.as_ref() {
-                            Ty::Con(n) => n.clone(),
-                            _ => unreachable!(),
-                        };
-                        self.access_class_field(&name, field, args, range)
-                    }
-                    Ty::Con(name) => {
-                        // Class instance field access.
-                        if self.classes.contains_key(name) {
-                            return self.access_class_field(name, field, &[], range);
-                        }
-                        // Bare type name — resolve via the
-                        // checker's enum registry.
-                        let variant_names = self.enums.get(name).cloned().unwrap_or_default();
-                        let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
-                        if variant_names.is_empty() {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("Cannot access field `{}` on non-record type", field),
-                                range,
-                                Some(format!("type `{}` is not a record-shaped enum", name)),
-                            );
-                        }
-                        let variants: Vec<(String, EnumVariantPayloadTy)> =
-                            variant_names.into_iter().zip(payloads).collect();
-                        self.access_field_in_sum(name, &variants, None, field, range)
-                    }
-                    Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
-                        Some((_, fty)) => fty.clone(),
-                        None => {
-                            let known: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-                            let msg = format!(
-                                "Cannot find field `{}` on record `{{ {} }}`",
-                                field,
-                                fields
-                                    .iter()
-                                    .map(|(n, t)| format!("{}: {}", n, t))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                            let help = if known.is_empty() {
-                                Some("the record has no fields".to_string())
-                            } else {
-                                Some(format!("the record has fields: {}", known.join(", ")))
-                            };
-                            self.error_with_help(ErrorCode::GenericTypeError, msg, range, help)
-                        }
-                    },
-                    _ => self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        format!("Cannot access field `{}` on non-record type", field),
-                        range,
-                        Some("only values of record-shaped enum types expose fields".to_string()),
-                    ),
-                }
-            }
-            Expression::Instantiate(class_expr, args) => {
-                let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
-                    && self.classes.contains_key(*name)
-                {
-                    (*name).to_string()
-                } else {
-                    let class_ty = self.infer(class_expr);
-                    let resolved = apply_ty_prune(&self.subst, &class_ty);
-                    match &resolved {
-                        Ty::Con(n) => n.clone(),
-                        _ => {
-                            return self.error(
-                                ErrorCode::NotAFunction,
-                                "Cannot instantiate non-class type".to_string(),
-                                range,
-                            );
-                        }
-                    }
-                };
-                if let Some(fields) = self.classes.get(&class_name).cloned() {
-                    let param_names = self
-                        .generics
-                        .generic_type_ctors
-                        .get(&class_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    // Freshen field types at each `new` site so independent
-                    // instantiations don't share type variables.
-                    let (field_tys, result_ty) = if param_names.is_empty() {
-                        (
-                            fields.iter().map(|(_, _, t)| t.clone()).collect::<Vec<_>>(),
-                            Ty::Con(class_name.clone()),
-                        )
-                    } else {
-                        let mut map = HashMap::new();
-                        let mut app_args = Vec::with_capacity(param_names.len());
-                        for p in &param_names {
-                            let v = Ty::Var(self.counter.fresh());
-                            app_args.push(v.clone());
-                            map.insert(p.clone(), v);
-                        }
-                        let field_tys = fields
-                            .iter()
-                            .map(|(_, _, t)| subst_ty_params(t, &map))
-                            .collect();
-                        (
-                            field_tys,
-                            Ty::App(Box::new(Ty::Con(class_name.clone())), app_args),
-                        )
-                    };
-                    let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
-                    if provided.len() != fields.len() {
-                        let _ = self.error_with_help(
-                            ErrorCode::ConstructorArity,
-                            format!(
-                                "Constructor `{}` expects {} arguments, got {}",
-                                class_name,
-                                fields.len(),
-                                provided.len()
-                            ),
-                            range,
-                            Some(
-                                "pass one argument per class field, in declaration order"
-                                    .to_string(),
-                            ),
-                        );
-                    } else {
-                        for (arg, fty) in provided.iter().zip(field_tys.iter()) {
-                            let aty = self.infer(arg);
-                            self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
-                        }
-                    }
-                    return apply_ty_prune(&self.subst, &result_ty);
-                }
-                Ty::Con(class_name)
-            }
+            Expression::Access(receiver, field) => self.infer_access_expr(receiver, field, range),
+            Expression::Instantiate(class_expr, args) => self.infer_instantiate(class_expr, args, range),
             Expression::Field { .. } => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
@@ -3596,6 +3356,265 @@ impl Checker {
             // above and remove this arm.
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
+        }
+    }
+
+    #[inline(never)]
+    fn infer_instantiate(
+        &mut self,
+        class_expr: &Output,
+        args: &Option<Vec<Output>>,
+        range: Range<usize>,
+    ) -> Ty {
+        let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
+            && self.classes.contains_key(*name)
+        {
+            (*name).to_string()
+        } else {
+            let class_ty = self.infer(class_expr);
+            let resolved = apply_ty_prune(&self.subst, &class_ty);
+            match &resolved {
+                Ty::Con(n) => n.clone(),
+                _ => {
+                    return self.error(
+                        ErrorCode::NotAFunction,
+                        "Cannot instantiate non-class type".to_string(),
+                        range,
+                    );
+                }
+            }
+        };
+        if let Some(fields) = self.classes.get(&class_name).cloned() {
+            let param_names = self
+                .generics
+                .generic_type_ctors
+                .get(&class_name)
+                .cloned()
+                .unwrap_or_default();
+            // Freshen field types at each `new` site so independent
+            // instantiations don't share type variables.
+            let (field_tys, result_ty) = if param_names.is_empty() {
+                (
+                    fields.iter().map(|(_, _, t)| t.clone()).collect::<Vec<_>>(),
+                    Ty::Con(class_name.clone()),
+                )
+            } else {
+                let mut map = HashMap::new();
+                let mut app_args = Vec::with_capacity(param_names.len());
+                for p in &param_names {
+                    let v = Ty::Var(self.counter.fresh());
+                    app_args.push(v.clone());
+                    map.insert(p.clone(), v);
+                }
+                let field_tys = fields
+                    .iter()
+                    .map(|(_, _, t)| subst_ty_params(t, &map))
+                    .collect();
+                (
+                    field_tys,
+                    Ty::App(Box::new(Ty::Con(class_name.clone())), app_args),
+                )
+            };
+            let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
+            if provided.len() != fields.len() {
+                let _ = self.error_with_help(
+                    ErrorCode::ConstructorArity,
+                    format!(
+                        "Constructor `{}` expects {} arguments, got {}",
+                        class_name,
+                        fields.len(),
+                        provided.len()
+                    ),
+                    range,
+                    Some(
+                        "pass one argument per class field, in declaration order"
+                            .to_string(),
+                    ),
+                );
+            } else {
+                for (arg, fty) in provided.iter().zip(field_tys.iter()) {
+                    let aty = self.infer(arg);
+                    self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
+                }
+            }
+            return apply_ty_prune(&self.subst, &result_ty);
+        }
+        Ty::Con(class_name)
+    }
+
+    #[inline(never)]
+    fn infer_access_expr(
+        &mut self,
+        receiver: &Output,
+        field: &str,
+        range: Range<usize>,
+    ) -> Ty {
+        let receiver_ty = self.infer(receiver);
+        let resolved = apply_ty_prune(&self.subst, &receiver_ty);
+        match strip_readonly(&resolved) {
+            Ty::Sum { name, variants } => {
+                self.access_field_in_sum(name, variants, None, field, range)
+            }
+            Ty::Constructor { tag, owner, .. } => {
+                // Resolve the owner to its variants.
+                match owner.as_ref() {
+                    Ty::Sum { name, variants } => {
+                        self.access_field_in_sum(name, variants, Some(*tag), field, range)
+                    }
+                    _ => self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on non-record type", field),
+                        range,
+                        Some(
+                            "only values of record-shaped enum types expose fields"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+            Ty::App(head, args) if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
+            {
+                let name = match head.as_ref() {
+                    Ty::Con(n) => n.clone(),
+                    _ => unreachable!(),
+                };
+                self.access_class_field(&name, field, args, range)
+            }
+            Ty::Con(name) => {
+                // Class instance field access.
+                if self.classes.contains_key(name) {
+                    return self.access_class_field(name, field, &[], range);
+                }
+                // Bare type name — resolve via the
+                // checker's enum registry.
+                let variant_names = self.enums.get(name).cloned().unwrap_or_default();
+                let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
+                if variant_names.is_empty() {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on non-record type", field),
+                        range,
+                        Some(format!("type `{}` is not a record-shaped enum", name)),
+                    );
+                }
+                let variants: Vec<(String, EnumVariantPayloadTy)> =
+                    variant_names.into_iter().zip(payloads).collect();
+                self.access_field_in_sum(name, &variants, None, field, range)
+            }
+            Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
+                Some((_, fty)) => fty.clone(),
+                None => {
+                    let known: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                    let msg = format!(
+                        "Cannot find field `{}` on record `{{ {} }}`",
+                        field,
+                        fields
+                            .iter()
+                            .map(|(n, t)| format!("{}: {}", n, t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let help = if known.is_empty() {
+                        Some("the record has no fields".to_string())
+                    } else {
+                        Some(format!("the record has fields: {}", known.join(", ")))
+                    };
+                    self.error_with_help(ErrorCode::GenericTypeError, msg, range, help)
+                }
+            },
+            _ => self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("Cannot access field `{}` on non-record type", field),
+                range,
+                Some("only values of record-shaped enum types expose fields".to_string()),
+            ),
+        }
+    }
+
+    #[inline(never)]
+    fn infer_cast(&mut self, expr: &Output, ty_ann: &Output) -> Ty {
+        let dst_ty = self.parse_type_name(ty_ann);
+        let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
+        // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
+        // in-range `65 as byte` type the operand as the target when it
+        // is a coercible literal.
+        let prev_expected = self.current_expected.take();
+        if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
+            self.current_expected = Some(dst_ty.clone());
+        }
+        let src_ty = self.infer(expr);
+        self.current_expected = prev_expected;
+        let src_ty = apply_ty_prune(&self.subst, &src_ty);
+        let range = expr.0.into_range();
+        if Self::is_byte_array_ty(&dst_ty).is_some() {
+            if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
+                return dst_ty;
+            }
+            if Self::is_string_ty(&src_ty) {
+                // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
+                // `[byte; N]` still requires a literal (length known).
+                if matches!(
+                    Self::is_byte_array_ty(&dst_ty),
+                    Some(crate::typechecking::ty::ArrayLength::Dynamic)
+                ) {
+                    return dst_ty;
+                }
+                return self.error_with_help(
+                    ErrorCode::TypeMismatch,
+                    "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
+                    range,
+                    Some(
+                        "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]` / `Vec<byte>`"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+        match (
+            Self::primitive_cast_name(&src_ty),
+            Self::primitive_cast_name(&dst_ty),
+        ) {
+            (Some(from), Some(to)) if from == to || Self::primitive_cast_allowed(from, to) => {
+                // Expected-byte inference can type `(-1)` as `byte` before
+                // this match (`from == to`); still reject out-of-range literals.
+                if to == "byte"
+                    && (from == "int" || from == "byte")
+                    && let Err(Some(n)) = Self::byte_literal_coercion(expr)
+                {
+                    return self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!("byte literal out of range: `{n}` is not in 0..=255"),
+                        range,
+                        Some(
+                            "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
+                                .to_string(),
+                        ),
+                    );
+                }
+                dst_ty
+            }
+            (Some(from), Some(to)) => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!("cannot cast `{from}` to `{to}`"),
+                range,
+                Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
+            ),
+            (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "cannot cast `string` to `byte`".to_string(),
+                range,
+                Some(
+                    "only a string literal whose UTF-8 encoding is exactly one byte coerces to `byte` (e.g. `\"/\"`, `\"\\n\"`)"
+                        .to_string(),
+                ),
+            ),
+            _ => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
+                    .to_string(),
+                ty_ann.0.into_range(),
+                None,
+            ),
         }
     }
 
