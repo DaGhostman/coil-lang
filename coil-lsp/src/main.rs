@@ -2540,7 +2540,7 @@ fn fib(
             &document,
             Position {
                 // `if n <= 2` — character 7 is the binding `n` (0-based).
-                line: 9,
+                line: 10,
                 character: 7,
             },
         )
