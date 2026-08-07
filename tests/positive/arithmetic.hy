@@ -50,6 +50,16 @@ test("float power on locals") {
     assert(base ** exp == 1024.0)?;
 }
 
+fn fpow(float base, float exp) -> float {
+    return base ** exp;
+}
+
+// Return-site fuse (`BinReturn` + PowF) is a third path that used to yield 0.0.
+test("float power via return") {
+    assert(fpow(2.0, 8.0) == 256.0)?;
+    assert(fpow(3.0, 4.0) == 81.0)?;
+}
+
 test("mixed locals preserve slots") {
     let a = 10;
     let b = 20;
