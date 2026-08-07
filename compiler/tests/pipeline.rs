@@ -2027,6 +2027,133 @@ use string::{format, to_bytes};
     );
 }
 
+/// `done(h)` is false before the first resume and true after completion
+/// without needing another resume (M6: extra resume panics).
+#[test]
+fn done_before_and_after_coroutine_completion() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn counter() {
+            yield 1;
+            return 2;
+        }
+
+        fn main() {
+            let h = counter();
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%z", done(h))));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "false,1,false,2,true");
+}
+
+/// Immediate-return async fn completes on first resume; `done` flips after.
+#[test]
+fn immediate_return_async_done_after_first_resume() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn unit_ret() {
+            return;
+        }
+
+        fn main() {
+            let h = unit_ret();
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            let _ = resume h;
+            write(stdout(), to_bytes(format("%z", done(h))));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "false,true");
+}
+
+/// `resume h with v` after completion panics (same M6 rule as bare resume).
+#[test]
+fn resume_with_send_after_done_panics() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn sink() {
+            let _ = yield 0;
+            return 1;
+        }
+
+        fn main() {
+            let h = sink();
+            let _ = resume h;
+            let _ = resume h with 10;
+            let _ = resume h;
+            write(stdout(), to_bytes(format("%i", resume h with 99)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert!(
+        output.contains("panic:") && output.contains("resumed after completion"),
+        "expected resume-with-send after done to panic, got: {output:?}"
+    );
+}
+
+/// Inline `yield from` must delegate every yielded value before completing.
+#[test]
+fn yield_from_inline_delegates_all_values() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn inner() {
+            yield 1;
+            yield 2;
+        }
+        async fn outer() {
+            yield from inner();
+        }
+
+        fn main() {
+            let h = outer();
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%i", resume h)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "1,2,0");
+}
+
+/// `write_all` between resumes must not mark the delegating coroutine done.
+#[test]
+fn yield_from_write_all_between_resumes() {
+    let src = r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+        async fn counter() {
+            yield 0;
+            yield 1;
+            yield 2;
+        }
+        async fn wrap() {
+            yield from counter();
+        }
+
+        fn main() {
+            let h = wrap();
+            let v0 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v0)));
+            let v1 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v1)));
+            let v2 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v2)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "012");
+}
+
 fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
     ensure_ffi_libsum_built();
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
