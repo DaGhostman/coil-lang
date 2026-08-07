@@ -8409,10 +8409,21 @@ impl Compiler {
                 {
                     bytecode.push_load(base + *idx as u32);
                 } else {
-                    let mut target_bc = self.do_compile(target);
-                    bytecode.append(&mut target_bc);
-                    let mut index_bc = self.do_compile(index);
-                    bytecode.append(&mut index_bc);
+                    bytecode.append(&mut self.do_compile(target));
+                    // When the index stages binary operands (`len(a) - 1`),
+                    // STORE seeks the shared stack past the live receiver and
+                    // Index pops a temp (−1) instead of the Vec. Stash both.
+                    if self.expr_may_clobber_operand_stack(index) {
+                        let tgt_slot = self.alloc_temp_slot();
+                        bytecode.push_store_pop(tgt_slot);
+                        bytecode.append(&mut self.do_compile(index));
+                        let idx_slot = self.alloc_temp_slot();
+                        bytecode.push_store_pop(idx_slot);
+                        bytecode.push_load(tgt_slot);
+                        bytecode.push_load(idx_slot);
+                    } else {
+                        bytecode.append(&mut self.do_compile(index));
+                    }
                     bytecode.push_index();
                 }
             }
