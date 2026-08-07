@@ -626,7 +626,9 @@ fn is_cmp_op(i: Instruction) -> bool {
 }
 
 /// Ops whose result is a JMPF condition (cmp, logical, or bitwise mask).
-fn is_jmpf_cond_op(i: Instruction) -> bool {
+/// Condition opcodes that fuse into a `*Jmpf` superinstruction with a following
+/// `JumpIfFalse`. `opt::cfg` consults this to avoid inverting a fusable guard.
+pub(crate) fn is_jmpf_cond_op(i: Instruction) -> bool {
     is_cmp_op(i)
         || matches!(
             i,
