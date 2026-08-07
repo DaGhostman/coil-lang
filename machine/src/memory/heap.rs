@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::AddrHashBuilder;
+
 #[cfg(feature = "crypto")]
 use crate::crypto_hasher_state::ObjCryptoHasher;
 #[cfg(feature = "regex")]
@@ -19,11 +21,11 @@ pub struct Heap {
     strings: Table<()>,
     head: Option<Object>,
     /// O(1) lookup of live objects by address (updated on alloc/sweep).
-    addr_index: HashMap<u64, Object>,
+    addr_index: HashMap<u64, Object, AddrHashBuilder>,
     /// Immortal arity-0 enum singletons keyed by tag (never swept).
-    immortal_enums: HashMap<u32, Object>,
+    immortal_enums: HashMap<u32, Object, AddrHashBuilder>,
     /// Reused mark-set across collections (avoids alloc per GC).
-    gc_mark_set: HashSet<u64>,
+    gc_mark_set: HashSet<u64, AddrHashBuilder>,
     /// Reused gray worklist / root buffers across collections.
     gc_gray: Vec<Object>,
     gc_root_objects: Vec<Object>,
@@ -38,9 +40,9 @@ impl Default for Heap {
             gc_growth_factor: GC_GROWTH_FACTOR,
             strings: Table::default(),
             head: None,
-            addr_index: HashMap::new(),
-            immortal_enums: HashMap::new(),
-            gc_mark_set: HashSet::new(),
+            addr_index: HashMap::default(),
+            immortal_enums: HashMap::default(),
+            gc_mark_set: HashSet::default(),
             gc_gray: Vec::new(),
             gc_root_objects: Vec::new(),
             gc_roots: Vec::new(),
