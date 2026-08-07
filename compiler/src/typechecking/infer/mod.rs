@@ -185,6 +185,11 @@ pub struct Checker {
 
     next_id_idx: usize,
 
+    /// Native call-stack depth of [`infer`](Self::infer)'s recursion, guarded
+    /// against a fixed limit so a pathologically nested expression gets a
+    /// clean diagnostic instead of a stack overflow.
+    infer_depth: u32,
+
     /// Span-indexed inferred types for codegen ([`lookup_at`](Self::lookup_at)).
     cache: std::collections::HashMap<NodeId, Ty>,
 

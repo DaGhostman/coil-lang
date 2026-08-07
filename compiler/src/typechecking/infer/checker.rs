@@ -30,6 +30,16 @@ use crate::typechecking::virtual_modules::{
 
 use super::*;
 
+/// Max native recursion depth for [`Checker::infer`]. Chosen well under what
+/// a debug-build stack of a few MiB can hold even with `infer_inner`'s
+/// current per-call frame size — see docs/internals/limitations.md.
+const INFER_RECURSION_LIMIT: u32 = 2000;
+
+/// Private unwind payload for [`Checker::infer`]'s recursion-limit panic.
+/// Caught in [`Checker::check_program`]; never lets user input abort the
+/// process the way a genuine native stack overflow does.
+struct RecursionLimitExceeded;
+
 impl Checker {
     pub fn new() -> Self {
         let mut env = Env::new();
@@ -54,6 +64,7 @@ impl Checker {
             static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
             next_id_idx: 0,
+            infer_depth: 0,
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
@@ -1405,6 +1416,7 @@ impl Checker {
         // the per-program tables and caches get cleared.
         self.ids = IdTable::new();
         self.next_id_idx = 0;
+        self.infer_depth = 0;
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
@@ -1516,7 +1528,21 @@ impl Checker {
 
         // Top frame for natives/globals; left on stack after check_program.
         self.push_scope();
-        let ty = self.infer(ast);
+        let ty = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.infer(ast))) {
+            Ok(ty) => ty,
+            Err(payload) => {
+                // Only swallow our own recursion-limit signal (message
+                // already recorded in `infer`) — any other panic is a real
+                // bug and must keep crashing loudly.
+                if payload.downcast_ref::<RecursionLimitExceeded>().is_none() {
+                    std::panic::resume_unwind(payload);
+                }
+                // The AST wasn't fully walked: NodeId / exhaustiveness state
+                // is inconsistent, so skip the post-passes below and bail
+                // out with the error already on `self.messages`.
+                return Ty::Var(self.counter.fresh());
+            }
+        };
         // NOTE: the frame is intentionally NOT popped — see the
         // doc-comment above.
 
@@ -1936,6 +1962,19 @@ impl Checker {
     }
 
     fn infer(&mut self, expr: &Output) -> Ty {
+        self.infer_depth += 1;
+        if self.infer_depth > INFER_RECURSION_LIMIT {
+            let _ = self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "expression nested too deeply (over {INFER_RECURSION_LIMIT} levels) for the typechecker"
+                ),
+                expr.0.into_range(),
+                Some("split the expression into smaller named bindings".to_string()),
+            );
+            std::panic::panic_any(RecursionLimitExceeded);
+        }
+
         // Pull the next ID from the pre-walk's minting order. Both
         // `infer` and the pre-walk visit in pre-order, so the `n`-th
         // call here consumes the `n`-th ID.
@@ -1947,6 +1986,7 @@ impl Checker {
         self.codegen_types_by_span
             .entry((expr.0.start, expr.0.end))
             .or_insert_with(|| ty.clone());
+        self.infer_depth -= 1;
         ty
     }
 
