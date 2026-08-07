@@ -26,7 +26,11 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 
 ## IL optimizations (low)
 
-GVN has no SSA slot rename; effectful ops are barriers. Per-function `multi_op_join_convoy` can mis-sink on JMPF diamonds — whole-buffer pass required. Fuse-select intentionally conservative during JMP migration.
+GVN has no SSA slot rename; effectful ops are barriers. Its Dup-CSE is re-expanded to a second `LOAD` before lower (`expand_dup_after_load`) because `Dup` hides a binop's operands from fuse-select — keep that in mind before adding new Dup rewrites. Per-function `multi_op_join_convoy` can mis-sink on JMPF diamonds — whole-buffer pass required. Fuse-select intentionally conservative during JMP migration.
+
+**No general copy propagation.** There is no pass that forwards `<producer>; STORE t` into a later `LOAD t` and deletes the copy, because slot liveness cannot be approximated by slot index on this VM: locals and the operand stack share one buffer, `STORE` raises `tell` past the written slot precisely to protect locals, `pop` lowers it, and a `CALL` places the callee frame above `tell`. Deleting a store therefore lowers `tell` and can move a callee frame over slots that are still live — the same hazard `dce::mem_fwd` refuses on. Doing this properly needs real backward liveness over the shared stack, not an index-based use count. Codegen avoids emitting the redundant temps instead (see the indexed-write path in `emit_write_lvalue`); the remaining known case is a constant spilled across a `CALL`, e.g. `1 + f(x)` keeping `CONST 1; STORE t`.
+
+**`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`.
 
 ## Test / CI reliability (high–medium)
 
