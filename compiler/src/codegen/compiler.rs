@@ -4179,6 +4179,26 @@ impl Compiler {
             (Ty::Array { element: e1, .. }, Ty::Array { element: e2, .. }) => {
                 Self::bind_scheme_vars(e1, e2, map);
             }
+            // Rest params are typed as `Vec<T>` in schemes, while call sites
+            // synthesize `Ty::Array` for the packed MakeArray — cross-bind.
+            (Ty::App(head, args), Ty::Array { element, .. })
+                if args.len() == 1
+                    && matches!(
+                        head.as_ref(),
+                        Ty::Con(n) if n == common::BUILTIN_VEC_TYPE
+                    ) =>
+            {
+                Self::bind_scheme_vars(&args[0], element, map);
+            }
+            (Ty::Array { element, .. }, Ty::App(head, args))
+                if args.len() == 1
+                    && matches!(
+                        head.as_ref(),
+                        Ty::Con(n) if n == common::BUILTIN_VEC_TYPE
+                    ) =>
+            {
+                Self::bind_scheme_vars(element, &args[0], map);
+            }
             _ => {}
         }
     }
@@ -5888,7 +5908,7 @@ impl Compiler {
     /// Synthesize the packed rest-array type for a call's trailing args
     /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
     fn synthesize_rest_array_ty(&self, rest: &[Output<'_>]) -> crate::typechecking::Ty {
-        use crate::typechecking::ty::{array, array_fixed};
+        use crate::typechecking::ty::vec_app_ty;
         let mut elem: Option<crate::typechecking::Ty> = None;
         for arg in rest {
             if let Some(t) = self.codegen_expr_ty(arg) {
@@ -5902,11 +5922,9 @@ impl Compiler {
             }
         }
         let element = elem.unwrap_or_else(crate::typechecking::ty::int);
-        if rest.is_empty() {
-            array(element)
-        } else {
-            array_fixed(element, rest.len())
-        }
+        // Rest params are `Vec<T>` in schemes (`parse_arg_list`); match that
+        // shape so `emit_call_site_dicts` can bind constraint vars.
+        vec_app_ty(element)
     }
 
     /// Bind names from an irrefutable `let` pattern by reading from
