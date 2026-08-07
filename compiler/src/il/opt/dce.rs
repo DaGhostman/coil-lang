@@ -3,12 +3,41 @@
 use crate::il::op::IlOp;
 use common::Instruction;
 
+/// Side-effect-free single-value producer: dropping it with its `Pop` is a no-op.
+fn is_droppable_producer(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Load { .. }
+    )
+}
+
+/// Run [`stack_dce_once`] to a fixpoint: removing a pair can expose a new one
+/// (`Load a; Const c; Pop; Pop` → `Load a; Pop` → empty).
 pub(super) fn stack_dce(ops: &mut Vec<IlOp>) {
+    loop {
+        let before = ops.len();
+        stack_dce_once(ops);
+        if ops.len() == before {
+            return;
+        }
+    }
+}
+
+fn stack_dce_once(ops: &mut Vec<IlOp>) {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
     while i < ops.len() {
         if i + 1 < ops.len()
             && matches!(&ops[i], IlOp::Dup { .. })
+            && matches!(&ops[i + 1], IlOp::Pop { .. })
+        {
+            i += 2;
+            continue;
+        }
+        // Pure producer discarded immediately (statement-position literals,
+        // inlined unit returns like `Vec::push`'s `CONST 0`).
+        if i + 1 < ops.len()
+            && is_droppable_producer(&ops[i])
             && matches!(&ops[i + 1], IlOp::Pop { .. })
         {
             i += 2;

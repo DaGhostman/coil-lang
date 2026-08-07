@@ -2994,3 +2994,48 @@
         assert_eq!(adds_after, adds_before);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::BinReturn { .. })));
     }
+
+    /// Opcode names for assertion messages (`IlOp` has no `Debug`).
+    fn insn_names(ops: &[IlOp]) -> Vec<String> {
+        ops.iter()
+            .map(|op| match op.instruction() {
+                Some(i) => format!("{i:?}"),
+                None => "<label/meta>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stack_dce_drops_dead_const_pop() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc },
+            IlOp::Pop { loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Const { .. })),
+            "statement-position CONST;POP should be removed; got {names:?}"
+        );
+        assert_eq!(ops.len(), 2, "only LOAD;RETURN should remain; got {names:?}");
+    }
+
+    #[test]
+    fn stack_dce_iterates_to_fixpoint() {
+        // `Load; Const; Pop; Pop`: removing the inner pair exposes `Load; Pop`.
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc },
+            IlOp::Const { imm: 7, loc },
+            IlOp::Pop { loc },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert_eq!(ops.len(), 1, "both pairs should be removed; got {names:?}");
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }

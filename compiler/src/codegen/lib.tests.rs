@@ -839,7 +839,8 @@ use string::{format, to_bytes};
     #[test]
     fn string_addition_emits_format_not_add() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("\"a\" + \"b\";");
+        // Returned, not a bare statement: stack DCE drops a discarded literal.
+        let (bc, _pool) = compile_src("fn cat() -> string { return \"a\" + \"b\"; } fn main() { }");
 
         let folded_string = bc
             .iter()
@@ -3433,13 +3434,19 @@ let _ = take(a); \
             "escaping stack-array local into take(a) must MakeArray; ops={:?}",
             main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
-        let loads = main_bc
+        let loads: Vec<_> = main_bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::LOAD))
-            .count();
+            .collect();
         assert!(
-            loads >= 3,
-            "expected multi-slot LOADs for escape/index; got {loads}; ops={:?}",
+            loads.len() >= 2,
+            "expected LOADs for escape/index; got {}; ops={:?}",
+            loads.len(),
+            main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            loads.iter().any(|b| b.load_store_single_slot().is_none()),
+            "escape push of a[0..3] should fuse into a packed multi-slot LOAD; ops={:?}",
             main_bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         // Init is forward CONST;STORE per element — only escape MakeArray.
@@ -5592,3 +5599,4 @@ fn main() {
             "expected while-exit BinSlotSlotJmpf targeting past back-edge JMP {back}"
         );
     }
+
