@@ -10,6 +10,9 @@ env:
   CARGO_TERM_COLOR: always
   CI: "true"
 
+# Prefer `--lib --tests --bins` over `--all-targets`: Criterion benches under
+# `[[bench]]` treat argv after `--` as their own CLI and abort the suite.
+
 jobs:
   test:
     name: test (${{ matrix.os }}, ${{ matrix.features.id }})
@@ -18,41 +21,46 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # Default feature stack on every OS.
         features:
           - id: default
             flags: ""
-        # Optional / tooling gates on Linux only so the failing job name
-        # identifies which feature broke without doubling macOS cost.
+            mode: test
         include:
           - os: ubuntu-latest
             features:
               id: no-default
               flags: "--no-default-features"
+              mode: check
           - os: ubuntu-latest
             features:
               id: crypto
               flags: "--no-default-features --features crypto"
+              mode: check
           - os: ubuntu-latest
             features:
               id: time
               flags: "--no-default-features --features time"
+              mode: check
           - os: ubuntu-latest
             features:
               id: regex
               flags: "--no-default-features --features regex"
+              mode: check
           - os: ubuntu-latest
             features:
               id: tls
               flags: "--no-default-features --features tls"
+              mode: check
           - os: ubuntu-latest
             features:
               id: dissect
               flags: "--features dissect"
+              mode: test
           - os: ubuntu-latest
             features:
               id: debugger
               flags: "--features debugger"
+              mode: test
     steps:
       - uses: actions/checkout@v4
 
@@ -80,13 +88,18 @@ jobs:
         if: matrix.features.id == 'default'
         run: cargo build
 
+      - name: Workspace check (${{ matrix.features.id }})
+        if: matrix.features.mode == 'check'
+        run: |
+          cargo check --workspace --lib --tests --bins ${{ matrix.features.flags }}
+
       - name: Workspace tests (${{ matrix.features.id }})
+        if: matrix.features.mode == 'test'
         run: |
           # macOS runners occasionally hit EAGAIN (WouldBlock) while cargo
           # lists many test binaries in parallel; one retry clears it.
-          # --all-targets covers lib + bins + integration tests + examples.
-          cargo test --workspace --all-targets ${{ matrix.features.flags }} \
-            || cargo test --workspace --all-targets ${{ matrix.features.flags }}
+          cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }} \
+            || cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }}
 
       - name: Language harness (`coil test`)
         if: matrix.features.id == 'default'

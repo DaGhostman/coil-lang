@@ -1,5 +1,5 @@
 ---
-description: Always run Rust tests with --workspace --all-targets (and feature matrix when relevant)
+description: Always run Rust tests with --workspace --lib --tests --bins (and feature matrix when relevant)
 alwaysApply: true
 ---
 
@@ -10,29 +10,26 @@ When verifying Rust changes (compiler, VM, parser, CLI, or CI), **do not** run b
 ## Required local / agent commands
 
 ```bash
-cargo test --workspace --all-targets
+cargo test --workspace --lib --tests --bins
 ```
 
 Retry once on transient macOS/EAGAIN listing failures (same as CI).
 
-`--all-targets` is required: integration tests under `*/tests/` (e.g. `compiler/tests/diagnostics.rs`, `perf_metrics.rs`) and bins/examples are **not** covered by lib-only or default-member `cargo test`.
+Prefer `--lib --tests --bins` over `--all-targets`: Criterion `[[bench]]` targets treat argv after `--` as their own CLI and abort the suite. Integration tests under `*/tests/` (e.g. `compiler/tests/diagnostics.rs`, `pipeline.rs`, `perf_metrics.rs`) are covered by `--tests`.
 
 ## Feature-gated suites
 
-Optional crate features must be exercised when touching gated code or when catching CI-shaped failures:
-
-| Feature | Typical flag | Notes |
-|---------|--------------|--------|
-| default stack | _(none)_ | `crypto` + `time` + `regex` + `tls` |
-| `crypto` / `time` / `regex` / `tls` | `--no-default-features --features <name>` | isolate which optional dep broke |
-| `dissect` | `--features dissect` | compiler dissect + its integration tests |
-| `debugger` | `--features debugger` | machine debugger paths |
-
-Example isolation run:
+| Feature | Command | Notes |
+|---------|---------|--------|
+| default stack | `cargo test --workspace --lib --tests --bins` | full suite |
+| `crypto` / `time` / `regex` / `tls` | `cargo check --workspace --lib --tests --bins --no-default-features --features <name>` | compile-gate only |
+| `no-default` | `cargo check --workspace --lib --tests --bins --no-default-features` | bare build |
+| `dissect` | `cargo test --workspace --lib --tests --bins --features dissect` | dissect integration |
+| `debugger` | `cargo test --workspace --lib --tests --bins --features debugger` | debugger paths |
 
 ```bash
-cargo test --workspace --all-targets --no-default-features --features tls
-cargo test --workspace --all-targets --features dissect
+cargo check --workspace --lib --tests --bins --no-default-features --features tls
+cargo test --workspace --lib --tests --bins --features dissect
 ```
 
 ## Related gates
