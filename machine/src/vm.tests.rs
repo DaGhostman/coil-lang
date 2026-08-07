@@ -322,6 +322,23 @@
         assert_eq!(after, after_more, "arity-0 MakeEnum must not re-allocate");
     }
 
+    /// Distinct tags must not share a singleton — the map is keyed by tag.
+    #[test]
+    fn arity0_make_enum_distinct_tags_are_distinct_singletons() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            make_enum(1, 0),
+            make_enum(2, 0),
+            make_enum(1, 0),
+            Byte::new(Instruction::HALT),
+        ]);
+        let again_tag1 = vm.pop().raw() as u64;
+        let tag2 = vm.pop().raw() as u64;
+        let tag1 = vm.pop().raw() as u64;
+        assert_eq!(tag1, again_tag1);
+        assert_ne!(tag1, tag2, "different tags must not alias");
+    }
+
     #[test]
     fn make_enum_with_payload_populates_payload() {
         let mut vm = Machine::<4>::default();
@@ -576,6 +593,80 @@
             0,
         );
         assert_eq!(vm.pop().as_float(), 3.5);
+    }
+
+    /// Fused `PowF` used to fall through to `Value::default()` (0.0) because
+    /// fuse-select admitted it via `is_bin_op` without a handler arm.
+    #[test]
+    fn bin_slot_slot_powf_computes_float_power() {
+        let pool = [2.0f64.to_bits(), 10.0f64.to_bits()];
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG),
+                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+                    Instruction::PowF as u8,
+                    0,
+                    1,
+                ),
+                Byte::new(Instruction::HALT),
+            ],
+            &pool,
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_float(), 1024.0);
+    }
+
+    /// `BinSlotSlotStore` float `PowF` is the store-into-dest fuse of the same
+    /// bug — must write `2.0 ** 3.0` into slot 2, not leave a zero default.
+    #[test]
+    fn bin_slot_slot_store_powf_writes_dest() {
+        let pool = [2.0f64.to_bits(), 3.0f64.to_bits()];
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+                    Instruction::PowF as u8,
+                    0,
+                    1,
+                    2,
+                ),
+                load(2),
+                Byte::new(Instruction::RETURN),
+            ],
+            &pool,
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_float(), 8.0);
+    }
+
+    /// `BinReturn` + `PowF` is the third fused path that silently returned 0.0.
+    #[test]
+    fn bin_return_powf_returns_float_power() {
+        let pool = [2.0f64.to_bits(), 4.0f64.to_bits()];
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                load(0),
+                load(1),
+                Byte::new(Instruction::BinReturn).with_bin_return(Instruction::PowF as u8),
+            ],
+            &pool,
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_float(), 16.0);
     }
 
     #[test]
