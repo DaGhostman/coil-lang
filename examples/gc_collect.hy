@@ -6,8 +6,8 @@ use string::{to_bytes};
 fn ephemeral_weak() {
     let r = root([1, 2, 3]);
     let w = weak(get(r));
-    let dropped = unroot(r);
-    dropped = [];
+    // Drop the strong root without retaining the payload locally.
+    unroot(r);
     return w;
 }
 

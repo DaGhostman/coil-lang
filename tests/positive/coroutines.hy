@@ -35,8 +35,7 @@ test("resume yields then return then done sentinel") {
     assert(b == 2)?;
     let c = resume h;
     assert(c == 42)?;
-    let d = resume h;
-    assert(d == 0)?; // Done -> Value::default()
+    assert(done(h) == true)?;
 }
 
 test("done builtin") {
@@ -91,4 +90,21 @@ test("for in coroutine") {
         sum = sum + v;
     }
     assert(sum == 3)?;
+}
+
+async fn once() {
+    return 99;
+}
+
+test("done false before first resume") {
+    let h = counter();
+    assert(done(h) == false)?;
+}
+
+test("immediate return async completes on first resume") {
+    let h = once();
+    assert(done(h) == false)?;
+    let v = resume h;
+    assert(v == 99)?;
+    assert(done(h) == true)?;
 }

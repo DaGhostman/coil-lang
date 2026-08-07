@@ -508,6 +508,67 @@ impl<const S: usize> Machine<S> {
         Some(format!("{}:{}:{}", path, pos.line, pos.column))
     }
 
+    fn fn_symbol_at_ip(&self, ip: usize) -> Option<&str> {
+        let syms = &self.program_debug.fn_symbols;
+        if syms.is_empty() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = syms.len();
+        let mut best = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if syms[mid].entry_pc as usize <= ip {
+                best = Some(mid);
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        best.map(|i| syms[i].name.as_str())
+    }
+
+    fn format_panic_backtrace(&self, panic_insn_ip: usize) -> String {
+        let mut lines = Vec::new();
+        if let Some(loc) = self.format_panic_location(panic_insn_ip) {
+            lines.push(format!("  at {loc}"));
+        }
+        for frame_idx in (0..self.frames.len()).rev() {
+            let ip = self.frames[frame_idx].tell();
+            let name = self.fn_symbol_at_ip(ip).unwrap_or("<unknown>");
+            if let Some(loc) = self.format_panic_location(ip) {
+                lines.push(format!("  in {name} at {loc}"));
+            } else {
+                lines.push(format!("  in {name}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Abort execution with a VM panic (same path as `Instruction::Panic`).
+    fn runtime_panic(&mut self, message: &str, panic_insn_ip: usize) -> bool {
+        let loc_suffix = self
+            .format_panic_location(panic_insn_ip)
+            .map(|loc| format!(" at {loc}"))
+            .unwrap_or_default();
+        let backtrace = self.format_panic_backtrace(panic_insn_ip);
+        if let Some(out) = self.output.as_mut() {
+            let _ = write!(out, "panic: {message}{loc_suffix}");
+            if !backtrace.is_empty() {
+                let _ = write!(out, "\n{backtrace}");
+            }
+            let _ = out.flush();
+        } else {
+            eprint!("panic: {message}{loc_suffix}");
+            if !backtrace.is_empty() {
+                eprintln!("{backtrace}");
+            }
+            let _ = io::stderr().flush();
+        }
+        self.panicked = true;
+        false
+    }
+
     pub fn with_ffi_paths(mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) -> Self {
         self.base_dir = base_dir;
         self.ffi_search_paths = search_paths;
@@ -688,15 +749,7 @@ impl<const S: usize> Machine<S> {
         for obj in heap.into_iter() {
             if let Object::Coroutine(gc) = obj {
                 roots.push(gc.as_ptr() as u64);
-                for v in &gc.as_ref().saved_stack {
-                    let addr = v.raw() as u64;
-                    if addr != 0 && heap.find_object_by_addr(addr).is_some() {
-                        roots.push(addr);
-                    }
-                }
-                if let Some(delegate) = &gc.as_ref().yield_from {
-                    roots.push(delegate.as_ptr() as u64);
-                }
+                Self::root_coroutine_saved_stack(heap, gc.as_ref(), &mut roots);
             }
         }
 
@@ -751,6 +804,36 @@ impl<const S: usize> Machine<S> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn saved_stack_live_mask(heap: &Heap, values: &[Value]) -> u64 {
+        let mut mask = 0u64;
+        for (i, v) in values.iter().enumerate() {
+            if i >= 64 {
+                break;
+            }
+            let addr = v.raw() as u64;
+            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    }
+
+    fn root_coroutine_saved_stack(heap: &Heap, coro: &ObjCoroutine, roots: &mut Vec<u64>) {
+        let mask = coro.saved_live_mask;
+        for (i, v) in coro.saved_stack.iter().enumerate() {
+            if mask != 0 && i < 64 && mask & (1u64 << i) == 0 {
+                continue;
+            }
+            let addr = v.raw() as u64;
+            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+                roots.push(addr);
+            }
+        }
+        if let Some(delegate) = &coro.yield_from {
+            roots.push(delegate.as_ptr() as u64);
         }
     }
 
@@ -1036,8 +1119,10 @@ impl<const S: usize> Machine<S> {
             saved_frames.last_mut().unwrap().0 = ip;
         }
 
+        let live_mask = Self::saved_stack_live_mask(&self.heap, &segment);
         self.with_coroutine_mut(coro_gc.as_ptr() as u64, |coro| {
             coro.saved_stack = segment;
+            coro.saved_live_mask = live_mask;
             coro.saved_frames = saved_frames;
             coro.resume_ip = ip;
             coro.state = CoroState::Suspended;
@@ -1057,6 +1142,12 @@ impl<const S: usize> Machine<S> {
             let old_wait = {
                 let mut taken = None;
                 self.with_coroutine_mut(coro_ptr, |coro| {
+                    // Outer coroutines suspended via `yield from` stay on
+                    // `resume_stack` while main runs; host RETURN must not
+                    // treat that as coroutine completion.
+                    if coro.yield_from.is_some() {
+                        return;
+                    }
                     taken = coro.io_wait.take();
                     coro.state = CoroState::Done;
                     coro.saved_stack.clear();
@@ -1208,6 +1299,9 @@ impl<const S: usize> Machine<S> {
         let caller = self.frames.get_mut();
         *ip = caller.tell();
         *sp = caller.get();
+        // Mirror `yield_coroutine`: delegating coroutine is not active while
+        // main runs between resumes.
+        self.resume_stack.pop();
     }
 
     fn yield_coroutine(&mut self, ip: &mut usize, sp: &mut usize, yield_val: Value) {
@@ -1248,8 +1342,10 @@ impl<const S: usize> Machine<S> {
             saved_frames.last_mut().unwrap().0 = *ip;
         }
 
+        let live_mask = Self::saved_stack_live_mask(&self.heap, &segment);
         self.with_coroutine_mut(coro_gc.as_ptr() as u64, |coro| {
             coro.saved_stack = segment;
+            coro.saved_live_mask = live_mask;
             coro.saved_frames = saved_frames;
             coro.resume_ip = *ip;
             coro.state = CoroState::Suspended;
@@ -1365,6 +1461,14 @@ impl<const S: usize> Machine<S> {
         // which looks like "recv never blocks" and "nothing after recv runs".
         // Only joins *this* Machine's registry (not a process-global list).
         crate::thread::join_undetached_threads(&self.live_threads);
+        // Reactor pool threads hold their own `Arc<Reactor>` clone and poll
+        // forever unless told to stop — otherwise every program that spawns
+        // a coil thread leaks `worker_cap` OS threads for the rest of the
+        // process. Skip if a detached job is still in flight (rare) rather
+        // than abandon queued work; that reactor just leaks as before.
+        if self.reactor.inflight() == 0 {
+            self.reactor.shutdown();
+        }
     }
 
     fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
@@ -1580,7 +1684,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinSlotSlotStore as u8);
+            promise!(*bc as u8 <= Instruction::Seek as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1622,6 +1726,13 @@ impl<const S: usize> Machine<S> {
                     if self.stack.tell() < need {
                         self.stack.seek(need);
                     }
+                }
+                Instruction::Seek => {
+                    // Frame-relative cursor: operands[31:0] = slot offset from `sp`.
+                    let slot = opcode.operand_u32() as usize;
+                    let abs = sp + slot;
+                    promise!(abs <= stack_cap);
+                    self.stack.seek(abs);
                 }
                 Instruction::LOAD => {
                     let count = opcode.load_store_count();
@@ -2986,10 +3097,12 @@ impl<const S: usize> Machine<S> {
                     }
                     values.reverse();
 
+                    let live_mask = Self::saved_stack_live_mask(&self.heap, &values);
                     let obj_coro = ObjCoroutine {
                         state: CoroState::Suspended,
                         resume_ip: target,
                         saved_stack: values,
+                        saved_live_mask: live_mask,
                         saved_frames: vec![(target, 0)],
                         pending_send: Value::from(0_i64),
                         yield_from: None,
@@ -3026,16 +3139,10 @@ impl<const S: usize> Machine<S> {
                             Self::find_object_by_addr(&self.heap, addr)
                         {
                             if gc.as_ref().state == CoroState::Done {
-                                // Resuming an already-Done coroutine always
-                                // yields the sentinel `Value::default()`
-                                // (never the coroutine's last `return`
-                                // value). There is no error-handling
-                                // machinery yet to signal "resumed after
-                                // completion", so this keeps the behavior
-                                // well-defined rather than leaking a stale
-                                // value; a real error/Result protocol is
-                                // deferred to a later phase.
-                                self.stack.push(Value::default());
+                                return self.runtime_panic(
+                                    "resumed after completion",
+                                    ip.saturating_sub(1),
+                                );
                             } else if let Some(sub) = gc.as_ref().yield_from {
                                 self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
                                     c.pending_send = send_val;
@@ -3045,10 +3152,10 @@ impl<const S: usize> Machine<S> {
                                 self.resume_coroutine(&mut ip, &mut sp, gc, send_val, code, true);
                             }
                         } else {
-                            // Handle didn't resolve to a live coroutine
-                            // object (e.g. already freed) — same
-                            // well-defined sentinel as the Done case.
-                            self.stack.push(Value::default());
+                            return self.runtime_panic(
+                                "resumed invalid coroutine handle",
+                                ip.saturating_sub(1),
+                            );
                         }
                     }
                 }
@@ -3134,7 +3241,7 @@ impl<const S: usize> Machine<S> {
                         {
                             let mut old_i = 0usize;
                             for slot in 0..arity {
-                                if filled_mask & (1u32 << slot) != 0 {
+                                if filled_mask & (1u64 << slot) != 0 {
                                     if old_i < base.captured_args.len() {
                                         slot_vals[slot] = Some(base.captured_args[old_i]);
                                         old_i += 1;
@@ -3144,20 +3251,20 @@ impl<const S: usize> Machine<S> {
                         }
                         let mut arg_i = 0usize;
                         for slot in 0..arity {
-                            if filled_mask & (1u32 << slot) != 0 {
+                            if filled_mask & (1u64 << slot) != 0 {
                                 continue;
                             }
                             if arg_i >= new_args.len() {
                                 break;
                             }
                             slot_vals[slot] = Some(new_args[arg_i]);
-                            filled_mask |= 1u32 << slot;
+                            filled_mask |= 1u64 << slot;
                             arg_i += 1;
                         }
 
                         let mut captured_args: Vec<Value> = Vec::with_capacity(arity);
                         for slot in 0..arity {
-                            if filled_mask & (1u32 << slot) != 0 {
+                            if filled_mask & (1u64 << slot) != 0 {
                                 if let Some(v) = slot_vals[slot] {
                                     captured_args.push(v);
                                 }
@@ -3324,7 +3431,7 @@ impl<const S: usize> Machine<S> {
                     let is_rest = (op & (1 << 24)) != 0;
 
                     let entry = self.stack.pop().as_int() as u32;
-                    let filled_mask = self.stack.pop().as_int() as u32;
+                    let filled_mask = self.stack.pop().as_int() as u64;
 
                     let mut filled_vals = Vec::with_capacity(n_filled);
                     for _ in 0..n_filled {

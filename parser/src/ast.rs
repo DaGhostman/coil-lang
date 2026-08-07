@@ -575,7 +575,7 @@ pub struct RecordFieldValue<'expr> {
 #[derive(Clone, PartialEq, Debug)]
 pub struct PatternField<'expr> {
     pub name: &'expr str,
-    pub pattern: Pattern<'expr>,
+    pub pattern: (SimpleSpan, Pattern<'expr>),
 }
 
 /// Payload shape for a qualified constructor application.
@@ -592,7 +592,7 @@ pub enum EnumConstructPayload<'expr> {
 /// One arm inside a `match` expression.
 #[derive(Clone, PartialEq, Debug)]
 pub struct MatchArm<'expr> {
-    pub pattern: Pattern<'expr>,
+    pub pattern: (SimpleSpan, Pattern<'expr>),
     pub body: Output<'expr>,
 }
 
@@ -635,11 +635,18 @@ pub enum PatternPayload<'expr> {
     /// `Foo` (no sub-patterns — bare qualified enum pattern).
     Unit,
     /// `Foo(p1, p2, ...)`.
-    Tuple(Vec<Pattern<'expr>>),
+    Tuple(Vec<(SimpleSpan, Pattern<'expr>)>),
     /// `Foo { name (shorthand) or name: pattern, ... }`.
     /// Shorthand `x` desugars at parse time to
     /// `PatternField { name: "x", pattern: Binding("x") }`.
     Record(Vec<PatternField<'expr>>),
+}
+
+pub type PatternOutput<'expr> = (SimpleSpan, Pattern<'expr>);
+
+/// Synthetic match patterns (attribute expansion, etc.) with a dummy span.
+pub fn spanned_pattern<'expr>(pattern: Pattern<'expr>) -> PatternOutput<'expr> {
+    (SimpleSpan::from(0..0), pattern)
 }
 
 fn fmt_attrs(attrs: &[Attribute<'_>]) -> String {
@@ -821,7 +828,7 @@ impl<'a> Display for Pattern<'a> {
                                 "({})",
                                 parts
                                     .iter()
-                                    .map(|p| p.to_string())
+                                    .map(|p| p.1.to_string())
                                     .collect::<Vec<String>>()
                                     .join(", ")
                             )?;
@@ -831,10 +838,10 @@ impl<'a> Display for Pattern<'a> {
                     PatternPayload::Record(fields) => {
                         let parts: Vec<String> = fields
                             .iter()
-                            .map(|pf| match &pf.pattern {
+                            .map(|pf| match &pf.pattern.1 {
                                 // Shorthand `x`: render as just `x`.
                                 Pattern::Binding { name } if *name == pf.name => name.to_string(),
-                                _ => format!("{}: {}", pf.name, pf.pattern),
+                                _ => format!("{}: {}", pf.name, pf.pattern.1),
                             })
                             .collect();
                         write!(f, "{{ {} }}", parts.join(", "))
@@ -1277,7 +1284,7 @@ impl<'a> Display for Expression<'a> {
                 let as_str = arms
                     .iter()
                     .map(|a| {
-                        let pat = a.pattern.to_string();
+                        let pat = a.pattern.1.to_string();
                         let body = a.body.1.to_string();
                         format!("{} => {}", pat, body)
                     })

@@ -37,6 +37,7 @@ fn compile_program_archive_bytes(
         bytecode,
         source_files,
         debug_locs,
+        fn_symbols: Vec::new(),
     };
     rkyv::to_bytes::<Error>(&program)
         .map(|b| b.as_slice().to_vec())
@@ -201,6 +202,7 @@ mod tests {
             bytecode: vec![Byte::new(Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         let bytes = rkyv::to_bytes::<Error>(&too_new).unwrap();
         assert!(matches!(
@@ -217,6 +219,7 @@ mod tests {
             bytecode: vec![Byte::new(Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         let bytes = rkyv::to_bytes::<Error>(&other_minor).unwrap();
         assert!(matches!(

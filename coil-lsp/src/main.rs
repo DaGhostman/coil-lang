@@ -4,7 +4,8 @@
 use std::{collections::HashMap, ops::Range, path::PathBuf};
 
 use compiler::{
-    BuiltinExport, Checker, Pipeline, SymbolIndex, SymbolKind, VirtualModules, format_ty_for_diag,
+    BuiltinExport, Checker, Pipeline, ProjectIndex, SymbolIndex, SymbolKind, VirtualModules,
+    format_ty_for_diag,
 };
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -46,6 +47,8 @@ struct GoodAnalysis {
 #[derive(Default)]
 struct ServerState {
     documents: HashMap<Uri, Document>,
+    project_index: Option<ProjectIndex>,
+    workspace_root: Option<PathBuf>,
 }
 
 fn main() {
@@ -117,6 +120,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     connection.initialize_finish(request_id, serde_json::to_value(result)?)?;
 
     let mut state = ServerState::default();
+    let workspace_root = _params
+        .root_uri
+        .as_ref()
+        .and_then(uri_path)
+        .or_else(|| {
+            _params
+                .workspace_folders
+                .as_ref()
+                .and_then(|folders| folders.first())
+                .and_then(|folder| uri_path(&folder.uri))
+        });
+    if let Some(root_uri) = workspace_root {
+        state.workspace_root = Some(root_uri.clone());
+        let mut index = ProjectIndex::new(root_uri);
+        index.index_from_manifest();
+        state.project_index = Some(index);
+    }
     for message in &connection.receiver {
         match message {
             Message::Request(request) => {
@@ -391,7 +411,30 @@ fn handle_request(
                         params.text_document_position_params.position,
                     )?;
                     let range = word_range(&document.text, offset)?;
-                    let name = document.text[range].to_owned();
+                    let name = document.text[range.clone()].to_owned();
+                    let file_path = uri_path(
+                        &params.text_document_position_params.text_document.uri,
+                    )?;
+                    let ref_range = range;
+
+                    if let Some(index) = &state.project_index {
+                        let defs = index.resolve_definition(&file_path, ref_range, &name);
+                        if !defs.is_empty() {
+                            return Some(
+                                defs.into_iter()
+                                    .filter_map(|(path, name_range)| {
+                                        state.documents.iter().find(|(uri, _)| {
+                                            uri_path(uri).as_deref() == Some(path.as_path())
+                                        }).map(|(uri, doc)| Location {
+                                            uri: uri.clone(),
+                                            range: byte_range(&doc.text, &name_range),
+                                        })
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+
                     let mut locations = Vec::new();
                     for (document_uri, open_document) in &state.documents {
                         let index = SymbolIndex::from_source(

@@ -5,13 +5,57 @@ use parser::Pratt;
 
 /// Parse `src`, run the HM checker, and return both the root type and
 /// the accumulated messages.
+///
+/// Bare expression statements (`42;`) check as `unit`. Single-line bare
+/// expressions are wrapped in a probe function so golden tests observe the
+/// expression value type (matching the checker unit-test harness).
 fn check(src: &str) -> (String, Vec<String>) {
-    let ast = Pratt::default().parse(src).expect("parse failed");
+    let trimmed = src.trim();
+    let probe = bare_expr_probe_src(trimmed);
+    let parse_src = probe.as_deref().unwrap_or(trimmed);
+    let ast = Pratt::default().parse(parse_src).expect("parse failed");
     let mut c = Checker::new();
     let ty = c.check_program(&ast);
     let msgs = c.take_messages();
     let msg_strings = msgs.iter().map(|m| m.message().to_string()).collect();
-    (format!("{}", ty), msg_strings)
+    let ty_str = if probe.is_some() {
+        c.env()
+            .lookup("__coil_diag_probe__")
+            .map(|scheme| peel_fn_ret_display(scheme))
+            .unwrap_or_else(|| format!("{ty}"))
+    } else {
+        format!("{ty}")
+    };
+    (ty_str, msg_strings)
+}
+
+fn bare_expr_probe_src(trimmed: &str) -> Option<String> {
+    if trimmed.contains('\n') || trimmed.starts_with('{') {
+        return None;
+    }
+    let expr = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    if expr.is_empty() {
+        return None;
+    }
+    const STMT_PREFIXES: &[&str] = &[
+        "let ", "use ", "class ", "enum ", "trait ", "impl ", "test(", "fn ", "if ", "while ",
+        "for ", "return ", "async ", "match ", "defer ",
+    ];
+    if STMT_PREFIXES.iter().any(|p| expr.starts_with(p)) {
+        return None;
+    }
+    Some(format!("fn __coil_diag_probe__() {{ return {expr}; }}"))
+}
+
+fn peel_fn_ret_display(scheme: &impl std::fmt::Display) -> String {
+    let s = format!("{scheme}");
+    // Scheme/Fun display is typically `(...) -> T` or nested arrows; take the
+    // final return type after the last `->`.
+    s.rsplit("->")
+        .next()
+        .map(str::trim)
+        .unwrap_or(&s)
+        .to_string()
 }
 
 fn check_messages(src: &str) -> Vec<Message> {
@@ -1469,10 +1513,10 @@ fn main() {}
 fn spread_dynamic_array_reports_diagnostic() {
     let msgs = check_messages(
         r#"
+fn rows() -> [int] { return [1, 2, 3]; }
 fn f(int x) -> int { return x; }
 fn main() {
-    let a: [int] = [1, 2, 3];
-    f(...a);
+    f(...rows());
 }
 "#,
     );

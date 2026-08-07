@@ -49,6 +49,11 @@ pub enum ErrorCode {
     UnreachableCode,
     /// `defer` that cannot run on function exit (dominated by / inside infinite loop).
     DeferNeverRuns,
+    /// A single expression is nested deep enough to risk overflowing the
+    /// compiler's own native stack (typecheck or codegen recursion) — not to
+    /// be confused with [`Self::UnboundedRecursion`], which is about the
+    /// *compiled program's* runtime call stack.
+    ExpressionNestingTooDeep,
 
     // --- Enums / match / constructs (E02xx) ---
     DuplicateEnum,
@@ -121,6 +126,7 @@ impl ErrorCode {
             Self::WildcardImport => "E0124",
             Self::UnreachableCode => "E0118",
             Self::DeferNeverRuns => "E0123",
+            Self::ExpressionNestingTooDeep => "E0125",
             Self::DuplicateEnum => "E0200",
             Self::DuplicateConstructor => "E0201",
             Self::UnknownEnum => "E0202",
@@ -187,6 +193,7 @@ impl ErrorCode {
             Self::WildcardImport => "wildcard import is not allowed",
             Self::UnreachableCode => "unreachable code",
             Self::DeferNeverRuns => "defer will never run on function exit",
+            Self::ExpressionNestingTooDeep => "expression nested too deeply for the compiler",
             Self::DuplicateEnum => "duplicate enum",
             Self::DuplicateConstructor => "duplicate constructor",
             Self::UnknownEnum => "unknown enum",
@@ -261,6 +268,7 @@ mod tests {
             | WildcardImport
             | UnreachableCode
             | DeferNeverRuns
+            | ExpressionNestingTooDeep
             | DuplicateEnum
             | DuplicateConstructor
             | UnknownEnum
@@ -317,6 +325,7 @@ mod tests {
             AmbiguousOverload,
             UnreachableCode,
             DeferNeverRuns,
+            ExpressionNestingTooDeep,
             DuplicateEnum,
             DuplicateConstructor,
             UnknownEnum,

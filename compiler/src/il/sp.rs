@@ -127,6 +127,8 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
                 Some(-1)
             }
         }
+        // Absolute cursor set — fail-closed for relative SP analysis.
+        Instruction::Seek => None,
         Instruction::ADD
         | Instruction::SUB
         | Instruction::MUL

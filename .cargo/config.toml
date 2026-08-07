@@ -1,0 +1,14 @@
+# infer_inner and do_compile used to be single giant functions with a few
+# oversized inline match arms; Rust sizes a function's stack frame for the
+# union of every arm's locals, so a moderately deep AST (attr-decorator
+# inlining, coroutine desugaring) could overflow a too-small thread stack. A
+# large-frame overflow can jump past the guard page into an adjacent
+# thread's stack or the heap instead of faulting cleanly, which showed up as
+# sporadic SIGSEGV / "corrupted double-linked list" / stack-smashing aborts
+# in unrelated tests. Both functions have since had their largest arms
+# extracted into their own methods, cutting the worst-case requirement from
+# ~2 MiB to ~1 MiB; match the OS default main-thread stack (`ulimit -s`, 8
+# MiB on Linux/macOS) as headroom rather than a load-bearing requirement.
+# See docs/internals/limitations.md ("Test / CI reliability").
+[env]
+RUST_MIN_STACK = "8388608"

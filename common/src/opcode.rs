@@ -260,6 +260,13 @@ pub enum Instruction {
     /// `BinSlotSlot; STORE dest` — no pool.
     /// Operands: [31:24] op, [23:16] a, [15:8] b, [7:0] dest.
     BinSlotSlotStore,
+
+    /// Seek: set shared operand/local cursor to `sp + operands[31:0]`.
+    ///
+    /// Used before `JumpIfMatch` so payloads land at the compile-time
+    /// `payload_base` even when prior `STORE`s raised the high-water mark
+    /// (shared stack/locals; see match-in-loop bindings).
+    Seek,
 }
 
 impl From<u8> for Instruction {
@@ -394,6 +401,7 @@ impl Instruction {
             Self::BinSlotSlotJmpf => "BinSlotSlotJmpf",
             Self::BinSlotImmStore => "BinSlotImmStore",
             Self::BinSlotSlotStore => "BinSlotSlotStore",
+            Self::Seek => "Seek",
         }
     }
 }
@@ -1141,7 +1149,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::BinSlotSlotStore as u8;
+        let last = Instruction::Seek as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1149,6 +1157,7 @@ mod tests {
     #[test]
     fn mnemonic_covers_first_and_last_variants() {
         assert_eq!(Instruction::HALT.mnemonic(), "HALT");
+        assert_eq!(Instruction::Seek.mnemonic(), "Seek");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");

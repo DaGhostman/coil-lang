@@ -1,0 +1,38 @@
+---
+description: Always run Rust tests with --workspace --lib --tests --bins (and feature matrix when relevant)
+alwaysApply: true
+---
+
+# Cargo test gate
+
+When verifying Rust changes (compiler, VM, parser, CLI, or CI), **do not** run bare `cargo test` or package-only suites as the sole check.
+
+## Required local / agent commands
+
+```bash
+cargo test --workspace --lib --tests --bins
+```
+
+Retry once on transient macOS/EAGAIN listing failures (same as CI).
+
+Prefer `--lib --tests --bins` over `--all-targets`: Criterion `[[bench]]` targets treat argv after `--` as their own CLI and abort the suite. Integration tests under `*/tests/` (e.g. `compiler/tests/diagnostics.rs`, `pipeline.rs`, `perf_metrics.rs`) are covered by `--tests`.
+
+## Feature-gated suites
+
+| Feature | Command | Notes |
+|---------|---------|--------|
+| default stack | `cargo test --workspace --lib --tests --bins` | full suite |
+| `crypto` / `time` / `regex` / `tls` | `cargo check --workspace --lib --tests --bins --no-default-features --features <name>` | compile-gate only |
+| `no-default` | `cargo check --workspace --lib --tests --bins --no-default-features` | bare build |
+| `dissect` | `cargo test --workspace --lib --tests --bins --features dissect` | dissect integration |
+| `debugger` | `cargo test --workspace --lib --tests --bins --features debugger` | debugger paths |
+
+```bash
+cargo check --workspace --lib --tests --bins --no-default-features --features tls
+cargo test --workspace --lib --tests --bins --features dissect
+```
+
+## Related gates
+
+- Lint: `cargo check --workspace` (not clippy — `Gc::payload_mut` deny).
+- Language harness (after a debug `coil` build): `./target/debug/coil test`.

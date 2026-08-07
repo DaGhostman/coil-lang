@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, Visibility};
+use parser::ast::{
+    Expression, ExternFunction, FieldModifier, MatchArm, Output, Pattern, TypeParam, Visibility,
+};
 use reporting::{ErrorCode, Label, Message};
 
 use crate::typechecking::env::{Env, TyVarCounter, instantiate_with_kinds};
@@ -28,6 +30,16 @@ use crate::typechecking::virtual_modules::{
 
 use super::*;
 
+/// Max native recursion depth for [`Checker::infer`]. Chosen well under what
+/// a debug-build stack of a few MiB can hold even with `infer_inner`'s
+/// current per-call frame size — see docs/internals/limitations.md.
+const INFER_RECURSION_LIMIT: u32 = 2000;
+
+/// Private unwind payload for [`Checker::infer`]'s recursion-limit panic.
+/// Caught in [`Checker::check_program`]; never lets user input abort the
+/// process the way a genuine native stack overflow does.
+struct RecursionLimitExceeded;
+
 impl Checker {
     pub fn new() -> Self {
         let mut env = Env::new();
@@ -52,6 +64,7 @@ impl Checker {
             static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
             next_id_idx: 0,
+            infer_depth: 0,
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
@@ -138,6 +151,7 @@ impl Checker {
         };
         checker.register_builtin_enums();
         checker.register_builtin_vec();
+        checker.register_builtin_call_sigs();
         checker
     }
 
@@ -273,6 +287,30 @@ impl Checker {
                 .or_default()
                 .insert(name.to_string(), (Visibility::Public, scheme));
         }
+    }
+
+    /// Parameter names for builtins that support named arguments at call sites.
+    fn register_builtin_call_sigs(&mut self) {
+        self.fn_param_names
+            .insert("len".into(), vec!["value".into()]);
+        self.fn_param_names
+            .insert("string::format".into(), vec!["fmt".into(), "args".into()]);
+        self.fn_param_names
+            .insert("string::from_bytes".into(), vec!["bytes".into()]);
+        self.fn_param_names
+            .insert("string::to_bytes".into(), vec!["s".into()]);
+        self.fn_param_names
+            .insert("assert".into(), vec!["cond".into(), "msg".into()]);
+        self.fn_param_names
+            .insert("block_on".into(), vec!["handle".into()]);
+        self.fn_param_names
+            .insert("dload".into(), vec!["path".into()]);
+        self.fn_param_names
+            .insert("declare".into(), vec!["lib".into(), "name".into(), "sig".into()]);
+        self.fn_param_names.insert(
+            "invoke".into(),
+            vec!["lib".into(), "name".into(), "args".into()],
+        );
     }
 
     /// Reset scope bindings and inject the auto-prelude.
@@ -1378,6 +1416,7 @@ impl Checker {
         // the per-program tables and caches get cleared.
         self.ids = IdTable::new();
         self.next_id_idx = 0;
+        self.infer_depth = 0;
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
@@ -1468,6 +1507,7 @@ impl Checker {
         self.register_builtin_enums();
         // `fn_param_names` was cleared above — reinstall Vec method ABI.
         self.register_builtin_vec();
+        self.register_builtin_call_sigs();
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
         self.inject_prelude_scope();
@@ -1488,7 +1528,21 @@ impl Checker {
 
         // Top frame for natives/globals; left on stack after check_program.
         self.push_scope();
-        let ty = self.infer(ast);
+        let ty = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.infer(ast))) {
+            Ok(ty) => ty,
+            Err(payload) => {
+                // Only swallow our own recursion-limit signal (message
+                // already recorded in `infer`) — any other panic is a real
+                // bug and must keep crashing loudly.
+                if payload.downcast_ref::<RecursionLimitExceeded>().is_none() {
+                    std::panic::resume_unwind(payload);
+                }
+                // The AST wasn't fully walked: NodeId / exhaustiveness state
+                // is inconsistent, so skip the post-passes below and bail
+                // out with the error already on `self.messages`.
+                return Ty::Var(self.counter.fresh());
+            }
+        };
         // NOTE: the frame is intentionally NOT popped — see the
         // doc-comment above.
 
@@ -1908,6 +1962,19 @@ impl Checker {
     }
 
     fn infer(&mut self, expr: &Output) -> Ty {
+        self.infer_depth += 1;
+        if self.infer_depth > INFER_RECURSION_LIMIT {
+            let _ = self.error_with_help(
+                ErrorCode::ExpressionNestingTooDeep,
+                format!(
+                    "expression nested too deeply (over {INFER_RECURSION_LIMIT} levels) for the typechecker"
+                ),
+                expr.0.into_range(),
+                Some("split the expression into smaller named bindings".to_string()),
+            );
+            std::panic::panic_any(RecursionLimitExceeded);
+        }
+
         // Pull the next ID from the pre-walk's minting order. Both
         // `infer` and the pre-walk visit in pre-order, so the `n`-th
         // call here consumes the `n`-th ID.
@@ -1919,6 +1986,7 @@ impl Checker {
         self.codegen_types_by_span
             .entry((expr.0.start, expr.0.end))
             .or_insert_with(|| ty.clone());
+        self.infer_depth -= 1;
         ty
     }
 
@@ -2182,113 +2250,7 @@ impl Checker {
             Expression::Bool(_) => boolean(),
 
             // ---- Names ----
-            Expression::Identifier(name) => {
-                // When `name` has multiple overload candidates and appears in
-                // value position, try to narrow using `current_expected`.
-                if self.is_overloaded(name) {
-                    let candidates: Vec<OverloadCandidate> = self
-                        .overload_candidates(name)
-                        .map(|c| c.to_vec())
-                        .unwrap_or_default();
-                    // If exactly one candidate matches current_expected, pick it.
-                    let expected = self.current_expected.clone();
-                    let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
-                        // Prune so a solved `Ty::Var` expected type doesn't look
-                        // open; unify under `self.subst` (not empty) so existing
-                        // bindings are visible without mutating the running subst.
-                        let exp = apply_ty_prune(&self.subst, exp);
-                        candidates
-                            .iter()
-                            .filter(|c| {
-                                let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
-                                crate::typechecking::unify::unify_with(&self.subst, &fun_ty, &exp)
-                                    .is_ok()
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    if matching.len() == 1 {
-                        // Unique match — record and return its type.
-                        let candidate = matching[0].clone();
-                        self.selected_overloads_by_span.insert(
-                            (range.start, range.end),
-                            (candidate.fixed_arity, candidate.is_rest, candidate.id),
-                        );
-                        return self.instantiate_ty(&candidate.scheme);
-                    } else if matching.len() > 1 || expected.is_none() {
-                        // Multiple matches or no expected type — ambiguous.
-                        // For the single-candidate case there is no ambiguity even
-                        // without context, but we already checked `is_overloaded`
-                        // (len > 1), so ambiguous.
-                        let arities: Vec<String> = candidates
-                            .iter()
-                            .map(|c| Self::overload_sig_label(c))
-                            .collect();
-                        return self.error_with_help(
-                            ErrorCode::AmbiguousOverload,
-                            format!(
-                                "Ambiguous overload: `{}` has multiple candidates in value position",
-                                name
-                            ),
-                            range,
-                            Some(format!(
-                                "available overloads: {}; annotate the expected type to disambiguate",
-                                arities.join(", ")
-                            )),
-                        );
-                    }
-                    // matching.len() == 0 with an expected type — no candidate
-                    // unifies. Emit a dedicated diagnostic rather than falling
-                    // through to the last-registered scheme (wrong codegen key /
-                    // confusing TypeMismatch downstream).
-                    let arities: Vec<String> = candidates
-                        .iter()
-                        .map(|c| Self::overload_sig_label(c))
-                        .collect();
-                    let expected_pretty = expected
-                        .as_ref()
-                        .map(|e| apply_ty_prune(&self.subst, e).to_string())
-                        .unwrap_or_else(|| "?".into());
-                    return self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        format!(
-                            "No overload of `{}` matches expected type `{}`",
-                            name, expected_pretty
-                        ),
-                        range,
-                        Some(format!("available overloads: {}", arities.join(", "))),
-                    );
-                }
-
-                let scheme = self.env.lookup(name).cloned();
-                match scheme {
-                    Some(s) => self.instantiate_ty(&s),
-                    None => {
-                        if self
-                            .lambda_uncaptured_outer
-                            .as_ref()
-                            .is_some_and(|s| s.contains(*name))
-                        {
-                            return self.error_with_help(
-                                ErrorCode::UnknownValue,
-                                format!("cannot capture `{}` without `use ({})`", name, name),
-                                range,
-                                Some(format!(
-                                    "list `{}` in the enclosing `use (…)` capture list",
-                                    name
-                                )),
-                            );
-                        }
-                        self.error(
-                            ErrorCode::UnknownValue,
-                            format!("Cannot find value `{}` in this scope", name),
-                            range,
-                        )
-                    }
-                }
-            }
+            Expression::Identifier(name) => self.infer_identifier(name, range),
 
             // A bare type name (only valid as an annotation, but be
             // permissive).
@@ -2307,78 +2269,7 @@ impl Checker {
             // Named call-site arg wrapper — type is the value's type.
             Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
-            Expression::Use { path, name, alias } => {
-                let module_ns = path.join("::");
-                if name == "*" {
-                    // Prelude is injected automatically; every other module —
-                    // virtual or userland — requires explicit imports.
-                    let mod_label = if module_ns.is_empty() {
-                        "<entry>".to_string()
-                    } else {
-                        module_ns.clone()
-                    };
-                    return self.error_with_help(
-                        ErrorCode::WildcardImport,
-                        format!("wildcard import `use {}::*` is not allowed", mod_label),
-                        range,
-                        Some(format!(
-                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
-                            mod_label
-                        )),
-                    );
-                }
-                if self.apply_virtual_use(path, name, alias.as_deref()) {
-                    // Bind FFI callables into the value env so Call sites
-                    // resolve; enums/traits/tags are scope-only.
-                    let locals: Vec<(String, BuiltinExport)> = self
-                        .scope_bindings
-                        .iter()
-                        .filter(|(_, e)| {
-                            matches!(
-                                e,
-                                BuiltinExport::FfiFn { .. }
-                                    | BuiltinExport::IoFn { .. }
-                                    | BuiltinExport::StringFn { .. }
-                                    | BuiltinExport::ThreadFn { .. }
-                                    | BuiltinExport::GcFn { .. }
-                                    | BuiltinExport::HostFn { .. }
-                            )
-                        })
-                        .map(|(k, e)| (k.clone(), e.clone()))
-                        .collect();
-                    for (local, export) in locals {
-                        if self.env.lookup(&local).is_some() {
-                            continue;
-                        }
-                        if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
-                            self.env.insert_top(local, scheme);
-                        }
-                    }
-                    return unit_ty();
-                }
-                let local = alias.clone().unwrap_or_else(|| name.clone());
-                let fqn = if module_ns.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{module_ns}::{name}")
-                };
-                // Prefer the defining module's real scheme (incl. generics with
-                // bounds) over a dummy Var so call sites get dict-passing ABI.
-                self.reexport_module_item(&fqn, &local);
-                // Re-export overload families under the local alias so
-                // `use num::{abs}` can still type-dispatch.
-                if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
-                    if cands.len() > 1 {
-                        self.overload_sets.insert(local.clone(), cands);
-                    }
-                }
-                // Disk imports are file-level globals — track for lambda/defer
-                // rebind after `take_and_isolate`.
-                if name != "*" {
-                    self.disk_imports.insert(local);
-                }
-                unit_ty()
-            }
+            Expression::Use { path, name, alias } => self.infer_use_decl(path, name, alias, range),
             Expression::Module(_, _) => unit_ty(),
             // FFI declaration block — register each function
             // signature in the top frame (so subsequent calls
@@ -2388,73 +2279,7 @@ impl Checker {
             Expression::ExternBlock {
                 library: _,
                 declarations,
-            } => {
-                for decl in declarations {
-                    let arg_tys: Vec<Ty> = if let Expression::Fragment(items) = decl.args.1.as_ref()
-                    {
-                        items
-                            .iter()
-                            .filter_map(|item| {
-                                if let Expression::Argument { ty, .. } = item.1.as_ref() {
-                                    ty.as_ref().map(|t| self.parse_type_name(t))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let nfixed = arg_tys.len();
-                    let ret_ty = decl
-                        .returns
-                        .as_ref()
-                        .map(|r| self.parse_type_name(r))
-                        .unwrap_or_else(unit_ty);
-                    // Register the fixed-prefix function type (extra `...` args
-                    // are accepted at call sites via `extern_variadic`).
-                    let fn_ty = arg_tys
-                        .iter()
-                        .rev()
-                        .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
-                    self.env
-                        .insert_top(decl.name.to_string(), Scheme::mono(fn_ty.clone()));
-                    if decl.variadic {
-                        self.extern_variadic.insert(decl.name.to_string());
-                        self.extern_variadic_nfixed
-                            .insert(decl.name.to_string(), nfixed);
-                    } else {
-                        // Fixed-arity extern overloads (C `...` is not a member).
-                        let param_names: Vec<String> =
-                            if let Expression::Fragment(items) = decl.args.1.as_ref() {
-                                items
-                                    .iter()
-                                    .filter_map(|item| {
-                                        if let Expression::Argument { name, .. } = item.1.as_ref() {
-                                            Some(name.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                        self.register_overload_candidate(
-                            decl.name,
-                            OverloadCandidate {
-                    id: 0,
-                                fixed_arity: nfixed,
-                                is_rest: false,
-                                scheme: Scheme::mono(fn_ty),
-                                param_names,
-                            },
-                            &decl.args.0.into_range(),
-                        );
-                    }
-                }
-                unit_ty()
-            }
+            } => self.infer_extern_block(declarations),
 
             Expression::Expr(e) | Expression::Group(e) | Expression::Statement(e) => self.infer(e),
             // Semicolon form discards the value (same as a Rust statement).
@@ -2529,57 +2354,7 @@ impl Checker {
             }
 
             // ---- Assignment / compound assignment / adjust ----
-            Expression::CompoundAssign(target, op, value) => {
-                let target_ty = self.infer_mutable_lvalue(target, range.clone());
-                let val_ty = self.infer(value);
-                let op_name = Self::compound_op_name(*op);
-                if matches!(
-                    op,
-                    parser::ast::AssignOp::Shl
-                        | parser::ast::AssignOp::Shr
-                        | parser::ast::AssignOp::BitAnd
-                        | parser::ast::AssignOp::BitOr
-                        | parser::ast::AssignOp::BitXor
-                ) {
-                    let _ = unify_with(&self.subst, &target_ty, &int());
-                    let _ = unify_with(&self.subst, &val_ty, &int());
-                } else {
-                    let tp = apply_ty_prune(&self.subst, &target_ty);
-                    let vp = apply_ty_prune(&self.subst, &val_ty);
-                    if crate::typechecking::aggregate_arith::is_matrix_ty(&tp)
-                        || crate::typechecking::aggregate_arith::is_matrix_ty(&vp)
-                    {
-                        let result =
-                            self.infer_matrix_arith(tp.clone(), vp, id, range.clone(), op_name);
-                        let _ = self.unify(
-                            &target_ty,
-                            &result,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    } else if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
-                        || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
-                    {
-                        // Resolve as aggregate arith; result must match LHS shape.
-                        let result =
-                            self.infer_aggregate_arith(tp.clone(), vp, id, range.clone(), op_name);
-                        let _ = self.unify(
-                            &target_ty,
-                            &result,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    } else {
-                        self.unify(
-                            &target_ty,
-                            &val_ty,
-                            &range,
-                            &format!("operands of `{}=`", op_name),
-                        );
-                    }
-                }
-                apply_ty_prune(&self.subst, &target_ty)
-            }
+            Expression::CompoundAssign(target, op, value) => self.infer_compound_assign(target, op, value, id, range),
 
             Expression::Assignment(name, value) => {
                 if let Expression::Index(arr, None) = name.1.as_ref() {
@@ -2699,970 +2474,7 @@ impl Checker {
                 }
                 pruned
             }
-            Expression::Call { name, args } => {
-                if let Expression::Identifier(callee) = name.1.as_ref() {
-                    if let Some(arg_list) = args.as_deref() {
-                        if arg_list.len() == 1 {
-                            if let Expression::Spread(pack) = arg_list[0].1.as_ref() {
-                                if self.next_id_idx < self.ids.ids().len() {
-                                    self.next_id_idx += 1;
-                                }
-                                if let Some(ty) =
-                                    self.try_infer_spread_call_target(callee, pack, &range, id)
-                                {
-                                    return ty;
-                                }
-                            }
-                        }
-                    }
-                }
-                // Method call: `recv.method(args)` — Access callee.
-                if let Expression::Access(recv, method) = name.1.as_ref() {
-                    let method_args = args.as_deref().unwrap_or(&[]);
-                    let method_has_named = method_args
-                        .iter()
-                        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-
-                    let recv_ty = self.infer(recv);
-                    let resolved = apply_ty_prune(&self.subst, &recv_ty);
-
-                    // Named args on methods: only inherent class methods.
-                    if method_has_named {
-                        let class_owner = self.class_owner_from_ty(&resolved);
-                        if let Some(owner) = class_owner.as_ref()
-                            && self
-                                .methods
-                                .get(owner)
-                                .and_then(|m| m.get(*method))
-                                .is_some()
-                        {
-                            let fqn = format!("{}::{}", owner, method);
-                            let user_argc = method_args.len();
-                            let scheme = if self.is_overloaded(&fqn) {
-                                let prelim_tys: Vec<Ty> = method_args
-                                    .iter()
-                                    .map(|a| {
-                                        let value = match a.1.as_ref() {
-                                            Expression::NamedArg(_, v) => v,
-                                            _ => a,
-                                        };
-                                        let ty = self.infer(value);
-                                        apply_ty_prune(&self.subst, &ty)
-                                    })
-                                    .collect();
-                                match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
-                                    OverloadSelect::Selected(c) => {
-                                        let c = c.clone();
-                                        self.selected_overloads_by_span.insert(
-                                            (range.start, range.end),
-                                            (c.fixed_arity, c.is_rest, c.id),
-                                        );
-                                        c.scheme
-                                    }
-                                    OverloadSelect::Ambiguous => {
-                                        return self.error_with_help(
-                                            ErrorCode::AmbiguousOverload,
-                                            format!(
-                                                "Ambiguous overload: call to `{}` matches multiple candidates",
-                                                fqn
-                                            ),
-                                            range,
-                                            Some(self.ambiguous_overload_help(&fqn)),
-                                        );
-                                    }
-                                    OverloadSelect::NoMatch => {
-                                        return self.error(
-                                            ErrorCode::WrongArity,
-                                            format!(
-                                                "No overload of `{}` accepts {} argument{}",
-                                                fqn,
-                                                user_argc,
-                                                if user_argc == 1 { "" } else { "s" }
-                                            ),
-                                            range,
-                                        );
-                                    }
-                                }
-                            } else {
-                                self.methods
-                                    .get(owner)
-                                    .and_then(|m| m.get(*method))
-                                    .map(|(_, s)| s.clone())
-                                    .expect("method present")
-                            };
-                            let (fun_ty, constraints, _mapping) =
-                                self.instantiate_scheme_mapped(&scheme);
-                            let mut arg_tys = vec![recv_ty];
-                            let (tys, ordered_exprs) =
-                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
-                            arg_tys.extend(tys);
-                            // Align exprs with `[self, …args]` for coerce_or_unify
-                            // (byte / string literal coercion on method args).
-                            let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
-                            arg_exprs.push(recv.clone());
-                            arg_exprs.extend(ordered_exprs);
-                            let result = self.apply_function(
-                                Some(&fqn),
-                                &fun_ty,
-                                &arg_tys,
-                                Some(&arg_exprs),
-                                id,
-                                range.clone(),
-                            );
-                            if !constraints.is_empty() {
-                                self.discharge_constraints(id, &constraints, &range);
-                            }
-                            return result;
-                        }
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Named arguments are not supported on this call to `{}`",
-                                method
-                            ),
-                            range,
-                            Some(
-                                "named arguments are supported on ordinary functions and inherent methods"
-                                    .to_string(),
-                            ),
-                        );
-                    }
-
-                    if let Ty::Existential { class } = &resolved
-                        && let Some((owner, method_slot, scheme)) =
-                            self.existential_method_candidate(class, method)
-                    {
-                        let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                            }
-                        }
-                        let hint = ExistentialMethodCall {
-                            method_slot,
-                            arity: arg_tys.len(),
-                            has_receiver: true,
-                        };
-                        if let Some(call_id) = id {
-                            self.existential_method_calls.insert(call_id, hint.clone());
-                        }
-                        self.existential_method_calls_by_span
-                            .insert((range.start, range.end), hint);
-                        return self.apply_existential_method(
-                            &owner,
-                            method,
-                            &scheme,
-                            &arg_tys,
-                            args.as_deref(),
-                            id,
-                            range,
-                        );
-                    }
-                    if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
-                        let candidates = self.bound_method_candidates(method, Some(receiver_var));
-                        if let Some((dict_index, dict_class, class, method_slot, scheme)) =
-                            self.select_bound_method(candidates, method, &range)
-                        {
-                            self.bind_matching_abstract_constraints(
-                                Some(receiver_var),
-                                &dict_class,
-                            );
-                            let (fun_ty, constraints, mapping) =
-                                self.instantiate_scheme_mapped(&scheme);
-                            let mut arg_tys = vec![recv_ty];
-                            if let Some(a) = args {
-                                for arg in a {
-                                    arg_tys.push(self.infer(arg));
-                                }
-                            }
-                            if let Some(call_id) = id {
-                                self.bound_method_calls.insert(
-                                    call_id,
-                                    BoundMethodCall {
-                                        dict_index,
-                                        method_slot,
-                                        arity: arg_tys.len(),
-                                        has_receiver: true,
-                                    },
-                                );
-                            }
-                            self.bound_method_calls_by_span.insert(
-                                (range.start, range.end),
-                                BoundMethodCall {
-                                    dict_index,
-                                    method_slot,
-                                    arity: arg_tys.len(),
-                                    has_receiver: true,
-                                },
-                            );
-                            let result = self.apply_function(
-                                Some(&format!("{}::{}", class, method)),
-                                &fun_ty,
-                                &arg_tys,
-                                None,
-                                id,
-                                range.clone(),
-                            );
-                            if !constraints.is_empty() {
-                                self.discharge_constraints(id, &constraints, &range);
-                                self.pin_assoc_after_discharge(
-                                    &class,
-                                    &constraints,
-                                    Some(&scheme),
-                                    &mapping,
-                                    &range,
-                                );
-                            }
-                            return result;
-                        }
-                    }
-                    // Inherent class methods win over ground trait methods
-                    // (Rust-style): `impl Point { fn show() ... }` must not be
-                    // shadowed by prelude `Show::show` when no Show instance
-                    // exists for Point.
-                    let class_owner = self.class_owner_from_ty(&resolved);
-                    if let Some(owner) = class_owner.as_ref()
-                        && self
-                            .methods
-                            .get(owner)
-                            .and_then(|m| m.get(*method))
-                            .is_some()
-                    {
-                        if self.is_static_method(owner, method) {
-                            let fqn = format!("{}::{}", owner, method);
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!(
-                                    "`{}` is a static method; call it as `{}(...)`",
-                                    method, fqn
-                                ),
-                                range,
-                                Some("static methods have no `self` receiver".to_string()),
-                            );
-                        }
-                        let fqn = format!("{}::{}", owner, method);
-                        let user_argc = method_args.len();
-                        let (scheme, selected) = if self.is_overloaded(&fqn) {
-                            let prelim_tys: Vec<Ty> = method_args
-                                .iter()
-                                .map(|a| {
-                                    let value = match a.1.as_ref() {
-                                        Expression::NamedArg(_, v) => v,
-                                        _ => a,
-                                    };
-                                    let ty = self.infer(value);
-                                    apply_ty_prune(&self.subst, &ty)
-                                })
-                                .collect();
-                            match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
-                                OverloadSelect::Selected(c) => {
-                                    let c = c.clone();
-                                    self.selected_overloads_by_span.insert(
-                                        (range.start, range.end),
-                                        (c.fixed_arity, c.is_rest, c.id),
-                                    );
-                                    (c.scheme, true)
-                                }
-                                OverloadSelect::Ambiguous => {
-                                    return self.error_with_help(
-                                        ErrorCode::AmbiguousOverload,
-                                        format!(
-                                            "Ambiguous overload: call to `{}` matches multiple candidates",
-                                            fqn
-                                        ),
-                                        range,
-                                        Some(self.ambiguous_overload_help(&fqn)),
-                                    );
-                                }
-                                OverloadSelect::NoMatch => {
-                                    let available: Vec<String> = self
-                                        .overload_sets
-                                        .get(&fqn)
-                                        .map(|cs| {
-                                            cs.iter()
-                                                .map(|c| {
-                                                    if c.is_rest {
-                                                        format!("{}+ args (rest)", c.fixed_arity)
-                                                    } else {
-                                                        format!("{} args", c.fixed_arity)
-                                                    }
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    return self.error_with_help(
-                                        ErrorCode::WrongArity,
-                                        format!(
-                                            "No overload of `{}` accepts {} argument{}",
-                                            fqn,
-                                            user_argc,
-                                            if user_argc == 1 { "" } else { "s" }
-                                        ),
-                                        range,
-                                        Some(format!(
-                                            "available arities: {}",
-                                            available.join(", ")
-                                        )),
-                                    );
-                                }
-                            }
-                        } else {
-                            let scheme = self
-                                .methods
-                                .get(owner)
-                                .and_then(|m| m.get(*method))
-                                .map(|(_, s)| s.clone())
-                                .expect("method present");
-                            (scheme, false)
-                        };
-                        let _ = selected;
-                        let (fun_ty, constraints, _mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        let mut arg_tys = vec![recv_ty];
-                        let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
-                        arg_exprs.push(recv.clone());
-                        if self.fn_has_rest(&fqn) {
-                            let (tys, ordered_exprs) =
-                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
-                            arg_tys.extend(tys);
-                            arg_exprs.extend(ordered_exprs);
-                        } else if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                                arg_exprs.push(arg.clone());
-                            }
-                        }
-                        let result = self.apply_function(
-                            Some(&fqn),
-                            &fun_ty,
-                            &arg_tys,
-                            Some(&arg_exprs),
-                            id,
-                            range.clone(),
-                        );
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                        }
-                        return result;
-                    }
-
-                    // Ground trait method: `recv.into()` / `recv.show()` via a
-                    // concrete instance (no open bound). Pin the return type from
-                    // `current_expected` when present so `let y: T = x.into();`
-                    // (or `return x.into();` under `-> T`) can select among
-                    // multiple `Into` targets.
-                    if let Some((class, scheme)) =
-                        self.ground_trait_method_for_receiver(method, &recv_ty)
-                    {
-                        let (fun_ty, constraints, mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
-                            for arg in a {
-                                arg_tys.push(self.infer(arg));
-                            }
-                        }
-                        let result = self.apply_function(
-                            Some(&format!("{}::{}", class, method)),
-                            &fun_ty,
-                            &arg_tys,
-                            None,
-                            id,
-                            range.clone(),
-                        );
-                        if let Some(expected) = self.current_expected.clone() {
-                            self.unify(&result, &expected, &range, "expected type");
-                        }
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                            self.pin_assoc_after_discharge(
-                                &class,
-                                &constraints,
-                                Some(&scheme),
-                                &mapping,
-                                &range,
-                            );
-                        }
-                        return apply_ty_prune(&self.subst, &result);
-                    }
-
-                    if let Some(owner) = class_owner {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            format!("Cannot find method `{}` on class `{}`", method, owner),
-                            range,
-                        );
-                    }
-                    return self.error_with_help(
-                        ErrorCode::NotAFunction,
-                        format!("Cannot call method `{}` on non-class type", method),
-                        range,
-                        Some("method calls require a class instance receiver".to_string()),
-                    );
-                }
-
-                // First-class callee (`lambda(...)`, nested fn value, etc.).
-                if !matches!(
-                    name.1.as_ref(),
-                    Expression::Identifier(_)
-                        | Expression::Access(_, _)
-                        | Expression::QualifiedAccess { .. }
-                ) {
-                    let callee_ty = self.infer(name);
-                    let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
-                    let arg_tys: Vec<Ty> = flat_args
-                        .iter()
-                        .map(|arg| self.infer_call_arg(arg))
-                        .collect();
-                    return self.apply_function(
-                        None,
-                        &callee_ty,
-                        &arg_tys,
-                        args.as_deref(),
-                        id,
-                        range,
-                    );
-                }
-
-                let ident = match name.1.as_ref() {
-                    Expression::Identifier(n) => n.to_string(),
-                    Expression::QualifiedAccess { owner, member } => {
-                        let fqn = format!("{}::{}", owner, member);
-                        if self.static_slot_types.contains_key(&fqn) {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("`{}` is a static field, not a function", fqn),
-                                range,
-                                Some(
-                                    "read it as a value or assign with `Class::field = expr`"
-                                        .to_string(),
-                                ),
-                            );
-                        }
-                        // Parser may emit Call(QualifiedAccess) for module paths;
-                        // Class::static_method stays Construct, but accept Call too.
-                        if let Some(ty) = self.try_infer_static_method_call(
-                            owner,
-                            member,
-                            &parser::ast::EnumConstructPayload::Tuple(
-                                args.as_deref().unwrap_or(&[]).to_vec(),
-                            ),
-                            range.clone(),
-                            id,
-                        ) {
-                            return ty;
-                        }
-                        if self.has_method(owner, member) {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!(
-                                    "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
-                                    fqn, member
-                                ),
-                                range,
-                                Some(format!(
-                                    "or declare `static fn {}` to call it as `{}`",
-                                    member, fqn
-                                )),
-                            );
-                        }
-                        fqn
-                    }
-                    _ => {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            "Invalid call target".to_string(),
-                            range,
-                        );
-                    }
-                };
-
-                let raw_args = args.as_deref().unwrap_or(&[]);
-                let has_named = raw_args
-                    .iter()
-                    .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-
-                if ident == "len" {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            "Named arguments are not supported on `len`".to_string(),
-                            range,
-                            Some("use positional arguments: `len(value)`".to_string()),
-                        );
-                    }
-                    return self.infer_len_call(args.as_deref(), id, range);
-                }
-                if let Some(kind) = self.string_fn_for_call(&ident) {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("string helpers take positional arguments only".to_string()),
-                        );
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    return match kind {
-                        StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
-                        StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
-                            if kind == StringBuiltin::FromBytes
-                                && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
-                            {
-                                self.register_builtin_io_error();
-                            }
-                            let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
-                            let flat_args = self.flatten_spread_call_args(arg_slice);
-                            let arg_tys: Vec<Ty> = flat_args
-                                .iter()
-                                .map(|arg| self.infer_call_arg(arg))
-                                .collect();
-                            self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if flat_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&flat_args)
-                                },
-                                id,
-                                range,
-                            )
-                        }
-                    };
-                }
-                // `assert` from `prelude::test` (auto-imported or via `use`).
-                if let Some(kind) = self.prelude_fn_in_scope(&ident) {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("use positional arguments".to_string()),
-                        );
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    return match kind {
-                        PreludeFn::Assert => self.infer_assert(arg_slice, range),
-                        PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
-                        PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
-                        PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
-                        PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
-                        PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
-                        PreludeFn::Ord => self.infer_ord(arg_slice, range),
-                        PreludeFn::Char => self.infer_char(arg_slice, range),
-                        PreludeFn::Sin
-                        | PreludeFn::Cos
-                        | PreludeFn::Tan
-                        | PreludeFn::Sqrt
-                        | PreludeFn::Floor
-                        | PreludeFn::Ceil
-                        | PreludeFn::Exp
-                        | PreludeFn::Ln
-                        | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
-                    };
-                }
-                // `dload` / `declare` / `invoke` after `use ffi::{…}`.
-                if let Some(kind) = self.ffi_fn_in_scope(&ident) {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            format!("Named arguments are not supported on `{}`", ident),
-                            range,
-                            Some("FFI builtins take positional arguments only".to_string()),
-                        );
-                    }
-                    let arg_slice = args.as_deref().unwrap_or(&[]);
-                    return match kind {
-                        FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
-                        FfiBuiltin::Declare => self.infer_ffi_declare(arg_slice, range),
-                        FfiBuiltin::Invoke => self.infer_ffi_invoke(arg_slice, range),
-                    };
-                }
-                if matches!(ident.as_str(), "dload" | "declare" | "invoke") {
-                    return self.error_with_help(
-                        ErrorCode::UnknownValue,
-                        format!("Cannot find value `{}` in this scope", ident),
-                        range,
-                        Some(
-                            "import it with `use ffi::{dload, declare, invoke}`".to_string(),
-                        ),
-                    );
-                }
-
-                // ── Overload-dispatch: select by argc + argument types ─────
-                // Must happen before `has_named` and `fn_has_rest` branches so
-                // the correct candidate's param_names / is_rest are used.
-                if self.is_overloaded(&ident) {
-                    let argc = raw_args.len();
-                    // Preliminary arg types for same-arity disambiguation.
-                    // Named args contribute their value type in source order;
-                    // reordering happens after the candidate is chosen.
-                    let prelim_tys: Vec<Ty> = raw_args
-                        .iter()
-                        .map(|a| {
-                            let value = match a.1.as_ref() {
-                                Expression::NamedArg(_, v) => v,
-                                _ => a,
-                            };
-                            let ty = self.infer(value);
-                            apply_ty_prune(&self.subst, &ty)
-                        })
-                        .collect();
-                    let candidate_opt = self
-                        .select_overload_for_args(&ident, argc, &prelim_tys);
-                    match candidate_opt {
-                        OverloadSelect::NoMatch => {
-                            // No candidate accepts this arity/types — emit a
-                            // "no overload" error listing the available arities.
-                            let available: Vec<String> = self
-                                .overload_candidates(&ident)
-                                .map(|cs| {
-                                    cs.iter().map(|c| Self::overload_sig_label(c)).collect()
-                                })
-                                .unwrap_or_default();
-                            return self.error_with_help(
-                                ErrorCode::WrongArity,
-                                format!(
-                                    "No overload of `{}` accepts {} argument{}",
-                                    ident,
-                                    argc,
-                                    if argc == 1 { "" } else { "s" }
-                                ),
-                                range,
-                                Some(format!("available overloads: {}", available.join(", "))),
-                            );
-                        }
-                        OverloadSelect::Ambiguous => {
-                            return self.error_with_help(
-                                ErrorCode::AmbiguousOverload,
-                                format!(
-                                    "Ambiguous overload: call to `{}` matches multiple candidates",
-                                    ident
-                                ),
-                                range,
-                                Some(self.ambiguous_overload_help(&ident)),
-                            );
-                        }
-                        OverloadSelect::Selected(candidate) => {
-                            let candidate = candidate.clone();
-                            // Record the selection for codegen.
-                            self.selected_overloads_by_span.insert(
-                                (range.start, range.end),
-                                (candidate.fixed_arity, candidate.is_rest, candidate.id),
-                            );
-                            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
-                                let (fun_ty, constraints, mapping) =
-                                    self.instantiate_scheme_mapped(&candidate.scheme);
-                                (fun_ty, constraints, mapping, Some(candidate.scheme.clone()))
-                            };
-                            let (arg_tys, ordered_args) = self
-                                .infer_and_reorder_call_args_with_candidate(
-                                    &ident, &candidate, raw_args, &range,
-                                );
-                            let result = self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if ordered_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&ordered_args)
-                                },
-                                id,
-                                range.clone(),
-                            );
-                            if !fresh_constraints.is_empty() {
-                                self.discharge_constraints(id, &fresh_constraints, &range);
-                                if let Some(scheme) = original_scheme.as_ref() {
-                                    self.pin_assoc_after_discharge(
-                                        "",
-                                        &fresh_constraints,
-                                        Some(scheme),
-                                        &fresh_mapping,
-                                        &range,
-                                    );
-                                }
-                            }
-                            return result;
-                        }
-                    }
-                }
-
-                // Named call-site args: skip trait UFCS and resolve an ordinary
-                // function (partial application is allowed — residual Fun is OK).
-                if has_named {
-                    let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                        Some(s) => {
-                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                            (fun_ty, constraints, mapping, Some(s))
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownFunction,
-                                format!("Cannot find function `{}`", ident),
-                                range,
-                            );
-                        }
-                    };
-                    let (arg_tys, ordered_args) =
-                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                    let result = if let Some(filled) = self
-                        .partial_filled_tys_by_span
-                        .get(&(range.start, range.end))
-                        .cloned()
-                    {
-                        let mask = self
-                            .partial_fills_by_span
-                            .get(&(range.start, range.end))
-                            .copied()
-                            .unwrap_or(0);
-                        let n = mask.count_ones();
-                        if !Self::is_prefix_fill_mask(mask, n) {
-                            self.apply_partial_with_mask(&fun_ty, &filled, &range)
-                        } else {
-                            self.apply_function(
-                                Some(&ident),
-                                &fun_ty,
-                                &arg_tys,
-                                if ordered_args.is_empty() {
-                                    None
-                                } else {
-                                    Some(&ordered_args)
-                                },
-                                id,
-                                range.clone(),
-                            )
-                        }
-                    } else {
-                        self.apply_function(
-                            Some(&ident),
-                            &fun_ty,
-                            &arg_tys,
-                            if ordered_args.is_empty() {
-                                None
-                            } else {
-                                Some(&ordered_args)
-                            },
-                            id,
-                            range.clone(),
-                        )
-                    };
-                    if !fresh_constraints.is_empty() {
-                        self.discharge_constraints(id, &fresh_constraints, &range);
-                        if let Some(scheme) = original_scheme.as_ref() {
-                            self.pin_assoc_after_discharge(
-                                "",
-                                &fresh_constraints,
-                                Some(scheme),
-                                &fresh_mapping,
-                                &range,
-                            );
-                        }
-                    }
-                    // Named under-apply is now allowed (residual Fun is returned
-                    // for partial application). Error only on unknown/duplicate
-                    // named args (handled inside infer_and_reorder_call_args).
-                    return result;
-                }
-
-                // Rest-parameter calls pack trailing args; skip UFCS trait
-                // resolution so we don't double-infer (NodeId alignment).
-                if self.fn_has_rest(&ident) {
-                    let scheme = self.env.lookup(&ident).cloned();
-                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                        Some(s) => {
-                            let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                            (fun_ty, constraints, mapping, Some(s))
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownFunction,
-                                format!("Cannot find function `{}`", ident),
-                                range,
-                            );
-                        }
-                    };
-                    let (call_arg_tys, ordered_args) =
-                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                    let result = self.apply_function(
-                        Some(&ident),
-                        &fun_ty,
-                        &call_arg_tys,
-                        if ordered_args.is_empty() {
-                            None
-                        } else {
-                            Some(&ordered_args)
-                        },
-                        id,
-                        range.clone(),
-                    );
-                    if !fresh_constraints.is_empty() {
-                        self.discharge_constraints(id, &fresh_constraints, &range);
-                        if let Some(scheme) = original_scheme.as_ref() {
-                            self.pin_assoc_after_discharge(
-                                "",
-                                &fresh_constraints,
-                                Some(scheme),
-                                &fresh_mapping,
-                                &range,
-                            );
-                        }
-                    }
-                    return result;
-                }
-
-                // Bare/UFCS trait method call: `method(x)`.
-                // Resolve it before ordinary environment lookup because class
-                // methods are selected by the active bound, not by a global FQN.
-                let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
-                let arg_tys: Vec<Ty> = flat_args
-                    .iter()
-                    .map(|arg| self.infer_call_arg(arg))
-                    .collect();
-                if let Some(Ty::Existential { class }) =
-                    arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
-                    && let Some((owner, method_slot, scheme)) =
-                        self.existential_method_candidate(&class, &ident)
-                {
-                    let hint = ExistentialMethodCall {
-                        method_slot,
-                        arity: arg_tys.len(),
-                        has_receiver: false,
-                    };
-                    if let Some(call_id) = id {
-                        self.existential_method_calls.insert(call_id, hint.clone());
-                    }
-                    self.existential_method_calls_by_span
-                        .insert((range.start, range.end), hint);
-                    return self.apply_existential_method(
-                        &owner,
-                        &ident,
-                        &scheme,
-                        &arg_tys,
-                        args.as_deref(),
-                        id,
-                        range,
-                    );
-                }
-                let candidates = self.bound_method_candidates(&ident, None);
-                if !candidates.is_empty() {
-                    let receiver_var = arg_tys.first().and_then(|ty| {
-                        Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
-                    });
-                    let candidates = receiver_var
-                        .map(|v| self.bound_method_candidates(&ident, Some(v)))
-                        .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
-                    if let Some((dict_index, dict_class, class, method_slot, scheme)) =
-                        self.select_bound_method(candidates, &ident, &range)
-                    {
-                        self.bind_matching_abstract_constraints(receiver_var, &dict_class);
-                        let (fun_ty, constraints, mapping) =
-                            self.instantiate_scheme_mapped(&scheme);
-                        if let Some(call_id) = id {
-                            self.bound_method_calls.insert(
-                                call_id,
-                                BoundMethodCall {
-                                    dict_index,
-                                    method_slot,
-                                    arity: arg_tys.len(),
-                                    has_receiver: false,
-                                },
-                            );
-                        }
-                        self.bound_method_calls_by_span.insert(
-                            (range.start, range.end),
-                            BoundMethodCall {
-                                dict_index,
-                                method_slot,
-                                arity: arg_tys.len(),
-                                has_receiver: false,
-                            },
-                        );
-                        let result = self.apply_function(
-                            Some(&format!("{}::{}", class, ident)),
-                            &fun_ty,
-                            &arg_tys,
-                            args.as_deref(),
-                            id,
-                            range.clone(),
-                        );
-                        if !constraints.is_empty() {
-                            self.discharge_constraints(id, &constraints, &range);
-                            self.pin_assoc_after_discharge(
-                                &class,
-                                &constraints,
-                                Some(&scheme),
-                                &mapping,
-                                &range,
-                            );
-                        }
-                        return result;
-                    }
-                }
-
-                let scheme = self.env.lookup(&ident).cloned();
-                let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
-                    Some(s) => {
-                        let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
-                        (fun_ty, constraints, mapping, Some(s))
-                    }
-                    None => {
-                        return self.error(
-                            ErrorCode::UnknownFunction,
-                            format!("Cannot find function `{}`", ident),
-                            range,
-                        );
-                    }
-                };
-
-                // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
-                if self.extern_variadic.contains(ident.as_str()) {
-                    return self.apply_extern_variadic_call(
-                        &ident,
-                        &fun_ty,
-                        &arg_tys,
-                        args.as_deref(),
-                        range,
-                    );
-                }
-
-                if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
-                    return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
-                }
-
-                let result = self.apply_function(
-                    Some(&ident),
-                    &fun_ty,
-                    &arg_tys,
-                    if flat_args.is_empty() {
-                        None
-                    } else {
-                        Some(&flat_args)
-                    },
-                    id,
-                    range.clone(),
-                );
-                // Discharge trait constraints from the instantiated scheme.
-                // This verifies that each concrete type argument satisfies the
-                // required bound, or propagates the constraint if the caller is
-                // itself generic with the same bound.
-                if !fresh_constraints.is_empty() {
-                    self.discharge_constraints(id, &fresh_constraints, &range);
-                    if let Some(scheme) = original_scheme.as_ref() {
-                        self.pin_assoc_after_discharge(
-                            "",
-                            &fresh_constraints,
-                            Some(scheme),
-                            &fresh_mapping,
-                            &range,
-                        );
-                    }
-                }
-                result
-            }
+            Expression::Call { name, args } => self.infer_call_expr(name, args, id, range),
 
             // ---- Match / loop / if ----
             Expression::If(branches) => self.infer_if(branches),
@@ -3794,89 +2606,7 @@ impl Checker {
                 }
             }
 
-            Expression::Cast(expr, ty_ann) => {
-                let dst_ty = self.parse_type_name(ty_ann);
-                let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
-                // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
-                // in-range `65 as byte` type the operand as the target when it
-                // is a coercible literal.
-                let prev_expected = self.current_expected.take();
-                if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
-                    self.current_expected = Some(dst_ty.clone());
-                }
-                let src_ty = self.infer(expr);
-                self.current_expected = prev_expected;
-                let src_ty = apply_ty_prune(&self.subst, &src_ty);
-                let range = expr.0.into_range();
-                if Self::is_byte_array_ty(&dst_ty).is_some() {
-                    if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
-                        return dst_ty;
-                    }
-                    if Self::is_string_ty(&src_ty) {
-                        // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
-                        // `[byte; N]` still requires a literal (length known).
-                        if matches!(
-                            Self::is_byte_array_ty(&dst_ty),
-                            Some(crate::typechecking::ty::ArrayLength::Dynamic)
-                        ) {
-                            return dst_ty;
-                        }
-                        return self.error_with_help(
-                            ErrorCode::TypeMismatch,
-                            "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
-                            range,
-                            Some(
-                                "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]` / `Vec<byte>`"
-                                    .to_string(),
-                            ),
-                        );
-                    }
-                }
-                match (
-                    Self::primitive_cast_name(&src_ty),
-                    Self::primitive_cast_name(&dst_ty),
-                ) {
-                    (Some(from), Some(to)) if from == to => dst_ty,
-                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => {
-                        if from == "int" && to == "byte" {
-                            if let Err(Some(n)) = Self::byte_literal_coercion(expr) {
-                                return self.error_with_help(
-                                    ErrorCode::TypeMismatch,
-                                    format!("byte literal out of range: `{n}` is not in 0..=255"),
-                                    range,
-                                    Some(
-                                        "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
-                                            .to_string(),
-                                    ),
-                                );
-                            }
-                        }
-                        dst_ty
-                    }
-                    (Some(from), Some(to)) => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        format!("cannot cast `{from}` to `{to}`"),
-                        range,
-                        Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
-                    ),
-                    (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        "cannot cast `string` to `byte`".to_string(),
-                        range,
-                        Some(
-                            "only a string literal whose UTF-8 encoding is exactly one byte coerces to `byte` (e.g. `\"/\"`, `\"\\n\"`)"
-                                .to_string(),
-                        ),
-                    ),
-                    _ => self.error_with_help(
-                        ErrorCode::TypeMismatch,
-                        "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
-                            .to_string(),
-                        ty_ann.0.into_range(),
-                        None,
-                    ),
-                }
-            }
+            Expression::Cast(expr, ty_ann) => self.infer_cast(expr, ty_ann),
 
             Expression::TypeOf(inner) => {
                 let inner_ty = self.infer(inner);
@@ -3988,207 +2718,9 @@ impl Checker {
                 tuple_ty(elem_tys)
             }
             // Array literal (static length from item count)
-            Expression::Array(items) => {
-                let expected_elem = self.current_expected.clone().and_then(|exp| {
-                    let exp = apply_ty_prune(&self.subst, &exp);
-                    if let Ty::Array { element, .. } = &exp {
-                        return Some(element.as_ref().clone());
-                    }
-                    vec_element_ty(&exp).cloned()
-                });
-                let mut elem_ty: Option<Ty> = None;
-                for item in items {
-                    let prev_expected = self.current_expected.take();
-                    if let Some(ref e) = expected_elem {
-                        self.current_expected = Some(e.clone());
-                    }
-                    let t = self.infer(item);
-                    self.current_expected = prev_expected;
-                    // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
-                    // `[Rank; 2]`, not a stuck `::v0` element type.
-                    let t_pruned =
-                        crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
-                            &self.subst, &t,
-                        ));
-                    match &elem_ty {
-                        None => elem_ty = Some(t_pruned),
-                        Some(prev) => {
-                            let prev_pruned = apply_ty_prune(&self.subst, prev);
-                            match unify_with(&self.subst, &prev_pruned, &t_pruned) {
-                                Ok(s) => {
-                                    self.subst = compose(&s, &self.subst);
-                                    elem_ty = Some(apply_ty_prune(
-                                        &self.subst,
-                                        &crate::typechecking::ty::peel_constructor_refinement(
-                                            prev_pruned,
-                                        ),
-                                    ));
-                                }
-                                Err(_) => {
-                                    let _ = self.error_with_help(
-                                        ErrorCode::TypeMismatch,
-                                        format!(
-                                            "array element type mismatch: expected `{}`, found `{}`",
-                                            prev_pruned, t_pruned
-                                        ),
-                                        range.clone(),
-                                        Some(
-                                            "an array literal requires every element to have the same type"
-                                                .to_string(),
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                let len = items.len();
-                if len == 0 {
-                    if let Some(exp) = self.current_expected.clone() {
-                        let exp = apply_ty_prune(&self.subst, &exp);
-                        if let Some(vec_elem) = vec_element_ty(&exp) {
-                            let _ = unify_with(&self.subst, vec_elem, &element);
-                            return apply_ty_prune(&self.subst, &exp);
-                        }
-                        if let Ty::Array {
-                            element: arr_elem,
-                            length,
-                        } = &exp
-                        {
-                            match length {
-                                ArrayLength::Static(0) => {
-                                    let _ = unify_with(&self.subst, arr_elem.as_ref(), &element);
-                                    return array_fixed(
-                                        apply_ty_prune(&self.subst, arr_elem.as_ref()),
-                                        0,
-                                    );
-                                }
-                                ArrayLength::Static(n) => {
-                                    return self.error_with_help(
-                                        ErrorCode::TypeMismatch,
-                                        format!(
-                                            "empty array literal `[]` cannot satisfy `[_; {}]`",
-                                            n
-                                        ),
-                                        range,
-                                        Some(format!(
-                                            "expected {} element{}, or annotate as `Vec<T>` / `[T; 0]`",
-                                            n,
-                                            if *n == 1 { "" } else { "s" }
-                                        )),
-                                    );
-                                }
-                                ArrayLength::Dynamic => {}
-                            }
-                        }
-                    }
-                    return self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        "empty array literal `[]` requires a type annotation".to_string(),
-                        range,
-                        Some(
-                            "annotate as `Vec<T>` (growable) or `[T; 0]` (fixed empty array)"
-                                .to_string(),
-                        ),
-                    );
-                }
-                array_fixed(element, len)
-            }
+            Expression::Array(items) => self.infer_array_literal(items, range),
             // Index: static-length OOB check for literal indices
-            Expression::Index(target, index_expr) => {
-                let target_ty = self.infer(target);
-                let target_ty = apply_ty_prune(&self.subst, &target_ty);
-                let Some(index_expr) = index_expr else {
-                    return self.error_with_help(
-                        ErrorCode::CannotIndex,
-                        "empty index `arr[]` is not valid".to_string(),
-                        range,
-                        Some("use `vec.push(value)` to append to a `Vec`".to_string()),
-                    );
-                };
-                let index_ty = self.infer(index_expr);
-                let index_ty_pruned = apply_ty_prune(&self.subst, &index_ty);
-                // Constrain the index to be an `int` (the VM only
-                // supports integer indices).
-                let _ = unify_with(&self.subst, &index_ty_pruned, &int());
-                let resolved = apply_ty_prune(&self.subst, &target_ty);
-                // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
-                let resolved =
-                    if let Some(data) = crate::typechecking::aggregate_arith::unwrap_matrix_ty(&resolved) {
-                        data.clone()
-                    } else {
-                        resolved
-                    };
-                match &resolved {
-                    Ty::Array { element, length } => {
-                        // Out-of-bounds check: only fires when the
-                        // target is a *static-length* array and the
-                        // index is a literal integer.
-                        if let ArrayLength::Static(n) = length
-                            && let Expression::Integer(idx) = index_expr.1.as_ref()
-                        {
-                            let i = *idx;
-                            if i < 0 || (i as usize) >= *n {
-                                let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds,
-                                    format!(
-                                        "array index {} out of bounds for array of length {}",
-                                        i, n
-                                    ),
-                                    range.clone(),
-                                    Some(format!(
-                                        "indices are valid in [0..{}); the array has length {}",
-                                        n, n
-                                    )),
-                                );
-                            }
-                        }
-                        (**element).clone()
-                    }
-                    other if vec_element_ty(other).is_some() => {
-                        vec_element_ty(other).expect("checked").clone()
-                    }
-                    Ty::Tuple(tys) => {
-                        // Tuple indexing: same diagnostic on constant
-                        // out-of-bounds; dynamic fallback returns a
-                        // fresh ty var (the runtime pushes -1i64 for
-                        // OOB).
-                        if let Expression::Integer(idx) = index_expr.1.as_ref() {
-                            let i = *idx;
-                            if i < 0 || (i as usize) >= tys.len() {
-                                let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds,
-                                    format!(
-                                        "tuple index {} out of bounds for tuple of length {}",
-                                        i,
-                                        tys.len()
-                                    ),
-                                    range.clone(),
-                                    Some(format!(
-                                        "indices are valid in [0..{}); the tuple has length {}",
-                                        tys.len(),
-                                        tys.len()
-                                    )),
-                                );
-                            } else {
-                                return tys[i as usize].clone();
-                            }
-                        }
-                        Ty::Var(self.counter.fresh())
-                    }
-                    _ => {
-                        // Non-aggregate target: emit a diagnostic.
-                        let _ = self.error_with_help(
-                            ErrorCode::CannotIndex,
-                            "cannot index non-aggregate type".to_string(),
-                            range.clone(),
-                            Some(format!("type `{}` does not support indexing", resolved)),
-                        );
-                        Ty::Var(self.counter.fresh())
-                    }
-                }
-            }
+            Expression::Index(target, index_expr) => self.infer_index_expr(target, index_expr, range),
             // ---- Dict literals ----
             Expression::Dict(fields) => {
                 // Check for duplicate field names — diagnostic
@@ -4338,122 +2870,25 @@ impl Checker {
                 returns,
                 where_constraints,
                 body,
-            } => {
-                if *is_static {
-                    return self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        "`static fn` is only allowed inside an `impl` block".to_string(),
-                        range,
-                        Some(
-                            "declare static methods as `impl Class { static fn ... }`".to_string(),
-                        ),
-                    );
-                }
-                if *name == "main" {
-                    self.main_decl_span = Some(range.clone());
-                }
-                let prev_overloadable = self.registering_overloadable_fn;
-                self.registering_overloadable_fn = self.current_typeclass.is_none();
-
-                let test_desc = parser::ast::attr_test_desc(attrs, name);
-                let prev_test_result_mode = if let Some(desc) = &test_desc {
-                    self.test_case_names.push(desc.clone());
-                    let prev = self.fn_result_mode.take();
-                    self.fn_result_mode = Some((unit_ty(), string()));
-                    prev
-                } else {
-                    None
-                };
-
-                self.infer_function(
-                    name,
-                    type_params,
-                    args,
-                    returns.as_ref(),
-                    where_constraints,
-                    body.as_ref(),
-                    &range,
-                    None,
-                    *is_coro,
-                    None,
-                    false,
-                );
-
-                if test_desc.is_some() {
-                    self.result_mode_fns.insert(name.to_string());
-                    self.fn_result_mode = prev_test_result_mode;
-                }
-
-                self.registering_overloadable_fn = prev_overloadable;
-                unit_ty()
-            }
+            } => self.infer_function_expr(
+                attrs,
+                name,
+                *is_coro,
+                *is_static,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                body,
+                range,
+            ),
 
             // ---- Anonymous lambdas ----
             Expression::Lambda {
                 args,
                 captures,
                 body,
-            } => {
-                // Resolve capture types from the outer env before isolating.
-                let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
-                for cap in captures {
-                    match self.env.lookup(cap).cloned() {
-                        Some(scheme) => {
-                            let ty = self.instantiate_ty(&scheme);
-                            cap_bindings.push((cap.to_string(), ty));
-                        }
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownValue,
-                                format!("Cannot find value `{}` in this scope", cap),
-                                range,
-                            );
-                        }
-                    }
-                }
-                let arg_tys = self.parse_arg_list(args);
-                let mut uncaptured = self.env.all_names();
-                for (n, _) in &cap_bindings {
-                    uncaptured.remove(n);
-                }
-                for (n, _) in &arg_tys {
-                    uncaptured.remove(n);
-                }
-
-                // File-level imports are global names, not closure captures.
-                // Rebind virtual + disk-module schemes after isolating the env.
-                let import_rebinds =
-                    self.snapshot_file_level_imports(&mut uncaptured, range.clone());
-
-                let saved_frames = self.env.take_and_isolate();
-                let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
-                self.rebind_file_level_imports(import_rebinds);
-                for (n, ty) in &cap_bindings {
-                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
-                    self.record_codegen_var_type(n.clone(), ty.clone());
-                }
-                for (n, ty) in &arg_tys {
-                    self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
-                    self.record_codegen_var_type(n.clone(), ty.clone());
-                }
-                // Match codegen: consume Fragment + Argument IDs before body.
-                self.assign_fn_arg_node_ids(args, &arg_tys);
-
-                let ret_slot = Ty::Var(self.counter.fresh());
-                let prev_ret = self.current_return_ty.replace(ret_slot.clone());
-                let body_ty = self.infer(body);
-                self.unify(&ret_slot, &body_ty, &range, "lambda body");
-                self.current_return_ty = prev_ret;
-                self.lambda_uncaptured_outer = prev_uncaptured;
-                self.env.restore_frames(saved_frames);
-
-                let ret = apply_ty_prune(&self.subst, &ret_slot);
-                let mut fun_ty = ret;
-                for (_, arg_ty) in arg_tys.iter().rev() {
-                    fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
-                }
-                Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false)
-            }
+            } => self.infer_lambda(args, captures, body, range),
 
             // ---- `test("…") { … }` harness cases ----
             Expression::TestCase { name, body } => self.infer_test_case(name, body, &range),
@@ -4501,164 +2936,8 @@ impl Checker {
             Expression::AttrDecl { .. } => unit_ty(),
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
-            Expression::Access(receiver, field) => {
-                let receiver_ty = self.infer(receiver);
-                let resolved = apply_ty_prune(&self.subst, &receiver_ty);
-                match strip_readonly(&resolved) {
-                    Ty::Sum { name, variants } => {
-                        self.access_field_in_sum(name, variants, None, field, range)
-                    }
-                    Ty::Constructor { tag, owner, .. } => {
-                        // Resolve the owner to its variants.
-                        match owner.as_ref() {
-                            Ty::Sum { name, variants } => {
-                                self.access_field_in_sum(name, variants, Some(*tag), field, range)
-                            }
-                            _ => self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("Cannot access field `{}` on non-record type", field),
-                                range,
-                                Some(
-                                    "only values of record-shaped enum types expose fields"
-                                        .to_string(),
-                                ),
-                            ),
-                        }
-                    }
-                    Ty::App(head, args) if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
-                    {
-                        let name = match head.as_ref() {
-                            Ty::Con(n) => n.clone(),
-                            _ => unreachable!(),
-                        };
-                        self.access_class_field(&name, field, args, range)
-                    }
-                    Ty::Con(name) => {
-                        // Class instance field access.
-                        if self.classes.contains_key(name) {
-                            return self.access_class_field(name, field, &[], range);
-                        }
-                        // Bare type name — resolve via the
-                        // checker's enum registry.
-                        let variant_names = self.enums.get(name).cloned().unwrap_or_default();
-                        let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
-                        if variant_names.is_empty() {
-                            return self.error_with_help(
-                                ErrorCode::GenericTypeError,
-                                format!("Cannot access field `{}` on non-record type", field),
-                                range,
-                                Some(format!("type `{}` is not a record-shaped enum", name)),
-                            );
-                        }
-                        let variants: Vec<(String, EnumVariantPayloadTy)> =
-                            variant_names.into_iter().zip(payloads).collect();
-                        self.access_field_in_sum(name, &variants, None, field, range)
-                    }
-                    Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
-                        Some((_, fty)) => fty.clone(),
-                        None => {
-                            let known: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-                            let msg = format!(
-                                "Cannot find field `{}` on record `{{ {} }}`",
-                                field,
-                                fields
-                                    .iter()
-                                    .map(|(n, t)| format!("{}: {}", n, t))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                            let help = if known.is_empty() {
-                                Some("the record has no fields".to_string())
-                            } else {
-                                Some(format!("the record has fields: {}", known.join(", ")))
-                            };
-                            self.error_with_help(ErrorCode::GenericTypeError, msg, range, help)
-                        }
-                    },
-                    _ => self.error_with_help(
-                        ErrorCode::GenericTypeError,
-                        format!("Cannot access field `{}` on non-record type", field),
-                        range,
-                        Some("only values of record-shaped enum types expose fields".to_string()),
-                    ),
-                }
-            }
-            Expression::Instantiate(class_expr, args) => {
-                let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
-                    && self.classes.contains_key(*name)
-                {
-                    (*name).to_string()
-                } else {
-                    let class_ty = self.infer(class_expr);
-                    let resolved = apply_ty_prune(&self.subst, &class_ty);
-                    match &resolved {
-                        Ty::Con(n) => n.clone(),
-                        _ => {
-                            return self.error(
-                                ErrorCode::NotAFunction,
-                                "Cannot instantiate non-class type".to_string(),
-                                range,
-                            );
-                        }
-                    }
-                };
-                if let Some(fields) = self.classes.get(&class_name).cloned() {
-                    let param_names = self
-                        .generics
-                        .generic_type_ctors
-                        .get(&class_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    // Freshen field types at each `new` site so independent
-                    // instantiations don't share type variables.
-                    let (field_tys, result_ty) = if param_names.is_empty() {
-                        (
-                            fields.iter().map(|(_, _, t)| t.clone()).collect::<Vec<_>>(),
-                            Ty::Con(class_name.clone()),
-                        )
-                    } else {
-                        let mut map = HashMap::new();
-                        let mut app_args = Vec::with_capacity(param_names.len());
-                        for p in &param_names {
-                            let v = Ty::Var(self.counter.fresh());
-                            app_args.push(v.clone());
-                            map.insert(p.clone(), v);
-                        }
-                        let field_tys = fields
-                            .iter()
-                            .map(|(_, _, t)| subst_ty_params(t, &map))
-                            .collect();
-                        (
-                            field_tys,
-                            Ty::App(Box::new(Ty::Con(class_name.clone())), app_args),
-                        )
-                    };
-                    let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
-                    if provided.len() != fields.len() {
-                        let _ = self.error_with_help(
-                            ErrorCode::ConstructorArity,
-                            format!(
-                                "Constructor `{}` expects {} arguments, got {}",
-                                class_name,
-                                fields.len(),
-                                provided.len()
-                            ),
-                            range,
-                            Some(
-                                "pass one argument per class field, in declaration order"
-                                    .to_string(),
-                            ),
-                        );
-                    } else {
-                        for (arg, fty) in provided.iter().zip(field_tys.iter()) {
-                            let aty = self.infer(arg);
-                            self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
-                        }
-                    }
-                    return apply_ty_prune(&self.subst, &result_ty);
-                }
-                Ty::Con(class_name)
-            }
+            Expression::Access(receiver, field) => self.infer_access_expr(receiver, field, range),
+            Expression::Instantiate(class_expr, args) => self.infer_instantiate(class_expr, args, range),
             Expression::Field { .. } => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
@@ -4766,670 +3045,13 @@ impl Checker {
                 name,
                 type_params,
                 methods,
-            } => {
-                // Collect associated type declarations and method defs.
-                let mut assoc_types: Vec<AssocTypeDecl> = Vec::new();
-                let method_defs: Vec<TypeClassMethodDef> = methods
-                    .iter()
-                    .filter_map(|m| match m.1.as_ref() {
-                        Expression::AssocTypeDecl {
-                            name: aname,
-                            type_params: assoc_params,
-                        } => {
-                            if assoc_types.iter().any(|a| a.name == *aname) {
-                                self.messages.push(Message::error(
-                                    ErrorCode::GenericTypeError,
-                                    format!(
-                                        "Duplicate associated type `{}` in trait `{}`",
-                                        aname, name
-                                    ),
-                                    m.0.into_range(),
-                                ));
-                            } else {
-                                let param_kinds = assoc_params
-                                    .iter()
-                                    .map(|tp| self.resolve_type_param_kind(tp))
-                                    .collect::<Vec<_>>();
-                                assoc_types.push(AssocTypeDecl::new(
-                                    aname.to_string(),
-                                    assoc_params.iter().map(|tp| tp.name.to_string()).collect(),
-                                    param_kinds,
-                                ));
-                            }
-                            None
-                        }
-                        Expression::Function {
-                            docs: _,
-                            name: mname, body, ..
-                        } => {
-                            let has_default = body.as_ref().is_some_and(
-                                |b| !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty()),
-                            );
-                            Some(TypeClassMethodDef {
-                                name: mname.to_string(),
-                                has_default,
-                            })
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let param_names: Vec<String> =
-                    type_params.iter().map(|tp| tp.name.to_string()).collect();
-                let param_kinds: Vec<Kind> = type_params
-                    .iter()
-                    .map(|tp| Kind::from(tp.kind.clone()))
-                    .collect();
-                // Single-param classes: param bounds become direct superclasses
-                // (`trait Ordered<T: Equal>` → superclasses: ["Equal"]).
-                // Multi-param classes ignore param bounds for superclass
-                // wiring (use `where` for those constraints later).
-                let superclasses: Vec<String> = if type_params.len() == 1 {
-                    type_params[0]
-                        .bounds
-                        .iter()
-                        .map(|b| (*b).to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                if let Some(previous) = self.generics.typeclass(name) {
-                    let is_prelude = Checker::is_builtin_class(name);
-                    if is_prelude && !self.builtin_name_in_scope(name) {
-                        // Short name was rebound (`use prelude::ops::Eq as …`);
-                        // allow the user trait to replace the builtin entry.
-                    } else {
-                        let mut msg = Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Duplicate trait `{}`", name),
-                            range.clone(),
-                        );
-                        if is_prelude && self.builtin_name_in_scope(name) {
-                            msg.with_help(format!(
-                                "`{}` is in the prelude; free the short name with `use {}::{} as OtherName;` before redefining, or pick a different name",
-                                name,
-                                previous.defined_module,
-                                name
-                            ));
-                        } else {
-                            msg.with_help(format!(
-                                "trait `{}` was already declared in module `{}`",
-                                name, previous.defined_module
-                            ));
-                        }
-                        self.messages.push(msg);
-                        for m in methods {
-                            let _ = self.infer(m);
-                        }
-                        return unit_ty();
-                    }
-                }
-                let def = TypeClassDef {
-                    name: name.to_string(),
-                    defined_module: self.current_module.clone(),
-                    type_params: param_names,
-                    param_kinds: param_kinds.clone(),
-                    superclasses,
-                    assoc_types: assoc_types.clone(),
-                    methods: method_defs.clone(),
-                };
-                self.generics.typeclasses.insert(name.to_string(), def);
-
-                // Build method schemes with trait parameters in scope.
-                // Applied associated types are recorded as explicit projection
-                // variables and quantified with the method scheme.
-                let mut param_frame = HashMap::new();
-                let mut param_vars = Vec::new();
-                let mut class_kinds = Vec::new();
-                for (i, type_param) in type_params.iter().enumerate() {
-                    let var = self.counter.fresh();
-                    let kind = param_kinds.get(i).cloned().unwrap_or(Kind::Type);
-                    self.set_var_kind(var, kind.clone());
-                    param_frame.insert(type_param.name.to_string(), var);
-                    param_vars.push(var);
-                    class_kinds.push(kind);
-                }
-                self.type_params_in_scope.push(param_frame);
-                self.current_typeclass = Some(name.to_string());
-                // ONE constraint over all class params (multi-param ready).
-                let class_constraints: Vec<Constraint> = vec![Constraint {
-                    class: name.to_string(),
-                    args: param_vars.iter().map(|v| Ty::Var(*v)).collect(),
-                }];
-                for method in methods {
-                    if let Expression::Function {
-                        docs: _,
-                        name: method_name,
-                        type_params: method_params,
-                        args,
-                        returns,
-                        ..
-                    } = method.1.as_ref()
-                    {
-                        // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
-                        let mut method_frame = HashMap::new();
-                        let mut method_vars = Vec::new();
-                        let mut method_kinds = Vec::new();
-                        for mp in method_params {
-                            let var = self.counter.fresh();
-                            let kind = self.resolve_type_param_kind(mp);
-                            self.set_var_kind(var, kind.clone());
-                            method_frame.insert(mp.name.to_string(), var);
-                            method_vars.push(var);
-                            method_kinds.push(kind);
-                        }
-                        let pushed_method = !method_frame.is_empty();
-                        if pushed_method {
-                            self.type_params_in_scope.push(method_frame);
-                        }
-                        let prev_assoc = self.current_assoc_projections.take();
-                        self.current_assoc_projections = Some(Vec::new());
-                        let arg_tys = self.parse_arg_list(args);
-                        let ret_ty = returns
-                            .as_ref()
-                            .map(|ret| self.parse_type_name(ret))
-                            .unwrap_or_else(unit_ty);
-                        let assoc_projections =
-                            self.current_assoc_projections.take().unwrap_or_default();
-                        self.current_assoc_projections = prev_assoc;
-                        let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
-                            Ty::Fun(Box::new(arg.clone()), Box::new(ret))
-                        });
-                        if pushed_method {
-                            self.type_params_in_scope.pop();
-                        }
-                        let mut all_bounds = param_vars.clone();
-                        all_bounds.extend(method_vars);
-                        all_bounds.extend(assoc_projections.iter().map(|p| p.var));
-                        let mut all_kinds = class_kinds.clone();
-                        all_kinds.extend(method_kinds);
-                        all_kinds.extend(std::iter::repeat_n(Kind::Type, assoc_projections.len()));
-                        self.typeclass_method_schemes.insert(
-                            (name.to_string(), method_name.to_string()),
-                            Scheme::poly_with_kinds_and_assoc(
-                                all_bounds,
-                                all_kinds,
-                                class_constraints.clone(),
-                                assoc_projections,
-                                fun_ty,
-                            ),
-                        );
-                    }
-                }
-
-                // Walk method bodies (ID alignment + default body typecheck).
-                // The class's own constraint is active so a default can call a
-                // sibling method through the same dictionary.
-                let active_len = self.active_constraints.len();
-                self.active_constraints.extend(class_constraints);
-                for m in methods {
-                    let _ = self.infer(m);
-                }
-                self.active_constraints.truncate(active_len);
-                self.type_params_in_scope.pop();
-                self.current_typeclass = None;
-                unit_ty()
-            }
+            } => self.infer_typeclass_decl(name, type_params, methods, range),
 
             Expression::TypeClassImpl {
                 class,
                 args,
                 methods,
-            } => {
-                // Resolve instance heads (bare ctors stay `Con` for HKT).
-                let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_instance_head(a)).collect();
-                // Walk arg type expressions for ID alignment; cache head tys
-                // so codegen FQNs match (not `Option<t0>` placeholders).
-                for (a, ty) in args.iter().zip(arg_tys.iter()) {
-                    self.cache_forced_ty(a, ty.clone());
-                }
-                // Verify class exists.
-                let class_def = self.generics.typeclass(class).cloned();
-                if class_def.is_none() {
-                    self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!("Unknown trait `{}`", class),
-                        range.clone(),
-                    ));
-                }
-                if let Some(ref cdef) = class_def {
-                    self.validate_instance_head_kinds(cdef, &arg_tys, &range);
-                }
-                let orphaned = class_def
-                    .as_ref()
-                    .is_some_and(|cdef| !self.instance_satisfies_orphan_rule(cdef, args, &arg_tys));
-                if orphaned {
-                    let instance = self.instance_signature(class, &arg_tys);
-                    let mut msg = Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Orphan instance `{}` is not allowed in module `{}`",
-                            instance, self.current_module
-                        ),
-                        range.clone(),
-                    );
-                    msg.with_help(
-                        "define the trait in this module, or define the nominal head of every non-variable instance argument here"
-                            .to_string(),
-                    );
-                    self.messages.push(msg);
-                }
-                let overlapping = self
-                    .generics
-                    .find_overlapping_instance(class, &arg_tys)
-                    .cloned();
-                if let Some(existing) = overlapping.as_ref() {
-                    let mut msg = Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Overlapping instance `{}` conflicts with existing `{}`",
-                            self.instance_signature(class, &arg_tys),
-                            self.instance_signature(&existing.class, &existing.args)
-                        ),
-                        range.clone(),
-                    );
-                    msg.with_help(format!(
-                        "existing instance was declared in module `{}`",
-                        existing.defined_module
-                    ));
-                    msg.push(Label::new(
-                        "new instance declared here".to_string(),
-                        range.clone(),
-                    ));
-                    if existing.defined_module == self.current_module {
-                        msg.push(Label::new(
-                            "existing overlapping instance declared here".to_string(),
-                            existing.range.clone(),
-                        ));
-                    }
-                    self.messages.push(msg);
-                }
-                // Build method_fqns, assoc_tys, and register instance.
-                let mut method_fqns = HashMap::new();
-                let mut method_names = Vec::new();
-                let mut assoc_tys: HashMap<String, AssocTypeValue> = HashMap::new();
-                let mut assoc_names: Vec<String> = Vec::new();
-                let mut invalid_assoc_defs = false;
-
-                // Pre-register a stub so recursive derived/hand-written
-                // method bodies can discharge constraints against the
-                // instance under construction. Assoc types are patched
-                // onto the stub as they are collected (before methods
-                // run), so projections stay valid during body infer.
-                let args_pretty_for_fqn: String = arg_tys
-                    .iter()
-                    .map(|t| format!("{}", t))
-                    .collect::<Vec<_>>()
-                    .join("_");
-                let mut stub_fqns = HashMap::new();
-                for m in methods {
-                    let mname = match m.1.as_ref() {
-                        Expression::Function { name, .. } => Some(*name),
-                        Expression::Method(_, body) => match body.1.as_ref() {
-                            Expression::Function { name, .. } => Some(*name),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(mname) = mname {
-                        stub_fqns.insert(
-                            mname.to_string(),
-                            format!("{}__{}__{}", class, args_pretty_for_fqn, mname),
-                        );
-                    }
-                }
-                let stub_idx = if class_def.is_some() && !orphaned && overlapping.is_none() {
-                    self.generics.instances.push(InstanceDef {
-                        class: class.to_string(),
-                        defined_module: self.current_module.clone(),
-                        range: range.clone(),
-                        args: arg_tys.clone(),
-                        method_fqns: stub_fqns,
-                        assoc_tys: HashMap::new(),
-                    });
-                    Some(self.generics.instances.len() - 1)
-                } else {
-                    None
-                };
-
-                for m in methods {
-                    match m.1.as_ref() {
-                        Expression::AssocTypeDef {
-                            name: aname,
-                            type_params: assoc_params,
-                            ty,
-                        } => {
-                            // Consume the AssocTypeDef wrapper NodeId, then the RHS.
-                            let wrapper_id = self.ids.ids()[self.next_id_idx];
-                            self.next_id_idx += 1;
-                            self.cache.insert(wrapper_id, unit_ty());
-                            let mut assoc_frame = HashMap::new();
-                            let mut assoc_param_vars = Vec::new();
-                            let mut assoc_param_kinds = Vec::new();
-                            for tp in assoc_params {
-                                let var = self.counter.fresh();
-                                let kind = self.resolve_type_param_kind(tp);
-                                self.set_var_kind(var, kind.clone());
-                                assoc_frame.insert(tp.name.to_string(), var);
-                                assoc_param_vars.push(var);
-                                assoc_param_kinds.push(kind);
-                            }
-                            let pushed_assoc_params = !assoc_frame.is_empty();
-                            if pushed_assoc_params {
-                                self.type_params_in_scope.push(assoc_frame);
-                            }
-                            let resolved = self.parse_type_name(ty);
-                            if pushed_assoc_params {
-                                let _ = self.type_params_in_scope.pop();
-                            }
-                            self.cache_forced_ty(ty, resolved.clone());
-                            if let Some(cdef) = class_def.as_ref()
-                                && let Some(decl) = cdef.assoc_type(aname)
-                            {
-                                if decl.params.len() != assoc_params.len() {
-                                    invalid_assoc_defs = true;
-                                    self.messages.push(Message::error(
-                                        ErrorCode::GenericTypeError,
-                                        format!(
-                                            "Associated type `{}` in instance of `{}` expects {} type parameter{}, got {}",
-                                            aname,
-                                            class,
-                                            decl.params.len(),
-                                            if decl.params.len() == 1 { "" } else { "s" },
-                                            assoc_params.len()
-                                        ),
-                                        m.0.into_range(),
-                                    ));
-                                }
-                                for (i, (expected, actual)) in decl
-                                    .param_kinds
-                                    .iter()
-                                    .zip(assoc_param_kinds.iter())
-                                    .enumerate()
-                                {
-                                    if expected != actual {
-                                        invalid_assoc_defs = true;
-                                        self.messages.push(Message::error(
-                                            ErrorCode::GenericTypeError,
-                                            format!(
-                                                "Type parameter {} of associated type `{}` has kind `{}`, expected `{}`",
-                                                i + 1,
-                                                aname,
-                                                actual,
-                                                expected
-                                            ),
-                                            m.0.into_range(),
-                                        ));
-                                    }
-                                }
-                                let rhs_kind = self.kind_of_ty(&resolved);
-                                if rhs_kind != Kind::Type {
-                                    invalid_assoc_defs = true;
-                                    self.messages.push(Message::error(
-                                        ErrorCode::GenericTypeError,
-                                        format!(
-                                            "Associated type `{}` in instance of `{}` must resolve to kind `*`, found `{}`",
-                                            aname, class, rhs_kind
-                                        ),
-                                        ty.0.into_range(),
-                                    ));
-                                }
-                            }
-                            if assoc_tys.contains_key(*aname) {
-                                self.messages.push(Message::error(
-                                    ErrorCode::GenericTypeError,
-                                    format!(
-                                        "Duplicate associated type `{}` in instance of `{}`",
-                                        aname, class
-                                    ),
-                                    m.0.into_range(),
-                                ));
-                            } else {
-                                assoc_names.push(aname.to_string());
-                                let value = AssocTypeValue {
-                                    params: assoc_params
-                                        .iter()
-                                        .map(|tp| tp.name.to_string())
-                                        .collect(),
-                                    param_vars: assoc_param_vars,
-                                    param_kinds: assoc_param_kinds,
-                                    ty: resolved,
-                                };
-                                if let Some(idx) = stub_idx {
-                                    self.generics.instances[idx]
-                                        .assoc_tys
-                                        .insert(aname.to_string(), value.clone());
-                                }
-                                assoc_tys.insert(aname.to_string(), value);
-                            }
-                        }
-                        _ => {
-                            let maybe_fn = match m.1.as_ref() {
-                                Expression::Function {
-                                    docs: _,
-                                    name,
-                                    type_params,
-                                    args,
-                                    returns,
-                                    where_constraints,
-                                    body,
-                                    is_coro,
-                                    ..
-                                } => Some((
-                                    *name,
-                                    type_params.as_slice(),
-                                    args,
-                                    returns,
-                                    where_constraints.as_slice(),
-                                    body,
-                                    *is_coro,
-                                )),
-                                Expression::Method(_, body) => match body.1.as_ref() {
-                                    Expression::Function {
-                                        docs: _,
-                                        name,
-                                        type_params,
-                                        args,
-                                        returns,
-                                        where_constraints,
-                                        body,
-                                        is_coro,
-                                        ..
-                                    } => Some((
-                                        *name,
-                                        type_params.as_slice(),
-                                        args,
-                                        returns,
-                                        where_constraints.as_slice(),
-                                        body,
-                                        *is_coro,
-                                    )),
-                                    _ => None,
-                                },
-                                _ => None,
-                            };
-                            if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
-                                maybe_fn
-                            {
-                                let fqn = format!(
-                                    "{}__{}__{}",
-                                    class,
-                                    arg_tys
-                                        .iter()
-                                        .map(|t| format!("{}", t))
-                                        .collect::<Vec<_>>()
-                                        .join("_"),
-                                    mname,
-                                );
-                                method_names.push(mname.to_string());
-                                method_fqns.insert(mname.to_string(), fqn.clone());
-                                self.infer_function(
-                                    mname,
-                                    mparams,
-                                    margs,
-                                    returns.as_ref(),
-                                    where_cs,
-                                    body.as_ref(),
-                                    &m.0.into_range(),
-                                    None,
-                                    is_coro,
-                                    None,
-                                    false,
-                                );
-                            } else {
-                                let _ = self.infer(m);
-                            }
-                        }
-                    }
-                }
-                let mut invalid_instance = class_def.is_none() || orphaned || overlapping.is_some();
-                if let Some(class_def) = class_def.as_ref() {
-                    // Superclass instances must already exist for the same args.
-                    // `impl Ordered<int>` requires `Equal<int>`, transitively.
-                    let mut missing_supers = Vec::new();
-                    let mut seen_super = HashSet::new();
-                    let mut stack: Vec<String> = class_def.superclasses.clone();
-                    while let Some(super_name) = stack.pop() {
-                        if !seen_super.insert(super_name.clone()) {
-                            continue;
-                        }
-                        if self.generics.find_instance(&super_name, &arg_tys).is_none() {
-                            missing_supers.push(super_name.clone());
-                        }
-                        if let Some(super_def) = self.generics.typeclass(&super_name) {
-                            stack.extend(super_def.superclasses.iter().cloned());
-                        }
-                    }
-                    for super_name in &missing_supers {
-                        let args_pretty = arg_tys
-                            .iter()
-                            .map(|ty| ty.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` requires superclass instance `{}<{}>`",
-                                class, args_pretty, super_name, args_pretty
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    let unknown_methods = Generics::unknown_instance_methods(
-                        class_def,
-                        method_names.iter().map(|name| name.as_str()),
-                    );
-                    for method in &unknown_methods {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Unknown method `{}` in instance of `{}`", method, class),
-                            range.clone(),
-                        ));
-                    }
-                    let unknown_assoc = Generics::unknown_assoc_types(
-                        class_def,
-                        assoc_names.iter().map(|n| n.as_str()),
-                    );
-                    for aname in &unknown_assoc {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Unknown associated type `{}` in instance of `{}`",
-                                aname, class
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    let missing_assoc = Generics::missing_assoc_types(class_def, &assoc_tys);
-                    if !missing_assoc.is_empty() {
-                        let names = missing_assoc
-                            .iter()
-                            .map(|n| format!("`{}`", n))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let noun = if missing_assoc.len() == 1 {
-                            "associated type"
-                        } else {
-                            "associated types"
-                        };
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` is missing {} {}",
-                                class,
-                                arg_tys
-                                    .iter()
-                                    .map(|ty| ty.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                noun,
-                                names
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    Generics::fill_default_method_fqns(class_def, &mut method_fqns);
-                    let missing_methods =
-                        Generics::missing_required_methods(class_def, &method_fqns);
-                    if !missing_methods.is_empty() {
-                        let methods = missing_methods
-                            .iter()
-                            .map(|method| format!("`{}`", method))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let noun = if missing_methods.len() == 1 {
-                            "method"
-                        } else {
-                            "methods"
-                        };
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` is missing {} {}",
-                                class,
-                                arg_tys
-                                    .iter()
-                                    .map(|ty| ty.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                noun,
-                                methods
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    invalid_instance |= !unknown_methods.is_empty()
-                        || !missing_methods.is_empty()
-                        || !missing_supers.is_empty()
-                        || !unknown_assoc.is_empty()
-                        || !missing_assoc.is_empty()
-                        || invalid_assoc_defs;
-                }
-                // Finalize the stub (or push a fresh instance when no stub).
-                // Omitted defaulted methods have been filled with class-default FQNs.
-                // Never `remove(idx)` — that shifts later instance indices; clear
-                // the stub in place when invalid instead.
-                if let Some(idx) = stub_idx {
-                    if invalid_instance {
-                        self.generics.instances[idx].method_fqns.clear();
-                        self.generics.instances[idx].assoc_tys.clear();
-                        self.generics.instances[idx].args.clear();
-                        self.generics.instances[idx].class.clear();
-                    } else {
-                        self.generics.instances[idx].method_fqns = method_fqns;
-                        self.generics.instances[idx].assoc_tys = assoc_tys;
-                    }
-                } else if !invalid_instance {
-                    self.generics.instances.push(InstanceDef {
-                        class: class.to_string(),
-                        defined_module: self.current_module.clone(),
-                        range: range.clone(),
-                        args: arg_tys,
-                        method_fqns,
-                        assoc_tys,
-                    });
-                }
-                unit_ty()
-            }
+            } => self.infer_typeclass_impl(class, args, methods, range),
 
             Expression::AssocTypeDecl { .. } => unit_ty(),
             Expression::AssocTypeDef { ty, .. } => {
@@ -5493,6 +3115,2612 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_compound_assign(
+        &mut self,
+        target: &Output,
+        op: &parser::ast::AssignOp,
+        value: &Output,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        let target_ty = self.infer_mutable_lvalue(target, range.clone());
+        let val_ty = self.infer(value);
+        let op_name = Self::compound_op_name(*op);
+        if matches!(
+            op,
+            parser::ast::AssignOp::Shl
+                | parser::ast::AssignOp::Shr
+                | parser::ast::AssignOp::BitAnd
+                | parser::ast::AssignOp::BitOr
+                | parser::ast::AssignOp::BitXor
+        ) {
+            let _ = unify_with(&self.subst, &target_ty, &int());
+            let _ = unify_with(&self.subst, &val_ty, &int());
+        } else {
+            let tp = apply_ty_prune(&self.subst, &target_ty);
+            let vp = apply_ty_prune(&self.subst, &val_ty);
+            if crate::typechecking::aggregate_arith::is_matrix_ty(&tp)
+                || crate::typechecking::aggregate_arith::is_matrix_ty(&vp)
+            {
+                let result =
+                    self.infer_matrix_arith(tp.clone(), vp, id, range.clone(), op_name);
+                let _ = self.unify(
+                    &target_ty,
+                    &result,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            } else if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
+                || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
+            {
+                // Resolve as aggregate arith; result must match LHS shape.
+                let result =
+                    self.infer_aggregate_arith(tp.clone(), vp, id, range.clone(), op_name);
+                let _ = self.unify(
+                    &target_ty,
+                    &result,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            } else {
+                self.unify(
+                    &target_ty,
+                    &val_ty,
+                    &range,
+                    &format!("operands of `{}=`", op_name),
+                );
+            }
+        }
+        apply_ty_prune(&self.subst, &target_ty)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_function_expr(
+        &mut self,
+        attrs: &[parser::ast::Attribute],
+        name: &str,
+        is_coro: bool,
+        is_static: bool,
+        type_params: &[TypeParam],
+        args: &Output,
+        returns: &Option<Output>,
+        where_constraints: &[parser::ast::WhereConstraint],
+        body: &Option<Output>,
+        range: Range<usize>,
+    ) -> Ty {
+        if is_static {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "`static fn` is only allowed inside an `impl` block".to_string(),
+                range,
+                Some(
+                    "declare static methods as `impl Class { static fn ... }`".to_string(),
+                ),
+            );
+        }
+        if name == "main" {
+            self.main_decl_span = Some(range.clone());
+        }
+        let prev_overloadable = self.registering_overloadable_fn;
+        self.registering_overloadable_fn = self.current_typeclass.is_none();
+
+        let test_desc = parser::ast::attr_test_desc(attrs, name);
+        let prev_test_result_mode = if let Some(desc) = &test_desc {
+            self.test_case_names.push(desc.clone());
+            let prev = self.fn_result_mode.take();
+            self.fn_result_mode = Some((unit_ty(), string()));
+            prev
+        } else {
+            None
+        };
+
+        self.infer_function(
+            name,
+            type_params,
+            args,
+            returns.as_ref(),
+            where_constraints,
+            body.as_ref(),
+            &range,
+            None,
+            is_coro,
+            None,
+            false,
+        );
+
+        if test_desc.is_some() {
+            self.result_mode_fns.insert(name.to_string());
+            self.fn_result_mode = prev_test_result_mode;
+        }
+
+        self.registering_overloadable_fn = prev_overloadable;
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_lambda(
+        &mut self,
+        args: &Output,
+        captures: &[&str],
+        body: &Output,
+        range: Range<usize>,
+    ) -> Ty {
+        // Resolve capture types from the outer env before isolating.
+        let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
+        for cap in captures {
+            match self.env.lookup(cap).cloned() {
+                Some(scheme) => {
+                    let ty = self.instantiate_ty(&scheme);
+                    cap_bindings.push((cap.to_string(), ty));
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownValue,
+                        format!("Cannot find value `{}` in this scope", cap),
+                        range,
+                    );
+                }
+            }
+        }
+        let arg_tys = self.parse_arg_list(args);
+        let mut uncaptured = self.env.all_names();
+        for (n, _) in &cap_bindings {
+            uncaptured.remove(n);
+        }
+        for (n, _) in &arg_tys {
+            uncaptured.remove(n);
+        }
+
+        // File-level imports are global names, not closure captures.
+        // Rebind virtual + disk-module schemes after isolating the env.
+        let import_rebinds =
+            self.snapshot_file_level_imports(&mut uncaptured, range.clone());
+
+        let saved_frames = self.env.take_and_isolate();
+        let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+        self.rebind_file_level_imports(import_rebinds);
+        for (n, ty) in &cap_bindings {
+            self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
+            self.record_codegen_var_type(n.clone(), ty.clone());
+        }
+        for (n, ty) in &arg_tys {
+            self.env.insert_top(n.clone(), Scheme::mono(ty.clone()));
+            self.record_codegen_var_type(n.clone(), ty.clone());
+        }
+        // Match codegen: consume Fragment + Argument IDs before body.
+        self.assign_fn_arg_node_ids(args, &arg_tys);
+
+        let ret_slot = Ty::Var(self.counter.fresh());
+        let prev_ret = self.current_return_ty.replace(ret_slot.clone());
+        let body_ty = self.infer(body);
+        self.unify(&ret_slot, &body_ty, &range, "lambda body");
+        self.current_return_ty = prev_ret;
+        self.lambda_uncaptured_outer = prev_uncaptured;
+        self.env.restore_frames(saved_frames);
+
+        let ret = apply_ty_prune(&self.subst, &ret_slot);
+        let mut fun_ty = ret;
+        for (_, arg_ty) in arg_tys.iter().rev() {
+            fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+        }
+        Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false)
+    }
+
+    #[inline(never)]
+    fn infer_extern_block(&mut self, declarations: &[ExternFunction]) -> Ty {
+        for decl in declarations {
+            let arg_tys: Vec<Ty> = if let Expression::Fragment(items) = decl.args.1.as_ref()
+            {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        if let Expression::Argument { ty, .. } = item.1.as_ref() {
+                            ty.as_ref().map(|t| self.parse_type_name(t))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let nfixed = arg_tys.len();
+            let ret_ty = decl
+                .returns
+                .as_ref()
+                .map(|r| self.parse_type_name(r))
+                .unwrap_or_else(unit_ty);
+            // Register the fixed-prefix function type (extra `...` args
+            // are accepted at call sites via `extern_variadic`).
+            let fn_ty = arg_tys
+                .iter()
+                .rev()
+                .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
+            self.env
+                .insert_top(decl.name.to_string(), Scheme::mono(fn_ty.clone()));
+            if decl.variadic {
+                self.extern_variadic.insert(decl.name.to_string());
+                self.extern_variadic_nfixed
+                    .insert(decl.name.to_string(), nfixed);
+            } else {
+                // Fixed-arity extern overloads (C `...` is not a member).
+                let param_names: Vec<String> =
+                    if let Expression::Fragment(items) = decl.args.1.as_ref() {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                if let Expression::Argument { name, .. } = item.1.as_ref() {
+                                    Some(name.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                self.register_overload_candidate(
+                    decl.name,
+                    OverloadCandidate {
+            id: 0,
+                        fixed_arity: nfixed,
+                        is_rest: false,
+                        scheme: Scheme::mono(fn_ty),
+                        param_names,
+                    },
+                    &decl.args.0.into_range(),
+                );
+            }
+        }
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_use_decl(
+        &mut self,
+        path: &[String],
+        name: &str,
+        alias: &Option<String>,
+        range: Range<usize>,
+    ) -> Ty {
+        let module_ns = path.join("::");
+        if name == "*" {
+            // Prelude is injected automatically; every other module —
+            // virtual or userland — requires explicit imports.
+            let mod_label = if module_ns.is_empty() {
+                "<entry>".to_string()
+            } else {
+                module_ns.clone()
+            };
+            return self.error_with_help(
+                ErrorCode::WildcardImport,
+                format!("wildcard import `use {}::*` is not allowed", mod_label),
+                range,
+                Some(format!(
+                    "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
+                    mod_label
+                )),
+            );
+        }
+        if self.apply_virtual_use(path, name, alias.as_deref()) {
+            // Bind FFI callables into the value env so Call sites
+            // resolve; enums/traits/tags are scope-only.
+            let locals: Vec<(String, BuiltinExport)> = self
+                .scope_bindings
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e,
+                        BuiltinExport::FfiFn { .. }
+                            | BuiltinExport::IoFn { .. }
+                            | BuiltinExport::StringFn { .. }
+                            | BuiltinExport::ThreadFn { .. }
+                            | BuiltinExport::GcFn { .. }
+                            | BuiltinExport::HostFn { .. }
+                    )
+                })
+                .map(|(k, e)| (k.clone(), e.clone()))
+                .collect();
+            for (local, export) in locals {
+                if self.env.lookup(&local).is_some() {
+                    continue;
+                }
+                if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                    self.env.insert_top(local, scheme);
+                }
+            }
+            return unit_ty();
+        }
+        let local = alias.clone().unwrap_or_else(|| name.to_string());
+        let fqn = if module_ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{module_ns}::{name}")
+        };
+        // Prefer the defining module's real scheme (incl. generics with
+        // bounds) over a dummy Var so call sites get dict-passing ABI.
+        self.reexport_module_item(&fqn, &local);
+        // Re-export overload families under the local alias so
+        // `use num::{abs}` can still type-dispatch.
+        if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
+            if cands.len() > 1 {
+                self.overload_sets.insert(local.clone(), cands);
+            }
+        }
+        // Disk imports are file-level globals — track for lambda/defer
+        // rebind after `take_and_isolate`.
+        if name != "*" {
+            self.disk_imports.insert(local);
+        }
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_instantiate(
+        &mut self,
+        class_expr: &Output,
+        args: &Option<Vec<Output>>,
+        range: Range<usize>,
+    ) -> Ty {
+        let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
+            && self.classes.contains_key(*name)
+        {
+            (*name).to_string()
+        } else {
+            let class_ty = self.infer(class_expr);
+            let resolved = apply_ty_prune(&self.subst, &class_ty);
+            match &resolved {
+                Ty::Con(n) => n.clone(),
+                _ => {
+                    return self.error(
+                        ErrorCode::NotAFunction,
+                        "Cannot instantiate non-class type".to_string(),
+                        range,
+                    );
+                }
+            }
+        };
+        if let Some(fields) = self.classes.get(&class_name).cloned() {
+            let param_names = self
+                .generics
+                .generic_type_ctors
+                .get(&class_name)
+                .cloned()
+                .unwrap_or_default();
+            // Freshen field types at each `new` site so independent
+            // instantiations don't share type variables.
+            let (field_tys, result_ty) = if param_names.is_empty() {
+                (
+                    fields.iter().map(|(_, _, t)| t.clone()).collect::<Vec<_>>(),
+                    Ty::Con(class_name.clone()),
+                )
+            } else {
+                let mut map = HashMap::new();
+                let mut app_args = Vec::with_capacity(param_names.len());
+                for p in &param_names {
+                    let v = Ty::Var(self.counter.fresh());
+                    app_args.push(v.clone());
+                    map.insert(p.clone(), v);
+                }
+                let field_tys = fields
+                    .iter()
+                    .map(|(_, _, t)| subst_ty_params(t, &map))
+                    .collect();
+                (
+                    field_tys,
+                    Ty::App(Box::new(Ty::Con(class_name.clone())), app_args),
+                )
+            };
+            let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
+            if provided.len() != fields.len() {
+                let _ = self.error_with_help(
+                    ErrorCode::ConstructorArity,
+                    format!(
+                        "Constructor `{}` expects {} arguments, got {}",
+                        class_name,
+                        fields.len(),
+                        provided.len()
+                    ),
+                    range,
+                    Some(
+                        "pass one argument per class field, in declaration order"
+                            .to_string(),
+                    ),
+                );
+            } else {
+                for (arg, fty) in provided.iter().zip(field_tys.iter()) {
+                    let aty = self.infer(arg);
+                    self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
+                }
+            }
+            return apply_ty_prune(&self.subst, &result_ty);
+        }
+        Ty::Con(class_name)
+    }
+
+    #[inline(never)]
+    fn infer_access_expr(
+        &mut self,
+        receiver: &Output,
+        field: &str,
+        range: Range<usize>,
+    ) -> Ty {
+        let receiver_ty = self.infer(receiver);
+        let resolved = apply_ty_prune(&self.subst, &receiver_ty);
+        match strip_readonly(&resolved) {
+            Ty::Sum { name, variants } => {
+                self.access_field_in_sum(name, variants, None, field, range)
+            }
+            Ty::Constructor { tag, owner, .. } => {
+                // Resolve the owner to its variants.
+                match owner.as_ref() {
+                    Ty::Sum { name, variants } => {
+                        self.access_field_in_sum(name, variants, Some(*tag), field, range)
+                    }
+                    _ => self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on non-record type", field),
+                        range,
+                        Some(
+                            "only values of record-shaped enum types expose fields"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+            Ty::App(head, args) if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
+            {
+                let name = match head.as_ref() {
+                    Ty::Con(n) => n.clone(),
+                    _ => unreachable!(),
+                };
+                self.access_class_field(&name, field, args, range)
+            }
+            Ty::Con(name) => {
+                // Class instance field access.
+                if self.classes.contains_key(name) {
+                    return self.access_class_field(name, field, &[], range);
+                }
+                // Bare type name — resolve via the
+                // checker's enum registry.
+                let variant_names = self.enums.get(name).cloned().unwrap_or_default();
+                let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
+                if variant_names.is_empty() {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on non-record type", field),
+                        range,
+                        Some(format!("type `{}` is not a record-shaped enum", name)),
+                    );
+                }
+                let variants: Vec<(String, EnumVariantPayloadTy)> =
+                    variant_names.into_iter().zip(payloads).collect();
+                self.access_field_in_sum(name, &variants, None, field, range)
+            }
+            Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
+                Some((_, fty)) => fty.clone(),
+                None => {
+                    let known: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                    let msg = format!(
+                        "Cannot find field `{}` on record `{{ {} }}`",
+                        field,
+                        fields
+                            .iter()
+                            .map(|(n, t)| format!("{}: {}", n, t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let help = if known.is_empty() {
+                        Some("the record has no fields".to_string())
+                    } else {
+                        Some(format!("the record has fields: {}", known.join(", ")))
+                    };
+                    self.error_with_help(ErrorCode::GenericTypeError, msg, range, help)
+                }
+            },
+            _ => self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("Cannot access field `{}` on non-record type", field),
+                range,
+                Some("only values of record-shaped enum types expose fields".to_string()),
+            ),
+        }
+    }
+
+    #[inline(never)]
+    fn infer_cast(&mut self, expr: &Output, ty_ann: &Output) -> Ty {
+        let dst_ty = self.parse_type_name(ty_ann);
+        let dst_ty = apply_ty_prune(&self.subst, &dst_ty);
+        // Pin expected type so `"/" as byte`, `"hi" as [byte]`, and
+        // in-range `65 as byte` type the operand as the target when it
+        // is a coercible literal.
+        let prev_expected = self.current_expected.take();
+        if Self::is_byte_ty(&dst_ty) || Self::is_byte_array_ty(&dst_ty).is_some() {
+            self.current_expected = Some(dst_ty.clone());
+        }
+        let src_ty = self.infer(expr);
+        self.current_expected = prev_expected;
+        let src_ty = apply_ty_prune(&self.subst, &src_ty);
+        let range = expr.0.into_range();
+        if Self::is_byte_array_ty(&dst_ty).is_some() {
+            if Self::byte_array_tys_compatible(&src_ty, &dst_ty) {
+                return dst_ty;
+            }
+            if Self::is_string_ty(&src_ty) {
+                // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
+                // `[byte; N]` still requires a literal (length known).
+                if matches!(
+                    Self::is_byte_array_ty(&dst_ty),
+                    Some(crate::typechecking::ty::ArrayLength::Dynamic)
+                ) {
+                    return dst_ty;
+                }
+                return self.error_with_help(
+                    ErrorCode::TypeMismatch,
+                    "cannot cast `string` to fixed-length `[byte; N]`".to_string(),
+                    range,
+                    Some(
+                        "use a string literal of length N, or `to_bytes(s)` for a dynamic `[byte]` / `Vec<byte>`"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+        match (
+            Self::primitive_cast_name(&src_ty),
+            Self::primitive_cast_name(&dst_ty),
+        ) {
+            (Some(from), Some(to)) if from == to || Self::primitive_cast_allowed(from, to) => {
+                // Expected-byte inference can type `(-1)` as `byte` before
+                // this match (`from == to`); still reject out-of-range literals.
+                if to == "byte"
+                    && (from == "int" || from == "byte")
+                    && let Err(Some(n)) = Self::byte_literal_coercion(expr)
+                {
+                    return self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!("byte literal out of range: `{n}` is not in 0..=255"),
+                        range,
+                        Some(
+                            "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
+                                .to_string(),
+                        ),
+                    );
+                }
+                dst_ty
+            }
+            (Some(from), Some(to)) => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!("cannot cast `{from}` to `{to}`"),
+                range,
+                Some("allowed casts: int↔float, int↔byte, int↔bool; single-byte string literals → byte; string literals → `[byte]` / `[byte; N]`".to_string()),
+            ),
+            (None, Some("byte")) if Self::is_string_ty(&src_ty) => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "cannot cast `string` to `byte`".to_string(),
+                range,
+                Some(
+                    "only a string literal whose UTF-8 encoding is exactly one byte coerces to `byte` (e.g. `\"/\"`, `\"\\n\"`)"
+                        .to_string(),
+                ),
+            ),
+            _ => self.error_with_help(
+                ErrorCode::TypeMismatch,
+                "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`) or a byte array (`[byte]` / `[byte; N]`)"
+                    .to_string(),
+                ty_ann.0.into_range(),
+                None,
+            ),
+        }
+    }
+
+    #[inline(never)]
+    fn infer_index_expr(
+        &mut self,
+        target: &Output,
+        index_expr: &Option<Output>,
+        range: Range<usize>,
+    ) -> Ty {
+        let target_ty = self.infer(target);
+        let target_ty = apply_ty_prune(&self.subst, &target_ty);
+        let Some(index_expr) = index_expr else {
+            return self.error_with_help(
+                ErrorCode::CannotIndex,
+                "empty index `arr[]` is not valid".to_string(),
+                range,
+                Some("use `vec.push(value)` to append to a `Vec`".to_string()),
+            );
+        };
+        let index_ty = self.infer(index_expr);
+        let index_ty_pruned = apply_ty_prune(&self.subst, &index_ty);
+        // Constrain the index to be an `int` (the VM only
+        // supports integer indices).
+        let _ = unify_with(&self.subst, &index_ty_pruned, &int());
+        let resolved = apply_ty_prune(&self.subst, &target_ty);
+        // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
+        let resolved =
+            if let Some(data) = crate::typechecking::aggregate_arith::unwrap_matrix_ty(&resolved) {
+                data.clone()
+            } else {
+                resolved
+            };
+        match &resolved {
+            Ty::Array { element, length } => {
+                // Out-of-bounds check: only fires when the
+                // target is a *static-length* array and the
+                // index is a literal integer.
+                if let ArrayLength::Static(n) = length
+                    && let Expression::Integer(idx) = index_expr.1.as_ref()
+                {
+                    let i = *idx;
+                    if i < 0 || (i as usize) >= *n {
+                        let _ = self.error_with_help(
+                            ErrorCode::IndexOutOfBounds,
+                            format!(
+                                "array index {} out of bounds for array of length {}",
+                                i, n
+                            ),
+                            range.clone(),
+                            Some(format!(
+                                "indices are valid in [0..{}); the array has length {}",
+                                n, n
+                            )),
+                        );
+                    }
+                }
+                (**element).clone()
+            }
+            other if vec_element_ty(other).is_some() => {
+                vec_element_ty(other).expect("checked").clone()
+            }
+            Ty::Tuple(tys) => {
+                // Tuple indexing: same diagnostic on constant
+                // out-of-bounds; dynamic fallback returns a
+                // fresh ty var (the runtime pushes -1i64 for
+                // OOB).
+                if let Expression::Integer(idx) = index_expr.1.as_ref() {
+                    let i = *idx;
+                    if i < 0 || (i as usize) >= tys.len() {
+                        let _ = self.error_with_help(
+                            ErrorCode::IndexOutOfBounds,
+                            format!(
+                                "tuple index {} out of bounds for tuple of length {}",
+                                i,
+                                tys.len()
+                            ),
+                            range.clone(),
+                            Some(format!(
+                                "indices are valid in [0..{}); the tuple has length {}",
+                                tys.len(),
+                                tys.len()
+                            )),
+                        );
+                    } else {
+                        return tys[i as usize].clone();
+                    }
+                }
+                Ty::Var(self.counter.fresh())
+            }
+            _ => {
+                // Non-aggregate target: emit a diagnostic.
+                let _ = self.error_with_help(
+                    ErrorCode::CannotIndex,
+                    "cannot index non-aggregate type".to_string(),
+                    range.clone(),
+                    Some(format!("type `{}` does not support indexing", resolved)),
+                );
+                Ty::Var(self.counter.fresh())
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn infer_array_literal(&mut self, items: &[Output], range: Range<usize>) -> Ty {
+        let expected_elem = self.current_expected.clone().and_then(|exp| {
+            let exp = apply_ty_prune(&self.subst, &exp);
+            if let Ty::Array { element, .. } = &exp {
+                return Some(element.as_ref().clone());
+            }
+            vec_element_ty(&exp).cloned()
+        });
+        let mut elem_ty: Option<Ty> = None;
+        for item in items {
+            let prev_expected = self.current_expected.take();
+            if let Some(ref e) = expected_elem {
+                self.current_expected = Some(e.clone());
+            }
+            let t = self.infer(item);
+            self.current_expected = prev_expected;
+            // Peel constructor tags so `[Rank::Low, Rank::Mid]` is
+            // `[Rank; 2]`, not a stuck `::v0` element type.
+            let t_pruned =
+                crate::typechecking::ty::peel_constructor_refinement(apply_ty_prune(
+                    &self.subst, &t,
+                ));
+            match &elem_ty {
+                None => elem_ty = Some(t_pruned),
+                Some(prev) => {
+                    let prev_pruned = apply_ty_prune(&self.subst, prev);
+                    match unify_with(&self.subst, &prev_pruned, &t_pruned) {
+                        Ok(s) => {
+                            self.subst = compose(&s, &self.subst);
+                            elem_ty = Some(apply_ty_prune(
+                                &self.subst,
+                                &crate::typechecking::ty::peel_constructor_refinement(
+                                    prev_pruned,
+                                ),
+                            ));
+                        }
+                        Err(_) => {
+                            let _ = self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "array element type mismatch: expected `{}`, found `{}`",
+                                    prev_pruned, t_pruned
+                                ),
+                                range.clone(),
+                                Some(
+                                    "an array literal requires every element to have the same type"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+        let len = items.len();
+        if len == 0 {
+            if let Some(exp) = self.current_expected.clone() {
+                let exp = apply_ty_prune(&self.subst, &exp);
+                if let Some(vec_elem) = vec_element_ty(&exp) {
+                    let _ = unify_with(&self.subst, vec_elem, &element);
+                    return apply_ty_prune(&self.subst, &exp);
+                }
+                if let Ty::Array {
+                    element: arr_elem,
+                    length,
+                } = &exp
+                {
+                    match length {
+                        ArrayLength::Static(0) => {
+                            let _ = unify_with(&self.subst, arr_elem.as_ref(), &element);
+                            return array_fixed(
+                                apply_ty_prune(&self.subst, arr_elem.as_ref()),
+                                0,
+                            );
+                        }
+                        ArrayLength::Static(n) => {
+                            return self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "empty array literal `[]` cannot satisfy `[_; {}]`",
+                                    n
+                                ),
+                                range,
+                                Some(format!(
+                                    "expected {} element{}, or annotate as `Vec<T>` / `[T; 0]`",
+                                    n,
+                                    if *n == 1 { "" } else { "s" }
+                                )),
+                            );
+                        }
+                        ArrayLength::Dynamic => {}
+                    }
+                }
+            }
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "empty array literal `[]` requires a type annotation".to_string(),
+                range,
+                Some(
+                    "annotate as `Vec<T>` (growable) or `[T; 0]` (fixed empty array)"
+                        .to_string(),
+                ),
+            );
+        }
+        array_fixed(element, len)
+    }
+
+    #[inline(never)]
+    fn infer_identifier(&mut self, name: &str, range: Range<usize>) -> Ty {
+        // When `name` has multiple overload candidates and appears in
+        // value position, try to narrow using `current_expected`.
+        if self.is_overloaded(name) {
+            let candidates: Vec<OverloadCandidate> = self
+                .overload_candidates(name)
+                .map(|c| c.to_vec())
+                .unwrap_or_default();
+            // If exactly one candidate matches current_expected, pick it.
+            let expected = self.current_expected.clone();
+            let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
+                // Prune so a solved `Ty::Var` expected type doesn't look
+                // open; unify under `self.subst` (not empty) so existing
+                // bindings are visible without mutating the running subst.
+                let exp = apply_ty_prune(&self.subst, exp);
+                candidates
+                    .iter()
+                    .filter(|c| {
+                        let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
+                        crate::typechecking::unify::unify_with(&self.subst, &fun_ty, &exp)
+                            .is_ok()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            if matching.len() == 1 {
+                // Unique match — record and return its type.
+                let candidate = matching[0].clone();
+                self.selected_overloads_by_span.insert(
+                    (range.start, range.end),
+                    (candidate.fixed_arity, candidate.is_rest, candidate.id),
+                );
+                return self.instantiate_ty(&candidate.scheme);
+            } else if matching.len() > 1 || expected.is_none() {
+                // Multiple matches or no expected type — ambiguous.
+                // For the single-candidate case there is no ambiguity even
+                // without context, but we already checked `is_overloaded`
+                // (len > 1), so ambiguous.
+                let arities: Vec<String> = candidates
+                    .iter()
+                    .map(|c| Self::overload_sig_label(c))
+                    .collect();
+                return self.error_with_help(
+                    ErrorCode::AmbiguousOverload,
+                    format!(
+                        "Ambiguous overload: `{}` has multiple candidates in value position",
+                        name
+                    ),
+                    range,
+                    Some(format!(
+                        "available overloads: {}; annotate the expected type to disambiguate",
+                        arities.join(", ")
+                    )),
+                );
+            }
+            // matching.len() == 0 with an expected type — no candidate
+            // unifies. Emit a dedicated diagnostic rather than falling
+            // through to the last-registered scheme (wrong codegen key /
+            // confusing TypeMismatch downstream).
+            let arities: Vec<String> = candidates
+                .iter()
+                .map(|c| Self::overload_sig_label(c))
+                .collect();
+            let expected_pretty = expected
+                .as_ref()
+                .map(|e| apply_ty_prune(&self.subst, e).to_string())
+                .unwrap_or_else(|| "?".into());
+            return self.error_with_help(
+                ErrorCode::TypeMismatch,
+                format!(
+                    "No overload of `{}` matches expected type `{}`",
+                    name, expected_pretty
+                ),
+                range,
+                Some(format!("available overloads: {}", arities.join(", "))),
+            );
+        }
+
+        let scheme = self.env.lookup(name).cloned();
+        match scheme {
+            Some(s) => self.instantiate_ty(&s),
+            None => {
+                if self
+                    .lambda_uncaptured_outer
+                    .as_ref()
+                    .is_some_and(|s| s.contains(name))
+                {
+                    return self.error_with_help(
+                        ErrorCode::UnknownValue,
+                        format!("cannot capture `{}` without `use ({})`", name, name),
+                        range,
+                        Some(format!(
+                            "list `{}` in the enclosing `use (…)` capture list",
+                            name
+                        )),
+                    );
+                }
+                self.error(
+                    ErrorCode::UnknownValue,
+                    format!("Cannot find value `{}` in this scope", name),
+                    range,
+                )
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn infer_typeclass_decl(
+        &mut self,
+        name: &str,
+        type_params: &[TypeParam],
+        methods: &[Output],
+        range: Range<usize>,
+    ) -> Ty {
+        // Collect associated type declarations and method defs.
+        let mut assoc_types: Vec<AssocTypeDecl> = Vec::new();
+        let method_defs: Vec<TypeClassMethodDef> = methods
+            .iter()
+            .filter_map(|m| match m.1.as_ref() {
+                Expression::AssocTypeDecl {
+                    name: aname,
+                    type_params: assoc_params,
+                } => {
+                    if assoc_types.iter().any(|a| a.name == *aname) {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Duplicate associated type `{}` in trait `{}`",
+                                aname, name
+                            ),
+                            m.0.into_range(),
+                        ));
+                    } else {
+                        let param_kinds = assoc_params
+                            .iter()
+                            .map(|tp| self.resolve_type_param_kind(tp))
+                            .collect::<Vec<_>>();
+                        assoc_types.push(AssocTypeDecl::new(
+                            aname.to_string(),
+                            assoc_params.iter().map(|tp| tp.name.to_string()).collect(),
+                            param_kinds,
+                        ));
+                    }
+                    None
+                }
+                Expression::Function {
+                    docs: _,
+                    name: mname, body, ..
+                } => {
+                    let has_default = body.as_ref().is_some_and(
+                        |b| !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty()),
+                    );
+                    Some(TypeClassMethodDef {
+                        name: mname.to_string(),
+                        has_default,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let param_names: Vec<String> =
+            type_params.iter().map(|tp| tp.name.to_string()).collect();
+        let param_kinds: Vec<Kind> = type_params
+            .iter()
+            .map(|tp| Kind::from(tp.kind.clone()))
+            .collect();
+        // Single-param classes: param bounds become direct superclasses
+        // (`trait Ordered<T: Equal>` → superclasses: ["Equal"]).
+        // Multi-param classes ignore param bounds for superclass
+        // wiring (use `where` for those constraints later).
+        let superclasses: Vec<String> = if type_params.len() == 1 {
+            type_params[0]
+                .bounds
+                .iter()
+                .map(|b| (*b).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(previous) = self.generics.typeclass(name) {
+            let is_prelude = Checker::is_builtin_class(name);
+            if is_prelude && !self.builtin_name_in_scope(name) {
+                // Short name was rebound (`use prelude::ops::Eq as …`);
+                // allow the user trait to replace the builtin entry.
+            } else {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("Duplicate trait `{}`", name),
+                    range.clone(),
+                );
+                if is_prelude && self.builtin_name_in_scope(name) {
+                    msg.with_help(format!(
+                        "`{}` is in the prelude; free the short name with `use {}::{} as OtherName;` before redefining, or pick a different name",
+                        name,
+                        previous.defined_module,
+                        name
+                    ));
+                } else {
+                    msg.with_help(format!(
+                        "trait `{}` was already declared in module `{}`",
+                        name, previous.defined_module
+                    ));
+                }
+                self.messages.push(msg);
+                for m in methods {
+                    let _ = self.infer(m);
+                }
+                return unit_ty();
+            }
+        }
+        let def = TypeClassDef {
+            name: name.to_string(),
+            defined_module: self.current_module.clone(),
+            type_params: param_names,
+            param_kinds: param_kinds.clone(),
+            superclasses,
+            assoc_types: assoc_types.clone(),
+            methods: method_defs.clone(),
+        };
+        self.generics.typeclasses.insert(name.to_string(), def);
+
+        // Build method schemes with trait parameters in scope.
+        // Applied associated types are recorded as explicit projection
+        // variables and quantified with the method scheme.
+        let mut param_frame = HashMap::new();
+        let mut param_vars = Vec::new();
+        let mut class_kinds = Vec::new();
+        for (i, type_param) in type_params.iter().enumerate() {
+            let var = self.counter.fresh();
+            let kind = param_kinds.get(i).cloned().unwrap_or(Kind::Type);
+            self.set_var_kind(var, kind.clone());
+            param_frame.insert(type_param.name.to_string(), var);
+            param_vars.push(var);
+            class_kinds.push(kind);
+        }
+        self.type_params_in_scope.push(param_frame);
+        self.current_typeclass = Some(name.to_string());
+        // ONE constraint over all class params (multi-param ready).
+        let class_constraints: Vec<Constraint> = vec![Constraint {
+            class: name.to_string(),
+            args: param_vars.iter().map(|v| Ty::Var(*v)).collect(),
+        }];
+        for method in methods {
+            if let Expression::Function {
+                docs: _,
+                name: method_name,
+                type_params: method_params,
+                args,
+                returns,
+                ..
+            } = method.1.as_ref()
+            {
+                // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
+                let mut method_frame = HashMap::new();
+                let mut method_vars = Vec::new();
+                let mut method_kinds = Vec::new();
+                for mp in method_params {
+                    let var = self.counter.fresh();
+                    let kind = self.resolve_type_param_kind(mp);
+                    self.set_var_kind(var, kind.clone());
+                    method_frame.insert(mp.name.to_string(), var);
+                    method_vars.push(var);
+                    method_kinds.push(kind);
+                }
+                let pushed_method = !method_frame.is_empty();
+                if pushed_method {
+                    self.type_params_in_scope.push(method_frame);
+                }
+                let prev_assoc = self.current_assoc_projections.take();
+                self.current_assoc_projections = Some(Vec::new());
+                let arg_tys = self.parse_arg_list(args);
+                let ret_ty = returns
+                    .as_ref()
+                    .map(|ret| self.parse_type_name(ret))
+                    .unwrap_or_else(unit_ty);
+                let assoc_projections =
+                    self.current_assoc_projections.take().unwrap_or_default();
+                self.current_assoc_projections = prev_assoc;
+                let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
+                    Ty::Fun(Box::new(arg.clone()), Box::new(ret))
+                });
+                if pushed_method {
+                    self.type_params_in_scope.pop();
+                }
+                let mut all_bounds = param_vars.clone();
+                all_bounds.extend(method_vars);
+                all_bounds.extend(assoc_projections.iter().map(|p| p.var));
+                let mut all_kinds = class_kinds.clone();
+                all_kinds.extend(method_kinds);
+                all_kinds.extend(std::iter::repeat_n(Kind::Type, assoc_projections.len()));
+                self.typeclass_method_schemes.insert(
+                    (name.to_string(), method_name.to_string()),
+                    Scheme::poly_with_kinds_and_assoc(
+                        all_bounds,
+                        all_kinds,
+                        class_constraints.clone(),
+                        assoc_projections,
+                        fun_ty,
+                    ),
+                );
+            }
+        }
+
+        // Walk method bodies (ID alignment + default body typecheck).
+        // The class's own constraint is active so a default can call a
+        // sibling method through the same dictionary.
+        let active_len = self.active_constraints.len();
+        self.active_constraints.extend(class_constraints);
+        for m in methods {
+            let _ = self.infer(m);
+        }
+        self.active_constraints.truncate(active_len);
+        self.type_params_in_scope.pop();
+        self.current_typeclass = None;
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_typeclass_impl(
+        &mut self,
+        class: &str,
+        args: &[Output],
+        methods: &[Output],
+        range: Range<usize>,
+    ) -> Ty {
+        // Resolve instance heads (bare ctors stay `Con` for HKT).
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_instance_head(a)).collect();
+        // Walk arg type expressions for ID alignment; cache head tys
+        // so codegen FQNs match (not `Option<t0>` placeholders).
+        for (a, ty) in args.iter().zip(arg_tys.iter()) {
+            self.cache_forced_ty(a, ty.clone());
+        }
+        // Verify class exists.
+        let class_def = self.generics.typeclass(class).cloned();
+        if class_def.is_none() {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Unknown trait `{}`", class),
+                range.clone(),
+            ));
+        }
+        if let Some(ref cdef) = class_def {
+            self.validate_instance_head_kinds(cdef, &arg_tys, &range);
+        }
+        let orphaned = class_def
+            .as_ref()
+            .is_some_and(|cdef| !self.instance_satisfies_orphan_rule(cdef, args, &arg_tys));
+        if orphaned {
+            let instance = self.instance_signature(class, &arg_tys);
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Orphan instance `{}` is not allowed in module `{}`",
+                    instance, self.current_module
+                ),
+                range.clone(),
+            );
+            msg.with_help(
+                "define the trait in this module, or define the nominal head of every non-variable instance argument here"
+                    .to_string(),
+            );
+            self.messages.push(msg);
+        }
+        let overlapping = self
+            .generics
+            .find_overlapping_instance(class, &arg_tys)
+            .cloned();
+        if let Some(existing) = overlapping.as_ref() {
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Overlapping instance `{}` conflicts with existing `{}`",
+                    self.instance_signature(class, &arg_tys),
+                    self.instance_signature(&existing.class, &existing.args)
+                ),
+                range.clone(),
+            );
+            msg.with_help(format!(
+                "existing instance was declared in module `{}`",
+                existing.defined_module
+            ));
+            msg.push(Label::new(
+                "new instance declared here".to_string(),
+                range.clone(),
+            ));
+            if existing.defined_module == self.current_module {
+                msg.push(Label::new(
+                    "existing overlapping instance declared here".to_string(),
+                    existing.range.clone(),
+                ));
+            }
+            self.messages.push(msg);
+        }
+        // Build method_fqns, assoc_tys, and register instance.
+        let mut method_fqns = HashMap::new();
+        let mut method_names = Vec::new();
+        let mut assoc_tys: HashMap<String, AssocTypeValue> = HashMap::new();
+        let mut assoc_names: Vec<String> = Vec::new();
+        let mut invalid_assoc_defs = false;
+
+        // Pre-register a stub so recursive derived/hand-written
+        // method bodies can discharge constraints against the
+        // instance under construction. Assoc types are patched
+        // onto the stub as they are collected (before methods
+        // run), so projections stay valid during body infer.
+        let args_pretty_for_fqn: String = arg_tys
+            .iter()
+            .map(|t| format!("{}", t))
+            .collect::<Vec<_>>()
+            .join("_");
+        let mut stub_fqns = HashMap::new();
+        for m in methods {
+            let mname = match m.1.as_ref() {
+                Expression::Function { name, .. } => Some(*name),
+                Expression::Method(_, body) => match body.1.as_ref() {
+                    Expression::Function { name, .. } => Some(*name),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(mname) = mname {
+                stub_fqns.insert(
+                    mname.to_string(),
+                    format!("{}__{}__{}", class, args_pretty_for_fqn, mname),
+                );
+            }
+        }
+        let stub_idx = if class_def.is_some() && !orphaned && overlapping.is_none() {
+            self.generics.instances.push(InstanceDef {
+                class: class.to_string(),
+                defined_module: self.current_module.clone(),
+                range: range.clone(),
+                args: arg_tys.clone(),
+                method_fqns: stub_fqns,
+                assoc_tys: HashMap::new(),
+            });
+            Some(self.generics.instances.len() - 1)
+        } else {
+            None
+        };
+
+        for m in methods {
+            match m.1.as_ref() {
+                Expression::AssocTypeDef {
+                    name: aname,
+                    type_params: assoc_params,
+                    ty,
+                } => {
+                    // Consume the AssocTypeDef wrapper NodeId, then the RHS.
+                    let wrapper_id = self.ids.ids()[self.next_id_idx];
+                    self.next_id_idx += 1;
+                    self.cache.insert(wrapper_id, unit_ty());
+                    let mut assoc_frame = HashMap::new();
+                    let mut assoc_param_vars = Vec::new();
+                    let mut assoc_param_kinds = Vec::new();
+                    for tp in assoc_params {
+                        let var = self.counter.fresh();
+                        let kind = self.resolve_type_param_kind(tp);
+                        self.set_var_kind(var, kind.clone());
+                        assoc_frame.insert(tp.name.to_string(), var);
+                        assoc_param_vars.push(var);
+                        assoc_param_kinds.push(kind);
+                    }
+                    let pushed_assoc_params = !assoc_frame.is_empty();
+                    if pushed_assoc_params {
+                        self.type_params_in_scope.push(assoc_frame);
+                    }
+                    let resolved = self.parse_type_name(ty);
+                    if pushed_assoc_params {
+                        let _ = self.type_params_in_scope.pop();
+                    }
+                    self.cache_forced_ty(ty, resolved.clone());
+                    if let Some(cdef) = class_def.as_ref()
+                        && let Some(decl) = cdef.assoc_type(aname)
+                    {
+                        if decl.params.len() != assoc_params.len() {
+                            invalid_assoc_defs = true;
+                            self.messages.push(Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Associated type `{}` in instance of `{}` expects {} type parameter{}, got {}",
+                                    aname,
+                                    class,
+                                    decl.params.len(),
+                                    if decl.params.len() == 1 { "" } else { "s" },
+                                    assoc_params.len()
+                                ),
+                                m.0.into_range(),
+                            ));
+                        }
+                        for (i, (expected, actual)) in decl
+                            .param_kinds
+                            .iter()
+                            .zip(assoc_param_kinds.iter())
+                            .enumerate()
+                        {
+                            if expected != actual {
+                                invalid_assoc_defs = true;
+                                self.messages.push(Message::error(
+                                    ErrorCode::GenericTypeError,
+                                    format!(
+                                        "Type parameter {} of associated type `{}` has kind `{}`, expected `{}`",
+                                        i + 1,
+                                        aname,
+                                        actual,
+                                        expected
+                                    ),
+                                    m.0.into_range(),
+                                ));
+                            }
+                        }
+                        let rhs_kind = self.kind_of_ty(&resolved);
+                        if rhs_kind != Kind::Type {
+                            invalid_assoc_defs = true;
+                            self.messages.push(Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Associated type `{}` in instance of `{}` must resolve to kind `*`, found `{}`",
+                                    aname, class, rhs_kind
+                                ),
+                                ty.0.into_range(),
+                            ));
+                        }
+                    }
+                    if assoc_tys.contains_key(*aname) {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Duplicate associated type `{}` in instance of `{}`",
+                                aname, class
+                            ),
+                            m.0.into_range(),
+                        ));
+                    } else {
+                        assoc_names.push(aname.to_string());
+                        let value = AssocTypeValue {
+                            params: assoc_params
+                                .iter()
+                                .map(|tp| tp.name.to_string())
+                                .collect(),
+                            param_vars: assoc_param_vars,
+                            param_kinds: assoc_param_kinds,
+                            ty: resolved,
+                        };
+                        if let Some(idx) = stub_idx {
+                            self.generics.instances[idx]
+                                .assoc_tys
+                                .insert(aname.to_string(), value.clone());
+                        }
+                        assoc_tys.insert(aname.to_string(), value);
+                    }
+                }
+                _ => {
+                    let maybe_fn = match m.1.as_ref() {
+                        Expression::Function {
+                            docs: _,
+                            name,
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body,
+                            is_coro,
+                            ..
+                        } => Some((
+                            *name,
+                            type_params.as_slice(),
+                            args,
+                            returns,
+                            where_constraints.as_slice(),
+                            body,
+                            *is_coro,
+                        )),
+                        Expression::Method(_, body) => match body.1.as_ref() {
+                            Expression::Function {
+                                docs: _,
+                                name,
+                                type_params,
+                                args,
+                                returns,
+                                where_constraints,
+                                body,
+                                is_coro,
+                                ..
+                            } => Some((
+                                *name,
+                                type_params.as_slice(),
+                                args,
+                                returns,
+                                where_constraints.as_slice(),
+                                body,
+                                *is_coro,
+                            )),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
+                        maybe_fn
+                    {
+                        let fqn = format!(
+                            "{}__{}__{}",
+                            class,
+                            arg_tys
+                                .iter()
+                                .map(|t| format!("{}", t))
+                                .collect::<Vec<_>>()
+                                .join("_"),
+                            mname,
+                        );
+                        method_names.push(mname.to_string());
+                        method_fqns.insert(mname.to_string(), fqn.clone());
+                        self.infer_function(
+                            mname,
+                            mparams,
+                            margs,
+                            returns.as_ref(),
+                            where_cs,
+                            body.as_ref(),
+                            &m.0.into_range(),
+                            None,
+                            is_coro,
+                            None,
+                            false,
+                        );
+                    } else {
+                        let _ = self.infer(m);
+                    }
+                }
+            }
+        }
+        let mut invalid_instance = class_def.is_none() || orphaned || overlapping.is_some();
+        if let Some(class_def) = class_def.as_ref() {
+            // Superclass instances must already exist for the same args.
+            // `impl Ordered<int>` requires `Equal<int>`, transitively.
+            let mut missing_supers = Vec::new();
+            let mut seen_super = HashSet::new();
+            let mut stack: Vec<String> = class_def.superclasses.clone();
+            while let Some(super_name) = stack.pop() {
+                if !seen_super.insert(super_name.clone()) {
+                    continue;
+                }
+                if self.generics.find_instance(&super_name, &arg_tys).is_none() {
+                    missing_supers.push(super_name.clone());
+                }
+                if let Some(super_def) = self.generics.typeclass(&super_name) {
+                    stack.extend(super_def.superclasses.iter().cloned());
+                }
+            }
+            for super_name in &missing_supers {
+                let args_pretty = arg_tys
+                    .iter()
+                    .map(|ty| ty.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` requires superclass instance `{}<{}>`",
+                        class, args_pretty, super_name, args_pretty
+                    ),
+                    range.clone(),
+                ));
+            }
+            let unknown_methods = Generics::unknown_instance_methods(
+                class_def,
+                method_names.iter().map(|name| name.as_str()),
+            );
+            for method in &unknown_methods {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("Unknown method `{}` in instance of `{}`", method, class),
+                    range.clone(),
+                ));
+            }
+            let unknown_assoc = Generics::unknown_assoc_types(
+                class_def,
+                assoc_names.iter().map(|n| n.as_str()),
+            );
+            for aname in &unknown_assoc {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Unknown associated type `{}` in instance of `{}`",
+                        aname, class
+                    ),
+                    range.clone(),
+                ));
+            }
+            let missing_assoc = Generics::missing_assoc_types(class_def, &assoc_tys);
+            if !missing_assoc.is_empty() {
+                let names = missing_assoc
+                    .iter()
+                    .map(|n| format!("`{}`", n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let noun = if missing_assoc.len() == 1 {
+                    "associated type"
+                } else {
+                    "associated types"
+                };
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` is missing {} {}",
+                        class,
+                        arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        noun,
+                        names
+                    ),
+                    range.clone(),
+                ));
+            }
+            Generics::fill_default_method_fqns(class_def, &mut method_fqns);
+            let missing_methods =
+                Generics::missing_required_methods(class_def, &method_fqns);
+            if !missing_methods.is_empty() {
+                let methods = missing_methods
+                    .iter()
+                    .map(|method| format!("`{}`", method))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let noun = if missing_methods.len() == 1 {
+                    "method"
+                } else {
+                    "methods"
+                };
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` is missing {} {}",
+                        class,
+                        arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        noun,
+                        methods
+                    ),
+                    range.clone(),
+                ));
+            }
+            invalid_instance |= !unknown_methods.is_empty()
+                || !missing_methods.is_empty()
+                || !missing_supers.is_empty()
+                || !unknown_assoc.is_empty()
+                || !missing_assoc.is_empty()
+                || invalid_assoc_defs;
+        }
+        // Finalize the stub (or push a fresh instance when no stub).
+        // Omitted defaulted methods have been filled with class-default FQNs.
+        // Never `remove(idx)` — that shifts later instance indices; clear
+        // the stub in place when invalid instead.
+        if let Some(idx) = stub_idx {
+            if invalid_instance {
+                self.generics.instances[idx].method_fqns.clear();
+                self.generics.instances[idx].assoc_tys.clear();
+                self.generics.instances[idx].args.clear();
+                self.generics.instances[idx].class.clear();
+            } else {
+                self.generics.instances[idx].method_fqns = method_fqns;
+                self.generics.instances[idx].assoc_tys = assoc_tys;
+            }
+        } else if !invalid_instance {
+            self.generics.instances.push(InstanceDef {
+                class: class.to_string(),
+                defined_module: self.current_module.clone(),
+                range: range.clone(),
+                args: arg_tys,
+                method_fqns,
+                assoc_tys,
+            });
+        }
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_call_expr(
+        &mut self,
+        name: &Output,
+        args: &Option<Vec<Output>>,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        if let Expression::Identifier(callee) = name.1.as_ref() {
+            if let Some(arg_list) = args.as_deref() {
+                if arg_list.len() == 1 {
+                    if let Expression::Spread(pack) = arg_list[0].1.as_ref() {
+                        if self.next_id_idx < self.ids.ids().len() {
+                            self.next_id_idx += 1;
+                        }
+                        if let Some(ty) =
+                            self.try_infer_spread_call_target(callee, pack, &range, id)
+                        {
+                            return ty;
+                        }
+                    }
+                }
+            }
+        }
+        // Method call: `recv.method(args)` — Access callee.
+        if let Expression::Access(recv, method) = name.1.as_ref() {
+            let method_args = args.as_deref().unwrap_or(&[]);
+            let method_has_named = method_args
+                .iter()
+                .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
+            let recv_ty = self.infer(recv);
+            let resolved = apply_ty_prune(&self.subst, &recv_ty);
+
+            // Named args on methods: only inherent class methods.
+            if method_has_named {
+                let class_owner = self.class_owner_from_ty(&resolved);
+                if let Some(owner) = class_owner.as_ref()
+                    && self
+                        .methods
+                        .get(owner)
+                        .and_then(|m| m.get(*method))
+                        .is_some()
+                {
+                    let fqn = format!("{}::{}", owner, method);
+                    let user_argc = method_args.len();
+                    let scheme = if self.is_overloaded(&fqn) {
+                        let prelim_tys: Vec<Ty> = method_args
+                            .iter()
+                            .map(|a| {
+                                let value = match a.1.as_ref() {
+                                    Expression::NamedArg(_, v) => v,
+                                    _ => a,
+                                };
+                                let ty = self.infer(value);
+                                apply_ty_prune(&self.subst, &ty)
+                            })
+                            .collect();
+                        match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                            OverloadSelect::Selected(c) => {
+                                let c = c.clone();
+                                self.selected_overloads_by_span.insert(
+                                    (range.start, range.end),
+                                    (c.fixed_arity, c.is_rest, c.id),
+                                );
+                                c.scheme
+                            }
+                            OverloadSelect::Ambiguous => {
+                                return self.error_with_help(
+                                    ErrorCode::AmbiguousOverload,
+                                    format!(
+                                        "Ambiguous overload: call to `{}` matches multiple candidates",
+                                        fqn
+                                    ),
+                                    range,
+                                    Some(self.ambiguous_overload_help(&fqn)),
+                                );
+                            }
+                            OverloadSelect::NoMatch => {
+                                return self.error(
+                                    ErrorCode::WrongArity,
+                                    format!(
+                                        "No overload of `{}` accepts {} argument{}",
+                                        fqn,
+                                        user_argc,
+                                        if user_argc == 1 { "" } else { "s" }
+                                    ),
+                                    range,
+                                );
+                            }
+                        }
+                    } else {
+                        self.methods
+                            .get(owner)
+                            .and_then(|m| m.get(*method))
+                            .map(|(_, s)| s.clone())
+                            .expect("method present")
+                    };
+                    let (fun_ty, constraints, _mapping) =
+                        self.instantiate_scheme_mapped(&scheme);
+                    let mut arg_tys = vec![recv_ty];
+                    let (tys, ordered_exprs) =
+                        self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                    arg_tys.extend(tys);
+                    // Align exprs with `[self, …args]` for coerce_or_unify
+                    // (byte / string literal coercion on method args).
+                    let mut arg_exprs = Vec::with_capacity(1 + ordered_exprs.len());
+                    arg_exprs.push(recv.clone());
+                    arg_exprs.extend(ordered_exprs);
+                    let result = self.apply_function(
+                        Some(&fqn),
+                        &fun_ty,
+                        &arg_tys,
+                        Some(&arg_exprs),
+                        id,
+                        range.clone(),
+                    );
+                    if !constraints.is_empty() {
+                        self.discharge_constraints(id, &constraints, &range);
+                    }
+                    return result;
+                }
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Named arguments are not supported on this call to `{}`",
+                        method
+                    ),
+                    range,
+                    Some(
+                        "named arguments are supported on ordinary functions and inherent methods"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            if let Ty::Existential { class } = &resolved
+                && let Some((owner, method_slot, scheme)) =
+                    self.existential_method_candidate(class, method)
+            {
+                let mut arg_tys = vec![recv_ty];
+                if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                    }
+                }
+                let hint = ExistentialMethodCall {
+                    method_slot,
+                    arity: arg_tys.len(),
+                    has_receiver: true,
+                };
+                if let Some(call_id) = id {
+                    self.existential_method_calls.insert(call_id, hint.clone());
+                }
+                self.existential_method_calls_by_span
+                    .insert((range.start, range.end), hint);
+                return self.apply_existential_method(
+                    &owner,
+                    method,
+                    &scheme,
+                    &arg_tys,
+                    args.as_deref(),
+                    id,
+                    range,
+                );
+            }
+            if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
+                let candidates = self.bound_method_candidates(method, Some(receiver_var));
+                if let Some((dict_index, dict_class, class, method_slot, scheme)) =
+                    self.select_bound_method(candidates, method, &range)
+                {
+                    self.bind_matching_abstract_constraints(
+                        Some(receiver_var),
+                        &dict_class,
+                    );
+                    let (fun_ty, constraints, mapping) =
+                        self.instantiate_scheme_mapped(&scheme);
+                    let mut arg_tys = vec![recv_ty];
+                    if let Some(a) = args {
+                        for arg in a {
+                            arg_tys.push(self.infer(arg));
+                        }
+                    }
+                    if let Some(call_id) = id {
+                        self.bound_method_calls.insert(
+                            call_id,
+                            BoundMethodCall {
+                                dict_index,
+                                method_slot,
+                                arity: arg_tys.len(),
+                                has_receiver: true,
+                            },
+                        );
+                    }
+                    self.bound_method_calls_by_span.insert(
+                        (range.start, range.end),
+                        BoundMethodCall {
+                            dict_index,
+                            method_slot,
+                            arity: arg_tys.len(),
+                            has_receiver: true,
+                        },
+                    );
+                    let result = self.apply_function(
+                        Some(&format!("{}::{}", class, method)),
+                        &fun_ty,
+                        &arg_tys,
+                        None,
+                        id,
+                        range.clone(),
+                    );
+                    if !constraints.is_empty() {
+                        self.discharge_constraints(id, &constraints, &range);
+                        self.pin_assoc_after_discharge(
+                            &class,
+                            &constraints,
+                            Some(&scheme),
+                            &mapping,
+                            &range,
+                        );
+                    }
+                    return result;
+                }
+            }
+            // Inherent class methods win over ground trait methods
+            // (Rust-style): `impl Point { fn show() ... }` must not be
+            // shadowed by prelude `Show::show` when no Show instance
+            // exists for Point.
+            let class_owner = self.class_owner_from_ty(&resolved);
+            if let Some(owner) = class_owner.as_ref()
+                && self
+                    .methods
+                    .get(owner)
+                    .and_then(|m| m.get(*method))
+                    .is_some()
+            {
+                if self.is_static_method(owner, method) {
+                    let fqn = format!("{}::{}", owner, method);
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is a static method; call it as `{}(...)`",
+                            method, fqn
+                        ),
+                        range,
+                        Some("static methods have no `self` receiver".to_string()),
+                    );
+                }
+                let fqn = format!("{}::{}", owner, method);
+                let user_argc = method_args.len();
+                let (scheme, selected) = if self.is_overloaded(&fqn) {
+                    let prelim_tys: Vec<Ty> = method_args
+                        .iter()
+                        .map(|a| {
+                            let value = match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v,
+                                _ => a,
+                            };
+                            let ty = self.infer(value);
+                            apply_ty_prune(&self.subst, &ty)
+                        })
+                        .collect();
+                    match self.select_overload_for_args(&fqn, user_argc, &prelim_tys) {
+                        OverloadSelect::Selected(c) => {
+                            let c = c.clone();
+                            self.selected_overloads_by_span.insert(
+                                (range.start, range.end),
+                                (c.fixed_arity, c.is_rest, c.id),
+                            );
+                            (c.scheme, true)
+                        }
+                        OverloadSelect::Ambiguous => {
+                            return self.error_with_help(
+                                ErrorCode::AmbiguousOverload,
+                                format!(
+                                    "Ambiguous overload: call to `{}` matches multiple candidates",
+                                    fqn
+                                ),
+                                range,
+                                Some(self.ambiguous_overload_help(&fqn)),
+                            );
+                        }
+                        OverloadSelect::NoMatch => {
+                            let available: Vec<String> = self
+                                .overload_sets
+                                .get(&fqn)
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|c| {
+                                            if c.is_rest {
+                                                format!("{}+ args (rest)", c.fixed_arity)
+                                            } else {
+                                                format!("{} args", c.fixed_arity)
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            return self.error_with_help(
+                                ErrorCode::WrongArity,
+                                format!(
+                                    "No overload of `{}` accepts {} argument{}",
+                                    fqn,
+                                    user_argc,
+                                    if user_argc == 1 { "" } else { "s" }
+                                ),
+                                range,
+                                Some(format!(
+                                    "available arities: {}",
+                                    available.join(", ")
+                                )),
+                            );
+                        }
+                    }
+                } else {
+                    let scheme = self
+                        .methods
+                        .get(owner)
+                        .and_then(|m| m.get(*method))
+                        .map(|(_, s)| s.clone())
+                        .expect("method present");
+                    (scheme, false)
+                };
+                let _ = selected;
+                let (fun_ty, constraints, _mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                let mut arg_tys = vec![recv_ty];
+                let mut arg_exprs = Vec::with_capacity(1 + method_args.len());
+                arg_exprs.push(recv.clone());
+                if self.fn_has_rest(&fqn) {
+                    let (tys, ordered_exprs) =
+                        self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                    arg_tys.extend(tys);
+                    arg_exprs.extend(ordered_exprs);
+                } else if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                        arg_exprs.push(arg.clone());
+                    }
+                }
+                let result = self.apply_function(
+                    Some(&fqn),
+                    &fun_ty,
+                    &arg_tys,
+                    Some(&arg_exprs),
+                    id,
+                    range.clone(),
+                );
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                }
+                return result;
+            }
+
+            // Ground trait method: `recv.into()` / `recv.show()` via a
+            // concrete instance (no open bound). Pin the return type from
+            // `current_expected` when present so `let y: T = x.into();`
+            // (or `return x.into();` under `-> T`) can select among
+            // multiple `Into` targets.
+            if let Some((class, scheme)) =
+                self.ground_trait_method_for_receiver(method, &recv_ty)
+            {
+                let (fun_ty, constraints, mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                let mut arg_tys = vec![recv_ty];
+                if let Some(a) = args {
+                    for arg in a {
+                        arg_tys.push(self.infer(arg));
+                    }
+                }
+                let result = self.apply_function(
+                    Some(&format!("{}::{}", class, method)),
+                    &fun_ty,
+                    &arg_tys,
+                    None,
+                    id,
+                    range.clone(),
+                );
+                if let Some(expected) = self.current_expected.clone() {
+                    self.unify(&result, &expected, &range, "expected type");
+                }
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                    self.pin_assoc_after_discharge(
+                        &class,
+                        &constraints,
+                        Some(&scheme),
+                        &mapping,
+                        &range,
+                    );
+                }
+                return apply_ty_prune(&self.subst, &result);
+            }
+
+            if let Some(owner) = class_owner {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    format!("Cannot find method `{}` on class `{}`", method, owner),
+                    range,
+                );
+            }
+            return self.error_with_help(
+                ErrorCode::NotAFunction,
+                format!("Cannot call method `{}` on non-class type", method),
+                range,
+                Some("method calls require a class instance receiver".to_string()),
+            );
+        }
+
+        // First-class callee (`lambda(...)`, nested fn value, etc.).
+        if !matches!(
+            name.1.as_ref(),
+            Expression::Identifier(_)
+                | Expression::Access(_, _)
+                | Expression::QualifiedAccess { .. }
+        ) {
+            let callee_ty = self.infer(name);
+            let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+            let arg_tys: Vec<Ty> = flat_args
+                .iter()
+                .map(|arg| self.infer_call_arg(arg))
+                .collect();
+            return self.apply_function(
+                None,
+                &callee_ty,
+                &arg_tys,
+                args.as_deref(),
+                id,
+                range,
+            );
+        }
+
+        let ident = match name.1.as_ref() {
+            Expression::Identifier(n) => n.to_string(),
+            Expression::QualifiedAccess { owner, member } => {
+                let fqn = format!("{}::{}", owner, member);
+                if self.static_slot_types.contains_key(&fqn) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("`{}` is a static field, not a function", fqn),
+                        range,
+                        Some(
+                            "read it as a value or assign with `Class::field = expr`"
+                                .to_string(),
+                        ),
+                    );
+                }
+                // Parser may emit Call(QualifiedAccess) for module paths;
+                // Class::static_method stays Construct, but accept Call too.
+                if let Some(ty) = self.try_infer_static_method_call(
+                    owner,
+                    member,
+                    &parser::ast::EnumConstructPayload::Tuple(
+                        args.as_deref().unwrap_or(&[]).to_vec(),
+                    ),
+                    range.clone(),
+                    id,
+                ) {
+                    return ty;
+                }
+                if self.has_method(owner, member) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "`{}` is an instance method; call it on a value (`obj.{}(...)`)",
+                            fqn, member
+                        ),
+                        range,
+                        Some(format!(
+                            "or declare `static fn {}` to call it as `{}`",
+                            member, fqn
+                        )),
+                    );
+                }
+                fqn
+            }
+            _ => {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    "Invalid call target".to_string(),
+                    range,
+                );
+            }
+        };
+
+        let raw_args = args.as_deref().unwrap_or(&[]);
+        let has_named = raw_args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
+        if ident == "len" {
+            if has_named {
+                let (tys, reordered) =
+                    self.infer_and_reorder_call_args("len", raw_args, &range);
+                return self.infer_len_call_from_tys(&tys, &reordered, id, range);
+            }
+            return self.infer_len_call(args.as_deref(), id, range);
+        }
+        if let Some(kind) = self.string_fn_for_call(&ident) {
+            let arg_slice = if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    StringBuiltin::Format => {
+                        self.infer_string_format_call(reordered.as_slice(), range)
+                    }
+                    StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                        if kind == StringBuiltin::FromBytes
+                            && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                        {
+                            self.register_builtin_io_error();
+                        }
+                        let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                        let flat_args = self.flatten_spread_call_args(reordered.as_slice());
+                        let arg_tys: Vec<Ty> = flat_args
+                            .iter()
+                            .map(|arg| self.infer_call_arg(arg))
+                            .collect();
+                        self.apply_function(
+                            Some(&ident),
+                            &fun_ty,
+                            &arg_tys,
+                            if flat_args.is_empty() {
+                                None
+                            } else {
+                                Some(&flat_args)
+                            },
+                            id,
+                            range,
+                        )
+                    }
+                };
+            } else {
+                args.as_deref().unwrap_or(&[])
+            };
+            return match kind {
+                StringBuiltin::Format => self.infer_string_format_call(arg_slice, range),
+                StringBuiltin::FromBytes | StringBuiltin::ToBytes => {
+                    if kind == StringBuiltin::FromBytes
+                        && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM)
+                    {
+                        self.register_builtin_io_error();
+                    }
+                    let fun_ty = self.instantiate_ty(&Self::string_fn_scheme(kind));
+                    let flat_args = self.flatten_spread_call_args(arg_slice);
+                    let arg_tys: Vec<Ty> = flat_args
+                        .iter()
+                        .map(|arg| self.infer_call_arg(arg))
+                        .collect();
+                    self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if flat_args.is_empty() {
+                            None
+                        } else {
+                            Some(&flat_args)
+                        },
+                        id,
+                        range,
+                    )
+                }
+            };
+        }
+        // `assert` from `prelude::test` (auto-imported or via `use`).
+        if let Some(kind) = self.prelude_fn_in_scope(&ident) {
+            if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    PreludeFn::Assert => self.infer_assert(&reordered, range),
+                    PreludeFn::BlockOn => self.infer_block_on(&reordered, range),
+                    PreludeFn::Dot => self.infer_dot(&reordered, id, range),
+                    PreludeFn::MatMul => self.infer_matmul(&reordered, id, range),
+                    PreludeFn::Cross => self.infer_cross(&reordered, id, range),
+                    PreludeFn::Matrix => self.infer_matrix_ctor(&reordered, id, range),
+                    PreludeFn::Ord => self.infer_ord(&reordered, range),
+                    PreludeFn::Char => self.infer_char(&reordered, range),
+                    PreludeFn::Sin
+                    | PreludeFn::Cos
+                    | PreludeFn::Tan
+                    | PreludeFn::Sqrt
+                    | PreludeFn::Floor
+                    | PreludeFn::Ceil
+                    | PreludeFn::Exp
+                    | PreludeFn::Ln
+                    | PreludeFn::Pow => self.infer_math(kind, &reordered, range),
+                };
+            }
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            return match kind {
+                PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                PreludeFn::BlockOn => self.infer_block_on(arg_slice, range),
+                PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
+                PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
+                PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
+                PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
+                PreludeFn::Ord => self.infer_ord(arg_slice, range),
+                PreludeFn::Char => self.infer_char(arg_slice, range),
+                PreludeFn::Sin
+                | PreludeFn::Cos
+                | PreludeFn::Tan
+                | PreludeFn::Sqrt
+                | PreludeFn::Floor
+                | PreludeFn::Ceil
+                | PreludeFn::Exp
+                | PreludeFn::Ln
+                | PreludeFn::Pow => self.infer_math(kind, arg_slice, range),
+            };
+        }
+        // `dload` / `declare` / `invoke` after `use ffi::{…}`.
+        if let Some(kind) = self.ffi_fn_in_scope(&ident) {
+            if has_named {
+                let (_, reordered) =
+                    self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                return match kind {
+                    FfiBuiltin::Dload => self.infer_ffi_dload(&reordered, range),
+                    FfiBuiltin::Declare => self.infer_ffi_declare(&reordered, range),
+                    FfiBuiltin::Invoke => self.infer_ffi_invoke(&reordered, range),
+                };
+            }
+            let arg_slice = args.as_deref().unwrap_or(&[]);
+            return match kind {
+                FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
+                FfiBuiltin::Declare => self.infer_ffi_declare(arg_slice, range),
+                FfiBuiltin::Invoke => self.infer_ffi_invoke(arg_slice, range),
+            };
+        }
+        if matches!(ident.as_str(), "dload" | "declare" | "invoke") {
+            return self.error_with_help(
+                ErrorCode::UnknownValue,
+                format!("Cannot find value `{}` in this scope", ident),
+                range,
+                Some(
+                    "import it with `use ffi::{dload, declare, invoke}`".to_string(),
+                ),
+            );
+        }
+
+        // ── Overload-dispatch: select by argc + argument types ─────
+        // Must happen before `has_named` and `fn_has_rest` branches so
+        // the correct candidate's param_names / is_rest are used.
+        if self.is_overloaded(&ident) {
+            let argc = raw_args.len();
+            // Preliminary arg types for same-arity disambiguation.
+            // Named args contribute their value type in source order;
+            // reordering happens after the candidate is chosen.
+            let prelim_tys: Vec<Ty> = raw_args
+                .iter()
+                .map(|a| {
+                    let value = match a.1.as_ref() {
+                        Expression::NamedArg(_, v) => v,
+                        _ => a,
+                    };
+                    let ty = self.infer(value);
+                    apply_ty_prune(&self.subst, &ty)
+                })
+                .collect();
+            let candidate_opt = self
+                .select_overload_for_args(&ident, argc, &prelim_tys);
+            match candidate_opt {
+                OverloadSelect::NoMatch => {
+                    // No candidate accepts this arity/types — emit a
+                    // "no overload" error listing the available arities.
+                    let available: Vec<String> = self
+                        .overload_candidates(&ident)
+                        .map(|cs| {
+                            cs.iter().map(|c| Self::overload_sig_label(c)).collect()
+                        })
+                        .unwrap_or_default();
+                    return self.error_with_help(
+                        ErrorCode::WrongArity,
+                        format!(
+                            "No overload of `{}` accepts {} argument{}",
+                            ident,
+                            argc,
+                            if argc == 1 { "" } else { "s" }
+                        ),
+                        range,
+                        Some(format!("available overloads: {}", available.join(", "))),
+                    );
+                }
+                OverloadSelect::Ambiguous => {
+                    return self.error_with_help(
+                        ErrorCode::AmbiguousOverload,
+                        format!(
+                            "Ambiguous overload: call to `{}` matches multiple candidates",
+                            ident
+                        ),
+                        range,
+                        Some(self.ambiguous_overload_help(&ident)),
+                    );
+                }
+                OverloadSelect::Selected(candidate) => {
+                    let candidate = candidate.clone();
+                    // Record the selection for codegen.
+                    self.selected_overloads_by_span.insert(
+                        (range.start, range.end),
+                        (candidate.fixed_arity, candidate.is_rest, candidate.id),
+                    );
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
+                        let (fun_ty, constraints, mapping) =
+                            self.instantiate_scheme_mapped(&candidate.scheme);
+                        (fun_ty, constraints, mapping, Some(candidate.scheme.clone()))
+                    };
+                    let (arg_tys, ordered_args) = self
+                        .infer_and_reorder_call_args_with_candidate(
+                            &ident, &candidate, raw_args, &range,
+                        );
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
+                    }
+                    return result;
+                }
+            }
+        }
+
+        // Named call-site args: skip trait UFCS and resolve an ordinary
+        // function (partial application is allowed — residual Fun is OK).
+        if has_named {
+            let scheme = self.env.lookup(&ident).cloned();
+            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                Some(s) => {
+                    let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                    (fun_ty, constraints, mapping, Some(s))
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownFunction,
+                        format!("Cannot find function `{}`", ident),
+                        range,
+                    );
+                }
+            };
+            let (arg_tys, ordered_args) =
+                self.infer_and_reorder_call_args(&ident, raw_args, &range);
+            let result = if let Some(filled) = self
+                .partial_filled_tys_by_span
+                .get(&(range.start, range.end))
+                .cloned()
+            {
+                let mask = self
+                    .partial_fills_by_span
+                    .get(&(range.start, range.end))
+                    .copied()
+                    .unwrap_or(0);
+                let n = mask.count_ones();
+                if !Self::is_prefix_fill_mask(mask, n) {
+                    self.apply_partial_with_mask(&fun_ty, &filled, &range)
+                } else {
+                    self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    )
+                }
+            } else {
+                self.apply_function(
+                    Some(&ident),
+                    &fun_ty,
+                    &arg_tys,
+                    if ordered_args.is_empty() {
+                        None
+                    } else {
+                        Some(&ordered_args)
+                    },
+                    id,
+                    range.clone(),
+                )
+            };
+            if !fresh_constraints.is_empty() {
+                self.discharge_constraints(id, &fresh_constraints, &range);
+                if let Some(scheme) = original_scheme.as_ref() {
+                    self.pin_assoc_after_discharge(
+                        "",
+                        &fresh_constraints,
+                        Some(scheme),
+                        &fresh_mapping,
+                        &range,
+                    );
+                }
+            }
+            // Named under-apply is now allowed (residual Fun is returned
+            // for partial application). Error only on unknown/duplicate
+            // named args (handled inside infer_and_reorder_call_args).
+            return result;
+        }
+
+        // Rest-parameter calls pack trailing args; skip UFCS trait
+        // resolution so we don't double-infer (NodeId alignment).
+        if self.fn_has_rest(&ident) {
+            let scheme = self.env.lookup(&ident).cloned();
+            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+                Some(s) => {
+                    let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                    (fun_ty, constraints, mapping, Some(s))
+                }
+                None => {
+                    return self.error(
+                        ErrorCode::UnknownFunction,
+                        format!("Cannot find function `{}`", ident),
+                        range,
+                    );
+                }
+            };
+            let (call_arg_tys, ordered_args) =
+                self.infer_and_reorder_call_args(&ident, raw_args, &range);
+            let result = self.apply_function(
+                Some(&ident),
+                &fun_ty,
+                &call_arg_tys,
+                if ordered_args.is_empty() {
+                    None
+                } else {
+                    Some(&ordered_args)
+                },
+                id,
+                range.clone(),
+            );
+            if !fresh_constraints.is_empty() {
+                self.discharge_constraints(id, &fresh_constraints, &range);
+                if let Some(scheme) = original_scheme.as_ref() {
+                    self.pin_assoc_after_discharge(
+                        "",
+                        &fresh_constraints,
+                        Some(scheme),
+                        &fresh_mapping,
+                        &range,
+                    );
+                }
+            }
+            return result;
+        }
+
+        // Bare/UFCS trait method call: `method(x)`.
+        // Resolve it before ordinary environment lookup because class
+        // methods are selected by the active bound, not by a global FQN.
+        let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+        let arg_tys: Vec<Ty> = flat_args
+            .iter()
+            .map(|arg| self.infer_call_arg(arg))
+            .collect();
+        if let Some(Ty::Existential { class }) =
+            arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
+            && let Some((owner, method_slot, scheme)) =
+                self.existential_method_candidate(&class, &ident)
+        {
+            let hint = ExistentialMethodCall {
+                method_slot,
+                arity: arg_tys.len(),
+                has_receiver: false,
+            };
+            if let Some(call_id) = id {
+                self.existential_method_calls.insert(call_id, hint.clone());
+            }
+            self.existential_method_calls_by_span
+                .insert((range.start, range.end), hint);
+            return self.apply_existential_method(
+                &owner,
+                &ident,
+                &scheme,
+                &arg_tys,
+                args.as_deref(),
+                id,
+                range,
+            );
+        }
+        let candidates = self.bound_method_candidates(&ident, None);
+        if !candidates.is_empty() {
+            let receiver_var = arg_tys.first().and_then(|ty| {
+                Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
+            });
+            let candidates = receiver_var
+                .map(|v| self.bound_method_candidates(&ident, Some(v)))
+                .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
+            if let Some((dict_index, dict_class, class, method_slot, scheme)) =
+                self.select_bound_method(candidates, &ident, &range)
+            {
+                self.bind_matching_abstract_constraints(receiver_var, &dict_class);
+                let (fun_ty, constraints, mapping) =
+                    self.instantiate_scheme_mapped(&scheme);
+                if let Some(call_id) = id {
+                    self.bound_method_calls.insert(
+                        call_id,
+                        BoundMethodCall {
+                            dict_index,
+                            method_slot,
+                            arity: arg_tys.len(),
+                            has_receiver: false,
+                        },
+                    );
+                }
+                self.bound_method_calls_by_span.insert(
+                    (range.start, range.end),
+                    BoundMethodCall {
+                        dict_index,
+                        method_slot,
+                        arity: arg_tys.len(),
+                        has_receiver: false,
+                    },
+                );
+                let result = self.apply_function(
+                    Some(&format!("{}::{}", class, ident)),
+                    &fun_ty,
+                    &arg_tys,
+                    args.as_deref(),
+                    id,
+                    range.clone(),
+                );
+                if !constraints.is_empty() {
+                    self.discharge_constraints(id, &constraints, &range);
+                    self.pin_assoc_after_discharge(
+                        &class,
+                        &constraints,
+                        Some(&scheme),
+                        &mapping,
+                        &range,
+                    );
+                }
+                return result;
+            }
+        }
+
+        let scheme = self.env.lookup(&ident).cloned();
+        let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
+            Some(s) => {
+                let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
+                (fun_ty, constraints, mapping, Some(s))
+            }
+            None => {
+                return self.error(
+                    ErrorCode::UnknownFunction,
+                    format!("Cannot find function `{}`", ident),
+                    range,
+                );
+            }
+        };
+
+        // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
+        if self.extern_variadic.contains(ident.as_str()) {
+            return self.apply_extern_variadic_call(
+                &ident,
+                &fun_ty,
+                &arg_tys,
+                args.as_deref(),
+                range,
+            );
+        }
+
+        if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
+            return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
+        }
+
+        let result = self.apply_function(
+            Some(&ident),
+            &fun_ty,
+            &arg_tys,
+            if flat_args.is_empty() {
+                None
+            } else {
+                Some(&flat_args)
+            },
+            id,
+            range.clone(),
+        );
+        // Discharge trait constraints from the instantiated scheme.
+        // This verifies that each concrete type argument satisfies the
+        // required bound, or propagates the constraint if the caller is
+        // itself generic with the same bound.
+        if !fresh_constraints.is_empty() {
+            self.discharge_constraints(id, &fresh_constraints, &range);
+            if let Some(scheme) = original_scheme.as_ref() {
+                self.pin_assoc_after_discharge(
+                    "",
+                    &fresh_constraints,
+                    Some(scheme),
+                    &fresh_mapping,
+                    &range,
+                );
+            }
+        }
+        result
     }
 
     // ============================================================
@@ -6870,6 +7098,35 @@ impl Checker {
         }
 
         let target_ty = self.infer(&args[0]);
+        self.finish_len_call(target_ty, args, id, range)
+    }
+
+    /// Named-arg path: arguments were already inferred during reorder.
+    fn infer_len_call_from_tys(
+        &mut self,
+        tys: &[Ty],
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        if tys.len() != 1 || args.len() != 1 {
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("len expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `len(value: …)`".to_string()),
+            );
+        }
+        self.finish_len_call(tys[0].clone(), args, id, range)
+    }
+
+    fn finish_len_call(
+        &mut self,
+        target_ty: Ty,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
         let resolved = apply_ty_prune(&self.subst, &target_ty);
         if Self::is_structural_len_ty(&resolved) {
             return int();
@@ -8352,7 +8609,8 @@ impl Checker {
     /// `Ok(())` if `expr` is an integer literal in `0..=255`.
     /// `Err(Some(n))` if literal but out of range; `Err(None)` if not a literal.
     fn byte_literal_coercion(expr: &Output) -> Result<(), Option<i64>> {
-        match unwrap_expr_wrappers(expr).1.as_ref() {
+        let expr = Self::peel_literal_expr(expr);
+        match expr.1.as_ref() {
             Expression::Integer(n) => {
                 if (0..=255).contains(n) {
                     Ok(())
@@ -8360,11 +8618,23 @@ impl Checker {
                     Err(Some(*n))
                 }
             }
-            Expression::Negate(inner) => match unwrap_expr_wrappers(inner).1.as_ref() {
+            Expression::Negate(inner) => match Self::peel_literal_expr(inner).1.as_ref() {
                 Expression::Integer(n) => Err(Some(-n)),
                 _ => Err(None),
             },
             _ => Err(None),
+        }
+    }
+
+    /// Peel wrappers around a literal operand, including `(…)` as
+    /// `Group(Fragment([inner]))`.
+    fn peel_literal_expr<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
+        let expr = unwrap_expr_wrappers(expr);
+        match expr.1.as_ref() {
+            Expression::Fragment(items) if items.len() == 1 => {
+                Self::peel_literal_expr(&items[0])
+            }
+            _ => expr,
         }
     }
 
@@ -9611,6 +9881,14 @@ impl Checker {
     }
 
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
+        self.parse_type_name_inner(ann, false)
+    }
+
+    fn parse_return_type_name(&mut self, ann: &Output) -> Ty {
+        self.parse_type_name_inner(ann, true)
+    }
+
+    fn parse_type_name_inner(&mut self, ann: &Output, allow_dynamic_slice: bool) -> Ty {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => {
                 let range = ann.0.into_range();
@@ -9659,13 +9937,19 @@ impl Checker {
                         *n as usize,
                     );
                 }
-                // Dynamic `[T]` annotations are rejected — use `[T; N]` or `Vec<T>`.
-                let _ = self.error_with_help(
-                    ErrorCode::GenericTypeError,
-                    "dynamic array type `[T]` is not allowed".to_string(),
-                    ann.0.into_range(),
-                    Some("use a fixed-length `[T; N]` or growable `Vec<T>`".to_string()),
-                );
+                if items.len() == 1 {
+                    let elem_ty = self.parse_type_name_inner(&items[0], allow_dynamic_slice);
+                    if matches!(&elem_ty, Ty::Con(name) if name == "byte") || allow_dynamic_slice {
+                        return crate::typechecking::ty::array(elem_ty);
+                    }
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "dynamic array type `[T]` is not allowed".to_string(),
+                        ann.0.into_range(),
+                        Some("use a fixed-length `[T; N]` or growable `Vec<T>`".to_string()),
+                    );
+                    return Ty::Var(self.counter.fresh());
+                }
                 Ty::Var(self.counter.fresh())
             }
             Expression::Tuple(items) => {
@@ -10955,7 +11239,7 @@ impl Checker {
             // Honor `async fn -> T`: unify declared T with the yield/
             // return slot so annotation mismatches are diagnosed.
             if let Some(r) = returns {
-                let declared = self.parse_type_name(r);
+                let declared = self.parse_return_type_name(r);
                 self.unify(
                     &yield_ty,
                     &declared,
@@ -10968,7 +11252,7 @@ impl Checker {
         } else {
             (
                 match returns {
-                    Some(r) => self.parse_type_name(r),
+                    Some(r) => self.parse_return_type_name(r),
                     None => Ty::Var(self.counter.fresh()),
                 },
                 None,
@@ -11616,13 +11900,14 @@ impl Checker {
                                 .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                             out.push((name.to_string(), pack));
                         } else {
-                            let elem = self.parse_type_name(ty.as_ref().expect("typed rest"));
+                            let elem =
+                                self.parse_return_type_name(ty.as_ref().expect("typed rest"));
                             out.push((name.to_string(), vec_app_ty(elem)));
                         }
                     } else {
                         out.push((
                             name.to_string(),
-                            self.parse_type_name(ty.as_ref().expect("fixed param type")),
+                            self.parse_return_type_name(ty.as_ref().expect("fixed param type")),
                         ));
                     }
                 }
@@ -12108,14 +12393,14 @@ impl Checker {
                 || args.len() >= fixed_count
                 || fixed_count == 0);
 
-        // `filled_mask` is a u32 on the VM stack (MakeFn / CallIndirect); cap
+        // `filled_mask` is a u64 on the VM stack (MakeFn / CallIndirect); cap
         // fixed arity so bit shifts never wrap. Abort early — continuing would
         // emit a truncated mask and mis-bind partials.
-        if fixed_count > 32 {
+        if fixed_count > 64 {
             let msg = Message::error(
                 ErrorCode::WrongArity,
                 format!(
-                    "Function `{}` has {} fixed parameters; at most 32 are supported for partial application",
+                    "Function `{}` has {} fixed parameters; at most 64 are supported for partial application",
                     fn_name, fixed_count
                 ),
                 range.clone(),
@@ -13424,8 +13709,8 @@ impl Checker {
             // error anchoring — it's close enough that ariadne
             // points near the offending pattern instead of at byte
             // 0 of the source.
-            let pattern_range = arm.body.0.into_range();
-            let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee, &pattern_range);
+            let pattern_range = arm.pattern.0.into_range();
+            let pat_ty = self.infer_pattern(&arm.pattern.1, &resolved_scrutinee, &pattern_range);
 
             // Narrow an Identifier scrutinee to the matched variant so
             // `p.0` / `p.field` inside the arm use tagged field lookup
@@ -13436,7 +13721,7 @@ impl Checker {
                     enum_name,
                     variant_name,
                     ..
-                } = &arm.pattern
+                } = &arm.pattern.1
             {
                 if let Some(tag) = self
                     .enum_tags
@@ -13491,7 +13776,7 @@ impl Checker {
             );
 
             // Step 4: capture coverage info.
-            let arm_cov = self.arm_coverage(&arm.pattern, &arm.body.0.into_range());
+            let arm_cov = self.arm_coverage(&arm.pattern.1, &pattern_range);
             coverage.push(arm_cov);
 
             // Step 5: infer body, unify with result.
@@ -13678,7 +13963,7 @@ impl Checker {
                     PatternPayload::Tuple(parts) => {
                         let expected_tys = expected_payload.field_types();
                         for (sub_pat, expected_ty) in parts.iter().zip(expected_tys.iter()) {
-                            let _ = self.infer_pattern(sub_pat, expected_ty, pattern_range);
+                            let _ = self.infer_pattern(&sub_pat.1, expected_ty, pattern_range);
                         }
                     }
                     PatternPayload::Record(fields) => {
@@ -13690,7 +13975,7 @@ impl Checker {
                         let mut pattern_site: std::collections::HashMap<&str, &Pattern> =
                             std::collections::HashMap::with_capacity(fields.len());
                         for pf in fields {
-                            if pattern_site.insert(pf.name, &pf.pattern).is_some() {
+                            if pattern_site.insert(pf.name, &pf.pattern.1).is_some() {
                                 return self.error_with_help(
                                     ErrorCode::DuplicateField,
                                     format!(
@@ -13950,31 +14235,61 @@ impl Checker {
     /// The codegen's inner `JUMP_IF_MATCH` test chain guarantees
     /// this at runtime; the typechecker just needs to stay out of
     /// the way.
-    fn inner_coverage(
-        payload: &parser::ast::PatternPayload<'_>,
+    fn pattern_coverage(
+        pattern: &Pattern,
         enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
-    ) -> InnerCoverage {
-        use parser::ast::PatternPayload;
-        let first = match payload {
-            PatternPayload::Unit => return InnerCoverage::Any,
-            PatternPayload::Tuple(parts) => parts.first(),
-            PatternPayload::Record(fields) => fields.first().map(|f| &f.pattern),
-        };
-        let Some(first) = first else {
-            return InnerCoverage::Any;
-        };
-        match first {
-            Pattern::Wildcard | Pattern::Binding { .. } => InnerCoverage::Any,
+    ) -> CoverageTree {
+        match pattern {
+            Pattern::Wildcard | Pattern::Binding { .. } => CoverageTree::Any,
             Pattern::Constructor {
                 enum_name,
                 variant_name,
+                payload,
                 ..
-            } => enum_tags
-                .get(enum_name.to_string().as_str())
-                .and_then(|t| t.get(variant_name.to_string().as_str()).copied())
-                .map(InnerCoverage::Tag)
-                .unwrap_or(InnerCoverage::Any),
+            } => {
+                let tag = enum_tags
+                    .get(enum_name.to_string().as_str())
+                    .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
+                let inner = Self::payload_coverage(payload, enum_tags);
+                tag.map(|t| CoverageTree::Tag(t, vec![inner]))
+                    .unwrap_or(CoverageTree::Any)
+            }
         }
+    }
+
+    fn payload_coverage(
+        payload: &parser::ast::PatternPayload<'_>,
+        enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
+    ) -> CoverageTree {
+        use parser::ast::PatternPayload;
+        match payload {
+            PatternPayload::Unit => CoverageTree::Any,
+            PatternPayload::Tuple(parts) => CoverageTree::Tuple(
+                parts
+                    .iter()
+                    .map(|p| Self::pattern_coverage(&p.1, enum_tags))
+                    .collect(),
+            ),
+            PatternPayload::Record(fields) => CoverageTree::Record(
+                fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.to_string(),
+                            Self::pattern_coverage(&f.pattern.1, enum_tags),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Payload coverage for constructor arms (full inner tree).
+    fn inner_coverage(
+        payload: &parser::ast::PatternPayload<'_>,
+        enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
+    ) -> CoverageTree {
+        Self::payload_coverage(payload, enum_tags)
     }
 
     /// Capture per-arm coverage info for the deferred
@@ -13983,13 +14298,13 @@ impl Checker {
         match pattern {
             Pattern::Wildcard => ArmCoverage {
                 tag: None,
-                inner: InnerCoverage::Any,
+                inner: CoverageTree::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
             Pattern::Binding { .. } => ArmCoverage {
                 tag: None,
-                inner: InnerCoverage::Any,
+                inner: CoverageTree::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
@@ -14044,7 +14359,7 @@ impl Checker {
         // them at runtime. Only when both the outer tag AND the
         // inner coverage match an earlier arm is the arm truly
         // unreachable.
-        let mut seen: BTreeMap<u32, BTreeSet<InnerCoverage>> = BTreeMap::new();
+        let mut seen: BTreeMap<u32, BTreeSet<CoverageTree>> = BTreeMap::new();
         let mut has_catchall = false;
         for arm in &pending.arms {
             if arm.is_catchall {
@@ -14077,6 +14392,15 @@ impl Checker {
                 Ty::Sum { variants, .. } => Some(variants.clone()),
                 other => self.poly_variants_from_app(other),
             },
+            Ty::Con(name) if self.enums.contains_key(name.as_str()) => {
+                let variant_names = self.enums.get(name.as_str()).cloned().unwrap_or_default();
+                let payloads = self
+                    .enum_payloads
+                    .get(name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                Some(variant_names.into_iter().zip(payloads).collect())
+            }
             other => self.poly_variants_from_app(other),
         };
 

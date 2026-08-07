@@ -7,6 +7,7 @@ mod il;
 mod manifest;
 mod monomorphize;
 mod pipeline;
+mod project_index;
 mod strip_tests;
 pub mod symbols;
 mod typechecking;
@@ -20,6 +21,7 @@ pub use dissect::{
 };
 pub use manifest::{Manifest, ManifestError};
 pub use pipeline::*;
+pub use project_index::ProjectIndex;
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
 pub use typechecking::env::{Env, Frame};
 pub use typechecking::pretty::format_ty_for_diag;

@@ -63,6 +63,15 @@ pub struct StackBoundReport {
     pub operand_slots_needed: u32,
 }
 
+/// How the measure parameter decreases on each self-call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasureStep {
+    /// `param - k` with fixed positive `k`.
+    Subtract(i64),
+    /// `param / 2` or `param >> 1`.
+    Half,
+}
+
 /// Unified decreasing-measure shape for stack-bound proofs.
 #[derive(Debug, Clone)]
 struct RecMeasureShape {
@@ -71,7 +80,7 @@ struct RecMeasureShape {
     measure_index: usize,
     base_bound: Option<i64>,
     /// Minimum positive decrease across all self-calls.
-    min_step: i64,
+    step: MeasureStep,
     #[allow(dead_code)]
     self_calls: usize,
 }
@@ -268,22 +277,37 @@ fn prove_measure_depth(
     let Some(base) = shape.base_bound else {
         return DepthProof::Unprovable;
     };
-    let step = shape.min_step.max(1);
     let mut max_d = 1u32;
     for &n in set {
-        max_d = max_d.max(measure_depth(n, base, step));
+        max_d = max_d.max(measure_depth(n, base, shape.step));
     }
     DepthProof::Frames(max_d)
 }
 
-/// Worst-case frames along a chain that decreases `n` by `step` until `n <= base`.
-fn measure_depth(n: i64, base: i64, step: i64) -> u32 {
+/// Worst-case frames along a chain that decreases `n` until `n <= base`.
+fn measure_depth(n: i64, base: i64, step: MeasureStep) -> u32 {
     if n <= base {
         return 1;
     }
-    let step = step.max(1) as u64;
-    let delta = (n - base) as u64;
-    (delta.div_ceil(step) as u32).saturating_add(1)
+    match step {
+        MeasureStep::Subtract(k) => {
+            let k = k.max(1) as u64;
+            let delta = (n - base) as u64;
+            (delta.div_ceil(k) as u32).saturating_add(1)
+        }
+        MeasureStep::Half => {
+            let mut depth = 1u32;
+            let mut cur = n;
+            while cur > base {
+                cur = cur / 2;
+                depth += 1;
+                if depth > 10_000 {
+                    break;
+                }
+            }
+            depth
+        }
+    }
 }
 
 fn parse_max_depth_attr(
@@ -418,29 +442,33 @@ fn detect_measure_shape(
 
     for (measure_index, measure_param) in params.iter().enumerate() {
         let base_bound = find_base_bound(body, measure_param);
-        let mut min_step: Option<i64> = None;
+        let mut min_step: Option<MeasureStep> = None;
         let mut ok = true;
         for call_args in &self_calls {
             let Some(arg) = call_args.get(measure_index) else {
                 ok = false;
                 break;
             };
-            let Some(step) = match_param_minus_const(peel(arg), measure_param) else {
+            let Some(step) = match_param_decrease(peel(arg), measure_param) else {
                 ok = false;
                 break;
             };
             min_step = Some(match min_step {
-                Some(m) => m.min(step),
+                Some(MeasureStep::Subtract(m)) => match step {
+                    MeasureStep::Subtract(s) => MeasureStep::Subtract(m.min(s)),
+                    MeasureStep::Half => MeasureStep::Half,
+                },
+                Some(MeasureStep::Half) => MeasureStep::Half,
                 None => step,
             });
         }
         if !ok {
             continue;
         }
-        let Some(min_step) = min_step else {
+        let Some(step) = min_step else {
             continue;
         };
-        if min_step <= 0 {
+        if matches!(step, MeasureStep::Subtract(k) if k <= 0) {
             continue;
         }
         // Accept shape even without base_bound so diagnostics can ask for a base case.
@@ -448,7 +476,7 @@ fn detect_measure_shape(
             measure_param: measure_param.clone(),
             measure_index,
             base_bound,
-            min_step,
+            step,
             self_calls: self_calls.len(),
         });
     }
@@ -1528,6 +1556,35 @@ fn match_base_bound(cond: &Output<'_>, param: &str) -> Option<i64> {
     }
 }
 
+fn match_param_decrease(expr: &Output<'_>, param: &str) -> Option<MeasureStep> {
+    if let Some(k) = match_param_minus_const(expr, param) {
+        return Some(MeasureStep::Subtract(k));
+    }
+    if match_param_half(expr, param) {
+        return Some(MeasureStep::Half);
+    }
+    None
+}
+
+fn match_param_half(expr: &Output<'_>, param: &str) -> bool {
+    let expr = peel(expr);
+    match expr.1.as_ref() {
+        Expression::Div(lhs, rhs) => {
+            let lhs = peel(lhs);
+            let rhs = peel(rhs);
+            matches!(lhs.1.as_ref(), Expression::Identifier(p) if *p == param)
+                && matches!(rhs.1.as_ref(), Expression::Integer(2))
+        }
+        Expression::Shr(lhs, rhs) => {
+            let lhs = peel(lhs);
+            let rhs = peel(rhs);
+            matches!(lhs.1.as_ref(), Expression::Identifier(p) if *p == param)
+                && matches!(rhs.1.as_ref(), Expression::Integer(1))
+        }
+        _ => false,
+    }
+}
+
 fn match_param_minus_const(expr: &Output<'_>, param: &str) -> Option<i64> {
     let expr = peel(expr);
     match expr.1.as_ref() {
@@ -2002,9 +2059,58 @@ fn main() {
 
     #[test]
     fn measure_depth_helpers() {
-        assert_eq!(measure_depth(2, 2, 1), 1);
-        assert_eq!(measure_depth(10, 2, 1), 9);
-        assert_eq!(measure_depth(32, 2, 1), 31);
+        use MeasureStep::{Half, Subtract};
+        assert_eq!(measure_depth(2, 2, Subtract(1)), 1);
+        assert_eq!(measure_depth(10, 2, Subtract(1)), 9);
+        assert_eq!(measure_depth(32, 2, Subtract(1)), 31);
+        assert_eq!(measure_depth(16, 1, Half), 5); // 16→8→4→2→1
+        assert_eq!(measure_depth(1, 1, Half), 1);
+    }
+
+    #[test]
+    fn half_measure_recursion_is_proven() {
+        let ast = parse(
+            r#"
+fn dig(int n) -> int {
+    if n <= 1 { return 1; }
+    return 1 + dig(n / 2);
+}
+fn main() {
+    let x = dig(16);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report
+            .bounds
+            .iter()
+            .find(|b| b.fn_name == "dig")
+            .expect("dig bound");
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 5);
+    }
+
+    #[test]
+    fn shr_one_measure_recursion_is_proven() {
+        let ast = parse(
+            r#"
+fn dig(int n) -> int {
+    if n <= 1 { return 0; }
+    return 1 + dig(n >> 1);
+}
+fn main() {
+    let x = dig(8);
+    return;
+}
+"#,
+        );
+        let report = analyze_stack_bounds(&ast);
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+        let b = report.bounds.iter().find(|b| b.fn_name == "dig").unwrap();
+        assert_eq!(b.source, BoundSource::Proven);
+        assert_eq!(b.max_frames, 4); // 8→4→2→1
     }
 
     #[test]

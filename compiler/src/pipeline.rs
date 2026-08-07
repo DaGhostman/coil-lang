@@ -193,6 +193,10 @@ impl Pipeline {
         &mut self.compiler
     }
 
+    pub fn compiler(&self) -> &Compiler {
+        &self.compiler
+    }
+
     /// Borrow the compiler's accumulated diagnostic
     /// messages. Public so integration tests can read
     /// them (the `#[cfg(test)]`-only `compiler_mut` is
@@ -1010,6 +1014,7 @@ impl Pipeline {
             bytecode: self.bytecode,
             source_files: self.compiler.source_files_list(),
             debug_locs: self.compiler.debug_locs().to_vec(),
+            fn_symbols: self.compiler.fn_debug_symbols(),
         };
 
         let mut out = File::create(output).expect("Unable to open output file");
@@ -1251,6 +1256,7 @@ impl Pipeline {
         ProgramDebug {
             source_files: self.compiler.source_files_list(),
             debug_locs: self.compiler.debug_locs().to_vec(),
+            fn_symbols: self.compiler.fn_debug_symbols(),
         }
     }
 
@@ -1303,6 +1309,7 @@ impl Pipeline {
             ProgramDebug {
                 source_files,
                 debug_locs,
+                fn_symbols: self.compiler.fn_debug_symbols(),
             },
         ))
     }

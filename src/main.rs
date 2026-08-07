@@ -665,6 +665,7 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
         bytecode,
         source_files: debug.source_files,
         debug_locs: debug.debug_locs,
+        fn_symbols: debug.fn_symbols,
     };
 
     let bytes = match rkyv::to_bytes::<Error>(&program) {
@@ -685,7 +686,6 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
     }
 }
 
-#[cfg(test)]
 mod archive_staleness {
     use std::path::Path;
     use std::time::SystemTime;
@@ -796,6 +796,56 @@ mod archive_staleness {
     }
 }
 
+/// Canonical entry path for FFI `base_dir` resolution (best-effort absolute).
+fn ffi_entry_path(entry: &Path) -> PathBuf {
+    std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf())
+}
+
+/// Warn when a cached `.hyc` is older than sources recorded in its debug bundle.
+fn maybe_warn_stale_archive(
+    pipeline: &mut Pipeline,
+    archive: &str,
+    debug: &ProgramDebug,
+) {
+    if debug.source_files.is_empty() {
+        return;
+    }
+    let entry = debug
+        .source_files
+        .iter()
+        .find(|p| {
+            Path::new(p)
+                .extension()
+                .is_some_and(|ext| ext == "hy")
+                && !p.contains("stdlib/")
+        })
+        .map(|s| s.as_str())
+        .unwrap_or(archive);
+    if archive_staleness::archive_is_stale(entry, archive, debug) {
+        pipeline.emit_spanless_warning(
+            ErrorCode::IoError,
+            format!(
+                "Bytecode archive `{archive}` may be stale (recorded sources are newer). Recompile with `coil compile … -o {archive}` or run `coil <entry.hy>` directly."
+            ),
+        );
+    }
+}
+
+/// Warn when a stale default `out.hyc` exists beside an in-memory run entry.
+fn maybe_warn_stale_default_out(pipeline: &mut Pipeline, entry: &str, debug: &ProgramDebug) {
+    if !Path::new(DEFAULT_OUT).exists() {
+        return;
+    }
+    if archive_staleness::archive_is_stale(entry, DEFAULT_OUT, debug) {
+        pipeline.emit_spanless_warning(
+            ErrorCode::IoError,
+            format!(
+                "`{DEFAULT_OUT}` is older than sources for `{entry}` and is not used by the default run. Refresh with `coil compile {entry} -o {DEFAULT_OUT}`."
+            ),
+        );
+    }
+}
+
 /// Run archived bytecode. Returns `true` when a language-level `panic` aborted.
 pub(crate) fn execute_archive(
     pipeline: &Pipeline,
@@ -805,10 +855,13 @@ pub(crate) fn execute_archive(
     static_slots: u32,
     debug: ProgramDebug,
     entry: Option<&Path>,
+    operand_stack_slots: u32,
 ) -> bool {
-    let mut machine =
-        Machine::<256>::with_operand_capacity(pipeline.operand_stack_slots() as usize);
-    pipeline.wire_vm_ffi(&mut machine, entry);
+    let operand_slots = operand_stack_slots
+        .max(machine::DEFAULT_OPERAND_STACK_SLOTS as u32) as usize;
+    let entry = entry.map(ffi_entry_path);
+    let mut machine = Machine::<256>::with_operand_capacity(operand_slots);
+    pipeline.wire_vm_ffi(&mut machine, entry.as_deref());
     pipeline.wire_host_natives(&mut machine);
     pipeline.wire_thread_program(&mut machine, bytecode, constants, strings);
     machine.set_program_debug(debug);
@@ -837,6 +890,8 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         let _ = pipeline.finish_reporting();
     }
 
+    maybe_warn_stale_default_out(pipeline, filename, &debug);
+    let entry = ffi_entry_path(Path::new(filename));
     if execute_archive(
         pipeline,
         &bytecode,
@@ -844,7 +899,8 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         &strings,
         static_slots,
         debug,
-        Some(Path::new(filename)),
+        Some(entry.as_path()),
+        pipeline.operand_stack_slots(),
     ) {
         exit(1);
     }
@@ -885,6 +941,8 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
         ),
     };
 
+    maybe_warn_stale_archive(pipeline, archive, &debug);
+
     if let Err(e) = pipeline.finish_reporting() {
         pipeline.emit_spanless_warning(
             ErrorCode::IoError,
@@ -903,6 +961,7 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
         static_slots,
         debug,
         Some(entry),
+        machine::DEFAULT_OPERAND_STACK_SLOTS as u32,
     ) {
         exit(1);
     }
@@ -1070,6 +1129,7 @@ fn run_test_suite(
                     if cases.is_empty() {
                         // Legacy: whole-file `main` is one opaque case.
                         let debug = pipeline.program_debug();
+                        let operand_stack_slots = pipeline.operand_stack_slots();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             execute_archive(
                                 &pipeline,
@@ -1079,6 +1139,7 @@ fn run_test_suite(
                                 static_slots,
                                 debug,
                                 Some(entry),
+                                operand_stack_slots,
                             )
                         }));
                         let ok = match result {
@@ -1584,6 +1645,7 @@ mod tests {
             bytecode: vec![Byte::new(common::Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![common::DebugLoc::unknown()],
+            fn_symbols: Vec::new(),
         })
         .unwrap();
         std::fs::write(&stale, bytes.as_slice()).unwrap();
@@ -1603,6 +1665,7 @@ mod tests {
             bytecode: vec![Byte::new(common::Instruction::HALT)],
             source_files: vec![],
             debug_locs: vec![common::DebugLoc::unknown()],
+            fn_symbols: Vec::new(),
         };
         let ok_bytes = rkyv::to_bytes::<Error>(&ok_prog).unwrap();
         std::fs::write(&ok_path, ok_bytes.as_slice()).unwrap();
@@ -1649,6 +1712,7 @@ mod tests {
         let debug = ProgramDebug {
             source_files: vec![a.to_string_lossy().into_owned()],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         // Running b.hy against an archive built from a.hy must rebuild.
         assert!(archive_is_stale(
@@ -1684,6 +1748,7 @@ mod tests {
                 dep.to_string_lossy().into_owned(),
             ],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         assert!(archive_is_stale(
             entry.to_str().unwrap(),
@@ -1704,6 +1769,7 @@ mod tests {
         let debug = ProgramDebug {
             source_files: vec![],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         // Entry not newer than archive → fresh via the empty-list branch.
         assert!(!archive_is_stale(
@@ -1736,6 +1802,7 @@ mod tests {
                 missing.to_string_lossy().into_owned(),
             ],
             debug_locs: vec![],
+            fn_symbols: Vec::new(),
         };
         assert!(
             archive_is_stale(entry.to_str().unwrap(), arch.to_str().unwrap(), &debug),

@@ -50,6 +50,7 @@ pub fn load_archive_bytes(
         ProgramDebug {
             source_files,
             debug_locs,
+            fn_symbols: Vec::new(),
         },
     ))
 }

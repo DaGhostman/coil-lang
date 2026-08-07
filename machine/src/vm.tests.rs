@@ -1562,9 +1562,9 @@
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Resuming a completed coroutine pushes 0 (MVP done protocol).
+    /// Resuming a completed coroutine panics.
     #[test]
-    fn coroutine_resume_after_done_returns_zero() {
+    fn coroutine_resume_after_done_panics() {
         let mut vm = Machine::<8>::default();
         vm.run(&[
             make_coro(0, 9),
@@ -1580,8 +1580,162 @@
             Byte::new(Instruction::YieldCoro),
             Byte::new(Instruction::RETURN),
         ]);
-        assert_eq!(vm.pop().as_int(), 0);
+        assert!(vm.panicked());
         assert_eq!(vm.pop().as_int(), 7);
+    }
+
+    /// Resume-after-done must emit the runtime panic contract (not a silent 0).
+    #[test]
+    fn coroutine_resume_after_done_writes_panic_message() {
+        let mut vm = Machine::<8>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+        vm.run(&[
+            make_coro(0, 9),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            const_int(7),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert!(vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf8");
+        assert!(
+            s.contains("panic: resumed after completion"),
+            "unexpected panic output: {s:?}"
+        );
+        assert!(!s.contains("HALT_SHOULD_NOT_RUN"));
+    }
+
+    /// Non-coroutine handles must panic instead of UB / silent no-op.
+    #[test]
+    fn coroutine_resume_invalid_handle_panics() {
+        let mut vm = Machine::<8>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+        let strings = vec!["should-not-print".to_string()];
+        vm.run_with_pool(
+            &[
+                const_int(0),
+                Byte::new(Instruction::ResumeCoro),
+                Byte::new(Instruction::STRING).with_operand_u32(0),
+                Byte::new(Instruction::PRINT),
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+            &strings,
+            0,
+        );
+        assert!(vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf8");
+        assert!(
+            s.contains("panic: resumed invalid coroutine handle"),
+            "unexpected panic output: {s:?}"
+        );
+        assert!(
+            !s.contains("should-not-print"),
+            "bytecode after panic must not execute: {s:?}"
+        );
+    }
+
+    /// Suspended coroutine heap slots must stay rooted via `saved_live_mask`.
+    #[test]
+    fn coroutine_suspended_string_survives_gc() {
+        let mut vm = Machine::<256>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let mut strings: Vec<String> = vec!["keep-me".into()];
+        strings.extend((0..n).map(|i| format!("junk-{i}")));
+
+        // main: resume → alloc junk while suspended → resume → PRINT kept string
+        // body: STRING "keep-me"; CONST 1; YieldCoro; PRINT; RETURN
+        let body = 8 + n * 3;
+        let mut code: Vec<Byte> = Vec::with_capacity(body + 6);
+        code.push(make_coro(0, body as u32));
+        code.push(store_pop(0));
+        code.push(load(0));
+        code.push(Byte::new(Instruction::ResumeCoro));
+        code.push(Byte::new(Instruction::POP));
+        for _ in 0..n {
+            code.push(const_int(0));
+            code.push(make_enum(0, 1));
+            code.push(Byte::new(Instruction::POP));
+        }
+        code.push(load(0));
+        code.push(Byte::new(Instruction::ResumeCoro));
+        code.push(Byte::new(Instruction::HALT));
+        assert_eq!(code.len(), body);
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(const_int(1));
+        code.push(Byte::new(Instruction::YieldCoro));
+        code.push(Byte::new(Instruction::PRINT));
+        code.push(Byte::new(Instruction::RETURN));
+
+        vm.run_with_pool(&code, &[], &strings, 0);
+        assert!(!vm.panicked(), "GC must not collect suspended string");
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf8");
+        assert_eq!(s, "keep-me");
+    }
+
+    /// Panic backtraces resolve `fn_symbols` by entry PC (binary search).
+    #[test]
+    fn runtime_panic_backtrace_includes_fn_symbols() {
+        use common::{FnDebugSym, ProgramDebug};
+
+        let mut vm = Machine::<8>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+        vm.set_program_debug(ProgramDebug {
+            source_files: vec![],
+            debug_locs: vec![],
+            fn_symbols: vec![
+                FnDebugSym {
+                    name: "main".into(),
+                    entry_pc: 0,
+                },
+                FnDebugSym {
+                    name: "worker".into(),
+                    entry_pc: 9,
+                },
+            ],
+        });
+        vm.run(&[
+            make_coro(0, 9),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            // worker @ 9
+            const_int(7),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert!(vm.panicked());
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf8");
+        assert!(
+            s.contains("panic: resumed after completion"),
+            "missing panic message: {s:?}"
+        );
+        assert!(
+            s.contains("in main"),
+            "expected fn_symbols backtrace frame, got: {s:?}"
+        );
     }
 
     /// Resume with send + binding yield: second resume returns the sent value.
@@ -1607,6 +1761,42 @@
         ]);
         assert_eq!(vm.pop().as_int(), 200);
         assert_eq!(vm.pop().as_int(), 100);
+    }
+
+    /// `yield from` delegation must survive an ordinary RETURN in main
+    /// between resumes (host I/O returns through the same `after_return`
+    /// path as coroutine completion).
+    #[test]
+    fn yield_from_delegation_survives_main_return_between_resumes() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            // main
+            make_coro(0, 10), // outer @ 10
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            store_pop(1), // first yield
+            Byte::new(Instruction::CALL).with_call_packed(0, 15), // host stub
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            store_pop(2), // second yield
+            Byte::new(Instruction::HALT),
+            // 10: outer — yield from inner @ 17
+            make_coro(0, 17),
+            Byte::new(Instruction::YieldFromCoro),
+            const_int(0),
+            Byte::new(Instruction::RETURN),
+            // 15: host stub
+            Byte::new(Instruction::RETURN),
+            // 17: inner
+            const_int(10),
+            Byte::new(Instruction::YieldCoro),
+            const_int(20),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert!(!vm.panicked());
+        assert_eq!(vm.stack[2].as_int(), 20);
     }
 
     #[test]
@@ -2219,6 +2409,68 @@
         let mut vm = Machine::<16>::default();
         vm.run(&code);
         assert_eq!(vm.pop().as_int(), 15);
+    }
+
+    #[test]
+    fn call_indirect_partial_mask_preserves_high_bit() {
+        let body_entry = 10u32;
+        let partial_mask = 1u64 << 32;
+        let constants = vec![partial_mask];
+        let code = vec![
+            const_int(42),
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 1, 33, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::RETURN),
+        ];
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(&code, &constants, &[], 0);
+        let addr = vm.pop().raw() as u64;
+        let fn_obj = vm
+            .heap()
+            .find_object_by_addr(addr)
+            .expect("partial ObjFn on heap");
+        if let crate::Object::Fn(gc) = fn_obj {
+            assert_eq!(gc.as_ref().filled_mask, partial_mask);
+            assert_eq!(gc.as_ref().captured_args.len(), 1);
+            assert_eq!(gc.as_ref().captured_args[0].as_int(), 42);
+        } else {
+            panic!("expected ObjFn");
+        }
+    }
+
+    /// Completing a 33-param partial whose only filled hole is slot 32.
+    #[test]
+    fn call_indirect_completes_high_bit_partial() {
+        let body_entry = 40u32;
+        let partial_mask = 1u64 << 32;
+        let constants = vec![partial_mask];
+        let mut code = vec![
+            const_int(42),
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 1, 33, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+        ];
+        for i in 0..32 {
+            code.push(const_int(i as i64));
+        }
+        code.push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+        code.push(Byte::new(Instruction::CallIndirect).with_operand_u32(32));
+        code.push(Byte::new(Instruction::HALT));
+        assert_eq!(code.len(), body_entry as usize);
+        code.push(Byte::new(Instruction::LOAD).with_operand_u32(32));
+        code.push(Byte::new(Instruction::RETURN));
+
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &constants, &[], 0);
+        assert!(!vm.panicked());
+        assert_eq!(vm.pop().as_int(), 42);
     }
 
     #[test]

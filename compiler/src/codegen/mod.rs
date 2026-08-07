@@ -4,7 +4,7 @@ use std::{
 };
 
 use common::{
-    Byte, DEBUG_FILE_UNKNOWN, DebugLoc, Instruction, Interner, Value, ValueTag, encode_tag_operand,
+    Byte, DEBUG_FILE_UNKNOWN, DebugLoc, FnDebugSym, Instruction, Interner, Value, ValueTag, encode_tag_operand,
     likely, tag, unlikely,
 };
 use reporting::Label as DiagLabel;
@@ -20,6 +20,17 @@ use parser::{
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
 };
 
+/// Max native recursion depth for [`compiler::Compiler::do_compile`]. Chosen
+/// well under what a debug-build stack of a few MiB can hold even with
+/// `do_compile`'s current per-call frame size — see
+/// docs/internals/limitations.md.
+const CODEGEN_RECURSION_LIMIT: u32 = 2000;
+
+/// Private unwind payload for `do_compile`'s recursion-limit panic. Caught in
+/// [`Compiler::compile_module`]; never lets user input abort the process the
+/// way a genuine native stack overflow does.
+struct CodegenRecursionLimitExceeded;
+
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
         $result.append(&mut $self.do_compile($rhs));
@@ -29,9 +40,7 @@ macro_rules! unary {
 }
 macro_rules! binary {
     ($result: expr, $self: expr, $lhs: expr, $rhs: expr, $instruction: expr) => {
-        $result.append(&mut $self.do_compile($lhs));
-        $result.append(&mut $self.do_compile($rhs));
-
+        let _ = $self.compile_binary_operands(&mut $result, $lhs, $rhs);
         $result.push($instruction);
     };
 }
@@ -254,7 +263,7 @@ fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup
     let mut groups: Vec<TagGroup> = Vec::new();
     let mut tag_to_idx: HashMap<u32, usize> = HashMap::new();
     for (i, arm) in arms.iter().enumerate() {
-        let tag = match &arm.pattern {
+        let tag = match &arm.pattern.1 {
             Pattern::Constructor {
                 enum_name,
                 variant_name,
@@ -292,22 +301,27 @@ fn arm_has_runtime_test(arm: &MatchArm) -> bool {
                 PatternPayload::Unit => false,
                 PatternPayload::Tuple(parts) => parts
                     .iter()
-                    .any(|p| matches!(p, Pattern::Binding { .. } | Pattern::Constructor { .. })),
+                    .any(|p| {
+                        matches!(
+                            p.1,
+                            Pattern::Binding { .. } | Pattern::Constructor { .. }
+                        )
+                    }),
                 PatternPayload::Record(fields) => fields.iter().any(|f| {
                     matches!(
-                        f.pattern,
+                        f.pattern.1,
                         Pattern::Binding { .. } | Pattern::Constructor { .. }
                     )
                 }),
             },
         }
     }
-    if let Pattern::Constructor { payload, .. } = &arm.pattern {
+    if let Pattern::Constructor { payload, .. } = &arm.pattern.1 {
         match payload {
             PatternPayload::Unit => false,
-            PatternPayload::Tuple(parts) => parts.iter().any(inner_carries_value),
+            PatternPayload::Tuple(parts) => parts.iter().any(|p| inner_carries_value(&p.1)),
             PatternPayload::Record(fields) => {
-                fields.iter().any(|f| inner_carries_value(&f.pattern))
+                fields.iter().any(|f| inner_carries_value(&f.pattern.1))
             }
         }
     } else {
@@ -345,7 +359,7 @@ fn emit_inner_test<'compiler>(
             // POP/STORE for wildcards/bindings; JUMP_IF_MATCH for nested constructors.
             let mut any_nested_ctor = false;
             for sub in parts {
-                match sub {
+                match &sub.1 {
                     Pattern::Wildcard => {
                         bytecode.push_pop();
                     }
@@ -415,7 +429,7 @@ fn emit_inner_test<'compiler>(
             // Walk record fields in declaration order (matches UNPACK slot layout).
             let decl_order = checker.payload_tys_for(enum_name, variant_name);
             let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
-                fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
+                fields.iter().map(|pf| (pf.name, &pf.pattern.1)).collect();
             let mut any_nested_ctor = false;
             for (decl_name, _) in decl_order.iter() {
                 let sub_pat = match pattern_site.get(decl_name.as_str()) {
@@ -534,7 +548,7 @@ fn collect_pattern_binding_types(
                     for (i, part) in parts.iter().enumerate() {
                         let expected = decl.get(i).map(|(_, ty)| ty);
                         collect_pattern_binding_types_with_expected(
-                            checker, enum_name, part, expected, out,
+                            checker, enum_name, &part.1, expected, out,
                         );
                     }
                 }
@@ -546,7 +560,7 @@ fn collect_pattern_binding_types(
                         collect_pattern_binding_types_with_expected(
                             checker,
                             enum_name,
-                            &pf.pattern,
+                            &pf.pattern.1,
                             expected,
                             out,
                         );
@@ -773,6 +787,11 @@ pub struct Compiler {
     /// memory).
     expr_depth: u32,
 
+    /// Native call-stack depth of [`Compiler::do_compile`]'s recursion,
+    /// guarded against a fixed limit — see the analogous `infer_depth` on
+    /// the typechecker's `Checker`.
+    codegen_depth: u32,
+
     /// Active loop labels: `(continue_target, break_target)`.
     loop_stack: Vec<(BbLabel, BbLabel)>,
 
@@ -813,6 +832,9 @@ pub struct Compiler {
 
     /// True when a user-written `fn main` was emitted this compile.
     user_main_defined: bool,
+
+    /// When true, [`Expression::Match`] arm bodies may emit tail calls.
+    match_tail_call: bool,
 
     /// When false (default), harness `test("…")` blocks and `#[test]` functions
     /// are stripped before typecheck/codegen. Set true for `coil test`
@@ -910,6 +932,7 @@ impl Default for Compiler {
             temp_counter: 0,
             field_key_slots: HashMap::new(),
             expr_depth: 0,
+            codegen_depth: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
             fn_defers: Vec::new(),
@@ -936,6 +959,7 @@ impl Default for Compiler {
             fn_bytecode_spans: HashMap::new(),
             fn_debug_locals: HashMap::new(),
             suppress_match_fusion_barrier: false,
+            match_tail_call: false,
             recursive_pure: HashSet::new(),
             par_shapes: HashMap::new(),
             par_spec_args: HashMap::new(),
@@ -1063,7 +1087,7 @@ fn emit_pattern_binding<'compiler>(
                         variant_name: sub_variant,
                         payload: PatternPayload::Record(_),
                         ..
-                    } = sub
+                    } = &sub.1
                     {
                         checker.payload_tys_for(sub_enum, sub_variant)
                     } else {
@@ -1073,7 +1097,7 @@ fn emit_pattern_binding<'compiler>(
                         checker,
                         match_bindings,
                         next_slot,
-                        sub,
+                        &sub.1,
                         &sub_decl_order,
                         bytecode,
                         consume_values,
@@ -1091,7 +1115,7 @@ fn emit_pattern_binding<'compiler>(
                 let record_base = *next_slot;
                 let n_fields = parent_decl_order.len() as u32;
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
-                    fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
+                    fields.iter().map(|pf| (pf.name, &pf.pattern.1)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
                     let field_slot = record_base + i as u32;
                     if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {

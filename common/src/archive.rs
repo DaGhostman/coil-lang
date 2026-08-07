@@ -13,10 +13,10 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::debug::{DebugLoc, ProgramDebug};
 
 /// Archive ABI major. Bump (and reset minor to 0) on incompatible layout/opcode changes.
-pub const ARCHIVE_MAJOR: u16 = 1;
+pub const ARCHIVE_MAJOR: u16 = 2;
 
 /// Archive ABI minor. Bump on additive, append-only bytecode changes.
-pub const ARCHIVE_MINOR: u16 = 2;
+pub const ARCHIVE_MINOR: u16 = 1;
 
 /// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
 pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
@@ -67,6 +67,8 @@ pub struct ArchivedProgram {
     pub source_files: Vec<String>,
     /// One [`DebugLoc`] per bytecode slot after finalize (same length as `bytecode`).
     pub debug_locs: Vec<DebugLoc>,
+    /// Function entry symbols for panic backtraces (sorted by `entry_pc`).
+    pub fn_symbols: Vec<crate::debug::FnDebugSym>,
 }
 
 pub use crate::opcode::Byte;
@@ -76,6 +78,7 @@ impl ArchivedProgram {
         ProgramDebug {
             source_files: self.source_files.clone(),
             debug_locs: self.debug_locs.clone(),
+            fn_symbols: self.fn_symbols.clone(),
         }
     }
 }
@@ -121,6 +124,7 @@ mod tests {
                 DebugLoc::unknown(),
                 DebugLoc::unknown(),
             ],
+            fn_symbols: Vec::new(),
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
         let archived =
@@ -134,30 +138,67 @@ mod tests {
     }
 
     #[test]
+    fn archive_round_trip_preserves_fn_symbols() {
+        use crate::debug::FnDebugSym;
+
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            static_slot_count: 0,
+            constants: vec![],
+            strings: vec![],
+            bytecode: vec![Byte::new(Instruction::HALT)],
+            source_files: vec!["main.hy".into()],
+            debug_locs: vec![DebugLoc::unknown()],
+            fn_symbols: vec![
+                FnDebugSym {
+                    name: "main".into(),
+                    entry_pc: 0,
+                },
+                FnDebugSym {
+                    name: "helper".into(),
+                    entry_pc: 4,
+                },
+            ],
+        };
+        let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
+        let archived =
+            rkyv::access::<ArchivedArchivedProgram, Error>(bytes.as_slice()).expect("access");
+        let back: ArchivedProgram =
+            rkyv::deserialize::<ArchivedProgram, Error>(archived).expect("deserialize");
+        assert_eq!(back.fn_symbols, program.fn_symbols);
+        let bundle = back.debug_bundle();
+        assert_eq!(bundle.fn_symbols.len(), 2);
+        assert_eq!(bundle.fn_symbols[0].name, "main");
+        assert_eq!(bundle.fn_symbols[1].entry_pc, 4);
+    }
+
+    #[test]
     fn archive_version_matches_current_abi() {
-        assert_eq!(ARCHIVE_MAJOR, 1);
-        assert_eq!(ARCHIVE_MINOR, 2);
-        assert_eq!(ARCHIVE_VERSION, pack_archive_version(1, 2));
-        assert_eq!(format_archive_version(ARCHIVE_VERSION), "1.2");
+        assert_eq!(ARCHIVE_MAJOR, 2);
+        assert_eq!(ARCHIVE_MINOR, 1);
+        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 1));
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.1");
+    }
+
+    #[test]
+    fn archive_rejects_older_major() {
+        let runtime = ARCHIVE_VERSION;
+        assert!(!archive_version_compatible(pack_archive_version(1, 99), runtime));
     }
 
     #[test]
     fn archive_version_compatible_within_major() {
-        let runtime = pack_archive_version(1, 2);
+        let runtime = pack_archive_version(2, 0);
         assert!(archive_version_compatible(
-            pack_archive_version(1, 0),
+            pack_archive_version(2, 0),
             runtime
         ));
-        assert!(archive_version_compatible(
-            pack_archive_version(1, 2),
+        assert!(!archive_version_compatible(
+            pack_archive_version(2, 1),
             runtime
         ));
         assert!(!archive_version_compatible(
             pack_archive_version(1, 3),
-            runtime
-        ));
-        assert!(!archive_version_compatible(
-            pack_archive_version(2, 0),
             runtime
         ));
         assert!(!archive_version_compatible(

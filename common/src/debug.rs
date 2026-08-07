@@ -29,12 +29,22 @@ impl DebugLoc {
     }
 }
 
+/// Function entry symbol for panic backtraces and debug tooling.
+#[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize, Debug)]
+#[rkyv(compare(PartialEq))]
+pub struct FnDebugSym {
+    pub name: String,
+    pub entry_pc: u32,
+}
+
 /// Debug sections loaded with bytecode (not the reporting `SourceMap`).
 #[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize, Debug, Default)]
 #[rkyv(compare(PartialEq))]
 pub struct ProgramDebug {
     pub source_files: Vec<String>,
     pub debug_locs: Vec<DebugLoc>,
+    /// Sorted by `entry_pc` for binary search during panic backtraces.
+    pub fn_symbols: Vec<FnDebugSym>,
 }
 
 impl ProgramDebug {
@@ -42,6 +52,7 @@ impl ProgramDebug {
         Self {
             source_files: Vec::new(),
             debug_locs: vec![DebugLoc::unknown(); len],
+            fn_symbols: Vec::new(),
         }
     }
 }

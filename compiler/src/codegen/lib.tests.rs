@@ -30,6 +30,29 @@
         (bc, compiler.constants)
     }
 
+    // ---- Recursion-depth guard ----
+
+    #[test]
+    fn codegen_depth_guard_panics_with_expected_diagnostic_past_limit() {
+        // See the analogous typechecker test (infer_depth_guard_...) for why
+        // this seeds the counter directly rather than compiling a literally
+        // deep AST: dropping a deep Box<Expression> chain overflows the
+        // stack on its own, independent of do_compile's frame size.
+        let ast = Pratt::default().parse("1;").expect("trivial literal parses");
+        let mut compiler = Compiler::default();
+        compiler.codegen_depth = super::CODEGEN_RECURSION_LIMIT;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler.do_compile(&ast)));
+        assert!(result.is_err(), "expected the recursion-limit panic");
+        assert!(
+            compiler
+                .messages
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ExpressionNestingTooDeep)),
+            "expected an ExpressionNestingTooDeep diagnostic to be recorded before panicking"
+        );
+    }
+
     /// True when bytecode contains a strength-reduced `x << shift`
     /// (`LOAD; CONST; SHL` or fused `BinSlotImm(SHL, shift)`).
     fn bytecode_has_shl_by(bc: &[Byte], shift: i64) -> bool {
@@ -112,6 +135,7 @@
             bytecode: bytecode.clone(),
             source_files: pipeline.program_debug().source_files,
             debug_locs: pipeline.program_debug().debug_locs,
+            fn_symbols: Vec::new(),
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
         let archived = rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice())
@@ -2790,6 +2814,27 @@ fn main() { write(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
         );
     }
 
+    /// `return match { … => self(...) }` arms must also emit TailCall.
+    #[test]
+    fn tail_match_self_calls_emit_tail_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn bounce(Option o) -> int { \
+return match o { \
+Option::None => bounce(Option::Some(0)), \
+Option::Some(_) => bounce(Option::None), \
+}; \
+} \
+fn main() { write(stdout(), to_bytes(format(\"%i\", bounce(Option::None)))); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            "expected TailCall from tail-match self calls; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Tiny `add` is inlined at direct call sites (arithmetic in main bytecode).
     #[test]
     fn tiny_add_inlined_at_call_site() {
@@ -3459,6 +3504,41 @@ let _y = nested[0]; \
     }
 
     #[test]
+    fn index_with_len_minus_one_stashes_receiver_before_staged_index() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let ab = [97, 47];
+    let last = ab[len(ab) - 1];
+}
+"#,
+        );
+        let has_index = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Index));
+        assert!(has_index, "expected Index for ab[len(ab)-1]; ops={:?}", {
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        });
+        // Staging must not leave the receiver under STORE high-water; look for
+        // LOAD of two slots immediately before Index (tgt + idx reload).
+        let idx_at = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::Index))
+            .expect("Index");
+        assert!(
+            idx_at >= 1,
+            "Index should be preceded by staged LOAD(s); ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(bc[idx_at - 1].bytecode(), Instruction::LOAD),
+            "expected LOAD before Index after staging; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn len_of_string_literal_folds_without_array_len() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
@@ -3473,8 +3553,8 @@ fn main() {
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
         assert_eq!(
-            array_lens, 1,
-            "literal len(string) should fold; only Length__string__len thunk keeps ArrayLen; ops={:?}",
+            array_lens, 2,
+            "Length thunks (string + vec) keep ArrayLen; literal len folds to CONST; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -3503,14 +3583,66 @@ fn main() {
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
         assert_eq!(
-            array_lens, 1,
-            "custom Length must not add structural ArrayLen beyond string thunk; ops={:?}",
+            array_lens, 2,
+            "custom Length uses CallIndirect; string/vec thunks keep ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
             "expected CallIndirect to Length::len; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn len_of_array_literal_folds_without_extra_array_len() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let n = len([10, 20, 30]);
+}
+"#,
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+            "expected folded CONST for len([10, 20, 30]); ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn len_of_dict_and_tuple_literals_fold_to_const() {
+        use common::Instruction;
+        for src in [
+            r#"fn main() { let n = len({ a: 1, b: 2 }); }"#,
+            r#"fn main() { let n = len((1, 2, 3)); }"#,
+        ] {
+            let (bc, _pool) = compile_src(src);
+            assert!(
+                bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)),
+                "expected folded CONST for literal len in `{src}`; ops={:?}",
+                bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn len_of_runtime_binding_keeps_array_len_path() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let s = "abc";
+    let n = len(s);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "runtime len(s) should use ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
@@ -4100,6 +4232,27 @@ fn main() {
             "UnboxValue operand should be ValueTag::Int ({}), got: {:?}",
             common::ValueTag::Int as u32,
             unbox_ops
+        );
+    }
+
+    /// Generic functions returning ADTs must not emit a primitive UnboxValue
+    /// on the call result (that would turn a valid heap object into garbage).
+    #[test]
+    fn generic_fn_returning_option_does_not_unbox_enum() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn some_of<T>(T x) -> Option<T> { return Option::Some(x); } \
+fn main() { let _ = some_of(7); }",
+        );
+        let opcodes: Vec<_> = bc.iter().map(|b| b.bytecode()).collect();
+        let last_call = opcodes
+            .iter()
+            .rposition(|op| matches!(op, Instruction::CALL | Instruction::TailCall))
+            .expect("expected a CALL to some_of");
+        assert!(
+            !matches!(opcodes.get(last_call + 1), Some(Instruction::UnboxValue)),
+            "Option return must not be UnboxValue'd after CALL; near: {:?}",
+            &opcodes[last_call.saturating_sub(2)..(last_call + 3).min(opcodes.len())]
         );
     }
 
@@ -4726,8 +4879,10 @@ fn main() {
         );
         let make_array = bc
             .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
-            .expect("expected MakeArray for rest packing");
+            .find(|b| {
+                matches!(b.bytecode(), Instruction::MakeArray) && b.operand_u32() == 3
+            })
+            .expect("expected MakeArray(3) for rest packing");
         assert_eq!(
             make_array.operand_u32(),
             3,
@@ -4983,11 +5138,8 @@ fn main() {
         );
     }
 
-    /// Dims over the `u8` packed ceiling fall back to scalar unroll (and the
-    /// typechecker warns — see diagnostics `*_over_packed_u8_limit_warns`).
-    // Pre-existing on main (#70): LA side-table miss → no scalar unroll MULs.
+    // Dims over the `u8` packed ceiling fall back to scalar unroll.
     #[test]
-    #[ignore = "pre-existing: 256-dim matmul does not attach LA info / unroll"]
     fn matmul_dims_over_u8_limit_falls_back_to_unroll() {
         use common::Instruction;
         let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
@@ -5420,19 +5572,23 @@ fn main() {
             .map(|(i, _)| i)
             .max()
             .expect("back-edge JMP");
-        let mut saw = false;
-        for (i, b) in bc.iter().enumerate() {
+        // Inner `if i < len(src)` may also fuse to BinSlotSlotJmpf and jump to
+        // the increment (still inside the loop). Only the while-exit must land
+        // past the back-edge JMP.
+        let mut saw_while_exit = false;
+        for (_i, b) in bc.iter().enumerate() {
             if *b.bytecode() != Instruction::BinSlotSlotJmpf {
                 continue;
             }
-            saw = true;
             let (_op, _a, idx) = b.bin_slot_slot_jmpf_parts();
             let packed = pool[idx];
             let tgt = (packed >> 32) as usize;
-            assert!(
-                tgt > back,
-                "BinSlotSlotJmpf while-exit at {i}: target {tgt} must be past back-edge JMP {back}"
-            );
+            if tgt > back {
+                saw_while_exit = true;
+            }
         }
-        assert!(saw, "expected BinSlotSlotJmpf for while i < end");
+        assert!(
+            saw_while_exit,
+            "expected while-exit BinSlotSlotJmpf targeting past back-edge JMP {back}"
+        );
     }

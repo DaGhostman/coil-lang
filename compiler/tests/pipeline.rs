@@ -44,7 +44,23 @@ fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    run_example_multifile(path)
+    // Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
+    // thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
+    // actually runs with. infer_inner/do_compile no longer have oversized
+    // inline match arms (see docs/internals/limitations.md), so this is
+    // headroom rather than a load-bearing requirement.
+    const STACK: usize = 8 * 1024 * 1024;
+    let path = path.to_string();
+    // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
+    // triage point at the offending example after a crash.
+    let thread_name = path.clone();
+    std::thread::Builder::new()
+        .name(thread_name)
+        .stack_size(STACK)
+        .spawn(move || run_example_multifile(&path))
+        .expect("pipeline example thread")
+        .join()
+        .expect("pipeline example thread join")
 }
 
 /// Compile and run in-memory source.
@@ -120,8 +136,9 @@ fn run_bytecode(
     pipeline: &Pipeline,
     entry: Option<&std::path::Path>,
 ) -> String {
+    let operand_slots = pipeline.operand_stack_slots() as usize;
     let shared = SharedBuf::new();
-    let mut machine = Machine::<128>::default();
+    let mut machine = Machine::<256>::with_operand_capacity(operand_slots);
     machine.set_shared_print(shared.inner.clone());
     machine.with_output(shared.clone());
     pipeline.wire_vm_ffi(&mut machine, entry);
@@ -954,62 +971,13 @@ fn example_chained_prints_42_7() {
 
 #[test]
 fn example_match_with_two_ok_arms_dispatches_correctly() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/result.hy");
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-
-    let mut pipeline = compiler::Pipeline::new();
-    let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("result.hy should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
-
-    let shared = SharedBuf::new();
-    let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared.clone());
-    pipeline.wire_thread_program(&mut machine, &bytecode, &constants, pipeline.strings());
-    pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(
-        &bytecode,
-        &constants,
-        pipeline.strings(),
-        pipeline.static_slot_count(),
-    );
-
-    let _ = machine.restore_output();
-    let output = shared.into_utf8();
-
+    let output = run_example("examples/result.hy");
     assert_eq!(output, "420-1");
 }
 
 #[test]
 fn fizbuz_runs_to_completion() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/fizbuz.hy");
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-
-    let mut pipeline = compiler::Pipeline::new();
-    let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("fizbuz.hy should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
-
-    let shared = SharedBuf::new();
-    let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared);
-    pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(
-        &bytecode,
-        &constants,
-        pipeline.strings(),
-        pipeline.static_slot_count(),
-    );
-
-    let _ = shared;
+    let _output = run_example("examples/fizbuz.hy");
 }
 
 #[test]
@@ -1078,6 +1046,59 @@ fn main() {
 "#,
     );
     assert_eq!(output, "Ada36Grace40");
+}
+
+#[test]
+fn builtin_len_named_arg_prints_3() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    write(stdout(), to_bytes(format("%i", len(value: [1, 2, 3]))));
+}
+"#,
+    );
+    assert_eq!(output, "3");
+}
+
+#[test]
+fn format_operand_string_concat_prints() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let n = 7;
+    write(stdout(), to_bytes("n=" + format("%i", n)));
+    write(stdout(), to_bytes(format("%i", n) + "!"));
+}
+"#,
+    );
+    assert_eq!(output, "n=77!");
+}
+
+#[test]
+fn pure_arg_reorder_preserves_identifier_args() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn effect() -> int {
+    write(stdout(), to_bytes(format("%i,", 7)));
+    return 2;
+}
+fn sink(int a, int b) -> int {
+    write(stdout(), to_bytes(format("%i,", a + b)));
+    return a + b;
+}
+fn main() {
+    let cached = 10;
+    write(stdout(), to_bytes(format("%i", sink(effect(), cached))));
+}
+"#,
+    );
+    assert_eq!(output, "7,12,12");
 }
 
 /// Rest packing with a named fixed prefix + trailing positionals (P4 + P2).
@@ -1463,6 +1484,28 @@ fn example_strlen_prints_5() {
         }
     };
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
+}
+
+#[test]
+fn example_strlen_prints_5_compile_src_from_file() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable on this platform via resolve_library(\"c\")");
+        return;
+    }
+
+    let result = std::panic::catch_unwind(|| run_example("examples/strlen.hy"));
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("strlen test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(
+        output,
+        "5",
+        "strlen(\"hello\") via compile_src_from_file should print 5"
+    );
 }
 
 /// Serialize fd-1 redirection: parallel tests + libtest status lines share
@@ -1913,13 +1956,10 @@ use string::{format, to_bytes};
     assert_eq!(output, "1,2,42");
 }
 
-/// Resuming an already-Done coroutine always yields the sentinel
-/// `Value::default()` (`0`) — never the coroutine's last `return`
-/// value — since there's no error-handling protocol yet to signal
-/// "resumed after completion" and returning the stale value again
-/// would be a worse form of undefined behavior.
+/// WP-M6: resuming an already-Done coroutine panics instead of returning a
+/// stale sentinel value.
 #[test]
-fn resume_after_done_returns_default_not_last_return_value() {
+fn resume_after_done_panics() {
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -1930,12 +1970,146 @@ use string::{format, to_bytes};
         fn main() {
             let h = counter();
             write(stdout(), to_bytes(format("%i,", resume h))); // return 42 (completes)
-            write(stdout(), to_bytes(format("%i,", resume h))); // Done -> 0, not 42
-            write(stdout(), to_bytes(format("%i", resume h)));  // Done -> 0, not 42
+            write(stdout(), to_bytes(format("%i,", resume h))); // panics
+            write(stdout(), to_bytes(format("%i", resume h)));
         }
     "#;
     let output = run_example_src(src);
-    assert_eq!(output, "42,0,0");
+    assert!(
+        output.starts_with("42,"),
+        "expected first resume output before panic, got: {output:?}"
+    );
+    assert!(
+        output.contains("panic:") && output.contains("resumed after completion"),
+        "expected resume-after-done panic, got: {output:?}"
+    );
+}
+
+/// `done(h)` is false before the first resume and true after completion
+/// without needing another resume (M6: extra resume panics).
+#[test]
+fn done_before_and_after_coroutine_completion() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn counter() {
+            yield 1;
+            return 2;
+        }
+
+        fn main() {
+            let h = counter();
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%z", done(h))));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "false,1,false,2,true");
+}
+
+/// Immediate-return async fn completes on first resume; `done` flips after.
+#[test]
+fn immediate_return_async_done_after_first_resume() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn unit_ret() {
+            return;
+        }
+
+        fn main() {
+            let h = unit_ret();
+            write(stdout(), to_bytes(format("%z,", done(h))));
+            let _ = resume h;
+            write(stdout(), to_bytes(format("%z", done(h))));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "false,true");
+}
+
+/// `resume h with v` after completion panics (same M6 rule as bare resume).
+#[test]
+fn resume_with_send_after_done_panics() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn sink() {
+            let _ = yield 0;
+            return 1;
+        }
+
+        fn main() {
+            let h = sink();
+            let _ = resume h;
+            let _ = resume h with 10;
+            let _ = resume h;
+            write(stdout(), to_bytes(format("%i", resume h with 99)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert!(
+        output.contains("panic:") && output.contains("resumed after completion"),
+        "expected resume-with-send after done to panic, got: {output:?}"
+    );
+}
+
+/// Inline `yield from` must delegate every yielded value before completing.
+#[test]
+fn yield_from_inline_delegates_all_values() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+        async fn inner() {
+            yield 1;
+            yield 2;
+        }
+        async fn outer() {
+            yield from inner();
+        }
+
+        fn main() {
+            let h = outer();
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%i,", resume h)));
+            write(stdout(), to_bytes(format("%i", resume h)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "1,2,0");
+}
+
+/// `write_all` between resumes must not mark the delegating coroutine done.
+#[test]
+fn yield_from_write_all_between_resumes() {
+    let src = r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+        async fn counter() {
+            yield 0;
+            yield 1;
+            yield 2;
+        }
+        async fn wrap() {
+            yield from counter();
+        }
+
+        fn main() {
+            let h = wrap();
+            let v0 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v0)));
+            let v1 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v1)));
+            let v2 = resume h;
+            write_all(stdout(), to_bytes(format("%i", v2)));
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "012");
 }
 
 fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
@@ -3263,12 +3437,16 @@ fn main() {
 
 #[test]
 fn attr_on_async_fn_rejected_at_compile_time() {
-    let mut pipeline = Pipeline::new();
-    let result = pipeline.compile_src(
-        r#"
+    // Attr-body-crosses-yield desugaring for a coroutine target used to
+    // recurse deep enough (~1.5-2 MiB) to risk the default per-test thread
+    // stack before infer_inner/do_compile were split up; run on a dedicated
+    // thread with the same headroom as `run_example` regardless (see
+    // docs/internals/limitations.md).
+    let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
 attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    yield 99;
     return target(...args);
 }
 #[log(message = "coro")]
@@ -3279,11 +3457,17 @@ fn main() {
     let h = counter();
     write(stdout(), to_bytes(format("%i", resume h)));
 }
-"#,
-    );
+"#
+    .to_string();
+    let is_err = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || Pipeline::new().compile_src(&src).is_err())
+        .expect("diagnostic thread")
+        .join()
+        .expect("diagnostic thread join");
     assert!(
-        result.is_err(),
-        "decorating async fn with user attrs is not supported yet"
+        is_err,
+        "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }
 
@@ -4654,6 +4838,7 @@ fn tls_server_enable_non_tcp_is_err_via_host_invoke() {
 use io::{{open, stdout, IoError}};
 
 use io::net::tls::server::{{enable}};
+use io::sync::{{write_all}};
 use string::{{format, to_bytes}};
 
 fn classify(IoError e) -> int {{
@@ -4681,7 +4866,7 @@ fn main() {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     }};
-    write(stdout(), to_bytes(format("%i", code)));
+    write_all(stdout(), to_bytes(format("%i", code)));
 }}
 "#
     );
@@ -5854,8 +6039,8 @@ fn main() {
     assert_eq!(run_example_src(src), "10,20");
 }
 
-/// SetField / StoreIndex leave the RHS on the stack — statement forms must POP
-/// or later ops see a corrupted stack.
+/// SetField leaves the RHS on the stack — statement forms must POP.
+/// Const index stores into stack `[T; N]` locals use direct STORE (no StoreIndex).
 #[test]
 fn set_field_and_store_index_statements_pop_value() {
     let src = r#"
@@ -5879,27 +6064,18 @@ fn main() {
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
     let mut set_field_followed_by_pop = 0usize;
-    let mut store_index_followed_by_pop = 0usize;
     for w in bytecode.windows(2) {
         if matches!(w[0].bytecode(), common::Instruction::SetField)
             && matches!(w[1].bytecode(), common::Instruction::POP)
         {
             set_field_followed_by_pop += 1;
         }
-        if matches!(w[0].bytecode(), common::Instruction::StoreIndex)
-            && matches!(w[1].bytecode(), common::Instruction::POP)
-        {
-            store_index_followed_by_pop += 1;
-        }
     }
     assert!(
         set_field_followed_by_pop >= 2,
         "class field assignment statements need SetField; POP"
     );
-    assert!(
-        store_index_followed_by_pop >= 2,
-        "index assignment statements need StoreIndex; POP"
-    );
+    // Fixed-array const stores are direct STORE — heap StoreIndex is optional.
     assert_eq!(run_example_src(src), "7,30");
 }
 
@@ -5967,17 +6143,23 @@ fn main() {
 "#;
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("compile");
-    let lens = bytecode
+    let syms = pipeline.program_debug().fn_symbols;
+    let main_idx = syms.iter().position(|s| s.name == "main").expect("main");
+    let start = syms[main_idx].entry_pc as usize;
+    let end = syms
+        .get(main_idx + 1)
+        .map(|s| s.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let lens = bytecode[start..end]
         .iter()
         .filter(|b| matches!(b.bytecode(), common::Instruction::ArrayLen))
         .count();
-    // Loop hoist emits one ArrayLen; builtin `Length__string__len` may add another.
-    assert!(
-        (1..=2).contains(&lens),
-        "for-in should ArrayLen once before the loop (got {lens})"
+    assert_eq!(
+        lens, 1,
+        "main for-in should ArrayLen once before the loop (got {lens})"
     );
     assert!(
-        bytecode
+        bytecode[start..end]
             .iter()
             .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpf)),
         "loop header should fuse idx < len into BinSlotSlotJmpf"
@@ -6059,6 +6241,7 @@ fn main() {
         bytecode: bytecode.clone(),
         source_files: pipeline.program_debug().source_files,
         debug_locs: pipeline.program_debug().debug_locs,
+        fn_symbols: Vec::new(),
     };
     let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
     let archived =
