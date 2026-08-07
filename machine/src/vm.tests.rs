@@ -1763,6 +1763,42 @@
         assert_eq!(vm.pop().as_int(), 100);
     }
 
+    /// `yield from` delegation must survive an ordinary RETURN in main
+    /// between resumes (host I/O returns through the same `after_return`
+    /// path as coroutine completion).
+    #[test]
+    fn yield_from_delegation_survives_main_return_between_resumes() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            // main
+            make_coro(0, 10), // outer @ 10
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            store_pop(1), // first yield
+            Byte::new(Instruction::CALL).with_call_packed(0, 15), // host stub
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            store_pop(2), // second yield
+            Byte::new(Instruction::HALT),
+            // 10: outer — yield from inner @ 17
+            make_coro(0, 17),
+            Byte::new(Instruction::YieldFromCoro),
+            const_int(0),
+            Byte::new(Instruction::RETURN),
+            // 15: host stub
+            Byte::new(Instruction::RETURN),
+            // 17: inner
+            const_int(10),
+            Byte::new(Instruction::YieldCoro),
+            const_int(20),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert!(!vm.panicked());
+        assert_eq!(vm.stack[2].as_int(), 20);
+    }
+
     #[test]
     fn log_not_bool_and_int() {
         let mut vm = Machine::<8>::default();
