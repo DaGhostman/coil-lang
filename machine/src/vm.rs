@@ -1142,6 +1142,12 @@ impl<const S: usize> Machine<S> {
             let old_wait = {
                 let mut taken = None;
                 self.with_coroutine_mut(coro_ptr, |coro| {
+                    // Outer coroutines suspended via `yield from` stay on
+                    // `resume_stack` while main runs; host RETURN must not
+                    // treat that as coroutine completion.
+                    if coro.yield_from.is_some() {
+                        return;
+                    }
                     taken = coro.io_wait.take();
                     coro.state = CoroState::Done;
                     coro.saved_stack.clear();
@@ -1293,6 +1299,9 @@ impl<const S: usize> Machine<S> {
         let caller = self.frames.get_mut();
         *ip = caller.tell();
         *sp = caller.get();
+        // Mirror `yield_coroutine`: delegating coroutine is not active while
+        // main runs between resumes.
+        self.resume_stack.pop();
     }
 
     fn yield_coroutine(&mut self, ip: &mut usize, sp: &mut usize, yield_val: Value) {
