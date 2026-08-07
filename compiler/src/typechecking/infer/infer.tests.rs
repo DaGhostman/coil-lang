@@ -4996,6 +4996,21 @@ fn main() {
             Some(crate::typechecking::ty::byte())
         );
     }
+    #[test]
+    fn byte_cast_rejects_negative_literal() {
+        for src in [
+            "fn main() { let x = -1 as byte; }",
+            "fn main() { let x = (-1) as byte; }",
+        ] {
+            let msgs = assert_messages(src);
+            assert!(
+                msgs.iter()
+                    .any(|m| m.message().contains("byte literal out of range")),
+                "expected OOB for `{src}`, got: {:?}",
+                msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn byte_annotation_rejects_out_of_range_literal() {

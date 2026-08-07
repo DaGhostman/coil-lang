@@ -3902,20 +3902,22 @@ impl Checker {
                     Self::primitive_cast_name(&src_ty),
                     Self::primitive_cast_name(&dst_ty),
                 ) {
-                    (Some(from), Some(to)) if from == to => dst_ty,
-                    (Some(from), Some(to)) if Self::primitive_cast_allowed(from, to) => {
-                        if from == "int" && to == "byte" {
-                            if let Err(Some(n)) = Self::byte_literal_coercion(expr) {
-                                return self.error_with_help(
-                                    ErrorCode::TypeMismatch,
-                                    format!("byte literal out of range: `{n}` is not in 0..=255"),
-                                    range,
-                                    Some(
-                                        "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
-                                            .to_string(),
-                                    ),
-                                );
-                            }
+                    (Some(from), Some(to)) if from == to || Self::primitive_cast_allowed(from, to) => {
+                        // Expected-byte inference can type `(-1)` as `byte` before
+                        // this match (`from == to`); still reject out-of-range literals.
+                        if to == "byte"
+                            && (from == "int" || from == "byte")
+                            && let Err(Some(n)) = Self::byte_literal_coercion(expr)
+                        {
+                            return self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!("byte literal out of range: `{n}` is not in 0..=255"),
+                                range,
+                                Some(
+                                    "literal `int as byte` must be in 0..=255; non-literal ints wrap at runtime"
+                                        .to_string(),
+                                ),
+                            );
                         }
                         dst_ty
                     }
@@ -8447,7 +8449,8 @@ impl Checker {
     /// `Ok(())` if `expr` is an integer literal in `0..=255`.
     /// `Err(Some(n))` if literal but out of range; `Err(None)` if not a literal.
     fn byte_literal_coercion(expr: &Output) -> Result<(), Option<i64>> {
-        match unwrap_expr_wrappers(expr).1.as_ref() {
+        let expr = Self::peel_literal_expr(expr);
+        match expr.1.as_ref() {
             Expression::Integer(n) => {
                 if (0..=255).contains(n) {
                     Ok(())
@@ -8455,11 +8458,23 @@ impl Checker {
                     Err(Some(*n))
                 }
             }
-            Expression::Negate(inner) => match unwrap_expr_wrappers(inner).1.as_ref() {
+            Expression::Negate(inner) => match Self::peel_literal_expr(inner).1.as_ref() {
                 Expression::Integer(n) => Err(Some(-n)),
                 _ => Err(None),
             },
             _ => Err(None),
+        }
+    }
+
+    /// Peel wrappers around a literal operand, including `(…)` as
+    /// `Group(Fragment([inner]))`.
+    fn peel_literal_expr<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
+        let expr = unwrap_expr_wrappers(expr);
+        match expr.1.as_ref() {
+            Expression::Fragment(items) if items.len() == 1 => {
+                Self::peel_literal_expr(&items[0])
+            }
+            _ => expr,
         }
     }
 
