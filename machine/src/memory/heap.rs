@@ -20,6 +20,8 @@ pub struct Heap {
     head: Option<Object>,
     /// O(1) lookup of live objects by address (updated on alloc/sweep).
     addr_index: HashMap<u64, Object>,
+    /// Immortal arity-0 enum singletons keyed by tag (never swept).
+    immortal_enums: HashMap<u32, Object>,
     /// Reused mark-set across collections (avoids alloc per GC).
     gc_mark_set: HashSet<u64>,
     /// Reused gray worklist / root buffers across collections.
@@ -37,6 +39,7 @@ impl Default for Heap {
             strings: Table::default(),
             head: None,
             addr_index: HashMap::new(),
+            immortal_enums: HashMap::new(),
             gc_mark_set: HashSet::new(),
             gc_gray: Vec::new(),
             gc_root_objects: Vec::new(),
@@ -156,18 +159,19 @@ impl Heap {
         self.addr_index.len()
     }
 
-    /// Returns the next GC threshold in bytes. If `Self::size() > Self::next_gc()`,
-    /// we should start tracing all reachable objects and call `Self::sweep`.
-    pub const fn next_gc(&self) -> usize {
-        #[cfg(not(debug_assertions))]
-        {
-            self.gc_next_threshold
-        }
-        #[cfg(debug_assertions)]
-        {
-            _ = self;
-            0
-        }
+    /// True when live heap bytes exceed the collection threshold. [`Self::sweep`]
+    /// rescales the threshold to `live * GC_GROWTH_FACTOR`, so collection cost
+    /// stays proportional to the live set rather than to the allocation count.
+    #[inline]
+    pub fn should_collect(&self) -> bool {
+        self.alloc_bytes > self.gc_next_threshold
+    }
+
+    /// Lower the byte threshold so the next [`Self::should_collect`] check
+    /// fires (test helper for GC stress).
+    #[cfg(any(test, feature = "debugger"))]
+    pub fn set_gc_threshold_for_test(&mut self, bytes: usize) {
+        self.gc_next_threshold = bytes;
     }
 
     /// Adjust tracked heap bytes after an in-place grow/shrink of a managed
@@ -303,10 +307,28 @@ impl Heap {
     }
 
     /// Take the reusable GC root address buffer (caller must restore via [`Self::restore_gc_roots`]).
+    /// Immortal arity-0 enum singletons are always seeded as roots.
     pub fn take_gc_roots(&mut self) -> Vec<u64> {
         let mut roots = std::mem::take(&mut self.gc_roots);
         roots.clear();
+        for obj in self.immortal_enums.values() {
+            roots.push(obj.addr());
+        }
         roots
+    }
+
+    /// Return a shared arity-0 enum for `tag`, allocating once per tag.
+    pub fn immortal_unit_enum(&mut self, tag: u32) -> Object {
+        if let Some(obj) = self.immortal_enums.get(&tag) {
+            return *obj;
+        }
+        let obj_enum = crate::memory::ObjEnum {
+            tag,
+            payload: Vec::new(),
+        };
+        let (object, _) = self.alloc(obj_enum, Object::Enum);
+        self.immortal_enums.insert(tag, object);
+        object
     }
 
     pub fn restore_gc_roots(&mut self, roots: Vec<u64>) {

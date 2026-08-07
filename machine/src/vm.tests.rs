@@ -294,6 +294,35 @@
     }
 
     #[test]
+    fn arity0_make_enum_reuses_immortal_singleton() {
+        let mut vm = Machine::<4>::default();
+        let before = vm.heap().size();
+        vm.run(&[
+            make_enum(3, 0),
+            make_enum(3, 0),
+            make_enum(3, 0),
+            Byte::new(Instruction::HALT),
+        ]);
+        let a = vm.pop().raw() as u64;
+        let b = vm.pop().raw() as u64;
+        let c = vm.pop().raw() as u64;
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        // One immortal alloc only — heap bytes should not grow per construct.
+        let after = vm.heap().size();
+        assert!(
+            after > before,
+            "expected one immortal enum allocation"
+        );
+        let after_more = {
+            vm.run(&[make_enum(3, 0), Byte::new(Instruction::HALT)]);
+            let _ = vm.pop();
+            vm.heap().size()
+        };
+        assert_eq!(after, after_more, "arity-0 MakeEnum must not re-allocate");
+    }
+
+    #[test]
     fn make_enum_with_payload_populates_payload() {
         let mut vm = Machine::<4>::default();
         vm.run(&[
@@ -614,13 +643,15 @@
         use std::collections::HashSet;
 
         let mut vm = Machine::<256>::default();
+        // Force frequent collections so dead enums are reclaimed.
+        vm.heap_mut().set_gc_threshold_for_test(256);
 
         // Build bytecode: CONST 0 (the sentinel int); then N
         // iterations of `MAKE_ENUM 0 1` (an enum wrapping the
         // sentinel); POP each result so the address is no
         // longer on the stack. After POP, the enum is
         // unreachable — the next GC cycle should free it.
-        let n: usize = 200; // 200 > GC_TRIGGER_INTERVAL = 64
+        let n: usize = 200;
         let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 4);
         bytecode.push(const_int(0));
         for _ in 0..n {
@@ -632,17 +663,7 @@
         vm.run(&bytecode);
 
         // After running, the heap should contain FAR FEWER
-        // than N objects. With 200 allocations and a GC
-        // threshold of 64, the worst case is "one GC threshold
-        // worth" (~64) of unreachable enums that haven't been
-        // collected yet because the last GC cycle hasn't
-        // caught up. Without GC, this would be ~200.
-        //
-        // We assert `live_count < n` as the success criterion
-        // (the heap does not grow proportionally to the
-        // number of allocations). Tightening further would
-        // require waiting for a final GC, which would need
-        // another mechanism we don't have.
+        // than N objects — GC reclaims POPed enums.
         let live_addrs: HashSet<u64> = vm.heap().into_iter().map(|o| o.addr()).collect();
 
         assert!(
@@ -652,11 +673,7 @@
             live_addrs.len()
         );
 
-        // Stronger: should be much less than n — bounded by
-        // `GC_TRIGGER_INTERVAL` plus a few extra. The exact
-        // count is timing-dependent but should be nowhere
-        // near n.
-        let _ = vm.alloc_counter();
+        let _ = vm.heap().size();
     }
 
     #[test]
@@ -664,6 +681,7 @@
         use std::collections::HashSet;
 
         let mut vm = Machine::<256>::default();
+        vm.heap_mut().set_gc_threshold_for_test(256);
 
         // Build bytecode:
         //   MAKE_ENUM 7 1 (the live root, payload = sentinel int)
@@ -791,10 +809,11 @@
     #[test]
     fn string_literal_survives_gc_triggered_at_intern() {
         let mut vm = Machine::<16>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
-        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let n = 72;
         let strings: Vec<String> = (0..n).map(|i| format!("lit-{i}")).collect();
         let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 2);
         for i in 0..n {
@@ -823,7 +842,8 @@
     #[test]
     fn make_enum_survives_gc_triggered_at_alloc() {
         let mut vm = Machine::<32>::default();
-        let n = super::GC_TRIGGER_INTERVAL + 4;
+        vm.heap_mut().set_gc_threshold_for_test(0);
+        let n = 68;
         let strings: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
         let mut bytecode: Vec<Byte> = Vec::new();
         // Burn the alloc counter with interned strings (popped so unmarked).
@@ -856,11 +876,12 @@
     #[test]
     fn format_concat_survives_gc_triggered_at_intern() {
         let mut vm = Machine::<16>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
         // FORMAT "%s%s" past the GC interval with unique RHS pieces.
-        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let n = 68;
         let mut strings = vec!["%s%s".to_string(), "x".to_string()];
         for i in 0..n {
             strings.push(format!("p{i}"));
@@ -897,10 +918,11 @@
     #[test]
     fn dyn_add_strings_survives_gc_triggered_at_intern() {
         let mut vm = Machine::<16>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
-        let n = super::GC_TRIGGER_INTERVAL + 4;
+        let n = 68;
         let mut strings = vec!["x".to_string()];
         for i in 0..n {
             strings.push(format!("p{i}"));
@@ -934,10 +956,11 @@
     #[test]
     fn stringify_survives_gc_triggered_at_intern() {
         let mut vm = Machine::<16>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
-        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let n = 72;
         let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 3 + 2);
         for i in 0..n {
             bytecode.push(const_int(i as i64));
@@ -1650,10 +1673,11 @@
     #[test]
     fn coroutine_suspended_string_survives_gc() {
         let mut vm = Machine::<256>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
-        let n = super::GC_TRIGGER_INTERVAL + 8;
+        let n = 72;
         let mut strings: Vec<String> = vec!["keep-me".into()];
         strings.extend((0..n).map(|i| format!("junk-{i}")));
 
@@ -2680,6 +2704,7 @@
         use std::collections::HashSet;
 
         let mut vm = Machine::<256>::default();
+        vm.heap_mut().set_gc_threshold_for_test(256);
         let n: usize = 200;
         let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 8);
         bytecode.push(const_int(0));

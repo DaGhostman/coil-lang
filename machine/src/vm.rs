@@ -23,9 +23,6 @@ use crate::{
 use crate::{DebugController, StopReason};
 use common::ValueTag;
 
-/// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
-const GC_TRIGGER_INTERVAL: usize = 64;
-
 // Thread-local dispatch counter (tests / `vm_profile` only).
 #[cfg(any(test, feature = "vm_profile"))]
 thread_local! {
@@ -137,7 +134,6 @@ pub struct Machine<const S: usize> {
     stack: Stack<Value>,
     frames: ArrayVec<Frame, S>,
     output: Option<OutputSink>,
-    alloc_counter: usize,
     natives: crate::ffi::Natives,
     libraries: std::collections::HashMap<String, std::sync::Arc<crate::ffi::Library>>,
     userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
@@ -214,7 +210,6 @@ impl<const S: usize> Machine<S> {
             heap: Heap::default(),
             stack: Stack::with_capacity(cap),
             output: None,
-            alloc_counter: 0,
             natives: crate::ffi::Natives::new(),
             libraries: std::collections::HashMap::new(),
             userland_libraries: std::collections::HashMap::new(),
@@ -393,7 +388,6 @@ impl<const S: usize> Machine<S> {
         self.nested_return = None;
         self.resume_stack.clear();
         self.statics.clear();
-        self.alloc_counter = 0;
         if let Some(dbg) = self.debug.as_mut() {
             dbg.clear_step();
             dbg.clear_skip_bp();
@@ -726,12 +720,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
-    fn gc_collect(
-        heap: &mut Heap,
-        stack: &Stack<Value>,
-        resume_stack: &[ResumeCtx],
-        alloc_counter: &mut usize,
-    ) {
+    fn gc_collect(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
         let mut roots = heap.take_gc_roots();
         // Only live operand-stack slots (not the full capacity buffer).
         for v in stack.as_slice() {
@@ -779,7 +768,14 @@ impl<const S: usize> Machine<S> {
 
         heap.restore_gc_worklists(gray, root_objects);
         heap.restore_gc_roots(roots);
-        *alloc_counter = 0;
+    }
+
+    /// Run GC when live heap bytes exceed the heap threshold.
+    #[inline]
+    fn maybe_gc_after_alloc(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
+        if unlikely(heap.should_collect()) {
+            Self::gc_collect(heap, stack, resume_stack);
+        }
     }
 
     /// Trace heap pointers stored as raw `Value`s inside arrays/tuples.
@@ -856,15 +852,7 @@ impl<const S: usize> Machine<S> {
         let gc_string = self.heap.intern(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
-        self.alloc_counter += 1;
-        if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-            Self::gc_collect(
-                &mut self.heap,
-                &self.stack,
-                &self.resume_stack,
-                &mut self.alloc_counter,
-            );
-        }
+        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
     }
 }
 
@@ -1051,12 +1039,7 @@ impl<const S: usize> Machine<S> {
 
     /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
-        Self::gc_collect(
-            &mut self.heap,
-            &self.stack,
-            &self.resume_stack,
-            &mut self.alloc_counter,
-        );
+        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack);
     }
 
     fn with_coroutine_mut(&self, addr: u64, f: impl FnOnce(&mut ObjCoroutine)) {
@@ -1386,12 +1369,6 @@ impl<const S: usize> Machine<S> {
     /// test to assert that the heap didn't grow unboundedly.
     pub fn heap(&self) -> &Heap {
         &self.heap
-    }
-
-    /// Current allocation counter (number of allocations since
-    /// the last GC). Exposed for tests.
-    pub fn alloc_counter(&self) -> usize {
-        self.alloc_counter
     }
 
     /// True when a language-level `panic` aborted the last run.
@@ -2014,15 +1991,7 @@ impl<const S: usize> Machine<S> {
                     let _ = r.as_mut();
                     // Root before GC — same rule as `push_interned_string`.
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
@@ -2568,12 +2537,7 @@ impl<const S: usize> Machine<S> {
                     if is_gc_collect {
                         // Full stack-rooted collect; stub native is not used.
                         let before = self.heap.size();
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack);
                         let freed = before.saturating_sub(self.heap.size());
                         self.stack.push(Value::from(freed as i64));
                     } else {
@@ -2613,15 +2577,7 @@ impl<const S: usize> Machine<S> {
                         }
                         let allocated = self.heap.live_object_count().saturating_sub(live_before);
                         if allocated > 0 {
-                            self.alloc_counter += allocated;
-                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                                Self::gc_collect(
-                                    &mut self.heap,
-                                    &self.stack,
-                                    &self.resume_stack,
-                                    &mut self.alloc_counter,
-                                );
-                            }
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                         }
                     }
                 }
@@ -2665,6 +2621,13 @@ impl<const S: usize> Machine<S> {
                     let tag = operands >> 16;
                     let arity = (operands & 0xFFFF) as usize;
 
+                    if arity == 0 {
+                        let object = self.heap.immortal_unit_enum(tag);
+                        self.stack.push(Value::from(object.addr()));
+                        // No alloc pressure — singleton is immortal.
+                        continue;
+                    }
+
                     let mut values: Vec<Value> = Vec::with_capacity(arity);
                     for _ in 0..arity {
                         if self.stack.tell() == 0 {
@@ -2688,15 +2651,7 @@ impl<const S: usize> Machine<S> {
                     // Root before GC — unmarked fresh enums are swept otherwise
                     // (result-mode `return Ok(s)` after a heavy callee was flaky).
                     self.stack.push(Value::from(object.addr()));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
@@ -2709,7 +2664,6 @@ impl<const S: usize> Machine<S> {
                         values.push(self.stack.pop());
                     }
                     values.reverse();
-                    self.alloc_counter += 1;
                     let addr = if matches!(opcode.bytecode(), Instruction::MakeTuple) {
                         let obj_tuple = ObjTuple { elements: values };
                         let (object, _) = self.heap.alloc(obj_tuple, Object::Tuple);
@@ -2720,35 +2674,32 @@ impl<const S: usize> Machine<S> {
                         object.addr()
                     };
                     self.stack.push(Value::from(addr));
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::Index => {
                     let index_val = self.stack.pop();
                     let target_val = self.stack.pop();
                     let target_addr = target_val.raw() as u64;
                     let index = index_val.as_int();
+                    // Arrays dominate Index traffic (Vec); check Array before Tuple.
                     let result = match Self::find_object_by_addr(&self.heap, target_addr) {
-                        Some(crate::memory::Object::Tuple(gc)) => {
-                            let elements = &gc.as_ref().elements;
-                            if index < 0 || (index as usize) >= elements.len() {
-                                Value::from(-1_i64)
-                            } else {
-                                elements[index as usize]
-                            }
-                        }
                         Some(crate::memory::Object::Array(gc)) => {
                             let elements = &gc.as_ref().elements;
-                            if index < 0 || (index as usize) >= elements.len() {
-                                Value::from(-1_i64)
+                            let len = elements.len();
+                            if index >= 0 && (index as usize) < len {
+                                // SAFETY: bounds checked above.
+                                unsafe { *elements.get_unchecked(index as usize) }
                             } else {
-                                elements[index as usize]
+                                Value::from(-1_i64)
+                            }
+                        }
+                        Some(crate::memory::Object::Tuple(gc)) => {
+                            let elements = &gc.as_ref().elements;
+                            let len = elements.len();
+                            if index >= 0 && (index as usize) < len {
+                                unsafe { *elements.get_unchecked(index as usize) }
+                            } else {
+                                Value::from(-1_i64)
                             }
                         }
                         _ => Value::from(-1_i64),
@@ -2766,7 +2717,6 @@ impl<const S: usize> Machine<S> {
                     }
                     pairs.reverse();
                     // Allocate the instance and populate.
-                    self.alloc_counter += 1;
                     let (object, mut gc) =
                         self.heap.alloc(ObjInstance::default(), Object::Instance);
                     {
@@ -2784,14 +2734,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     self.stack.push(Value::from(object.addr()));
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
@@ -2844,8 +2787,12 @@ impl<const S: usize> Machine<S> {
                         Self::find_object_by_addr(&self.heap, target_addr)
                     {
                         let arr = gc.as_mut();
-                        if index >= 0 && (index as usize) < arr.elements.len() {
-                            arr.elements[index as usize] = value;
+                        let len = arr.elements.len();
+                        if index >= 0 && (index as usize) < len {
+                            // SAFETY: bounds checked above.
+                            unsafe {
+                                *arr.elements.get_unchecked_mut(index as usize) = value;
+                            }
                         }
                     }
                     self.stack.push(value);
@@ -2902,7 +2849,6 @@ impl<const S: usize> Machine<S> {
                                 Member::Value(v) => v,
                                 Member::Object(o) => Value::from(o.addr()),
                             };
-                            self.alloc_counter += 1;
                             let (tuple_obj, _) = self.heap.alloc(
                                 ObjTuple {
                                     elements: vec![key_val, val],
@@ -2912,7 +2858,6 @@ impl<const S: usize> Machine<S> {
                             pair_addrs.push(Value::from(tuple_obj.addr()));
                         }
                     }
-                    self.alloc_counter += 1;
                     let (array_obj, _) = self.heap.alloc(
                         ObjArray {
                             elements: pair_addrs,
@@ -2920,14 +2865,7 @@ impl<const S: usize> Machine<S> {
                         Object::Array,
                     );
                     self.stack.push(Value::from(array_obj.addr()));
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; pool index in operands[15:0]
@@ -3112,15 +3050,7 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
                     self.stack.push(Value::from(object.addr()));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
@@ -3286,15 +3216,7 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.stack.push(Value::from(object.addr()));
-                            self.alloc_counter += 1;
-                            if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                                Self::gc_collect(
-                                    &mut self.heap,
-                                    &self.stack,
-                                    &self.resume_stack,
-                                    &mut self.alloc_counter,
-                                );
-                            }
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                             continue;
                         }
 
@@ -3317,7 +3239,6 @@ impl<const S: usize> Machine<S> {
                                         elements: remaining_new.to_vec(),
                                     };
                                     let (object, _) = self.heap.alloc(arr, Object::Array);
-                                    self.alloc_counter += 1;
                                     Value::from(object.addr())
                                 }
                             } else {
@@ -3325,7 +3246,6 @@ impl<const S: usize> Machine<S> {
                                     elements: remaining_new.to_vec(),
                                 };
                                 let (object, _) = self.heap.alloc(arr, Object::Array);
-                                self.alloc_counter += 1;
                                 Value::from(object.addr())
                             };
                             call_args.push(rest_val);
@@ -3455,15 +3375,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::Fn);
                     self.stack.push(Value::from(object.addr()));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::LoadStatic => {
                     let slot = opcode.operand_u32() as usize;
@@ -3500,15 +3412,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let boxed = ObjBoxed { tag, payload };
                     let (object, _) = self.heap.alloc(boxed, Object::Boxed);
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::UnboxValue => {
@@ -3543,15 +3447,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::MakePolyFnCapture => {
                     let count = (opcode.operand_u32() & 0xFF) as usize;
@@ -3576,15 +3472,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    self.alloc_counter += 1;
-                    if unlikely(self.alloc_counter > GC_TRIGGER_INTERVAL) {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::DynAdd
                 | Instruction::DynSub
