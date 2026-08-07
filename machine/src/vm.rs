@@ -2307,6 +2307,7 @@ impl<const S: usize> Machine<S> {
                             let exp = rhs.as_int().max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
                         }
+                        Instruction::PowF => Value::from(lhs.as_float().powf(rhs.as_float())),
                         _ => Value::default(),
                     };
                     if self.capture_nested_return(ret_val) {
@@ -2359,6 +2360,7 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
                         Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
                         Instruction::GEQF => Value::from((va.as_float() >= vb.as_float()) as i64),
+                        Instruction::PowF => Value::from(va.as_float().powf(vb.as_float())),
                         _ => Value::default(),
                     };
                     self.stack.push(result);

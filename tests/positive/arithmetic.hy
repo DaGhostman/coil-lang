@@ -40,6 +40,16 @@ test("float power") {
     assert(2.0 ** 3.0 == 8.0)?;
 }
 
+// Literal `**` const-folds; variable operands lower to a fused slot-pair op,
+// which is a separate VM path.
+test("float power on locals") {
+    let base = 2.0;
+    let exp = 10.0;
+    let p = base ** exp;
+    assert(p == 1024.0)?;
+    assert(base ** exp == 1024.0)?;
+}
+
 test("mixed locals preserve slots") {
     let a = 10;
     let b = 20;
