@@ -3481,6 +3481,41 @@ let _y = nested[0]; \
     }
 
     #[test]
+    fn index_with_len_minus_one_stashes_receiver_before_staged_index() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let ab = [97, 47];
+    let last = ab[len(ab) - 1];
+}
+"#,
+        );
+        let has_index = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Index));
+        assert!(has_index, "expected Index for ab[len(ab)-1]; ops={:?}", {
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        });
+        // Staging must not leave the receiver under STORE high-water; look for
+        // LOAD of two slots immediately before Index (tgt + idx reload).
+        let idx_at = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::Index))
+            .expect("Index");
+        assert!(
+            idx_at >= 1,
+            "Index should be preceded by staged LOAD(s); ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(bc[idx_at - 1].bytecode(), Instruction::LOAD),
+            "expected LOAD before Index after staging; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn len_of_string_literal_folds_without_array_len() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
