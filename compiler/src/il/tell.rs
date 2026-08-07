@@ -416,4 +416,151 @@ mod tests {
         assert_eq!(info.tell_before(0).known(), Some(0));
         assert_eq!(info.tell_before(1), Tell::Unknown);
     }
+
+    /// Packed multi-slot STORE floors to `max(slot) + 1`, not the first slot.
+    #[test]
+    fn packed_store_floors_to_the_highest_written_slot() {
+        let code = vec![
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::CONST).with_const_inline(2),
+            Byte::new(Instruction::STORE).with_load_store_packed(2, 3, 7, 0),
+            Byte::new(Instruction::NOOP),
+        ];
+        // Two consts → cursor 2; pop 2 then floor at 8.
+        assert_eq!(cursors(&code).last().copied().unwrap(), Some(8));
+    }
+
+    /// Fused `BinSlotSlotStore` has no stack traffic but still protects `dest`.
+    #[test]
+    fn bin_slot_slot_store_raises_cursor_without_stack_delta() {
+        let code = vec![
+            Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+                Instruction::BITAND as u8,
+                0,
+                1,
+                5,
+            ),
+            Byte::new(Instruction::NOOP),
+        ];
+        assert_eq!(cursors(&code), vec![Some(0), Some(6)]);
+    }
+
+    /// Dest lives in the pool high half — a wrong decode silently under-floors.
+    #[test]
+    fn bin_slot_imm_store_floors_from_pool_dest() {
+        let pool = vec![(5u64 << 32) | 1];
+        let code = vec![
+            Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+                Instruction::ADD as u8,
+                0,
+                0,
+            ),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &pool, 0, 0);
+        assert_eq!(info.tell_before(1).known(), Some(6));
+        assert!(is_modelled(&code[0], &pool));
+    }
+
+    #[test]
+    fn bin_slot_imm_store_with_missing_pool_entry_is_unmodelled() {
+        let code = vec![
+            Byte::new(Instruction::BinSlotImmStore).with_bin_slot_imm_store(
+                Instruction::ADD as u8,
+                0,
+                0,
+            ),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &[], 0, 0);
+        assert!(!is_modelled(&code[0], &[]));
+        assert_eq!(info.tell_before(1), Tell::Unknown);
+    }
+
+    #[test]
+    fn unpack_pushes_payload_arity_minus_scrutinee() {
+        let code = vec![
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::Unpack).with_operand_u32(2),
+            Byte::new(Instruction::NOOP),
+        ];
+        // cursor 1 → pop 1 + push 2 → 2
+        assert_eq!(cursors(&code).last().copied().unwrap(), Some(2));
+    }
+
+    /// Taken edge is intentionally unmodelled: payload arity is runtime-only.
+    #[test]
+    fn jump_if_match_fallthrough_keeps_cursor_taken_edge_unknown() {
+        let pool = vec![2u64];
+        let jim = Byte::new(Instruction::JumpIfMatch).with_operands_u16([0, 0]);
+        assert!(!is_modelled(&jim, &pool));
+        let code = vec![
+            jim,
+            Byte::new(Instruction::NOOP),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &pool, 0, 3);
+        assert_eq!(info.tell_before(1).known(), Some(3));
+        assert_eq!(info.tell_before(2), Tell::Unknown);
+    }
+
+    #[test]
+    fn return_terminator_blocks_fallthrough() {
+        let code = vec![
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &[], 0, 0);
+        assert_eq!(info.tell_before(2), Tell::Unknown);
+    }
+
+    /// Absolute `Seek` re-anchors a poisoned path so later stores stay usable.
+    #[test]
+    fn seek_recovers_known_cursor_after_unknown() {
+        let code = vec![
+            Byte::new(Instruction::FfiInvoke).with_operand_u32(0),
+            Byte::new(Instruction::Seek).with_operand_u32(4),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &[], 0, 0);
+        assert_eq!(info.tell_before(1), Tell::Unknown);
+        assert_eq!(info.tell_before(2).known(), Some(4));
+    }
+
+    /// Fused jmpf forms pack the target in the pool high half — must join both edges.
+    #[test]
+    fn bin_slot_imm_jmpf_joins_fallthrough_and_taken_with_same_cursor() {
+        let pool = vec![2u64 << 32];
+        let code = vec![
+            Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(
+                Instruction::LE as u8,
+                0,
+                0,
+            ),
+            Byte::new(Instruction::NOOP),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &pool, 0, 1);
+        assert!(is_modelled(&code[0], &pool));
+        assert_eq!(info.tell_before(1).known(), Some(1));
+        assert_eq!(info.tell_before(2).known(), Some(1));
+    }
+
+    #[test]
+    fn bin_slot_slot_jmpf_joins_both_edges() {
+        let pool = vec![2u64 << 32];
+        let code = vec![
+            Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(
+                Instruction::AND as u8,
+                0,
+                0,
+            ),
+            Byte::new(Instruction::NOOP),
+            Byte::new(Instruction::NOOP),
+        ];
+        let info = analyze_at(&code, &pool, 0, 2);
+        assert_eq!(info.tell_before(1).known(), Some(2));
+        assert_eq!(info.tell_before(2).known(), Some(2));
+    }
 }

@@ -206,3 +206,45 @@ fn tell_model_matches_vm_on_match_bindings() {
     );
 }
 
+/// Pin the documented `JumpIfMatch` gap and that fused store floors stay modelled
+/// on real codegen — the shapes a later copy-prop pass will delete against.
+#[test]
+fn tell_model_jump_if_match_gap_and_fused_store_coverage() {
+    let mut saw_jim = false;
+    let mut saw_fused_store = false;
+    for path in CORPUS {
+        let c = compile(path);
+        let r = check(path);
+        assert!(
+            r.mismatches.is_empty(),
+            "{path}: {}",
+            r.mismatches.join("\n")
+        );
+        for b in &c.bytecode {
+            match *b.bytecode() {
+                Instruction::JumpIfMatch => {
+                    saw_jim = true;
+                    assert!(
+                        !tell::is_modelled(b, &c.pool),
+                        "{path}: JumpIfMatch must stay unmodelled (runtime arity)"
+                    );
+                }
+                Instruction::BinSlotImmStore | Instruction::BinSlotSlotStore => {
+                    saw_fused_store = true;
+                    assert!(
+                        tell::is_modelled(b, &c.pool),
+                        "{path}: fused store must be modelled: {:?}",
+                        b.bytecode()
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_jim, "corpus must exercise JumpIfMatch");
+    assert!(
+        saw_fused_store,
+        "corpus must exercise BinSlotImmStore / BinSlotSlotStore"
+    );
+}
+
