@@ -2481,7 +2481,6 @@ impl Compiler {
         }
     }
 
-
     /// True when compiling `expr` may `STORE` into a high temp that aliases the
     /// live expression-stack cursor (CALL receiver temps, HostInvoke, match).
     /// Used so binary operands stage instead of leaving a value under a call.
@@ -5422,11 +5421,13 @@ impl Compiler {
             }
             current = ret;
         }
-        let free = crate::typechecking::subst::ftv(current);
-        scheme
-            .bounds
-            .iter()
-            .any(|bound| free.contains(bound) && top_level_vars.contains(bound))
+        // Only a bare type-param return (`id<T>(T) -> T`) is boxed at the ABI
+        // boundary. Nested ADTs (`Option<T>`, `Vec<T>`) keep their native
+        // representation — UnboxValue would corrupt the heap object.
+        match current {
+            Ty::Var(v) => scheme.bounds.iter().any(|b| b == v) && top_level_vars.contains(v),
+            _ => false,
+        }
     }
 
     /// Whether CallIndirect args through `local` must be `BoxValue`'d.
@@ -5513,7 +5514,6 @@ impl Compiler {
         matches!(result_ty, Ty::Var(_))
     }
 
-
     /// Instantiate a (possibly `forall`) function type against concrete arg
     /// types and return the result type after binding.
     fn instantiate_polyfn_app_result(fun_ty: &Ty, arg_tys: &[Ty]) -> Option<Ty> {
@@ -5534,7 +5534,6 @@ impl Compiler {
         }
         Some(Self::apply_ty_var_map(current, &map))
     }
-
 
     fn apply_ty_var_map(
         ty: &Ty,
@@ -9829,7 +9828,7 @@ impl Compiler {
                             Byte::new(Instruction::CallIndirect)
                                 .with_operand_u32(value_arity | (dict_count << 16)),
                         );
-// Generic→concrete unbox for polyfn call site.
+                        // Generic→concrete unbox for polyfn call site.
                         if self.local_polyfn_call_needs_unbox(
                             &identifier,
                             Some((span.start, span.end)),
@@ -9870,7 +9869,6 @@ impl Compiler {
                                 Self::emit_unbox_if_needed(&mut bytecode, &ty);
                             }
                         }
-
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownFunction,
