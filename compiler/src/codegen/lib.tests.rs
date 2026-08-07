@@ -5514,19 +5514,23 @@ fn main() {
             .map(|(i, _)| i)
             .max()
             .expect("back-edge JMP");
-        let mut saw = false;
-        for (i, b) in bc.iter().enumerate() {
+        // Inner `if i < len(src)` may also fuse to BinSlotSlotJmpf and jump to
+        // the increment (still inside the loop). Only the while-exit must land
+        // past the back-edge JMP.
+        let mut saw_while_exit = false;
+        for (_i, b) in bc.iter().enumerate() {
             if *b.bytecode() != Instruction::BinSlotSlotJmpf {
                 continue;
             }
-            saw = true;
             let (_op, _a, idx) = b.bin_slot_slot_jmpf_parts();
             let packed = pool[idx];
             let tgt = (packed >> 32) as usize;
-            assert!(
-                tgt > back,
-                "BinSlotSlotJmpf while-exit at {i}: target {tgt} must be past back-edge JMP {back}"
-            );
+            if tgt > back {
+                saw_while_exit = true;
+            }
         }
-        assert!(saw, "expected BinSlotSlotJmpf for while i < end");
+        assert!(
+            saw_while_exit,
+            "expected while-exit BinSlotSlotJmpf targeting past back-edge JMP {back}"
+        );
     }

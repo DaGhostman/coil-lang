@@ -2481,6 +2481,58 @@ impl Compiler {
         }
     }
 
+
+    /// True when compiling `expr` may `STORE` into a high temp that aliases the
+    /// live expression-stack cursor (CALL receiver temps, HostInvoke, match).
+    /// Used so binary operands stage instead of leaving a value under a call.
+    fn expr_may_clobber_operand_stack(&self, expr: &Output<'_>) -> bool {
+        if self.arg_emits_on_self_bytecode(expr) {
+            return true;
+        }
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
+                self.expr_may_clobber_operand_stack(v)
+            }
+            Expression::Call { .. } | Expression::Match { .. } => true,
+            Expression::Negate(e)
+            | Expression::Not(e)
+            | Expression::LogicalNot(e)
+            | Expression::Positive(e)
+            | Expression::Cast(e, _) => self.expr_may_clobber_operand_stack(e),
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Pow(a, b)
+            | Expression::Shl(a, b)
+            | Expression::Shr(a, b)
+            | Expression::Xor(a, b)
+            | Expression::And(a, b)
+            | Expression::BitAnd(a, b)
+            | Expression::Or(a, b)
+            | Expression::BitOr(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Gt(a, b)
+            | Expression::Geq(a, b) => {
+                self.expr_may_clobber_operand_stack(a) || self.expr_may_clobber_operand_stack(b)
+            }
+            Expression::Access(recv, _) | Expression::OptionalAccess(recv, _) => {
+                self.expr_may_clobber_operand_stack(recv)
+            }
+            Expression::Index(recv, idx) => {
+                self.expr_may_clobber_operand_stack(recv)
+                    || idx
+                        .as_ref()
+                        .is_some_and(|i| self.expr_may_clobber_operand_stack(i))
+            }
+            _ => false,
+        }
+    }
+
     /// Pure call arg: literals and pure arith/cmp/logic — no Call / HostInvoke /
     /// IO / mutation / control side effects.
     ///
@@ -5695,14 +5747,19 @@ impl Compiler {
         // advances `emit_idx` past lhs's entire subtree.
         let lhs_ty = self.codegen_expr_ty(lhs);
         let lhs_id = self.checker.id_table().ids().get(self.emit_idx).copied();
-        if self.arg_emits_on_self_bytecode(lhs) || self.arg_emits_on_self_bytecode(rhs) {
-            // HostInvoke results live on the shared operand/local stack. A
-            // second invoke can overwrite the first result before this local
-            // bytecode buffer is appended, so stage both operands immediately.
-            let mut lhs_slot = 0;
-            let mut rhs_slot = 0;
-            self.stage_call_arg_to_temp(lhs, false, &mut lhs_slot);
-            self.stage_call_arg_to_temp(rhs, false, &mut rhs_slot);
+        if self.expr_may_clobber_operand_stack(lhs) || self.expr_may_clobber_operand_stack(rhs) {
+            // CALL/HostInvoke temps share the operand/local stack. Leaving
+            // `acc` under `p.sum()` lets `STORE` of the call temp overwrite the
+            // stacked lhs. Stage into *this* buffer (not `self.bytecode`) so
+            // while/if label layout stays contiguous with the surrounding ops.
+            let lhs_slot;
+            let rhs_slot;
+            self.append_with_existential_pack(bytecode, lhs);
+            lhs_slot = self.alloc_temp_slot();
+            bytecode.push_store_pop(lhs_slot);
+            self.append_with_existential_pack(bytecode, rhs);
+            rhs_slot = self.alloc_temp_slot();
+            bytecode.push_store_pop(rhs_slot);
             bytecode.push_load(lhs_slot);
             bytecode.push_load(rhs_slot);
         } else {
