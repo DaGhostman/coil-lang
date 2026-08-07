@@ -4039,462 +4039,7 @@ impl Checker {
                 class,
                 args,
                 methods,
-            } => {
-                // Resolve instance heads (bare ctors stay `Con` for HKT).
-                let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_instance_head(a)).collect();
-                // Walk arg type expressions for ID alignment; cache head tys
-                // so codegen FQNs match (not `Option<t0>` placeholders).
-                for (a, ty) in args.iter().zip(arg_tys.iter()) {
-                    self.cache_forced_ty(a, ty.clone());
-                }
-                // Verify class exists.
-                let class_def = self.generics.typeclass(class).cloned();
-                if class_def.is_none() {
-                    self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!("Unknown trait `{}`", class),
-                        range.clone(),
-                    ));
-                }
-                if let Some(ref cdef) = class_def {
-                    self.validate_instance_head_kinds(cdef, &arg_tys, &range);
-                }
-                let orphaned = class_def
-                    .as_ref()
-                    .is_some_and(|cdef| !self.instance_satisfies_orphan_rule(cdef, args, &arg_tys));
-                if orphaned {
-                    let instance = self.instance_signature(class, &arg_tys);
-                    let mut msg = Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Orphan instance `{}` is not allowed in module `{}`",
-                            instance, self.current_module
-                        ),
-                        range.clone(),
-                    );
-                    msg.with_help(
-                        "define the trait in this module, or define the nominal head of every non-variable instance argument here"
-                            .to_string(),
-                    );
-                    self.messages.push(msg);
-                }
-                let overlapping = self
-                    .generics
-                    .find_overlapping_instance(class, &arg_tys)
-                    .cloned();
-                if let Some(existing) = overlapping.as_ref() {
-                    let mut msg = Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Overlapping instance `{}` conflicts with existing `{}`",
-                            self.instance_signature(class, &arg_tys),
-                            self.instance_signature(&existing.class, &existing.args)
-                        ),
-                        range.clone(),
-                    );
-                    msg.with_help(format!(
-                        "existing instance was declared in module `{}`",
-                        existing.defined_module
-                    ));
-                    msg.push(Label::new(
-                        "new instance declared here".to_string(),
-                        range.clone(),
-                    ));
-                    if existing.defined_module == self.current_module {
-                        msg.push(Label::new(
-                            "existing overlapping instance declared here".to_string(),
-                            existing.range.clone(),
-                        ));
-                    }
-                    self.messages.push(msg);
-                }
-                // Build method_fqns, assoc_tys, and register instance.
-                let mut method_fqns = HashMap::new();
-                let mut method_names = Vec::new();
-                let mut assoc_tys: HashMap<String, AssocTypeValue> = HashMap::new();
-                let mut assoc_names: Vec<String> = Vec::new();
-                let mut invalid_assoc_defs = false;
-
-                // Pre-register a stub so recursive derived/hand-written
-                // method bodies can discharge constraints against the
-                // instance under construction. Assoc types are patched
-                // onto the stub as they are collected (before methods
-                // run), so projections stay valid during body infer.
-                let args_pretty_for_fqn: String = arg_tys
-                    .iter()
-                    .map(|t| format!("{}", t))
-                    .collect::<Vec<_>>()
-                    .join("_");
-                let mut stub_fqns = HashMap::new();
-                for m in methods {
-                    let mname = match m.1.as_ref() {
-                        Expression::Function { name, .. } => Some(*name),
-                        Expression::Method(_, body) => match body.1.as_ref() {
-                            Expression::Function { name, .. } => Some(*name),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(mname) = mname {
-                        stub_fqns.insert(
-                            mname.to_string(),
-                            format!("{}__{}__{}", class, args_pretty_for_fqn, mname),
-                        );
-                    }
-                }
-                let stub_idx = if class_def.is_some() && !orphaned && overlapping.is_none() {
-                    self.generics.instances.push(InstanceDef {
-                        class: class.to_string(),
-                        defined_module: self.current_module.clone(),
-                        range: range.clone(),
-                        args: arg_tys.clone(),
-                        method_fqns: stub_fqns,
-                        assoc_tys: HashMap::new(),
-                    });
-                    Some(self.generics.instances.len() - 1)
-                } else {
-                    None
-                };
-
-                for m in methods {
-                    match m.1.as_ref() {
-                        Expression::AssocTypeDef {
-                            name: aname,
-                            type_params: assoc_params,
-                            ty,
-                        } => {
-                            // Consume the AssocTypeDef wrapper NodeId, then the RHS.
-                            let wrapper_id = self.ids.ids()[self.next_id_idx];
-                            self.next_id_idx += 1;
-                            self.cache.insert(wrapper_id, unit_ty());
-                            let mut assoc_frame = HashMap::new();
-                            let mut assoc_param_vars = Vec::new();
-                            let mut assoc_param_kinds = Vec::new();
-                            for tp in assoc_params {
-                                let var = self.counter.fresh();
-                                let kind = self.resolve_type_param_kind(tp);
-                                self.set_var_kind(var, kind.clone());
-                                assoc_frame.insert(tp.name.to_string(), var);
-                                assoc_param_vars.push(var);
-                                assoc_param_kinds.push(kind);
-                            }
-                            let pushed_assoc_params = !assoc_frame.is_empty();
-                            if pushed_assoc_params {
-                                self.type_params_in_scope.push(assoc_frame);
-                            }
-                            let resolved = self.parse_type_name(ty);
-                            if pushed_assoc_params {
-                                let _ = self.type_params_in_scope.pop();
-                            }
-                            self.cache_forced_ty(ty, resolved.clone());
-                            if let Some(cdef) = class_def.as_ref()
-                                && let Some(decl) = cdef.assoc_type(aname)
-                            {
-                                if decl.params.len() != assoc_params.len() {
-                                    invalid_assoc_defs = true;
-                                    self.messages.push(Message::error(
-                                        ErrorCode::GenericTypeError,
-                                        format!(
-                                            "Associated type `{}` in instance of `{}` expects {} type parameter{}, got {}",
-                                            aname,
-                                            class,
-                                            decl.params.len(),
-                                            if decl.params.len() == 1 { "" } else { "s" },
-                                            assoc_params.len()
-                                        ),
-                                        m.0.into_range(),
-                                    ));
-                                }
-                                for (i, (expected, actual)) in decl
-                                    .param_kinds
-                                    .iter()
-                                    .zip(assoc_param_kinds.iter())
-                                    .enumerate()
-                                {
-                                    if expected != actual {
-                                        invalid_assoc_defs = true;
-                                        self.messages.push(Message::error(
-                                            ErrorCode::GenericTypeError,
-                                            format!(
-                                                "Type parameter {} of associated type `{}` has kind `{}`, expected `{}`",
-                                                i + 1,
-                                                aname,
-                                                actual,
-                                                expected
-                                            ),
-                                            m.0.into_range(),
-                                        ));
-                                    }
-                                }
-                                let rhs_kind = self.kind_of_ty(&resolved);
-                                if rhs_kind != Kind::Type {
-                                    invalid_assoc_defs = true;
-                                    self.messages.push(Message::error(
-                                        ErrorCode::GenericTypeError,
-                                        format!(
-                                            "Associated type `{}` in instance of `{}` must resolve to kind `*`, found `{}`",
-                                            aname, class, rhs_kind
-                                        ),
-                                        ty.0.into_range(),
-                                    ));
-                                }
-                            }
-                            if assoc_tys.contains_key(*aname) {
-                                self.messages.push(Message::error(
-                                    ErrorCode::GenericTypeError,
-                                    format!(
-                                        "Duplicate associated type `{}` in instance of `{}`",
-                                        aname, class
-                                    ),
-                                    m.0.into_range(),
-                                ));
-                            } else {
-                                assoc_names.push(aname.to_string());
-                                let value = AssocTypeValue {
-                                    params: assoc_params
-                                        .iter()
-                                        .map(|tp| tp.name.to_string())
-                                        .collect(),
-                                    param_vars: assoc_param_vars,
-                                    param_kinds: assoc_param_kinds,
-                                    ty: resolved,
-                                };
-                                if let Some(idx) = stub_idx {
-                                    self.generics.instances[idx]
-                                        .assoc_tys
-                                        .insert(aname.to_string(), value.clone());
-                                }
-                                assoc_tys.insert(aname.to_string(), value);
-                            }
-                        }
-                        _ => {
-                            let maybe_fn = match m.1.as_ref() {
-                                Expression::Function {
-                                    docs: _,
-                                    name,
-                                    type_params,
-                                    args,
-                                    returns,
-                                    where_constraints,
-                                    body,
-                                    is_coro,
-                                    ..
-                                } => Some((
-                                    *name,
-                                    type_params.as_slice(),
-                                    args,
-                                    returns,
-                                    where_constraints.as_slice(),
-                                    body,
-                                    *is_coro,
-                                )),
-                                Expression::Method(_, body) => match body.1.as_ref() {
-                                    Expression::Function {
-                                        docs: _,
-                                        name,
-                                        type_params,
-                                        args,
-                                        returns,
-                                        where_constraints,
-                                        body,
-                                        is_coro,
-                                        ..
-                                    } => Some((
-                                        *name,
-                                        type_params.as_slice(),
-                                        args,
-                                        returns,
-                                        where_constraints.as_slice(),
-                                        body,
-                                        *is_coro,
-                                    )),
-                                    _ => None,
-                                },
-                                _ => None,
-                            };
-                            if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
-                                maybe_fn
-                            {
-                                let fqn = format!(
-                                    "{}__{}__{}",
-                                    class,
-                                    arg_tys
-                                        .iter()
-                                        .map(|t| format!("{}", t))
-                                        .collect::<Vec<_>>()
-                                        .join("_"),
-                                    mname,
-                                );
-                                method_names.push(mname.to_string());
-                                method_fqns.insert(mname.to_string(), fqn.clone());
-                                self.infer_function(
-                                    mname,
-                                    mparams,
-                                    margs,
-                                    returns.as_ref(),
-                                    where_cs,
-                                    body.as_ref(),
-                                    &m.0.into_range(),
-                                    None,
-                                    is_coro,
-                                    None,
-                                    false,
-                                );
-                            } else {
-                                let _ = self.infer(m);
-                            }
-                        }
-                    }
-                }
-                let mut invalid_instance = class_def.is_none() || orphaned || overlapping.is_some();
-                if let Some(class_def) = class_def.as_ref() {
-                    // Superclass instances must already exist for the same args.
-                    // `impl Ordered<int>` requires `Equal<int>`, transitively.
-                    let mut missing_supers = Vec::new();
-                    let mut seen_super = HashSet::new();
-                    let mut stack: Vec<String> = class_def.superclasses.clone();
-                    while let Some(super_name) = stack.pop() {
-                        if !seen_super.insert(super_name.clone()) {
-                            continue;
-                        }
-                        if self.generics.find_instance(&super_name, &arg_tys).is_none() {
-                            missing_supers.push(super_name.clone());
-                        }
-                        if let Some(super_def) = self.generics.typeclass(&super_name) {
-                            stack.extend(super_def.superclasses.iter().cloned());
-                        }
-                    }
-                    for super_name in &missing_supers {
-                        let args_pretty = arg_tys
-                            .iter()
-                            .map(|ty| ty.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` requires superclass instance `{}<{}>`",
-                                class, args_pretty, super_name, args_pretty
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    let unknown_methods = Generics::unknown_instance_methods(
-                        class_def,
-                        method_names.iter().map(|name| name.as_str()),
-                    );
-                    for method in &unknown_methods {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Unknown method `{}` in instance of `{}`", method, class),
-                            range.clone(),
-                        ));
-                    }
-                    let unknown_assoc = Generics::unknown_assoc_types(
-                        class_def,
-                        assoc_names.iter().map(|n| n.as_str()),
-                    );
-                    for aname in &unknown_assoc {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Unknown associated type `{}` in instance of `{}`",
-                                aname, class
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    let missing_assoc = Generics::missing_assoc_types(class_def, &assoc_tys);
-                    if !missing_assoc.is_empty() {
-                        let names = missing_assoc
-                            .iter()
-                            .map(|n| format!("`{}`", n))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let noun = if missing_assoc.len() == 1 {
-                            "associated type"
-                        } else {
-                            "associated types"
-                        };
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` is missing {} {}",
-                                class,
-                                arg_tys
-                                    .iter()
-                                    .map(|ty| ty.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                noun,
-                                names
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    Generics::fill_default_method_fqns(class_def, &mut method_fqns);
-                    let missing_methods =
-                        Generics::missing_required_methods(class_def, &method_fqns);
-                    if !missing_methods.is_empty() {
-                        let methods = missing_methods
-                            .iter()
-                            .map(|method| format!("`{}`", method))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let noun = if missing_methods.len() == 1 {
-                            "method"
-                        } else {
-                            "methods"
-                        };
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Instance of `{}` for `{}` is missing {} {}",
-                                class,
-                                arg_tys
-                                    .iter()
-                                    .map(|ty| ty.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                noun,
-                                methods
-                            ),
-                            range.clone(),
-                        ));
-                    }
-                    invalid_instance |= !unknown_methods.is_empty()
-                        || !missing_methods.is_empty()
-                        || !missing_supers.is_empty()
-                        || !unknown_assoc.is_empty()
-                        || !missing_assoc.is_empty()
-                        || invalid_assoc_defs;
-                }
-                // Finalize the stub (or push a fresh instance when no stub).
-                // Omitted defaulted methods have been filled with class-default FQNs.
-                // Never `remove(idx)` — that shifts later instance indices; clear
-                // the stub in place when invalid instead.
-                if let Some(idx) = stub_idx {
-                    if invalid_instance {
-                        self.generics.instances[idx].method_fqns.clear();
-                        self.generics.instances[idx].assoc_tys.clear();
-                        self.generics.instances[idx].args.clear();
-                        self.generics.instances[idx].class.clear();
-                    } else {
-                        self.generics.instances[idx].method_fqns = method_fqns;
-                        self.generics.instances[idx].assoc_tys = assoc_tys;
-                    }
-                } else if !invalid_instance {
-                    self.generics.instances.push(InstanceDef {
-                        class: class.to_string(),
-                        defined_module: self.current_module.clone(),
-                        range: range.clone(),
-                        args: arg_tys,
-                        method_fqns,
-                        assoc_tys,
-                    });
-                }
-                unit_ty()
-            }
+            } => self.infer_typeclass_impl(class, args, methods, range),
 
             Expression::AssocTypeDecl { .. } => unit_ty(),
             Expression::AssocTypeDef { ty, .. } => {
@@ -4558,6 +4103,470 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_typeclass_impl(
+        &mut self,
+        class: &str,
+        args: &[Output],
+        methods: &[Output],
+        range: Range<usize>,
+    ) -> Ty {
+        // Resolve instance heads (bare ctors stay `Con` for HKT).
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_instance_head(a)).collect();
+        // Walk arg type expressions for ID alignment; cache head tys
+        // so codegen FQNs match (not `Option<t0>` placeholders).
+        for (a, ty) in args.iter().zip(arg_tys.iter()) {
+            self.cache_forced_ty(a, ty.clone());
+        }
+        // Verify class exists.
+        let class_def = self.generics.typeclass(class).cloned();
+        if class_def.is_none() {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Unknown trait `{}`", class),
+                range.clone(),
+            ));
+        }
+        if let Some(ref cdef) = class_def {
+            self.validate_instance_head_kinds(cdef, &arg_tys, &range);
+        }
+        let orphaned = class_def
+            .as_ref()
+            .is_some_and(|cdef| !self.instance_satisfies_orphan_rule(cdef, args, &arg_tys));
+        if orphaned {
+            let instance = self.instance_signature(class, &arg_tys);
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Orphan instance `{}` is not allowed in module `{}`",
+                    instance, self.current_module
+                ),
+                range.clone(),
+            );
+            msg.with_help(
+                "define the trait in this module, or define the nominal head of every non-variable instance argument here"
+                    .to_string(),
+            );
+            self.messages.push(msg);
+        }
+        let overlapping = self
+            .generics
+            .find_overlapping_instance(class, &arg_tys)
+            .cloned();
+        if let Some(existing) = overlapping.as_ref() {
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Overlapping instance `{}` conflicts with existing `{}`",
+                    self.instance_signature(class, &arg_tys),
+                    self.instance_signature(&existing.class, &existing.args)
+                ),
+                range.clone(),
+            );
+            msg.with_help(format!(
+                "existing instance was declared in module `{}`",
+                existing.defined_module
+            ));
+            msg.push(Label::new(
+                "new instance declared here".to_string(),
+                range.clone(),
+            ));
+            if existing.defined_module == self.current_module {
+                msg.push(Label::new(
+                    "existing overlapping instance declared here".to_string(),
+                    existing.range.clone(),
+                ));
+            }
+            self.messages.push(msg);
+        }
+        // Build method_fqns, assoc_tys, and register instance.
+        let mut method_fqns = HashMap::new();
+        let mut method_names = Vec::new();
+        let mut assoc_tys: HashMap<String, AssocTypeValue> = HashMap::new();
+        let mut assoc_names: Vec<String> = Vec::new();
+        let mut invalid_assoc_defs = false;
+
+        // Pre-register a stub so recursive derived/hand-written
+        // method bodies can discharge constraints against the
+        // instance under construction. Assoc types are patched
+        // onto the stub as they are collected (before methods
+        // run), so projections stay valid during body infer.
+        let args_pretty_for_fqn: String = arg_tys
+            .iter()
+            .map(|t| format!("{}", t))
+            .collect::<Vec<_>>()
+            .join("_");
+        let mut stub_fqns = HashMap::new();
+        for m in methods {
+            let mname = match m.1.as_ref() {
+                Expression::Function { name, .. } => Some(*name),
+                Expression::Method(_, body) => match body.1.as_ref() {
+                    Expression::Function { name, .. } => Some(*name),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(mname) = mname {
+                stub_fqns.insert(
+                    mname.to_string(),
+                    format!("{}__{}__{}", class, args_pretty_for_fqn, mname),
+                );
+            }
+        }
+        let stub_idx = if class_def.is_some() && !orphaned && overlapping.is_none() {
+            self.generics.instances.push(InstanceDef {
+                class: class.to_string(),
+                defined_module: self.current_module.clone(),
+                range: range.clone(),
+                args: arg_tys.clone(),
+                method_fqns: stub_fqns,
+                assoc_tys: HashMap::new(),
+            });
+            Some(self.generics.instances.len() - 1)
+        } else {
+            None
+        };
+
+        for m in methods {
+            match m.1.as_ref() {
+                Expression::AssocTypeDef {
+                    name: aname,
+                    type_params: assoc_params,
+                    ty,
+                } => {
+                    // Consume the AssocTypeDef wrapper NodeId, then the RHS.
+                    let wrapper_id = self.ids.ids()[self.next_id_idx];
+                    self.next_id_idx += 1;
+                    self.cache.insert(wrapper_id, unit_ty());
+                    let mut assoc_frame = HashMap::new();
+                    let mut assoc_param_vars = Vec::new();
+                    let mut assoc_param_kinds = Vec::new();
+                    for tp in assoc_params {
+                        let var = self.counter.fresh();
+                        let kind = self.resolve_type_param_kind(tp);
+                        self.set_var_kind(var, kind.clone());
+                        assoc_frame.insert(tp.name.to_string(), var);
+                        assoc_param_vars.push(var);
+                        assoc_param_kinds.push(kind);
+                    }
+                    let pushed_assoc_params = !assoc_frame.is_empty();
+                    if pushed_assoc_params {
+                        self.type_params_in_scope.push(assoc_frame);
+                    }
+                    let resolved = self.parse_type_name(ty);
+                    if pushed_assoc_params {
+                        let _ = self.type_params_in_scope.pop();
+                    }
+                    self.cache_forced_ty(ty, resolved.clone());
+                    if let Some(cdef) = class_def.as_ref()
+                        && let Some(decl) = cdef.assoc_type(aname)
+                    {
+                        if decl.params.len() != assoc_params.len() {
+                            invalid_assoc_defs = true;
+                            self.messages.push(Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Associated type `{}` in instance of `{}` expects {} type parameter{}, got {}",
+                                    aname,
+                                    class,
+                                    decl.params.len(),
+                                    if decl.params.len() == 1 { "" } else { "s" },
+                                    assoc_params.len()
+                                ),
+                                m.0.into_range(),
+                            ));
+                        }
+                        for (i, (expected, actual)) in decl
+                            .param_kinds
+                            .iter()
+                            .zip(assoc_param_kinds.iter())
+                            .enumerate()
+                        {
+                            if expected != actual {
+                                invalid_assoc_defs = true;
+                                self.messages.push(Message::error(
+                                    ErrorCode::GenericTypeError,
+                                    format!(
+                                        "Type parameter {} of associated type `{}` has kind `{}`, expected `{}`",
+                                        i + 1,
+                                        aname,
+                                        actual,
+                                        expected
+                                    ),
+                                    m.0.into_range(),
+                                ));
+                            }
+                        }
+                        let rhs_kind = self.kind_of_ty(&resolved);
+                        if rhs_kind != Kind::Type {
+                            invalid_assoc_defs = true;
+                            self.messages.push(Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Associated type `{}` in instance of `{}` must resolve to kind `*`, found `{}`",
+                                    aname, class, rhs_kind
+                                ),
+                                ty.0.into_range(),
+                            ));
+                        }
+                    }
+                    if assoc_tys.contains_key(*aname) {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Duplicate associated type `{}` in instance of `{}`",
+                                aname, class
+                            ),
+                            m.0.into_range(),
+                        ));
+                    } else {
+                        assoc_names.push(aname.to_string());
+                        let value = AssocTypeValue {
+                            params: assoc_params
+                                .iter()
+                                .map(|tp| tp.name.to_string())
+                                .collect(),
+                            param_vars: assoc_param_vars,
+                            param_kinds: assoc_param_kinds,
+                            ty: resolved,
+                        };
+                        if let Some(idx) = stub_idx {
+                            self.generics.instances[idx]
+                                .assoc_tys
+                                .insert(aname.to_string(), value.clone());
+                        }
+                        assoc_tys.insert(aname.to_string(), value);
+                    }
+                }
+                _ => {
+                    let maybe_fn = match m.1.as_ref() {
+                        Expression::Function {
+                            docs: _,
+                            name,
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body,
+                            is_coro,
+                            ..
+                        } => Some((
+                            *name,
+                            type_params.as_slice(),
+                            args,
+                            returns,
+                            where_constraints.as_slice(),
+                            body,
+                            *is_coro,
+                        )),
+                        Expression::Method(_, body) => match body.1.as_ref() {
+                            Expression::Function {
+                                docs: _,
+                                name,
+                                type_params,
+                                args,
+                                returns,
+                                where_constraints,
+                                body,
+                                is_coro,
+                                ..
+                            } => Some((
+                                *name,
+                                type_params.as_slice(),
+                                args,
+                                returns,
+                                where_constraints.as_slice(),
+                                body,
+                                *is_coro,
+                            )),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
+                        maybe_fn
+                    {
+                        let fqn = format!(
+                            "{}__{}__{}",
+                            class,
+                            arg_tys
+                                .iter()
+                                .map(|t| format!("{}", t))
+                                .collect::<Vec<_>>()
+                                .join("_"),
+                            mname,
+                        );
+                        method_names.push(mname.to_string());
+                        method_fqns.insert(mname.to_string(), fqn.clone());
+                        self.infer_function(
+                            mname,
+                            mparams,
+                            margs,
+                            returns.as_ref(),
+                            where_cs,
+                            body.as_ref(),
+                            &m.0.into_range(),
+                            None,
+                            is_coro,
+                            None,
+                            false,
+                        );
+                    } else {
+                        let _ = self.infer(m);
+                    }
+                }
+            }
+        }
+        let mut invalid_instance = class_def.is_none() || orphaned || overlapping.is_some();
+        if let Some(class_def) = class_def.as_ref() {
+            // Superclass instances must already exist for the same args.
+            // `impl Ordered<int>` requires `Equal<int>`, transitively.
+            let mut missing_supers = Vec::new();
+            let mut seen_super = HashSet::new();
+            let mut stack: Vec<String> = class_def.superclasses.clone();
+            while let Some(super_name) = stack.pop() {
+                if !seen_super.insert(super_name.clone()) {
+                    continue;
+                }
+                if self.generics.find_instance(&super_name, &arg_tys).is_none() {
+                    missing_supers.push(super_name.clone());
+                }
+                if let Some(super_def) = self.generics.typeclass(&super_name) {
+                    stack.extend(super_def.superclasses.iter().cloned());
+                }
+            }
+            for super_name in &missing_supers {
+                let args_pretty = arg_tys
+                    .iter()
+                    .map(|ty| ty.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` requires superclass instance `{}<{}>`",
+                        class, args_pretty, super_name, args_pretty
+                    ),
+                    range.clone(),
+                ));
+            }
+            let unknown_methods = Generics::unknown_instance_methods(
+                class_def,
+                method_names.iter().map(|name| name.as_str()),
+            );
+            for method in &unknown_methods {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!("Unknown method `{}` in instance of `{}`", method, class),
+                    range.clone(),
+                ));
+            }
+            let unknown_assoc = Generics::unknown_assoc_types(
+                class_def,
+                assoc_names.iter().map(|n| n.as_str()),
+            );
+            for aname in &unknown_assoc {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Unknown associated type `{}` in instance of `{}`",
+                        aname, class
+                    ),
+                    range.clone(),
+                ));
+            }
+            let missing_assoc = Generics::missing_assoc_types(class_def, &assoc_tys);
+            if !missing_assoc.is_empty() {
+                let names = missing_assoc
+                    .iter()
+                    .map(|n| format!("`{}`", n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let noun = if missing_assoc.len() == 1 {
+                    "associated type"
+                } else {
+                    "associated types"
+                };
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` is missing {} {}",
+                        class,
+                        arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        noun,
+                        names
+                    ),
+                    range.clone(),
+                ));
+            }
+            Generics::fill_default_method_fqns(class_def, &mut method_fqns);
+            let missing_methods =
+                Generics::missing_required_methods(class_def, &method_fqns);
+            if !missing_methods.is_empty() {
+                let methods = missing_methods
+                    .iter()
+                    .map(|method| format!("`{}`", method))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let noun = if missing_methods.len() == 1 {
+                    "method"
+                } else {
+                    "methods"
+                };
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of `{}` for `{}` is missing {} {}",
+                        class,
+                        arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        noun,
+                        methods
+                    ),
+                    range.clone(),
+                ));
+            }
+            invalid_instance |= !unknown_methods.is_empty()
+                || !missing_methods.is_empty()
+                || !missing_supers.is_empty()
+                || !unknown_assoc.is_empty()
+                || !missing_assoc.is_empty()
+                || invalid_assoc_defs;
+        }
+        // Finalize the stub (or push a fresh instance when no stub).
+        // Omitted defaulted methods have been filled with class-default FQNs.
+        // Never `remove(idx)` — that shifts later instance indices; clear
+        // the stub in place when invalid instead.
+        if let Some(idx) = stub_idx {
+            if invalid_instance {
+                self.generics.instances[idx].method_fqns.clear();
+                self.generics.instances[idx].assoc_tys.clear();
+                self.generics.instances[idx].args.clear();
+                self.generics.instances[idx].class.clear();
+            } else {
+                self.generics.instances[idx].method_fqns = method_fqns;
+                self.generics.instances[idx].assoc_tys = assoc_tys;
+            }
+        } else if !invalid_instance {
+            self.generics.instances.push(InstanceDef {
+                class: class.to_string(),
+                defined_module: self.current_module.clone(),
+                range: range.clone(),
+                args: arg_tys,
+                method_fqns,
+                assoc_tys,
+            });
+        }
+        unit_ty()
     }
 
     #[inline(never)]
