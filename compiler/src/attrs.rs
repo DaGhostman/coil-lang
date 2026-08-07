@@ -2440,13 +2440,53 @@ fn ty_name<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
     at(span, Expression::Type(name))
 }
 
-/// Parse `int` / `string` or dynamic `[elem]` (not `Type("[byte]")`, which is invalid).
+/// Parse `int` / `string`, `Vec<elem>`, or legacy dynamic `[elem]` (maps to `Vec`).
 fn ty_ret<'a>(span: SimpleSpan, ret: &'a str) -> Output<'a> {
+    if let Some(elem) = ret
+        .strip_prefix("Vec<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        return at(
+            span,
+            Expression::TypeApp {
+                name: "Vec",
+                args: vec![ty_name(span, leak(elem.to_string()))],
+            },
+        );
+    }
     if ret.len() >= 2 && ret.starts_with('[') && ret.ends_with(']') && !ret.contains(';') {
         let elem = &ret[1..ret.len() - 1];
-        return at(span, Expression::Array(vec![ty_name(span, elem)]));
+        return at(
+            span,
+            Expression::TypeApp {
+                name: "Vec",
+                args: vec![ty_name(span, elem)],
+            },
+        );
     }
     ty_name(span, ret)
+}
+
+fn vec_new_call<'a>(span: SimpleSpan) -> Output<'a> {
+    at(
+        span,
+        Expression::Construct {
+            enum_name: "Vec",
+            variant_name: "new",
+            fields: EnumConstructPayload::Unit,
+        },
+    )
+}
+
+fn vec_from_array<'a>(span: SimpleSpan, elems: Vec<Output<'a>>) -> Output<'a> {
+    at(
+        span,
+        Expression::Construct {
+            enum_name: "Vec",
+            variant_name: "from",
+            fields: EnumConstructPayload::Tuple(vec![at(span, Expression::Array(elems))]),
+        },
+    )
 }
 
 fn ident<'a>(span: SimpleSpan, name: &'a str) -> Output<'a> {
@@ -3391,7 +3431,7 @@ fn serialize_variant_body<'a>(
             }
         }
     }
-    at(span, Expression::Array(elems))
+    vec_from_array(span, elems)
 }
 
 fn synth_serialize_enum<'a>(
@@ -3410,7 +3450,7 @@ fn synth_serialize_enum<'a>(
     }
     arms.push(MatchArm {
         pattern: span_pat(span, Pattern::Wildcard),
-        body: at(span, Expression::Array(vec![])),
+        body: vec_new_call(span),
     });
     let match_expr = at(
         span,
@@ -3423,7 +3463,7 @@ fn synth_serialize_enum<'a>(
         span,
         "serialize",
         vec![arg(span, enum_name, p)],
-        "[byte]",
+        "Vec<byte>",
         block_return(span, match_expr),
     );
     typeclass_impl(span, "Serialize", enum_name, vec![m])
@@ -3534,7 +3574,7 @@ fn synth_deserialize_enum<'a>(
     let m = method_fn(
         span,
         "deserialize",
-        vec![arg(span, "[byte]", data)],
+        vec![arg(span, "Vec<byte>", data)],
         enum_name,
         body,
     );
@@ -3548,12 +3588,12 @@ fn synth_serialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]
         let field = at(span, Expression::Access(ident(span, p), f));
         elems.push(as_byte(span, field));
     }
-    let arr = at(span, Expression::Array(elems));
+    let arr = vec_from_array(span, elems);
     let m = method_fn(
         span,
         "serialize",
         vec![arg(span, name, p)],
-        "[byte]",
+        "Vec<byte>",
         block_return(span, arr),
     );
     typeclass_impl(span, "Serialize", name, vec![m])
@@ -3570,7 +3610,7 @@ fn synth_deserialize_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a st
     let m = method_fn(
         span,
         "deserialize",
-        vec![arg(span, "[byte]", data)],
+        vec![arg(span, "Vec<byte>", data)],
         name,
         block_return(span, value),
     );
