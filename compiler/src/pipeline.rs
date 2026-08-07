@@ -1536,4 +1536,136 @@ fn main() {
         assert!(err.is_err());
         assert!(pipeline.had_errors());
     }
+
+    /// `Pipeline::with_reporter` must not pay for `Compiler::default` — that is
+    /// the whole point of the OnceCell (run-path startup).
+    #[test]
+    fn construction_defers_compiler_until_first_use() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(
+            pipeline.compiler.get().is_none(),
+            "compiler must stay uninitialized after construction"
+        );
+        assert!(
+            !pipeline.pending_native_ids.is_empty(),
+            "standard HostInvoke ids must be buffered for later replay"
+        );
+        assert_eq!(
+            pipeline.pending_native_ids.len(),
+            pipeline.host_natives.len(),
+            "buffered ids must line up 1:1 with the host-native table"
+        );
+    }
+
+    /// Buffered standard-native ids must land in the typechecker map when the
+    /// compiler is first built — otherwise HostInvoke fn_ids drift from the VM.
+    #[test]
+    fn first_compiler_access_replays_pending_native_ids() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        let pending = pipeline.pending_native_ids.clone();
+        assert!(!pending.is_empty());
+
+        let compiler = pipeline.compiler();
+        for (name, id) in &pending {
+            assert_eq!(
+                compiler.native_id(name),
+                Some(*id),
+                "native `{name}` must keep HostInvoke id {id} after lazy init"
+            );
+        }
+        assert_eq!(
+            compiler.native_id("stdout"),
+            pending.iter().find(|(n, _)| n == "stdout").map(|(_, id)| *id)
+        );
+        assert_eq!(
+            compiler.native_id("write"),
+            pending.iter().find(|(n, _)| n == "write").map(|(_, id)| *id)
+        );
+    }
+
+    /// Wiring the VM for `coil run` only needs the host-native table, not a
+    /// typechecker. Touching the compiler here would undo the startup win.
+    #[test]
+    fn wire_host_natives_does_not_build_compiler() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+
+        let mut machine = machine::Machine::<128>::default();
+        pipeline.wire_host_natives(&mut machine);
+        assert!(
+            pipeline.compiler.get().is_none(),
+            "wire_host_natives must not initialize the compiler"
+        );
+        assert!(!pipeline.host_natives.is_empty());
+    }
+
+    /// `register_host_native` forces compiler init; pending standard ids must
+    /// already be present so later HostInvoke codegen stays consistent.
+    #[test]
+    fn register_host_native_preserves_replayed_standard_ids() {
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+        let stdout_id = pipeline
+            .pending_native_ids
+            .iter()
+            .find(|(n, _)| n == "stdout")
+            .map(|(_, id)| *id)
+            .expect("stdout native buffered at construction");
+
+        let custom_id = pipeline.register_host_native(
+            machine::FfiSignature::from_parts(
+                "coverage_probe",
+                vec![],
+                machine::FfiType::Int,
+            )
+            .expect("sig"),
+            |_heap, _args| Ok(Some(common::Value::from(7))),
+        );
+        assert!(pipeline.compiler.get().is_some());
+        assert_eq!(pipeline.compiler().native_id("stdout"), Some(stdout_id));
+        assert!(
+            custom_id >= pipeline.pending_native_ids.len(),
+            "custom host native must append after the standard table"
+        );
+    }
+
+    /// End-to-end: deferred construction + lazy replay still emits working
+    /// HostInvoke for virtual `io` natives.
+    #[test]
+    fn deferred_compiler_host_invoke_io_round_trip() {
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+
+        let (bytecode, constants) = pipeline
+            .compile_src(
+                r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    write(stdout(), to_bytes(format("%s", "ok")));
+}
+"#,
+            )
+            .expect("io HostInvoke program must compile after lazy init");
+        assert!(pipeline.compiler.get().is_some());
+
+        let shared = SharedBuf::new();
+        let mut machine = machine::Machine::<128>::default();
+        machine.set_shared_print(shared.inner.clone());
+        machine.with_output(shared.clone());
+        pipeline.wire_host_natives(&mut machine);
+        machine.run_raw(
+            &bytecode,
+            &constants,
+            pipeline.strings(),
+            pipeline.static_slot_count(),
+        );
+        let _ = machine.restore_output();
+        assert_eq!(shared.into_string(), "ok");
+    }
 }
