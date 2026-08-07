@@ -29,9 +29,7 @@ macro_rules! unary {
 }
 macro_rules! binary {
     ($result: expr, $self: expr, $lhs: expr, $rhs: expr, $instruction: expr) => {
-        $result.append(&mut $self.do_compile($lhs));
-        $result.append(&mut $self.do_compile($rhs));
-
+        let _ = $self.compile_binary_operands(&mut $result, $lhs, $rhs);
         $result.push($instruction);
     };
 }
