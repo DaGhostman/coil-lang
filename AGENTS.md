@@ -11,7 +11,7 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 
 ## User preferences
 
-- Tests: `ulimit -v 65536 && cargo run -- test` (leak smoke). Soft CPU: `./scripts/poop_baseline.sh`.
+- Tests: `cargo test --workspace --all-targets` (required gate; covers integration tests). Feature isolation: `--no-default-features --features <crypto|time|regex|tls>` or `--features <dissect|debugger>`. Leak smoke: `ulimit -v 65536 && cargo run -- test`. Soft CPU: `./scripts/poop_baseline.sh`.
 - Large tasks: scoped sub-agents on disjoint modules.
 - VM perf: alloc reduction, hot-loop tuning, bounds-check elimination, `promise!` — not benchmark-shaped opcodes unless universal.
 - Language features: draft plans; full HM; update `docs/`; minimal runnable example.

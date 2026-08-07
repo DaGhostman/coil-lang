@@ -1,0 +1,41 @@
+---
+description: Always run Rust tests with --workspace --all-targets (and feature matrix when relevant)
+alwaysApply: true
+---
+
+# Cargo test gate
+
+When verifying Rust changes (compiler, VM, parser, CLI, or CI), **do not** run bare `cargo test` or package-only suites as the sole check.
+
+## Required local / agent commands
+
+```bash
+cargo test --workspace --all-targets
+```
+
+Retry once on transient macOS/EAGAIN listing failures (same as CI).
+
+`--all-targets` is required: integration tests under `*/tests/` (e.g. `compiler/tests/diagnostics.rs`, `perf_metrics.rs`) and bins/examples are **not** covered by lib-only or default-member `cargo test`.
+
+## Feature-gated suites
+
+Optional crate features must be exercised when touching gated code or when catching CI-shaped failures:
+
+| Feature | Typical flag | Notes |
+|---------|--------------|--------|
+| default stack | _(none)_ | `crypto` + `time` + `regex` + `tls` |
+| `crypto` / `time` / `regex` / `tls` | `--no-default-features --features <name>` | isolate which optional dep broke |
+| `dissect` | `--features dissect` | compiler dissect + its integration tests |
+| `debugger` | `--features debugger` | machine debugger paths |
+
+Example isolation run:
+
+```bash
+cargo test --workspace --all-targets --no-default-features --features tls
+cargo test --workspace --all-targets --features dissect
+```
+
+## Related gates
+
+- Lint: `cargo check --workspace` (not clippy — `Gc::payload_mut` deny).
+- Language harness (after a debug `coil` build): `./target/debug/coil test`.
