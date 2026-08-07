@@ -935,6 +935,9 @@ impl Compiler {
                     | Instruction::MakeArray
                     | Instruction::MakeTuple
                     | Instruction::JumpIfMatch
+                    | Instruction::Unpack
+                    | Instruction::UnpackAt
+                    | Instruction::Seek
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
                     | Instruction::PRINT
@@ -2113,6 +2116,25 @@ impl Compiler {
             bytecode.push_load(base + i as u32);
         }
         bytecode.push_make_array(n as u32);
+    }
+
+    /// Copy heap-array elements at `arr_slot` back into multi-slot locals `base..base+n`.
+    ///
+    /// Dynamic `StoreIndex` mutates an escaped `MakeArray` temporary; without
+    /// writeback, stack-array slots stay stale (e.g. `arr[i % n] += 1` loops).
+    fn emit_unbox_stack_array(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        arr_slot: u32,
+        base: u32,
+        n: usize,
+    ) {
+        for i in 0..n {
+            bytecode.push_load(arr_slot);
+            bytecode.push_const(i as i32);
+            bytecode.push_index();
+            bytecode.push_store_pop(base + i as u32);
+        }
     }
 
     /// Emit a multi-slot stack-array init: one Value per slot, store immediately.
@@ -5070,11 +5092,12 @@ impl Compiler {
             Ty::Constructor { owner, .. } => Self::ty_to_value_tag(owner),
             Ty::Tuple(_) => Some(ValueTag::Tuple),
             Ty::Array { .. } => Some(ValueTag::Array),
-            Ty::App(head, _)
-                if matches!(head.as_ref(), Ty::Con(n) if n == common::BUILTIN_VEC_TYPE) =>
-            {
-                Some(ValueTag::Array)
-            }
+            Ty::App(head, _) => match head.as_ref() {
+                Ty::Con(n) if n == common::BUILTIN_VEC_TYPE => Some(ValueTag::Array),
+                // Option / Result / user ADT apps share the Instance box tag.
+                Ty::Con(_) => Some(ValueTag::Instance),
+                _ => None,
+            },
             Ty::Record { .. } => Some(ValueTag::Record),
             // Open type vars — boxing is required but we don't know the tag yet
             Ty::Var(_) => None,
@@ -6688,6 +6711,10 @@ impl Compiler {
                     // Always stash the RHS — `StoreIndex` pops value/index/array.
                     // Dropping with POP when `leave_value_on_stack == false` left
                     // StoreIndex without a value (stack underflow / wrong write).
+                    let stack_info = match arr.1.as_ref() {
+                        Expression::Identifier(name) => self.stack_array_info(name),
+                        _ => None,
+                    };
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
@@ -6700,7 +6727,13 @@ impl Compiler {
                     bytecode.push_load(tmp_idx);
                     bytecode.push_load(tmp_val);
                     bytecode.push(Byte::new(Instruction::StoreIndex));
-                    if leave_value_on_stack {
+                    if let Some((base, n)) = stack_info {
+                        bytecode.push_pop();
+                        self.emit_unbox_stack_array(bytecode, tmp_arr, base, n);
+                        if leave_value_on_stack {
+                            bytecode.push_load(tmp_val);
+                        }
+                    } else if leave_value_on_stack {
                         // StoreIndex leaves the value on the stack; keep it.
                     } else {
                         bytecode.push_pop();
@@ -6785,6 +6818,10 @@ impl Compiler {
                 bytecode.push_store_pop(slot);
                 return;
             }
+            let stack_info = match arr.1.as_ref() {
+                Expression::Identifier(name) => self.stack_array_info(name),
+                _ => None,
+            };
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -6802,6 +6839,10 @@ impl Compiler {
             bytecode.push_load(tmp_idx);
             bytecode.push_load(tmp_val);
             bytecode.push(Byte::new(Instruction::StoreIndex));
+            if let Some((base, n)) = stack_info {
+                bytecode.push_pop();
+                self.emit_unbox_stack_array(bytecode, tmp_arr, base, n);
+            }
             return;
         }
 
@@ -11147,6 +11188,13 @@ impl Compiler {
                                 Some(bb.fresh_label(self.bytecode.il_mut()));
                         }
                     }
+
+                    // Reset shared stack/locals cursor to the live-local height
+                    // before evaluating the scrutinee. Prior STORE high-water
+                    // (e.g. `let v = match` in a loop) would otherwise make
+                    // JumpIfMatch push payloads past `payload_base`.
+                    let seek_base = self.context.variables.len() as u32;
+                    self.bytecode.push_seek(seek_base);
 
                     // Compile scrutinee before choosing payload_base —
                     // HostInvoke arg staging (`alloc_temp_slot`) grows
