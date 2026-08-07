@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, TypeParam, Visibility};
+use parser::ast::{
+    Expression, ExternFunction, FieldModifier, MatchArm, Output, Pattern, TypeParam, Visibility,
+};
 use reporting::{ErrorCode, Label, Message};
 
 use crate::typechecking::env::{Env, TyVarCounter, instantiate_with_kinds};
@@ -2227,78 +2229,7 @@ impl Checker {
             // Named call-site arg wrapper — type is the value's type.
             Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
-            Expression::Use { path, name, alias } => {
-                let module_ns = path.join("::");
-                if name == "*" {
-                    // Prelude is injected automatically; every other module —
-                    // virtual or userland — requires explicit imports.
-                    let mod_label = if module_ns.is_empty() {
-                        "<entry>".to_string()
-                    } else {
-                        module_ns.clone()
-                    };
-                    return self.error_with_help(
-                        ErrorCode::WildcardImport,
-                        format!("wildcard import `use {}::*` is not allowed", mod_label),
-                        range,
-                        Some(format!(
-                            "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
-                            mod_label
-                        )),
-                    );
-                }
-                if self.apply_virtual_use(path, name, alias.as_deref()) {
-                    // Bind FFI callables into the value env so Call sites
-                    // resolve; enums/traits/tags are scope-only.
-                    let locals: Vec<(String, BuiltinExport)> = self
-                        .scope_bindings
-                        .iter()
-                        .filter(|(_, e)| {
-                            matches!(
-                                e,
-                                BuiltinExport::FfiFn { .. }
-                                    | BuiltinExport::IoFn { .. }
-                                    | BuiltinExport::StringFn { .. }
-                                    | BuiltinExport::ThreadFn { .. }
-                                    | BuiltinExport::GcFn { .. }
-                                    | BuiltinExport::HostFn { .. }
-                            )
-                        })
-                        .map(|(k, e)| (k.clone(), e.clone()))
-                        .collect();
-                    for (local, export) in locals {
-                        if self.env.lookup(&local).is_some() {
-                            continue;
-                        }
-                        if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
-                            self.env.insert_top(local, scheme);
-                        }
-                    }
-                    return unit_ty();
-                }
-                let local = alias.clone().unwrap_or_else(|| name.clone());
-                let fqn = if module_ns.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{module_ns}::{name}")
-                };
-                // Prefer the defining module's real scheme (incl. generics with
-                // bounds) over a dummy Var so call sites get dict-passing ABI.
-                self.reexport_module_item(&fqn, &local);
-                // Re-export overload families under the local alias so
-                // `use num::{abs}` can still type-dispatch.
-                if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
-                    if cands.len() > 1 {
-                        self.overload_sets.insert(local.clone(), cands);
-                    }
-                }
-                // Disk imports are file-level globals — track for lambda/defer
-                // rebind after `take_and_isolate`.
-                if name != "*" {
-                    self.disk_imports.insert(local);
-                }
-                unit_ty()
-            }
+            Expression::Use { path, name, alias } => self.infer_use_decl(path, name, alias, range),
             Expression::Module(_, _) => unit_ty(),
             // FFI declaration block — register each function
             // signature in the top frame (so subsequent calls
@@ -2308,73 +2239,7 @@ impl Checker {
             Expression::ExternBlock {
                 library: _,
                 declarations,
-            } => {
-                for decl in declarations {
-                    let arg_tys: Vec<Ty> = if let Expression::Fragment(items) = decl.args.1.as_ref()
-                    {
-                        items
-                            .iter()
-                            .filter_map(|item| {
-                                if let Expression::Argument { ty, .. } = item.1.as_ref() {
-                                    ty.as_ref().map(|t| self.parse_type_name(t))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let nfixed = arg_tys.len();
-                    let ret_ty = decl
-                        .returns
-                        .as_ref()
-                        .map(|r| self.parse_type_name(r))
-                        .unwrap_or_else(unit_ty);
-                    // Register the fixed-prefix function type (extra `...` args
-                    // are accepted at call sites via `extern_variadic`).
-                    let fn_ty = arg_tys
-                        .iter()
-                        .rev()
-                        .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
-                    self.env
-                        .insert_top(decl.name.to_string(), Scheme::mono(fn_ty.clone()));
-                    if decl.variadic {
-                        self.extern_variadic.insert(decl.name.to_string());
-                        self.extern_variadic_nfixed
-                            .insert(decl.name.to_string(), nfixed);
-                    } else {
-                        // Fixed-arity extern overloads (C `...` is not a member).
-                        let param_names: Vec<String> =
-                            if let Expression::Fragment(items) = decl.args.1.as_ref() {
-                                items
-                                    .iter()
-                                    .filter_map(|item| {
-                                        if let Expression::Argument { name, .. } = item.1.as_ref() {
-                                            Some(name.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                        self.register_overload_candidate(
-                            decl.name,
-                            OverloadCandidate {
-                    id: 0,
-                                fixed_arity: nfixed,
-                                is_rest: false,
-                                scheme: Scheme::mono(fn_ty),
-                                param_names,
-                            },
-                            &decl.args.0.into_range(),
-                        );
-                    }
-                }
-                unit_ty()
-            }
+            } => self.infer_extern_block(declarations),
 
             Expression::Expr(e) | Expression::Group(e) | Expression::Statement(e) => self.infer(e),
             // Semicolon form discards the value (same as a Rust statement).
@@ -3357,6 +3222,155 @@ impl Checker {
             #[allow(unreachable_patterns)]
             _ => unreachable!("all Expression variants must be handled above"),
         }
+    }
+
+    #[inline(never)]
+    fn infer_extern_block(&mut self, declarations: &[ExternFunction]) -> Ty {
+        for decl in declarations {
+            let arg_tys: Vec<Ty> = if let Expression::Fragment(items) = decl.args.1.as_ref()
+            {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        if let Expression::Argument { ty, .. } = item.1.as_ref() {
+                            ty.as_ref().map(|t| self.parse_type_name(t))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let nfixed = arg_tys.len();
+            let ret_ty = decl
+                .returns
+                .as_ref()
+                .map(|r| self.parse_type_name(r))
+                .unwrap_or_else(unit_ty);
+            // Register the fixed-prefix function type (extra `...` args
+            // are accepted at call sites via `extern_variadic`).
+            let fn_ty = arg_tys
+                .iter()
+                .rev()
+                .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
+            self.env
+                .insert_top(decl.name.to_string(), Scheme::mono(fn_ty.clone()));
+            if decl.variadic {
+                self.extern_variadic.insert(decl.name.to_string());
+                self.extern_variadic_nfixed
+                    .insert(decl.name.to_string(), nfixed);
+            } else {
+                // Fixed-arity extern overloads (C `...` is not a member).
+                let param_names: Vec<String> =
+                    if let Expression::Fragment(items) = decl.args.1.as_ref() {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                if let Expression::Argument { name, .. } = item.1.as_ref() {
+                                    Some(name.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                self.register_overload_candidate(
+                    decl.name,
+                    OverloadCandidate {
+            id: 0,
+                        fixed_arity: nfixed,
+                        is_rest: false,
+                        scheme: Scheme::mono(fn_ty),
+                        param_names,
+                    },
+                    &decl.args.0.into_range(),
+                );
+            }
+        }
+        unit_ty()
+    }
+
+    #[inline(never)]
+    fn infer_use_decl(
+        &mut self,
+        path: &[String],
+        name: &str,
+        alias: &Option<String>,
+        range: Range<usize>,
+    ) -> Ty {
+        let module_ns = path.join("::");
+        if name == "*" {
+            // Prelude is injected automatically; every other module —
+            // virtual or userland — requires explicit imports.
+            let mod_label = if module_ns.is_empty() {
+                "<entry>".to_string()
+            } else {
+                module_ns.clone()
+            };
+            return self.error_with_help(
+                ErrorCode::WildcardImport,
+                format!("wildcard import `use {}::*` is not allowed", mod_label),
+                range,
+                Some(format!(
+                    "list names explicitly, e.g. `use {}::{{name1, name2}}`; prelude is auto-imported",
+                    mod_label
+                )),
+            );
+        }
+        if self.apply_virtual_use(path, name, alias.as_deref()) {
+            // Bind FFI callables into the value env so Call sites
+            // resolve; enums/traits/tags are scope-only.
+            let locals: Vec<(String, BuiltinExport)> = self
+                .scope_bindings
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(
+                        e,
+                        BuiltinExport::FfiFn { .. }
+                            | BuiltinExport::IoFn { .. }
+                            | BuiltinExport::StringFn { .. }
+                            | BuiltinExport::ThreadFn { .. }
+                            | BuiltinExport::GcFn { .. }
+                            | BuiltinExport::HostFn { .. }
+                    )
+                })
+                .map(|(k, e)| (k.clone(), e.clone()))
+                .collect();
+            for (local, export) in locals {
+                if self.env.lookup(&local).is_some() {
+                    continue;
+                }
+                if let Some(scheme) = self.virtual_callable_scheme(export, range.clone()) {
+                    self.env.insert_top(local, scheme);
+                }
+            }
+            return unit_ty();
+        }
+        let local = alias.clone().unwrap_or_else(|| name.to_string());
+        let fqn = if module_ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{module_ns}::{name}")
+        };
+        // Prefer the defining module's real scheme (incl. generics with
+        // bounds) over a dummy Var so call sites get dict-passing ABI.
+        self.reexport_module_item(&fqn, &local);
+        // Re-export overload families under the local alias so
+        // `use num::{abs}` can still type-dispatch.
+        if let Some(cands) = self.overload_sets.get(&fqn).cloned() {
+            if cands.len() > 1 {
+                self.overload_sets.insert(local.clone(), cands);
+            }
+        }
+        // Disk imports are file-level globals — track for lambda/defer
+        // rebind after `take_and_isolate`.
+        if name != "*" {
+            self.disk_imports.insert(local);
+        }
+        unit_ty()
     }
 
     #[inline(never)]
