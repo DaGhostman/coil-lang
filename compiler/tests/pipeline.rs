@@ -4141,6 +4141,101 @@ fn main() {
 }
 
 #[test]
+fn copy_prop_preserves_spilled_call_result_alias() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn produce() -> int {
+    return 41;
+}
+fn use_copy() -> int {
+    let value = produce();
+    let copy = value;
+    return copy + 1;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", use_copy())));
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn copy_prop_preserves_field_aliases() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn sum(Point point) -> int {
+    let alias = point;
+    return alias.x + alias.y;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", sum(new Point(3, 4)))));
+}
+"#,
+    );
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn copy_prop_preserves_match_aliases() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Choice {
+    Empty,
+    Value(int),
+}
+fn unwrap(Choice choice) -> int {
+    return match choice {
+        Choice::Empty => 0,
+        Choice::Value(value) => value,
+    };
+}
+fn main() {
+    let value = Choice::Value(42);
+    let alias = value;
+    write(stdout(), to_bytes(format("%i", unwrap(alias))));
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn copy_prop_preserves_loop_carried_writes() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sum_alias() -> int {
+    let seed = 3;
+    let alias = seed;
+    let i = 0;
+    let total = 0;
+    while i < 4 {
+        total = total + alias;
+        i = i + 1;
+    }
+    return total;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", sum_alias())));
+}
+"#,
+    );
+    assert_eq!(output, "12");
+}
+
+#[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
     assert_eq!(output, "42");

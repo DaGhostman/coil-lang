@@ -343,7 +343,10 @@ pub(super) fn dead_store_at(ops: &mut Vec<IlOp>, entry_tell: u32) {
                     IlOp::Dup { .. }
                     | IlOp::Const { .. }
                     | IlOp::ConstPool { .. }
-                    | IlOp::Load { .. } => {
+                    | IlOp::Load { .. }
+                    | IlOp::String { .. }
+                    | IlOp::BinSlotImm { .. }
+                    | IlOp::BinSlotSlot { .. } => {
                         if cursor.can_remove_one_value_store(i - 1, slot) {
                             remove.insert(i - 1);
                             remove.insert(i);
