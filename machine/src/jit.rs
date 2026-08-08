@@ -494,4 +494,204 @@ mod tests {
             42
         );
     }
+
+    #[test]
+    fn refuses_unsupported_binary_shapes() {
+        let mut runtime = JitRuntime::new(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+
+        let wrong_slots = vec![
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::ADD as u8,
+                1,
+                0,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert!(
+            runtime
+                .try_direct_binary(&wrong_slots, 0, Value::from(1_i64), Value::from(2_i64))
+                .is_none()
+        );
+
+        let compare = vec![
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::LEQ as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert!(
+            runtime
+                .try_direct_binary(&compare, 0, Value::from(1_i64), Value::from(2_i64))
+                .is_none()
+        );
+        assert_eq!(runtime.compiled_count(), 0);
+    }
+
+    #[test]
+    fn compiles_direct_unary_immediate() {
+        let mut runtime = JitRuntime::new(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        let imm = vec![
+            Byte::new(ArchivedInstruction::BinSlotImm).with_bin_slot_imm(
+                Instruction::ADD as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert_eq!(
+            runtime
+                .try_direct_unary(&imm, 0, Value::from(41_i64))
+                .expect("unary imm")
+                .as_int(),
+            42
+        );
+    }
+
+    #[test]
+    fn compiles_direct_division_shape() {
+        let mut runtime = JitRuntime::new(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        let div = vec![
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::DIV as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert_eq!(
+            runtime
+                .try_direct_binary(&div, 0, Value::from(84_i64), Value::from(2_i64))
+                .expect("div")
+                .as_int(),
+            42
+        );
+    }
+
+    fn fib_program() -> (Vec<Byte>, Vec<u64>) {
+        // false_target = entry + 2 = 2 for an entry PC of zero.
+        let pool = vec![(2_u64 << 32) | 2];
+        let code = vec![
+            Byte::new(ArchivedInstruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(
+                Instruction::LEQ as u8,
+                0,
+                0,
+            ),
+            Byte::new(ArchivedInstruction::ConstReturnImm).with_operand_u32(1),
+            Byte::new(ArchivedInstruction::BinSlotImm).with_bin_slot_imm(
+                Instruction::SUB as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::CALL).with_call_packed(1, 0),
+            Byte::new(ArchivedInstruction::STORE).with_load_store_slot(1),
+            Byte::new(ArchivedInstruction::BinSlotImm).with_bin_slot_imm(
+                Instruction::SUB as u8,
+                0,
+                2,
+            ),
+            Byte::new(ArchivedInstruction::CALL).with_call_packed(1, 0),
+            Byte::new(ArchivedInstruction::STORE).with_load_store_slot(2),
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::ADD as u8,
+                1,
+                2,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        (code, pool)
+    }
+
+    #[test]
+    fn recognizes_recursive_fib_and_refuses_near_misses() {
+        let (code, pool) = fib_program();
+        assert!(recursive_fib_shape(&code, &pool, 0).is_some());
+
+        let bad_immediate = vec![(5_u64 << 32) | 3];
+        assert!(recursive_fib_shape(&code, &bad_immediate, 0).is_none());
+
+        let bad_false_target = vec![(6_u64 << 32) | 2];
+        assert!(recursive_fib_shape(&code, &bad_false_target, 0).is_none());
+
+        let mut near_miss = fib_program().0;
+        near_miss[1] = Byte::new(ArchivedInstruction::ConstReturnImm).with_operand_u32(0);
+        assert!(recursive_fib_shape(&near_miss, &pool, 0).is_none());
+    }
+
+    #[test]
+    fn compiles_recursive_fib_shape() {
+        let mut runtime = JitRuntime::new(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        let (code, pool) = fib_program();
+        assert_eq!(
+            runtime
+                .try_recursive_fib(&code, &pool, 0, Value::from(10_i64))
+                .expect("fib")
+                .as_int(),
+            89
+        );
+    }
+
+    #[test]
+    fn reset_program_clears_compiled_cache() {
+        let mut runtime = JitRuntime::new(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        let code = add_program();
+        assert!(
+            runtime
+                .try_direct_binary(&code, 0, Value::from(1_i64), Value::from(2_i64))
+                .is_some()
+        );
+        assert_eq!(runtime.compiled_count(), 1);
+        runtime.reset_program();
+        assert_eq!(runtime.compiled_count(), 0);
+        assert!(
+            runtime
+                .try_direct_binary(&code, 0, Value::from(1_i64), Value::from(2_i64))
+                .is_some()
+        );
+        assert_eq!(runtime.compiled_count(), 1);
+    }
+
+    #[test]
+    fn array_helpers_match_interpreter_bounds_semantics() {
+        let mut heap = crate::memory::Heap::default();
+        let (object, _) = heap.alloc(
+            crate::memory::ObjArray {
+                elements: vec![Value::from(10_i64), Value::from(20_i64)],
+            },
+            crate::memory::Object::Array,
+        );
+        let addr = object.addr() as i64;
+        let mut context = JitCallContext {
+            heap: &mut heap,
+        };
+        let ctx = (&mut context as *mut JitCallContext).cast();
+
+        assert_eq!(jit_array_len(ctx, addr), 2);
+        assert_eq!(jit_array_index(ctx, addr, 1), 20);
+        assert_eq!(jit_array_index(ctx, addr, 2), -1);
+        assert_eq!(jit_array_index(ctx, addr, -1), -1);
+        assert_eq!(jit_array_index(ctx, 0, 0), -1);
+        assert_eq!(jit_array_len(ctx, 0), 0);
+    }
 }
