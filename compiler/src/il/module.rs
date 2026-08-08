@@ -120,6 +120,9 @@ impl IlModule {
         let mut per = opts.clone();
         let run_multi = per.multi_op_join_convoy;
         per.multi_op_join_convoy = false;
+        // Guard inversion removes JMPs that whole-buffer multi_op matches on.
+        let run_invert = per.invert_guard_branch;
+        per.invert_guard_branch = false;
 
         if self.funcs.is_empty() {
             let mut ops = self.to_flat();
@@ -135,6 +138,9 @@ impl IlModule {
         let mut flat = self.to_flat();
         if run_multi {
             opt::multi_op_join_convoy(&mut flat);
+        }
+        if run_invert {
+            opt::invert_guard_branch(&mut flat);
         }
         flat
     }
@@ -360,6 +366,7 @@ mod tests {
             clone_shared_return: false,
             bin_join_convoy: false,
             multi_op_join_convoy: true,
+            invert_guard_branch: false,
         });
         let loads = flat
             .iter()

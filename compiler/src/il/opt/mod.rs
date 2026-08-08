@@ -27,6 +27,8 @@ pub struct OptimizeOptions {
     pub bin_join_convoy: bool,
     /// Sink identical multi-op suffixes (len 2..=4) at return / non-return joins.
     pub multi_op_join_convoy: bool,
+    /// `JMPF A; JMP B; A:` → `JMPT B` for non-fusable guard conditions.
+    pub invert_guard_branch: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -42,6 +44,7 @@ impl Default for OptimizeOptions {
             clone_shared_return: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
+            invert_guard_branch: true,
         }
     }
 }
@@ -85,6 +88,10 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
     }
     if opts.multi_op_join_convoy {
         multi_op_join_convoy(ops);
+    }
+    // Last: the convoy passes match on JMP-to-join shapes this would remove.
+    if opts.invert_guard_branch {
+        invert_branch_over_jump(ops);
     }
 }
 
@@ -149,7 +156,8 @@ mod cfg;
 mod convoy;
 mod dce;
 
-use cfg::{eliminate_dead_blocks, jump_thread};
+use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
 use dce::{dead_store, mem_fwd, stack_dce};
 use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
+pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;

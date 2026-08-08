@@ -114,14 +114,14 @@ fn perf_match_sum_emits_jump_if_match() {
 }
 
 #[test]
-fn perf_fib_dispatch_regression() {
-    let (bc, pool, strings, statics, pipeline) = compile("examples/fib_bench.hy");
+fn perf_mandelbrot_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/mandelbrot.hy");
     let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
-    // fib_bench runs fib(32); userland `io::sync::write_all` adds a blocking
-    // loop on top of the recursive fib work. Keep a generous ceiling.
+    // Nested float loops (size=160, max_iter=50) + write_all.
+    // Measured ~12M dispatches on debug Machine; keep headroom for stdlib churn.
     assert!(
-        dispatches < 2_000_000,
-        "fib(32) dispatch count regressed: {dispatches}"
+        dispatches < 25_000_000,
+        "mandelbrot dispatch count regressed: {dispatches}"
     );
 }
 
@@ -155,5 +155,75 @@ fn perf_for_in_array_uses_single_array_len() {
     assert!(
         (1..=8).contains(&n),
         "for_in_array should hoist ArrayLen out of the loop (got {n})"
+    );
+}
+
+#[test]
+fn perf_bool_guard_inverts_into_jmpt() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/bool_guard.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "count_until", bc.len());
+    // `if stop { break }` loads a bool: nothing to fuse into *Jmpf, so the
+    // JMPF-over-JMP pair collapses to a single JMPT.
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::JMPT),
+        1,
+        "bool guard should invert to JMPT"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::JMPF),
+        0,
+        "no bare JMPF should remain in the guard"
+    );
+}
+
+#[test]
+fn perf_mandelbrot_keeps_fused_jmpf_guards() {
+    // Guard inversion must refuse fusable conditions: there is no *Jmpt
+    // superinstruction, so inverting `CmpJmpf` would add a dispatch.
+    let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::JMPT),
+        0,
+        "mandelbrot's compare guards must stay fused as *Jmpf"
+    );
+    assert!(
+        count_opcodes_in(&bc, start, end, Instruction::CmpJmpf) >= 1,
+        "escape test should stay a fused CmpJmpf"
+    );
+}
+
+#[test]
+fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
+    // `zr * zr` / `zi * zi`: GVN's Dup is re-expanded so both operands fuse.
+    let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::DUPLICATE),
+        0,
+        "no DUPLICATE should survive in the float inner loop"
+    );
+    // Either fused form is fine: BinSlotSlot, or BinSlotSlotStore when the
+    // result is stored straight into a slot.
+    let self_mulf = bc[start..end]
+        .iter()
+        .filter(|b| match *b.bytecode() {
+            Instruction::BinSlotSlot => {
+                let (op, a, c) = b.bin_slot_slot_parts();
+                op == Instruction::MULF as u8 && a == c
+            }
+            Instruction::BinSlotSlotStore => {
+                let (op, a, c, _) = b.bin_slot_slot_store_parts();
+                op == Instruction::MULF as u8 && a == c
+            }
+            _ => false,
+        })
+        .count();
+    assert!(
+        self_mulf >= 2,
+        "zr*zr and zi*zi should each fuse to one self-MULF op, got {self_mulf}"
     );
 }

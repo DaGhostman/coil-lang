@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::AddrHashBuilder;
+
 #[cfg(feature = "crypto")]
 use crate::crypto_hasher_state::ObjCryptoHasher;
 #[cfg(feature = "regex")]
@@ -19,9 +21,11 @@ pub struct Heap {
     strings: Table<()>,
     head: Option<Object>,
     /// O(1) lookup of live objects by address (updated on alloc/sweep).
-    addr_index: HashMap<u64, Object>,
+    addr_index: HashMap<u64, Object, AddrHashBuilder>,
+    /// Immortal arity-0 enum singletons keyed by tag (never swept).
+    immortal_enums: HashMap<u32, Object, AddrHashBuilder>,
     /// Reused mark-set across collections (avoids alloc per GC).
-    gc_mark_set: HashSet<u64>,
+    gc_mark_set: HashSet<u64, AddrHashBuilder>,
     /// Reused gray worklist / root buffers across collections.
     gc_gray: Vec<Object>,
     gc_root_objects: Vec<Object>,
@@ -36,8 +40,9 @@ impl Default for Heap {
             gc_growth_factor: GC_GROWTH_FACTOR,
             strings: Table::default(),
             head: None,
-            addr_index: HashMap::new(),
-            gc_mark_set: HashSet::new(),
+            addr_index: HashMap::default(),
+            immortal_enums: HashMap::default(),
+            gc_mark_set: HashSet::default(),
             gc_gray: Vec::new(),
             gc_root_objects: Vec::new(),
             gc_roots: Vec::new(),
@@ -156,18 +161,19 @@ impl Heap {
         self.addr_index.len()
     }
 
-    /// Returns the next GC threshold in bytes. If `Self::size() > Self::next_gc()`,
-    /// we should start tracing all reachable objects and call `Self::sweep`.
-    pub const fn next_gc(&self) -> usize {
-        #[cfg(not(debug_assertions))]
-        {
-            self.gc_next_threshold
-        }
-        #[cfg(debug_assertions)]
-        {
-            _ = self;
-            0
-        }
+    /// True when live heap bytes exceed the collection threshold. [`Self::sweep`]
+    /// rescales the threshold to `live * GC_GROWTH_FACTOR`, so collection cost
+    /// stays proportional to the live set rather than to the allocation count.
+    #[inline]
+    pub fn should_collect(&self) -> bool {
+        self.alloc_bytes > self.gc_next_threshold
+    }
+
+    /// Lower the byte threshold so the next [`Self::should_collect`] check
+    /// fires (test helper for GC stress).
+    #[cfg(any(test, feature = "debugger"))]
+    pub fn set_gc_threshold_for_test(&mut self, bytes: usize) {
+        self.gc_next_threshold = bytes;
     }
 
     /// Adjust tracked heap bytes after an in-place grow/shrink of a managed
@@ -303,10 +309,28 @@ impl Heap {
     }
 
     /// Take the reusable GC root address buffer (caller must restore via [`Self::restore_gc_roots`]).
+    /// Immortal arity-0 enum singletons are always seeded as roots.
     pub fn take_gc_roots(&mut self) -> Vec<u64> {
         let mut roots = std::mem::take(&mut self.gc_roots);
         roots.clear();
+        for obj in self.immortal_enums.values() {
+            roots.push(obj.addr());
+        }
         roots
+    }
+
+    /// Return a shared arity-0 enum for `tag`, allocating once per tag.
+    pub fn immortal_unit_enum(&mut self, tag: u32) -> Object {
+        if let Some(obj) = self.immortal_enums.get(&tag) {
+            return *obj;
+        }
+        let obj_enum = crate::memory::ObjEnum {
+            tag,
+            payload: Vec::new(),
+        };
+        let (object, _) = self.alloc(obj_enum, Object::Enum);
+        self.immortal_enums.insert(tag, object);
+        object
     }
 
     pub fn restore_gc_roots(&mut self, roots: Vec<u64>) {
@@ -1913,6 +1937,79 @@ mod tests {
             Some(Object::String(_))
         ));
         assert!(heap.find_object_by_addr(addr.wrapping_add(1)).is_none());
+    }
+
+    /// Byte-threshold GC: under threshold → no collect; after a rooted sweep the
+    /// threshold scales with live bytes so a single surviving object does not
+    /// trigger on every subsequent alloc.
+    #[test]
+    fn should_collect_uses_byte_threshold_rescaled_by_sweep() {
+        let mut heap = Heap::default();
+        assert!(
+            !heap.should_collect(),
+            "fresh heap must sit under the default threshold"
+        );
+
+        let (keep, _) = heap.alloc(ObjString::from("keep"), Object::String);
+        let keep_addr = keep.addr();
+        // Force a collection, then root `keep` so it survives.
+        heap.set_gc_threshold_for_test(0);
+        assert!(heap.should_collect());
+        heap.trace(&[keep_addr]);
+        keep.mark_references(&mut Vec::new());
+        unsafe { heap.sweep() };
+
+        assert!(
+            !heap.should_collect(),
+            "after sweep, threshold must be live*growth so one survivor is quiet"
+        );
+        let quiet_size = heap.size();
+        // Grow past the rescaled threshold without roots — should_collect again.
+        while !heap.should_collect() {
+            let _ = heap.alloc(ObjString::from("pressure"), Object::String);
+            // Guard against runaway if rescale broke (would never trip).
+            assert!(
+                heap.size() < quiet_size.saturating_mul(8).max(4096),
+                "alloc_bytes grew without tripping should_collect"
+            );
+        }
+    }
+
+    /// Immortal arity-0 enums are seeded as GC roots and must not be swept,
+    /// even when nothing else references them.
+    #[test]
+    fn immortal_unit_enums_survive_sweep_as_roots() {
+        let mut heap = Heap::default();
+        let immortal = heap.immortal_unit_enum(7);
+        let immortal_addr = immortal.addr();
+        let again = heap.immortal_unit_enum(7);
+        assert_eq!(immortal_addr, again.addr());
+
+        let (junk, _) = heap.alloc(ObjString::from("junk"), Object::String);
+        let junk_addr = junk.addr();
+
+        let roots = heap.take_gc_roots();
+        assert!(
+            roots.contains(&immortal_addr),
+            "take_gc_roots must seed immortal enum addresses"
+        );
+        heap.trace(&roots);
+        unsafe { heap.sweep() };
+        heap.restore_gc_roots(roots);
+
+        assert!(
+            heap.find_object_by_addr(immortal_addr).is_some(),
+            "immortal enum must survive an otherwise empty-root sweep"
+        );
+        assert!(
+            heap.find_object_by_addr(junk_addr).is_none(),
+            "unrooted junk must still be collected"
+        );
+        assert_eq!(
+            heap.immortal_unit_enum(7).addr(),
+            immortal_addr,
+            "post-sweep lookup must reuse the same singleton"
+        );
     }
 
     #[test]

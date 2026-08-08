@@ -74,7 +74,12 @@ pub struct Pipeline {
     overlays: HashMap<PathBuf, String>,
     /// When true, harness tests are compiled into the program (see `--include-tests`).
     include_tests: bool,
-    compiler: Compiler,
+    /// Built on first use. `coil run` never compiles, and `Compiler::default`
+    /// (builtin typeclasses + Vec signatures) was ~28% of process startup.
+    compiler: std::cell::OnceCell<Compiler>,
+    /// Standard-native name/id pairs, replayed into the compiler when it is
+    /// first built — only the typechecker needs them.
+    pending_native_ids: Vec<(String, usize)>,
     /// Owned diagnostic sink (pretty / SARIF / LSP).
     sink: Box<dyn DiagnosticSink>,
     /// How many compiler messages have already been emitted to [`Self::sink`].
@@ -119,7 +124,7 @@ impl Pipeline {
         let params: Vec<crate::typechecking::ty::Ty> =
             sig.args.iter().copied().map(ffi_type_to_ty).collect();
         let ret = ffi_type_to_ty(sig.ret);
-        self.compiler.register(&sig.name, &params, &ret);
+        self.compiler_lazy_mut().register(&sig.name, &params, &ret);
         let id = self.host_natives.len();
         self.host_natives
             .push(std::sync::Arc::new(HostClosureFn::new(sig, func)));
@@ -133,7 +138,7 @@ impl Pipeline {
         let params: Vec<crate::typechecking::ty::Ty> =
             sig.args.iter().copied().map(ffi_type_to_ty).collect();
         let ret = ffi_type_to_ty(sig.ret);
-        self.compiler.register(&name, &params, &ret);
+        self.compiler_lazy_mut().register(&name, &params, &ret);
         self.natives.push(NativeDecl {
             name,
             namespace,
@@ -151,11 +156,11 @@ impl Pipeline {
 
     /// Register standard host natives (io/fs/env/thread/…) with stable HostInvoke ids.
     fn register_standard_host_natives(&mut self) {
-        let mut compiler = std::mem::take(&mut self.compiler);
+        let mut pending = Vec::new();
         self.host_natives = machine::build_standard_host_natives(|name, id| {
-            compiler.register_native_id(name, id);
+            pending.push((name.to_string(), id));
         });
-        self.compiler = compiler;
+        self.pending_native_ids = pending;
     }
 
     /// Install shared bytecode on `machine` for `thread::spawn` workers.
@@ -180,7 +185,7 @@ impl Pipeline {
 
     /// Bytecode entry offset for a registered function (for tests).
     pub fn function_offset(&self, name: &str) -> Option<usize> {
-        self.compiler.function_offset(name)
+        self.compiler_lazy().function_offset(name)
     }
 
     /// Borrow the inner `Compiler` mutably. Used by the
@@ -190,11 +195,30 @@ impl Pipeline {
     /// directly.
     #[cfg(test)]
     pub fn compiler_mut(&mut self) -> &mut Compiler {
-        &mut self.compiler
+        self.compiler_lazy_mut()
     }
 
     pub fn compiler(&self) -> &Compiler {
-        &self.compiler
+        self.compiler_lazy()
+    }
+
+    /// Build the compiler on first access, replaying the buffered standard
+    /// native ids the typechecker needs.
+    fn compiler_lazy(&self) -> &Compiler {
+        self.compiler.get_or_init(|| {
+            let mut c = Compiler::default();
+            for (name, id) in &self.pending_native_ids {
+                c.register_native_id(name, *id);
+            }
+            c
+        })
+    }
+
+    fn compiler_lazy_mut(&mut self) -> &mut Compiler {
+        let _ = self.compiler_lazy();
+        self.compiler
+            .get_mut()
+            .expect("compiler initialized by compiler_lazy")
     }
 
     /// Borrow the compiler's accumulated diagnostic
@@ -202,7 +226,7 @@ impl Pipeline {
     /// them (the `#[cfg(test)]`-only `compiler_mut` is
     /// only visible to in-crate tests).
     pub fn messages(&self) -> &[Message] {
-        self.compiler.get_messages()
+        self.compiler_lazy().get_messages()
     }
 
     /// Typecheck an entry and its discovered modules without generating
@@ -243,9 +267,9 @@ impl Pipeline {
                     .or_else(|| self.manifest.namespace_of(&self.project_root, &item.file))
                     .unwrap_or_default()
             };
-            let before = self.compiler.get_messages().len();
-            self.compiler.typecheck_module(&namespace, &ast);
-            let messages = self.compiler.get_messages()[before..].to_vec();
+            let before = self.compiler_lazy_mut().get_messages().len();
+            self.compiler_lazy_mut().typecheck_module(&namespace, &ast);
+            let messages = self.compiler_lazy_mut().get_messages()[before..].to_vec();
             results.push((item.file, messages));
         }
         results
@@ -296,7 +320,7 @@ impl Pipeline {
             .map(|p| self.project_root.join(p))
             .collect();
         vm.set_ffi_paths(base_dir, search);
-        for def in self.compiler.c_structs() {
+        for def in self.compiler_lazy().c_structs() {
             let fields = def
                 .fields
                 .iter()
@@ -378,7 +402,8 @@ impl Pipeline {
             source_cache: Vec::new(),
             overlays: HashMap::new(),
             include_tests: false,
-            compiler: Compiler::default(),
+            compiler: std::cell::OnceCell::new(),
+            pending_native_ids: Vec::new(),
             sink,
             messages_emitted: 0,
         };
@@ -400,8 +425,8 @@ impl Pipeline {
     /// typecheck diagnostics). Advances `messages_emitted` so a later
     /// [`Self::emit_new_messages`] does not re-forward the same text.
     fn emit_message(&mut self, path: &Path, source: &str, message: &Message) {
-        self.compiler.push_message(message.clone());
-        self.messages_emitted = self.compiler.get_messages().len();
+        self.compiler_lazy_mut().push_message(message.clone());
+        self.messages_emitted = self.compiler_lazy_mut().get_messages().len();
         let file_id = self.sink.register_source(path, source);
         self.sink.emit(Diagnostic::from_message(message, file_id));
         if self.sink.had_errors() {
@@ -411,8 +436,9 @@ impl Pipeline {
 
     /// Emit compiler messages that have not yet been forwarded to the sink.
     fn emit_new_messages(&mut self, file_id: SourceId) {
-        let all = self.compiler.get_messages();
-        let pending: Vec<Message> = all[self.messages_emitted..].to_vec();
+        let already = self.messages_emitted;
+        let all = self.compiler_lazy().get_messages();
+        let pending: Vec<Message> = all[already..].to_vec();
         self.messages_emitted = all.len();
         for msg in &pending {
             self.sink.emit(Diagnostic::from_message(msg, file_id));
@@ -934,7 +960,7 @@ impl Pipeline {
             .strip_prefix(&self.project_root)
             .unwrap_or(&file)
             .to_path_buf();
-        self.compiler.set_source_file(rel);
+        self.compiler_lazy_mut().set_source_file(rel);
 
         // Compile the file. The compiler's `namespace`
         // field is set to the file's derived namespace.
@@ -944,7 +970,7 @@ impl Pipeline {
         // the prologue on the second call). See
         // `Compiler::compile_module` for the operand
         // adjustment details.
-        let bytecode = self.compiler.compile_module(namespace.as_str(), &mut ast);
+        let bytecode = self.compiler_lazy_mut().compile_module(namespace.as_str(), &mut ast);
 
         // Append this file's bytecode to the running
         // output. Each file's bytecode is independent;
@@ -990,17 +1016,17 @@ impl Pipeline {
         // Module compilation emits unfused absolute-offset bytecode.
         // Finalize (peephole fusion + CodePtr/MakePolyFn relocation) once
         // on the linked buffer, then sync the pipeline output.
-        self.compiler.finalize_bytecode();
-        self.bytecode = self.compiler.bytecode_vec();
+        self.compiler_lazy_mut().finalize_bytecode();
+        self.bytecode = self.compiler_lazy().bytecode_vec();
 
         // Patch the JMP at offset 1 to point to the
         // user-program's `main`. If the source had at
         // least one `extern` block or module statics,
         // jump to `program_start_offset` so setup runs
         // before `main`. Otherwise jump straight to `main`.
+        let jmp_target = self.compiler_lazy().prologue_jmp_target();
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(jmp_target);
         }
 
         // Wrap the bytecode in the versioned `ArchivedProgram` envelope
@@ -1008,13 +1034,13 @@ impl Pipeline {
         // `version` mismatch (see `Pipeline::run`).
         let program = ArchivedProgram {
             version: ARCHIVE_VERSION,
-            static_slot_count: self.compiler.static_slot_count(),
-            constants: self.compiler.constants().to_vec(),
-            strings: self.compiler.strings().to_vec(),
+            static_slot_count: self.compiler_lazy().static_slot_count(),
+            constants: self.compiler_lazy().constants().to_vec(),
+            strings: self.compiler_lazy().strings().to_vec(),
+            source_files: self.compiler_lazy().source_files_list(),
+            debug_locs: self.compiler_lazy().debug_locs().to_vec(),
+            fn_symbols: self.compiler_lazy().fn_debug_symbols(),
             bytecode: self.bytecode,
-            source_files: self.compiler.source_files_list(),
-            debug_locs: self.compiler.debug_locs().to_vec(),
-            fn_symbols: self.compiler.fn_debug_symbols(),
         };
 
         let mut out = File::create(output).expect("Unable to open output file");
@@ -1038,16 +1064,16 @@ impl Pipeline {
         module: &str,
         ast: &mut (SimpleSpan, Box<Expression<'_>>),
     ) -> (Vec<Byte>, Vec<u64>) {
-        let mut bytecode = self.compiler.compile(module, ast);
+        let mut bytecode = self.compiler_lazy_mut().compile(module, ast);
 
         // Patch the JMP at offset 1 (the second prologue
         // instruction).
         if let Some(byte) = bytecode.get_mut(1) {
             *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler_lazy().prologue_jmp_target());
         }
 
-        (bytecode, self.compiler.constants().to_vec())
+        (bytecode, self.compiler_lazy_mut().constants().to_vec())
     }
 
     pub fn compile_src(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
@@ -1077,8 +1103,8 @@ impl Pipeline {
             return Err(());
         }
 
-        self.compiler.set_source_file(path);
-        self.compiler.compile_module("", &mut ast);
+        self.compiler_lazy_mut().set_source_file(path);
+        self.compiler_lazy_mut().compile_module("", &mut ast);
 
         // Register source and drain typecheck / codegen diagnostics via the sink.
         let file_id = self.sink.register_source(path, src);
@@ -1087,12 +1113,12 @@ impl Pipeline {
             return Err(());
         }
 
-        self.compiler.finalize_bytecode();
-        let mut bytecode = self.compiler.bytecode_vec();
+        self.compiler_lazy_mut().finalize_bytecode();
+        let mut bytecode = self.compiler_lazy_mut().bytecode_vec();
 
         if let Some(byte) = bytecode.get_mut(1) {
             *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+                Byte::new(Instruction::JMP).with_operand_u32(self.compiler_lazy().prologue_jmp_target());
         }
 
         // Warnings are kept for callers to inspect; only hard errors fail.
@@ -1100,7 +1126,7 @@ impl Pipeline {
             return Err(());
         }
 
-        Ok((bytecode, self.compiler.constants().to_vec()))
+        Ok((bytecode, self.compiler_lazy_mut().constants().to_vec()))
     }
 
     /// Compile a single source file in-memory and return the
@@ -1135,23 +1161,23 @@ impl Pipeline {
         }
 
         // Final-link peephole fusion (see `Pipeline::compile`).
-        self.compiler.finalize_bytecode();
-        self.bytecode = self.compiler.bytecode_vec();
+        self.compiler_lazy_mut().finalize_bytecode();
+        self.bytecode = self.compiler_lazy_mut().bytecode_vec();
 
         // Patch the JMP at offset 1.
+        let jmp_target = self.compiler_lazy().prologue_jmp_target();
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(jmp_target);
         }
 
         // In-memory API: any diagnostic (error or warning) is a failure.
-        if !self.compiler.get_messages().is_empty() {
+        if !self.compiler_lazy_mut().get_messages().is_empty() {
             return Err(());
         }
 
         Ok((
             std::mem::take(&mut self.bytecode),
-            self.compiler.constants().to_vec(),
+            self.compiler_lazy_mut().constants().to_vec(),
         ))
     }
 
@@ -1186,28 +1212,28 @@ impl Pipeline {
         }
 
         let il = if capture_il {
-            Some(self.compiler.finalize_bytecode_capturing_il())
+            Some(self.compiler_lazy_mut().finalize_bytecode_capturing_il())
         } else {
-            self.compiler.finalize_bytecode();
+            self.compiler_lazy_mut().finalize_bytecode();
             None
         };
-        self.bytecode = self.compiler.bytecode_vec();
+        self.bytecode = self.compiler_lazy_mut().bytecode_vec();
 
+        let jmp_target = self.compiler_lazy().prologue_jmp_target();
         if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler.prologue_jmp_target());
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(jmp_target);
         }
 
-        if !self.compiler.get_messages().is_empty() {
+        if !self.compiler_lazy_mut().get_messages().is_empty() {
             return Err(());
         }
 
-        let functions = self.compiler.function_symbols();
+        let functions = self.compiler_lazy_mut().function_symbols();
         let debug = self.program_debug();
         Ok(crate::DissectArtifacts {
             bytecode: std::mem::take(&mut self.bytecode),
-            constants: self.compiler.constants().to_vec(),
-            strings: self.compiler.strings().to_vec(),
+            constants: self.compiler_lazy_mut().constants().to_vec(),
+            strings: self.compiler_lazy_mut().strings().to_vec(),
             functions,
             il,
             debug,
@@ -1216,14 +1242,14 @@ impl Pipeline {
 
     /// Harness test cases from the last compile (`description`, bytecode offset).
     pub fn test_cases(&self) -> &[(String, u32)] {
-        self.compiler.test_cases()
+        self.compiler_lazy().test_cases()
     }
 
     /// When true, `test("…")` blocks and `#[test]` functions are compiled and
     /// registered for the harness. Default is false (production builds).
     pub fn set_include_tests(&mut self, include: bool) {
         self.include_tests = include;
-        self.compiler.set_include_tests(include);
+        self.compiler_lazy_mut().set_include_tests(include);
     }
 
     pub fn include_tests(&self) -> bool {
@@ -1236,27 +1262,27 @@ impl Pipeline {
     }
 
     pub fn constants(&self) -> &[u64] {
-        self.compiler.constants()
+        self.compiler_lazy().constants()
     }
 
     pub fn strings(&self) -> &[String] {
-        self.compiler.strings()
+        self.compiler_lazy().strings()
     }
 
     /// Operand-stack capacity from the last compile's recursion-depth analysis.
     pub fn operand_stack_slots(&self) -> u32 {
-        self.compiler.operand_stack_slots()
+        self.compiler_lazy().operand_stack_slots()
     }
 
     pub fn static_slot_count(&self) -> u32 {
-        self.compiler.static_slot_count()
+        self.compiler_lazy().static_slot_count()
     }
 
     pub fn program_debug(&self) -> ProgramDebug {
         ProgramDebug {
-            source_files: self.compiler.source_files_list(),
-            debug_locs: self.compiler.debug_locs().to_vec(),
-            fn_symbols: self.compiler.fn_debug_symbols(),
+            source_files: self.compiler_lazy().source_files_list(),
+            debug_locs: self.compiler_lazy().debug_locs().to_vec(),
+            fn_symbols: self.compiler_lazy().fn_debug_symbols(),
         }
     }
 
@@ -1309,7 +1335,7 @@ impl Pipeline {
             ProgramDebug {
                 source_files,
                 debug_locs,
-                fn_symbols: self.compiler.fn_debug_symbols(),
+                fn_symbols: self.compiler_lazy().fn_debug_symbols(),
             },
         ))
     }
@@ -1509,5 +1535,137 @@ fn main() {
         );
         assert!(err.is_err());
         assert!(pipeline.had_errors());
+    }
+
+    /// `Pipeline::with_reporter` must not pay for `Compiler::default` — that is
+    /// the whole point of the OnceCell (run-path startup).
+    #[test]
+    fn construction_defers_compiler_until_first_use() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(
+            pipeline.compiler.get().is_none(),
+            "compiler must stay uninitialized after construction"
+        );
+        assert!(
+            !pipeline.pending_native_ids.is_empty(),
+            "standard HostInvoke ids must be buffered for later replay"
+        );
+        assert_eq!(
+            pipeline.pending_native_ids.len(),
+            pipeline.host_natives.len(),
+            "buffered ids must line up 1:1 with the host-native table"
+        );
+    }
+
+    /// Buffered standard-native ids must land in the typechecker map when the
+    /// compiler is first built — otherwise HostInvoke fn_ids drift from the VM.
+    #[test]
+    fn first_compiler_access_replays_pending_native_ids() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        let pending = pipeline.pending_native_ids.clone();
+        assert!(!pending.is_empty());
+
+        let compiler = pipeline.compiler();
+        for (name, id) in &pending {
+            assert_eq!(
+                compiler.native_id(name),
+                Some(*id),
+                "native `{name}` must keep HostInvoke id {id} after lazy init"
+            );
+        }
+        assert_eq!(
+            compiler.native_id("stdout"),
+            pending.iter().find(|(n, _)| n == "stdout").map(|(_, id)| *id)
+        );
+        assert_eq!(
+            compiler.native_id("write"),
+            pending.iter().find(|(n, _)| n == "write").map(|(_, id)| *id)
+        );
+    }
+
+    /// Wiring the VM for `coil run` only needs the host-native table, not a
+    /// typechecker. Touching the compiler here would undo the startup win.
+    #[test]
+    fn wire_host_natives_does_not_build_compiler() {
+        let pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+
+        let mut machine = machine::Machine::<128>::default();
+        pipeline.wire_host_natives(&mut machine);
+        assert!(
+            pipeline.compiler.get().is_none(),
+            "wire_host_natives must not initialize the compiler"
+        );
+        assert!(!pipeline.host_natives.is_empty());
+    }
+
+    /// `register_host_native` forces compiler init; pending standard ids must
+    /// already be present so later HostInvoke codegen stays consistent.
+    #[test]
+    fn register_host_native_preserves_replayed_standard_ids() {
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+        let stdout_id = pipeline
+            .pending_native_ids
+            .iter()
+            .find(|(n, _)| n == "stdout")
+            .map(|(_, id)| *id)
+            .expect("stdout native buffered at construction");
+
+        let custom_id = pipeline.register_host_native(
+            machine::FfiSignature::from_parts(
+                "coverage_probe",
+                vec![],
+                machine::FfiType::Int,
+            )
+            .expect("sig"),
+            |_heap, _args| Ok(Some(common::Value::from(7))),
+        );
+        assert!(pipeline.compiler.get().is_some());
+        assert_eq!(pipeline.compiler().native_id("stdout"), Some(stdout_id));
+        assert!(
+            custom_id >= pipeline.pending_native_ids.len(),
+            "custom host native must append after the standard table"
+        );
+    }
+
+    /// End-to-end: deferred construction + lazy replay still emits working
+    /// HostInvoke for virtual `io` natives.
+    #[test]
+    fn deferred_compiler_host_invoke_io_round_trip() {
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        assert!(pipeline.compiler.get().is_none());
+
+        let (bytecode, constants) = pipeline
+            .compile_src(
+                r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    write(stdout(), to_bytes(format("%s", "ok")));
+}
+"#,
+            )
+            .expect("io HostInvoke program must compile after lazy init");
+        assert!(pipeline.compiler.get().is_some());
+
+        let shared = SharedBuf::new();
+        let mut machine = machine::Machine::<128>::default();
+        machine.set_shared_print(shared.inner.clone());
+        machine.with_output(shared.clone());
+        pipeline.wire_host_natives(&mut machine);
+        machine.run_raw(
+            &bytecode,
+            &constants,
+            pipeline.strings(),
+            pipeline.static_slot_count(),
+        );
+        let _ = machine.restore_output();
+        assert_eq!(shared.into_string(), "ok");
     }
 }

@@ -106,7 +106,7 @@ pub fn stack_delta(op: &IlOp) -> Option<i32> {
     }
 }
 
-fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
+pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
     match insn {
         Instruction::LOAD
         | Instruction::CONST
@@ -173,6 +173,12 @@ fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option<i32> {
         Instruction::JMPF | Instruction::JMPT => Some(-1),
         Instruction::Index => Some(-1),
         Instruction::BoxValue | Instruction::UnboxValue | Instruction::LoadField => Some(0),
+        Instruction::CastIntToFloat
+        | Instruction::CastFloatToInt
+        | Instruction::CastIntToByte
+        | Instruction::CastByteToInt
+        | Instruction::CastIntToBool
+        | Instruction::CastBoolToInt => Some(0),
         Instruction::MakeTuple | Instruction::MakeArray => Some(1 - byte.operand_u32() as i32),
         Instruction::MakeDict => {
             let arity = (byte.operand_u32() & 0xFFFF) as i32;

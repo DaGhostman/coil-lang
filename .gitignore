@@ -7,5 +7,6 @@ out.hyc
 *.so
 *.o
 THREADS_PLAN.md
-.cursor/hooks/state/continual-learning.json
+# Per-machine hook state (session ids / mtimes) — regenerated, never source.
+.cursor/hooks/state/
 

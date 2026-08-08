@@ -76,8 +76,8 @@ A successful build produces the `coil` binary (via `src/main.rs`) plus the `pars
 ## Run your first program
 
 The canonical starter example computes the 10th Fibonacci number recursively
-(fast enough for debug builds; the release CPU / dispatch entry is the same
-workload in `examples/fib_bench.hy`):
+(fast enough for debug builds). Fair cross-language CPU baselines live under
+`examples/perf/` (`./scripts/poop_baseline.sh`):
 
 ```coil
 use io::{stdout};

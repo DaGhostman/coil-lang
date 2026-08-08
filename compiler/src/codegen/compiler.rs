@@ -938,6 +938,9 @@ impl Compiler {
                     | Instruction::Unpack
                     | Instruction::UnpackAt
                     | Instruction::Seek
+                    // Frame-slot operands the copy paths do not remap.
+                    | Instruction::INC
+                    | Instruction::DEC
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
                     | Instruction::PRINT
@@ -1014,7 +1017,48 @@ impl Compiler {
         }
     }
 
+    /// Inline a tiny direct call, or emit nothing at all.
+    ///
+    /// A refusal must leave `bytecode` byte-for-byte as it was: arg prep and
+    /// partially copied body ops would otherwise run *and* be followed by the
+    /// real `CALL`, and their `STORE`s would write caller slots.
+    ///
+    /// The attempt keeps writing into the caller's buffer rather than a scratch
+    /// one, because the diamond path flushes that buffer into `self.bytecode` to
+    /// hold both in program order — handing it an empty scratch would sink the
+    /// caller's prefix (e.g. method-receiver staging) *after* the inlined body.
     fn try_emit_inline_direct_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        if self.try_inline_direct_call_into(fqn, args, bytecode) {
+            return true;
+        }
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    /// Snapshot a speculative emit target so [`Self::restore_emit_attempt`] can
+    /// undo a refused attempt. `None` means it was empty (the common case).
+    fn emit_attempt_prefix(bytecode: &[Byte]) -> Option<Vec<Byte>> {
+        if bytecode.is_empty() {
+            None
+        } else {
+            Some(bytecode.to_vec())
+        }
+    }
+
+    fn restore_emit_attempt(bytecode: &mut Vec<Byte>, prefix: Option<Vec<Byte>>) {
+        match prefix {
+            Some(p) => *bytecode = p,
+            None => bytecode.clear(),
+        }
+    }
+
+    fn try_inline_direct_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
@@ -1089,6 +1133,20 @@ impl Compiler {
                 bytecode.push_load(tmp);
             } else if matches!(
                 byte.bytecode(),
+                Instruction::STORE | Instruction::StorePop
+            ) {
+                // Must be remapped like LOAD: a verbatim copy writes the
+                // *callee's* slot number into the caller's frame. Only
+                // parameter slots have a caller temp; locals refuse the inline.
+                let Some(slot) = byte.load_store_single_slot() else {
+                    return false;
+                };
+                let Some(&tmp) = temps.get(slot as usize) else {
+                    return false;
+                };
+                bytecode.push_store_pop(tmp);
+            } else if matches!(
+                byte.bytecode(),
                 Instruction::BinSlotImm | Instruction::BinSlotSlot
             ) {
                 let Some(remapped) = Self::remap_bin_slot_for_inline(byte, &temps) else {
@@ -1105,6 +1163,22 @@ impl Compiler {
     /// One-level self-unroll: peel callee body once at a self-`CALL` site.
     /// Nested self-calls remain `CALL`/`Entry`. Emits into `self.bytecode`.
     fn try_emit_self_unroll_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        if self.try_self_unroll_call_into(fqn, args, bytecode) {
+            return true;
+        }
+        // The inner bail clears `bytecode` after flushing it into `self.bytecode`,
+        // which would drop the caller's prefix along with the attempt.
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_self_unroll_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
@@ -1165,6 +1239,27 @@ impl Compiler {
     /// immediate/slot base return, evaluate that check before `CALL` so base cases
     /// skip the frame. Nested/false path still `CALL`s.
     fn try_emit_predicate_peel_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+        is_indirect: bool,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        let rollback = self.bytecode.len();
+        if self.try_predicate_peel_call_into(fqn, args, bytecode, target_offset, is_indirect) {
+            return true;
+        }
+        // `remap_peel_ops_ok` pre-checks the slot remaps, so the emit-time bails
+        // are defensive — but without this they would leave arg prep plus a
+        // half-built diamond whose labels never bind.
+        self.bytecode.truncate(rollback);
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_predicate_peel_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
@@ -5944,6 +6039,16 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// True when compiling `idx` will only push (no `STORE` that seeks `tell`
+    /// past a live operand). Safe to leave the array under the index on the
+    /// shared locals/operand buffer; call/inline index exprs are not.
+    fn index_keeps_array_on_stack_safe(idx: &Expression<'_>) -> bool {
+        matches!(
+            idx,
+            Expression::Identifier(_) | Expression::Integer(_)
+        )
+    }
+
     /// Synthesize the packed rest-array type for a call's trailing args
     /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
     fn synthesize_rest_array_ty(&self, rest: &[Output<'_>]) -> crate::typechecking::Ty {
@@ -6887,9 +6992,44 @@ impl Compiler {
                         Expression::Identifier(name) => self.stack_array_info(name),
                         _ => None,
                     };
+                    let tmp_val = self.alloc_temp_slot();
+                    if stack_info.is_none() {
+                        // Heap array: RHS is always spilled. Leaving the array on
+                        // the operand stack is only safe when `idx` is a pure push
+                        // (ident/int): a call/inline that `STORE`s temps seeks
+                        // `tell` past the stranded array, so StoreIndex pops a
+                        // stale slot instead of the array pointer.
+                        bytecode.push_store_pop(tmp_val);
+                        if Self::index_keeps_array_on_stack_safe(idx.1.as_ref()) {
+                            let depth_on_entry = self.expr_depth;
+                            bytecode.append(&mut self.do_compile(arr));
+                            self.expr_depth = depth_on_entry + 1;
+                            bytecode.append(&mut self.do_compile(idx));
+                            self.expr_depth = depth_on_entry;
+                            bytecode.push_load(tmp_val);
+                        } else {
+                            let tmp_arr = self.alloc_temp_slot();
+                            let tmp_idx = self.alloc_temp_slot();
+                            bytecode.append(&mut self.do_compile(arr));
+                            bytecode.push_store_pop(tmp_arr);
+                            bytecode.append(&mut self.do_compile(idx));
+                            bytecode.push_store_pop(tmp_idx);
+                            bytecode.push_load(tmp_arr);
+                            bytecode.push_load(tmp_idx);
+                            bytecode.push_load(tmp_val);
+                        }
+                        bytecode.push(Byte::new(Instruction::StoreIndex));
+                        if leave_value_on_stack {
+                            // StoreIndex leaves the value on the stack; keep it.
+                        } else {
+                            bytecode.push_pop();
+                        }
+                        return;
+                    }
+                    // Stack array: `emit_unbox_stack_array` needs the boxed
+                    // address back, so keep it in a temp.
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
-                    let tmp_val = self.alloc_temp_slot();
                     bytecode.push_store_pop(tmp_val);
                     bytecode.append(&mut self.do_compile(arr));
                     bytecode.push_store_pop(tmp_arr);
@@ -9940,18 +10080,30 @@ impl Compiler {
                         // Leave value on stack like StoreIndex.
                         bytecode.push_load(base + *i as u32);
                     } else {
-                        let tmp_arr = self.alloc_temp_slot();
-                        let tmp_idx = self.alloc_temp_slot();
+                        // RHS is evaluated first and spilled. Array may stay on
+                        // the operand stack only for push-only index exprs —
+                        // see `index_keeps_array_on_stack_safe`.
                         let tmp_val = self.alloc_temp_slot();
+                        let depth_on_entry = self.expr_depth;
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push_store_pop(tmp_val);
-                        bytecode.append(&mut self.do_compile(arr));
-                        bytecode.push_store_pop(tmp_arr);
-                        bytecode.append(&mut self.do_compile(idx));
-                        bytecode.push_store_pop(tmp_idx);
-                        bytecode.push_load(tmp_arr);
-                        bytecode.push_load(tmp_idx);
-                        bytecode.push_load(tmp_val);
+                        if Self::index_keeps_array_on_stack_safe(idx.1.as_ref()) {
+                            bytecode.append(&mut self.do_compile(arr));
+                            self.expr_depth = depth_on_entry + 1;
+                            bytecode.append(&mut self.do_compile(idx));
+                            self.expr_depth = depth_on_entry;
+                            bytecode.push_load(tmp_val);
+                        } else {
+                            let tmp_arr = self.alloc_temp_slot();
+                            let tmp_idx = self.alloc_temp_slot();
+                            bytecode.append(&mut self.do_compile(arr));
+                            bytecode.push_store_pop(tmp_arr);
+                            bytecode.append(&mut self.do_compile(idx));
+                            bytecode.push_store_pop(tmp_idx);
+                            bytecode.push_load(tmp_arr);
+                            bytecode.push_load(tmp_idx);
+                            bytecode.push_load(tmp_val);
+                        }
                         bytecode.push(Byte::new(Instruction::StoreIndex));
                     }
                 }
@@ -11654,6 +11806,22 @@ impl Compiler {
                     fqn_base
                 };
                 if let Some(offset) = self.functions.get(&fqn).copied() {
+                    // Inline `Vec::push` as ArrayPush — avoids CALL/frame for fill loops.
+                    if fqn == format!("{}::push", common::BUILTIN_VEC_TYPE)
+                        && args.as_ref().map(|a| a.len()) == Some(1)
+                    {
+                        bytecode.append(&mut self.do_compile(recv));
+                        let arg = &args.as_ref().unwrap()[0];
+                        let value = match arg.1.as_ref() {
+                            Expression::NamedArg(_, v) => v,
+                            _ => arg,
+                        };
+                        bytecode.append(&mut self.do_compile(value));
+                        bytecode.push(Byte::new(Instruction::ArrayPush));
+                        bytecode.push_pop();
+                        bytecode.push_const(0);
+                        return bytecode;
+                    }
                     // Same ABI as free generics: box top-level type
                     // params, append trait dictionaries, unbox returns.
                     let lookup_name = strip_overload_key(&fqn).to_string();

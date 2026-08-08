@@ -633,6 +633,23 @@ pub fn cfg_gvn(ops: &mut Vec<IlOp>) {
     // Recompute blocks after possible Dup rewrites (indices unchanged).
     let blocks = build_blocks(ops);
     gvn_at_joins(ops, &blocks);
+    expand_dup_after_load(ops);
+}
+
+/// `Load s; Dup` → `Load s; Load s`, undoing Dup-CSE that would otherwise hide
+/// a binop's operands from fuse-select (`BinSlotSlot*`, packed `LOAD`).
+///
+/// Dispatch-neutral on its own — `Dup` and `Load` are one op each — and always
+/// sound: nothing between the pair can write `s`, so TOS still holds `stack[s]`.
+fn expand_dup_after_load(ops: &mut [IlOp]) {
+    for i in 0..ops.len().saturating_sub(1) {
+        let IlOp::Load { slot, .. } = ops[i] else {
+            continue;
+        };
+        if let IlOp::Dup { loc } = ops[i + 1] {
+            ops[i + 1] = IlOp::Load { slot, loc };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +687,8 @@ mod tests {
         assert!(matches!(ops[2], IlOp::Dup { .. }));
     }
 
+    /// Tests the CSE step directly: `cfg_gvn` re-expands `Load; Dup` at the end
+    /// so fuse-select still sees both operands (`expand_dup_after_load`).
     #[test]
     fn within_block_dup_replaces_second_identical_load() {
         let mut ops = vec![
@@ -683,7 +702,8 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        cfg_gvn(&mut ops);
+        let blocks = build_blocks(&ops);
+        gvn_within_blocks(&mut ops, &blocks);
         assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
         assert!(matches!(ops[1], IlOp::Dup { .. }));
     }
@@ -1239,4 +1259,37 @@ mod tests {
             .count();
         assert_eq!(join_loads, 0, "length-2 join tail should be sunk");
     }
+
+    #[test]
+    fn expands_dup_after_load_so_binop_can_fuse() {
+        // `x * x`: GVN would leave `Load; Dup; MUL`, which fuse-select cannot
+        // turn into BinSlotSlot.
+        let mut ops = vec![
+            IlOp::Load { slot: 7, loc: loc() },
+            IlOp::Load { slot: 7, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(
+            matches!(ops[0], IlOp::Load { slot: 7, .. })
+                && matches!(ops[1], IlOp::Load { slot: 7, .. }),
+            "both operands must stay LOADs for BinSlotSlot fusion"
+        );
+    }
+
+    #[test]
+    fn expand_dup_after_load_leaves_const_dup_alone() {
+        let mut ops = vec![
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        cfg_gvn(&mut ops);
+        assert!(matches!(ops[1], IlOp::Dup { .. }));
+    }
+
 }

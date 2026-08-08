@@ -1,8 +1,9 @@
-use io::{stdout};
-use io::sync::{write_all};
+use io::stdout;
+use io::sync::write_all;
+
 use string::{format, to_bytes};
 
-/// Calcualte the sum of `n` fib sequence
+/// Calculate the sum of `n` fib sequence
 fn fib(
     /// The N number of items to calculate the fib sum of
     int n,

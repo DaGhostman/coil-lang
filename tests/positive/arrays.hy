@@ -13,6 +13,22 @@ test("store index") {
     assert(a[0] == 1)?;
 }
 
+// Heap `a[i] = v` spills only the RHS before compiling array/index. Eval order
+// must stay value → index (array is a plain local here).
+fn record_step(Vec<int> log, int id, int ret) -> int {
+    log.push(id);
+    return ret;
+}
+
+test("indexed assign evaluates RHS before index") {
+    let log: Vec<int> = Vec::new();
+    let a = Vec::from([0, 0, 0]);
+    a[record_step(log, 2, 1)] = record_step(log, 1, 42);
+    assert(a[1] == 42)?;
+    assert(log[0] == 1)?;
+    assert(log[1] == 2)?;
+}
+
 test("compound index assign") {
     let a = [10, 20, 30];
     a[1] += 5;

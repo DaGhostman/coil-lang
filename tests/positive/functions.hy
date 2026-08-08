@@ -17,6 +17,16 @@ fn early(int n, int is_neg) -> int {
     return n * 2;
 }
 
+/// Body wraps another call, so the callee is a candidate for tiny-call
+/// inlining but must be refused (its locals have no caller temp).
+fn wraps_call(int n) -> int {
+    return 1 + add(n, 0);
+}
+
+fn wraps_call_sub(int n) -> int {
+    return 10 - add(n, 0);
+}
+
 fn multi(int a, int b, int c) -> int {
     return a + b * c;
 }
@@ -43,4 +53,21 @@ test("multi arg precedence in callee") {
 
 test("nested calls") {
     assert(add(add(1, 2), add(3, 4)) == 10)?;
+}
+
+// A refused inline attempt must leave no bytecode behind: leaked arg prep or a
+// partially copied body used to run *and* be followed by the real CALL, storing
+// into caller slots and clobbering an already-computed operand.
+test("call whose body wraps a call") {
+    assert(wraps_call(5) == 6)?;
+    assert(wraps_call_sub(3) == 7)?;
+}
+
+test("two such calls in one expression keep both operands") {
+    assert(wraps_call(5) + wraps_call_sub(3) == 13)?;
+    assert(wraps_call(5) + wraps_call(3) == 10)?;
+    let x = wraps_call(5);
+    let y = wraps_call_sub(3);
+    assert(x == 6)?;
+    assert(y == 7)?;
 }

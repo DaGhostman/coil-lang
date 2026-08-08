@@ -335,20 +335,70 @@ fn main() {
 | **Run** | `cargo run -- examples/fib.hy` |
 | **Output** | `55` |
 
-For the release CPU / dispatch regression entry (same `fib(10)` → `55`), use
-`examples/fib_bench.hy` instead.
+Cross-language CPU baselines (mandelbrot / tak / nsieve / binary trees) live under
+`examples/perf/` with matching `benchmarks/*.{lua,js}` ports. For timing, prefer
+`coil compile … -o x.hyc` then `coil run x.hyc` (see `./scripts/poop_baseline.sh`).
 
 ---
 
-### `examples/fib_bench.hy`
+### `examples/perf/mandelbrot.hy`
 
-**Demonstrates:** Same recursive Fibonacci as `fib.hy` (`fib(10)`), kept as the
-dedicated entry for release `poop` / `perf_metrics` without long wall time.
+**Demonstrates:** Nested loops + float arithmetic; fair cross-lang checksum bench.
 
 | | |
 |---|---|
-| **Run** | `cargo run --release -- examples/fib_bench.hy` |
-| **Output** | `55` |
+| **Run** | `cargo run --release -- examples/perf/mandelbrot.hy` |
+| **Output** | `625885` |
+| **Ports** | `benchmarks/mandelbrot.lua`, `benchmarks/mandelbrot.js` |
+
+---
+
+### `examples/perf/tak.hy`
+
+**Demonstrates:** Deep Takeuchi recursion (no auto-par binary shape).
+
+| | |
+|---|---|
+| **Run** | `cargo run --release -- examples/perf/tak.hy` |
+| **Output** | `7` |
+| **Ports** | `benchmarks/tak.lua`, `benchmarks/tak.js` |
+
+---
+
+### `examples/perf/nsieve.hy`
+
+**Demonstrates:** Sieve of Eratosthenes (`Vec` fill + mutation).
+
+| | |
+|---|---|
+| **Run** | `cargo run --release -- examples/perf/nsieve.hy` |
+| **Output** | `1900` |
+| **Ports** | `benchmarks/nsieve.lua`, `benchmarks/nsieve.js` |
+
+---
+
+### `examples/perf/binary_trees.hy`
+
+**Demonstrates:** Recursive tree alloc + walk checksum (GC-heavy).
+
+| | |
+|---|---|
+| **Run** | `cargo run --release -- examples/perf/binary_trees.hy` |
+| **Output** | `135854` |
+| **Ports** | `benchmarks/binary_trees.lua`, `benchmarks/binary_trees.js` |
+
+---
+
+### `examples/perf/bool_guard.hy`
+
+**Demonstrates:** `if flag { break }` on a bool local — a guard with nothing to
+fuse into `*Jmpf`, so it lowers to a single `JMPT`. Codegen anchor for
+`invert_guard_branch` (see `compiler/tests/perf_metrics.rs`).
+
+| | |
+|---|---|
+| **Run** | `cargo run --release -- examples/perf/bool_guard.hy` |
+| **Output** | `45` |
 
 ---
 
@@ -2016,7 +2066,12 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `for_break.hy` | Basics | `18` |
 | `fizbuz.hy` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
 | `fib.hy` | Basics | `55` |
-| `fib_bench.hy` | Perf | `55` |
+| `perf/mandelbrot.hy` | Perf | `625885` |
+| `perf/tak.hy` | Perf | `7` |
+| `perf/nsieve.hy` | Perf | `1900` |
+| `perf/binary_trees.hy` | Perf | `135854` |
+| `perf/bool_guard.hy` | Perf | `45` |
+| `inline_wrapped_call.hy` | Codegen | `13` |
 | `bench.hy` | Basics | `12\n` |
 | `call_test.hy` | Basics | `done` |
 | `gc.hy` | Basics | `Hello` |

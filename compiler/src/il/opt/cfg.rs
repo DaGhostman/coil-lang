@@ -49,6 +49,99 @@ pub(super) fn jump_thread(ops: &mut Vec<IlOp>) {
     }
 }
 
+/// True when `op` would fuse into a `*Jmpf` superinstruction with a following
+/// `JumpIfFalse` (mirrors the `try_fuse_*_jmpf` arms in [`crate::il::lower`]).
+fn fuses_with_jmpf(op: Option<&IlOp>) -> bool {
+    let Some(op) = op else {
+        return false;
+    };
+    if matches!(op, IlOp::BinSlotImm { op: o, .. } | IlOp::BinSlotSlot { op: o, .. }
+        if crate::il::lower::is_jmpf_cond_op(Instruction::from(*o)))
+    {
+        return true;
+    }
+    if matches!(op, IlOp::Bin { op: o, .. } if crate::il::lower::is_jmpf_cond_op(*o)) {
+        return true;
+    }
+    match op.as_encode_byte() {
+        Some(b) => match *b.bytecode() {
+            Instruction::LogNot => true,
+            Instruction::BinSlotImm => {
+                crate::il::lower::is_jmpf_cond_op(Instruction::from(b.bin_slot_imm_parts().0))
+            }
+            Instruction::BinSlotSlot => {
+                crate::il::lower::is_jmpf_cond_op(Instruction::from(b.bin_slot_slot_parts().0))
+            }
+            other => crate::il::lower::is_jmpf_cond_op(other),
+        },
+        None => false,
+    }
+}
+
+/// `JMPF A; JMP B; A:` → `JMPT B`, dropping the trailing unconditional jump.
+///
+/// This is the shape every `if cond { break / return / continue }` guard emits.
+/// Refused when the condition producer would fuse into a `*Jmpf` superinstruction
+/// — there is no `*Jmpt` counterpart, so inverting would cost more than it saves.
+pub(crate) fn invert_branch_over_jump(ops: &mut Vec<IlOp>) {
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut i = 0;
+    while i + 2 < ops.len() {
+        let (
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: skip,
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: far,
+                ..
+            },
+        ) = (&ops[i], &ops[i + 1])
+        else {
+            i += 1;
+            continue;
+        };
+        let (skip, far, loc) = (*skip, *far, *loc);
+        let prev = i.checked_sub(1).and_then(|p| ops.get(p));
+        if fuses_with_jmpf(prev) || !labels_bind_at(ops, i + 2, skip) {
+            i += 1;
+            continue;
+        }
+        ops[i] = IlOp::Jump {
+            kind: IlJumpKind::JumpIfTrue,
+            target: far,
+            loc,
+        };
+        remove.insert(i + 1);
+        i += 2;
+    }
+    if remove.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(ops.len());
+    for (idx, op) in ops.iter().enumerate() {
+        if !remove.contains(&idx) {
+            out.push(op.clone());
+        }
+    }
+    *ops = out;
+}
+
+/// True when `target` is bound by the run of labels starting at `from`, i.e. the
+/// JMPF's false path is exactly the next instruction.
+fn labels_bind_at(ops: &[IlOp], from: usize, target: Label) -> bool {
+    for op in &ops[from..] {
+        match op {
+            IlOp::Label(l) if *l == target => return true,
+            IlOp::Label(_) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
 pub(super) fn is_unconditional_jmp(op: &IlOp) -> bool {
     matches!(
         op,

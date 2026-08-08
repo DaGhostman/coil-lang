@@ -17,7 +17,7 @@ broken, what looked flaky, incomplete implementations, and fixes applied.
 
 | Path | Issue | Fix |
 |------|-------|-----|
-| `examples/fib.hy` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example and `examples/fib_bench.hy` both use `fib(10)` → `55` (`poop` / `vm_bench.sh` / `perf_fib_dispatch_regression`) |
+| `examples/fib.hy` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example uses `fib(10)` → `55`; fair CPU baselines are `examples/perf/{mandelbrot,tak,nsieve,binary_trees}.hy` (`poop` / `vm_bench.sh` / `perf_mandelbrot_dispatch_regression`) |
 
 ## Flaky tests
 

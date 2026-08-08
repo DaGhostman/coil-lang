@@ -1,6 +1,6 @@
     use super::*;
     use crate::il::opt::{OptimizeOptions, optimize_at, optimize_per_func};
-    use crate::il::opt::cfg::{eliminate_dead_blocks, jump_thread};
+    use crate::il::opt::cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
     use crate::il::opt::dce::{dead_store, mem_fwd, stack_dce};
     use common::{Byte, Instruction};
 
@@ -1275,6 +1275,7 @@
                 clone_shared_return: false,
                 bin_join_convoy: false,
                 multi_op_join_convoy: false,
+                invert_guard_branch: false,
             },
             3,
         );
@@ -2993,4 +2994,170 @@
             .count();
         assert_eq!(adds_after, adds_before);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::BinReturn { .. })));
+    }
+
+    /// Opcode names for assertion messages (`IlOp` has no `Debug`).
+    fn insn_names(ops: &[IlOp]) -> Vec<String> {
+        ops.iter()
+            .map(|op| match op.instruction() {
+                Some(i) => format!("{i:?}"),
+                None => "<label/meta>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stack_dce_drops_dead_const_pop() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc },
+            IlOp::Pop { loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Const { .. })),
+            "statement-position CONST;POP should be removed; got {names:?}"
+        );
+        assert_eq!(ops.len(), 2, "only LOAD;RETURN should remain; got {names:?}");
+    }
+
+    #[test]
+    fn stack_dce_drops_dead_string_and_const_pool_pop() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::String { idx: 0, loc },
+            IlOp::Pop { loc },
+            IlOp::ConstPool { idx: 3, loc },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert_eq!(
+            ops.len(),
+            1,
+            "String;Pop and ConstPool;Pop are pure discards; got {names:?}"
+        );
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_iterates_to_fixpoint() {
+        // `Load; Const; Pop; Pop`: removing the inner pair exposes `Load; Pop`.
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc },
+            IlOp::Const { imm: 7, loc },
+            IlOp::Pop { loc },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+        stack_dce(&mut ops);
+        let names = insn_names(&ops);
+        assert_eq!(ops.len(), 1, "both pairs should be removed; got {names:?}");
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn inverts_guard_branch_over_unconditional_jump() {
+        // `if flag { break }`: LOAD is not a *Jmpf-fusable condition.
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc,
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const { imm: 5, loc },
+            IlOp::Label(Label(2)),
+            IlOp::Return { loc },
+        ];
+        invert_branch_over_jump(&mut ops);
+        let jumps: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                IlOp::Jump { kind, target, .. } => Some((*kind, target.0)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jumps,
+            vec![(IlJumpKind::JumpIfTrue, 2)],
+            "JMPF L1; JMP L2; L1: should collapse to JMPT L2"
+        );
+    }
+
+    #[test]
+    fn refuses_guard_inversion_when_condition_fuses_with_jmpf() {
+        // `BinSlotSlot LE; JMPF` fuses into BinSlotSlotJmpf; there is no
+        // BinSlotSlotJmpt, so inverting would cost a dispatch.
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotSlot {
+                op: Instruction::LE as u8,
+                a: 0,
+                b: 1,
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc,
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Label(Label(2)),
+            IlOp::Return { loc },
+        ];
+        let before = ops.len();
+        invert_branch_over_jump(&mut ops);
+        assert_eq!(ops.len(), before, "fusable guard must be left alone");
+        assert!(matches!(
+            ops[1],
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_guard_inversion_when_false_target_is_not_next() {
+        // JMPF's target is bound after real code, so the JMP is reachable
+        // independently and must not be dropped.
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(3),
+                loc,
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc,
+            },
+            IlOp::Const { imm: 1, loc },
+            IlOp::Label(Label(3)),
+            IlOp::Label(Label(2)),
+            IlOp::Return { loc },
+        ];
+        let before = ops.len();
+        invert_branch_over_jump(&mut ops);
+        assert_eq!(ops.len(), before, "non-adjacent false target must refuse");
     }

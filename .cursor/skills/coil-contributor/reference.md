@@ -71,7 +71,7 @@ Prefer over new opcodes / IL opts:
 - Hot-loop tuning in VM
 - `promise!` for release assertions
 
-Soft baseline: `./scripts/poop_baseline.sh` on `examples/fib_bench.hy`. See AGENTS.md user preferences.
+Soft baseline: `./scripts/poop_baseline.sh` (compile once, then `coil run` archives under `examples/perf/`). See AGENTS.md user preferences.
 
 | Tree | When to update |
 |------|----------------|
