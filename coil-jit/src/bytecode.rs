@@ -189,4 +189,54 @@ mod tests {
         ];
         assert!(translate_i64_bytecode(&code, 0).is_none());
     }
+
+    #[test]
+    fn translates_fused_immediate_add() {
+        let code = vec![
+            Byte::new(ArchivedInstruction::BinSlotImm).with_bin_slot_imm(
+                Instruction::ADD as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        let function = translate_i64_bytecode(&code, 0).expect("fused imm");
+        assert_eq!(function.params(), 1);
+        assert!(!function.uses_context());
+    }
+
+    #[test]
+    fn refuses_wrong_fused_slots_and_non_arithmetic_ops() {
+        let wrong_slots = vec![
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::ADD as u8,
+                1,
+                0,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert!(translate_i64_bytecode(&wrong_slots, 0).is_none());
+
+        let compare = vec![
+            Byte::new(ArchivedInstruction::BinSlotSlot).with_bin_slot_slot(
+                Instruction::LEQ as u8,
+                0,
+                1,
+            ),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert!(translate_i64_bytecode(&compare, 0).is_none());
+    }
+
+    #[test]
+    fn refuses_pool_constant_array_index() {
+        let code = vec![
+            Byte::new(ArchivedInstruction::LOAD).with_load_store_slot(0),
+            Byte::new(ArchivedInstruction::CONST)
+                .with_operand_u32(Byte::POOL_FLAG),
+            Byte::new(ArchivedInstruction::Index),
+            Byte::new(ArchivedInstruction::RETURN),
+        ];
+        assert!(translate_i64_bytecode(&code, 0).is_none());
+    }
 }
