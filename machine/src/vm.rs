@@ -1213,7 +1213,9 @@ impl<const S: usize> Machine<S> {
         sp: &mut usize,
         req: crate::io::IoParkRequest,
     ) {
-        let token = self.io_reactor.register_wait(req.fd, req.interest);
+        let token = self
+            .io_reactor
+            .register_wait(req.fd, req.interest);
         let coro_ptr = self
             .resume_stack
             .last()
@@ -2185,12 +2187,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => {
-                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
-                        }
-                        Instruction::NEQ => {
-                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
-                        }
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -2340,12 +2342,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => {
-                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
-                        }
-                        Instruction::NEQ => {
-                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
-                        }
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -2394,12 +2396,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => {
-                            Value::from(crate::value_eq::values_eq(&self.heap, va, vb) as i64)
-                        }
-                        Instruction::NEQ => {
-                            Value::from((!crate::value_eq::values_eq(&self.heap, va, vb)) as i64)
-                        }
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
+                        ),
                         Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
                         Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
                         Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
@@ -2461,12 +2463,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => {
-                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
-                        }
-                        Instruction::NEQ => {
-                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
-                        }
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
+                        ),
                         Instruction::LEF => Value::from((lhs.as_float() < rhs.as_float()) as i64),
                         Instruction::LEQF => Value::from((lhs.as_float() <= rhs.as_float()) as i64),
                         Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
@@ -2525,12 +2527,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => {
-                            Value::from(crate::value_eq::values_eq(&self.heap, va, vb) as i64)
-                        }
-                        Instruction::NEQ => {
-                            Value::from((!crate::value_eq::values_eq(&self.heap, va, vb)) as i64)
-                        }
+                        Instruction::EQ => Value::from(
+                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
+                        ),
+                        Instruction::NEQ => Value::from(
+                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
+                        ),
                         Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
                         Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
                         Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
@@ -2726,7 +2728,9 @@ impl<const S: usize> Machine<S> {
                                         if !self.resume_stack.is_empty() {
                                             // Inside a coroutine: register for batch
                                             // poll and yield (do not park the VM).
-                                            self.cooperative_io_await_yield(&mut ip, &mut sp, req);
+                                            self.cooperative_io_await_yield(
+                                                &mut ip, &mut sp, req,
+                                            );
                                         } else {
                                             self.frames.get_mut().set(sp);
                                             self.pending_io = Some(PendingIoWait {
@@ -2752,11 +2756,7 @@ impl<const S: usize> Machine<S> {
                         }
                         let allocated = self.heap.live_object_count().saturating_sub(live_before);
                         if allocated > 0 {
-                            Self::maybe_gc_after_alloc(
-                                &mut self.heap,
-                                &self.stack,
-                                &self.resume_stack,
-                            );
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                         }
                     }
                 }
@@ -3395,11 +3395,7 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.stack.push(Value::from(object.addr()));
-                            Self::maybe_gc_after_alloc(
-                                &mut self.heap,
-                                &self.stack,
-                                &self.resume_stack,
-                            );
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                             continue;
                         }
 
