@@ -1174,6 +1174,118 @@
     }
 
     #[test]
+    fn copy_prop_refuses_get_field_shape_sensitive_load() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::GetField { loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_refuses_make_array_after_pure_load_chain() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::MakeArray { arity: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_forwards_bin_slot_imm_producer() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 0,
+                imm: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(
+            ops[2],
+            IlOp::BinSlotImm {
+                slot: 0,
+                imm: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_prop_skips_self_alias_store_binding() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 1, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_clears_bindings_across_host_invoke() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::HostInvoke { arity: 0, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[3], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn dead_store_keeps_store_before_opaque_byte_barrier() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Byte {
+                byte: Byte::new(Instruction::FfiInvoke).with_operand_u32(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+
+        dead_store_at(&mut ops, 4);
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
+        );
+    }
+
+    #[test]
     fn dead_store_drops_dup_store_when_slot_unused() {
         let mut ops = vec![
             IlOp::Const {

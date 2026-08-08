@@ -4118,6 +4118,28 @@ fn main() {
     assert_eq!(output, "42");
 }
 
+/// Copied locals feeding MakeArray must not be rewritten into shape-sensitive
+/// stack producers that break array construction.
+#[test]
+fn copy_prop_preserves_array_built_from_copied_locals() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn build() -> int {
+    let a = 10;
+    let b = a;
+    let xs = [b, 20];
+    return xs[0] + xs[1];
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", build())));
+}
+"#,
+    );
+    assert_eq!(output, "30");
+}
+
 #[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
