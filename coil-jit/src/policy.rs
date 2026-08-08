@@ -100,4 +100,18 @@ mod tests {
         assert!(!counters.record_entry(11, &config));
         assert_eq!(counters.entry_count(11), 0);
     }
+
+    #[test]
+    fn compiled_entry_is_not_requested_again() {
+        let config = JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        };
+        let mut counters = HotCounters::default();
+        assert!(counters.record_entry(5, &config));
+        counters.mark_compiled(5);
+        assert!(!counters.record_entry(5, &config));
+        assert!(!counters.compile_requested(5));
+        assert_eq!(counters.entry_count(5), 2);
+    }
 }
