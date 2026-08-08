@@ -412,6 +412,7 @@ pub fn analyze_il_at(ops: &[IlOp], entry_tell: u32) -> TellInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::il::op::Label;
 
     fn store(slot: u32) -> Byte {
         Byte::new(Instruction::STORE).with_load_store_slot(slot)
@@ -511,6 +512,47 @@ mod tests {
 
         let high = analyze_il_at(&ops, 6);
         assert!(high.can_remove_one_value_store(0, 5));
+    }
+
+    /// Symbolic JMPF joins both edges with the same post-pop cursor.
+    #[test]
+    fn symbolic_il_jump_if_false_joins_both_edges() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 0);
+        // Const → 1; JMPF pops → 0 on fall-through and taken.
+        assert_eq!(info.tell_before(2).known(), Some(0));
+        assert_eq!(info.tell_before(3).known(), Some(0));
+    }
+
+    /// Unlike bytecode JumpIfMatch, IL carries arity so the taken edge is modelled.
+    #[test]
+    fn symbolic_il_jump_if_match_models_taken_edge_with_arity() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 2 },
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 3);
+        // Fall-through keeps cursor; taken edge applies arity-1 (= +1) → 4.
+        assert_eq!(info.tell_before(1).known(), Some(3));
+        assert_eq!(info.tell_before(2).known(), Some(4));
     }
 
     /// The cursor is genuinely not a per-PC constant: a loop that stores to a
