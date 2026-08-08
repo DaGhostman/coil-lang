@@ -306,6 +306,91 @@
         assert_eq!(vm.jit_compiled_count(), 1);
     }
 
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_unsupported_shape_falls_back_to_interpreter() {
+        let mut vm = Machine::<8>::default();
+        vm.enable_jit(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        // Compare-and-return is intentionally outside the JIT allow-list.
+        let code = vec![
+            const_int(3),
+            const_int(5),
+            Byte::new(Instruction::CALL).with_call_packed(2, 4),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::LEQ as u8, 0, 1),
+            Byte::new(Instruction::RETURN),
+        ];
+
+        vm.run(&code);
+
+        assert!(vm.pop().as_bool());
+        assert_eq!(vm.jit_compiled_count(), 0);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_float_binary_call_uses_native() {
+        let mut vm = Machine::<8>::default();
+        vm.enable_jit(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        let pool = [f64::to_bits(20.5), f64::to_bits(21.5)];
+        let code = vec![
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 0),
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+            Byte::new(Instruction::CALL).with_call_packed(2, 5),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::NOOP),
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::ADDF as u8, 0, 1),
+            Byte::new(Instruction::RETURN),
+        ];
+
+        vm.run_with_pool(&code, &pool, &[], 0);
+
+        assert_eq!(vm.pop().as_float(), 42.0);
+        assert_eq!(vm.jit_compiled_count(), 1);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_near_miss_fib_falls_back_to_interpreter() {
+        let mut vm = Machine::<16>::default();
+        vm.enable_jit(JitConfig {
+            function_threshold: 1,
+            ..JitConfig::default()
+        })
+        .expect("native target");
+        // Immediate threshold is 3 instead of the recognized fib shape's 2.
+        let pool = vec![(5_u64 << 32) | 3];
+        let code = vec![
+            const_int(1),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(Instruction::LEQ as u8, 0, 0),
+            Byte::new(Instruction::ConstReturnImm).with_operand_u32(1),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::SUB as u8, 0, 1),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::STORE).with_load_store_slot(1),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(Instruction::SUB as u8, 0, 2),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::STORE).with_load_store_slot(2),
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::ADD as u8, 1, 2),
+            Byte::new(Instruction::RETURN),
+        ];
+
+        vm.run_with_pool(&code, &pool, &[], 0);
+
+        // n=1 <= 3, so ConstReturnImm path returns 1 without recursion.
+        assert_eq!(vm.pop().as_int(), 1);
+        assert_eq!(vm.jit_compiled_count(), 0);
+    }
+
 
     /// Tail-recursive countdown reuses one frame (no stack overflow for deep n).
     #[test]
