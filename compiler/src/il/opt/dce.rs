@@ -1,5 +1,7 @@
 //! IL optimization — dce passes.
 
+use std::collections::HashMap;
+
 use crate::il::op::IlOp;
 use common::Instruction;
 
@@ -113,6 +115,156 @@ pub(super) fn mem_fwd(ops: &mut Vec<IlOp>, entry_sp: i32) {
     }
 }
 
+#[derive(Clone)]
+struct CopyBinding {
+    producer: IlOp,
+    dependencies: Vec<u32>,
+}
+
+/// Return the local slots read by a pure producer that can be cloned at a
+/// later `Load`. Memory-dependent and stack-consuming producers are excluded.
+fn copy_producer_dependencies(op: &IlOp) -> Option<Vec<u32>> {
+    let mut dependencies = match op {
+        IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } => Vec::new(),
+        IlOp::Load { slot, .. } => vec![*slot],
+        IlOp::BinSlotImm { slot, .. } => vec![*slot as u32],
+        IlOp::BinSlotSlot { a, b, .. } => vec![*a as u32, *b as u32],
+        _ => return None,
+    };
+    dependencies.sort_unstable();
+    dependencies.dedup();
+    Some(dependencies)
+}
+
+fn copy_prop_shape_sensitive_load(ops: &[IlOp], load_idx: usize) -> bool {
+    let Some(next) = ops.get(load_idx + 1) else {
+        return false;
+    };
+    if matches!(next, IlOp::GetField { .. }) {
+        return true;
+    }
+
+    let mut idx = load_idx + 1;
+    while let Some(op) = ops.get(idx) {
+        if matches!(
+            op,
+            IlOp::MakeTuple { .. } | IlOp::MakeArray { .. } | IlOp::MakeEnum { .. }
+        ) {
+            return true;
+        }
+        if matches!(
+            op,
+            IlOp::Load { .. }
+                | IlOp::Const { .. }
+                | IlOp::ConstPool { .. }
+                | IlOp::String { .. }
+                | IlOp::Dup { .. }
+                | IlOp::BinSlotImm { .. }
+                | IlOp::BinSlotSlot { .. }
+        ) {
+            idx += 1;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn invalidate_copy_slot(bindings: &mut HashMap<u32, CopyBinding>, slot: u32) {
+    bindings
+        .retain(|bound_slot, binding| *bound_slot != slot && !binding.dependencies.contains(&slot));
+}
+
+fn copy_prop_barrier(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Label(_)
+            | IlOp::Jump { .. }
+            | IlOp::Entry { .. }
+            | IlOp::HostInvoke { .. }
+            | IlOp::Print { .. }
+            | IlOp::GetField { .. }
+            | IlOp::SetField { .. }
+            | IlOp::MakeTuple { .. }
+            | IlOp::MakeArray { .. }
+            | IlOp::MakeEnum { .. }
+            | IlOp::BoxValue { .. }
+            | IlOp::UnboxValue { .. }
+            | IlOp::Return { .. }
+            | IlOp::Halt { .. }
+            | IlOp::LoadReturnSlot { .. }
+            | IlOp::ConstReturnImm { .. }
+            | IlOp::BinReturn { .. }
+            | IlOp::Byte { .. }
+    ) || matches!(
+        op.as_encode_byte(),
+        Some(byte)
+            if matches!(
+                *byte.bytecode(),
+                Instruction::STORE
+                    | Instruction::StorePop
+                    | Instruction::HostInvoke
+                    | Instruction::PRINT
+                    | Instruction::CALL
+                    | Instruction::TailCall
+                    | Instruction::GetField
+                    | Instruction::SetField
+                    | Instruction::MakeTuple
+                    | Instruction::MakeArray
+                    | Instruction::MakeEnum
+                    | Instruction::BoxValue
+                    | Instruction::FfiInvoke
+            )
+    )
+}
+
+/// Forward pure producer copies through a straight-line IL region.
+///
+/// The pass deliberately stops at labels, control flow, calls, unknown bytes,
+/// and memory operations. `dead_store_at` removes the now-unused original
+/// producer/store pair only when the shared cursor proof allows it.
+pub(super) fn copy_prop(ops: &mut Vec<IlOp>, entry_tell: u32) {
+    let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
+    let mut bindings: HashMap<u32, CopyBinding> = HashMap::new();
+    let mut i = 0;
+
+    while i < ops.len() {
+        if let IlOp::Load { slot, .. } = ops[i]
+            && cursor.tell_before(i).known().is_some()
+            && !copy_prop_shape_sensitive_load(ops, i)
+            && let Some(binding) = bindings.get(&slot).cloned()
+        {
+            let mut replacement = binding.producer;
+            replacement.set_loc(ops[i].loc());
+            ops[i] = replacement;
+        }
+
+        if i + 1 < ops.len()
+            && let IlOp::StorePop { slot, .. } = &ops[i + 1]
+            && let Some(dependencies) = copy_producer_dependencies(&ops[i])
+            && !dependencies.contains(slot)
+        {
+            invalidate_copy_slot(&mut bindings, *slot);
+            bindings.insert(
+                *slot,
+                CopyBinding {
+                    producer: ops[i].clone(),
+                    dependencies,
+                },
+            );
+            i += 2;
+            continue;
+        }
+
+        match &ops[i] {
+            IlOp::StorePop { slot, .. } => invalidate_copy_slot(&mut bindings, *slot),
+            op if copy_prop_barrier(op) => bindings.clear(),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
 fn slot_used_by(op: &IlOp, slot: u32) -> bool {
     match op {
         IlOp::Load { slot: s, .. } | IlOp::LoadReturnSlot { slot: s, .. } => *s == slot,
@@ -129,6 +281,7 @@ fn is_store_barrier(op: &IlOp) -> bool {
             | IlOp::Print { .. }
             | IlOp::Entry { .. }
             | IlOp::SetField { .. }
+            | IlOp::Byte { .. }
             | IlOp::Jump { .. }
             | IlOp::Label(_)
             | IlOp::Return { .. }
@@ -147,7 +300,14 @@ pub(super) fn mem_fwd_load_feeds_index(ops: &[IlOp], load_idx: usize) -> bool {
 
 /// Drop `StorePop s` (and a preceding dead producer / Dup) when `s` is unused
 /// before the next store to `s` or a control/effect barrier. Straight-line only.
+#[cfg(test)]
 pub(super) fn dead_store(ops: &mut Vec<IlOp>) {
+    dead_store_at(ops, 0);
+}
+
+/// Cursor-seeded dead-store elimination for an IL function body.
+pub(super) fn dead_store_at(ops: &mut Vec<IlOp>, entry_tell: u32) {
+    let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
     let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut i = 0;
     while i < ops.len() {
@@ -184,8 +344,10 @@ pub(super) fn dead_store(ops: &mut Vec<IlOp>) {
                     | IlOp::Const { .. }
                     | IlOp::ConstPool { .. }
                     | IlOp::Load { .. } => {
-                        remove.insert(i - 1);
-                        remove.insert(i);
+                        if cursor.can_remove_one_value_store(i - 1, slot) {
+                            remove.insert(i - 1);
+                            remove.insert(i);
+                        }
                     }
                     _ => {}
                 }

@@ -360,6 +360,7 @@ mod tests {
             dead_block: false,
             stack_dce: false,
             mem_fwd: false,
+            copy_prop: false,
             algebraic: false,
             licm: false,
             return_convoy: false,
