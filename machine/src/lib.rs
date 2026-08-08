@@ -15,6 +15,8 @@ pub mod host_natives;
 pub mod io;
 pub mod io_reactor;
 pub mod math_libm;
+#[cfg(feature = "jit")]
+mod jit;
 mod memory;
 mod opcode;
 pub mod packed_la;

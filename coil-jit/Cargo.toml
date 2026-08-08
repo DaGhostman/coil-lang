@@ -1,0 +1,22 @@
+[package]
+name = "coil-jit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { version = "0.1.0", path = "../common" }
+cranelift-codegen = { version = "0.134.3", optional = true }
+cranelift-frontend = { version = "0.134.3", optional = true }
+cranelift-jit = { version = "0.134.3", optional = true }
+cranelift-module = { version = "0.134.3", optional = true }
+cranelift-native = { version = "0.134.3", optional = true }
+
+[features]
+default = []
+cranelift = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+]

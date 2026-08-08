@@ -220,6 +220,9 @@ pub struct Machine<const S: usize> {
     live_threads: crate::thread::LiveThreadRegistry,
     /// Shared concurrent OS-worker budget for this root VM (and its workers).
     worker_cap: std::sync::Arc<crate::thread::WorkerCap>,
+    #[cfg(feature = "jit")]
+    /// Optional native tier; bytecode remains the default and fallback path.
+    jit: Option<crate::jit::JitRuntime>,
     /// Work-stealing pool sized by [`Self::worker_cap`].
     reactor: std::sync::Arc<crate::reactor::Reactor>,
     /// IO readiness reactor (sync adapters + async waiters).
@@ -273,6 +276,8 @@ impl<const S: usize> Machine<S> {
             shared_print: None,
             live_threads: crate::thread::new_live_thread_registry(),
             worker_cap,
+            #[cfg(feature = "jit")]
+            jit: None,
             reactor,
             io_reactor: crate::io_reactor::IoReactor::new(),
         }
@@ -281,6 +286,22 @@ impl<const S: usize> Machine<S> {
     /// Current operand-stack capacity (slots).
     pub fn operand_stack_capacity(&self) -> usize {
         self.stack.capacity()
+    }
+
+    /// Enable the optional native tier for supported direct numeric calls.
+    #[cfg(feature = "jit")]
+    pub fn enable_jit(&mut self, config: coil_jit::JitConfig) -> Result<(), String> {
+        self.jit = Some(crate::jit::JitRuntime::new(config)?);
+        Ok(())
+    }
+
+    /// Number of native functions currently installed in this VM.
+    #[cfg(feature = "jit")]
+    pub fn jit_compiled_count(&self) -> usize {
+        self.jit
+            .as_ref()
+            .map(crate::jit::JitRuntime::compiled_count)
+            .unwrap_or(0)
     }
 
     pub fn set_ffi_paths(&mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) {
@@ -1192,9 +1213,7 @@ impl<const S: usize> Machine<S> {
         sp: &mut usize,
         req: crate::io::IoParkRequest,
     ) {
-        let token = self
-            .io_reactor
-            .register_wait(req.fd, req.interest);
+        let token = self.io_reactor.register_wait(req.fd, req.interest);
         let coro_ptr = self
             .resume_stack
             .last()
@@ -1442,6 +1461,10 @@ impl<const S: usize> Machine<S> {
         if code.is_empty() {
             return;
         }
+        #[cfg(feature = "jit")]
+        if let Some(jit) = self.jit.as_mut() {
+            jit.reset_program();
+        }
         self.statics = vec![Value::default(); static_slots as usize];
         self.program_code = unsafe {
             std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
@@ -1656,6 +1679,69 @@ impl<const S: usize> Machine<S> {
     ) {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
         self.run_with_pool(code, constants, strings, static_slots);
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_jit_direct_binary(&mut self, code: &[Byte], target: usize) -> Option<Value> {
+        let args_start = self.stack.tell().checked_sub(2)?;
+        let left = self.stack[args_start];
+        let right = self.stack[args_start + 1];
+        self.jit
+            .as_mut()?
+            .try_direct_binary(code, target as u32, left, right)
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_jit_direct_unary(&mut self, code: &[Byte], target: usize) -> Option<Value> {
+        let args_start = self.stack.tell().checked_sub(1)?;
+        let value = self.stack[args_start];
+        self.jit
+            .as_mut()?
+            .try_direct_unary(code, target as u32, value)
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_jit_recursive_fib(
+        &mut self,
+        code: &[Byte],
+        constants: &[u64],
+        target: usize,
+    ) -> Option<Value> {
+        let args_start = self.stack.tell().checked_sub(1)?;
+        let value = self.stack[args_start];
+        self.jit
+            .as_mut()?
+            .try_recursive_fib(code, constants, target as u32, value)
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_jit_array_len(&mut self, code: &[Byte], target: usize) -> Option<Value> {
+        let args_start = self.stack.tell().checked_sub(1)?;
+        let value = self.stack[args_start];
+        let mut context = crate::jit::JitCallContext {
+            heap: &mut self.heap,
+        };
+        self.jit.as_mut()?.try_array_len(
+            code,
+            target as u32,
+            (&mut context as *mut crate::jit::JitCallContext).cast(),
+            value,
+        )
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_jit_array_index(&mut self, code: &[Byte], target: usize) -> Option<Value> {
+        let args_start = self.stack.tell().checked_sub(1)?;
+        let value = self.stack[args_start];
+        let mut context = crate::jit::JitCallContext {
+            heap: &mut self.heap,
+        };
+        self.jit.as_mut()?.try_array_index_const(
+            code,
+            target as u32,
+            (&mut context as *mut crate::jit::JitCallContext).cast(),
+            value,
+        )
     }
 
     /// Never-inline: `#[inline(always)]` forced fat LTO to paste this giant
@@ -1973,6 +2059,42 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::CALL => {
                     let (arity, target) = opcode.call_parts();
+                    #[cfg(feature = "jit")]
+                    if arity == 2
+                        && let Some(ret_val) = self.try_jit_direct_binary(code, target)
+                    {
+                        let return_sp = self.stack.tell() - arity;
+                        self.stack.seek(return_sp);
+                        self.stack.push(ret_val);
+                        continue;
+                    }
+                    #[cfg(feature = "jit")]
+                    if arity == 1 {
+                        if let Some(ret_val) = self.try_jit_recursive_fib(code, constants, target) {
+                            let return_sp = self.stack.tell() - arity;
+                            self.stack.seek(return_sp);
+                            self.stack.push(ret_val);
+                            continue;
+                        }
+                        if let Some(ret_val) = self.try_jit_direct_unary(code, target) {
+                            let return_sp = self.stack.tell() - arity;
+                            self.stack.seek(return_sp);
+                            self.stack.push(ret_val);
+                            continue;
+                        }
+                        if let Some(ret_val) = self.try_jit_array_len(code, target) {
+                            let return_sp = self.stack.tell() - arity;
+                            self.stack.seek(return_sp);
+                            self.stack.push(ret_val);
+                            continue;
+                        }
+                        if let Some(ret_val) = self.try_jit_array_index(code, target) {
+                            let return_sp = self.stack.tell() - arity;
+                            self.stack.seek(return_sp);
+                            self.stack.push(ret_val);
+                            continue;
+                        }
+                    }
                     let callee_sp = self.stack.tell() - arity;
                     // Direct calls dominate; avoid the indirect `target == 0`
                     // return-ip adjustment on that path.
@@ -2063,12 +2185,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from(
-                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
-                        ),
-                        Instruction::NEQ => Value::from(
-                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
-                        ),
+                        Instruction::EQ => {
+                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
+                        }
+                        Instruction::NEQ => {
+                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
+                        }
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -2218,12 +2340,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from(
-                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
-                        ),
-                        Instruction::NEQ => Value::from(
-                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
-                        ),
+                        Instruction::EQ => {
+                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
+                        }
+                        Instruction::NEQ => {
+                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
+                        }
                         Instruction::Pow => {
                             let exp = imm.max(0) as u32;
                             Value::from(lhs.as_int().pow(exp))
@@ -2272,12 +2394,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => Value::from(
-                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
-                        ),
-                        Instruction::NEQ => Value::from(
-                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
-                        ),
+                        Instruction::EQ => {
+                            Value::from(crate::value_eq::values_eq(&self.heap, va, vb) as i64)
+                        }
+                        Instruction::NEQ => {
+                            Value::from((!crate::value_eq::values_eq(&self.heap, va, vb)) as i64)
+                        }
                         Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
                         Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
                         Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
@@ -2339,12 +2461,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((lhs.as_int() <= rhs.as_int()) as i64),
                         Instruction::GT => Value::from((lhs.as_int() > rhs.as_int()) as i64),
                         Instruction::GEQ => Value::from((lhs.as_int() >= rhs.as_int()) as i64),
-                        Instruction::EQ => Value::from(
-                            crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64
-                        ),
-                        Instruction::NEQ => Value::from(
-                            (!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64
-                        ),
+                        Instruction::EQ => {
+                            Value::from(crate::value_eq::values_eq(&self.heap, lhs, rhs) as i64)
+                        }
+                        Instruction::NEQ => {
+                            Value::from((!crate::value_eq::values_eq(&self.heap, lhs, rhs)) as i64)
+                        }
                         Instruction::LEF => Value::from((lhs.as_float() < rhs.as_float()) as i64),
                         Instruction::LEQF => Value::from((lhs.as_float() <= rhs.as_float()) as i64),
                         Instruction::GTF => Value::from((lhs.as_float() > rhs.as_float()) as i64),
@@ -2403,12 +2525,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::LEQ => Value::from((va.as_int() <= vb.as_int()) as i64),
                         Instruction::GT => Value::from((va.as_int() > vb.as_int()) as i64),
                         Instruction::GEQ => Value::from((va.as_int() >= vb.as_int()) as i64),
-                        Instruction::EQ => Value::from(
-                            crate::value_eq::values_eq(&self.heap, va, vb) as i64
-                        ),
-                        Instruction::NEQ => Value::from(
-                            (!crate::value_eq::values_eq(&self.heap, va, vb)) as i64
-                        ),
+                        Instruction::EQ => {
+                            Value::from(crate::value_eq::values_eq(&self.heap, va, vb) as i64)
+                        }
+                        Instruction::NEQ => {
+                            Value::from((!crate::value_eq::values_eq(&self.heap, va, vb)) as i64)
+                        }
                         Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
                         Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
                         Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
@@ -2604,9 +2726,7 @@ impl<const S: usize> Machine<S> {
                                         if !self.resume_stack.is_empty() {
                                             // Inside a coroutine: register for batch
                                             // poll and yield (do not park the VM).
-                                            self.cooperative_io_await_yield(
-                                                &mut ip, &mut sp, req,
-                                            );
+                                            self.cooperative_io_await_yield(&mut ip, &mut sp, req);
                                         } else {
                                             self.frames.get_mut().set(sp);
                                             self.pending_io = Some(PendingIoWait {
@@ -2632,7 +2752,11 @@ impl<const S: usize> Machine<S> {
                         }
                         let allocated = self.heap.live_object_count().saturating_sub(live_before);
                         if allocated > 0 {
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                            Self::maybe_gc_after_alloc(
+                                &mut self.heap,
+                                &self.stack,
+                                &self.resume_stack,
+                            );
                         }
                     }
                 }
@@ -3271,7 +3395,11 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.stack.push(Value::from(object.addr()));
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                            Self::maybe_gc_after_alloc(
+                                &mut self.heap,
+                                &self.stack,
+                                &self.resume_stack,
+                            );
                             continue;
                         }
 
@@ -3683,7 +3811,6 @@ impl<const S: usize> Machine<S> {
         false
     }
 }
-
 
 #[cfg(test)]
 #[path = "vm.tests.rs"]

@@ -13,6 +13,7 @@ members = [
     "coil-fmt",
     "coil-lsp",
     "coil-simd",
+    "coil-jit",
 ]
 # Plain `cargo build` / `cargo test` at the repo root builds all CLI binaries
 # (coil + helpers), not only the root package.
@@ -45,6 +46,7 @@ crypto = ["machine/crypto", "compiler/crypto", "coil-cli/crypto"]
 time = ["machine/time", "compiler/time", "coil-cli/time"]
 regex = ["machine/regex", "compiler/regex", "coil-cli/regex"]
 tls = ["machine/tls", "compiler/tls", "coil-cli/tls"]
+jit = ["machine/jit", "coil-cli/jit"]
 
 [profile.release]
 opt-level=3

@@ -23,10 +23,12 @@ time = ["dep:chrono"]
 regex = ["dep:pcre2"]
 tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 vm_profile = []
+jit = ["dep:coil-jit", "coil-jit/cranelift"]
 
 [dependencies]
 common = { path = "../common" }
 coil-simd = { path = "../coil-simd" }
+coil-jit = { path = "../coil-jit", optional = true }
 crossbeam-deque = "0.8"
 rkyv = "0.8.12"
 libloading = "0.9"
