@@ -682,4 +682,87 @@ mod tests {
             Err(JitError::InvalidIr(message)) if message.contains("no return")
         ));
     }
+
+    #[test]
+    fn rejects_undefined_register_and_bad_branch_target() {
+        let undefined = I64Function::new(
+            1,
+            vec![
+                I64Instr::LoadParam { dst: 0, param: 0 },
+                I64Instr::Binary {
+                    dst: 1,
+                    lhs: 0,
+                    rhs: 9,
+                    op: I64BinaryOp::Add,
+                },
+                I64Instr::Return { value: 1 },
+            ],
+        );
+        assert!(matches!(
+            undefined.validate(),
+            Err(JitError::InvalidIr(message)) if message.contains("undefined register")
+        ));
+
+        let bad_branch = I64Function::new(
+            1,
+            vec![
+                I64Instr::LoadParam { dst: 0, param: 0 },
+                I64Instr::Branch {
+                    cond: 0,
+                    then_block: 1,
+                    else_block: 99,
+                },
+                I64Instr::Label { block: 1 },
+                I64Instr::Return { value: 0 },
+            ],
+        );
+        assert!(matches!(
+            bad_branch.validate(),
+            Err(JitError::InvalidIr(message)) if message.contains("undefined block")
+        ));
+    }
+
+    #[test]
+    fn rejects_self_call_arity_mismatch_and_code_after_terminator() {
+        let arity = I64Function::new(
+            1,
+            vec![
+                I64Instr::LoadParam { dst: 0, param: 0 },
+                I64Instr::CallSelf {
+                    dst: 1,
+                    args: vec![0, 0],
+                },
+                I64Instr::Return { value: 1 },
+            ],
+        );
+        assert!(matches!(
+            arity.validate(),
+            Err(JitError::InvalidIr(message)) if message.contains("args for arity")
+        ));
+
+        let after_return = I64Function::new(
+            1,
+            vec![
+                I64Instr::Const { dst: 0, value: 1 },
+                I64Instr::Return { value: 0 },
+                I64Instr::Const { dst: 1, value: 2 },
+            ],
+        );
+        assert!(matches!(
+            after_return.validate(),
+            Err(JitError::InvalidIr(message)) if message.contains("after terminator")
+        ));
+    }
+
+    #[test]
+    fn rejects_f64_ir_without_return() {
+        let function = F64Function {
+            params: 1,
+            instructions: vec![F64Instr::Const { dst: 0, value: 1.0 }],
+        };
+        assert!(matches!(
+            function.validate(),
+            Err(JitError::InvalidIr(message)) if message.contains("no return")
+        ));
+    }
 }
