@@ -12,8 +12,7 @@ use crate::memory::{Heap, ObjArray, Object};
 /// `Vec::with_capacity(n) -> Vec<T>` — empty growable array with reserved capacity.
 pub fn host_vec_with_capacity(heap: &mut Heap, args: &[Value]) -> Value {
     let n = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let mut elements = Vec::with_capacity(n);
-    elements.reserve(n);
+    let elements = Vec::with_capacity(n);
     let (obj, _) = heap.alloc(ObjArray { elements }, Object::Array);
     Value::from(obj.addr())
 }

@@ -12,7 +12,7 @@ OUT_DIR="${OUT_DIR:-/tmp/coil_perf_matrix}"
 RUN_MASSIF="${RUN_MASSIF:-0}"
 
 CROSS_LANG=(mandelbrot tak nsieve binary_trees)
-AOT_ONLY=(numeric operators_loop match_sum)
+AOT_ONLY=(numeric operators_loop match_sum field_hot dict_hot array_mut)
 declare -A EXPECTED=(
     [mandelbrot]=625885
     [tak]=7
@@ -21,6 +21,9 @@ declare -A EXPECTED=(
     [numeric]=1999000
     [operators_loop]=149912
     [match_sum]=7995
+    [field_hot]=4000000
+    [dict_hot]=6000
+    [array_mut]=2000
 )
 
 if ! command -v poop >/dev/null 2>&1; then
@@ -91,6 +94,12 @@ for name in "${AOT_ONLY[@]}"; do
     touch "$archive"
     check_archive "$name" "$archive"
     run_pooped "$name" "$BIN run $archive"
+
+    if [[ "$RUN_MASSIF" == 1 ]] && command -v valgrind >/dev/null 2>&1; then
+        valgrind --tool=massif \
+            --massif-out-file="$OUT_DIR/${name}.massif.out" \
+            "$BIN" run "$archive" >/dev/null 2>&1 || true
+    fi
 done
 
 echo "Performance artifacts written to $OUT_DIR"

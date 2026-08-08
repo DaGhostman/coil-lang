@@ -204,6 +204,39 @@
         vec![Byte::new(Instruction::STRING).with_operand_u32(idx)]
     }
 
+    #[test]
+    fn repeated_program_string_reuses_one_heap_object() {
+        let strings = vec!["literal".to_owned()];
+        let code = vec![
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::POP),
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+
+        let value = vm.pop();
+        assert_eq!(
+            vm.heap()
+                .into_iter()
+                .filter(|obj| matches!(obj, Object::String(_)))
+                .count(),
+            1
+        );
+        assert!(vm.heap().find_object_by_addr(value.raw() as u64).is_some());
+    }
+
+    #[test]
+    fn intern_key_reuses_heap_string_handle() {
+        let mut vm = Machine::<8>::default();
+        let key = vm.heap_mut().intern("field".to_owned());
+        let value = Value::from(key.as_ptr() as u64);
+        let resolved = Machine::<8>::intern_key(vm.heap_mut(), value);
+
+        assert!(crate::memory::Gc::ptr_eq(key, resolved));
+    }
+
     /// `ArrayLen` must report string/tuple/dict lengths (structural `len`).
     #[test]
     fn array_len_reports_string_tuple_and_dict_sizes() {

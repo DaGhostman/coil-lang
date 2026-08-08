@@ -658,6 +658,15 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    fn intern_key(heap: &mut Heap, v: Value) -> crate::memory::RefString {
+        if let Some(crate::memory::Object::String(gc)) =
+            Self::find_object_by_addr(heap, v.raw() as u64)
+        {
+            return heap.intern_ref(gc);
+        }
+        heap.intern_str("")
+    }
+
     /// Convert a runtime value to a display string (Show / `%v` / STRINGIFY).
     fn stringify_value(heap: &Heap, v: Value) -> String {
         let addr = v.raw() as u64;
@@ -885,6 +894,14 @@ impl<const S: usize> Machine<S> {
     /// [`Self::gc_collect`] so it survives the cycle.
     fn push_interned_string(&mut self, data: String) {
         let gc_string = self.heap.intern(data);
+        self.stack
+            .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+    }
+
+    fn push_program_string(&mut self, idx: usize) {
+        let data = unsafe { self.program_strings.get_unchecked(idx) };
+        let gc_string = self.heap.intern_str(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
         Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
@@ -2665,8 +2682,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::STRING => {
                     let idx = opcode.operand_u32() as usize;
                     promise!(idx < self.program_strings.len());
-                    let value = unsafe { self.program_strings.get_unchecked(idx) }.clone();
-                    self.push_interned_string(value);
+                    self.push_program_string(idx);
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
@@ -2683,16 +2699,12 @@ impl<const S: usize> Machine<S> {
                         continue;
                     }
 
-                    let mut values: Vec<Value> = Vec::with_capacity(arity);
+                    let mut payload: Vec<Member> = Vec::with_capacity(arity);
                     for _ in 0..arity {
                         if self.stack.tell() == 0 {
                             break;
                         }
-                        values.push(self.stack.pop());
-                    }
-
-                    let mut payload: Vec<Member> = Vec::with_capacity(values.len());
-                    for v in values {
+                        let v = self.stack.pop();
                         let addr = v.raw() as u64;
                         if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
                             payload.push(Member::Object(o));
@@ -2700,7 +2712,6 @@ impl<const S: usize> Machine<S> {
                             payload.push(Member::Value(v));
                         }
                     }
-
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
                     // Root before GC — unmarked fresh enums are swept otherwise
@@ -2763,12 +2774,12 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::MakeDict => {
                     let arity = (opcode.operand_u32() & 0xFFFF) as usize;
-                    let mut pairs: Vec<(String, Value)> = Vec::with_capacity(arity);
+                    let mut pairs: Vec<(crate::memory::RefString, Value)> =
+                        Vec::with_capacity(arity);
                     for _ in 0..arity {
                         let name_val = self.stack.pop();
                         let value = self.stack.pop();
-                        let name = Self::object_string_value(&self.heap, &name_val);
-                        pairs.push((name, value));
+                        pairs.push((Self::intern_key(&mut self.heap, name_val), value));
                     }
                     pairs.reverse();
                     // Allocate the instance and populate.
@@ -2776,8 +2787,7 @@ impl<const S: usize> Machine<S> {
                         self.heap.alloc(ObjInstance::default(), Object::Instance);
                     {
                         let instance: &mut ObjInstance = gc.as_mut();
-                        for (name, value) in pairs {
-                            let key = self.heap.intern(name);
+                        for (key, value) in pairs {
                             let member = if let Some(obj) =
                                 Self::find_object_by_addr(&self.heap, value.raw() as u64)
                             {
@@ -2794,11 +2804,10 @@ impl<const S: usize> Machine<S> {
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
                     let target_val = self.stack.pop();
-                    let name = Self::object_string_value(&self.heap, &name_val);
+                    let key = Self::intern_key(&mut self.heap, name_val);
                     let target_addr = target_val.raw() as u64;
                     let result = match Self::find_object_by_addr(&self.heap, target_addr) {
                         Some(crate::memory::Object::Instance(gc)) => {
-                            let key = self.heap.intern(name);
                             match gc.as_ref().get(key) {
                                 Some(crate::memory::Member::Value(v)) => v,
                                 // Heap objects (strings, nested dicts, enums, …)
@@ -2815,12 +2824,11 @@ impl<const S: usize> Machine<S> {
                     let name_val = self.stack.pop();
                     let target_val = self.stack.pop();
                     let value = self.stack.pop();
-                    let name = Self::object_string_value(&self.heap, &name_val);
+                    let key = Self::intern_key(&mut self.heap, name_val);
                     let target_addr = target_val.raw() as u64;
                     if let Some(crate::memory::Object::Instance(mut gc)) =
                         Self::find_object_by_addr(&self.heap, target_addr)
                     {
-                        let key = self.heap.intern(name);
                         let member = if let Some(obj) =
                             Self::find_object_by_addr(&self.heap, value.raw() as u64)
                         {
