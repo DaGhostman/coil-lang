@@ -6,10 +6,10 @@
 //! and can therefore move a callee frame over slots that are still live — see
 //! `docs/internals/limitations.md`.
 //!
-//! Modelled at the bytecode level rather than on `IlOp` so it can be checked
-//! against the VM directly: `tell_cursor_model_matches_vm` in
-//! `compiler/tests/cursor_model.rs` diffs every prediction against the real
-//! cursor recorded by `machine::cursor_trace`.
+//! The bytecode path is checked against the VM directly, while the symbolic-IL
+//! path feeds cursor-safe pre-lower optimizations. `tell_cursor_model_matches_vm`
+//! in `compiler/tests/cursor_model.rs` diffs every bytecode prediction against
+//! the real cursor recorded by `machine::cursor_trace`.
 //!
 //! **The cursor is not a per-PC constant.** A loop whose body stores to a higher
 //! slot each pass reaches its header with a different cursor on the back edge
@@ -22,6 +22,8 @@
 //! the validated per-op rules that such a relative analysis needs.
 
 use common::{Byte, Instruction};
+
+use super::op::{EntryKind, IlJumpKind, IlOp};
 
 /// Frame-relative cursor before an instruction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -72,6 +74,19 @@ impl TellInfo {
         }
         let known = self.tell_in.iter().filter(|t| t.known().is_some()).count();
         known as f64 / self.tell_in.len() as f64
+    }
+
+    /// True when deleting a one-value producer followed by `STORE slot` keeps
+    /// the shared cursor unchanged at the pair's continuation.
+    pub fn can_remove_one_value_store(&self, producer_idx: usize, slot: u32) -> bool {
+        let Some(before) = self.tell_before(producer_idx).known() else {
+            return false;
+        };
+        let after_store = apply(
+            Tell::Known(before.saturating_add(1)),
+            Effect::DeltaThenFloor(-1, slot.saturating_add(1)),
+        );
+        after_store == Some(Tell::Known(before))
     }
 }
 
@@ -222,12 +237,83 @@ fn is_unconditional_transfer(byte: &Byte) -> bool {
     )
 }
 
-/// Compute cursor-in per PC for one function body, seeded at `entry_tell`.
-///
-/// A function entry has its arguments already in slots `0..arity`, so the
-/// caller passes `arity` (`CALL` sets the callee frame base at `tell - arity`).
-pub fn analyze_at(code: &[Byte], pool: &[u64], entry: usize, entry_tell: u32) -> TellInfo {
-    let n = code.len();
+fn signed_arity_delta(arity: u32) -> i32 {
+    arity.min(i32::MAX as u32) as i32 - 1
+}
+
+fn effect_il(op: &IlOp, pool: &[u64]) -> Effect {
+    match op {
+        IlOp::StorePop { slot, .. } => Effect::DeltaThenFloor(-1, slot.saturating_add(1)),
+        IlOp::Entry { kind, arity, .. } => match kind {
+            EntryKind::Call | EntryKind::MakeCoro => Effect::Delta(signed_arity_delta(*arity)),
+            EntryKind::TailCall => Effect::Terminator,
+            EntryKind::CodePtr | EntryKind::MakePolyFn => Effect::Delta(1),
+        },
+        IlOp::PrologueJmp { .. } => Effect::Terminator,
+        IlOp::Byte { byte, .. } => effect(byte, pool),
+        IlOp::Jump { .. } => Effect::Unknown,
+        _ => match super::sp::stack_delta(op) {
+            Some(delta) => Effect::Delta(delta),
+            None => Effect::Unknown,
+        },
+    }
+}
+
+fn edge_effects_il(op: &IlOp, pool: &[u64]) -> (Effect, Effect) {
+    if let IlOp::Jump { kind, .. } = op {
+        return match kind {
+            IlJumpKind::Unconditional => (Effect::Delta(0), Effect::Delta(0)),
+            IlJumpKind::JumpIfFalse | IlJumpKind::JumpIfTrue => {
+                (Effect::Delta(-1), Effect::Delta(-1))
+            }
+            IlJumpKind::JumpIfMatch { arity, .. } => {
+                (Effect::Delta(0), Effect::Delta(signed_arity_delta(*arity)))
+            }
+        };
+    }
+    let effect = effect_il(op, pool);
+    (effect, effect)
+}
+
+fn il_jump_target(op: &IlOp, labels: &std::collections::HashMap<u32, usize>) -> Option<usize> {
+    match op {
+        IlOp::Jump { target, .. } => labels.get(&target.0).copied(),
+        _ => None,
+    }
+}
+
+fn il_is_unconditional_transfer(op: &IlOp) -> bool {
+    matches!(
+        op,
+        IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            ..
+        } | IlOp::Entry {
+            kind: EntryKind::TailCall,
+            ..
+        } | IlOp::PrologueJmp { .. }
+    ) || matches!(
+        op,
+        IlOp::Return { .. }
+            | IlOp::Halt { .. }
+            | IlOp::LoadReturnSlot { .. }
+            | IlOp::ConstReturnImm { .. }
+            | IlOp::BinReturn { .. }
+    ) || matches!(
+        op,
+        IlOp::Byte { byte, .. }
+            if is_unconditional_transfer(byte)
+    )
+}
+
+fn analyze_cfg(
+    n: usize,
+    entry: usize,
+    entry_tell: u32,
+    mut edge_effects: impl FnMut(usize) -> (Effect, Effect),
+    mut jump_target: impl FnMut(usize) -> Option<usize>,
+    mut is_unconditional_transfer: impl FnMut(usize) -> bool,
+) -> TellInfo {
     let mut tell_in: Vec<Option<Tell>> = vec![None; n];
     if entry < n {
         tell_in[entry] = Some(Tell::Known(entry_tell));
@@ -257,16 +343,15 @@ pub fn analyze_at(code: &[Byte], pool: &[u64], entry: usize, entry_tell: u32) ->
             let Some(before) = tell_in[pc] else {
                 continue;
             };
-            let byte = &code[pc];
-            let (fall_eff, branch_eff) = edge_effects(byte, pool);
+            let (fall_eff, branch_eff) = edge_effects(pc);
 
-            if let Some(target) = jump_target(byte, pool)
+            if let Some(target) = jump_target(pc)
                 && target < n
                 && let Some(edge) = apply(before, branch_eff)
             {
                 changed |= meet(&mut tell_in[target], edge);
             }
-            if !is_unconditional_transfer(byte)
+            if !is_unconditional_transfer(pc)
                 && pc + 1 < n
                 && let Some(edge) = apply(before, fall_eff)
             {
@@ -281,14 +366,53 @@ pub fn analyze_at(code: &[Byte], pool: &[u64], entry: usize, entry_tell: u32) ->
     TellInfo {
         tell_in: tell_in
             .into_iter()
-            .map(|t| t.unwrap_or(Tell::Unknown))
+            .map(|tell| tell.unwrap_or(Tell::Unknown))
             .collect(),
     }
+}
+
+/// Compute cursor-in per PC for one function body, seeded at `entry_tell`.
+///
+/// A function entry has its arguments already in slots `0..arity`, so the
+/// caller passes `arity` (`CALL` sets the callee frame base at `tell - arity`).
+pub fn analyze_at(code: &[Byte], pool: &[u64], entry: usize, entry_tell: u32) -> TellInfo {
+    analyze_cfg(
+        code.len(),
+        entry,
+        entry_tell,
+        |pc| edge_effects(&code[pc], pool),
+        |pc| jump_target(&code[pc], pool),
+        |pc| is_unconditional_transfer(&code[pc]),
+    )
+}
+
+/// Compute cursor-in per symbolic IL op, before lowering assigns PCs.
+///
+/// This is the optimizer-facing sibling of [`analyze_at`]. Symbolic labels
+/// make the CFG exact, while residual `Byte` ops reuse the bytecode rules.
+pub fn analyze_il_at(ops: &[IlOp], entry_tell: u32) -> TellInfo {
+    let labels: std::collections::HashMap<u32, usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| match op {
+            IlOp::Label(label) => Some((label.0, idx)),
+            _ => None,
+        })
+        .collect();
+    analyze_cfg(
+        ops.len(),
+        0,
+        entry_tell,
+        |idx| edge_effects_il(&ops[idx], &[]),
+        |idx| il_jump_target(&ops[idx], &labels),
+        |idx| il_is_unconditional_transfer(&ops[idx]),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::il::op::Label;
 
     fn store(slot: u32) -> Byte {
         Byte::new(Instruction::STORE).with_load_store_slot(slot)
@@ -372,6 +496,63 @@ mod tests {
         let info = analyze_at(&code, &[], 0, 3);
         assert_eq!(info.tell_before(0).known(), Some(3));
         assert_eq!(info.tell_before(1).known(), Some(4));
+    }
+
+    #[test]
+    fn symbolic_il_store_pair_proof_requires_existing_cursor_floor() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Return { loc },
+        ];
+
+        let low = analyze_il_at(&ops, 0);
+        assert!(!low.can_remove_one_value_store(0, 5));
+
+        let high = analyze_il_at(&ops, 6);
+        assert!(high.can_remove_one_value_store(0, 5));
+    }
+
+    /// Symbolic JMPF joins both edges with the same post-pop cursor.
+    #[test]
+    fn symbolic_il_jump_if_false_joins_both_edges() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 0);
+        // Const → 1; JMPF pops → 0 on fall-through and taken.
+        assert_eq!(info.tell_before(2).known(), Some(0));
+        assert_eq!(info.tell_before(3).known(), Some(0));
+    }
+
+    /// Unlike bytecode JumpIfMatch, IL carries arity so the taken edge is modelled.
+    #[test]
+    fn symbolic_il_jump_if_match_models_taken_edge_with_arity() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 2 },
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 3);
+        // Fall-through keeps cursor; taken edge applies arity-1 (= +1) → 4.
+        assert_eq!(info.tell_before(1).known(), Some(3));
+        assert_eq!(info.tell_before(2).known(), Some(4));
     }
 
     /// The cursor is genuinely not a per-PC constant: a loop that stores to a

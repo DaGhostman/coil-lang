@@ -15,6 +15,8 @@ pub struct OptimizeOptions {
     pub stack_dce: bool,
     /// `StorePop s; Load s` → `Dup; StorePop s`; dead-store elimination.
     pub mem_fwd: bool,
+    /// Forward pure producer copies through cursor-safe straight-line regions.
+    pub copy_prop: bool,
     /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
     pub algebraic: bool,
     /// Hoist invariant Const/Load out of Known-SP natural loops.
@@ -38,6 +40,7 @@ impl Default for OptimizeOptions {
             dead_block: true,
             stack_dce: true,
             mem_fwd: true,
+            copy_prop: true,
             algebraic: true,
             licm: true,
             return_convoy: true,
@@ -67,7 +70,13 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
     }
     if opts.mem_fwd {
         mem_fwd(ops, entry_sp);
-        dead_store(ops);
+    }
+    let entry_tell = entry_sp.max(0) as u32;
+    if opts.copy_prop {
+        copy_prop(ops, entry_tell);
+    }
+    if opts.mem_fwd {
+        dead_store_at(ops, entry_tell);
     }
     if opts.algebraic {
         super::algebraic::algebraic_simplify(ops);
@@ -157,7 +166,7 @@ mod convoy;
 mod dce;
 
 use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
-use dce::{dead_store, mem_fwd, stack_dce};
+use dce::{copy_prop, dead_store_at, mem_fwd, stack_dce};
 use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
 pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;

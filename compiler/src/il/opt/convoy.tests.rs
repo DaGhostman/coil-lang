@@ -1,7 +1,7 @@
     use super::*;
     use crate::il::opt::{OptimizeOptions, optimize_at, optimize_per_func};
     use crate::il::opt::cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
-    use crate::il::opt::dce::{dead_store, mem_fwd, stack_dce};
+    use crate::il::opt::dce::{copy_prop, dead_store, dead_store_at, mem_fwd, stack_dce};
     use common::{Byte, Instruction};
 
     fn is_insn(op: &IlOp, i: Instruction) -> bool {
@@ -1098,6 +1098,194 @@
     }
 
     #[test]
+    fn copy_prop_replaces_load_and_cursor_safe_dead_store() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+        dead_store_at(&mut ops, 3);
+
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], IlOp::Const { imm: 7, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn copy_prop_keeps_store_when_cursor_floor_is_needed() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Load { slot: 5, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 0);
+        dead_store_at(&mut ops, 0);
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. }))
+        );
+        assert!(matches!(ops[2], IlOp::Const { imm: 7, .. }));
+    }
+
+    #[test]
+    fn copy_prop_invalidates_bindings_when_dependencies_are_stored() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 0, loc },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Const { imm: 9, loc },
+            IlOp::StorePop { slot: 0, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[4], IlOp::Load { slot: 2, .. }));
+    }
+
+    #[test]
+    fn copy_prop_refuses_control_flow_boundaries() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[4], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_refuses_get_field_shape_sensitive_load() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::GetField { loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_refuses_make_array_after_pure_load_chain() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::MakeArray { arity: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_forwards_bin_slot_imm_producer() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 0,
+                imm: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(
+            ops[2],
+            IlOp::BinSlotImm {
+                slot: 0,
+                imm: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_prop_skips_self_alias_store_binding() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Load { slot: 1, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[2], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn copy_prop_clears_bindings_across_host_invoke() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::StorePop { slot: 1, loc },
+            IlOp::HostInvoke { arity: 0, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(ops[3], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn dead_store_keeps_store_before_opaque_byte_barrier() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Byte {
+                byte: Byte::new(Instruction::FfiInvoke).with_operand_u32(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+
+        dead_store_at(&mut ops, 4);
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 2, .. }))
+        );
+    }
+
+    #[test]
     fn dead_store_drops_dup_store_when_slot_unused() {
         let mut ops = vec![
             IlOp::Const {
@@ -1115,7 +1303,7 @@
                 loc: common::DebugLoc::unknown(),
             },
         ];
-        dead_store(&mut ops);
+        dead_store_at(&mut ops, 10);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Dup { .. })));
         assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
@@ -1182,7 +1370,7 @@
                 loc: common::DebugLoc::unknown(),
             },
         ];
-        dead_store(&mut ops);
+        dead_store_at(&mut ops, 9);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::ConstPool { .. })));
         assert!(matches!(ops[0], IlOp::Return { .. }));
@@ -1269,6 +1457,7 @@
                 dead_block: false,
                 stack_dce: false,
                 mem_fwd: true,
+                copy_prop: true,
                 algebraic: false,
                 licm: false,
                 return_convoy: false,
