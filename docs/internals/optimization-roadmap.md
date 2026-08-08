@@ -139,6 +139,20 @@ and function-pointer lookup operations:
 Keep this dependency optional in a new `coil-jit` crate or a `jit` feature.
 It should not be part of the default compiler or VM build.
 
+The first implementation slice is now present in [`coil-jit`](../../coil-jit):
+the default build is a disabled stub, while `--features cranelift` validates a
+linear `I64Function` IR and calls native `i64` add/sub/mul functions. It is
+connected to the optional `machine/jit` feature for hot direct
+`BinSlotSlot; RETURN`, `BinSlotImm; RETURN`, and the initial fused recursive
+Fibonacci shape. `translate_i64_bytecode` now centralizes the fused/unfused
+numeric and read-only array shapes, while VM helpers keep heap ownership in the
+interpreter. Broader `IlFunc` translation remains the next integration step.
+
+The same crate also contains the first hotness-policy scaffold:
+`JitConfig` and `HotCounters` request compilation once a configurable function
+entry threshold is reached. VM-side counter collection and native-entry
+installation are intentionally still separate.
+
 ```mermaid
 flowchart LR
   archive[".hyc bytecode"] --> counters["hot function / loop counters"]
