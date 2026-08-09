@@ -268,6 +268,9 @@ fn absolute_jump_targets(slots: &[Slot]) -> std::collections::HashSet<usize> {
 
 fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
     // Fuse-select order mirrors historical peephole try_fuse; JMPF targets stay symbolic.
+    if let Some(s) = try_fuse_float_chain_store(window, pool) {
+        return Some((s, 6));
+    }
     if let Some(s) = try_fuse_load_const_cmp_jmpf_slot(window) {
         return Some((s, 4));
     }
@@ -370,6 +373,41 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
         return Some((fused, n));
     }
     None
+}
+
+/// `LOAD a; LOAD b; float-bin1; LOAD c; float-bin2; STORE d` →
+/// `FloatChainStore`. The VM evaluates the two stages in source order.
+fn try_fuse_float_chain_store(window: &[Slot], pool: &mut Vec<u64>) -> Option<Slot> {
+    if window.len() < 6 {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    let b1 = slot_as_byte(&window[1])?;
+    let b2 = slot_as_byte(&window[2])?;
+    let b3 = slot_as_byte(&window[3])?;
+    let b4 = slot_as_byte(&window[4])?;
+    let b5 = slot_as_byte(&window[5])?;
+    let lhs = load_slot(&b0)?;
+    let rhs = load_slot(&b1)?;
+    let rhs2 = load_slot(&b3)?;
+    let op1 = *b2.bytecode();
+    let op2 = *b4.bytecode();
+    if !is_float_arith_op(op1) || !is_float_arith_op(op2) {
+        return None;
+    }
+    let dest = store_slot_u8(&b5)?;
+    let descriptor_idx = u16::try_from(pool.len()).ok()?;
+    let descriptor = (op1 as u64)
+        | ((lhs as u64) << 8)
+        | ((rhs as u64) << 16)
+        | ((op2 as u64) << 24)
+        | ((rhs2 as u64) << 32);
+    pool.push(descriptor);
+    let operand = ((dest as u32) << 16) | descriptor_idx as u32;
+    Some(Slot::Byte(
+        Byte::new(Instruction::FloatChainStore).with_operand_u32(operand),
+        window[0].loc(),
+    ))
 }
 
 fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
@@ -655,6 +693,17 @@ fn is_bin_op(i: Instruction) -> bool {
                 | Instruction::GEQF
                 | Instruction::PowF
         )
+}
+
+fn is_float_arith_op(i: Instruction) -> bool {
+    matches!(
+        i,
+        Instruction::ADDF
+            | Instruction::SUBF
+            | Instruction::MULF
+            | Instruction::DIVF
+            | Instruction::MODF
+    )
 }
 
 fn const_inline_value(byte: &Byte) -> Option<i32> {
@@ -1132,6 +1181,31 @@ mod tests {
         let packed = pool[idx];
         assert_eq!(packed >> 32, 0); // dest
         assert_eq!(packed as u16, 1); // imm
+    }
+
+    #[test]
+    fn lower_fuses_two_stage_float_chain_store() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(1));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(2));
+        il.push_byte(Byte::new(Instruction::SUBF));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(3));
+        il.push_byte(Byte::new(Instruction::ADDF));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(4));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::FloatChainStore
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u32() >> 16, 4);
+        let descriptor = pool[lowered.bytecode[0].operand_u32() as usize & 0xFFFF];
+        assert_eq!(descriptor as u8, Instruction::SUBF as u8);
+        assert_eq!((descriptor >> 8) as u8, 1);
+        assert_eq!((descriptor >> 16) as u8, 2);
+        assert_eq!((descriptor >> 24) as u8, Instruction::ADDF as u8);
+        assert_eq!((descriptor >> 32) as u8, 3);
     }
 
     #[test]

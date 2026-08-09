@@ -2080,6 +2080,95 @@
     }
 
     #[test]
+    fn float_chain_store_preserves_separate_operation_rounding() {
+        let a = 1.0 + 2f64.powi(-27);
+        let b = 1.0 - 2f64.powi(-27);
+        let c = -1.0;
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::ADDF as u64) << 24)
+            | (2_u64 << 32);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((3 << 16) | 3),
+                load(3),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(a).raw() as u64,
+                Value::from(b).raw() as u64,
+                Value::from(c).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+
+        // Separate MULF then ADDF rounds the product to 1.0 before adding -1.
+        assert_eq!(vm.pop().as_float(), 0.0);
+    }
+
+    #[test]
+    fn float_chain_store_preserves_special_float_values() {
+        let descriptor = (Instruction::ADDF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (2_u64 << 32);
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+            store_pop(0),
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+            store_pop(1),
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+            store_pop(2),
+            Byte::new(Instruction::FloatChainStore).with_operand_u32((3 << 16) | 3),
+            load(3),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &code,
+            &[
+                Value::from(-0.0_f64).raw() as u64,
+                Value::from(-0.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        let signed_zero = vm.pop().as_float();
+        assert_eq!(signed_zero, 0.0);
+        assert!(signed_zero.is_sign_negative());
+
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &code,
+            &[
+                Value::from(f64::NAN).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert!(vm.pop().as_float().is_nan());
+    }
+
+    #[test]
     fn vec_niche_pop_does_not_allocate_an_option_enum() {
         let mut vm = Machine::<16>::default();
         let (object, _) = vm.heap.alloc(

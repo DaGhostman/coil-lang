@@ -198,6 +198,7 @@ pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option
         }
         Instruction::TailCall => None,
         Instruction::HostInvoke | Instruction::HostInvokeNiche => Some(-1),
+        Instruction::FloatChainStore => Some(0),
         Instruction::PRINT | Instruction::GetField => Some(-1),
         Instruction::SetField => Some(-2),
         // STRING pushes the ObjString; DATA is a stack-neutral archive tombstone.

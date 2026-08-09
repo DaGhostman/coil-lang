@@ -285,6 +285,10 @@ pub enum Instruction {
     ReturnPair,
     /// Invoke a known host native that returns pointer-niche `Option<T>`.
     HostInvokeNiche,
+    /// Evaluate two source-ordered float binary stages and store the result.
+    /// The pool descriptor packs `(op1, lhs_slot, rhs_slot, op2, rhs2_slot)`;
+    /// the opcode operand packs the descriptor index and destination slot.
+    FloatChainStore,
 }
 
 impl From<u8> for Instruction {
@@ -427,6 +431,7 @@ impl Instruction {
             Self::HeapToPair => "HeapToPair",
             Self::ReturnPair => "ReturnPair",
             Self::HostInvokeNiche => "HostInvokeNiche",
+            Self::FloatChainStore => "FloatChainStore",
         }
     }
 }
@@ -1174,7 +1179,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::HostInvokeNiche as u8;
+        let last = Instruction::FloatChainStore as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1185,6 +1190,7 @@ mod tests {
         assert_eq!(Instruction::Seek.mnemonic(), "Seek");
         assert_eq!(Instruction::ReturnPair.mnemonic(), "ReturnPair");
         assert_eq!(Instruction::HostInvokeNiche.mnemonic(), "HostInvokeNiche");
+        assert_eq!(Instruction::FloatChainStore.mnemonic(), "FloatChainStore");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");

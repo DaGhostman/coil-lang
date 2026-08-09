@@ -1721,7 +1721,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::HostInvokeNiche as u8);
+            promise!(*bc as u8 <= Instruction::FloatChainStore as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2805,6 +2805,40 @@ impl<const S: usize> Machine<S> {
                         None => Value::default(),
                     };
                     self.stack.push(value);
+                }
+                Instruction::FloatChainStore => {
+                    let raw = opcode.operand_u32();
+                    let descriptor_idx = (raw & 0xFFFF) as usize;
+                    let dest = ((raw >> 16) & 0xFF) as usize;
+                    promise!(descriptor_idx < constants.len());
+                    let descriptor = unsafe { *constants.get_unchecked(descriptor_idx) };
+                    let op1 = descriptor as u8;
+                    let lhs_slot = (descriptor >> 8) as u8 as usize;
+                    let rhs_slot = (descriptor >> 16) as u8 as usize;
+                    let op2 = (descriptor >> 24) as u8;
+                    let rhs2_slot = (descriptor >> 32) as u8 as usize;
+                    promise!(sp + lhs_slot < stack_cap);
+                    promise!(sp + rhs_slot < stack_cap);
+                    promise!(sp + rhs2_slot < stack_cap);
+                    promise!(sp + dest < stack_cap);
+                    let bin = |op: u8, lhs: f64, rhs: f64| match Instruction::from(op) {
+                        Instruction::ADDF => lhs + rhs,
+                        Instruction::SUBF => lhs - rhs,
+                        Instruction::MULF => lhs * rhs,
+                        Instruction::DIVF => lhs / rhs,
+                        Instruction::MODF => lhs % rhs,
+                        _ => f64::NAN,
+                    };
+                    let first = bin(
+                        op1,
+                        self.stack[sp + lhs_slot].as_float(),
+                        self.stack[sp + rhs_slot].as_float(),
+                    );
+                    let result = bin(op2, first, self.stack[sp + rhs2_slot].as_float());
+                    self.stack[sp + dest] = Value::from(result);
+                    if self.stack.tell() <= sp + dest {
+                        self.stack.seek(sp + dest + 1);
+                    }
                 }
                 Instruction::HALT => {
                     if let Some(out) = self.output.as_mut() {
