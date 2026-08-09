@@ -12,7 +12,7 @@ OUT_DIR="${OUT_DIR:-/tmp/coil_perf_matrix}"
 RUN_MASSIF="${RUN_MASSIF:-0}"
 
 CROSS_LANG=(mandelbrot tak nsieve binary_trees)
-AOT_ONLY=(numeric operators_loop match_sum field_hot dict_hot array_mut)
+AOT_ONLY=(numeric operators_loop match_sum option_result field_hot dict_hot array_mut)
 declare -A EXPECTED=(
     [mandelbrot]=625885
     [tak]=7
@@ -21,6 +21,7 @@ declare -A EXPECTED=(
     [numeric]=1999000
     [operators_loop]=149912
     [match_sum]=7995
+    [option_result]=25328
     [field_hot]=4000000
     [dict_hot]=6000
     [array_mut]=2000
@@ -59,6 +60,33 @@ run_pooped() {
     printf '\n' >>"$OUT_DIR/README.md"
 }
 
+run_resource_sample() {
+    local name="$1"
+    shift
+    if [[ -x /usr/bin/time ]]; then
+        /usr/bin/time -f 'wall_seconds=%e\nmax_rss_kb=%M' \
+            bash -c "$*" >/dev/null 2>"$OUT_DIR/${name}.resource.txt"
+    else
+        local started finished pid rss max_rss=0
+        started="$(date +%s%N)"
+        bash -c "$*" >/dev/null &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            if [[ -r "/proc/$pid/status" ]]; then
+                rss="$(awk '/VmHWM:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)"
+                if [[ "${rss:-0}" -gt "$max_rss" ]]; then
+                    max_rss="$rss"
+                fi
+            fi
+        done
+        wait "$pid"
+        finished="$(date +%s%N)"
+        awk -v start="$started" -v end="$finished" -v rss="$max_rss" \
+            'BEGIN { printf "wall_seconds=%.6f\nmax_rss_kb=%s\n", (end-start)/1000000000, rss }' \
+            >"$OUT_DIR/${name}.resource.txt"
+    fi
+}
+
 check_archive() {
     local name="$1"
     local archive="$2"
@@ -80,6 +108,7 @@ for name in "${CROSS_LANG[@]}"; do
         "$BIN run $archive" \
         "lua benchmarks/${name}.lua" \
         "node benchmarks/${name}.js"
+    run_resource_sample "$name" "$BIN run $archive"
 
     if [[ "$RUN_MASSIF" == 1 ]] && command -v valgrind >/dev/null 2>&1; then
         valgrind --tool=massif \
@@ -94,6 +123,7 @@ for name in "${AOT_ONLY[@]}"; do
     touch "$archive"
     check_archive "$name" "$archive"
     run_pooped "$name" "$BIN run $archive"
+    run_resource_sample "$name" "$BIN run $archive"
 
     if [[ "$RUN_MASSIF" == 1 ]] && command -v valgrind >/dev/null 2>&1; then
         valgrind --tool=massif \

@@ -4283,6 +4283,104 @@ fn main() {
 }
 
 #[test]
+fn pointer_niche_option_match_and_coalesce() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn show(Option<string> value) -> string {
+    return match value {
+        Option::Some(text) => text,
+        Option::None => "none",
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%s,%s", show(Option::Some("ok")), show(Option::None))));
+}
+"#,
+    );
+    assert_eq!(output, "ok,none");
+}
+
+#[test]
+fn direct_result_pair_match_and_try() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn parse(int value) {
+    if value < 0 {
+        raise "bad";
+    }
+    return value;
+}
+fn inc(int value) {
+    let parsed = parse(value)?;
+    return parsed + 1;
+}
+fn main() {
+    let ok = match parse(4) {
+        Result::Ok(value) => value,
+        Result::Err(_) => -1,
+    };
+    let bad = match inc(-1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    let direct_bad = match parse(-1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    write(
+        stdout(),
+        to_bytes(format("%i,%i,%i", ok, bad, direct_bad)),
+    );
+}
+"#,
+    );
+    assert_eq!(output, "4,1,1");
+}
+
+#[test]
+fn custom_iterator_uses_pointer_niche_option() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class TextCounter {
+    cur: int,
+    end: int,
+    text: string,
+}
+impl IntoIterator<TextCounter> {
+    type Item = string;
+    type IntoIter = TextCounter;
+    fn into_iter(TextCounter value) -> TextCounter {
+        return value;
+    }
+}
+impl Iterator<TextCounter> {
+    type Item = string;
+    fn next(TextCounter value) -> Option<string> {
+        if value.cur < value.end {
+            value.cur = value.cur + 1;
+            return Option::Some(value.text);
+        }
+        return Option::None;
+    }
+}
+fn main() {
+    let value = new TextCounter(0, 2, "x");
+    for text in value {
+        write(stdout(), to_bytes(format("%s", text)));
+    }
+}
+"#,
+    );
+    assert_eq!(output, "xx");
+}
+
+#[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
     assert_eq!(output, "42");

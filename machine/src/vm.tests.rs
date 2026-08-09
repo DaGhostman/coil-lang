@@ -2042,6 +2042,63 @@
     }
 
     #[test]
+    fn option_niche_round_trip_preserves_heap_payload() {
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::STRING).with_operand_u32(0),
+                Byte::new(Instruction::OptionNicheToHeap),
+                Byte::new(Instruction::HeapOptionToNiche),
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+            &["ok".to_string()],
+            0,
+        );
+        let value = vm.pop();
+        match vm.heap().find_object_by_addr(value.raw() as u64) {
+            Some(Object::String(string)) => assert_eq!(string.as_ref().data, "ok"),
+            other => panic!(
+                "niche round-trip lost string payload (object present: {})",
+                other.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn pair_box_round_trip_preserves_tag_and_payload() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            Byte::new(Instruction::PairToHeap),
+            Byte::new(Instruction::HeapToPair),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    #[test]
+    fn vec_niche_pop_does_not_allocate_an_option_enum() {
+        let mut vm = Machine::<16>::default();
+        let (object, _) = vm.heap.alloc(
+            ObjArray {
+                elements: vec![Value::from(7_i64)],
+            },
+            Object::Array,
+        );
+        let before = vm.heap.live_object_count();
+        let value = crate::vec_ops::host_vec_pop_niche(
+            &mut vm.heap,
+            &[Value::from(object.addr())],
+        );
+
+        assert_eq!(value.as_int(), 7);
+        assert_eq!(vm.heap.live_object_count(), before);
+    }
+
+    #[test]
     fn inc_prefix_returns_new_value() {
         let mut vm = Machine::<8>::default();
         vm.run(&[

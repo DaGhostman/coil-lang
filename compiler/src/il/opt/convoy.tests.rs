@@ -1146,6 +1146,39 @@
     }
 
     #[test]
+    fn stack_dce_threads_direct_constructor_match() {
+        let loc = common::DebugLoc::unknown();
+        let target = crate::il::op::Label(7);
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 1,
+                arity: 1,
+                loc,
+            },
+            IlOp::Jump {
+                kind: crate::il::op::IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
+                target,
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(
+            ops[1],
+            IlOp::Jump {
+                kind: crate::il::op::IlJumpKind::Unconditional,
+                target: crate::il::op::Label(7),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn mem_fwd_store_pop_load_becomes_dup_store() {
         // Need height before StorePop > slot+1 (cursor-safe Dup;Store).
         let loc = common::DebugLoc::unknown();
