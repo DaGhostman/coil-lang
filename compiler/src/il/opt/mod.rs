@@ -54,14 +54,14 @@ impl Default for OptimizeOptions {
 
 /// Run IL opts in place. Safe to call before [`super::lower`].
 ///
-/// Pass the const pool when available so algebraic float identities can read
-/// `ConstPool` bits; `&[]` disables those peeps only.
-pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, pool: &[u64]) {
+/// Pass the const pool when available so algebraic float peeps can read
+/// `ConstPool` bits and push folded IEEE results; an empty vec disables those.
+pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, pool: &mut Vec<u64>) {
     optimize_at(ops, opts, 0, pool);
 }
 
 /// Like [`optimize`], seeding SP analysis at `entry_sp` for the op buffer.
-pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, pool: &[u64]) {
+pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, pool: &mut Vec<u64>) {
     if opts.jump_thread {
         jump_thread(ops);
     }
@@ -122,7 +122,7 @@ pub fn optimize_per_func(
     ops: &mut Vec<IlOp>,
     funcs: &[super::IlFunc],
     opts: &OptimizeOptions,
-    pool: &[u64],
+    pool: &mut Vec<u64>,
 ) {
     if funcs.is_empty() {
         optimize(ops, opts, pool);

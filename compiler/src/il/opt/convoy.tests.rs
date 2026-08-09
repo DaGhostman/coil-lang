@@ -1648,7 +1648,7 @@
                 invert_guard_branch: false,
             },
             3,
-            &[],
+            &mut Vec::new(),
         );
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Load { .. })));
@@ -3251,7 +3251,7 @@
             },
         ];
         let funcs = vec![crate::il::IlFunc::new("f", None, 2, 6)];
-        optimize_per_func(&mut ops, &funcs, &OptimizeOptions::default(), &[]);
+        optimize_per_func(&mut ops, &funcs, &OptimizeOptions::default(), &mut Vec::new());
 
         assert!(
             matches!(ops[0], IlOp::Dup { .. }) && matches!(ops[1], IlOp::Pop { .. }),

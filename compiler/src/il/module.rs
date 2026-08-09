@@ -118,8 +118,8 @@ impl IlModule {
     /// whole-buffer [`opt::multi_op_join_convoy`] on the concatenated stream.
     ///
     /// `pool` is the module const pool (`f64` / boxed int bits) for algebraic
-    /// float identity peeps.
-    pub fn optimize_and_flatten(&mut self, opts: &OptimizeOptions, pool: &[u64]) -> Vec<IlOp> {
+    /// float identity / const-fold peeps (may push folded float results).
+    pub fn optimize_and_flatten(&mut self, opts: &OptimizeOptions, pool: &mut Vec<u64>) -> Vec<IlOp> {
         let mut per = opts.clone();
         let run_multi = per.multi_op_join_convoy;
         per.multi_op_join_convoy = false;
@@ -254,7 +254,7 @@ mod tests {
             ],
             ..IlModule::default()
         };
-        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &[]);
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &mut Vec::new());
         assert!(!flat.iter().any(|op| matches!(op, IlOp::Dup { .. })));
         assert!(flat.iter().any(
             |op| matches!(op, IlOp::ConstReturnImm { .. }) || matches!(op, IlOp::Return { .. })
@@ -278,7 +278,7 @@ mod tests {
                 multi_op_join_convoy: false,
                 ..OptimizeOptions::default()
             },
-            &[],
+            &mut Vec::new(),
         );
         assert!(matches!(flat[0], IlOp::Dup { .. }));
         assert!(matches!(flat[1], IlOp::Pop { .. }));
@@ -325,7 +325,7 @@ mod tests {
 
         let funcs = vec![IlFunc::new("f", None, 1, body_emit_end)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &[]);
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &mut Vec::new());
         let loads = flat
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))
@@ -376,7 +376,7 @@ mod tests {
                 multi_op_join_convoy: true,
                 invert_guard_branch: false,
             },
-            &[],
+            &mut Vec::new(),
         );
         let loads = flat
             .iter()
