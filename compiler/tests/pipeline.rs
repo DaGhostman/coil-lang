@@ -4235,6 +4235,29 @@ fn main() {
     assert_eq!(output, "12");
 }
 
+/// MakeEnum one-pass payload build must keep mixed Value/Object order for match.
+#[test]
+fn make_enum_mixed_payload_survives_match() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Pair {
+    Both(int, string),
+}
+fn describe(Pair p) -> int {
+    return match p {
+        Pair::Both(n, s) => n + len(s),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", describe(Pair::Both(7, "abcd")))));
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
 #[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
