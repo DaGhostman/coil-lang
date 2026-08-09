@@ -1234,6 +1234,33 @@
     }
 
     #[test]
+    fn copy_prop_forwards_bin_slot_slot_producer() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotSlot {
+                op: Instruction::ADD as u8,
+                a: 0,
+                b: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(
+            ops[2],
+            IlOp::BinSlotSlot {
+                a: 0,
+                b: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn copy_prop_forwards_string_producer_and_drops_copy_store() {
         let loc = common::DebugLoc::unknown();
         let mut ops = vec![
@@ -1259,6 +1286,26 @@
                 op: Instruction::ADD as u8,
                 slot: 0,
                 imm: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        dead_store_at(&mut ops, 3);
+
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn dead_store_removes_unused_bin_slot_slot_producer_when_cursor_allows() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotSlot {
+                op: Instruction::SUB as u8,
+                a: 0,
+                b: 1,
                 loc,
             },
             IlOp::StorePop { slot: 2, loc },
