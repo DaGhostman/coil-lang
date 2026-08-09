@@ -17,6 +17,8 @@ pub struct OptimizeOptions {
     pub mem_fwd: bool,
     /// Forward pure producer copies through cursor-safe straight-line regions.
     pub copy_prop: bool,
+    /// Promote slots to virtual values (straight-line + same-def joins).
+    pub slot_promote: bool,
     /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
     pub algebraic: bool,
     /// Hoist invariant Const/Load out of Known-SP natural loops.
@@ -41,6 +43,7 @@ impl Default for OptimizeOptions {
             stack_dce: true,
             mem_fwd: true,
             copy_prop: true,
+            slot_promote: true,
             algebraic: true,
             licm: true,
             return_convoy: true,
@@ -88,6 +91,11 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
         let _ = entry_sp;
         super::licm::licm(ops);
+    }
+    // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
+    if opts.slot_promote {
+        slot_promote(ops, entry_tell);
+        dead_store_at(ops, entry_tell);
     }
     if opts.clone_shared_return {
         clone_shared_return(ops);
@@ -172,9 +180,11 @@ pub(crate) fn emitting_range_to_raw(
 mod cfg;
 mod convoy;
 mod dce;
+mod slot_promote;
 
 use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
 use dce::{copy_prop, dead_store_at, mem_fwd, stack_dce};
 use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
+use slot_promote::slot_promote;
 pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;

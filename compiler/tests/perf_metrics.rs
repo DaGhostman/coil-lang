@@ -331,3 +331,70 @@ fn perf_mandelbrot_hoists_invariant_ci_out_of_x_loop() {
         "x-loop prefix should keep only cr's SUBF; ci SUBF must be hoisted (got {subf})"
     );
 }
+
+#[test]
+fn perf_mandelbrot_slot_promote_drops_ci_temp_copy() {
+    // LICM hoists `ci` into a temp; slot promotion must rewrite uses to that
+    // temp and elide the per-pixel `LOAD temp; STORE ci` copy.
+    let (bc, pool, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    let body = &bc[start..end];
+
+    let mut copy_temp_to_local = false;
+    for i in 0..body.len().saturating_sub(1) {
+        if *body[i].bytecode() != Instruction::LOAD {
+            continue;
+        }
+        if body[i].load_store_single_slot() != Some(15) {
+            continue;
+        }
+        if matches!(
+            *body[i + 1].bytecode(),
+            Instruction::STORE | Instruction::StorePop
+        ) && body[i + 1].load_store_single_slot() == Some(6)
+        {
+            copy_temp_to_local = true;
+            break;
+        }
+    }
+    assert!(
+        !copy_temp_to_local,
+        "slot promote should drop LOAD 15; STORE 6 after rewriting ci uses"
+    );
+
+    // zi FloatChainStore should read the hoisted temp (15), not local slot 6.
+    let mut zi_uses_temp = false;
+    for b in body {
+        if *b.bytecode() != Instruction::FloatChainStore {
+            continue;
+        }
+        let op = b.operand_u32();
+        let dest = (op >> 16) as u8;
+        let di = (op & 0xffff) as usize;
+        if dest != 8 || di >= pool.len() {
+            continue;
+        }
+        let d = pool[di];
+        let rhs2 = ((d >> 48) & 0xff) as u8;
+        if rhs2 == 15 {
+            zi_uses_temp = true;
+        }
+    }
+    assert!(
+        zi_uses_temp,
+        "zi FloatChainStore should consume hoisted ci temp slot 15"
+    );
+
+    let loads = count_opcodes_in(&bc, start, end, Instruction::LOAD);
+    let stores = count_opcodes_in(&bc, start, end, Instruction::STORE)
+        + count_opcodes_in(&bc, start, end, Instruction::StorePop);
+    assert!(
+        loads <= 6,
+        "mandelbrot LOAD count regressed after slot promote: {loads}"
+    );
+    assert!(
+        stores <= 10,
+        "mandelbrot STORE count regressed after slot promote: {stores}"
+    );
+}

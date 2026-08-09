@@ -1639,6 +1639,7 @@
                 stack_dce: false,
                 mem_fwd: true,
                 copy_prop: true,
+                slot_promote: false,
                 algebraic: false,
                 licm: false,
                 return_convoy: false,

@@ -1195,6 +1195,7 @@ mod tests {
                 stack_dce: false,
                 mem_fwd: false,
                 copy_prop: false,
+                slot_promote: false,
                 algebraic: true,
                 licm: false,
                 return_convoy: false,
