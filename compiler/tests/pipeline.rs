@@ -2444,6 +2444,12 @@ fn example_perf_numeric_prints_expected_sum() {
 }
 
 #[test]
+fn example_perf_mandelbrot_prints_checksum() {
+    let output = run_example("examples/perf/mandelbrot.hy");
+    assert_eq!(output, "625885");
+}
+
+#[test]
 fn example_perf_array_mut_prints_expected() {
     let output = run_example("examples/perf/array_mut.hy");
     assert_eq!(output, "2000");

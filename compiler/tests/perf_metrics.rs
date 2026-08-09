@@ -227,3 +227,14 @@ fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
         "zr*zr and zi*zi should each fuse to one self-MULF op, got {self_mulf}"
     );
 }
+
+#[test]
+fn perf_mandelbrot_fuses_source_order_float_chain() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    assert!(
+        count_opcodes_in(&bc, start, end, Instruction::FloatChainStore) >= 1,
+        "Mandelbrot should fuse a source-ordered two-stage float store"
+    );
+}

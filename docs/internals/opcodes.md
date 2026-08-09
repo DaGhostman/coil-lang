@@ -15,6 +15,7 @@ User code does not name these directly; the compiler emits them:
 | `PairToHeap` / `HeapToPair` | Box or unbox a unary `[payload, tag]` pair |
 | `ReturnPair` | Return a unary pair without changing `Value` |
 | `Panic` | Abort after writing `panic: <msg>` |
+| `FloatChainStore` | Execute two source-ordered float stages and store the result |
 
 ---
 

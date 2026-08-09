@@ -15,7 +15,7 @@ How a `.hy` program becomes running bytecode on the VM.
 AST + HM → Stack IL (labels) → IL opts → lower/fuse-select → Vec<Byte> → .hyc → VM
 ```
 
-The IL is **compile-time only**; the VM implements the representation-boundary opcodes and archive minor 4 records them.
+The IL is **compile-time only**; the VM implements the representation-boundary and numeric-chain opcodes and archive minor 5 records them.
 
 ## Cache and rebuild
 
