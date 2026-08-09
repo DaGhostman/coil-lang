@@ -40,6 +40,8 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 **Float magnitude compare fusion.** `BinSlotSlotConstJmpf` fuses `BinSlotSlot <float-arith>; CONST pool; <float-cmp>; JMPF` (mandelbrot `zr2 + zi2 > 4.0`) into one dispatch. Source-ordered evaluation only; no FMA/reassoc.
 
+**Algebraic float identities.** Known-SP algebraic peeps fold `x + 0.0` / `0.0 + x` → `x` and `x * 1.0` / `1.0 * x` → `x` only when the constant is a **known exact finite** const-pool literal with the `+0.0` or `+1.0` bit pattern. Missing/unknown pool entries, non-const operands, NaN, and −0.0 are refused. `x - 0.0` → `x` and `x * 0.0` → `0.0` are intentionally not rewritten (signed zero / NaN). Folding float binops into a new const-pool result is not covered here.
+
 **Class temporary scalar replacement.** Direct `new Class(args).field` expressions now evaluate constructor arguments in order and return the selected argument without allocating an intermediate instance. Named local instances remain heap-backed until a broader escape/alias analysis can prove that methods, calls, mutation, and object identity are unobservable.
 
 Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially against the VM; any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test.

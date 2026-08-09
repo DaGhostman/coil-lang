@@ -53,12 +53,15 @@ impl Default for OptimizeOptions {
 }
 
 /// Run IL opts in place. Safe to call before [`super::lower`].
-pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
-    optimize_at(ops, opts, 0);
+///
+/// Pass the const pool when available so algebraic float identities can read
+/// `ConstPool` bits; `&[]` disables those peeps only.
+pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, pool: &[u64]) {
+    optimize_at(ops, opts, 0, pool);
 }
 
 /// Like [`optimize`], seeding SP analysis at `entry_sp` for the op buffer.
-pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
+pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, pool: &[u64]) {
     if opts.jump_thread {
         jump_thread(ops);
     }
@@ -79,7 +82,7 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
         dead_store_at(ops, entry_tell);
     }
     if opts.algebraic {
-        super::algebraic::algebraic_simplify(ops);
+        super::algebraic::algebraic_simplify(ops, pool);
     }
     if opts.licm {
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
@@ -115,14 +118,19 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
 /// Whole-buffer [`multi_op_join_convoy`] is required: scoped multi_op can treat
 /// JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
 #[allow(dead_code)]
-pub fn optimize_per_func(ops: &mut Vec<IlOp>, funcs: &[super::IlFunc], opts: &OptimizeOptions) {
+pub fn optimize_per_func(
+    ops: &mut Vec<IlOp>,
+    funcs: &[super::IlFunc],
+    opts: &OptimizeOptions,
+    pool: &[u64],
+) {
     if funcs.is_empty() {
-        optimize(ops, opts);
+        optimize(ops, opts, pool);
         return;
     }
 
     let mut module = super::IlModule::from_flat(ops, funcs);
-    *ops = module.optimize_and_flatten(opts);
+    *ops = module.optimize_and_flatten(opts, pool);
 }
 
 /// Map inclusive-exclusive emitting indices to a raw op range, including

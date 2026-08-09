@@ -119,7 +119,7 @@ pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> 
 ///
 /// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
 pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
-    let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default());
+    let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default(), pool);
     lower_optimized(&flat, pool)
 }
 
