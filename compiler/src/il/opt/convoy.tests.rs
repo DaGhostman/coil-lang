@@ -1083,6 +1083,69 @@
     }
 
     #[test]
+    fn stack_dce_drops_discarded_enum_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 2,
+                loc,
+            },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_unwraps_unary_enum_without_heap_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 1,
+                loc,
+            },
+            IlOp::byte(Byte::new(Instruction::Unpack).with_operand_u32(1)),
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_reads_unary_enum_field_without_heap_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 1,
+                loc,
+            },
+            IlOp::LoadField { index: 0, loc },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
     fn mem_fwd_store_pop_load_becomes_dup_store() {
         // Need height before StorePop > slot+1 (cursor-safe Dup;Store).
         let loc = common::DebugLoc::unknown();

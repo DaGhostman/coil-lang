@@ -4259,6 +4259,30 @@ fn main() {
 }
 
 #[test]
+fn direct_enum_consumers_avoid_heap_construction() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Choice {
+    Value(int),
+}
+enum Point {
+    Point { x: int },
+}
+fn main() {
+    let unwrapped = match Choice::Value(42) {
+        Choice::Value(value) => value,
+    };
+    let field = Point::Point { x: 9 }.x;
+    write(stdout(), to_bytes(format("%i,%i", unwrapped, field)));
+}
+"#,
+    );
+    assert_eq!(output, "42,9");
+}
+
+#[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
     assert_eq!(output, "42");
