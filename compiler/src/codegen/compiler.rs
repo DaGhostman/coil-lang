@@ -6684,6 +6684,60 @@ impl Compiler {
             .expect("BlockBuilder::finalize: for-in custom labels bound");
     }
 
+    /// Replace `new Class(args).field` with the selected constructor argument.
+    ///
+    /// The temporary object has no observable identity because it is consumed
+    /// immediately. Arguments still evaluate in declaration order and are
+    /// staged into slots so non-selected arguments retain their side effects.
+    fn try_emit_direct_class_field_access(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        receiver: &Output<'_>,
+        field: &str,
+    ) -> bool {
+        let receiver = match receiver.1.as_ref() {
+            Expression::Group(inner) | Expression::Expr(inner) => inner,
+            _ => receiver,
+        };
+        let Expression::Instantiate(class, Some(args)) = receiver.1.as_ref() else {
+            return false;
+        };
+        let Expression::Identifier(class_name) = class.1.as_ref() else {
+            return false;
+        };
+        if self.decorated_class_ctors.contains_key(*class_name) {
+            return false;
+        }
+        if args.iter().any(|arg| self.arg_emits_on_self_bytecode(arg)) {
+            return false;
+        }
+        let Some(fields) = self.context.classes.get(*class_name).cloned() else {
+            return false;
+        };
+        if args.len() != fields.len() {
+            return false;
+        }
+        let Some((field_index, _)) = fields
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| name == field)
+        else {
+            return false;
+        };
+
+        let mut arg_slots = Vec::with_capacity(args.len());
+        for arg in args {
+            let mut arg_bc = Vec::new();
+            self.append_with_existential_pack(&mut arg_bc, arg);
+            bytecode.append(&mut arg_bc);
+            let slot = self.alloc_temp_slot();
+            bytecode.push_store_pop(slot);
+            arg_slots.push(slot);
+        }
+        bytecode.push_load(arg_slots[field_index]);
+        true
+    }
+
     fn emit_field_name(&mut self, bytecode: &mut impl EmitBuf, field: &str) {
         if let Some(&slot) = self.field_key_slots.get(field) {
             bytecode.push_load(slot);
@@ -10903,6 +10957,9 @@ impl Compiler {
             // receiver bytecode + LoadField(index) or GetField(name) for
             // dicts / class instances.
             Expression::Access(receiver, field) => {
+                if self.try_emit_direct_class_field_access(&mut bytecode, receiver, field) {
+                    return bytecode;
+                }
                 bytecode.append(&mut self.do_compile(receiver));
 
                 let receiver_ty = self.receiver_type(receiver);

@@ -4289,6 +4289,49 @@ fn main() {
 }
 
 #[test]
+fn direct_class_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    let x = new Point(5, 6).x;
+    write(stdout(), to_bytes(format("%i", x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("class field source");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "direct class field access should not allocate or touch fields"
+    );
+}
+
+#[test]
 fn pointer_niche_option_match_and_coalesce() {
     let output = run_example_src(
         r#"

@@ -38,6 +38,8 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 **Float-chain fusion.** `FloatChainStore` fuses two source-ordered float binary stages into one dispatch when all operands are local slots and the result is stored. It does not reassociate operations, use FMA, or fuse chains with calls, memory effects, unknown cursor state, or non-float arithmetic.
 
+**Class temporary scalar replacement.** Direct `new Class(args).field` expressions now evaluate constructor arguments in order and return the selected argument without allocating an intermediate instance. Named local instances remain heap-backed until a broader escape/alias analysis can prove that methods, calls, mutation, and object identity are unobservable.
+
 Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially against the VM; any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test.
 
 **`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`.
