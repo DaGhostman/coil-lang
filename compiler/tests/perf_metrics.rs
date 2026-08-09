@@ -64,6 +64,59 @@ fn run_dispatch(
 }
 
 #[test]
+fn perf_tak_direct_calls_no_call_indirect() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/tak.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "tak", bc.len());
+    let call_indirect = count_opcodes_in(&bc, start, end, Instruction::CallIndirect);
+    let calls = count_opcodes_in(&bc, start, end, Instruction::CALL);
+    let tails = count_opcodes_in(&bc, start, end, Instruction::TailCall);
+    assert_eq!(
+        call_indirect, 0,
+        "tak must stay on direct CALL/TailCall (got CallIndirect={call_indirect})"
+    );
+    assert!(
+        calls >= 3,
+        "tak recursive arms should use CALL; got {calls}"
+    );
+    assert!(
+        tails >= 1,
+        "tak outer recursion should TailCall; got {tails}"
+    );
+    // Self-recursive peels: each nested CALL is guarded by a fused compare+branch.
+    let body = &bc[start..end];
+    let peel_guards = body
+        .iter()
+        .filter(|b| {
+            matches!(
+                *b.bytecode(),
+                Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::CmpJmpf
+                    | Instruction::JMPF
+            )
+        })
+        .count();
+    assert!(
+        peel_guards >= 4,
+        "tak should keep entry guard + 3 self-peels; guards={peel_guards}; ops={:?}",
+        body.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn perf_tak_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/tak.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    // tak(18,12,6) is deep recursion; peels skip base-case frames.
+    // Measured ~1.5–3M dispatches on debug Machine; keep headroom.
+    assert!(
+        dispatches < 4_000_000,
+        "tak dispatch count regressed: {dispatches}"
+    );
+}
+
+#[test]
 fn perf_numeric_uses_bin_slot_imm_jmpf_for_loop() {
     let (bc, _, _, _, _) = compile("examples/perf/numeric.hy");
     assert!(

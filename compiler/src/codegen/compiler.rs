@@ -1059,15 +1059,39 @@ impl Compiler {
         }
     }
 
+    /// Resolve a function body byte span, including provisional self-bodies.
+    ///
+    /// While a function is still streaming into `self.bytecode`, the span is
+    /// recorded as `(start, start)`. Callers then use `bytecode.len()` as the
+    /// live end so self-recursive peels can see the opening predicate.
+    /// The third flag is `true` when the body is still incomplete (no "rest"
+    /// required for peel matching).
+    fn resolve_fn_span(&self, fqn: &str) -> Option<(usize, usize, bool)> {
+        let &(start, end) = self.fn_bytecode_spans.get(fqn)?;
+        if end > start {
+            return Some((start, end, false));
+        }
+        let cur = self.bytecode.len();
+        if cur > start {
+            Some((start, cur, true))
+        } else {
+            None
+        }
+    }
+
     fn try_inline_direct_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        // Incomplete self-bodies are not safe to tiny-inline (missing else/rest).
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
+        if provisional {
+            return false;
+        }
         let lookup = strip_overload_key(fqn).to_string();
         if self.checker.fn_has_rest(&lookup) {
             return false;
@@ -1185,9 +1209,13 @@ impl Compiler {
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        // Need a finished body: mid-compile self-unroll would copy a partial CFG.
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
+        if provisional {
+            return false;
+        }
         let lookup = strip_overload_key(fqn).to_string();
         if self.checker.fn_has_rest(&lookup) {
             return false;
@@ -1268,7 +1296,7 @@ impl Compiler {
         target_offset: u32,
         is_indirect: bool,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
         let lookup = strip_overload_key(fqn).to_string();
@@ -1282,7 +1310,7 @@ impl Compiler {
             return false;
         }
         let ops = self.bytecode.code_slice_raw_ops(start, end);
-        let Some(peel) = Self::match_predicate_peel_shape(&ops) else {
+        let Some(peel) = Self::match_predicate_peel_shape(&ops, !provisional) else {
             return false;
         };
         drop(ops);
@@ -1396,7 +1424,10 @@ impl Compiler {
 
     /// Opening shape: `cond…; JumpIfFalse; (Const|Load) [; Return]; Label? …`
     /// with an imm/slot base return. `arity_hint` is 1 + max slot referenced.
-    fn match_predicate_peel_shape(ops: &[IlOp]) -> Option<PredicatePeel> {
+    ///
+    /// When `require_rest` is false (provisional self-body), accept an opening
+    /// early-return even if the recursive remainder has not been emitted yet.
+    fn match_predicate_peel_shape(ops: &[IlOp], require_rest: bool) -> Option<PredicatePeel> {
         // Skip leading labels.
         let mut i = 0usize;
         while i < ops.len() && matches!(ops[i], IlOp::Label(_)) {
@@ -1547,11 +1578,14 @@ impl Compiler {
             (v, end)
         };
         // After then-arm there should be more body (otherwise tiny-inline diamond
-        // would have taken it). Require at least one emitting op past the peel.
+        // would have taken it). Require at least one emitting op past the peel
+        // unless this is a provisional self-body (rest not emitted yet).
         let after = then_end + 1;
-        let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
-        if !has_rest {
-            return None;
+        if require_rest {
+            let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
+            if !has_rest {
+                return None;
+            }
         }
         let mut arity_hint = 0usize;
         let bump_slot = |slot: u32, hint: &mut usize| {
@@ -2916,6 +2950,15 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
+    /// Direct `CALL` when the callee entry is statically known (no stack target).
+    ///
+    /// Prefer this over [`Self::emit_call_indirect`] for ground method / instance
+    /// thunks: same frame ABI, one fewer dispatch, no `CodePtr` materialization.
+    /// Keep `CallIndirect` for PolyFn / locals / dictionary `Index` targets.
+    fn emit_known_target_call(bytecode: &mut impl EmitBuf, target_offset: u32, arity: u32) {
+        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(arity, target_offset));
+    }
+
     /// Lower an operator selected by HM inference to the uniform dictionary
     /// calling convention: two boxed values, the hidden trailing dictionary,
     /// then its method entry loaded from the dictionary tuple.
@@ -3718,7 +3761,7 @@ impl Compiler {
         bytecode.push_store_pop(rhs_slot);
         bytecode.push_load(lhs_slot);
         bytecode.push_load(rhs_slot);
-        Self::emit_call_indirect(bytecode, offset as u32, 2);
+        Self::emit_known_target_call(bytecode, offset as u32, 2);
         true
     }
 
@@ -4139,7 +4182,7 @@ impl Compiler {
                 self.bytecode.append(&mut arg_bc);
                 // Box using the lookup head so enum Constructs get Enum tag.
                 Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
-                Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                Self::emit_known_target_call(&mut self.bytecode, offset as u32, 1);
                 return;
             }
         }
@@ -4194,7 +4237,7 @@ impl Compiler {
                     && let Some(&offset) = self.functions.get(&fqn)
                 {
                     Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
-                    Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                    Self::emit_known_target_call(&mut self.bytecode, offset as u32, 1);
                 } else {
                     self.bytecode.push(Byte::new(Instruction::STRINGIFY));
                 }
@@ -6599,7 +6642,7 @@ impl Compiler {
     ///
     /// Trait instance methods unbox type-parameter args in their prologue
     /// (`ValueTag::Instance` for classes), so call sites must `BoxValue`
-    /// the carrier before `CallIndirect`.
+    /// the carrier before the direct CALL.
     fn emit_for_in_custom(
         &mut self,
         iterable: &Output<'_>,
@@ -6622,7 +6665,7 @@ impl Compiler {
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode.push_box_value(carrier_tag);
-        Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
+        Self::emit_known_target_call(&mut self.bytecode, into_off, 1);
         self.bytecode.push_store_pop(it_slot);
 
         let _ = self.next_emit_id();
@@ -6635,7 +6678,7 @@ impl Compiler {
 
         self.bytecode.push_load(it_slot);
         self.bytecode.push_box_value(carrier_tag);
-        Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
+        Self::emit_known_target_call(&mut self.bytecode, next_off, 1);
 
         if niche_next {
             self.bytecode.push(Byte::new(Instruction::DUPLICATE));
@@ -8722,6 +8765,10 @@ impl Compiler {
                 self.bytecode.append(&mut a);
 
                 let body_start = self.bytecode.len();
+                // Provisional span so self-recursive peels can see the opening
+                // predicate while the body is still streaming into `self.bytecode`.
+                self.fn_bytecode_spans
+                    .insert(table_key.clone(), (body_start, body_start));
                 let body_op_start = self.bytecode.ops().len();
                 let prev_field_keys = std::mem::take(&mut self.field_key_slots);
                 self.emit_field_key_prologue(body);
@@ -12583,8 +12630,8 @@ impl Compiler {
         if let Expression::Access(recv, method) = name.1.borrow() {
             // Ground trait method (`recv.into()`, …): typechecker
             // discharged a concrete instance into `call_dicts_at`.
-            // Emit receiver + args + dictionary, then CallIndirect to
-            // the instance method (dict ABI, `dict_arity = 1`).
+            // Emit receiver + args + dictionary, then direct CALL to
+            // the instance method (dict ABI, trailing dict arg).
             let ground_trait = self_id
                 .and_then(|id| self.checker.call_dicts_at(id))
                 .or_else(|| self.checker.call_dicts_for_span(span.start, span.end))
@@ -12627,7 +12674,7 @@ impl Compiler {
                 ) {
                     nargs += 1; // trailing dictionary
                 }
-                Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                Self::emit_known_target_call(&mut bytecode, offset as u32, nargs);
                 return bytecode;
             }
 
@@ -12944,7 +12991,7 @@ impl Compiler {
                             && let Some(&offset) = self.functions.get(&fqn)
                         {
                             bytecode.append(&mut self.do_compile(&items[0]));
-                            Self::emit_call_indirect(
+                            Self::emit_known_target_call(
                                 &mut bytecode,
                                 offset as u32,
                                 1,
@@ -13140,7 +13187,7 @@ impl Compiler {
 
                 // Caller-side base-case peel: cmp-jmp before CALL when
                 // the callee opens with fused/unfused compare + imm/slot return.
-                let peel_indirect = is_instance_method_fqn(&self.checker, &lookup_name);
+                // Instance methods with known entries use CALL (not CallIndirect).
                 if pair_kind.is_none()
                     && !is_generic
                     && !self.coroutine_fns.contains(&n)
@@ -13150,7 +13197,7 @@ impl Compiler {
                         Some(arg_slice),
                         &mut bytecode,
                         target_offset as u32,
-                        peel_indirect,
+                        /*is_indirect=*/ false,
                     )
                 {
                     return bytecode;
@@ -13275,7 +13322,9 @@ impl Compiler {
 
                 let arity = value_arity + dict_count as u32;
                 if is_instance_method_fqn(&self.checker, &lookup_name) {
-                    Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
+                    // Ground instance methods have a fixed entry — use CALL
+                    // (dict evidence already pushed as trailing args when needed).
+                    Self::emit_known_target_call(&mut bytecode, target_offset as u32, arity);
                 } else if self.coroutine_fns.contains(&lookup_name)
                     || self.coroutine_fns.contains(&n)
                 {

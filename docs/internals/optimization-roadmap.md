@@ -114,17 +114,18 @@ This is the most direct path for `binary_trees`; it is independent of a JIT.
 
 ### 4. Direct-call and closure specialization
 
-Priority: medium.
+Priority: medium. **Status: partial (B4 landed).**
 
-The compiler already has tiny direct-call inlining and monomorphization, but
-generic dictionaries and `CallIndirect` still carry runtime work. Extend
-specialization only when the target, arity, and evidence are statically known:
+Landed for monomorphic known targets:
 
-- devirtualize ground method and dictionary calls;
-- inline small monomorphic bodies with no host, FFI, coroutine, or dynamic
-  operations;
-- preserve the existing `CallIndirect` and generic fallback;
-- measure `tak` call count and frame traffic before and after.
+- ground trait / instance method sites emit direct `CALL` instead of
+  `CodePtr` + `CallIndirect` when the entry and arity are static;
+- self-recursive predicate peels (provisional body spans) so nested `tak`
+  calls skip base-case frames;
+- existing tiny direct-call inlining / monomorphization unchanged.
+
+Still use `CallIndirect` for PolyFn locals, dictionary `Index` targets, and
+generic shared-body evidence that is not static at the call site.
 
 ### 5. Dispatch and trace fusion
 

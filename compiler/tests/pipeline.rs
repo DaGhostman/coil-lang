@@ -2438,6 +2438,12 @@ fn attr_test_fn_discovered_by_harness() {
 }
 
 #[test]
+fn example_perf_tak_prints_expected() {
+    let output = run_example("examples/perf/tak.hy");
+    assert_eq!(output, "7");
+}
+
+#[test]
 fn example_perf_numeric_prints_expected_sum() {
     let output = run_example("examples/perf/numeric.hy");
     assert_eq!(output, "1999000");
