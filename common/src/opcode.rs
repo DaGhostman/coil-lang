@@ -267,6 +267,24 @@ pub enum Instruction {
     /// `payload_base` even when prior `STORE`s raised the high-water mark
     /// (shared stack/locals; see match-in-loop bindings).
     Seek,
+
+    /// Convert a pointer-niche `Option<T>` (`0` / heap payload) to a boxed
+    /// `Option<T>` enum at a representation boundary.
+    OptionNicheToHeap,
+    /// Convert a boxed `Option<T>` enum to its pointer-niche representation.
+    HeapOptionToNiche,
+
+    /// Test the tag at the top of a unary stack pair `[payload, tag]`.
+    /// A matching tag is consumed and branches to the packed target.
+    PairJumpIfTag,
+    /// Box a unary stack pair `[payload, tag]` as a heap enum.
+    PairToHeap,
+    /// Unbox a unary heap enum into `[payload, tag]`.
+    HeapToPair,
+    /// Return a unary stack pair `[payload, tag]` to the caller.
+    ReturnPair,
+    /// Invoke a known host native that returns pointer-niche `Option<T>`.
+    HostInvokeNiche,
 }
 
 impl From<u8> for Instruction {
@@ -402,6 +420,13 @@ impl Instruction {
             Self::BinSlotImmStore => "BinSlotImmStore",
             Self::BinSlotSlotStore => "BinSlotSlotStore",
             Self::Seek => "Seek",
+            Self::OptionNicheToHeap => "OptionNicheToHeap",
+            Self::HeapOptionToNiche => "HeapOptionToNiche",
+            Self::PairJumpIfTag => "PairJumpIfTag",
+            Self::PairToHeap => "PairToHeap",
+            Self::HeapToPair => "HeapToPair",
+            Self::ReturnPair => "ReturnPair",
+            Self::HostInvokeNiche => "HostInvokeNiche",
         }
     }
 }
@@ -1149,7 +1174,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::Seek as u8;
+        let last = Instruction::HostInvokeNiche as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1158,6 +1183,8 @@ mod tests {
     fn mnemonic_covers_first_and_last_variants() {
         assert_eq!(Instruction::HALT.mnemonic(), "HALT");
         assert_eq!(Instruction::Seek.mnemonic(), "Seek");
+        assert_eq!(Instruction::ReturnPair.mnemonic(), "ReturnPair");
+        assert_eq!(Instruction::HostInvokeNiche.mnemonic(), "HostInvokeNiche");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");

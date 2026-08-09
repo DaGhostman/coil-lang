@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::il::op::IlOp;
+use crate::il::op::{IlJumpKind, IlOp};
 use common::Instruction;
 
 /// Side-effect-free single-value producer: dropping it with its `Pop` is a no-op.
@@ -28,7 +28,11 @@ fn stack_dce_once(ops: &mut Vec<IlOp>) -> bool {
     let mut i = 0;
     while i < ops.len() {
         if i + 1 < ops.len()
-            && let IlOp::MakeEnum { arity, .. } = &ops[i]
+            && let IlOp::MakeEnum {
+                tag,
+                arity,
+                ..
+            } = &ops[i]
         {
             let arity = *arity as usize;
             match &ops[i + 1] {
@@ -46,6 +50,23 @@ fn stack_dce_once(ops: &mut Vec<IlOp>) -> bool {
                 IlOp::Byte { byte, .. }
                     if arity == 1 && *byte.bytecode() == Instruction::Unpack =>
                 {
+                    i += 2;
+                    continue;
+                }
+                IlOp::Jump {
+                    kind:
+                        IlJumpKind::JumpIfMatch {
+                            tag: expected_tag,
+                            ..
+                        },
+                    target,
+                    loc: jump_loc,
+                } if arity == 1 && u32::from(*tag) == *expected_tag => {
+                    out.push(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: *target,
+                        loc: *jump_loc,
+                    });
                     i += 2;
                     continue;
                 }

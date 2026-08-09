@@ -63,6 +63,15 @@ pub fn host_vec_pop(heap: &mut Heap, args: &[Value]) -> Value {
     }
 }
 
+/// Niche form of `v.pop()`: `0` is `None`, otherwise the element value.
+pub fn host_vec_pop_niche(heap: &mut Heap, args: &[Value]) -> Value {
+    let handle = args.first().copied().unwrap_or(Value::default());
+    match heap.find_object_by_addr(handle.raw() as u64) {
+        Some(Object::Array(mut gc)) => gc.as_mut().elements.pop().unwrap_or_default(),
+        _ => Value::default(),
+    }
+}
+
 /// `v.insert(i, x) -> ()` — clamps out-of-range `i` to `len` (append).
 pub fn host_vec_insert(heap: &mut Heap, args: &[Value]) -> Value {
     let handle = args.first().copied().unwrap_or(Value::from(0i64));
@@ -102,6 +111,23 @@ pub fn host_vec_remove(heap: &mut Heap, args: &[Value]) -> Value {
             }
         }
         _ => alloc_option_none(heap),
+    }
+}
+
+/// Niche form of `v.remove(i)`: `0` is `None`, otherwise the removed value.
+pub fn host_vec_remove_niche(heap: &mut Heap, args: &[Value]) -> Value {
+    let handle = args.first().copied().unwrap_or(Value::default());
+    let index = args.get(1).map(|v| v.as_int()).unwrap_or(-1);
+    match heap.find_object_by_addr(handle.raw() as u64) {
+        Some(Object::Array(mut gc)) => {
+            let len = gc.as_ref().elements.len();
+            if index < 0 || (index as usize) >= len {
+                Value::default()
+            } else {
+                gc.as_mut().elements.remove(index as usize)
+            }
+        }
+        _ => Value::default(),
     }
 }
 

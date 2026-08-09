@@ -82,6 +82,8 @@ pub enum ForInKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForInInfo {
     pub kind: ForInKind,
+    /// Resolved item type used by representation-specialized `next` loops.
+    pub item_ty: Ty,
 }
 use crate::typechecking::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId,
