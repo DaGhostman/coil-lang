@@ -237,6 +237,83 @@
         assert!(crate::memory::Gc::ptr_eq(key, resolved));
     }
 
+    #[test]
+    fn intern_key_non_string_falls_back_to_empty() {
+        let mut vm = Machine::<8>::default();
+        let empty = vm.heap_mut().intern_str("");
+        let resolved = Machine::<8>::intern_key(vm.heap_mut(), Value::from(42i64));
+
+        assert!(crate::memory::Gc::ptr_eq(empty, resolved));
+        assert_eq!(resolved.as_ref().data, "");
+    }
+
+    #[test]
+    fn make_dict_set_field_get_field_roundtrip_via_intern_key() {
+        let strings = vec!["k".to_owned()];
+        let mut code = Vec::new();
+        code.push(const_int(1));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
+        code.push(store_pop(0));
+        // SetField pops name, target, value — push value, dict, key.
+        code.push(const_int(99));
+        code.push(load(0));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::SetField));
+        code.push(Byte::new(Instruction::POP));
+        code.push(load(0));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::GetField));
+        code.push(Byte::new(Instruction::HALT));
+
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        assert_eq!(vm.pop().as_int(), 99);
+        assert_eq!(
+            vm.heap()
+                .into_iter()
+                .filter(|obj| matches!(obj, Object::String(_)))
+                .count(),
+            1,
+            "MakeDict/SetField/GetField must reuse the program string key"
+        );
+    }
+
+    #[test]
+    fn make_enum_mixed_int_and_string_payload_order() {
+        use crate::memory::Member;
+
+        let strings = vec!["payload".to_owned()];
+        let mut code = Vec::new();
+        // Declaration order (int, string): push string then int so payload[0]=int.
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(const_int(7));
+        code.push(make_enum(3, 2));
+        code.push(Byte::new(Instruction::HALT));
+
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        let enum_addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(enum_addr) {
+            Some(Object::Enum(gc)) => {
+                let e = gc.as_ref();
+                assert_eq!(e.tag, 3);
+                assert_eq!(e.payload.len(), 2);
+                match &e.payload[0] {
+                    Member::Value(v) => assert_eq!(v.as_int(), 7),
+                    Member::Object(_) => panic!("payload[0] should be int Value"),
+                }
+                match &e.payload[1] {
+                    Member::Object(Object::String(s)) => {
+                        assert_eq!(s.as_ref().data, "payload");
+                    }
+                    _ => panic!("payload[1] should be string Object"),
+                }
+            }
+            _ => panic!("expected enum on stack"),
+        }
+    }
+
     /// `ArrayLen` must report string/tuple/dict lengths (structural `len`).
     #[test]
     fn array_len_reports_string_tuple_and_dict_sizes() {
