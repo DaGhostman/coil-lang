@@ -10391,6 +10391,16 @@ impl Checker {
         self.option_mode_fns.contains(fn_name)
     }
 
+    /// Return the resolved result type of a registered function.
+    pub fn fn_return_ty(&self, fn_name: &str) -> Option<Ty> {
+        let scheme = self.env.lookup(fn_name)?;
+        let mut ty = scheme.ty.clone();
+        while let Ty::Fun(_, next) = ty {
+            ty = *next;
+        }
+        Some(apply_ty_prune(&self.subst, &ty))
+    }
+
     // ============================================================
     // ============================================================
     //  Native registration

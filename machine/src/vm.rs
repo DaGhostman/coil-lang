@@ -1721,7 +1721,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::Seek as u8);
+            promise!(*bc as u8 <= Instruction::ReturnPair as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1770,6 +1770,122 @@ impl<const S: usize> Machine<S> {
                     let abs = sp + slot;
                     promise!(abs <= stack_cap);
                     self.stack.seek(abs);
+                }
+                Instruction::OptionNicheToHeap => {
+                    let value = self.stack.pop();
+                    if value.raw().is_null() {
+                        let object = self.heap.immortal_unit_enum(0);
+                        self.stack.push(Value::from(object.addr()));
+                    } else {
+                        let member = Self::find_object_by_addr(&self.heap, value.raw() as u64)
+                            .map(Member::Object)
+                            .unwrap_or(Member::Value(value));
+                        let (object, _) = self.heap.alloc(
+                            ObjEnum {
+                                tag: 1,
+                                payload: vec![member],
+                            },
+                            Object::Enum,
+                        );
+                        self.stack.push(Value::from(object.addr()));
+                        Self::maybe_gc_after_alloc(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                        );
+                    }
+                }
+                Instruction::HeapOptionToNiche => {
+                    let value = self.stack.pop();
+                    let niche = match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+                        Some(Object::Enum(gc)) => match gc.as_ref().tag {
+                            0 => Value::default(),
+                            1 => gc
+                                .as_ref()
+                                .payload
+                                .first()
+                                .map(|member| match member {
+                                    Member::Object(object) => Value::from(object.addr()),
+                                    Member::Value(value) => *value,
+                                })
+                                .unwrap_or_default(),
+                            _ => Value::default(),
+                        },
+                        _ => Value::default(),
+                    };
+                    self.stack.push(niche);
+                }
+                Instruction::PairJumpIfTag => {
+                    let operands = opcode.operand_u32();
+                    let expected_tag = operands >> 16;
+                    if self.stack.tell() > 0 && self.stack.peek().as_int() as u32 == expected_tag {
+                        let pool_idx = (operands & 0xFFFF) as usize;
+                        debug_assert!(
+                            pool_idx < constants.len(),
+                            "PairJumpIfTag pool index {pool_idx} out of range (len {})",
+                            constants.len()
+                        );
+                        let target = opcode.jump_if_match_target(constants);
+                        self.stack.pop();
+                        ip = target;
+                    }
+                }
+                Instruction::PairToHeap => {
+                    let tag = self.stack.pop().as_int() as u32;
+                    let payload = self.stack.pop();
+                    let is_option = opcode.operand_u32() & 1 != 0;
+                    let arity = if is_option && tag == 0 { 0 } else { 1 };
+                    let payload = if arity == 0 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            Self::find_object_by_addr(&self.heap, payload.raw() as u64)
+                                .map(Member::Object)
+                                .unwrap_or(Member::Value(payload)),
+                        ]
+                    };
+                    let (object, _) = self.heap.alloc(
+                        ObjEnum { tag, payload },
+                        Object::Enum,
+                    );
+                    self.stack.push(Value::from(object.addr()));
+                    Self::maybe_gc_after_alloc(
+                        &mut self.heap,
+                        &self.stack,
+                        &self.resume_stack,
+                    );
+                }
+                Instruction::HeapToPair => {
+                    let value = self.stack.pop();
+                    let is_option = opcode.operand_u32() & 1 != 0;
+                    let (tag, payload) =
+                        match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+                            Some(Object::Enum(gc)) => {
+                                let enum_ref = gc.as_ref();
+                                let payload = enum_ref
+                                    .payload
+                                    .first()
+                                    .map(|member| match member {
+                                        Member::Object(object) => Value::from(object.addr()),
+                                        Member::Value(value) => *value,
+                                    })
+                                    .unwrap_or_default();
+                                (enum_ref.tag, payload)
+                            }
+                            _ => (0, Value::default()),
+                        };
+                    self.stack.push(payload);
+                    self.stack.push(Value::from(tag as i64));
+                    let _ = is_option;
+                }
+                Instruction::ReturnPair => {
+                    let tag = self.stack.pop();
+                    let payload = self.stack.pop();
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(payload);
+                    self.stack.push(tag);
+                    self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::LOAD => {
                     let count = opcode.load_store_count();

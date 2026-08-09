@@ -166,13 +166,20 @@ pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option
         | Instruction::BinSlotSlotStore => Some(0),
         Instruction::CmpJmpf => Some(-2),
         Instruction::LogNotJmpf => Some(-1),
-        Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => Some(-1),
+        Instruction::RETURN
+        | Instruction::LoadReturnSlot
+        | Instruction::ConstReturnImm => Some(-1),
+        Instruction::ReturnPair => Some(-2),
         Instruction::BinReturn => Some(-2),
         Instruction::HALT | Instruction::NOOP => Some(0),
         Instruction::JMP => Some(0),
         Instruction::JMPF | Instruction::JMPT => Some(-1),
         Instruction::Index => Some(-1),
         Instruction::BoxValue | Instruction::UnboxValue | Instruction::LoadField => Some(0),
+        Instruction::OptionNicheToHeap
+        | Instruction::HeapOptionToNiche => Some(0),
+        Instruction::PairToHeap => Some(-1),
+        Instruction::HeapToPair => Some(1),
         Instruction::CastIntToFloat
         | Instruction::CastFloatToInt
         | Instruction::CastIntToByte
@@ -230,6 +237,7 @@ fn is_terminator(op: &IlOp) -> bool {
         Some(b) if matches!(
             *b.bytecode(),
             Instruction::RETURN
+                | Instruction::ReturnPair
                 | Instruction::HALT
                 | Instruction::LoadReturnSlot
                 | Instruction::ConstReturnImm

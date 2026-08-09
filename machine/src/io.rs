@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use common::{BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
 use crate::io_reactor::Interest;
-use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
+use crate::memory::{Heap, Member, ObjArray, ObjStream, ObjTuple, Object, StreamKind};
 
 type OutputRedirect = *mut (dyn Write + Send);
 
@@ -139,8 +139,7 @@ pub fn alloc_io_error(heap: &mut Heap, tag: IoErrorTag) -> Value {
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 fn member_from_value(heap: &Heap, value: Value) -> Member {

@@ -18,7 +18,7 @@ pub const ARCHIVE_MAJOR: u16 = 2;
 /// Archive ABI minor. Bump on additive, append-only bytecode changes.
 ///
 /// 2 — `BinSlotSlotStore` accepts float ops (ADDF…GEQF, PowF) in its op field.
-pub const ARCHIVE_MINOR: u16 = 2;
+pub const ARCHIVE_MINOR: u16 = 3;
 
 /// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
 pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
@@ -177,9 +177,9 @@ mod tests {
     #[test]
     fn archive_version_matches_current_abi() {
         assert_eq!(ARCHIVE_MAJOR, 2);
-        assert_eq!(ARCHIVE_MINOR, 2);
-        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 2));
-        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.2");
+        assert_eq!(ARCHIVE_MINOR, 3);
+        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 3));
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.3");
     }
 
     #[test]

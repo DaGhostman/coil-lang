@@ -1,0 +1,49 @@
+break parse
+run
+continue
+continue
+finish
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+stepi
+info locals
+print ok
+print bad
+quit

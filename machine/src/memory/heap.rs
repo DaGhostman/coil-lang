@@ -132,6 +132,16 @@ impl Heap {
         self.alloc(obj_lib, Object::Library)
     }
 
+    /// Allocate an enum value, reusing the immortal object for unit variants.
+    pub fn alloc_enum_value(&mut self, tag: u32, payload: Vec<Member>) -> common::Value {
+        let object = if payload.is_empty() {
+            self.immortal_unit_enum(tag)
+        } else {
+            self.alloc(ObjEnum { tag, payload }, Object::Enum).0
+        };
+        common::Value::from(object.addr())
+    }
+
     /// Releases all objects that aren't marked. This method also removes
     /// interned strings when no object is referencing them.
     ///
@@ -2077,6 +2087,21 @@ mod tests {
             heap.immortal_unit_enum(7).addr(),
             immortal_addr,
             "post-sweep lookup must reuse the same singleton"
+        );
+    }
+
+    #[test]
+    fn alloc_enum_value_reuses_unit_singletons() {
+        let mut heap = Heap::default();
+        let first = heap.alloc_enum_value(3, Vec::new());
+        let second = heap.alloc_enum_value(3, Vec::new());
+
+        assert_eq!(first.raw(), second.raw());
+        assert_eq!(
+            heap.into_iter()
+                .filter(|obj| matches!(obj, Object::Enum(_)))
+                .count(),
+            1
         );
     }
 

@@ -826,6 +826,17 @@ pub struct Compiler {
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
 
+    /// Force ground pointer-niche `Option` expressions back to heap enums
+    /// while using legacy pattern lowering or an unknown boundary.
+    force_heap_option: bool,
+
+    /// Emit and consume the two-slot `[payload, tag]` ABI for a unary
+    /// `Option`/`Result` return while compiling a statically known function.
+    compiling_pair_mode: bool,
+    /// The current expression is allowed to remain in the pair ABI instead of
+    /// being materialized back into a heap enum.
+    pair_value_context: bool,
+
     /// Harness metadata: `(description, bytecode offset)` for each
     /// top-level `test("…") { … }` case, in source order.
     test_cases: Vec<(String, u32)>,
@@ -940,6 +951,9 @@ impl Default for Compiler {
             active_fn_name: None,
             compiling_method: false,
             compiling_result_mode: false,
+            force_heap_option: false,
+            compiling_pair_mode: false,
+            pair_value_context: false,
             test_cases: Vec::new(),
             user_main_defined: false,
             include_tests: false,
