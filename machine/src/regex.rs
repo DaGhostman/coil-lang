@@ -7,7 +7,7 @@ use pcre2::bytes::{Captures, Regex, RegexBuilder};
 use common::{BUILTIN_REGEX_ERROR_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
 use crate::io::{alloc_result_err, alloc_result_ok};
-use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjTuple, Object};
+use crate::memory::{Heap, Member, ObjArray, ObjTuple, Object};
 use crate::regex_state::ObjRegex;
 
 /// Tag indices for [`RegexError`](common::BUILTIN_REGEX_ERROR_ENUM).
@@ -21,8 +21,7 @@ pub enum RegexErrorTag {
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 /// Allocate a unit-payload `RegexError` variant.

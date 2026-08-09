@@ -9,7 +9,7 @@ use std::time::{Duration, Instant as StdInstant};
 use chrono::{DateTime, Months, NaiveDate, NaiveDateTime, TimeDelta, Utc};
 use common::{BUILTIN_RESULT_VARIANTS, Value};
 
-use crate::memory::{Heap, Member, ObjEnum, ObjInstance, Object};
+use crate::memory::{Heap, Member, ObjInstance, Object};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_MS: i64 = 1_000_000;
@@ -59,8 +59,7 @@ pub fn alloc_time_error(heap: &mut Heap, tag: TimeErrorTag) -> Value {
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 fn member_from_value(heap: &Heap, value: Value) -> Member {
