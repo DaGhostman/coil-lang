@@ -29,6 +29,10 @@ The 2026-08-08 release baseline used precompiled Coil archives and 6-second
 | `nsieve` | 2.72 ms | 1.00 ms | 14.2 ms | array mutation, indexing, and bounds/object checks |
 | `binary_trees` | 12.9 ms | 9.24 ms | 15.2 ms | heap allocation and GC |
 
+Post–float-fusion soft baseline (`./scripts/poop_baseline.sh`, 2026-08-10):
+`mandelbrot` ~19.6 ms / 392M instructions, `tak` ~2.17 ms, `nsieve` ~2.73 ms,
+`binary_trees` ~12.4 ms (still directional; re-run `perf_matrix.sh` for cross-lang).
+
 Coil used about 5.9–7.4 MB RSS, Lua 2.7–3.2 MB, and Node 89–91 MB. These are
 directional comparisons rather than language rankings: the ports have
 different runtime startup, library, and allocation behavior.
@@ -36,6 +40,20 @@ different runtime startup, library, and allocation behavior.
 The repository also has Coil-only `numeric`, `operators_loop`, and `match_sum`
 benchmarks. Their current results are retained by the matrix, but they have no
 Lua or Node ports.
+
+## Recently landed (float AOT)
+
+Source-ordered float work on the interpreter path (no FMA / reassociation):
+
+- LICM: full invariant float expression chains (past intermediate height-1).
+- `FloatChainStore`: up to three stages; `BinSlotSlot` stage0; const-pool operands.
+- `BinSlotSlotConstJmpf`: float mag arith + pool compare + `JMPF`.
+- `NEGF` unary float negate.
+- Algebraic: exact `+0.0` / `+1.0` float identities; const-pool float binop fold.
+- Codegen: `new Class(args).field` scalar replacement (no temp instance).
+
+Next AOT priorities below remain the main gap vs Lua on `mandelbrot` /
+`tak` / `nsieve` / `binary_trees`.
 
 ## AOT priorities
 
