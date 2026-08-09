@@ -477,10 +477,10 @@ fn is_multi_op_suffix_op(op: &IlOp) -> bool {
     ) {
         return true;
     }
-    // Unary residual compute (NOT/NEG stay as Byte until typed lift).
+    // Unary residual compute (NOT/NEG/NEGF stay as Byte until typed lift).
     matches!(
         op.as_encode_byte().as_ref().map(|b| *b.bytecode()),
-        Some(Instruction::NOT | Instruction::NEG)
+        Some(Instruction::NOT | Instruction::NEG | Instruction::NEGF)
     )
 }
 

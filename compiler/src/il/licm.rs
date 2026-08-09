@@ -367,7 +367,7 @@ fn pure_float_chain_instruction(op: &IlOp, stored: &HashSet<u32>) -> Option<Inst
     let byte = op.as_encode_byte()?;
     let instruction = *byte.bytecode();
     match instruction {
-        Instruction::CONST | Instruction::CastIntToFloat => Some(instruction),
+        Instruction::CONST | Instruction::CastIntToFloat | Instruction::NEGF => Some(instruction),
         Instruction::LOAD => {
             let slot = byte.load_store_single_slot()?;
             (!stored.contains(&slot)).then_some(instruction)

@@ -1721,7 +1721,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinSlotSlotConstJmpf as u8);
+            promise!(*bc as u8 <= Instruction::NEGF as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1925,6 +1925,14 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(!(val.as_int() != 0)));
                 }
                 Instruction::NEG => unary!(self.stack, -, as_int),
+                // IEEE negate: flip sign bit (preserves NaN payload).
+                Instruction::NEGF => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 1);
+                    let idx = sp - 1;
+                    let bits = self.stack[idx].raw() as u64;
+                    self.stack[idx].replace((bits ^ (1u64 << 63)) as _);
+                }
                 Instruction::AND => binary!(self.stack, &&, as_bool),
                 Instruction::OR => binary!(self.stack, ||, as_bool),
                 Instruction::ADD => binary!(self.stack, +, as_int),

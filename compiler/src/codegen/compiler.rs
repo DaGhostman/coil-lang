@@ -2983,7 +2983,7 @@ impl Compiler {
                 (AggregateOp::Mod, true) => Instruction::MODF,
                 (AggregateOp::Pow, false) => Instruction::Pow,
                 (AggregateOp::Pow, true) => Instruction::PowF,
-                // Neg is handled by `emit_neg_tos` (float uses MULF −1; no NEGF).
+                // Neg is handled by `emit_neg_tos` (float uses NEGF).
                 (AggregateOp::Neg, _) => Instruction::NEG,
             }
         };
@@ -3329,13 +3329,10 @@ impl Compiler {
         true
     }
 
-    /// Negate TOS: int via `NEG`; float via `MULF` by −1 (no `NEGF` opcode).
+    /// Negate TOS: int via `NEG`; float via `NEGF`.
     fn emit_neg_tos(&mut self, bytecode: &mut Vec<Byte>, is_float: bool) {
         if is_float {
-            let bits = Value::from(-1.0f64).raw() as u64;
-            let idx = self.intern_constant(bits);
-            bytecode.push_const_pool(idx);
-            bytecode.push(Byte::new(Instruction::MULF));
+            bytecode.push(Byte::new(Instruction::NEGF));
         } else {
             bytecode.push(Byte::new(Instruction::NEG));
         }

@@ -4766,20 +4766,33 @@ fn main() {
 }
 
 #[test]
-fn aggregate_float_negate_uses_mulf_not_int_neg() {
+fn aggregate_float_negate_uses_negf_not_int_neg() {
     // Regression: float aggregate unary `-` must not emit int `NEG`
-    // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
-    let output = run_example_src(
-        r#"
+    // (which bit-twiddles a float as i64). Float path is `NEGF`.
+    use common::Instruction;
+    let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let d = -(1.5, 2.0);
     write(stdout(), to_bytes(format("%f,%f", d[0], d[1])));
 }
-"#,
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::NEGF)),
+        "expected NEGF for float aggregate negate"
     );
-    assert_eq!(output, "-1.5,-2.0");
+    assert!(
+        !bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::NEG)),
+        "float aggregate negate must not emit int NEG"
+    );
+    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "-1.5,-2.0");
 }
 
 #[test]

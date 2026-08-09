@@ -307,6 +307,9 @@ pub enum Instruction {
     /// `[63:32] false-branch target PC`. Evaluates `bin_op(slot[a], slot[b])`
     /// then compares with the pool float (source order; no FMA/reassoc).
     BinSlotSlotConstJmpf,
+
+    /// Float unary negate (IEEE sign-bit flip). Replaces `CONST -1; MULF`.
+    NEGF,
 }
 
 impl From<u8> for Instruction {
@@ -451,6 +454,7 @@ impl Instruction {
             Self::HostInvokeNiche => "HostInvokeNiche",
             Self::FloatChainStore => "FloatChainStore",
             Self::BinSlotSlotConstJmpf => "BinSlotSlotConstJmpf",
+            Self::NEGF => "NEGF",
         }
     }
 }
@@ -1251,7 +1255,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::BinSlotSlotConstJmpf as u8;
+        let last = Instruction::NEGF as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1267,6 +1271,7 @@ mod tests {
             Instruction::BinSlotSlotConstJmpf.mnemonic(),
             "BinSlotSlotConstJmpf"
         );
+        assert_eq!(Instruction::NEGF.mnemonic(), "NEGF");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
