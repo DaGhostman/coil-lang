@@ -159,6 +159,71 @@ fn perf_for_in_array_uses_single_array_len() {
 }
 
 #[test]
+fn perf_indexed_sum_hoists_array_len_once() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/indexed_sum.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "sum", bc.len());
+    let n = count_opcodes_in(&bc, start, end, Instruction::ArrayLen);
+    assert_eq!(
+        n, 1,
+        "sum should hoist ArrayLen out of the while i < len(arr) loop (got {n})"
+    );
+    // ArrayLen must not sit on the back-edge cycle: find the loop JMP and
+    // ensure its target PC is at-or-after the sole ArrayLen (preheader).
+    let sum = &bc[start..end];
+    let len_pc = sum
+        .iter()
+        .position(|b| *b.bytecode() == Instruction::ArrayLen)
+        .expect("ArrayLen in sum");
+    let back_edge = sum.iter().rposition(|b| *b.bytecode() == Instruction::JMP);
+    let Some(be) = back_edge else {
+        panic!("sum should have a back-edge JMP");
+    };
+    let target = sum[be].operand_u32() as usize;
+    let target_rel = target.saturating_sub(start);
+    assert!(
+        len_pc < target_rel,
+        "ArrayLen at {len_pc} must be before back-edge target {target_rel} (hoisted preheader)"
+    );
+    let stats = compiler::last_bounds_stats();
+    assert!(
+        stats.array_len_hoists >= 1,
+        "indexed_sum should hoist ArrayLen; stats={stats:?}"
+    );
+    assert!(
+        stats.proven_index >= 1,
+        "indexed_sum Index under i < len should be proven; stats={stats:?}"
+    );
+}
+
+#[test]
+fn perf_nsieve_proves_fill_bounded_index() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/nsieve.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "nsieve", bc.len());
+    // No UncheckedIndex opcode: Index/StoreIndex remain; proofs are counters.
+    assert!(
+        count_opcodes_in(&bc, start, end, Instruction::Index) >= 1,
+        "nsieve should keep checked Index"
+    );
+    assert!(
+        count_opcodes_in(&bc, start, end, Instruction::StoreIndex) >= 1,
+        "nsieve should keep checked StoreIndex"
+    );
+    let stats = compiler::last_bounds_stats();
+    assert!(
+        stats.proven_index >= 1,
+        "nsieve p-loop Index after fill-to-n should be proven; stats={stats:?}"
+    );
+    // Inner k = p+p / k += p is not a unit +1 counted form — stay checked.
+    assert!(
+        stats.checked_store_index >= 1,
+        "nsieve StoreIndex on stride induction should stay checked; stats={stats:?}"
+    );
+}
+
+
+#[test]
 fn perf_bool_guard_inverts_into_jmpt() {
     let (bc, _, _, _, pipeline) = compile("examples/perf/bool_guard.hy");
     let syms = pipeline.program_debug().fn_symbols;

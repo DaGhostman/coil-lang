@@ -1642,6 +1642,7 @@
                 slot_promote: false,
                 algebraic: false,
                 licm: false,
+                loop_bounds: false,
                 return_convoy: false,
                 clone_shared_return: false,
                 bin_join_convoy: false,

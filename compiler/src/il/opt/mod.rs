@@ -23,6 +23,8 @@ pub struct OptimizeOptions {
     pub algebraic: bool,
     /// Hoist invariant Const/Load out of Known-SP natural loops.
     pub licm: bool,
+    /// Counted-loop ArrayLen hoist + Index/StoreIndex bounds proofs.
+    pub loop_bounds: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
     /// Clone plain `RETURN` onto jump-only preds of mixed return joins.
@@ -46,6 +48,7 @@ impl Default for OptimizeOptions {
             slot_promote: true,
             algebraic: true,
             licm: true,
+            loop_bounds: true,
             return_convoy: true,
             clone_shared_return: true,
             bin_join_convoy: true,
@@ -91,6 +94,9 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
         let _ = entry_sp;
         super::licm::licm(ops);
+    }
+    if opts.loop_bounds {
+        super::bounds::loop_bounds(ops);
     }
     // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
     if opts.slot_promote {
