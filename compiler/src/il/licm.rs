@@ -30,10 +30,12 @@ pub fn licm(ops: &mut Vec<IlOp>) {
         }
         hoisted = true;
     }
-    if hoisted {
+    // Run after casts so invariant float exprs (e.g. mandelbrot `ci`) see
+    // already-hoisted `(y as float)` / `(size as float)` temps.
+    if licm_float_expression_chain(ops) {
         return;
     }
-    if licm_float_expression_chain(ops) {
+    if hoisted {
         return;
     }
     licm_stack_producers(ops);
@@ -325,23 +327,40 @@ fn collect_float_chain(
     let mut height = 0i32;
     let mut has_float = false;
     let mut chain = Vec::new();
+    // Prefer the longest source-ordered pure float chain that ends at height 1.
+    // Intermediate height==1 (e.g. after `2.0 * (y/size)`) must not cut short a
+    // following `CONST; SUBF` continuation.
+    let mut last_good: Option<(usize, Vec<IlOp>)> = None;
     while end < latch {
         let op = &ops[end];
-        let instruction = pure_float_chain_instruction(op, stored)?;
-        let byte = op.as_encode_byte()?;
-        let delta = sp::byte_stack_delta(instruction, &byte)?;
+        let Some(instruction) = pure_float_chain_instruction(op, stored) else {
+            break;
+        };
+        let Some(byte) = op.as_encode_byte() else {
+            break;
+        };
+        let Some(delta) = sp::byte_stack_delta(instruction, &byte) else {
+            break;
+        };
         height += delta;
-        if height < 0 {
-            return None;
+        // Chain-relative height must stay positive: a leading CastIntToFloat
+        // (no producer in-chain) or an under-arity binop is not a valid expr.
+        if height < 1 {
+            break;
         }
-        has_float |= is_float_arith(instruction) || instruction == Instruction::CastIntToFloat;
+        has_float |= is_float_arith(instruction)
+            || instruction == Instruction::CastIntToFloat
+            || matches!(
+                instruction,
+                Instruction::BinSlotImm | Instruction::BinSlotSlot
+            );
         chain.push(op.clone());
         end += 1;
         if height == 1 && has_float && chain.len() >= 2 {
-            return Some((end, chain));
+            last_good = Some((end, chain.clone()));
         }
     }
-    None
+    last_good
 }
 
 fn pure_float_chain_instruction(op: &IlOp, stored: &HashSet<u32>) -> Option<Instruction> {
@@ -1183,6 +1202,92 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::SUBF)),
             "the invariant chain should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn hoists_multi_stage_float_chain_past_intermediate_height_one() {
+        // Mandelbrot-shaped `2.0 * (a/b) - 1.0`: height returns to 1 after MULF,
+        // then CONST; SUBF continues. The collector must keep the full chain.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::BinSlotSlot {
+                op: Instruction::DIVF as u8,
+                a: 1,
+                b: 2,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::MULF)),
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::SUBF)),
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+
+        licm(&mut ops);
+
+                let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        let pre = &ops[..header];
+        assert!(
+            pre.iter()
+                .any(|op| matches!(op, IlOp::Bin { op: Instruction::MULF, .. }))
+                && pre
+                    .iter()
+                    .any(|op| matches!(op, IlOp::Bin { op: Instruction::SUBF, .. }))
+                && pre.iter().any(|op| {
+                    matches!(
+                        op,
+                        IlOp::BinSlotSlot {
+                            op: o,
+                            a: 1,
+                            b: 2,
+                            ..
+                        } if *o == Instruction::DIVF as u8
+                    )
+                }),
+            "full multi-stage chain should materialize in the preheader"
+        );
+        assert!(
+            ops[header..]
+                .iter()
+                .any(|op| matches!(op, IlOp::Load { slot: 4, .. })),
+            "the loop should reload the hoisted chain result"
+        );
+        assert!(
+            !ops[header..].iter().any(|op| {
+                matches!(op, IlOp::Bin { op: Instruction::MULF | Instruction::SUBF, .. })
+                    || matches!(
+                        op,
+                        IlOp::BinSlotSlot {
+                            op: o,
+                            ..
+                        } if *o == Instruction::DIVF as u8
+                    )
+            }),
+            "no stage of the invariant chain should remain in the loop body"
         );
     }
 

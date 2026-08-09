@@ -238,3 +238,57 @@ fn perf_mandelbrot_fuses_source_order_float_chain() {
         "Mandelbrot should fuse a source-ordered two-stage float store"
     );
 }
+
+#[test]
+fn perf_mandelbrot_hoists_invariant_ci_out_of_x_loop() {
+    // `ci = 2.0 * (y as float)/(size as float) - 1.0` is invariant in the
+    // x-loop. After LICM it must not recompute via BinSlotSlot DIVF + SUBF
+    // between the x-loop header and the iter-loop header.
+    // Use from_file so module resolution matches `coil dissect` / production.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let path = root.join("examples/perf/mandelbrot.hy");
+    let mut pipeline = compiler::Pipeline::new();
+    let (bc, _) = pipeline
+        .compile_src_from_file(path.to_str().unwrap())
+        .expect("compile mandelbrot from file");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    let body = &bc[start..end];
+
+    // Nested counted loops: y-header, x-header, iter-header (BinSlotSlotJmpf).
+    let headers: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| (*b.bytecode() == Instruction::BinSlotSlotJmpf).then_some(i))
+        .collect();
+    assert!(
+        headers.len() >= 3,
+        "expected y/x/iter loop headers, got {}",
+        headers.len()
+    );
+    let x_header = headers[1];
+    let iter_header = headers[2];
+    let x_prefix = &body[x_header..iter_header];
+
+    let bin_slot_divf = x_prefix
+        .iter()
+        .filter(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::DIVF as u8
+        })
+        .count();
+    let subf = x_prefix
+        .iter()
+        .filter(|b| *b.bytecode() == Instruction::SUBF)
+        .count();
+    assert_eq!(
+        bin_slot_divf, 0,
+        "ci's BinSlotSlot DIVF must leave the x-loop body (before iter header)"
+    );
+    // `cr` still ends with SUBF in the x-loop; ci's trailing SUBF must not
+    // add a second one in the x-prefix (only cr's scale-subtract remains).
+    assert_eq!(
+        subf, 1,
+        "x-loop prefix should keep only cr's SUBF; ci SUBF must be hoisted (got {subf})"
+    );
+}
