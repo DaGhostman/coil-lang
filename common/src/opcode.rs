@@ -299,6 +299,14 @@ pub enum Instruction {
     /// bit60 stage1_other_on_left, bit61 stage2_other_on_left, bit62 has_stage2.
     /// When `other_on_left`, that stage is `op(other, acc)` (stack const-under).
     FloatChainStore,
+
+    /// `BinSlotSlot <float-arith>; CONST pool; CmpJmpf <float-cmp>` — one dispatch.
+    ///
+    /// Operands: `[31:24] bin_op`, `[23:16] a`, `[15:0] descriptor pool index`.
+    /// Descriptor: `[7:0] b`, `[15:8] cmp_op`, `[31:16] float_pool_idx`,
+    /// `[63:32] false-branch target PC`. Evaluates `bin_op(slot[a], slot[b])`
+    /// then compares with the pool float (source order; no FMA/reassoc).
+    BinSlotSlotConstJmpf,
 }
 
 impl From<u8> for Instruction {
@@ -442,6 +450,7 @@ impl Instruction {
             Self::ReturnPair => "ReturnPair",
             Self::HostInvokeNiche => "HostInvokeNiche",
             Self::FloatChainStore => "FloatChainStore",
+            Self::BinSlotSlotConstJmpf => "BinSlotSlotConstJmpf",
         }
     }
 }
@@ -675,6 +684,44 @@ impl Byte {
             (o >> 24) as u8,
             ((o >> 16) & 0xFF) as usize,
             (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotConstJmpf: [31:24] bin_op, [23:16] a, [15:0] descriptor pool index.
+    pub fn with_bin_slot_slot_const_jmpf(mut self, bin_op: u8, a: u8, pool_idx: u16) -> Self {
+        self.operands = ((bin_op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_const_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// Pack descriptor for [`Instruction::BinSlotSlotConstJmpf`].
+    pub fn pack_bin_slot_slot_const_jmpf_desc(
+        b: u8,
+        cmp_op: u8,
+        float_pool_idx: u16,
+        target: u32,
+    ) -> u64 {
+        (b as u64)
+            | ((cmp_op as u64) << 8)
+            | ((float_pool_idx as u64) << 16)
+            | ((target as u64) << 32)
+    }
+
+    /// Unpack descriptor for [`Instruction::BinSlotSlotConstJmpf`].
+    pub fn unpack_bin_slot_slot_const_jmpf_desc(packed: u64) -> (u8, u8, usize, usize) {
+        (
+            packed as u8,
+            (packed >> 8) as u8,
+            ((packed >> 16) & 0xFFFF) as usize,
+            (packed >> 32) as usize,
         )
     }
 
@@ -983,6 +1030,21 @@ impl ArchivedByte {
         )
     }
 
+    pub fn with_bin_slot_slot_const_jmpf(mut self, bin_op: u8, a: u8, pool_idx: u16) -> Self {
+        let packed = ((bin_op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_const_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
     pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
         let o: u32 = self.operands.into();
         (
@@ -1189,7 +1251,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::FloatChainStore as u8;
+        let last = Instruction::BinSlotSlotConstJmpf as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1201,9 +1263,32 @@ mod tests {
         assert_eq!(Instruction::ReturnPair.mnemonic(), "ReturnPair");
         assert_eq!(Instruction::HostInvokeNiche.mnemonic(), "HostInvokeNiche");
         assert_eq!(Instruction::FloatChainStore.mnemonic(), "FloatChainStore");
+        assert_eq!(
+            Instruction::BinSlotSlotConstJmpf.mnemonic(),
+            "BinSlotSlotConstJmpf"
+        );
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
+    }
+
+    #[test]
+    fn bin_slot_slot_const_jmpf_pack() {
+        let b = Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+            Instruction::ADDF as u8,
+            10,
+            3,
+        );
+        assert_eq!(
+            b.bin_slot_slot_const_jmpf_parts(),
+            (Instruction::ADDF as u8, 10, 3)
+        );
+        let desc = Byte::pack_bin_slot_slot_const_jmpf_desc(11, Instruction::GTF as u8, 6, 815);
+        let (slot_b, cmp, fidx, target) = Byte::unpack_bin_slot_slot_const_jmpf_desc(desc);
+        assert_eq!(slot_b, 11);
+        assert_eq!(cmp, Instruction::GTF as u8);
+        assert_eq!(fidx, 6);
+        assert_eq!(target, 815);
     }
 
     #[test]

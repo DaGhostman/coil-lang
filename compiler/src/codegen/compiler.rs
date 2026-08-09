@@ -953,6 +953,7 @@ impl Compiler {
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
                     | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotSlotConstJmpf
                     | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm

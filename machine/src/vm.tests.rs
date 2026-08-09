@@ -3590,6 +3590,67 @@
         assert_eq!(vm.pop().as_int(), 1);
     }
 
+    /// BinSlotSlotConstJmpf: ADDF(slots) > pool float — fall through / jump.
+    #[test]
+    fn bin_slot_slot_const_jmpf_addf_gtf() {
+        let four = 4.0f64.to_bits();
+        let three = 3.0f64.to_bits();
+        let one = 1.0f64.to_bits();
+        let two = 2.0f64.to_bits();
+        // Code layout: setup(0..3), fused(4), fall(5..6), jump(7..8).
+        // 3.0+1.0=4.0; 4.0 > 4.0 is false → jump to 7 → push 0
+        let desc_jump =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, one, four, desc_jump],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // 3.0+2.0=5.0; 5.0 > 4.0 → fall through → push 1
+        let desc_fall =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, two, four, desc_fall],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
     /// Packed LOAD/STORE n=2 preserves push/pop order (n=3 is covered separately).
     #[test]
     fn packed_load_store_n2_order() {

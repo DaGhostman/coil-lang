@@ -16,6 +16,7 @@ User code does not name these directly; the compiler emits them:
 | `ReturnPair` | Return a unary pair without changing `Value` |
 | `Panic` | Abort after writing `panic: <msg>` |
 | `FloatChainStore` | Execute two or three source-ordered float stages and store (slots and/or const-pool operands; no FMA/reassoc) |
+| `BinSlotSlotConstJmpf` | `BinSlotSlot` float-arith + pool `CONST` + float `CmpJmpf` in one dispatch (e.g. mandelbrot `|z|² > 4`) |
 
 ---
 

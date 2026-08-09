@@ -190,8 +190,13 @@ fn perf_mandelbrot_keeps_fused_jmpf_guards() {
         "mandelbrot's compare guards must stay fused as *Jmpf"
     );
     assert!(
-        count_opcodes_in(&bc, start, end, Instruction::CmpJmpf) >= 1,
-        "escape test should stay a fused CmpJmpf"
+        count_opcodes_in(&bc, start, end, Instruction::BinSlotSlotConstJmpf) >= 1,
+        "escape test should fuse to BinSlotSlotConstJmpf"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::CmpJmpf),
+        0,
+        "escape CmpJmpf should be absorbed into BinSlotSlotConstJmpf"
     );
 }
 

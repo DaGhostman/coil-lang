@@ -220,6 +220,11 @@ fn jump_target(byte: &Byte, pool: &[u64]) -> Option<usize> {
             let (_, _, pool_idx) = byte.bin_slot_slot_jmpf_parts();
             Some((*pool.get(pool_idx)? >> 32) as usize)
         }
+        Instruction::BinSlotSlotConstJmpf => {
+            let (_, _, pool_idx) = byte.bin_slot_slot_const_jmpf_parts();
+            let packed = *pool.get(pool_idx)?;
+            Some((packed >> 32) as usize)
+        }
         Instruction::JumpIfMatch | Instruction::PairJumpIfTag => {
             Some(byte.jump_if_match_target(pool))
         }

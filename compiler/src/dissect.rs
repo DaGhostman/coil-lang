@@ -211,6 +211,10 @@ fn format_operands(
             let (bop, a, pool_idx) = byte.bin_slot_slot_jmpf_parts();
             format!("op={} a={a} pool_idx={pool_idx}", bin_op_name(bop))
         }
+        Instruction::BinSlotSlotConstJmpf => {
+            let (bop, a, pool_idx) = byte.bin_slot_slot_const_jmpf_parts();
+            format!("bin={} a={a} pool_idx={pool_idx}", bin_op_name(bop))
+        }
         Instruction::BinSlotImmStore => {
             let (bop, src, pool_idx) = byte.bin_slot_imm_store_parts();
             format!("op={} src={src} pool_idx={pool_idx}", bin_op_name(bop))

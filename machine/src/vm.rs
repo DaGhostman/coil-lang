@@ -1721,7 +1721,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::FloatChainStore as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlotConstJmpf as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2874,6 +2874,39 @@ impl<const S: usize> Machine<S> {
                     self.stack[sp + dest] = Value::from(acc);
                     if self.stack.tell() <= sp + dest {
                         self.stack.seek(sp + dest + 1);
+                    }
+                }
+                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf` — no stack traffic.
+                Instruction::BinSlotSlotConstJmpf => {
+                    let (bin_op, a, desc_idx) = opcode.bin_slot_slot_const_jmpf_parts();
+                    promise!(desc_idx < constants.len());
+                    let packed = unsafe { *constants.get_unchecked(desc_idx) };
+                    let (b, cmp_op, float_idx, target) =
+                        RawByte::unpack_bin_slot_slot_const_jmpf_desc(packed);
+                    let b = b as usize;
+                    promise!(float_idx < constants.len());
+                    promise!(sp + a < stack_cap);
+                    promise!(sp + b < stack_cap);
+                    let va = self.stack[sp + a].as_float();
+                    let vb = self.stack[sp + b].as_float();
+                    let mag = match Instruction::from(bin_op) {
+                        Instruction::ADDF => va + vb,
+                        Instruction::SUBF => va - vb,
+                        Instruction::MULF => va * vb,
+                        Instruction::DIVF => va / vb,
+                        Instruction::MODF => va % vb,
+                        _ => f64::NAN,
+                    };
+                    let rhs = Value::from(unsafe { *constants.get_unchecked(float_idx) }).as_float();
+                    let taken = match Instruction::from(cmp_op) {
+                        Instruction::LEF => mag < rhs,
+                        Instruction::LEQF => mag <= rhs,
+                        Instruction::GTF => mag > rhs,
+                        Instruction::GEQF => mag >= rhs,
+                        _ => false,
+                    };
+                    if !taken {
+                        ip = target;
                     }
                 }
                 Instruction::HALT => {
