@@ -2169,6 +2169,95 @@
     }
 
     #[test]
+    fn float_chain_store_three_stage_const_under_matches_separate_ops() {
+        // 2.0 * (zr * zi) + ci with intermediate rounding, const-under MULF.
+        let zr = 1.0 + 2f64.powi(-27);
+        let zi = 1.0 - 2f64.powi(-27);
+        let ci = -1.0;
+        let two = 2.0_f64;
+        let separate = {
+            let t = zr * zi;
+            let t = two * t;
+            t + ci
+        };
+        // EXT | has_stage2 | stage1_left | rhs1_const
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (3_u64 << 32) // pool idx of 2.0
+            | ((Instruction::ADDF as u64) << 40)
+            | (2_u64 << 48) // ci slot
+            | (1 << 57) // rhs1 const
+            | (1 << 60) // stage1 other on left
+            | (1 << 62) // has stage2
+            | (1u64 << 63);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((4 << 16) | 4),
+                load(4),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(zr).raw() as u64,
+                Value::from(zi).raw() as u64,
+                Value::from(ci).raw() as u64,
+                Value::from(two).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_float(), separate);
+    }
+
+    #[test]
+    fn float_chain_store_three_stage_preserves_nan() {
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (3_u64 << 32)
+            | ((Instruction::ADDF as u64) << 40)
+            | (2_u64 << 48)
+            | (1 << 57)
+            | (1 << 60)
+            | (1 << 62)
+            | (1u64 << 63);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((4 << 16) | 4),
+                load(4),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(f64::NAN).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(2.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert!(vm.pop().as_float().is_nan());
+    }
+
+    #[test]
     fn vec_niche_pop_does_not_allocate_an_option_enum() {
         let mut vm = Machine::<16>::default();
         let (object, _) = vm.heap.alloc(

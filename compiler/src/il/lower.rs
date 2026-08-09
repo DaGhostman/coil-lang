@@ -268,8 +268,8 @@ fn absolute_jump_targets(slots: &[Slot]) -> std::collections::HashSet<usize> {
 
 fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
     // Fuse-select order mirrors historical peephole try_fuse; JMPF targets stay symbolic.
-    if let Some(s) = try_fuse_float_chain_store(window, pool) {
-        return Some((s, 6));
+    if let Some((s, n)) = try_fuse_float_chain_store(window, pool) {
+        return Some((s, n));
     }
     if let Some(s) = try_fuse_load_const_cmp_jmpf_slot(window) {
         return Some((s, 4));
@@ -375,39 +375,256 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
     None
 }
 
-/// `LOAD a; LOAD b; float-bin1; LOAD c; float-bin2; STORE d` →
-/// `FloatChainStore`. The VM evaluates the two stages in source order.
-fn try_fuse_float_chain_store(window: &[Slot], pool: &mut Vec<u64>) -> Option<Slot> {
-    if window.len() < 6 {
+/// Source-ordered float chain → `FloatChainStore`.
+///
+/// Matches:
+/// - `LOAD a; LOAD b; op1; LOAD c; op2; STORE d` (legacy 2-stage)
+/// - `BinSlotSlot op1; LOAD c; op2; [LOAD e; op3;] STORE d`
+/// - `CONST pool; BinSlotSlot/LOADs op1; op2; LOAD c; op3; STORE d` (const-under)
+///
+/// Stages evaluate left-to-right with no reassociation/FMA. Returns `(fused, consumed)`.
+fn try_fuse_float_chain_store(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
+    if let Some(r) = try_fuse_float_chain_const_under(window, pool) {
+        return Some(r);
+    }
+    try_fuse_float_chain_standard(window, pool)
+}
+
+/// `CONST k; <stage0>; op1; [LOAD/CONST other; op2;] STORE dest`
+/// where `op1` uses const-under stack order: `op1(k, acc0)`.
+fn try_fuse_float_chain_const_under(
+    window: &[Slot],
+    pool: &mut Vec<u64>,
+) -> Option<(Slot, usize)> {
+    if window.len() < 5 {
         return None;
     }
-    let b0 = slot_as_byte(&window[0])?;
-    let b1 = slot_as_byte(&window[1])?;
-    let b2 = slot_as_byte(&window[2])?;
-    let b3 = slot_as_byte(&window[3])?;
-    let b4 = slot_as_byte(&window[4])?;
-    let b5 = slot_as_byte(&window[5])?;
-    let lhs = load_slot(&b0)?;
-    let rhs = load_slot(&b1)?;
-    let rhs2 = load_slot(&b3)?;
-    let op1 = *b2.bytecode();
-    let op2 = *b4.bytecode();
-    if !is_float_arith_op(op1) || !is_float_arith_op(op2) {
-        return None;
+    let const_idx = u8::try_from(const_pool_index(&slot_as_byte(&window[0])?)?).ok()?;
+    let (stage0_len, op0, lhs0, rhs0) = parse_float_stage0(&window[1..])?;
+    let mut i = 1 + stage0_len;
+    let op1 = float_arith_byte(&slot_as_byte(window.get(i)?)?)?;
+    i += 1;
+
+    let mut op2 = 0u8;
+    let mut rhs2 = 0u8;
+    let mut rhs2_const = false;
+    let mut stage2_left = false;
+    let mut has_stage2 = false;
+    if let Some((ni, op, other, is_const, on_left)) = parse_float_continuation(&window[i..]) {
+        // Need STORE after this continuation.
+        let after = i + ni;
+        if store_slot_u8(&slot_as_byte(window.get(after)?)?).is_some() {
+            op2 = op;
+            rhs2 = other;
+            rhs2_const = is_const;
+            stage2_left = on_left;
+            has_stage2 = true;
+            i = after;
+        }
     }
-    let dest = store_slot_u8(&b5)?;
+    let dest = store_slot_u8(&slot_as_byte(window.get(i)?)?)?;
+    i += 1;
+    // Const-under without a third stage is only useful if stage1 is the const op;
+    // require at least the closing store after op1 (2 binary stages total).
+    let descriptor = pack_float_chain_ext(
+        op0,
+        lhs0,
+        false,
+        rhs0,
+        false,
+        op1,
+        const_idx,
+        true,
+        true, // stage1: op1(const, acc)
+        has_stage2,
+        op2,
+        rhs2,
+        rhs2_const,
+        stage2_left,
+    );
+    Some((emit_float_chain_store(window, pool, dest, descriptor)?, i))
+}
+
+/// `<stage0>; (LOAD|CONST other; op)+ ; STORE` with accumulator on the left.
+fn try_fuse_float_chain_standard(
+    window: &[Slot],
+    pool: &mut Vec<u64>,
+) -> Option<(Slot, usize)> {
+    let (stage0_len, op0, lhs0, rhs0) = parse_float_stage0(window)?;
+    let mut i = stage0_len;
+    let (i1, op1, rhs1, rhs1_const, stage1_left) = parse_float_continuation(&window[i..])?;
+    i += i1;
+
+    let mut op2 = 0u8;
+    let mut rhs2 = 0u8;
+    let mut rhs2_const = false;
+    let mut stage2_left = false;
+    let mut has_stage2 = false;
+    if let Some((ni, op, other, is_const, on_left)) = parse_float_continuation(&window[i..]) {
+        let after = i + ni;
+        if store_slot_u8(&slot_as_byte(window.get(after)?)?).is_some() {
+            op2 = op;
+            rhs2 = other;
+            rhs2_const = is_const;
+            stage2_left = on_left;
+            has_stage2 = true;
+            i = after;
+        }
+    }
+    let dest = store_slot_u8(&slot_as_byte(window.get(i)?)?)?;
+    i += 1;
+
+    let use_ext = has_stage2 || rhs1_const || rhs2_const || stage1_left || stage2_left;
+    let descriptor = if use_ext {
+        pack_float_chain_ext(
+            op0,
+            lhs0,
+            false,
+            rhs0,
+            false,
+            op1,
+            rhs1,
+            rhs1_const,
+            stage1_left,
+            has_stage2,
+            op2,
+            rhs2,
+            rhs2_const,
+            stage2_left,
+        )
+    } else {
+        (op0 as u64)
+            | ((lhs0 as u64) << 8)
+            | ((rhs0 as u64) << 16)
+            | ((op1 as u64) << 24)
+            | ((rhs1 as u64) << 32)
+    };
+    Some((emit_float_chain_store(window, pool, dest, descriptor)?, i))
+}
+
+fn emit_float_chain_store(
+    window: &[Slot],
+    pool: &mut Vec<u64>,
+    dest: u8,
+    descriptor: u64,
+) -> Option<Slot> {
     let descriptor_idx = u16::try_from(pool.len()).ok()?;
-    let descriptor = (op1 as u64)
-        | ((lhs as u64) << 8)
-        | ((rhs as u64) << 16)
-        | ((op2 as u64) << 24)
-        | ((rhs2 as u64) << 32);
     pool.push(descriptor);
     let operand = ((dest as u32) << 16) | descriptor_idx as u32;
     Some(Slot::Byte(
         Byte::new(Instruction::FloatChainStore).with_operand_u32(operand),
         window[0].loc(),
     ))
+}
+
+/// Pack extended `FloatChainStore` descriptor (bit 63 set). See `Instruction::FloatChainStore`.
+fn pack_float_chain_ext(
+    op0: u8,
+    lhs0: u8,
+    lhs0_const: bool,
+    rhs0: u8,
+    rhs0_const: bool,
+    op1: u8,
+    rhs1: u8,
+    rhs1_const: bool,
+    stage1_left: bool,
+    has_stage2: bool,
+    op2: u8,
+    rhs2: u8,
+    rhs2_const: bool,
+    stage2_left: bool,
+) -> u64 {
+    let mut d = (op0 as u64)
+        | ((lhs0 as u64) << 8)
+        | ((rhs0 as u64) << 16)
+        | ((op1 as u64) << 24)
+        | ((rhs1 as u64) << 32)
+        | ((op2 as u64) << 40)
+        | ((rhs2 as u64) << 48)
+        | (1u64 << 63);
+    if rhs0_const {
+        d |= 1 << 56;
+    }
+    if rhs1_const {
+        d |= 1 << 57;
+    }
+    if rhs2_const {
+        d |= 1 << 58;
+    }
+    if lhs0_const {
+        d |= 1 << 59;
+    }
+    if stage1_left {
+        d |= 1 << 60;
+    }
+    if stage2_left {
+        d |= 1 << 61;
+    }
+    if has_stage2 {
+        d |= 1 << 62;
+    }
+    d
+}
+
+/// Stage0: `LOAD a; LOAD b; float-op` or float `BinSlotSlot`.
+fn parse_float_stage0(window: &[Slot]) -> Option<(usize, u8, u8, u8)> {
+    if window.is_empty() {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    if *b0.bytecode() == Instruction::BinSlotSlot {
+        let (op, a, b) = b0.bin_slot_slot_parts();
+        if !is_float_arith_op(Instruction::from(op)) {
+            return None;
+        }
+        return Some((1, op, a as u8, b as u8));
+    }
+    if window.len() < 3 {
+        return None;
+    }
+    let b1 = slot_as_byte(&window[1])?;
+    let b2 = slot_as_byte(&window[2])?;
+    let lhs = load_slot(&b0)?;
+    let rhs = load_slot(&b1)?;
+    let op = float_arith_byte(&b2)?;
+    Some((3, op, lhs, rhs))
+}
+
+/// Continuation: `LOAD slot; float-op` or `CONST pool; float-op`.
+/// Returns `(consumed, op, other_idx, is_const, other_on_left)`.
+/// Stack order after pushing other is always `[acc, other]`, so `other_on_left` is false.
+fn parse_float_continuation(window: &[Slot]) -> Option<(usize, u8, u8, bool, bool)> {
+    if window.len() < 2 {
+        return None;
+    }
+    let b0 = slot_as_byte(&window[0])?;
+    let b1 = slot_as_byte(&window[1])?;
+    let op = float_arith_byte(&b1)?;
+    if let Some(slot) = load_slot(&b0) {
+        return Some((2, op, slot, false, false));
+    }
+    let idx = u8::try_from(const_pool_index(&b0)?).ok()?;
+    Some((2, op, idx, true, false))
+}
+
+fn float_arith_byte(byte: &Byte) -> Option<u8> {
+    let op = *byte.bytecode();
+    if is_float_arith_op(op) {
+        Some(op as u8)
+    } else {
+        None
+    }
+}
+
+fn const_pool_index(byte: &Byte) -> Option<u32> {
+    if *byte.bytecode() != Instruction::CONST {
+        return None;
+    }
+    let op = byte.operand_u32();
+    if op & Byte::POOL_FLAG == 0 {
+        return None;
+    }
+    Some(op & !Byte::POOL_FLAG)
 }
 
 fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
@@ -914,6 +1131,7 @@ fn try_fuse_bin_return_local(window: &[Byte; 2]) -> Option<Byte> {
 mod tests {
     use super::*;
     use crate::il::IlBuilder;
+    use common::Value;
 
     #[test]
     fn lower_resolves_forward_jmp() {
@@ -1206,6 +1424,71 @@ mod tests {
         assert_eq!((descriptor >> 16) as u8, 2);
         assert_eq!((descriptor >> 24) as u8, Instruction::ADDF as u8);
         assert_eq!((descriptor >> 32) as u8, 3);
+        assert_eq!(descriptor & (1u64 << 63), 0, "legacy 2-stage keeps EXT clear");
+    }
+
+    #[test]
+    fn lower_fuses_three_stage_const_under_float_chain_store() {
+        // CONST 2.0; BinSlotSlot MULF zr,zi; MULF; LOAD ci; ADDF; STORE zi
+        let mut pool = vec![Value::from(2.0_f64).raw() as u64];
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::CONST).with_const_pool(0));
+        il.push_byte(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::MULF as u8,
+            7,
+            8,
+        ));
+        il.push_byte(Byte::new(Instruction::MULF));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(6));
+        il.push_byte(Byte::new(Instruction::ADDF));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(8));
+
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::FloatChainStore
+        ));
+        assert_eq!(lowered.bytecode[0].operand_u32() >> 16, 8);
+        let descriptor = pool[lowered.bytecode[0].operand_u32() as usize & 0xFFFF];
+        assert_ne!(descriptor & (1u64 << 63), 0);
+        assert_eq!(descriptor as u8, Instruction::MULF as u8);
+        assert_eq!((descriptor >> 8) as u8, 7);
+        assert_eq!((descriptor >> 16) as u8, 8);
+        assert_eq!((descriptor >> 24) as u8, Instruction::MULF as u8);
+        assert_eq!((descriptor >> 32) as u8, 0); // const pool idx 0
+        assert_ne!(descriptor & (1 << 57), 0); // rhs1 const
+        assert_ne!(descriptor & (1 << 60), 0); // stage1 other on left
+        assert_ne!(descriptor & (1 << 62), 0); // has stage2
+        assert_eq!((descriptor >> 40) as u8, Instruction::ADDF as u8);
+        assert_eq!((descriptor >> 48) as u8, 6);
+    }
+
+    #[test]
+    fn lower_fuses_bin_slot_slot_two_stage_float_chain_store() {
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::SUBF as u8,
+            1,
+            2,
+        ));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(3));
+        il.push_byte(Byte::new(Instruction::ADDF));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(4));
+
+        let mut pool = Vec::new();
+        let lowered = lower(il.ops(), &mut pool);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::FloatChainStore
+        ));
+        let descriptor = pool[lowered.bytecode[0].operand_u32() as usize & 0xFFFF];
+        assert_eq!(descriptor as u8, Instruction::SUBF as u8);
+        assert_eq!((descriptor >> 8) as u8, 1);
+        assert_eq!((descriptor >> 16) as u8, 2);
+        assert_eq!((descriptor >> 24) as u8, Instruction::ADDF as u8);
+        assert_eq!((descriptor >> 32) as u8, 3);
+        assert_eq!(descriptor & (1u64 << 63), 0);
     }
 
     #[test]

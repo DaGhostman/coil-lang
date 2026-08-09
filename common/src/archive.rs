@@ -21,7 +21,9 @@ pub const ARCHIVE_MAJOR: u16 = 2;
 /// 3 — pointer-niche Option conversion and unary pair representation opcodes.
 /// 4 — allocation-free niche Vec host invocation.
 /// 5 — source-ordered two-stage float chain storage.
-pub const ARCHIVE_MINOR: u16 = 5;
+/// 6 — `FloatChainStore` extended descriptor: up to 3 stages, const-pool
+///     operands, and `BinSlotSlot` stage0 (bit 63 distinguishes layouts).
+pub const ARCHIVE_MINOR: u16 = 6;
 
 /// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
 pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
@@ -180,9 +182,9 @@ mod tests {
     #[test]
     fn archive_version_matches_current_abi() {
         assert_eq!(ARCHIVE_MAJOR, 2);
-        assert_eq!(ARCHIVE_MINOR, 5);
-        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 5));
-        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.5");
+        assert_eq!(ARCHIVE_MINOR, 6);
+        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 6));
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.6");
     }
 
     #[test]

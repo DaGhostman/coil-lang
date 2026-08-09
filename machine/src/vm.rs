@@ -2812,15 +2812,12 @@ impl<const S: usize> Machine<S> {
                     let dest = ((raw >> 16) & 0xFF) as usize;
                     promise!(descriptor_idx < constants.len());
                     let descriptor = unsafe { *constants.get_unchecked(descriptor_idx) };
-                    let op1 = descriptor as u8;
-                    let lhs_slot = (descriptor >> 8) as u8 as usize;
-                    let rhs_slot = (descriptor >> 16) as u8 as usize;
-                    let op2 = (descriptor >> 24) as u8;
-                    let rhs2_slot = (descriptor >> 32) as u8 as usize;
-                    promise!(sp + lhs_slot < stack_cap);
-                    promise!(sp + rhs_slot < stack_cap);
-                    promise!(sp + rhs2_slot < stack_cap);
-                    promise!(sp + dest < stack_cap);
+                    let op0 = descriptor as u8;
+                    let lhs0 = (descriptor >> 8) as u8 as usize;
+                    let rhs0 = (descriptor >> 16) as u8 as usize;
+                    let op1 = (descriptor >> 24) as u8;
+                    let rhs1 = (descriptor >> 32) as u8 as usize;
+                    let extended = descriptor & (1u64 << 63) != 0;
                     let bin = |op: u8, lhs: f64, rhs: f64| match Instruction::from(op) {
                         Instruction::ADDF => lhs + rhs,
                         Instruction::SUBF => lhs - rhs,
@@ -2829,13 +2826,52 @@ impl<const S: usize> Machine<S> {
                         Instruction::MODF => lhs % rhs,
                         _ => f64::NAN,
                     };
-                    let first = bin(
-                        op1,
-                        self.stack[sp + lhs_slot].as_float(),
-                        self.stack[sp + rhs_slot].as_float(),
+                    let load_op = |idx: usize, is_const: bool| -> f64 {
+                        if is_const {
+                            promise!(idx < constants.len());
+                            Value::from(unsafe { *constants.get_unchecked(idx) }).as_float()
+                        } else {
+                            promise!(sp + idx < stack_cap);
+                            self.stack[sp + idx].as_float()
+                        }
+                    };
+                    let (lhs0_const, rhs0_const, rhs1_const, rhs2_const, s1_left, s2_left, has_s2) =
+                        if extended {
+                            (
+                                descriptor & (1 << 59) != 0,
+                                descriptor & (1 << 56) != 0,
+                                descriptor & (1 << 57) != 0,
+                                descriptor & (1 << 58) != 0,
+                                descriptor & (1 << 60) != 0,
+                                descriptor & (1 << 61) != 0,
+                                descriptor & (1 << 62) != 0,
+                            )
+                        } else {
+                            (false, false, false, false, false, false, false)
+                        };
+                    let mut acc = bin(
+                        op0,
+                        load_op(lhs0, lhs0_const),
+                        load_op(rhs0, rhs0_const),
                     );
-                    let result = bin(op2, first, self.stack[sp + rhs2_slot].as_float());
-                    self.stack[sp + dest] = Value::from(result);
+                    let other1 = load_op(rhs1, rhs1_const);
+                    acc = if s1_left {
+                        bin(op1, other1, acc)
+                    } else {
+                        bin(op1, acc, other1)
+                    };
+                    if has_s2 {
+                        let op2 = (descriptor >> 40) as u8;
+                        let rhs2 = (descriptor >> 48) as u8 as usize;
+                        let other2 = load_op(rhs2, rhs2_const);
+                        acc = if s2_left {
+                            bin(op2, other2, acc)
+                        } else {
+                            bin(op2, acc, other2)
+                        };
+                    }
+                    promise!(sp + dest < stack_cap);
+                    self.stack[sp + dest] = Value::from(acc);
                     if self.stack.tell() <= sp + dest {
                         self.stack.seek(sp + dest + 1);
                     }

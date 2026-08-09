@@ -233,9 +233,43 @@ fn perf_mandelbrot_fuses_source_order_float_chain() {
     let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
     let syms = pipeline.program_debug().fn_symbols;
     let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    let chains = count_opcodes_in(&bc, start, end, Instruction::FloatChainStore);
     assert!(
-        count_opcodes_in(&bc, start, end, Instruction::FloatChainStore) >= 1,
-        "Mandelbrot should fuse a source-ordered two-stage float store"
+        chains >= 2,
+        "Mandelbrot should fuse both tr and zi source-ordered float stores, got {chains}"
+    );
+    // zi = 2.0 * (zr * zi) + ci must not remain as CONST + BinSlotSlot + MULF + …
+    let mut unfused_zi = false;
+    let slice = &bc[start..end];
+    for i in 0..slice.len().saturating_sub(5) {
+        if *slice[i].bytecode() != Instruction::CONST {
+            continue;
+        }
+        if slice[i].operand_u32() & common::Byte::POOL_FLAG == 0 {
+            continue;
+        }
+        if *slice[i + 1].bytecode() != Instruction::BinSlotSlot {
+            continue;
+        }
+        let (op, _, _) = slice[i + 1].bin_slot_slot_parts();
+        if op != Instruction::MULF as u8 {
+            continue;
+        }
+        if *slice[i + 2].bytecode() == Instruction::MULF
+            && *slice[i + 3].bytecode() == Instruction::LOAD
+            && *slice[i + 4].bytecode() == Instruction::ADDF
+            && matches!(
+                *slice[i + 5].bytecode(),
+                Instruction::STORE | Instruction::StorePop
+            )
+        {
+            unfused_zi = true;
+            break;
+        }
+    }
+    assert!(
+        !unfused_zi,
+        "zi update should fuse to FloatChainStore, not CONST;BinSlotSlot;MULF;LOAD;ADDF;STORE"
     );
 }
 

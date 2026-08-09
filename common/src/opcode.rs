@@ -285,9 +285,19 @@ pub enum Instruction {
     ReturnPair,
     /// Invoke a known host native that returns pointer-niche `Option<T>`.
     HostInvokeNiche,
-    /// Evaluate two source-ordered float binary stages and store the result.
-    /// The pool descriptor packs `(op1, lhs_slot, rhs_slot, op2, rhs2_slot)`;
-    /// the opcode operand packs the descriptor index and destination slot.
+    /// Evaluate two or three source-ordered float binary stages and store.
+    ///
+    /// Opcode operand: `[31:16] dest_slot`, `[15:0] descriptor pool index`.
+    ///
+    /// Legacy descriptor (bit 63 clear): two stages, slot operands only —
+    /// `[7:0] op0`, `[15:8] lhs0`, `[23:16] rhs0`, `[31:24] op1`, `[39:32] rhs1`.
+    /// Acc starts as `op0(slot[lhs0], slot[rhs0])`, then `op1(acc, slot[rhs1])`.
+    ///
+    /// Extended (bit 63 set): optional third stage and const-pool operands —
+    /// same low fields, plus `[47:40] op2`, `[55:48] rhs2`, flags in `[62:56]`:
+    /// bit56 rhs0_const, bit57 rhs1_const, bit58 rhs2_const, bit59 lhs0_const,
+    /// bit60 stage1_other_on_left, bit61 stage2_other_on_left, bit62 has_stage2.
+    /// When `other_on_left`, that stage is `op(other, acc)` (stack const-under).
     FloatChainStore,
 }
 
