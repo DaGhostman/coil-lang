@@ -78,6 +78,7 @@ impl Heap {
         self.head = Some(object);
         self.alloc_bytes += size;
         self.addr_index.insert(object.addr(), object);
+        crate::vm::note_heap_alloc();
 
         (object, content)
     }

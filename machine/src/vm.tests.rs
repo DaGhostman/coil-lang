@@ -2,7 +2,9 @@
         ArchivedByte as Byte, ArchivedInstruction as Instruction, Byte as RawByte, Value,
     };
 
-    use super::{dispatch_count, reset_dispatch_count};
+    use super::{
+        alloc_count, dispatch_count, make_fast_count, reset_alloc_profile, reset_dispatch_count,
+    };
     use crate::{Heap, Machine, ObjArray, ObjEnum, Object};
     use std::sync::{Arc, Mutex};
 
@@ -312,6 +314,136 @@
             }
             _ => panic!("expected enum on stack"),
         }
+    }
+
+    /// MakeTuple fixed-arity fast path: declaration-order elements, no reverse.
+    #[test]
+    fn make_tuple_arity2_and_3_preserve_declaration_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        let addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Tuple(gc)) => {
+                let e = &gc.as_ref().elements;
+                assert_eq!(e.len(), 2);
+                assert_eq!(e[0].as_int(), 10);
+                assert_eq!(e[1].as_int(), 20);
+            }
+            _ => panic!("expected tuple"),
+        }
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 2);
+    }
+
+    /// MakeArray fixed-arity fast path mirrors MakeTuple order.
+    #[test]
+    fn make_array_arity2_preserves_declaration_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(6),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 5);
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(6),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 6);
+    }
+
+    /// Empty MakeTuple / MakeArray still allocate a rooted aggregate.
+    #[test]
+    fn make_tuple_and_array_arity0() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            Byte::new(Instruction::MakeArray).with_operand_u32(0),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// Tree-node shape: MakeEnum arity-2 hits the fixed-arity fast path and
+    /// keeps pop-order payload (codegen reverse-pushes).
+    #[test]
+    fn make_enum_arity2_fast_path_tree_node_shape() {
+        reset_alloc_profile();
+        let mut vm = Machine::<8>::default();
+        // Leaf singletons + Node(left, right): push right leaf, left leaf.
+        vm.run(&[
+            make_enum(0, 0),
+            make_enum(0, 0),
+            make_enum(1, 2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert!(
+            make_fast_count() >= 1,
+            "arity-2 MakeEnum should take the fixed-arity fast path"
+        );
+        assert!(alloc_count() >= 1, "Node must allocate one enum object");
+        let node = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(node) {
+            Some(Object::Enum(gc)) => {
+                let e = gc.as_ref();
+                assert_eq!(e.tag, 1);
+                assert_eq!(e.payload.len(), 2);
+            }
+            _ => panic!("expected Node enum"),
+        }
+    }
+
+    /// Large arity still works (slow Vec path) and preserves order.
+    #[test]
+    fn make_tuple_arity4_slow_path_preserves_order() {
+        reset_alloc_profile();
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            const_int(4),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(4),
+            const_int(3),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 4);
+        // arity 4 must not bump the fixed-arity fast counter for this op.
+        // (Other setup may be zero — only this MakeTuple ran.)
+        assert_eq!(make_fast_count(), 0);
     }
 
     /// `ArrayLen` must report string/tuple/dict lengths (structural `len`).

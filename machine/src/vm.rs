@@ -86,6 +86,90 @@ pub fn cursor_trace() -> Vec<(u32, u32)> {
     Vec::new()
 }
 
+// Allocation / GC counters (`vm_profile` + tests). Useful for binary_trees-style
+// heap traffic without needing external alloc tracers.
+#[cfg(any(test, feature = "vm_profile"))]
+thread_local! {
+    static VM_ALLOC_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+    static VM_GC_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+    static VM_MAKE_FAST_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+/// Record one managed heap object allocation.
+#[cfg(any(test, feature = "vm_profile"))]
+#[inline]
+pub(crate) fn note_heap_alloc() {
+    VM_ALLOC_COUNT.with(|c| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[inline]
+pub(crate) fn note_heap_alloc() {}
+
+/// Reset allocation / GC / Make* fast-path counters.
+#[cfg(any(test, feature = "vm_profile"))]
+pub fn reset_alloc_profile() {
+    VM_ALLOC_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+    VM_GC_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+    VM_MAKE_FAST_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+pub fn reset_alloc_profile() {}
+
+/// Number of managed objects allocated since the last reset.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn alloc_count() -> u64 {
+    VM_ALLOC_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn alloc_count() -> u64 {
+    0
+}
+
+/// Number of mark-and-sweep collections since the last reset.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn gc_count() -> u64 {
+    VM_GC_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn gc_count() -> u64 {
+    0
+}
+
+/// Number of MakeTuple / MakeArray / MakeEnum fixed-arity fast paths taken.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn make_fast_count() -> u64 {
+    VM_MAKE_FAST_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn make_fast_count() -> u64 {
+    0
+}
+
+#[cfg(any(test, feature = "vm_profile"))]
+#[inline]
+fn note_make_fast() {
+    VM_MAKE_FAST_COUNT.with(|c| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[inline]
+fn note_make_fast() {}
+
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
         {
@@ -765,6 +849,10 @@ impl<const S: usize> Machine<S> {
 
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
     fn gc_collect(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
+        #[cfg(any(test, feature = "vm_profile"))]
+        VM_GC_COUNT.with(|c| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
         let mut roots = heap.take_gc_roots();
         // Only live operand-stack slots (not the full capacity buffer).
         for v in stack.as_slice() {
@@ -819,6 +907,63 @@ impl<const S: usize> Machine<S> {
     fn maybe_gc_after_alloc(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
         if unlikely(heap.should_collect()) {
             Self::gc_collect(heap, stack, resume_stack);
+        }
+    }
+
+    /// Classify a stack value as an enum member; heap pointers become `Object`.
+    #[inline]
+    fn value_as_member(heap: &Heap, v: Value) -> Member {
+        let addr = v.raw() as u64;
+        if let Some(o) = Self::find_object_by_addr(heap, addr) {
+            Member::Object(o)
+        } else {
+            Member::Value(v)
+        }
+    }
+
+    /// Copy `n` stack values in declaration order (`stack[base..base+n]`).
+    /// Used by MakeTuple / MakeArray. Args stay on the stack for GC rooting
+    /// until the caller seeks past them after allocation.
+    #[inline]
+    fn stack_copy_decl(stack: &Stack<Value>, base: usize, n: usize) -> Vec<Value> {
+        match n {
+            0 => Vec::new(),
+            1 => vec![stack[base]],
+            2 => vec![stack[base], stack[base + 1]],
+            3 => vec![stack[base], stack[base + 1], stack[base + 2]],
+            _ => {
+                let mut values = Vec::with_capacity(n);
+                for i in 0..n {
+                    values.push(stack[base + i]);
+                }
+                values
+            }
+        }
+    }
+
+    /// Copy `n` stack values in MakeEnum pop order (TOS → payload[0]).
+    /// Codegen reverse-pushes constructor args so this yields declaration order.
+    #[inline]
+    fn stack_copy_enum_payload(heap: &Heap, stack: &Stack<Value>, sp: usize, n: usize) -> Vec<Member> {
+        match n {
+            0 => Vec::new(),
+            1 => vec![Self::value_as_member(heap, stack[sp - 1])],
+            2 => vec![
+                Self::value_as_member(heap, stack[sp - 1]),
+                Self::value_as_member(heap, stack[sp - 2]),
+            ],
+            3 => vec![
+                Self::value_as_member(heap, stack[sp - 1]),
+                Self::value_as_member(heap, stack[sp - 2]),
+                Self::value_as_member(heap, stack[sp - 3]),
+            ],
+            _ => {
+                let mut payload = Vec::with_capacity(n);
+                for i in 0..n {
+                    payload.push(Self::value_as_member(heap, stack[sp - 1 - i]));
+                }
+                payload
+            }
         }
     }
 
@@ -2950,8 +3095,9 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
-                    // operands: tag (high 16), arity (low 16). Args popped top-first
-                    // into declaration order; classify each as immediate or heap pointer.
+                    // operands: tag (high 16), arity (low 16). Codegen reverse-pushes
+                    // args; we read TOS-first into declaration-order payload.
+                    // Values stay on the stack until after alloc so GC can root them.
                     let operands = opcode.operand_u32();
                     let tag = operands >> 16;
                     let arity = (operands & 0xFFFF) as usize;
@@ -2963,46 +3109,44 @@ impl<const S: usize> Machine<S> {
                         continue;
                     }
 
-                    let mut payload: Vec<Member> = Vec::with_capacity(arity);
-                    for _ in 0..arity {
-                        if self.stack.tell() == 0 {
-                            break;
-                        }
-                        let v = self.stack.pop();
-                        let addr = v.raw() as u64;
-                        if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
-                            payload.push(Member::Object(o));
-                        } else {
-                            payload.push(Member::Value(v));
-                        }
+                    let sp = self.stack.tell();
+                    let n = arity.min(sp);
+                    if n <= 3 {
+                        note_make_fast();
                     }
+                    let payload = Self::stack_copy_enum_payload(&self.heap, &self.stack, sp, n);
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
-                    // Root before GC — unmarked fresh enums are swept otherwise
-                    // (result-mode `return Ok(s)` after a heavy callee was flaky).
+                    // Drop args, then root the fresh enum before maybe-GC.
+                    self.stack.seek(sp - n);
                     self.stack.push(Value::from(object.addr()));
                     Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
                     let arity = (operands & 0xFFFF) as usize;
-                    let mut values: Vec<Value> = Vec::with_capacity(arity);
-                    for _ in 0..arity {
-                        if self.stack.tell() == 0 {
-                            break;
-                        }
-                        values.push(self.stack.pop());
+                    let sp = self.stack.tell();
+                    let n = arity.min(sp);
+                    let base = sp - n;
+                    if n <= 3 {
+                        note_make_fast();
                     }
-                    values.reverse();
+                    // Declaration order; keep args on stack through alloc for rooting.
+                    let values = Self::stack_copy_decl(&self.stack, base, n);
                     let addr = if matches!(opcode.bytecode(), Instruction::MakeTuple) {
-                        let obj_tuple = ObjTuple { elements: values };
-                        let (object, _) = self.heap.alloc(obj_tuple, Object::Tuple);
+                        let (object, _) = self.heap.alloc(
+                            ObjTuple { elements: values },
+                            Object::Tuple,
+                        );
                         object.addr()
                     } else {
-                        let obj_array = ObjArray { elements: values };
-                        let (object, _) = self.heap.alloc(obj_array, Object::Array);
+                        let (object, _) = self.heap.alloc(
+                            ObjArray { elements: values },
+                            Object::Array,
+                        );
                         object.addr()
                     };
+                    self.stack.seek(base);
                     self.stack.push(Value::from(addr));
                     Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }

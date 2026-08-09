@@ -2450,6 +2450,12 @@ fn example_perf_mandelbrot_prints_checksum() {
 }
 
 #[test]
+fn example_perf_binary_trees_prints_checksum() {
+    let output = run_example("examples/perf/binary_trees.hy");
+    assert_eq!(output, "135854");
+}
+
+#[test]
 fn example_perf_array_mut_prints_expected() {
     let output = run_example("examples/perf/array_mut.hy");
     assert_eq!(output, "2000");
