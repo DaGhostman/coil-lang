@@ -335,9 +335,11 @@ fn main() {
 | **Run** | `cargo run -- examples/fib.hy` |
 | **Output** | `55` |
 
-Cross-language CPU baselines (mandelbrot / tak / nsieve / binary trees) live under
-`examples/perf/` with matching `benchmarks/*.{lua,js}` ports. For timing, prefer
-`coil compile … -o x.hyc` then `coil run x.hyc` (see `./scripts/poop_baseline.sh`).
+Cross-language CPU baselines (mandelbrot / tak / nsieve / binary trees / fib)
+live under `examples/perf/` with matching `benchmarks/*.{lua,js}` ports. For
+timing, prefer `coil compile … -o x.hyc` then `coil run x.hyc` (see
+`./scripts/poop_baseline.sh`). Compile `perf/fib.hy` with `COIL_AUTO_PAR=0` so
+the naive recursion stays sequential like the Lua/Node ports.
 
 ---
 
@@ -362,6 +364,21 @@ Cross-language CPU baselines (mandelbrot / tak / nsieve / binary trees) live und
 | **Run** | `cargo run --release -- examples/perf/tak.hy` |
 | **Output** | `7` |
 | **Ports** | `benchmarks/tak.lua`, `benchmarks/tak.js` |
+
+---
+
+### `examples/perf/fib.hy`
+
+**Demonstrates:** Plain naive `fib(32)` recursion (math/dispatch baseline).
+
+| | |
+|---|---|
+| **Run** | `COIL_AUTO_PAR=0 cargo run --release -- examples/perf/fib.hy` |
+| **Output** | `2178309` |
+| **Ports** | `benchmarks/fib.lua`, `benchmarks/fib.js` |
+
+Compile with `COIL_AUTO_PAR=0` for fair sequential timing (default auto-par would
+fork-join the binary recursion).
 
 ---
 
@@ -2068,6 +2085,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `fib.hy` | Basics | `55` |
 | `perf/mandelbrot.hy` | Perf | `625885` |
 | `perf/tak.hy` | Perf | `7` |
+| `perf/fib.hy` | Perf | `2178309` |
 | `perf/nsieve.hy` | Perf | `1900` |
 | `perf/binary_trees.hy` | Perf | `135854` |
 | `perf/bool_guard.hy` | Perf | `45` |

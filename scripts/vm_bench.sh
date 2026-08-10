@@ -31,6 +31,7 @@ declare -A EXPECTED=(
     ["examples/perf/tak.hy"]="7"
     ["examples/perf/nsieve.hy"]="1900"
     ["examples/perf/binary_trees.hy"]="135854"
+    ["examples/perf/fib.hy"]="2178309"
     ["examples/perf/bool_guard.hy"]="45"
     ["examples/inline_wrapped_call.hy"]="13"
 )
@@ -41,6 +42,7 @@ CPU_BENCH=(
     examples/perf/tak.hy
     examples/perf/nsieve.hy
     examples/perf/binary_trees.hy
+    examples/perf/fib.hy
     examples/perf/numeric.hy
     examples/perf/operators_loop.hy
     examples/perf/match_sum.hy
@@ -51,6 +53,7 @@ CROSS_LANG=(
     tak
     nsieve
     binary_trees
+    fib
 )
 
 run_example() {
@@ -93,7 +96,11 @@ if command -v poop >/dev/null 2>&1; then
     for name in "${CROSS_LANG[@]}"; do
         echo "-- $name"
         hyc="$POOP_DIR/${name}.hyc"
-        "$BIN" compile "examples/perf/${name}.hy" -o "$hyc" >/dev/null
+        if [[ "$name" == "fib" ]]; then
+            COIL_AUTO_PAR=0 "$BIN" compile "examples/perf/${name}.hy" -o "$hyc" >/dev/null
+        else
+            "$BIN" compile "examples/perf/${name}.hy" -o "$hyc" >/dev/null
+        fi
         cmds=("$BIN run $hyc" "lua benchmarks/${name}.lua")
         if command -v node >/dev/null 2>&1; then
             cmds+=("node benchmarks/${name}.js")
@@ -106,7 +113,11 @@ if command -v poop >/dev/null 2>&1; then
         name="$(basename "$path" .hy)"
         hyc="$POOP_DIR/${name}.hyc"
         echo "-- $path"
-        "$BIN" compile "$path" -o "$hyc" >/dev/null
+        if [[ "$name" == "fib" ]]; then
+            COIL_AUTO_PAR=0 "$BIN" compile "$path" -o "$hyc" >/dev/null
+        else
+            "$BIN" compile "$path" -o "$hyc" >/dev/null
+        fi
         poop -d 3000 "$BIN run $hyc" || true
     done
 else

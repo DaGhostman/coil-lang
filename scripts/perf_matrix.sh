@@ -11,13 +11,14 @@ DURATION_MS="${DURATION_MS:-6000}"
 OUT_DIR="${OUT_DIR:-/tmp/coil_perf_matrix}"
 RUN_MASSIF="${RUN_MASSIF:-0}"
 
-CROSS_LANG=(mandelbrot tak nsieve binary_trees)
+CROSS_LANG=(mandelbrot tak nsieve binary_trees fib)
 AOT_ONLY=(numeric operators_loop match_sum option_result field_hot dict_hot array_mut)
 declare -A EXPECTED=(
     [mandelbrot]=625885
     [tak]=7
     [nsieve]=1900
     [binary_trees]=135854
+    [fib]=2178309
     [numeric]=1999000
     [operators_loop]=149912
     [match_sum]=7995
@@ -99,9 +100,21 @@ check_archive() {
     printf -- '- checksum `%s`: `%s`\n' "$name" "$got" >>"$OUT_DIR/README.md"
 }
 
+compile_perf() {
+    local name="$1"
+    local archive="$2"
+    # fib(32) is a sequential recursion baseline; keep auto-par off so Coil
+    # matches the naive Lua/Node ports rather than fork-join specializations.
+    if [[ "$name" == "fib" ]]; then
+        COIL_AUTO_PAR=0 "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
+    else
+        "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
+    fi
+}
+
 for name in "${CROSS_LANG[@]}"; do
     archive="$OUT_DIR/${name}.hyc"
-    "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
+    compile_perf "$name" "$archive"
     touch "$archive"
     check_archive "$name" "$archive"
     run_pooped "$name" \

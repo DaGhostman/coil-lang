@@ -2444,6 +2444,13 @@ fn example_perf_tak_prints_expected() {
 }
 
 #[test]
+fn example_perf_fib_prints_checksum() {
+    // Prefer `COIL_AUTO_PAR=0` when timing; checksum is identical either way.
+    let output = run_example("examples/perf/fib.hy");
+    assert_eq!(output, "2178309");
+}
+
+#[test]
 fn example_perf_numeric_prints_expected_sum() {
     let output = run_example("examples/perf/numeric.hy");
     assert_eq!(output, "1999000");

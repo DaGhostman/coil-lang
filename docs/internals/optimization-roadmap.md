@@ -14,7 +14,7 @@ Run the repeatable matrix with:
 ```
 
 The script builds the release binary, checks each benchmark checksum, compares
-the four cross-language benchmarks against Lua and Node, runs the Coil-only
+the four cross-language benchmarks (plus restored `fib`) against Lua and Node, runs the Coil-only
 examples, and writes raw `poop` output plus metadata under
 `/tmp/coil_perf_matrix/`. Set `OUT_DIR` for another location, `DURATION_MS`
 for longer samples, or `RUN_MASSIF=1` to collect optional Valgrind Massif files.
