@@ -590,6 +590,9 @@ struct OpcodeGaps {
     bin_slot_slot_branch_without_cmp_fuse: usize,
     /// Adjacent `LOAD a; STORE b` with `a != b` (MoveSlot / CopySlot candidate).
     slot_move_copy: usize,
+    /// Latch-position slot move: `LOAD a; STORE b` soon followed by a backward
+    /// `JMP` (loop-carried φ-like shuffle proxy). Subset of `slot_move_copy`.
+    loop_carried_phi_shuffle: usize,
     /// Adjacent single-slot LOADs (`n==0|1`) that packing could have merged.
     call_arg_peel_packing_holes: usize,
     index: usize,
@@ -681,7 +684,7 @@ fn inventory_health(body: &[Byte]) -> OpcodeHealth {
     h
 }
 
-fn inventory_gaps(body: &[Byte]) -> OpcodeGaps {
+fn inventory_gaps(body: &[Byte], body_abs_start: usize) -> OpcodeGaps {
     let health = inventory_health(body);
     let mut g = OpcodeGaps {
         bare_jmpf: health.jmpf,
@@ -720,6 +723,19 @@ fn inventory_gaps(body: &[Byte]) -> OpcodeGaps {
             && a != b_slot
         {
             g.slot_move_copy += 1;
+            // Latch / φ-shuffle proxy: backward JMP within a short window
+            // (allows iter++ / fused stores between the copy and the back-edge).
+            let window_end = n.min(i + 2 + 6);
+            for j in i + 2..window_end {
+                if *body[j].bytecode() == Instruction::JMP {
+                    let abs = body_abs_start + j;
+                    let target = body[j].operand_u32() as usize;
+                    if target < abs {
+                        g.loop_carried_phi_shuffle += 1;
+                    }
+                    break;
+                }
+            }
         }
 
         // Packing hole: adjacent single-slot LOADs (n==0|1) not already packed.
@@ -774,16 +790,12 @@ fn inventory_gaps(body: &[Byte]) -> OpcodeGaps {
     g
 }
 
-fn fn_body<'a>(bc: &'a [Byte], pipeline: &Pipeline, name: &str) -> &'a [Byte] {
-    let syms = pipeline.program_debug().fn_symbols;
-    let (start, end) = fn_pc_range(&syms, name, bc.len());
-    &bc[start..end]
-}
-
 fn compile_fn_inventory(path: &str, fn_name: &str) -> (OpcodeHealth, OpcodeGaps) {
     let (bc, _, _, _, pipeline) = compile(path);
-    let body = fn_body(&bc, &pipeline, fn_name);
-    (inventory_health(body), inventory_gaps(body))
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, fn_name, bc.len());
+    let body = &bc[start..end];
+    (inventory_health(body), inventory_gaps(body, start))
 }
 
 #[test]
@@ -799,6 +811,11 @@ fn perf_phase0_mandelbrot_shape_inventory() {
     //   gaps:   slot_move=1 residual_float_arith=3; all other gap families 0
     // Phase 1: tr/zr live-range overlap refuses coalesce; slot_move stays 1.
     // Phase 2: no peel-param copies; tr/zr latch remains (Phase 3).
+    // Phase 3: copy-only latch elision cannot reclaim tr→zr — zi update keeps
+    //   zr live across STORE tr (opaque FloatChain + live-range overlap).
+    //   Residual: slot_move=1, loop_carried_phi_shuffle=1 (LOAD tr; STORE zr).
+    //   Estimated dynamic weight: ~1.28M × (LOAD+STORE) ≈ 2.56M unreclaimed
+    //   latch dispatches/run — Phase 5 MoveSlot / rename candidate.
     let (h, g) = compile_fn_inventory("examples/perf/mandelbrot.hy", "mandelbrot");
 
     // Existing-opcode health (post slot_promote / FloatChain / *Jmpf).
@@ -843,10 +860,14 @@ fn perf_phase0_mandelbrot_shape_inventory() {
         g.bin_slot_slot_branch_without_cmp_fuse, 0,
         "escape stays ConstJmpf; no BinSlotSlot→branch miss: {g:?}"
     );
-    // Residual LOAD tr; STORE zr — Phase 3 loop-carried target.
-    assert!(
-        g.slot_move_copy <= 1,
-        "slot move/copy (φ-like latch proxy) budget: {g:?}"
+    // Unreclaimed LOAD tr; STORE zr — overlapping live ranges + opaque chain.
+    assert_eq!(
+        g.slot_move_copy, 1,
+        "mandelbrot unreclaimed slot move (tr→zr): {g:?}"
+    );
+    assert_eq!(
+        g.loop_carried_phi_shuffle, 1,
+        "mandelbrot unreclaimed loop-carried φ-shuffle (tr→zr latch): {g:?}"
     );
     assert_eq!(
         g.call_arg_peel_packing_holes, 0,
@@ -869,6 +890,8 @@ fn perf_phase0_tak_shape_inventory() {
     //   peel LOAD param;STORE temp remain). packed_load_n3=4; packing_holes=0.
     // Phase 2: raise peel producers into dead high temps + elide param copies;
     //   LOAD=7 STORE=3 slot_move=0. packed_load_n3=4; packing_holes=0.
+    // Phase 3: no loop-carried latch shuffles in tak (recursion, not loops).
+    //   slot_move=0, loop_carried_phi_shuffle=0. Dynamic weight N/A.
     let (h, g) = compile_fn_inventory("examples/perf/tak.hy", "tak");
 
     assert!(h.load <= 8, "tak LOAD budget: {h:?}");
@@ -881,7 +904,7 @@ fn perf_phase0_tak_shape_inventory() {
         h.fused_bin_slot_total() >= 3,
         "x-1/y-1/z-1 peels should use BinSlot*: {h:?}"
     );
-    assert!(h.packed_load_n3 >= 3, "peel args pack as LOAD n=3: {h:?}");
+    assert!(h.packed_load_n3 >= 4, "tak peels keep packed_load_n3=4: {h:?}");
 
     // *Jmpt: peels/guards are *Jmpf; JMPT unused. Proxy documents static blindness.
     assert_eq!(h.jmpt, 0, "tak has no JMPT: {h:?}");
@@ -890,6 +913,10 @@ fn perf_phase0_tak_shape_inventory() {
     assert_eq!(
         g.slot_move_copy, 0,
         "tak peel param copies should elide: {g:?}"
+    );
+    assert_eq!(
+        g.loop_carried_phi_shuffle, 0,
+        "tak has no loop-carried φ-shuffle: {g:?}"
     );
     assert_eq!(
         g.call_arg_peel_packing_holes, 0,
@@ -908,6 +935,8 @@ fn perf_phase0_numeric_shape_inventory() {
     //   health: LOAD=4 STORE=6 BinSlotImmStore=1 BinSlotSlotStore=1
     //           BinSlotImmJmpf=1 packed_load_n2=1
     //   gaps:   slot_move=1; other gap families 0
+    // Phase 3: residual slot_move is post-loop format/host copy (not a latch);
+    //   loop_carried_phi_shuffle=0. Family: Slot move / copy.
     let (h, g) = compile_fn_inventory("examples/perf/numeric.hy", "main");
 
     assert!(h.load <= 6, "numeric LOAD budget: {h:?}");
@@ -926,6 +955,10 @@ fn perf_phase0_numeric_shape_inventory() {
     assert!(
         g.slot_move_copy <= 3,
         "numeric slot-move budget: {g:?}"
+    );
+    assert_eq!(
+        g.loop_carried_phi_shuffle, 0,
+        "numeric slot_move is post-loop, not latch: {g:?}"
     );
     assert_eq!(
         g.call_arg_peel_packing_holes, 0,
@@ -962,6 +995,10 @@ fn perf_phase0_nsieve_shape_inventory() {
     assert_eq!(
         g.slot_move_copy, 0,
         "nsieve slot-move should stay 0: {g:?}"
+    );
+    assert_eq!(
+        g.loop_carried_phi_shuffle, 0,
+        "nsieve has no loop-carried φ-shuffle: {g:?}"
     );
     assert_eq!(
         g.call_arg_peel_packing_holes, 0,
