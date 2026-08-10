@@ -682,7 +682,12 @@ fn push_thread_natives(
             Ok(Some(v))
         };
         let native: Arc<dyn NativeFn> = if kind == ThreadKind::Spawn {
-            Arc::new(HostClosureFn::new_with_arity_range(sig, 1, 2, closure))
+            Arc::new(HostClosureFn::new_with_arity_range(
+                sig,
+                1,
+                1 + common::MAX_THREAD_SPAWN_ARGS,
+                closure,
+            ))
         } else {
             Arc::new(HostClosureFn::new(sig, closure))
         };
