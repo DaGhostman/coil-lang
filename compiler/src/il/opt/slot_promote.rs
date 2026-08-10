@@ -19,16 +19,22 @@
 //!   defs/uses of `t` to `s` when slot liveness proves `t`/`s` do not
 //!   interfere and tell still covers the store floor (`s >= t`, or the usual
 //!   remove-store proof). Overlapping ranges (mandelbrot `tr`/`zr`) refuse.
+//! - Copy-only latch shuffles: at a back-edge pred, `LOAD t; STORE s` elides
+//!   when live-out proves `t` is dead at the header (value reaches only via
+//!   `s`) and a unique in-loop reaching def of `t` can be redirected to `s`
+//!   without interfering with a live `s`. Opaque/`Byte` between refuse; true
+//!   φ merges (multi-pred) refuse. Mandelbrot `tr`/`zr` stays refused.
 //! - Uses `il::tell` known-cursor as a gate on LOAD→producer replacement
 //!   (same proof surface as `copy_prop`); dead stores are left to
 //!   `dead_store_at` except for the alias-elide cleanup above.
 //!
 //! **Deferred**
-//! - Full SSA rename / φ nodes / general loop-carried promotion.
+//! - Full SSA rename / φ nodes / general loop-carried promotion across
+//!   overlapping live ranges (ledger: loop-carried φ-like shuffle).
 //! - Peel raise across CFG edges / opaque ops without stronger proofs.
 //! - Keeping values on the operand stack across calls or unknown SP.
 //! - Address-taken / aggregate / residual `Byte` promotion.
-//! - Coalesce / virtual rename across CFG edges without stronger proofs.
+//! - Coalesce / virtual rename across arbitrary CFG edges without stronger proofs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -649,6 +655,7 @@ pub(super) fn slot_promote(ops: &mut Vec<IlOp>, entry_tell: u32) {
     // Prefer writing the final destination before alias forwarding rewrites
     // uses of `s` back to temp `t` (`LOAD t; STORE s` → Alias(t)).
     coalesce_store_destinations(ops, entry_tell);
+    elide_copy_only_latch_shuffles(ops, entry_tell);
 
     let blocks = build_blocks(ops);
     if blocks.is_empty() {
@@ -790,6 +797,8 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
 struct SlotLiveness {
     /// Slots live immediately before each op.
     live_before: Vec<HashSet<u32>>,
+    /// Slots live on exit from each block.
+    live_out: Vec<HashSet<u32>>,
     /// Ops whose slot footprint is incompletely known.
     opaque: Vec<bool>,
 }
@@ -860,6 +869,7 @@ fn analyze_slot_liveness(ops: &[IlOp], blocks: &[Block]) -> SlotLiveness {
 
     SlotLiveness {
         live_before,
+        live_out,
         opaque,
     }
 }
@@ -997,6 +1007,210 @@ fn find_coalesce_def(
         }
     }
 
+    let alt = if t == 0 { 1 } else { 0 };
+    {
+        let mut probe = ops[def_idx].clone();
+        if !rewrite_slot_def(&mut probe, t, alt) {
+            return None;
+        }
+    }
+    for op in ops.iter().take(copy_idx + 1).skip(def_idx + 1) {
+        let (uses, _, _) = op_slot_use_def(op);
+        if uses.contains(&t) {
+            let mut probe = op.clone();
+            if !rewrite_slot_uses(&mut probe, t, alt) {
+                return None;
+            }
+        }
+    }
+
+    Some(def_idx)
+}
+
+fn block_index_containing(blocks: &[Block], op_idx: usize) -> Option<usize> {
+    blocks
+        .iter()
+        .position(|b| op_idx >= b.start && op_idx < b.end)
+}
+
+/// Elide `LOAD t; STORE s` on a loop latch when live-out proves `t` is copy-only
+/// (dead at the header — the carried value reaches only via `s`) and a unique
+/// in-loop reaching def of `t` can be redirected to `s` without clobbering a
+/// live `s`. Opaque ops / multi-pred merges refuse (mandelbrot `tr`/`zr`).
+fn elide_copy_only_latch_shuffles(ops: &mut Vec<IlOp>, entry_tell: u32) {
+    if ops.len() < 2 {
+        return;
+    }
+    let mut guard = 0;
+    while guard < 64 {
+        guard += 1;
+        let blocks = build_blocks(ops);
+        if blocks.is_empty() {
+            return;
+        }
+        let preds = preds_of(&blocks);
+        let live = analyze_slot_liveness(ops, &blocks);
+        let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
+
+        let mut chosen: Option<(usize, usize, u32, u32)> = None;
+        for header in 0..blocks.len() {
+            let latch_preds: Vec<usize> = preds[header]
+                .iter()
+                .copied()
+                .filter(|&p| blocks[p].start >= blocks[header].start)
+                .collect();
+            if latch_preds.is_empty() {
+                continue;
+            }
+            let members = loop_block_set(header, &preds, &blocks);
+            for &latch in &latch_preds {
+                // Copy-only: header must not need `t` itself — only `s`.
+                // Approximated as `t ∉ live_out[latch]` after the shuffle.
+                let latch_live_out = &live.live_out[latch];
+                let mut i = blocks[latch].start;
+                while i + 1 < blocks[latch].end {
+                    let (
+                        IlOp::Load { slot: t, .. },
+                        IlOp::StorePop { slot: s, .. },
+                    ) = (&ops[i], &ops[i + 1])
+                    else {
+                        i += 1;
+                        continue;
+                    };
+                    let t = *t;
+                    let s = *s;
+                    if t == s {
+                        i += 1;
+                        continue;
+                    }
+                    // After STORE s, t must be dead at the back-edge.
+                    if latch_live_out.contains(&t) {
+                        i += 1;
+                        continue;
+                    }
+                    if !coalesce_tell_ok(ops, &cursor, i, t, s) {
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(def_idx) =
+                        find_latch_coalesce_def(ops, &live, &blocks, &preds, &members, header, i, t, s)
+                    {
+                        chosen = Some((def_idx, i, t, s));
+                        break;
+                    }
+                    i += 1;
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+            if chosen.is_some() {
+                break;
+            }
+        }
+
+        let Some((def_idx, copy_idx, t, s)) = chosen else {
+            return;
+        };
+
+        if !rewrite_slot_def(&mut ops[def_idx], t, s) {
+            return;
+        }
+        for op in ops.iter_mut().take(copy_idx + 1).skip(def_idx + 1) {
+            rewrite_slot_uses(op, t, s);
+        }
+        if matches!(
+            (&ops[copy_idx], &ops[copy_idx + 1]),
+            (IlOp::Load { slot: a, .. }, IlOp::StorePop { slot: b, .. }) if *a == s && *b == s
+        ) {
+            ops.remove(copy_idx + 1);
+            ops.remove(copy_idx);
+        } else {
+            return;
+        }
+    }
+}
+
+/// Unique in-loop reaching def of `t` for a latch copy, walking only along
+/// single-predecessor edges inside the natural loop (excluding the header).
+/// Multi-pred joins are φ-like and refuse. Opaque ops refuse.
+fn find_latch_coalesce_def(
+    ops: &[IlOp],
+    live: &SlotLiveness,
+    blocks: &[Block],
+    preds: &[Vec<usize>],
+    members: &HashSet<usize>,
+    header: usize,
+    copy_idx: usize,
+    t: u32,
+    s: u32,
+) -> Option<usize> {
+    let mut bi = block_index_containing(blocks, copy_idx)?;
+    if !members.contains(&bi) {
+        return None;
+    }
+    let mut end = copy_idx;
+    let mut def_idx = None;
+
+    loop {
+        // Do not search defs inside the header (prior-iteration values).
+        if bi == header {
+            return None;
+        }
+        for j in (blocks[bi].start..end).rev() {
+            let (_uses, defs, opaque) = op_slot_use_def(&ops[j]);
+            if opaque {
+                return None;
+            }
+            if defs.contains(&s) {
+                return None;
+            }
+            if defs.contains(&t) {
+                def_idx = Some(j);
+                break;
+            }
+        }
+        if def_idx.is_some() {
+            break;
+        }
+        // Unique in-loop predecessor (fail closed on φ merges).
+        let in_loop_preds: Vec<usize> = preds[bi]
+            .iter()
+            .copied()
+            .filter(|p| members.contains(p))
+            .collect();
+        if in_loop_preds.len() != 1 {
+            return None;
+        }
+        let pred = in_loop_preds[0];
+        if pred == bi {
+            return None;
+        }
+        bi = pred;
+        end = blocks[bi].end;
+    }
+    let def_idx = def_idx?;
+
+    // No use of this def of `t` after the latch copy.
+    if copy_idx + 2 < live.live_before.len() {
+        for i in copy_idx + 2..live.live_before.len() {
+            if live.live_before[i].contains(&t) {
+                return None;
+            }
+        }
+    }
+
+    // `s` must not be live in (def, copy] — overlapping tr/zr refuses here.
+    for i in def_idx + 1..=copy_idx {
+        if live.live_before[i].contains(&s) {
+            return None;
+        }
+        if live.opaque.get(i).copied().unwrap_or(true) {
+            return None;
+        }
+    }
+
+    // Rewritable def / uses (probe with an alternate slot).
     let alt = if t == 0 { 1 } else { 0 };
     {
         let mut probe = ops[def_idx].clone();
@@ -1911,6 +2125,201 @@ mod tests {
                 (IlOp::Load { .. }, IlOp::StorePop { .. })
             )),
             "copy should be removed"
+        );
+    }
+
+    #[test]
+    fn elides_copy_only_latch_shuffle_across_blocks() {
+        // Header (slot 5) is a separate block from the body that writes temp 3;
+        // latch shuffles 3→5. Live-out proves 3 is copy-only → store 5 directly.
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 5,
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Const { imm: 7, loc: loc() },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "producer should store carried slot 5"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 3, .. })),
+            "copy-only temp 3 should be gone"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 3, .. }, IlOp::StorePop { slot: 5, .. })
+            )),
+            "latch shuffle should elide"
+        );
+    }
+
+    #[test]
+    fn refuses_latch_shuffle_when_dest_live_across_temp() {
+        // Mandelbrot-shaped: STORE tr(2); use zr(1); LOAD tr; STORE zr on latch.
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotSlot {
+                op: Instruction::MULF as u8,
+                a: 1,
+                b: 1,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::BinSlotSlot {
+                op: Instruction::MULF as u8,
+                a: 1,
+                b: 1,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 2, .. }, IlOp::StorePop { slot: 1, .. })
+            )),
+            "overlapping zr live range must keep latch shuffle"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 2, .. })),
+            "tr temp store must remain"
+        );
+    }
+
+    #[test]
+    fn refuses_latch_shuffle_on_multi_pred_phi_merge() {
+        // Two body paths both reach the latch — true φ; fail closed.
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 1,
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(3),
+                loc: loc(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::StorePop {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Label(Label(3)),
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 2, .. }, IlOp::StorePop { slot: 1, .. })
+            )),
+            "φ-like multi-pred latch must keep shuffle"
         );
     }
 }
