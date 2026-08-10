@@ -377,4 +377,60 @@ mod tests {
         assert_eq!(ops.len(), 3);
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Byte { .. })));
     }
+
+    /// `CALL` takes its frame base from `tell - arity`; dropping operand loads
+    /// would slide the callee frame over caller slots.
+    #[test]
+    fn call_reload_run_is_not_promoted() {
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop { slot: 3, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::StorePop { slot: 4, loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Load { slot: 4, loc: loc() },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 2,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.clone();
+        slot_promote_at(&mut ops, 3);
+        assert!(ops == before);
+        assert_eq!(counts(&ops), (2, 2));
+    }
+
+    /// `LOAD t; RETURN` is the join sink for whole-buffer return convoys — do
+    /// not treat it like a TailCall reload run.
+    #[test]
+    fn return_reload_is_not_promoted() {
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop { slot: 3, loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.clone();
+        slot_promote_at(&mut ops, 3);
+        assert!(ops == before);
+        assert_eq!(counts(&ops), (1, 1));
+    }
+
+    /// Absolute `Seek` names a cursor this pass cannot reason about from the
+    /// IL alone, so the whole body is refused.
+    #[test]
+    fn seek_in_body_refuses_slot_promotion() {
+        let mut ops = vec![
+            IlOp::byte(Byte::new(common::Instruction::Seek).with_operand_u32(3)),
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop { slot: 3, loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            tail_call(1),
+        ];
+        slot_promote_at(&mut ops, 3);
+        assert_eq!(counts(&ops), (1, 1));
+    }
 }
