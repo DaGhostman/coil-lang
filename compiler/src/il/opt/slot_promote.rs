@@ -874,21 +874,17 @@ fn analyze_slot_liveness(ops: &[IlOp], blocks: &[Block]) -> SlotLiveness {
     }
 }
 
-fn coalesce_tell_ok(
-    ops: &[IlOp],
-    cursor: &crate::il::tell::TellInfo,
-    copy_idx: usize,
-    t: u32,
-    s: u32,
-) -> bool {
-    if cursor.can_remove_one_value_store(copy_idx, s)
-        || later_store_dominates_floor(ops, copy_idx + 1, s)
-    {
+fn coalesce_tell_ok(ops: &[IlOp], copy_idx: usize, t: u32, s: u32) -> bool {
+    // Redirecting STORE t → STORE s with s >= t keeps the floor at least as
+    // high as the copy store, so removing the copy is tell-safe.
+    if s >= t {
         return true;
     }
-    // Redirecting STORE t → STORE s with s >= t raises the floor at least as
-    // high as the copy store, so removing the copy keeps the cursor safe.
-    s >= t
+    // s < t would lower the def's floor. `can_remove_one_value_store` on the
+    // copy alone is insufficient — it may only succeed because STORE t still
+    // covers the cursor, which disappears after redirect. Require an
+    // independent later store that preserves the original floor height.
+    later_store_dominates_floor(ops, copy_idx + 1, t)
 }
 
 /// Coalesce `STORE t; …; LOAD t; STORE s` into defs/uses of `s` when live
@@ -896,7 +892,7 @@ fn coalesce_tell_ok(
 ///
 /// Only the reaching def and uses in `(def, copy]` are rewritten — other live
 /// ranges of `t` stay put (global rename would clobber unrelated defs).
-fn coalesce_store_destinations(ops: &mut Vec<IlOp>, entry_tell: u32) {
+fn coalesce_store_destinations(ops: &mut Vec<IlOp>, _entry_tell: u32) {
     if ops.len() < 2 {
         return;
     }
@@ -908,7 +904,6 @@ fn coalesce_store_destinations(ops: &mut Vec<IlOp>, entry_tell: u32) {
             return;
         }
         let live = analyze_slot_liveness(ops, &blocks);
-        let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
 
         let mut chosen: Option<(usize, usize, u32, u32)> = None;
         let mut i = 0;
@@ -921,7 +916,7 @@ fn coalesce_store_destinations(ops: &mut Vec<IlOp>, entry_tell: u32) {
                 let t = *t;
                 let s = *s;
                 if t != s
-                    && coalesce_tell_ok(ops, &cursor, i, t, s)
+                    && coalesce_tell_ok(ops, i, t, s)
                     && let Some(def_idx) = find_coalesce_def(ops, &live, i, t, s)
                 {
                     chosen = Some((def_idx, i, t, s));
@@ -1037,7 +1032,7 @@ fn block_index_containing(blocks: &[Block], op_idx: usize) -> Option<usize> {
 /// (dead at the header — the carried value reaches only via `s`) and a unique
 /// in-loop reaching def of `t` can be redirected to `s` without clobbering a
 /// live `s`. Opaque ops / multi-pred merges refuse (mandelbrot `tr`/`zr`).
-fn elide_copy_only_latch_shuffles(ops: &mut Vec<IlOp>, entry_tell: u32) {
+fn elide_copy_only_latch_shuffles(ops: &mut Vec<IlOp>, _entry_tell: u32) {
     if ops.len() < 2 {
         return;
     }
@@ -1050,7 +1045,6 @@ fn elide_copy_only_latch_shuffles(ops: &mut Vec<IlOp>, entry_tell: u32) {
         }
         let preds = preds_of(&blocks);
         let live = analyze_slot_liveness(ops, &blocks);
-        let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
 
         let mut chosen: Option<(usize, usize, u32, u32)> = None;
         for header in 0..blocks.len() {
@@ -1088,7 +1082,7 @@ fn elide_copy_only_latch_shuffles(ops: &mut Vec<IlOp>, entry_tell: u32) {
                         i += 1;
                         continue;
                     }
-                    if !coalesce_tell_ok(ops, &cursor, i, t, s) {
+                    if !coalesce_tell_ok(ops, i, t, s) {
                         i += 1;
                         continue;
                     }
