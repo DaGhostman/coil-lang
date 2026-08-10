@@ -181,13 +181,11 @@ const WORK_MEMO_CAP: usize = 1 << 14;
 
 /// Bounded structural estimate of the work below a fork site.
 ///
-/// Counts the fork-site nodes reachable from a concrete arg vector by walking
-/// the arms' [`ArgForm`] transforms and pruning children that miss the site's
-/// guards (those are base cases and do no forkable work). Every source of
-/// imprecision — an arm into a function with no known fork site, a `SelfCall`
-/// combine's re-entry on joined values, the depth and memo caps, saturation at
-/// the cutoff — is resolved *downwards*, so the count is a lower bound and
-/// unknown structure can only make a site refuse to fork.
+/// Counts the fork-site nodes a concrete arg vector reaches through the arms'
+/// [`ArgForm`] transforms, pruning children that miss the site's guards — those
+/// are base cases and do no forkable work. Every imprecision (opaque callees, a
+/// `SelfCall` combine's re-entry on joined values, the caps below) resolves
+/// *downwards*, so the count is a lower bound: unknown structure only refuses.
 struct WorkEstimate<'a> {
     sites: &'a HashMap<String, ParForkSite>,
     /// Counting past the cutoff cannot change the verdict, so totals stop here.
