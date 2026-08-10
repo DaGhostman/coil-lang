@@ -5,13 +5,16 @@
 //!   `BinSlot*` uses of `b` to `a`. Const/ConstPool clones at LOAD sites are
 //!   left to `copy_prop` (re-cloning after LICM breaks call-arg peel packing).
 //! - Same-def joins: seed a block's binding map when every predecessor is a
-//!   forward edge and all agree on the same binding for a slot.
+//!   forward edge and all agree on the same binding for a slot. Disagreeing
+//!   preds drop the binding (fail-closed — no φ in bytecode).
 //! - Loop-invariant aliases: at a header with a back-edge, forward-pred
 //!   bindings whose slots (and deps) are not stored in the natural loop may
 //!   enter the loop (covers LICM `LOAD temp; STORE local` copies).
-//! - Elide unused `<producer>; STORE b` when tell allows **or** a later
-//!   straight-line store to a higher-or-equal slot dominates the cursor floor
-//!   (labels/jumps/calls refuse).
+//! - Virtual values in tell-safe regions: `Binding::Producer` / `Alias` rewrite
+//!   consumers in place (`BinSlot*` operands, `LOAD` sources). Unused alias
+//!   stores elide when tell or a straight-line higher store covers the floor —
+//!   bare tell-drop across `CALL`/host is refused. Peel param copies: raise the
+//!   real producer into the dead high peel slot (keeps the cursor), then elide.
 //! - Store-destination coalescing: `STORE t; …; LOAD t; STORE s` rewrites
 //!   defs/uses of `t` to `s` when slot liveness proves `t`/`s` do not
 //!   interfere and tell still covers the store floor (`s >= t`, or the usual
@@ -22,8 +25,10 @@
 //!
 //! **Deferred**
 //! - Full SSA rename / φ nodes / general loop-carried promotion.
+//! - Peel raise across CFG edges / opaque ops without stronger proofs.
 //! - Keeping values on the operand stack across calls or unknown SP.
 //! - Address-taken / aggregate / residual `Byte` promotion.
+//! - Coalesce / virtual rename across CFG edges without stronger proofs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -691,8 +696,9 @@ pub(super) fn slot_promote(ops: &mut Vec<IlOp>, entry_tell: u32) {
         out_bindings[bi] = transfer_block(ops, &blocks[bi], in_map, &cursor);
     }
 
-    // dead_store_at treats labels/jumps as barriers (loop-carried caution), so
-    // elide `LOAD a; STORE b` here when `b` has no remaining uses and tell allows.
+    // Raise peel producers into dead high temps, then elide unused aliases when
+    // tell / dominating stores prove the floor (never bare tell-drop across CALL).
+    raise_producer_into_dead_peel_floor(ops, entry_tell);
     elide_unused_alias_stores(ops, entry_tell);
 }
 
@@ -1109,8 +1115,196 @@ fn earlier_store_covers_floor(ops: &[IlOp], store_idx: usize, dest: u32) -> bool
     false
 }
 
+/// Entry / param slot that is never stored in this body.
+fn is_immutable_entry_slot(ops: &[IlOp], slot: u32, entry_tell: u32) -> bool {
+    if slot >= entry_tell {
+        return false;
+    }
+    for op in ops {
+        let (_, defs, _) = op_slot_use_def(op);
+        if defs.contains(&slot) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Move `STORE mid` up into a dead peel-temp `high` and drop unused
+/// `LOAD param; STORE …` copies in between.
+///
+/// Keeps the cursor floor (value lives in `high`) so later `CALL`s stay safe,
+/// unlike deleting the high store outright. Same-block / straight-line only.
+fn raise_producer_into_dead_peel_floor(ops: &mut Vec<IlOp>, entry_tell: u32) {
+    let mut guard = 0;
+    while guard < 32 {
+        guard += 1;
+        let blocks = build_blocks(ops);
+        if blocks.is_empty() {
+            return;
+        }
+        let live = analyze_slot_liveness(ops, &blocks);
+
+        let mut chosen: Option<(usize, usize, usize, u32, u32)> = None;
+        // (def_idx, first_copy, high_copy, mid, high)
+        let mut i = 0;
+        while i + 1 < ops.len() {
+            let (
+                IlOp::Load { slot: src, .. },
+                IlOp::StorePop { slot: high, .. },
+            ) = (&ops[i], &ops[i + 1])
+            else {
+                i += 1;
+                continue;
+            };
+            let src = *src;
+            let high = *high;
+            if !is_immutable_entry_slot(ops, src, entry_tell) {
+                i += 1;
+                continue;
+            }
+            let mut rest: Vec<IlOp> = Vec::new();
+            for (idx, op) in ops.iter().enumerate() {
+                if idx != i && idx != i + 1 {
+                    rest.push(op.clone());
+                }
+            }
+            if slot_used_anywhere(&rest, high) {
+                i += 1;
+                continue;
+            }
+
+            let mut first_copy = i;
+            while first_copy >= 2 {
+                let prev = first_copy - 2;
+                match (&ops[prev], &ops[prev + 1]) {
+                    (
+                        IlOp::Load { slot: psrc, .. },
+                        IlOp::StorePop { slot: pdest, .. },
+                    ) if is_immutable_entry_slot(ops, *psrc, entry_tell) => {
+                        let mut rest2 = Vec::new();
+                        for (idx, op) in ops.iter().enumerate() {
+                            if (prev..=i + 1).contains(&idx) {
+                                continue;
+                            }
+                            rest2.push(op.clone());
+                        }
+                        if slot_used_anywhere(&rest2, *pdest) {
+                            break;
+                        }
+                        first_copy = prev;
+                    }
+                    _ => break,
+                }
+            }
+
+            let mut def_idx = None;
+            let mut mid = None;
+            for k in (0..first_copy).rev() {
+                match &ops[k] {
+                    IlOp::Label(_) | IlOp::Jump { .. } => break,
+                    IlOp::StorePop { slot, .. } if *slot < high => {
+                        def_idx = Some(k);
+                        mid = Some(*slot);
+                        break;
+                    }
+                    other => {
+                        let (_u, defs, opaque) = op_slot_use_def(other);
+                        if opaque {
+                            break;
+                        }
+                        if let Some(&d) = defs.iter().filter(|d| **d < high).max() {
+                            def_idx = Some(k);
+                            mid = Some(d);
+                            break;
+                        }
+                        if !defs.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let (Some(def_idx), Some(mid)) = (def_idx, mid) else {
+                i += 1;
+                continue;
+            };
+
+            // high must not be live in (def, high_copy] (would clobber).
+            let mut ok = true;
+            for t in def_idx + 1..=i + 1 {
+                if live.opaque.get(t).copied().unwrap_or(true) {
+                    ok = false;
+                    break;
+                }
+                if live.live_before[t].contains(&high) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                i += 1;
+                continue;
+            }
+            // After rewriting mid→high through the rest of the function for this
+            // def, mid must not be needed under a different reaching def. Require
+            // no later STORE of mid before we finish rewriting (fail closed on
+            // another def of mid).
+            for t in i + 2..ops.len() {
+                let (_u, defs, opaque) = op_slot_use_def(&ops[t]);
+                if opaque {
+                    // Residual forms: only OK if mid is not live there.
+                    if live.live_before.get(t).is_some_and(|s| s.contains(&mid)) {
+                        ok = false;
+                    }
+                    break;
+                }
+                if defs.contains(&mid) {
+                    break; // new def; stop rewrite range
+                }
+            }
+            if !ok {
+                i += 1;
+                continue;
+            }
+            let mut probe = ops[def_idx].clone();
+            if !rewrite_slot_def(&mut probe, mid, if mid == 0 { 1 } else { 0 }) {
+                i += 1;
+                continue;
+            }
+
+            chosen = Some((def_idx, first_copy, i, mid, high));
+            break;
+        }
+
+        let Some((def_idx, first_copy, high_copy, mid, high)) = chosen else {
+            return;
+        };
+
+        if !rewrite_slot_def(&mut ops[def_idx], mid, high) {
+            return;
+        }
+        // Rewrite uses of mid → high until the next def of mid.
+        for t in def_idx + 1..ops.len() {
+            let (_u, defs, opaque) = op_slot_use_def(&ops[t]);
+            if opaque {
+                break;
+            }
+            if defs.contains(&mid) {
+                break;
+            }
+            rewrite_slot_uses(&mut ops[t], mid, high);
+        }
+        // Drop peel alias copies [first_copy, high_copy+1].
+        let mut idx = high_copy + 1;
+        while idx > first_copy {
+            ops.remove(idx);
+            ops.remove(idx - 1);
+            idx -= 2;
+        }
+    }
+}
+
 /// Drop `LOAD a; STORE b` when `b` is unused afterward and either the cursor
-/// proof or a dominating later store shows the floor is redundant.
+/// proof or a dominating later/earlier store shows the floor is redundant.
 ///
 /// Only alias copies are eligible — `CONST; STORE` materializations for `let`
 /// bindings must remain even when a later use was producer-forwarded.
@@ -1600,6 +1794,80 @@ mod tests {
                 (IlOp::Load { .. }, IlOp::StorePop { .. })
             )),
             "post-call tell-floor copies should elide after coalesce"
+        );
+    }
+
+    #[test]
+    fn raises_producer_into_dead_peel_floor() {
+        // STORE mid; LOAD param; STORE high (unused after rewrite) → STORE high.
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 3,
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "producer should raise into peel slot 5"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 2, .. }, IlOp::StorePop { .. })
+            )),
+            "peel param copy should be gone"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::BinSlotImm { slot: 5, .. })),
+            "uses of mid should read raised slot 5"
+        );
+    }
+
+    #[test]
+    fn rewrites_peel_param_alias_across_jump() {
+        // LOAD param; STORE temp; … JMP …; LOAD temp → LOAD param (store may
+        // remain for tell when no producer raises into the peel slot).
+        let mut ops = vec![
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load { slot: 5, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.iter().any(|op| matches!(op, IlOp::Load { slot: 2, .. })),
+            "join use should read param 2"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Load { slot: 5, .. })),
+            "temp 5 LOAD should be rewritten"
         );
     }
 
