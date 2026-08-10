@@ -2806,6 +2806,43 @@ fn main() {
         );
     }
 
+    /// Self-recursive sites stay unpeeled: the callee span is not ready while the
+    /// body is compiling, and peeling them was measured as a loss on `tak`.
+    #[test]
+    fn self_recursive_sites_are_not_predicate_peeled() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn tak(int x, int y, int z) -> int { \
+               if y >= x { return z; } \
+               return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y)); \
+             } \
+             fn main() { let r = tak(3, 2, 1); }",
+        );
+        let calls = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .count();
+        let tails = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::TailCall))
+            .count();
+        // Three inner self-calls stay CALL (or TailCall if TCO applies to outer);
+        // a self-peel would replace each with a cmp-jmp diamond and inflate the body.
+        assert!(
+            calls + tails >= 3,
+            "expected ≥3 recursive call sites; call={calls} tail={tails}; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let stores = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE | Instruction::StorePop))
+            .count();
+        assert!(
+            stores <= 8,
+            "self-peel would spill join temps per site; stores={stores}"
+        );
+    }
+
     /// Codegen test 25 : two `let` bindings in the same
     /// scope emit two `STORE_POP`s — one per binding, with
     /// distinct slot operands (0 and 1).

@@ -393,6 +393,12 @@ fn aot_p1_p4_tak_residual_load_store_and_call_density() {
         "tak outer self-call should stay a TailCall"
     );
     assert!(fused >= 4, "tak lost fused BinSlot* coverage: {fused}");
+    // Self-recursive predicate peel was measured and refused (13 → 41 words).
+    assert!(
+        end - start <= 20,
+        "tak body grew past the no-self-peel ceiling: {} words",
+        end - start
+    );
 }
 
 /// P2 baseline: `nsieve`'s hot loops keep exactly one `Index` and one
