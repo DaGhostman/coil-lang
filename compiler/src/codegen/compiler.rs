@@ -1272,7 +1272,7 @@ impl Compiler {
         false
     }
 
-    /// Shared refusals for the predicate peel: rest params, coroutines and
+    /// Shared refusals for both peel flavours: rest params, coroutines and
     /// un-monomorphized generics change the callee ABI the peel replicates.
     fn peel_callee_shape_ok(&self, fqn: &str, lookup: &str) -> bool {
         !self.checker.fn_has_rest(lookup)
@@ -1407,6 +1407,338 @@ impl Compiler {
         self.bytecode.push_store_pop(result);
         bytecode.push_load(result);
         true
+    }
+
+    /// Max guard ops the re-materializing peel will rewrite at a call site.
+    const PEEL_REMAT_MAX_COND_OPS: usize = 8;
+
+    /// Caller-side predicate peel that reads leaf arguments in place instead of
+    /// spilling them into frame slots.
+    ///
+    /// [`Self::try_predicate_peel_call_into`] stores every argument to a temp so
+    /// the peeled guard and the `CALL` can both read it. An argument that compiles
+    /// to a single pure byte needs no such slot: the byte is simply emitted in both
+    /// places, which drops one `STORE` and one spill `LOAD` per argument and leaves
+    /// the guard reading the caller's own locals. Anything longer keeps its temp,
+    /// because the guard copy and the call copy would each pay for it.
+    fn try_emit_remat_peel_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        let rollback = self.bytecode.len();
+        if self.try_remat_peel_call_into(fqn, args, bytecode, target_offset) {
+            return true;
+        }
+        // Every refusal is decided before the first emit; this only guards
+        // against a future check slipping in after one.
+        self.bytecode.truncate(rollback);
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_remat_peel_call_into(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+    ) -> bool {
+        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+            return false;
+        };
+        let lookup = strip_overload_key(fqn).to_string();
+        if !self.peel_callee_shape_ok(fqn, &lookup) {
+            return false;
+        }
+        // Partial application lowers to `MakeFn`, not `CALL`, so only a
+        // saturated fixed-arity call site may be peeled.
+        let Some(&(fixed_arity, has_rest)) = self.fn_arities.get(fqn) else {
+            return false;
+        };
+        if has_rest {
+            return false;
+        }
+        let ops = self.bytecode.code_slice_raw_ops(start, end);
+        let Some(peel) = Self::match_predicate_peel_shape(&ops) else {
+            return false;
+        };
+        drop(ops);
+        if peel.cond.len() > Self::PEEL_REMAT_MAX_COND_OPS {
+            return false;
+        }
+        let flat = self.flatten_call_args_for_emit(args.unwrap_or(&[]));
+        if flat.len() != fixed_arity as usize || flat.len() < peel.arity_hint {
+            return false;
+        }
+        let Some(plan) = Self::peel_remat_plan(&peel, flat.len()) else {
+            return false;
+        };
+        // The guard reads some arguments ahead of the others and the false path
+        // evaluates them again, so no argument may carry a side effect.
+        if !flat.iter().all(Self::peel_arg_is_pure) {
+            return false;
+        }
+        // Guard-referenced arguments must be re-materializable up front: once an
+        // argument has been compiled a refusal can no longer be rolled back.
+        if !plan
+            .guard_args
+            .iter()
+            .all(|&i| Self::peel_arg_is_remat_shape(&flat[i]))
+        {
+            return false;
+        }
+
+        // The caller prefix belongs ahead of everything below, so flush it before
+        // compiling arguments — a spilled argument must not slip in front of it.
+        self.bytecode.append(bytecode);
+        let mut argv: Vec<Vec<Byte>> = Vec::with_capacity(flat.len());
+        for arg in &flat {
+            let value = match arg.1.as_ref() {
+                Expression::NamedArg(_, v) => v,
+                _ => arg,
+            };
+            let before = self.bytecode.len();
+            let mut bytes = self.do_compile(value);
+            let split = self.bytecode.len() != before;
+            if split || !Self::peel_remat_bytes_ok(&bytes) {
+                self.bytecode.append(&mut bytes);
+                let tmp = self.alloc_temp_slot();
+                self.bytecode.push_store_pop(tmp);
+                argv.push(vec![
+                    Byte::new(Instruction::LOAD).with_load_store_slot(tmp),
+                ]);
+            } else {
+                argv.push(bytes);
+            }
+        }
+
+        let do_call = self.bytecode.fresh_label();
+        let join = self.bytecode.fresh_label();
+        for op in &plan.cond {
+            self.emit_peel_remat_op(op, &argv);
+        }
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: do_call,
+            loc: DebugLoc::unknown(),
+        });
+        self.emit_peel_remat_op(&plan.then_value, &argv);
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: join,
+            loc: DebugLoc::unknown(),
+        });
+        self.bytecode.bind_label(do_call);
+        for bytes in &argv {
+            for byte in bytes {
+                self.bytecode.push(*byte);
+            }
+        }
+        self.bytecode.push(
+            Byte::new(Instruction::CALL).with_call_packed(argv.len() as u32, target_offset),
+        );
+        self.bytecode.bind_label(join);
+        let result = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(result);
+        bytecode.push_load(result);
+        true
+    }
+
+    /// Rewrite a matched guard against caller arguments, or `None` when any op is
+    /// outside the re-materializable set or reads past `argc`.
+    fn peel_remat_plan(peel: &PredicatePeel, argc: usize) -> Option<PeelRematPlan> {
+        let mut guard_args = Vec::new();
+        let mut cond = Vec::with_capacity(peel.cond.len());
+        for op in &peel.cond {
+            cond.push(Self::peel_remat_op(op, argc, &mut guard_args)?);
+        }
+        let then_value = Self::peel_remat_op(&peel.then_value, argc, &mut guard_args)?;
+        Some(PeelRematPlan {
+            cond,
+            then_value,
+            guard_args,
+        })
+    }
+
+    fn peel_remat_op(op: &IlOp, argc: usize, args: &mut Vec<usize>) -> Option<PeelRematOp> {
+        fn note(idx: usize, argc: usize, args: &mut Vec<usize>) -> Option<usize> {
+            if idx >= argc {
+                return None;
+            }
+            if !args.contains(&idx) {
+                args.push(idx);
+            }
+            Some(idx)
+        }
+        match op {
+            IlOp::Load { slot, .. } => Some(PeelRematOp::Arg(note(*slot as usize, argc, args)?)),
+            IlOp::BinSlotImm {
+                op: bin, slot, imm, ..
+            } => Some(PeelRematOp::ArgImm {
+                op: Instruction::from(*bin),
+                idx: note(*slot as usize, argc, args)?,
+                imm: *imm as i32,
+            }),
+            IlOp::BinSlotSlot { op: bin, a, b, .. } => Some(PeelRematOp::ArgArg {
+                op: Instruction::from(*bin),
+                a: note(*a as usize, argc, args)?,
+                b: note(*b as usize, argc, args)?,
+            }),
+            IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Dup { .. } => {
+                Some(PeelRematOp::Copy(op.clone()))
+            }
+            IlOp::Bin { op: bin, .. } if Self::peel_remat_bin_ok(*bin) => {
+                Some(PeelRematOp::Copy(op.clone()))
+            }
+            other => {
+                let byte = other.as_plain_byte()?;
+                match *byte.bytecode() {
+                    Instruction::LOAD => Some(PeelRematOp::Arg(note(
+                        byte.load_store_single_slot()? as usize,
+                        argc,
+                        args,
+                    )?)),
+                    Instruction::BinSlotImm => {
+                        let (bin, slot, imm) = byte.bin_slot_imm_parts();
+                        Some(PeelRematOp::ArgImm {
+                            op: Instruction::from(bin),
+                            idx: note(slot, argc, args)?,
+                            imm: imm as i32,
+                        })
+                    }
+                    Instruction::BinSlotSlot => {
+                        let (bin, a, b) = byte.bin_slot_slot_parts();
+                        Some(PeelRematOp::ArgArg {
+                            op: Instruction::from(bin),
+                            a: note(a, argc, args)?,
+                            b: note(b, argc, args)?,
+                        })
+                    }
+                    Instruction::CONST | Instruction::DUPLICATE => {
+                        Some(PeelRematOp::Copy(other.clone()))
+                    }
+                    bin if Self::peel_remat_bin_ok(bin) => Some(PeelRematOp::Copy(other.clone())),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Integer binary ops the peel may duplicate: total, trap-free on the operand
+    /// shapes a guard produces, and unfusable back to a plain opcode.
+    fn peel_remat_bin_ok(op: Instruction) -> bool {
+        matches!(
+            op,
+            Instruction::ADD
+                | Instruction::SUB
+                | Instruction::MUL
+                | Instruction::BITAND
+                | Instruction::BITOR
+                | Instruction::XOR
+                | Instruction::EQ
+                | Instruction::NEQ
+                | Instruction::LE
+                | Instruction::LEQ
+                | Instruction::GT
+                | Instruction::GEQ
+                | Instruction::AND
+                | Instruction::OR
+        )
+    }
+
+    fn emit_peel_remat_op(&mut self, op: &PeelRematOp, argv: &[Vec<Byte>]) {
+        let push_arg = |buf: &mut CodeBuf, idx: usize| {
+            for byte in &argv[idx] {
+                buf.push(*byte);
+            }
+        };
+        match op {
+            PeelRematOp::Arg(idx) => push_arg(&mut self.bytecode, *idx),
+            PeelRematOp::ArgImm { op: bin, idx, imm } => {
+                push_arg(&mut self.bytecode, *idx);
+                self.bytecode.push_const(*imm);
+                self.bytecode.push(Byte::new(*bin));
+            }
+            PeelRematOp::ArgArg { op: bin, a, b } => {
+                push_arg(&mut self.bytecode, *a);
+                push_arg(&mut self.bytecode, *b);
+                self.bytecode.push(Byte::new(*bin));
+            }
+            PeelRematOp::Copy(il) => match il.as_plain_byte() {
+                Some(byte) => self.bytecode.push(byte),
+                None => self.bytecode.push_op(il.clone()),
+            },
+        }
+    }
+
+    /// Compiled argument that re-materializes for free: exactly one byte pushing
+    /// one value out of the caller's frame, independent of the operand stack. That
+    /// last part rules out `DUPLICATE`, whose two copies would read two tops.
+    fn peel_remat_bytes_ok(bytes: &[Byte]) -> bool {
+        let [byte] = bytes else {
+            return false;
+        };
+        match *byte.bytecode() {
+            // A packed multi-slot LOAD pushes more than one value.
+            Instruction::LOAD => byte.load_store_single_slot().is_some(),
+            Instruction::CONST | Instruction::BinSlotImm | Instruction::BinSlotSlot => true,
+            _ => false,
+        }
+    }
+
+    /// Side-effect-free argument expression: safe to evaluate out of order with
+    /// its siblings and, when the compiled bytes allow, more than once.
+    fn peel_arg_is_pure(expr: &Output<'_>) -> bool {
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v)
+            | Expression::Group(v)
+            | Expression::Expr(v)
+            | Expression::Negate(v)
+            | Expression::Not(v)
+            | Expression::LogicalNot(v)
+            | Expression::Positive(v)
+            | Expression::Cast(v, _) => Self::peel_arg_is_pure(v),
+            Expression::Identifier(_)
+            | Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::Bool(_) => true,
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Shl(a, b)
+            | Expression::Shr(a, b)
+            | Expression::Xor(a, b)
+            | Expression::And(a, b)
+            | Expression::BitAnd(a, b)
+            | Expression::Or(a, b)
+            | Expression::BitOr(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Geq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Gt(a, b) => Self::peel_arg_is_pure(a) && Self::peel_arg_is_pure(b),
+            _ => false,
+        }
+    }
+
+    /// Argument that can plausibly compile to one byte: a name or an int/bool
+    /// literal. Checked before anything is emitted, since a refusal after an
+    /// argument has been compiled can no longer be rolled back.
+    fn peel_arg_is_remat_shape(expr: &Output<'_>) -> bool {
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
+                Self::peel_arg_is_remat_shape(v)
+            }
+            Expression::Identifier(_) | Expression::Integer(_) | Expression::Bool(_) => true,
+            _ => false,
+        }
     }
 
     /// Opening shape: `cond…; JumpIfFalse; (Const|Load); Return; …` with an
@@ -12570,6 +12902,22 @@ impl Compiler {
                     && !self.coroutine_fns.contains(&n)
                     && !self.coroutine_fns.contains(&lookup_name)
                     && self.try_emit_self_unroll_call(&n, Some(arg_slice), &mut bytecode)
+                {
+                    return bytecode;
+                }
+
+                // Base-case peel that reads leaf args in place instead of
+                // spilling them; falls through to the spilling peel below.
+                if !is_generic
+                    && !is_instance_method_fqn(&self.checker, &lookup_name)
+                    && !self.coroutine_fns.contains(&n)
+                    && !self.coroutine_fns.contains(&lookup_name)
+                    && self.try_emit_remat_peel_call(
+                        &n,
+                        Some(arg_slice),
+                        &mut bytecode,
+                        target_offset as u32,
+                    )
                 {
                     return bytecode;
                 }

@@ -2659,8 +2659,9 @@ fn main() {
     fn call_arg_prep_packs_three_loads() {
         use common::Instruction;
         // Two early-return guards → not a single tiny-inline diamond.
-        // Predicate peel (2B) still applies: args land in temps, then a packed
-        // LOAD of those temps feeds the CALL.
+        // Predicate peel (2B) still applies, and since every arg is a plain
+        // local the re-materializing peel reads them in place — the packed
+        // LOAD feeding the CALL names `x, y, z`, not argument spills.
         let (bc, _pool) = compile_src(
             "fn add(int a, int b, int c) -> int { \
  if a < 0 { return 0; } \
@@ -2680,11 +2681,69 @@ fn main() {
         let packed = packed.expect("expected one LOAD with n=3 for add(x,y,z) arg prep");
         let (n, s0, s1, s2) = packed.load_store_parts();
         assert_eq!(n, 3, "packed LOAD must carry three slots");
-        // Locals x,y,z are 0,1,2; peel stores them into consecutive temps 3,4,5.
+        // Locals x,y,z are 0,1,2 and need no spill.
         assert_eq!(
             (s0, s1, s2),
-            (3, 4, 5),
-            "peel arg prep should LOAD temps in original order"
+            (0, 1, 2),
+            "peel arg prep should LOAD the locals in original order"
+        );
+    }
+
+    /// A peel over leaf args spills nothing: the only STOREs `main` emits are the
+    /// three `let`s, the peel's join temp and `let result`. The spilling peel
+    /// needed three more, one per argument.
+    #[test]
+    fn predicate_peel_does_not_spill_leaf_args() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b, int c) -> int { \
+ if a < 0 { return 0; } \
+ if b < 0 { return 0; } \
+ return a + b + c; \
+ } \
+ fn main() { \
+ let x = 1; \
+ let y = 2; \
+ let z = 3; \
+ let result = add(x, y, z); \
+ }",
+        );
+        let stores = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE | Instruction::StorePop))
+            .count();
+        assert_eq!(
+            stores, 5,
+            "peel spilled args: expected 3 locals + join temp + result, got {stores} STOREs"
+        );
+    }
+
+    /// An argument the guard reads but that needs more than one byte keeps its
+    /// spill — `x + 1` is staged to a temp, so the packed LOAD names temps.
+    #[test]
+    fn predicate_peel_spills_computed_guard_arg() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b, int c) -> int { \
+ if a < 0 { return 0; } \
+ if b < 0 { return 0; } \
+ return a + b + c; \
+ } \
+ fn main() { \
+ let x = 1; \
+ let y = 2; \
+ let z = 3; \
+ let result = add(x + 1, y, z); \
+ }",
+        );
+        let packed = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3)
+            .expect("expected one LOAD with n=3 for the peeled arg prep");
+        let (_, s0, s1, s2) = packed.load_store_parts();
+        assert!(
+            s0 > 2 && s1 > 2 && s2 > 2,
+            "computed guard arg should fall back to the spilling peel; got ({s0}, {s1}, {s2})"
         );
     }
 
