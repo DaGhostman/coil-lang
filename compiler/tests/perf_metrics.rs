@@ -797,11 +797,12 @@ fn perf_phase0_mandelbrot_shape_inventory() {
     //           BinSlotSlotJmpf=3 BinSlotSlotConstJmpf=1 FloatChainStore=3
     //           float_arith=3 packed_load=0
     //   gaps:   slot_move=1 residual_float_arith=3; all other gap families 0
+    // Phase 1: tr/zr live-range overlap refuses coalesce; slot_move stays 1.
     let (h, g) = compile_fn_inventory("examples/perf/mandelbrot.hy", "mandelbrot");
 
     // Existing-opcode health (post slot_promote / FloatChain / *Jmpf).
-    assert!(h.load <= 8, "mandelbrot LOAD budget: {h:?}");
-    assert!(h.store <= 12, "mandelbrot STORE budget: {h:?}");
+    assert!(h.load <= 6, "mandelbrot LOAD budget: {h:?}");
+    assert!(h.store <= 10, "mandelbrot STORE budget: {h:?}");
     assert!(
         h.float_chain_store >= 2,
         "mandelbrot should keep FloatChainStore fuse: {h:?}"
@@ -841,10 +842,9 @@ fn perf_phase0_mandelbrot_shape_inventory() {
         g.bin_slot_slot_branch_without_cmp_fuse, 0,
         "escape stays ConstJmpf; no BinSlotSlot→branch miss: {g:?}"
     );
-    // Loop-carried φ-like shuffle: at minimum slot-move tally (promotion residue).
-    // Baseline slot_move=1; Phase 1 coalescing should drive this toward 0.
+    // Residual LOAD tr; STORE zr — Phase 3 loop-carried target.
     assert!(
-        g.slot_move_copy <= 3,
+        g.slot_move_copy <= 1,
         "slot move/copy (φ-like latch proxy) budget: {g:?}"
     );
     assert_eq!(
@@ -864,10 +864,12 @@ fn perf_phase0_tak_shape_inventory() {
     //   health: LOAD=11 STORE=7 BinSlotImmStore=3 BinSlotSlotJmpf=4
     //           packed_load_n3=4
     //   gaps:   slot_move=4; packing_holes=0; float/Index families 0
+    // Phase 1 coalesce: LOAD=10 STORE=6 slot_move=3 (call result → slot 17;
+    //   peel LOAD param;STORE temp remain). packed_load_n3=4; packing_holes=0.
     let (h, g) = compile_fn_inventory("examples/perf/tak.hy", "tak");
 
-    assert!(h.load <= 16, "tak LOAD budget: {h:?}");
-    assert!(h.store <= 10, "tak STORE budget: {h:?}");
+    assert!(h.load <= 12, "tak LOAD budget: {h:?}");
+    assert!(h.store <= 8, "tak STORE budget: {h:?}");
     assert!(
         h.fused_jmpf_total() >= 4,
         "entry + 3 peels should stay fused *Jmpf: {h:?}"
@@ -881,9 +883,9 @@ fn perf_phase0_tak_shape_inventory() {
     // *Jmpt: peels/guards are *Jmpf; JMPT unused. Proxy documents static blindness.
     assert_eq!(h.jmpt, 0, "tak has no JMPT: {h:?}");
     assert_eq!(h.jmpf, 0, "tak has no bare JMPF: {h:?}");
-    // Arg shuffles / latch copies — Phase 1–3 coalescing target.
+    // Peel arg shuffles (LOAD param; STORE temp) — Phase 2–3 target.
     assert!(
-        g.slot_move_copy <= 6,
+        g.slot_move_copy <= 4,
         "tak slot-move (arg shuffle / φ-like) budget: {g:?}"
     );
     assert_eq!(
