@@ -53,9 +53,9 @@ full function bodies, including **irrefutable** match arms (`_` / binding);
 constructor-pattern arms stay opaque (AlwaysPar would skip the match). Forks
 never span exclusive alternatives.
 
-For each demanded constant argument vector whose **cost** (max component)
-exceeds `COIL_PAR_THRESHOLD` (default **20**), and that still reaches the fork
-under the site's path guards, codegen emits a nullary specialization
+For each demanded constant argument vector whose **work score** exceeds
+`COIL_PAR_THRESHOLD` (default **20**), and that still reaches the fork under the
+site's path guards, codegen emits a nullary specialization
 `__coil_par_{f}_{a}_{b}_…` that **always** forks:
 
 1. `MakeFn` of a child specialization when one exists for an arm's derived args,
@@ -68,6 +68,58 @@ under the site's path guards, codegen emits a nullary specialization
 Call sites with matching const args rewrite to `CALL` the specialization.
 Below-threshold / dynamic args stay on the original sequential `f` (no hot-path
 runtime threshold tax).
+
+### The work score
+
+A site's cost used to be `max(args)`, which reads argument *magnitude* as if it
+were work. It is not: `tak(24, 22, 20)` is 53 calls but outranked `fib(23)`.
+
+Instead, `par_work_units(sites, f, args)` counts the **fork-site nodes** reachable
+from a concrete arg vector:
+
+```
+W(f, args) = 0                                  if args miss f's guards, go
+                                                negative, or f has no fork site
+           = 1 + Σ_arms W(callee, arm(args))    otherwise
+```
+
+Guard pruning is what makes this a work model rather than a size model: a child
+that fails the site's path conditions is a base case and contributes nothing.
+Arms into *other* pure functions recurse into that function's own site, so heavy
+helper arms count and trivial ones do not. The walk is memoized per arg vector
+and bounded by a depth cap, a memo-entry cap, and saturation at the cutoff.
+
+`W` is then converted back into **threshold units** by inverting the same
+recurrence on the canonical shape — the units are “as much work as `fib(n)`”:
+
+```
+fib_nodes(n) = Fib(n + 1) - 1        // W for fib(n-1) + fib(n-2), base n <= 1
+score(args)  = min { n : fib_nodes(n) >= W }
+fork iff score > COIL_PAR_THRESHOLD
+```
+
+So the threshold keeps its old meaning on the shape it was calibrated on:
+`fib(n)` scores exactly `n`, and the default **20** still admits `fib(21)` and
+refuses `fib(20)`. What changed is everything that is *not* fib-shaped:
+
+| Site | `max(args)` | Work score | Real calls |
+|---|---|---|---|
+| `fib(21)` | 21 → fork | 21 → fork | 35 421 |
+| `fib(20)` | 20 → refuse | 20 → refuse | 21 891 |
+| `tak(18, 12, 6)` (fair bench) | 18 → refuse | 20 → refuse | 63 609 |
+| `tak(21, 12, 6)` | 21 → fork | 23 → fork | 230 613 |
+| `tak(24, 22, 20)` | 24 → fork | 5 → refuse | 53 |
+| `sq(n) + sq(n - 1)` at 22 | 22 → fork | 2 → refuse | 2 |
+| `fib(n) + fib(n - 1)` at 22 | 22 → fork | >20 → fork | 92 734 |
+
+Every imprecision resolves *downwards* — an arm into a function with no fork
+site, a `SelfCall` combine's re-entry on joined values (unknowable statically),
+the caps — so the score is a lower bound on the tree and unknown structure can
+only make a site refuse. `tak` is the interesting case: its arms rotate
+parameters, so a large component stays alive, but many children miss the `y < x`
+guard and the combine's re-entry is invisible. The fair benchmark
+load lands exactly *on* the cutoff and stays sequential; only a genuinely deeper
+tree crosses it.
 
 The default **20** is a profitability floor, not an arbitrary gate: forking below
 it (e.g. `COIL_PAR_THRESHOLD=12` on `fib(32)` or `tak(18,12,6)`) multiplies
@@ -136,7 +188,7 @@ idle workers steal. `thread::spawn` / auto-par share this pool — no per-call
 |-----|--------|
 | `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2). |
 | `COIL_AUTO_PAR` | `0` / `false` / `off` / `no` disables auto fork-join codegen. |
-| `COIL_PAR_THRESHOLD` | Compile-time profitability cutoff — recursion arg size and loop trip count (default 20). |
+| `COIL_PAR_THRESHOLD` | Compile-time profitability cutoff — fork-site work score and loop trip count (default 20). |
 
 Pool workers pin a TLS local deque tagged with the owning reactor identity.
 `submit` / join-help only push or pop that deque when it belongs to the same

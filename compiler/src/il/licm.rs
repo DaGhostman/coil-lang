@@ -4,13 +4,15 @@ use std::collections::{HashMap, HashSet};
 
 use common::{DebugLoc, Instruction};
 
+use super::bounds;
 use super::op::{IlJumpKind, IlOp, Label};
 use super::sp;
 
 /// Hoist loop-invariant `Const` / `Load` / `BinSlotImm` / `BinSlotSlot` out of
 /// natural loops when header SP-in is Known. Also sinks repeated table-indexed
 /// `STRING` field-key literals into preheader temps (GetField/SetField loops),
-/// and CSEs invariant `LOAD; CastIntToFloat` into a preheader temp.
+/// CSEs invariant `LOAD; CastIntToFloat` into a preheader temp, and moves an
+/// invariant `len(a)` out of an array-addressing loop ([`bounds`]).
 pub fn licm(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
         return;
@@ -21,7 +23,7 @@ pub fn licm(ops: &mut Vec<IlOp>) {
     // Each pass clears one loop; a cast hoisted out of an inner loop becomes a
     // candidate in the enclosing one, so iterate until it reaches the outermost
     // level. Progress is monotone toward outer loops, hence the loop-count bound.
-    let mut hoisted = false;
+    let mut hoisted = bounds::hoist_loop_invariants(ops);
     for _ in 0..find_natural_loops(ops).len() + 1 {
         // Triple form first: it migrates an existing materialization outward
         // without leaving a slot-to-slot copy behind.
@@ -85,7 +87,7 @@ fn licm_cast_hoist_triple(ops: &mut Vec<IlOp>) -> bool {
     false
 }
 
-fn store_count_in_loop(ops: &[IlOp], lp: &NaturalLoop, slot: u32) -> usize {
+pub(super) fn store_count_in_loop(ops: &[IlOp], lp: &NaturalLoop, slot: u32) -> usize {
     let mut n = 0;
     for i in lp.header..=lp.latch {
         match &ops[i] {
@@ -415,20 +417,20 @@ fn max_slot_used(ops: &[IlOp]) -> u32 {
 }
 
 #[derive(Clone, Debug)]
-struct NaturalLoop {
-    header: usize,
+pub(super) struct NaturalLoop {
+    pub(super) header: usize,
     /// Index of back-edge `Jump` (unconditional) to header.
-    latch: usize,
-    header_label: Label,
+    pub(super) latch: usize,
+    pub(super) header_label: Label,
 }
 
 impl NaturalLoop {
-    fn body_start(&self) -> usize {
+    pub(super) fn body_start(&self) -> usize {
         self.header + 1
     }
 }
 
-fn find_natural_loops(ops: &[IlOp]) -> Vec<NaturalLoop> {
+pub(super) fn find_natural_loops(ops: &[IlOp]) -> Vec<NaturalLoop> {
     let mut label_at: HashMap<u32, usize> = HashMap::new();
     for (i, op) in ops.iter().enumerate() {
         if let IlOp::Label(Label(id)) = op {
@@ -461,7 +463,7 @@ fn find_natural_loops(ops: &[IlOp]) -> Vec<NaturalLoop> {
     out
 }
 
-fn loop_has_barrier(ops: &[IlOp], lp: &NaturalLoop) -> bool {
+pub(super) fn loop_has_barrier(ops: &[IlOp], lp: &NaturalLoop) -> bool {
     for i in lp.header..=lp.latch {
         match &ops[i] {
             IlOp::HostInvoke { .. }
@@ -541,7 +543,7 @@ fn loop_has_field_ops(ops: &[IlOp], lp: &NaturalLoop) -> bool {
     false
 }
 
-fn slots_stored_in_loop(ops: &[IlOp], lp: &NaturalLoop) -> HashSet<u32> {
+pub(super) fn slots_stored_in_loop(ops: &[IlOp], lp: &NaturalLoop) -> HashSet<u32> {
     let mut s = HashSet::new();
     for i in lp.header..=lp.latch {
         match &ops[i] {
@@ -579,7 +581,7 @@ fn apply_hoist(ops: &mut Vec<IlOp>, lp: &NaturalLoop, hoist_idx: usize, cand: Il
     insert_preheader_ops(ops, &lp2, vec![cand]);
 }
 
-fn insert_preheader_ops(ops: &mut Vec<IlOp>, lp: &NaturalLoop, materialize: Vec<IlOp>) {
+pub(super) fn insert_preheader_ops(ops: &mut Vec<IlOp>, lp: &NaturalLoop, materialize: Vec<IlOp>) {
     if materialize.is_empty() {
         return;
     }

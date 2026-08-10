@@ -720,6 +720,30 @@ struct PredicatePeel {
     /// One past the highest callee slot referenced by cond/then.
     arity_hint: usize,
 }
+
+/// A peeled guard op rewritten against the caller's argument expressions.
+enum PeelRematOp {
+    /// Re-materialize argument `idx`.
+    Arg(usize),
+    /// Argument `idx`, then `imm`, then the binary op (unfused `BinSlotImm`).
+    ArgImm {
+        op: Instruction,
+        idx: usize,
+        imm: i32,
+    },
+    /// Arguments `a` then `b`, then the binary op (unfused `BinSlotSlot`).
+    ArgArg { op: Instruction, a: usize, b: usize },
+    /// Argument-independent op, copied as the callee emitted it.
+    Copy(IlOp),
+}
+
+/// A callee guard ready to emit at a call site without spilling arguments.
+struct PeelRematPlan {
+    cond: Vec<PeelRematOp>,
+    then_value: PeelRematOp,
+    /// Argument indices the guard reads (must be re-materializable).
+    guard_args: Vec<usize>,
+}
 pub struct Compiler {
     namespace: String,
     /// Stack IL during emit; lowered `Vec<Byte>` after [`Self::finalize_bytecode`].

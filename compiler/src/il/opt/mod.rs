@@ -31,6 +31,9 @@ pub struct OptimizeOptions {
     pub multi_op_join_convoy: bool,
     /// `JMPF A; JMP B; A:` → `JMPT B` for non-fusable guard conditions.
     pub invert_guard_branch: bool,
+    /// Drop `LOAD`/`STORE` the shared cursor proves redundant, promoting the
+    /// slot out of the frame.
+    pub slot_promote: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -48,6 +51,7 @@ impl Default for OptimizeOptions {
             bin_join_convoy: true,
             multi_op_join_convoy: true,
             invert_guard_branch: true,
+            slot_promote: true,
         }
     }
 }
@@ -101,6 +105,11 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
     // Last: the convoy passes match on JMP-to-join shapes this would remove.
     if opts.invert_guard_branch {
         invert_branch_over_jump(ops);
+    }
+    // After every slot-tracking pass: promotion leaves a slot defined only by
+    // the push that lands on it, which earlier passes would not see.
+    if opts.slot_promote {
+        slot_promote_at(ops, entry_tell);
     }
 }
 
@@ -164,9 +173,11 @@ pub(crate) fn emitting_range_to_raw(
 mod cfg;
 mod convoy;
 mod dce;
+mod slot_promote;
 
 use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
 use dce::{copy_prop, dead_store_at, mem_fwd, stack_dce};
 use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
 pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;
+pub(crate) use slot_promote::slot_promote_at;

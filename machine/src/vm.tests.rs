@@ -197,6 +197,168 @@
         assert_eq!(vm.pop().as_int(), 3);
     }
 
+    /// The aggregate builders read their operand window in place instead of
+    /// popping, so element order and stack discipline are what can break.
+    #[test]
+    fn make_tuple_and_array_keep_declaration_order_and_consume_exactly_arity() {
+        for (name, insn) in [
+            ("MakeTuple", Instruction::MakeTuple),
+            ("MakeArray", Instruction::MakeArray),
+        ] {
+            let mut vm = Machine::<16>::default();
+            vm.run(&[
+                const_int(99), // sentinel below the operand window
+                const_int(10),
+                const_int(20),
+                const_int(30),
+                Byte::new(insn).with_operand_u32(3),
+                Byte::new(Instruction::HALT),
+            ]);
+
+            let addr = vm.pop().raw() as u64;
+            let elements: Vec<i64> = match vm.heap().find_object_by_addr(addr) {
+                Some(Object::Tuple(gc)) => {
+                    gc.as_ref().elements.iter().map(Value::as_int).collect()
+                }
+                Some(Object::Array(gc)) => {
+                    gc.as_ref().elements.iter().map(Value::as_int).collect()
+                }
+                _ => panic!("{name} did not allocate an aggregate"),
+            };
+
+            assert_eq!(elements, vec![10, 20, 30], "{name} element order");
+            assert_eq!(
+                vm.pop().as_int(),
+                99,
+                "{name} consumed more than `arity` operands"
+            );
+        }
+    }
+
+    #[test]
+    fn make_tuple_arity_zero_allocates_an_empty_aggregate() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(7),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ]);
+
+        let addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Tuple(gc)) => assert!(gc.as_ref().elements.is_empty()),
+            _ => panic!("arity-0 MakeTuple must still allocate a tuple"),
+        }
+        assert_eq!(
+            vm.pop().as_int(),
+            7,
+            "arity-0 MakeTuple must not touch the operand stack"
+        );
+    }
+
+    /// Underfull stacks keep the pre-`top_window` truncate: `n = arity.min(tell)`.
+    #[test]
+    fn make_tuple_truncates_when_stack_short() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(99),
+            const_int(42),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            Byte::new(Instruction::HALT),
+        ]);
+
+        let addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Tuple(gc)) => {
+                assert_eq!(
+                    gc.as_ref().elements.len(),
+                    2,
+                    "must take only what is on the stack"
+                );
+                assert_eq!(gc.as_ref().elements[0].as_int(), 99);
+                assert_eq!(gc.as_ref().elements[1].as_int(), 42);
+            }
+            _ => panic!("underfull MakeTuple must still allocate"),
+        }
+        assert_eq!(vm.tell(), 0, "operand window must be fully consumed");
+    }
+
+    /// `MakeEnum` stores its payload top-first and tags each arg as immediate
+    /// or heap pointer; that classification is what GC tracing walks.
+    #[test]
+    fn make_enum_payload_is_top_first_and_classifies_heap_args() {
+        use crate::Member;
+
+        let strings = vec!["payload".to_owned()];
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                const_int(41),
+                Byte::new(Instruction::STRING).with_operand_u32(0),
+                make_enum(5, 2),
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+            &strings,
+            0,
+        );
+
+        let addr = vm.pop().raw() as u64;
+        let gc = match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Enum(gc)) => gc,
+            _ => panic!("MakeEnum did not allocate an enum"),
+        };
+        let obj = gc.as_ref();
+
+        assert_eq!(obj.tag, 5);
+        assert_eq!(obj.payload.len(), 2);
+        assert!(
+            matches!(obj.payload[0], Member::Object(Object::String(_))),
+            "the top operand must land in payload[0]"
+        );
+        match obj.payload[1] {
+            Member::Value(v) => assert_eq!(v.as_int(), 41),
+            Member::Object(_) => panic!("an immediate int must not be classified as a heap object"),
+        }
+    }
+
+    /// binary_trees' `Node(Tree, Tree)`: the fresh arity-2 enum has to be
+    /// rooted before the post-alloc GC, otherwise its children get swept.
+    #[test]
+    fn make_enum_arity_two_keeps_children_alive_across_gc() {
+        use crate::Member;
+
+        let mut vm = Machine::<32>::default();
+        // Collect on every allocation so rooting bugs cannot hide.
+        vm.heap_mut().set_gc_threshold_for_test(1);
+        vm.run(&[
+            const_int(1),
+            make_enum(3, 1), // left
+            const_int(2),
+            make_enum(3, 1), // right
+            make_enum(4, 2), // Node(left, right)
+            Byte::new(Instruction::HALT),
+        ]);
+
+        let addr = vm.pop().raw() as u64;
+        let node = match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Enum(gc)) => gc,
+            _ => panic!("the Node enum was swept by the post-alloc GC"),
+        };
+
+        assert_eq!(node.as_ref().tag, 4);
+        assert_eq!(node.as_ref().payload.len(), 2);
+        for member in &node.as_ref().payload {
+            match member {
+                Member::Object(child) => assert!(
+                    vm.heap().find_object_by_addr(child.addr()).is_some(),
+                    "a child enum was swept while reachable from the Node payload"
+                ),
+                Member::Value(_) => panic!("a child enum must be classified as a heap object"),
+            }
+        }
+    }
+
     /// Emit a STRING opcode that pushes an interned heap string.
     fn string_lit(strings: &mut Vec<String>, s: &str) -> Vec<Byte> {
         let idx = strings.len() as u32;

@@ -48,6 +48,79 @@ fn count_opcodes_in(bytecode: &[Byte], start: usize, end: usize, op: Instruction
         .count()
 }
 
+/// Residual `LOAD`/`STORE` shape in a PC range.
+///
+/// `*_ops` counts instruction words, `*_slots` the slots they move (a packed
+/// word carries up to 3). `packed_*_ops` are the words with `n > 1`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LoadStoreShape {
+    load_ops: usize,
+    load_slots: usize,
+    packed_load_ops: usize,
+    store_ops: usize,
+    store_slots: usize,
+    packed_store_ops: usize,
+}
+
+fn load_store_shape(bytecode: &[Byte], start: usize, end: usize) -> LoadStoreShape {
+    let mut shape = LoadStoreShape::default();
+    for b in &bytecode[start..end] {
+        let n = b.load_store_count();
+        match *b.bytecode() {
+            Instruction::LOAD => {
+                shape.load_ops += 1;
+                shape.load_slots += n;
+                shape.packed_load_ops += usize::from(n > 1);
+            }
+            Instruction::STORE => {
+                shape.store_ops += 1;
+                shape.store_slots += n;
+                shape.packed_store_ops += usize::from(n > 1);
+            }
+            _ => {}
+        }
+    }
+    shape
+}
+
+/// Tightest backward-branch range `[target, jmp)` in a PC window — the innermost
+/// loop body of a well-nested function.
+fn innermost_loop_range(bytecode: &[Byte], start: usize, end: usize) -> (usize, usize) {
+    let mut best: Option<(usize, usize)> = None;
+    for (pc, b) in bytecode[start..end].iter().enumerate().map(|(i, b)| (start + i, b)) {
+        if *b.bytecode() != Instruction::JMP {
+            continue;
+        }
+        let target = b.operand_u32() as usize;
+        if target >= pc || target < start {
+            continue;
+        }
+        if best.is_none_or(|(t, _)| target > t) {
+            best = Some((target, pc));
+        }
+    }
+    best.expect("function has a backward branch")
+}
+
+/// Fused `BinSlot*` words in a PC range — the slot-addressed shapes that
+/// already bypass a stack round-trip.
+fn count_bin_slot_family_in(bytecode: &[Byte], start: usize, end: usize) -> usize {
+    bytecode[start..end]
+        .iter()
+        .filter(|b| {
+            matches!(
+                *b.bytecode(),
+                Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotImmStore
+                    | Instruction::BinSlotSlotStore
+            )
+        })
+        .count()
+}
+
 fn run_dispatch(
     bytecode: Vec<Byte>,
     constants: Vec<u64>,
@@ -225,5 +298,274 @@ fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
     assert!(
         self_mulf >= 2,
         "zr*zr and zi*zi should each fuse to one self-MULF op, got {self_mulf}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AOT harvest — Phase 0 inventory
+//
+// Soft ceilings on the bytecode shapes that later phases are supposed to move.
+// Each ceiling is the count measured at Phase 0, so a regression trips the
+// assert and a real win makes the ceiling stale (tighten it in that phase).
+// Every test also prints its measured shape under `--nocapture`.
+//
+// Counter ownership:
+//   P1 — residual LOAD / STORE (op + slot counts, packed vs single) and the
+//        BinSlot* family that already avoids the stack round-trip. Landed:
+//        `il::opt::slot_promote`. Still open, and both out of its reach: the
+//        loop-carried cursor drift that leaves inner-loop stores non-redundant
+//        (`mandelbrot`), and `Bin(slot, TOS)` operand shapes.
+//   P2 — Index / StoreIndex in array-hot fns.
+//   P3 — MakeEnum / MakeTuple / MakeArray allocation sites.
+//   P4 — CALL / TailCall density in recursion-hot fns.
+// ---------------------------------------------------------------------------
+
+/// P1 + P4 baseline: `mandelbrot`'s float loops keep 8 LOADs / 13 STOREs, all
+/// single-slot, against 13 already-fused `BinSlot*` words and zero calls.
+#[test]
+fn aot_p1_mandelbrot_residual_load_store_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    let shape = load_store_shape(&bc, start, end);
+    let fused = count_bin_slot_family_in(&bc, start, end);
+    eprintln!("[P1] mandelbrot::mandelbrot {shape:?} bin_slot_family={fused}");
+
+    assert!(
+        shape.load_ops <= 8,
+        "mandelbrot residual LOAD regressed: {shape:?}"
+    );
+    assert!(
+        shape.store_ops <= 13,
+        "mandelbrot residual STORE regressed: {shape:?}"
+    );
+    // Nothing in the float loops packs today: every LOAD/STORE moves one slot.
+    assert_eq!(shape.load_slots, shape.load_ops, "{shape:?}");
+    assert_eq!(shape.store_slots, shape.store_ops, "{shape:?}");
+    assert_eq!(shape.packed_load_ops, 0, "{shape:?}");
+    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
+    assert!(
+        fused >= 13,
+        "mandelbrot lost fused BinSlot* coverage: {fused}"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::CALL),
+        0,
+        "mandelbrot must stay call-free"
+    );
+}
+
+/// P1 + P4: `tak` is call-dominated — 3 `CALL` + 1 `TailCall`. Slot promotion
+/// took the three argument temps out of the frame, so the reload run in front of
+/// the `TailCall` and all three spill STOREs are gone (Phase 0: 4 packed LOADs
+/// over 9 slots, 3 single-slot STOREs).
+#[test]
+fn aot_p1_p4_tak_residual_load_store_and_call_density() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/tak.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "tak", bc.len());
+    let shape = load_store_shape(&bc, start, end);
+    let calls = count_opcodes_in(&bc, start, end, Instruction::CALL);
+    let tail_calls = count_opcodes_in(&bc, start, end, Instruction::TailCall);
+    let fused = count_bin_slot_family_in(&bc, start, end);
+    eprintln!(
+        "[P1/P4] tak::tak {shape:?} call={calls} tail_call={tail_calls} bin_slot_family={fused} words={}",
+        end - start
+    );
+
+    assert!(
+        shape.load_ops <= 3,
+        "tak residual LOAD regressed: {shape:?}"
+    );
+    assert_eq!(
+        shape.store_ops, 0,
+        "tak argument temps must stay promoted out of the frame: {shape:?}"
+    );
+    // Argument setup for the three recursive calls is fully packed.
+    assert_eq!(shape.packed_load_ops, shape.load_ops, "{shape:?}");
+    assert!(
+        shape.load_slots >= 6,
+        "tak should still pack the 6 forwarded argument loads: {shape:?}"
+    );
+    assert_eq!(calls, 3, "tak call density changed");
+    assert!(
+        tail_calls >= 1,
+        "tak outer self-call should stay a TailCall"
+    );
+    assert!(fused >= 4, "tak lost fused BinSlot* coverage: {fused}");
+    // Self-recursive predicate peel was measured and refused (13 → 41 words).
+    assert!(
+        end - start <= 20,
+        "tak body grew past the no-self-peel ceiling: {} words",
+        end - start
+    );
+}
+
+/// P2 baseline: `nsieve`'s hot loops keep exactly one `Index` and one
+/// `StoreIndex` alongside 5 LOADs / 5 STOREs. Landed: `il::bounds` proved the
+/// `flags[k] = 0` operand temp invariant across the element writes, so the
+/// `CONST 0; STORE t` pair that materialized it left both loops — the sieve's
+/// innermost body is down to 6 words.
+#[test]
+fn aot_p2_nsieve_index_shape_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/nsieve.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "nsieve", bc.len());
+    let index = count_opcodes_in(&bc, start, end, Instruction::Index);
+    let store_index = count_opcodes_in(&bc, start, end, Instruction::StoreIndex);
+    let shape = load_store_shape(&bc, start, end);
+    let (inner_start, inner_end) = innermost_loop_range(&bc, start, end);
+    eprintln!(
+        "[P2] nsieve::nsieve index={index} store_index={store_index} {shape:?} inner_words={}",
+        inner_end - inner_start
+    );
+
+    // `flags[p]` read and `flags[k] = 0` write — one site each in source.
+    assert_eq!(index, 1, "nsieve Index count changed");
+    assert_eq!(store_index, 1, "nsieve StoreIndex count changed");
+    assert!(
+        shape.load_ops <= 5,
+        "nsieve residual LOAD regressed: {shape:?}"
+    );
+    assert!(
+        shape.store_ops <= 5,
+        "nsieve residual STORE regressed: {shape:?}"
+    );
+    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
+    // `flags.push(1)` is still an out-of-line Vec::push call.
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::CALL),
+        1,
+        "nsieve call count changed"
+    );
+    // The `flags[k] = 0` sieve loop: guard, packed LOAD, StoreIndex, POP,
+    // stride add, back edge. Nothing may re-materialize the stored constant.
+    assert!(
+        inner_end - inner_start <= 5,
+        "nsieve sieve loop grew: {} words",
+        inner_end - inner_start
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, inner_start, inner_end, Instruction::CONST),
+        0,
+        "the StoreIndex operand constant must stay hoisted"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, inner_start, inner_end, Instruction::STORE),
+        0,
+        "the StoreIndex operand temp store must stay hoisted"
+    );
+}
+
+/// P2: `while i < len(v)` keeps its `Index` / `StoreIndex` bounds checks, but the
+/// invariant `LOAD v; ArrayLen; STORE t` triple codegen leaves in the header
+/// moves to the preheader — including in `fill`, where the loop writes elements.
+#[test]
+fn aot_p2_len_loop_hoists_invariant_array_len() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/vec_scan.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    for (name, index, store_index) in [("scan", 1usize, 0usize), ("fill", 0, 1)] {
+        let (start, end) = fn_pc_range(&syms, name, bc.len());
+        let (inner_start, inner_end) = innermost_loop_range(&bc, start, end);
+        let in_loop = count_opcodes_in(&bc, inner_start, inner_end, Instruction::ArrayLen);
+        let total = count_opcodes_in(&bc, start, end, Instruction::ArrayLen);
+        eprintln!("[P2] vec_scan::{name} array_len={total} in_loop={in_loop}");
+        assert_eq!(
+            in_loop, 0,
+            "{name} must not recompute len(v) every iteration"
+        );
+        assert_eq!(
+            count_opcodes_in(&bc, start, end, Instruction::Index),
+            index,
+            "{name} Index count changed"
+        );
+        assert_eq!(
+            count_opcodes_in(&bc, start, end, Instruction::StoreIndex),
+            store_index,
+            "{name} StoreIndex count changed"
+        );
+    }
+}
+
+#[test]
+fn aot_p2_vec_scan_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/vec_scan.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    eprintln!("[P2] vec_scan dispatches={dispatches}");
+    // 64 rounds over a 4096-element Vec, both loops hoisted (~5.0M).
+    assert!(
+        dispatches < 5_300_000,
+        "vec_scan dispatch count regressed: {dispatches}"
+    );
+}
+
+#[test]
+fn aot_p2_nsieve_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/nsieve.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    eprintln!("[P2] nsieve dispatches={dispatches}");
+    // ~470k with the sieve loop's operand materialization hoisted.
+    assert!(
+        dispatches < 490_000,
+        "nsieve dispatch count regressed: {dispatches}"
+    );
+}
+
+/// P3 + P4 baseline: `bottom_up` allocates both `Tree` variants (2 `MakeEnum`)
+/// per level and `item_check` unpacks without re-allocating.
+#[test]
+fn aot_p3_binary_trees_make_enum_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/binary_trees.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let mut total_enums = 0usize;
+    let mut total_tuples = 0usize;
+    let mut total_arrays = 0usize;
+    let mut total_calls = 0usize;
+    for name in ["bottom_up", "item_check", "main"] {
+        let (start, end) = fn_pc_range(&syms, name, bc.len());
+        let make_enum = count_opcodes_in(&bc, start, end, Instruction::MakeEnum);
+        let make_tuple = count_opcodes_in(&bc, start, end, Instruction::MakeTuple);
+        let make_array = count_opcodes_in(&bc, start, end, Instruction::MakeArray);
+        let calls = count_opcodes_in(&bc, start, end, Instruction::CALL);
+        eprintln!(
+            "[P3/P4] binary_trees::{name} make_enum={make_enum} make_tuple={make_tuple} make_array={make_array} call={calls}"
+        );
+        total_enums += make_enum;
+        total_tuples += make_tuple;
+        total_arrays += make_array;
+        total_calls += calls;
+    }
+
+    let (bottom_up_start, bottom_up_end) = fn_pc_range(&syms, "bottom_up", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, bottom_up_start, bottom_up_end, Instruction::MakeEnum),
+        2,
+        "bottom_up should allocate exactly Leaf + Node"
+    );
+    let (check_start, check_end) = fn_pc_range(&syms, "item_check", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, check_start, check_end, Instruction::MakeEnum),
+        0,
+        "item_check must not re-allocate while walking"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, check_start, check_end, Instruction::Unpack),
+        1,
+        "item_check should keep one payload Unpack"
+    );
+
+    // User fns only: `format` needs 2 MakeTuple in main, no arrays anywhere.
+    assert!(
+        total_enums <= 2,
+        "binary_trees user MakeEnum regressed: {total_enums}"
+    );
+    assert!(
+        total_tuples <= 2,
+        "binary_trees user MakeTuple regressed: {total_tuples}"
+    );
+    assert_eq!(total_arrays, 0, "binary_trees should not build arrays");
+    assert!(
+        total_calls <= 11,
+        "binary_trees user CALL density regressed: {total_calls}"
     );
 }

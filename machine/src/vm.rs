@@ -2686,7 +2686,7 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
-                    // operands: tag (high 16), arity (low 16). Args popped top-first
+                    // operands: tag (high 16), arity (low 16). Args read top-first
                     // into declaration order; classify each as immediate or heap pointer.
                     let operands = opcode.operand_u32();
                     let tag = operands >> 16;
@@ -2699,19 +2699,21 @@ impl<const S: usize> Machine<S> {
                         continue;
                     }
 
-                    let mut payload: Vec<Member> = Vec::with_capacity(arity);
-                    for _ in 0..arity {
-                        if self.stack.tell() == 0 {
-                            break;
-                        }
-                        let v = self.stack.pop();
-                        let addr = v.raw() as u64;
-                        if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
-                            payload.push(Member::Object(o));
-                        } else {
-                            payload.push(Member::Value(v));
-                        }
-                    }
+                    // Args are contiguous on the stack; classify the window
+                    // top-first straight into the payload (exact-size collect)
+                    // instead of popping element-by-element.
+                    let n = arity.min(self.stack.tell());
+                    let payload: Vec<Member> = self
+                        .stack
+                        .top_window(n)
+                        .iter()
+                        .rev()
+                        .map(|v| match Self::find_object_by_addr(&self.heap, v.raw() as u64) {
+                            Some(o) => Member::Object(o),
+                            None => Member::Value(*v),
+                        })
+                        .collect();
+                    self.stack.seek(self.stack.tell() - n);
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
                     // Root before GC — unmarked fresh enums are swept otherwise
@@ -2722,14 +2724,11 @@ impl<const S: usize> Machine<S> {
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
                     let arity = (operands & 0xFFFF) as usize;
-                    let mut values: Vec<Value> = Vec::with_capacity(arity);
-                    for _ in 0..arity {
-                        if self.stack.tell() == 0 {
-                            break;
-                        }
-                        values.push(self.stack.pop());
-                    }
-                    values.reverse();
+                    // Elements already sit in declaration order on the stack:
+                    // copy the window in one memcpy, no pop loop or reverse.
+                    let n = arity.min(self.stack.tell());
+                    let values: Vec<Value> = self.stack.top_window(n).to_vec();
+                    self.stack.seek(self.stack.tell() - n);
                     let addr = if matches!(opcode.bytecode(), Instruction::MakeTuple) {
                         let obj_tuple = ObjTuple { elements: values };
                         let (object, _) = self.heap.alloc(obj_tuple, Object::Tuple);
