@@ -69,6 +69,13 @@ Call sites with matching const args rewrite to `CALL` the specialization.
 Below-threshold / dynamic args stay on the original sequential `f` (no hot-path
 runtime threshold tax).
 
+The default **20** is a profitability floor, not an arbitrary gate: forking below
+it (e.g. `COIL_PAR_THRESHOLD=12` on `fib(32)` or `tak(18,12,6)`) multiplies
+reactor spawn/join work and is typically **slower** than sequential, and very
+low values can exhaust the specialization budget or overflow worker stacks.
+Raise the workload (larger const args) when you want IPA evidence; do not lower
+the threshold to “force” more forks.
+
 ## Loop IPA: chunked fork-join over an induction range
 
 A counted loop is the same idea with the arms spread over an induction range.
