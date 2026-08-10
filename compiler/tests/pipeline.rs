@@ -4132,6 +4132,65 @@ fn main() {
     );
 }
 
+/// Independent pure helper arms (not self-recursion) still fork-join.
+#[test]
+fn auto_par_pure_helper_arms_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int n) -> int {
+    return n * n;
+}
+fn pair_sq(int n) -> int {
+    if n <= 0 { return 0; }
+    return sq(n) + sq(n - 1);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", pair_sq(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("helper-arm IPA should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_pair_sq_22").is_some(),
+        "expected a specialization for pair_sq(22)"
+    );
+    // 22² + 21²
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "925");
+}
+
+/// Fork inside an irrefutable match arm keeps evaluable path guards.
+#[test]
+fn auto_par_irrefutable_match_arm_emits_spec() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(64)]
+fn fibm(int n) -> int {
+    if n <= 1 { return n; }
+    return match n {
+        _ => fibm(n - 1) + fibm(n - 2),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", fibm(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("match-arm IPA should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_fibm_22").is_some(),
+        "irrefutable match arm must still specialize"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "17711");
+}
+
 /// A pure counted loop above the threshold must split into chunk workers and
 /// still fold to the sequential sum.
 #[test]

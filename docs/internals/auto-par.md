@@ -4,7 +4,8 @@ coil can fork-join **independent parallel arms** (IPA) without a source-level
 `par` / `spawn` annotation. Two shapes qualify today:
 
 ```coil
-return fib(n - 1) + fib(n - 2);      // recursive IPA — sibling self-calls
+return fib(n - 1) + fib(n - 2);      // expression IPA — independent pure calls
+return sq(n) + sq(n - 1);            // helper arms (no self-recursion required)
 while i < 100 { acc = acc + f(i); i = i + 1; }   // loop IPA — iteration arms
 ```
 
@@ -26,26 +27,31 @@ over the AST:
 - `analyze_pure_fns` returns everything that survives; `analyze_recursive_pure`
   keeps only the subset that **calls itself**.
 
-Recursive IPA needs recursive-pure (the arms *are* self-calls). Loop IPA only
-needs pure, so ordinary helpers such as `fn sq(int i) -> int { i * i }` qualify.
+Expression IPA runs on **any pure** function whose body contains a fork site
+(self-calls or independent helper calls). Loop IPA also needs pure body callees.
 
 Disable both transforms with `COIL_AUTO_PAR=0` (or `false` / `off` / `no`).
 
-## Recursive IPA: static profitability (no runtime threshold checks)
+## Expression IPA: static profitability (no runtime threshold checks)
 
 [`par_profit`](../../compiler/src/typechecking/par_profit.rs) detects **fork
-sites** on recursive-pure functions — expressions whose operands are two or more
-independent self-calls — and collects **constant** call-site arguments
-(`fib(32)`, …). Three combine shapes are recognized:
+sites** on pure functions — expressions whose operands are two or more
+independent pure calls — and collects **constant** call-site arguments
+(`fib(32)`, …). Combine shapes recognized:
 
 | Combine | Source shape |
 |---|---|
-| `BinOp` | `f(n - a) ⊕ f(n - b)` |
-| `EnumCtor` | `E::V(f(…), f(…))` |
-| `SelfCall` | `f(f(…), f(…), f(…))` (tak-style) |
+| `BinOp` | `f(…) ⊕ g(…)` (`+` / `-` / `*`) |
+| `EnumCtor` | `E::V(f(…), g(…))` (tuple or record payload) |
+| `SelfCall` | `f(f(…), f(…), …)` (tak-style) |
+| `ApplyCall` | `h(f(…), g(…))` for a pure `h` |
+| `Tuple` | `(f(…), g(…))` |
 
 Arms are described structurally (`ArgForm::Const` / `Param` / `ParamMinus`), so
-any arity works and child arg vectors are derived statically.
+any arity works and child arg vectors are derived statically. Detection walks
+full function bodies, including **irrefutable** match arms (`_` / binding);
+constructor-pattern arms stay opaque (AlwaysPar would skip the match). Forks
+never span exclusive alternatives.
 
 For each demanded constant argument vector whose **cost** (max component)
 exceeds `COIL_PAR_THRESHOLD` (default **20**), and that still reaches the fork
@@ -53,10 +59,10 @@ under the site's path guards, codegen emits a nullary specialization
 `__coil_par_{f}_{a}_{b}_…` that **always** forks:
 
 1. `MakeFn` of a child specialization when one exists for an arm's derived args,
-   otherwise `MakeFn` of the original `f` with those concrete args.
+   otherwise `MakeFn` of the arm's callee with those concrete args.
 2. `thread_spawn` the first arm into the work-stealing reactor (no `GT` gate).
 3. On `Ok(handle)`: evaluate remaining arms locally, `join` (help-steals), apply
-   the site's combine (`BinOp`, rebuild `SelfCall`, or `MakeEnum` for `EnumCtor`).
+   the site's combine.
 4. On `Err` (spawn or non-sendable join): sequential fallback of all arms + combine.
 
 Call sites with matching const args rewrite to `CALL` the specialization.
