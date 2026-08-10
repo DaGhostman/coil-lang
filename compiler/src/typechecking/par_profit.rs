@@ -4,9 +4,10 @@
 //! independent **pure** calls — self-recursion is common but not required:
 //! `f(a) ⊕ f(b)`, `h(a) + h(b)`, `E::V(f(a), f(b))`, `(f(a), f(b))`, the
 //! tak-style `f(f(a), f(b), f(c))`, or `g(f(a), f(b))`. Arms are described
-//! structurally ([`ArgForm`]) rather than by function allowlists. Call sites
-//! with constant args above [`par_cost_threshold`] rewrite to specialized
-//! nullary clones that always fork (fully static, no runtime threshold checks).
+//! structurally ([`ArgForm`]) rather than by function allowlists. Constant call
+//! sites whose estimated **work** ([`par_work_units`]) exceeds
+//! [`par_cost_threshold`] rewrite to specialized nullary clones that always fork
+//! (fully static, no runtime threshold checks).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -148,6 +149,138 @@ pub fn const_args_worth_parallel(args: &[i64]) -> bool {
         .is_some_and(|m| m > par_cost_threshold())
 }
 
+// ---------------------------------------------------------------------------
+// Structural work score
+// ---------------------------------------------------------------------------
+
+/// Fork-site nodes in the tree of `fib(n) = fib(n-1) + fib(n-2)`, the shape the
+/// threshold is calibrated on: `W(k) = 1 + W(k-1) + W(k-2)`, `W(k <= 1) = 0`,
+/// which closes to `Fib(n + 1) - 1`. Saturates instead of overflowing.
+fn fib_tree_nodes(n: i64) -> i64 {
+    if n <= 1 {
+        return 0;
+    }
+    let (mut prev, mut cur) = (1i64, 1i64); // Fib(1), Fib(2)
+    for _ in 2..=n.min(FIB_UNITS_MAX) {
+        let next = prev.saturating_add(cur);
+        prev = cur;
+        cur = next;
+    }
+    cur.saturating_sub(1)
+}
+
+/// `Fib(n + 1)` overflows `i64` past this, so units saturate here.
+const FIB_UNITS_MAX: i64 = 91;
+
+/// Node counts back into threshold units: the smallest `n` whose `fib(n)` tree
+/// is at least this big. Exact inverse of [`fib_tree_nodes`], so a fib-shaped
+/// site at `n` scores exactly `n`.
+fn fib_tree_units(nodes: i64) -> i64 {
+    let mut n = 0;
+    while n < FIB_UNITS_MAX && fib_tree_nodes(n) < nodes {
+        n += 1;
+    }
+    n
+}
+
+/// Recursion depth at which the estimator stops descending and calls it a leaf.
+const WORK_MAX_DEPTH: u32 = 256;
+
+/// Distinct arg vectors the estimator will memoize before giving up.
+const WORK_MEMO_CAP: usize = 1 << 14;
+
+/// Bounded structural estimate of the work below a fork site.
+///
+/// Counts the fork-site nodes reachable from a concrete arg vector by walking
+/// the arms' [`ArgForm`] transforms and pruning children that miss the site's
+/// guards (those are base cases and do no forkable work). Every source of
+/// imprecision — an arm into a function with no known fork site, a `SelfCall`
+/// combine's re-entry on joined values, the depth and memo caps, saturation at
+/// the cutoff — is resolved *downwards*, so the count is a lower bound and
+/// unknown structure can only make a site refuse to fork.
+struct WorkEstimate<'a> {
+    sites: &'a HashMap<String, ParForkSite>,
+    /// Counting past the cutoff cannot change the verdict, so totals stop here.
+    cap: i64,
+    memo: HashMap<(&'a str, Vec<i64>), i64>,
+}
+
+impl<'a> WorkEstimate<'a> {
+    fn new(sites: &'a HashMap<String, ParForkSite>) -> Self {
+        Self {
+            sites,
+            cap: fib_tree_nodes(par_cost_threshold()).saturating_add(1),
+            memo: HashMap::new(),
+        }
+    }
+
+    /// Work below `fn_name(args)` in threshold units, saturating one unit past
+    /// the cutoff (scores at or below it are exact).
+    fn units(&mut self, fn_name: &str, args: &[i64]) -> i64 {
+        let nodes = self.nodes(fn_name, args, 0);
+        fib_tree_units(nodes)
+    }
+
+    fn worth_parallel(&mut self, fn_name: &str, args: &[i64]) -> bool {
+        self.nodes(fn_name, args, 0) > fib_tree_nodes(par_cost_threshold())
+    }
+
+    fn nodes(&mut self, fn_name: &str, args: &[i64], depth: u32) -> i64 {
+        let sites = self.sites;
+        let Some(site) = sites.get(fn_name) else {
+            return 0;
+        };
+        // Negative args are base-case territory, and a clone is only entered
+        // where the guards let control reach the fork.
+        if args.len() != site.param_count
+            || args.iter().any(|a| *a < 0)
+            || !guards_hold(&site.guards, args)
+        {
+            return 0;
+        }
+        let key = (site.fn_name.as_str(), args.to_vec());
+        if let Some(&hit) = self.memo.get(&key) {
+            return hit;
+        }
+        if depth >= WORK_MAX_DEPTH || self.memo.len() >= WORK_MEMO_CAP {
+            return 0;
+        }
+        // `Const` arg forms can raise a component, so the arg graph may cycle;
+        // the placeholder makes a re-entrant vector a leaf.
+        self.memo.insert(key.clone(), 0);
+        let mut total: i64 = 1;
+        for arm in &site.arms {
+            let Some(child) = eval_arm_args(arm, args) else {
+                continue;
+            };
+            total = total.saturating_add(self.nodes(arm_callee(arm), &child, depth + 1));
+            if total >= self.cap {
+                total = self.cap;
+                break;
+            }
+        }
+        self.memo.insert(key, total);
+        total
+    }
+}
+
+/// Structural work below `fn_name(args)`'s fork site, in [`par_cost_threshold`]
+/// units (a fib-shaped site at `n` scores `n`). Saturates at `threshold + 1`.
+#[allow(dead_code)] // score accessor for unit tests / tooling
+pub fn par_work_units(sites: &HashMap<String, ParForkSite>, fn_name: &str, args: &[i64]) -> i64 {
+    WorkEstimate::new(sites).units(fn_name, args)
+}
+
+/// True when `fn_name(args)` carries more work than [`par_cost_threshold`].
+#[allow(dead_code)] // used by codegen's specialization gates
+pub fn args_worth_parallel(
+    sites: &HashMap<String, ParForkSite>,
+    fn_name: &str,
+    args: &[i64],
+) -> bool {
+    WorkEstimate::new(sites).worth_parallel(fn_name, args)
+}
+
 /// Specialized nullary entry name for `fn_name` at concrete `args`.
 ///
 /// `("fib", &[22])` → `__coil_par_fib_22`; `("tak", &[18, 12, 6])` →
@@ -211,7 +344,8 @@ pub fn collect_par_specialization_args(
     sites: &HashMap<String, ParForkSite>,
 ) -> HashMap<String, BTreeSet<Vec<i64>>> {
     let mut demanded: HashMap<String, BTreeSet<Vec<i64>>> = HashMap::new();
-    collect_const_calls(ast, sites, &mut demanded);
+    let mut work = WorkEstimate::new(sites);
+    collect_const_calls(ast, &mut work, &mut demanded);
     for (name, set) in demanded.iter_mut() {
         let Some(site) = sites.get(name) else {
             continue;
@@ -229,11 +363,11 @@ pub fn collect_par_specialization_args(
                 let Some(child) = eval_arm_args(arm, &cur) else {
                     continue;
                 };
-                // Negative args are base-case territory. Without this an arm
-                // that rotates a large param (tak's `f(z-1, x, y)`) keeps the
-                // max above the threshold forever and the closure diverges.
+                // Negative args are base-case territory, and a child that no
+                // longer carries threshold work stays on the sequential
+                // original — which is also what bounds the closure.
                 if child.iter().any(|a| *a < 0)
-                    || !const_args_worth_parallel(&child)
+                    || !work.worth_parallel(arm_callee(arm), &child)
                     || !guards_hold(&site.guards, &child)
                 {
                     continue;
@@ -248,8 +382,8 @@ pub fn collect_par_specialization_args(
         }
         *set = seen.into_iter().collect();
     }
-    demanded.retain(|_, set| {
-        set.retain(|args| const_args_worth_parallel(args));
+    demanded.retain(|name, set| {
+        set.retain(|args| work.worth_parallel(name, args));
         !set.is_empty()
     });
     demanded
@@ -862,9 +996,10 @@ fn callee_name<'a>(name: &'a Output<'a>) -> Option<&'a str> {
 
 fn collect_const_calls(
     ast: &Output<'_>,
-    sites: &HashMap<String, ParForkSite>,
+    work: &mut WorkEstimate<'_>,
     out: &mut HashMap<String, BTreeSet<Vec<i64>>>,
 ) {
+    let sites = work.sites;
     match ast.1.as_ref() {
         Expression::Program(items)
         | Expression::Block(items)
@@ -874,7 +1009,7 @@ fn collect_const_calls(
         | Expression::Tuple(items)
         | Expression::If(items) => {
             for item in items {
-                collect_const_calls(item, sites, out);
+                collect_const_calls(item, work, out);
             }
         }
         Expression::Module(_, body)
@@ -890,7 +1025,7 @@ fn collect_const_calls(
         | Expression::Positive(body)
         | Expression::Cast(body, _)
         | Expression::Try(body)
-        | Expression::Readonly(body) => collect_const_calls(body, sites, out),
+        | Expression::Readonly(body) => collect_const_calls(body, work, out),
         Expression::Add(a, b)
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
@@ -904,16 +1039,16 @@ fn collect_const_calls(
         | Expression::Leq(a, b)
         | Expression::Geq(a, b)
         | Expression::Coalesce(a, b) => {
-            collect_const_calls(a, sites, out);
-            collect_const_calls(b, sites, out);
+            collect_const_calls(a, work, out);
+            collect_const_calls(b, work, out);
         }
         Expression::Call { name, args } => {
-            collect_const_calls(name, sites, out);
+            collect_const_calls(name, work, out);
             let Some(args) = args else {
                 return;
             };
             for a in args {
-                collect_const_calls(a, sites, out);
+                collect_const_calls(a, work, out);
             }
             let Some(fname) = callee_name(name) else {
                 return;
@@ -932,7 +1067,7 @@ fn collect_const_calls(
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(consts) = consts {
-                if const_args_worth_parallel(&consts) {
+                if work.worth_parallel(fname, &consts) {
                     out.entry(fname.to_string()).or_default().insert(consts);
                 }
             }
@@ -940,26 +1075,26 @@ fn collect_const_calls(
         Expression::Construct { fields, .. } => match fields {
             EnumConstructPayload::Tuple(items) => {
                 for item in items {
-                    collect_const_calls(item, sites, out);
+                    collect_const_calls(item, work, out);
                 }
             }
             EnumConstructPayload::Record(fields) => {
                 for f in fields {
-                    collect_const_calls(&f.value, sites, out);
+                    collect_const_calls(&f.value, work, out);
                 }
             }
             EnumConstructPayload::Unit => {}
         },
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {
-                collect_const_calls(c, sites, out);
+                collect_const_calls(c, work, out);
             }
-            collect_const_calls(body, sites, out);
+            collect_const_calls(body, work, out);
         }
         Expression::Match { scrutinee, arms } => {
-            collect_const_calls(scrutinee, sites, out);
+            collect_const_calls(scrutinee, work, out);
             for arm in arms {
-                collect_const_calls(&arm.body, sites, out);
+                collect_const_calls(&arm.body, work, out);
             }
         }
         Expression::For {
@@ -969,13 +1104,13 @@ fn collect_const_calls(
             body,
         } => {
             if let Some(i) = init {
-                collect_const_calls(i, sites, out);
+                collect_const_calls(i, work, out);
             }
-            collect_const_calls(cond, sites, out);
+            collect_const_calls(cond, work, out);
             if let Some(s) = step {
-                collect_const_calls(s, sites, out);
+                collect_const_calls(s, work, out);
             }
-            collect_const_calls(body, sites, out);
+            collect_const_calls(body, work, out);
         }
         Expression::Loop {
             identifier,
@@ -983,27 +1118,27 @@ fn collect_const_calls(
             body,
         } => {
             if let Some(id) = identifier {
-                collect_const_calls(id, sites, out);
+                collect_const_calls(id, work, out);
             }
-            collect_const_calls(iterable, sites, out);
-            collect_const_calls(body, sites, out);
+            collect_const_calls(iterable, work, out);
+            collect_const_calls(body, work, out);
         }
         Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
-            collect_const_calls(init, sites, out);
+            collect_const_calls(init, work, out);
         }
-        Expression::LetDestructure { rhs, .. } => collect_const_calls(rhs, sites, out),
+        Expression::LetDestructure { rhs, .. } => collect_const_calls(rhs, work, out),
         Expression::Function {
             body: Some(body), ..
         }
         | Expression::Lambda { body, .. }
-        | Expression::Defer { body, .. } => collect_const_calls(body, sites, out),
+        | Expression::Defer { body, .. } => collect_const_calls(body, work, out),
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                collect_const_calls(m, sites, out);
+                collect_const_calls(m, work, out);
             }
         }
         Expression::Method(_, inner) | Expression::Member(inner) => {
-            collect_const_calls(inner, sites, out);
+            collect_const_calls(inner, work, out);
         }
         _ => {}
     }
@@ -1073,8 +1208,10 @@ fn main() {
         let demanded = collect_par_specialization_args(&ast, &sites);
         let set = demanded.get("fib").expect("fib demands");
         assert!(set.contains(&vec![32]));
-        assert!(set.contains(&vec![21])); // chain toward threshold
-        assert!(!set.contains(&vec![20]));
+        // This fib bottoms out at `n <= 2`, one level earlier than the shape
+        // the threshold is calibrated on, so its chain stops one level higher.
+        assert!(set.contains(&vec![22])); // chain toward threshold
+        assert!(!set.contains(&vec![21]));
     }
 
     #[test]
@@ -1266,9 +1403,128 @@ fn main() {{
             demanded.get("fib").is_none(),
             "arg == threshold and dynamic args must not demand specs: {demanded:?}"
         );
-        assert!(!const_args_worth_parallel(&[t]));
-        assert!(const_args_worth_parallel(&[t + 1]));
-        assert!(!const_args_worth_parallel(&[]));
+        assert!(!args_worth_parallel(&sites, "fib", &[t]));
+        assert!(args_worth_parallel(&sites, "fib", &[t + 1]));
+        assert!(!args_worth_parallel(&sites, "fib", &[]));
+        assert!(!args_worth_parallel(&sites, "nosuch", &[t + 1]));
+    }
+
+    /// The score is expressed in fib-equivalent units, so the canonical shape
+    /// scores its own argument and the threshold keeps its old meaning there.
+    #[test]
+    fn fib_shape_scores_its_own_argument() {
+        let t = par_cost_threshold();
+        let sites = sites_of(
+            r#"
+fn fib(int n) -> int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        for n in 2..=t {
+            assert_eq!(
+                par_work_units(&sites, "fib", &[n]),
+                n,
+                "fib({n}) must score {n} units"
+            );
+        }
+        // Above the cutoff the count saturates — the verdict cannot change.
+        assert_eq!(par_work_units(&sites, "fib", &[t + 1]), t + 1);
+        assert_eq!(par_work_units(&sites, "fib", &[32]), t + 1);
+        assert!(args_worth_parallel(&sites, "fib", &[32]));
+    }
+
+    /// Arms into a callee with no fork site (or none at all) are leaves, so a
+    /// site whose work the analysis cannot see stays sequential.
+    #[test]
+    fn trivial_helper_arms_score_below_threshold() {
+        let sites = sites_of(
+            r#"
+fn sq(int n) -> int {
+    return n * n;
+}
+fn pair_sq(int n) -> int {
+    if n <= 0 { return 0; }
+    return sq(n) + sq(n - 1);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(sites.contains_key("pair_sq"), "fork site still detected");
+        assert_eq!(par_work_units(&sites, "pair_sq", &[22]), 2);
+        assert!(!args_worth_parallel(&sites, "pair_sq", &[22]));
+    }
+
+    /// Heavy helper arms carry their own subtree, so the parent forks even
+    /// though it is not itself recursive.
+    #[test]
+    fn recursive_helper_arms_score_above_threshold() {
+        let sites = sites_of(
+            r#"
+fn fib(int n) -> int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn pair_fib(int n) -> int {
+    if n <= 0 { return 0; }
+    return fib(n) + fib(n - 1);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(args_worth_parallel(&sites, "pair_fib", &[24]));
+        assert!(!args_worth_parallel(&sites, "pair_fib", &[10]));
+    }
+
+    /// Rotating `tak` arms keep a large component alive, but most children miss
+    /// the `y < x` guard and the `SelfCall` combine's re-entry is unknowable,
+    /// so the fair benchmark load scores just *under* the cutoff and refuses.
+    /// Only a load with a genuinely deeper tree crosses it.
+    #[test]
+    fn fair_tak_load_scores_below_threshold() {
+        let t = par_cost_threshold();
+        let sites = sites_of(
+            r#"
+fn tak(int x, int y, int z) -> int {
+    if y >= x {
+        return z;
+    }
+    return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y));
+}
+fn main() { return; }
+"#,
+        );
+        assert_eq!(par_work_units(&sites, "tak", &[18, 12, 6]), t);
+        assert!(
+            !args_worth_parallel(&sites, "tak", &[18, 12, 6]),
+            "the fair tak(18, 12, 6) load must stay sequential"
+        );
+        // `max(args)` alone rated this above the threshold; it is 53 calls.
+        assert!(
+            !args_worth_parallel(&sites, "tak", &[24, 22, 20]),
+            "a narrow x - y gap is cheap however large the args"
+        );
+        assert!(args_worth_parallel(&sites, "tak", &[21, 12, 6]));
+        assert!(args_worth_parallel(&sites, "tak", &[24, 16, 8]));
+    }
+
+    /// A cyclic arg graph (`Const` forms can raise a component) must not hang
+    /// the estimator; re-entrant vectors are leaves.
+    #[test]
+    fn cyclic_arg_forms_terminate_the_estimator() {
+        let sites = sites_of(
+            r#"
+fn ping(int n, int m) -> int {
+    if n <= 0 { return m; }
+    return ping(n - 1, 9) + ping(n - 1, m);
+}
+fn main() { return; }
+"#,
+        );
+        assert!(sites.contains_key("ping"), "fork site detected");
+        let _ = par_work_units(&sites, "ping", &[40, 3]);
     }
 
     /// `f(z - 1, x, y)` keeps a large param alive in every child, so the
@@ -1321,7 +1577,7 @@ fn tak(int x, int y, int z) -> int {
     return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y));
 }
 fn main() {
-    let a = tak(21, 1, 0);
+    let a = tak(21, 12, 6);
     let b = tak(0, 0, 21);
     return;
 }
@@ -1341,7 +1597,7 @@ fn main() {
         );
         let demanded = collect_par_specialization_args(&ast, &sites);
         let set = demanded.get("tak").expect("tak demands");
-        assert!(set.contains(&vec![21, 1, 0]));
+        assert!(set.contains(&vec![21, 12, 6]));
         assert!(
             !set.contains(&vec![0, 0, 21]),
             "base-case vector must not be specialized: {set:?}"
