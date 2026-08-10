@@ -1018,6 +1018,29 @@ fn main() { return; }
     }
 
     #[test]
+    fn detects_sub_binop_fork() {
+        let sites = sites_of(
+            r#"
+fn diff(int n) -> int {
+    if n <= 1 { return n; }
+    return diff(n - 1) - diff(n - 2);
+}
+fn main() { return; }
+"#,
+        );
+        let diff = sites.get("diff").expect("diff fork site");
+        assert_eq!(diff.combine, ParCombine::BinOp(ParBinOp::Sub));
+        assert_eq!(
+            arm_args(diff, 0),
+            [ArgForm::ParamMinus { param: 0, sub: 1 }]
+        );
+        assert_eq!(
+            arm_args(diff, 1),
+            [ArgForm::ParamMinus { param: 0, sub: 2 }]
+        );
+    }
+
+    #[test]
     fn rejects_single_recursive_arm() {
         let sites = sites_of(
             r#"

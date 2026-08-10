@@ -4011,6 +4011,68 @@ fn main() {
     assert_eq!(output, "17711");
 }
 
+/// Impurity nested only inside an enum constructor payload must still block
+/// `__coil_par_*` clones (purity used to skip Construct payloads entirely).
+#[test]
+fn impure_call_in_enum_ctor_payload_skips_par_specialization() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Cell {
+    Val(int),
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn rec(int n) -> int {
+    if n <= 1 { return n; }
+    let _ = Cell::Val(shout(n));
+    return rec(n - 1) + rec(n - 2);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", rec(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let _ = pipeline
+        .compile_src(src)
+        .expect("impure ctor-payload rec should still compile");
+    assert!(
+        pipeline.function_offset("__coil_par_rec_22").is_none(),
+        "impurity inside a Construct payload must block auto-par"
+    );
+}
+
+/// Subtraction combines are first-class IPA arms, not only Add/Mul.
+#[test]
+fn auto_par_sub_binop_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn diff(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return diff(n - 1) - diff(n - 2);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", diff(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par sub binop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_diff_22").is_some(),
+        "expected a Sub specialization for diff(22)"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    // d(n)=d(n-1)-d(n-2) with d(0)=0,d(1)=1 is period-6; d(22)=-1.
+    assert_eq!(output, "-1");
+}
+
 /// A `SelfCall` combine rebuilds the outer N-ary call from the joined arms.
 #[test]
 fn auto_par_self_call_combine_emits_spec() {
