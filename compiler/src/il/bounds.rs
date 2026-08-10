@@ -613,6 +613,32 @@ mod tests {
         );
     }
 
+    /// `MakeArray` sits on the same length-changing arm as `ArrayPush`; splitting
+    /// the match must not drop it. Keep the loop stack-balanced so the refusal
+    /// is `LengthMayChange`, not a poisoned header.
+    #[test]
+    fn refuses_when_the_loop_makes_an_array() {
+        let mut ops = read_loop();
+        let after_index = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Index { .. }))
+            .expect("index site")
+            + 1;
+        // MakeArray(0) / Pop is stack-neutral and still trips length refusal.
+        ops.insert(after_index, IlOp::Pop { loc: loc() });
+        ops.insert(
+            after_index,
+            IlOp::byte(Byte::new(Instruction::MakeArray).with_operand_u32(0)),
+        );
+        let before = ops.clone();
+        assert!(!hoist_loop_invariants(&mut ops));
+        assert!(ops == before);
+        assert_eq!(
+            loop_array_facts(&ops)[0].refusal,
+            Some(Refusal::LengthMayChange)
+        );
+    }
+
     #[test]
     fn refuses_when_the_array_local_is_rebound() {
         let mut ops = read_loop();
