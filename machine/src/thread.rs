@@ -488,8 +488,7 @@ fn member_from_value(heap: &Heap, value: Value) -> Member {
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 fn is_immediate_value(heap: &Heap, v: Value) -> bool {

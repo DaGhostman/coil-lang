@@ -389,7 +389,16 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         io_reactor,
     } = job;
 
-    let clear_print = shared_print.is_some();
+    // A joining root help-steals jobs onto its *own* thread, so the print
+    // redirects have to be saved and put back: `OUTPUT_REDIRECT` points into
+    // `vm`'s boxed writer, which dies with `vm` at the end of this call.
+    let redirected = shared_print.is_some();
+    let prev_output = redirected
+        .then(|| crate::io::set_output_redirect(None))
+        .flatten();
+    let prev_shared_print = redirected
+        .then(|| crate::io::set_shared_print_redirect(None))
+        .flatten();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.install_natives(&natives);
         vm.set_thread_program(Arc::clone(&program));
@@ -421,8 +430,9 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         }
         value_to_portable(vm.heap(), ret)
     }));
-    if clear_print {
-        crate::io::set_shared_print_redirect(None);
+    if redirected {
+        crate::io::set_output_redirect(prev_output);
+        crate::io::set_shared_print_redirect(prev_shared_print);
     }
 
     let stored = match result {

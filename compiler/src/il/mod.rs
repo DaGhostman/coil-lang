@@ -19,6 +19,8 @@ mod opt;
 mod sp;
 pub mod tell;
 
+pub use bounds::{BoundsStats, last_bounds_stats};
+
 pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;
 pub use emit_buf::EmitBuf;

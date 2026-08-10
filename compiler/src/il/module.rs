@@ -116,7 +116,10 @@ impl IlModule {
 
     /// Per-func opts (excluding multi_op) + CFG GVN on each body, then
     /// whole-buffer [`opt::multi_op_join_convoy`] on the concatenated stream.
-    pub fn optimize_and_flatten(&mut self, opts: &OptimizeOptions) -> Vec<IlOp> {
+    ///
+    /// `pool` is the module const pool (`f64` / boxed int bits) for algebraic
+    /// float identity / const-fold peeps (may push folded float results).
+    pub fn optimize_and_flatten(&mut self, opts: &OptimizeOptions, pool: &mut Vec<u64>) -> Vec<IlOp> {
         let mut per = opts.clone();
         let run_multi = per.multi_op_join_convoy;
         per.multi_op_join_convoy = false;
@@ -125,19 +128,19 @@ impl IlModule {
         per.invert_guard_branch = false;
         // GVN reasons about slot defs; promotion removes the store that makes one
         // visible, so it runs after GVN has seen the body.
-        let run_slot_promote = per.slot_promote;
-        per.slot_promote = false;
+        let run_slot_promote_tell = per.slot_promote_tell;
+        per.slot_promote_tell = false;
 
         if self.funcs.is_empty() {
             let mut ops = self.to_flat();
-            opt::optimize(&mut ops, opts);
+            opt::optimize(&mut ops, opts, pool);
             return ops;
         }
 
         for body in &mut self.funcs {
-            opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32);
+            opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32, pool);
             super::gvn::cfg_gvn(&mut body.ops);
-            if run_slot_promote {
+            if run_slot_promote_tell {
                 opt::slot_promote_at(&mut body.ops, body.meta.entry_sp);
             }
         }
@@ -258,7 +261,7 @@ mod tests {
             ],
             ..IlModule::default()
         };
-        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &mut Vec::new());
         assert!(!flat.iter().any(|op| matches!(op, IlOp::Dup { .. })));
         assert!(flat.iter().any(
             |op| matches!(op, IlOp::ConstReturnImm { .. }) || matches!(op, IlOp::Return { .. })
@@ -277,10 +280,13 @@ mod tests {
         ];
         let funcs = vec![IlFunc::new("f", None, 2, 6)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        let flat = m.optimize_and_flatten(&OptimizeOptions {
-            multi_op_join_convoy: false,
-            ..OptimizeOptions::default()
-        });
+        let flat = m.optimize_and_flatten(
+            &OptimizeOptions {
+                multi_op_join_convoy: false,
+                ..OptimizeOptions::default()
+            },
+            &mut Vec::new(),
+        );
         assert!(matches!(flat[0], IlOp::Dup { .. }));
         assert!(matches!(flat[1], IlOp::Pop { .. }));
         assert!(!flat[2..].iter().any(|op| matches!(op, IlOp::Dup { .. })));
@@ -326,7 +332,7 @@ mod tests {
 
         let funcs = vec![IlFunc::new("f", None, 1, body_emit_end)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        let flat = m.optimize_and_flatten(&OptimizeOptions::default());
+        let flat = m.optimize_and_flatten(&OptimizeOptions::default(), &mut Vec::new());
         let loads = flat
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))
@@ -362,21 +368,26 @@ mod tests {
         let emit_end = ops.iter().filter(|op| op.emits_code()).count();
         let funcs = vec![IlFunc::new("f", None, 0, emit_end)];
         let mut m = IlModule::from_flat(&ops, &funcs);
-        let flat = m.optimize_and_flatten(&OptimizeOptions {
-            jump_thread: false,
-            dead_block: false,
-            stack_dce: false,
-            mem_fwd: false,
-            copy_prop: false,
-            algebraic: false,
-            licm: false,
-            return_convoy: false,
-            clone_shared_return: false,
-            bin_join_convoy: false,
-            multi_op_join_convoy: true,
-            invert_guard_branch: false,
-            slot_promote: false,
-        });
+        let flat = m.optimize_and_flatten(
+            &OptimizeOptions {
+                jump_thread: false,
+                dead_block: false,
+                stack_dce: false,
+                mem_fwd: false,
+                copy_prop: false,
+                slot_promote: false,
+                algebraic: false,
+                licm: false,
+                loop_bounds: false,
+                return_convoy: false,
+                clone_shared_return: false,
+                bin_join_convoy: false,
+                multi_op_join_convoy: true,
+                invert_guard_branch: false,
+                slot_promote_tell: false,
+            },
+            &mut Vec::new(),
+        );
         let loads = flat
             .iter()
             .filter(|op| matches!(op, IlOp::Load { .. }))

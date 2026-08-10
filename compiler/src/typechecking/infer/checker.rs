@@ -10391,6 +10391,16 @@ impl Checker {
         self.option_mode_fns.contains(fn_name)
     }
 
+    /// Return the resolved result type of a registered function.
+    pub fn fn_return_ty(&self, fn_name: &str) -> Option<Ty> {
+        let scheme = self.env.lookup(fn_name)?;
+        let mut ty = scheme.ty.clone();
+        while let Ty::Fun(_, next) = ty {
+            ty = *next;
+        }
+        Some(apply_ty_prune(&self.subst, &ty))
+    }
+
     // ============================================================
     // ============================================================
     //  Native registration
@@ -15239,7 +15249,14 @@ impl Checker {
     ) -> Option<Ty> {
         // ---- Builtin synthesis ----
         if let Some((item, kind)) = self.builtin_for_in_kind(te, iterable_range) {
-            self.record_for_in_info(loop_id, loop_range, ForInInfo { kind });
+            self.record_for_in_info(
+                loop_id,
+                loop_range,
+                ForInInfo {
+                    kind,
+                    item_ty: item.clone(),
+                },
+            );
             return Some(item);
         }
 
@@ -15271,6 +15288,7 @@ impl Checker {
                         let next_fqn = iter_inst.method_fqns.get("next").cloned();
                         match (into_fqn, next_fqn) {
                             (Some(into_iter_fqn), Some(next_fqn)) => {
+                                let item_ty = apply_ty_prune(&self.subst, &item);
                                 self.record_for_in_info(
                                     loop_id,
                                     loop_range,
@@ -15279,9 +15297,10 @@ impl Checker {
                                             into_iter_fqn,
                                             next_fqn,
                                         },
+                                        item_ty: item_ty.clone(),
                                     },
                                 );
-                                Some(apply_ty_prune(&self.subst, &item))
+                                Some(item_ty)
                             }
                             _ => {
                                 let _ = self.error_with_help(

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::il::op::IlOp;
+use crate::il::op::{IlJumpKind, IlOp};
 use common::Instruction;
 
 /// Side-effect-free single-value producer: dropping it with its `Pop` is a no-op.
@@ -17,18 +17,62 @@ fn is_droppable_producer(op: &IlOp) -> bool {
 /// (`Load a; Const c; Pop; Pop` → `Load a; Pop` → empty).
 pub(super) fn stack_dce(ops: &mut Vec<IlOp>) {
     loop {
-        let before = ops.len();
-        stack_dce_once(ops);
-        if ops.len() == before {
+        if !stack_dce_once(ops) {
             return;
         }
     }
 }
 
-fn stack_dce_once(ops: &mut Vec<IlOp>) {
+fn stack_dce_once(ops: &mut Vec<IlOp>) -> bool {
     let mut out = Vec::with_capacity(ops.len());
     let mut i = 0;
     while i < ops.len() {
+        if i + 1 < ops.len()
+            && let IlOp::MakeEnum {
+                tag,
+                arity,
+                ..
+            } = &ops[i]
+        {
+            let arity = *arity as usize;
+            match &ops[i + 1] {
+                IlOp::Pop { loc } => {
+                    if arity > 0 {
+                        out.extend((0..arity).map(|_| IlOp::Pop { loc: *loc }));
+                    }
+                    i += 2;
+                    continue;
+                }
+                IlOp::LoadField { index: 0, .. } if arity == 1 => {
+                    i += 2;
+                    continue;
+                }
+                IlOp::Byte { byte, .. }
+                    if arity == 1 && *byte.bytecode() == Instruction::Unpack =>
+                {
+                    i += 2;
+                    continue;
+                }
+                IlOp::Jump {
+                    kind:
+                        IlJumpKind::JumpIfMatch {
+                            tag: expected_tag,
+                            ..
+                        },
+                    target,
+                    loc: jump_loc,
+                } if arity == 1 && u32::from(*tag) == *expected_tag => {
+                    out.push(IlOp::Jump {
+                        kind: IlJumpKind::Unconditional,
+                        target: *target,
+                        loc: *jump_loc,
+                    });
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         if i + 1 < ops.len()
             && matches!(&ops[i], IlOp::Dup { .. })
             && matches!(&ops[i + 1], IlOp::Pop { .. })
@@ -79,7 +123,9 @@ fn stack_dce_once(ops: &mut Vec<IlOp>) {
         out.push(ops[i].clone());
         i += 1;
     }
+    let changed = out.as_slice() != ops.as_slice();
     *ops = out;
+    changed
 }
 
 /// `StorePop s; Load s` → `Dup; StorePop s` when the value stays on stack after

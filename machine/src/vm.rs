@@ -86,6 +86,90 @@ pub fn cursor_trace() -> Vec<(u32, u32)> {
     Vec::new()
 }
 
+// Allocation / GC counters (`vm_profile` + tests). Useful for binary_trees-style
+// heap traffic without needing external alloc tracers.
+#[cfg(any(test, feature = "vm_profile"))]
+thread_local! {
+    static VM_ALLOC_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+    static VM_GC_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+    static VM_MAKE_FAST_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+/// Record one managed heap object allocation.
+#[cfg(any(test, feature = "vm_profile"))]
+#[inline]
+pub(crate) fn note_heap_alloc() {
+    VM_ALLOC_COUNT.with(|c| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[inline]
+pub(crate) fn note_heap_alloc() {}
+
+/// Reset allocation / GC / Make* fast-path counters.
+#[cfg(any(test, feature = "vm_profile"))]
+pub fn reset_alloc_profile() {
+    VM_ALLOC_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+    VM_GC_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+    VM_MAKE_FAST_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+pub fn reset_alloc_profile() {}
+
+/// Number of managed objects allocated since the last reset.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn alloc_count() -> u64 {
+    VM_ALLOC_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn alloc_count() -> u64 {
+    0
+}
+
+/// Number of mark-and-sweep collections since the last reset.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn gc_count() -> u64 {
+    VM_GC_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn gc_count() -> u64 {
+    0
+}
+
+/// Number of MakeTuple / MakeArray / MakeEnum fixed-arity fast paths taken.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn make_fast_count() -> u64 {
+    VM_MAKE_FAST_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn make_fast_count() -> u64 {
+    0
+}
+
+#[cfg(any(test, feature = "vm_profile"))]
+#[inline]
+fn note_make_fast() {
+    VM_MAKE_FAST_COUNT.with(|c| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[inline]
+fn note_make_fast() {}
+
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
         {
@@ -765,6 +849,10 @@ impl<const S: usize> Machine<S> {
 
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
     fn gc_collect(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
+        #[cfg(any(test, feature = "vm_profile"))]
+        VM_GC_COUNT.with(|c| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
         let mut roots = heap.take_gc_roots();
         // Only live operand-stack slots (not the full capacity buffer).
         for v in stack.as_slice() {
@@ -819,6 +907,63 @@ impl<const S: usize> Machine<S> {
     fn maybe_gc_after_alloc(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
         if unlikely(heap.should_collect()) {
             Self::gc_collect(heap, stack, resume_stack);
+        }
+    }
+
+    /// Classify a stack value as an enum member; heap pointers become `Object`.
+    #[inline]
+    fn value_as_member(heap: &Heap, v: Value) -> Member {
+        let addr = v.raw() as u64;
+        if let Some(o) = Self::find_object_by_addr(heap, addr) {
+            Member::Object(o)
+        } else {
+            Member::Value(v)
+        }
+    }
+
+    /// Copy `n` stack values in declaration order (`stack[base..base+n]`).
+    /// Used by MakeTuple / MakeArray. Args stay on the stack for GC rooting
+    /// until the caller seeks past them after allocation.
+    #[inline]
+    fn stack_copy_decl(stack: &Stack<Value>, base: usize, n: usize) -> Vec<Value> {
+        match n {
+            0 => Vec::new(),
+            1 => vec![stack[base]],
+            2 => vec![stack[base], stack[base + 1]],
+            3 => vec![stack[base], stack[base + 1], stack[base + 2]],
+            _ => {
+                let mut values = Vec::with_capacity(n);
+                for i in 0..n {
+                    values.push(stack[base + i]);
+                }
+                values
+            }
+        }
+    }
+
+    /// Copy `n` stack values in MakeEnum pop order (TOS → payload[0]).
+    /// Codegen reverse-pushes constructor args so this yields declaration order.
+    #[inline]
+    fn stack_copy_enum_payload(heap: &Heap, stack: &Stack<Value>, sp: usize, n: usize) -> Vec<Member> {
+        match n {
+            0 => Vec::new(),
+            1 => vec![Self::value_as_member(heap, stack[sp - 1])],
+            2 => vec![
+                Self::value_as_member(heap, stack[sp - 1]),
+                Self::value_as_member(heap, stack[sp - 2]),
+            ],
+            3 => vec![
+                Self::value_as_member(heap, stack[sp - 1]),
+                Self::value_as_member(heap, stack[sp - 2]),
+                Self::value_as_member(heap, stack[sp - 3]),
+            ],
+            _ => {
+                let mut payload = Vec::with_capacity(n);
+                for i in 0..n {
+                    payload.push(Self::value_as_member(heap, stack[sp - 1 - i]));
+                }
+                payload
+            }
         }
     }
 
@@ -1634,6 +1779,43 @@ impl<const S: usize> Machine<S> {
         self.nested_return.take().unwrap_or_default()
     }
 
+    /// Box a `(payload, tag)` pair-ABI value back into a heap `Option`/`Result`.
+    ///
+    /// `is_option` picks the arity of tag 0: `None` carries nothing, `Ok` carries
+    /// the payload.
+    fn alloc_pair_enum(&mut self, payload: Value, tag: u32, is_option: bool) -> Value {
+        let payload = if is_option && tag == 0 {
+            Vec::new()
+        } else {
+            vec![
+                Self::find_object_by_addr(&self.heap, payload.raw() as u64)
+                    .map(Member::Object)
+                    .unwrap_or(Member::Value(payload)),
+            ]
+        };
+        let (object, _) = self.heap.alloc(ObjEnum { tag, payload }, Object::Enum);
+        Value::from(object.addr())
+    }
+
+    /// Pair-ABI counterpart of [`Self::capture_nested_return`].
+    ///
+    /// A host entry (`spawn`, an FFI/IO callback) has no caller-side
+    /// `PairToHeap`, so the two slots are boxed here; without this the frame
+    /// unwinds past the [`Self::call_function`] entry and execution runs on into
+    /// whatever bytecode follows the callee.
+    #[inline]
+    fn capture_nested_pair_return(&mut self, payload: Value, tag: Value, is_option: bool) -> bool {
+        if unlikely(self.nested_depth > 0) {
+            let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+            if self.frames.len() == nested_target {
+                let boxed = self.alloc_pair_enum(payload, tag.as_int() as u32, is_option);
+                self.nested_return = Some(boxed);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Stash a return value when `execute` runs inside [`Self::call_function`].
     #[inline]
     fn capture_nested_return(&mut self, ret_val: Value) -> bool {
@@ -1721,7 +1903,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::Seek as u8);
+            promise!(*bc as u8 <= Instruction::NEGF as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1771,6 +1953,113 @@ impl<const S: usize> Machine<S> {
                     promise!(abs <= stack_cap);
                     self.stack.seek(abs);
                 }
+                Instruction::OptionNicheToHeap => {
+                    let value = self.stack.pop();
+                    if value.raw().is_null() {
+                        let object = self.heap.immortal_unit_enum(0);
+                        self.stack.push(Value::from(object.addr()));
+                    } else {
+                        let member = Self::find_object_by_addr(&self.heap, value.raw() as u64)
+                            .map(Member::Object)
+                            .unwrap_or(Member::Value(value));
+                        let (object, _) = self.heap.alloc(
+                            ObjEnum {
+                                tag: 1,
+                                payload: vec![member],
+                            },
+                            Object::Enum,
+                        );
+                        self.stack.push(Value::from(object.addr()));
+                        Self::maybe_gc_after_alloc(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                        );
+                    }
+                }
+                Instruction::HeapOptionToNiche => {
+                    let value = self.stack.pop();
+                    let niche = match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+                        Some(Object::Enum(gc)) => match gc.as_ref().tag {
+                            0 => Value::default(),
+                            1 => gc
+                                .as_ref()
+                                .payload
+                                .first()
+                                .map(|member| match member {
+                                    Member::Object(object) => Value::from(object.addr()),
+                                    Member::Value(value) => *value,
+                                })
+                                .unwrap_or_default(),
+                            _ => Value::default(),
+                        },
+                        _ => Value::default(),
+                    };
+                    self.stack.push(niche);
+                }
+                Instruction::PairJumpIfTag => {
+                    let operands = opcode.operand_u32();
+                    let expected_tag = operands >> 16;
+                    if self.stack.tell() > 0 && self.stack.peek().as_int() as u32 == expected_tag {
+                        let pool_idx = (operands & 0xFFFF) as usize;
+                        debug_assert!(
+                            pool_idx < constants.len(),
+                            "PairJumpIfTag pool index {pool_idx} out of range (len {})",
+                            constants.len()
+                        );
+                        let target = opcode.jump_if_match_target(constants);
+                        self.stack.pop();
+                        ip = target;
+                    }
+                }
+                Instruction::PairToHeap => {
+                    let tag = self.stack.pop().as_int() as u32;
+                    let payload = self.stack.pop();
+                    let is_option = opcode.operand_u32() & 1 != 0;
+                    let boxed = self.alloc_pair_enum(payload, tag, is_option);
+                    self.stack.push(boxed);
+                    Self::maybe_gc_after_alloc(
+                        &mut self.heap,
+                        &self.stack,
+                        &self.resume_stack,
+                    );
+                }
+                Instruction::HeapToPair => {
+                    let value = self.stack.pop();
+                    let is_option = opcode.operand_u32() & 1 != 0;
+                    let (tag, payload) =
+                        match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+                            Some(Object::Enum(gc)) => {
+                                let enum_ref = gc.as_ref();
+                                let payload = enum_ref
+                                    .payload
+                                    .first()
+                                    .map(|member| match member {
+                                        Member::Object(object) => Value::from(object.addr()),
+                                        Member::Value(value) => *value,
+                                    })
+                                    .unwrap_or_default();
+                                (enum_ref.tag, payload)
+                            }
+                            _ => (0, Value::default()),
+                        };
+                    self.stack.push(payload);
+                    self.stack.push(Value::from(tag as i64));
+                    let _ = is_option;
+                }
+                Instruction::ReturnPair => {
+                    let tag = self.stack.pop();
+                    let payload = self.stack.pop();
+                    if self.capture_nested_pair_return(payload, tag, opcode.operand_u32() & 1 != 0)
+                    {
+                        return false;
+                    }
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(payload);
+                    self.stack.push(tag);
+                    self.after_return(&mut ip, &mut sp);
+                }
                 Instruction::LOAD => {
                     let count = opcode.load_store_count();
                     for i in 0..count {
@@ -1809,6 +2098,14 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(!(val.as_int() != 0)));
                 }
                 Instruction::NEG => unary!(self.stack, -, as_int),
+                // IEEE negate: flip sign bit (preserves NaN payload).
+                Instruction::NEGF => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 1);
+                    let idx = sp - 1;
+                    let bits = self.stack[idx].raw() as u64;
+                    self.stack[idx].replace((bits ^ (1u64 << 63)) as _);
+                }
                 Instruction::AND => binary!(self.stack, &&, as_bool),
                 Instruction::OR => binary!(self.stack, ||, as_bool),
                 Instruction::ADD => binary!(self.stack, +, as_int),
@@ -2653,6 +2950,146 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
+                Instruction::HostInvokeNiche => {
+                    let tuple_val = self.stack.pop();
+                    let tuple_addr = tuple_val.raw() as u64;
+                    let fn_id = self.stack.pop().as_int() as usize;
+                    let args: Vec<Value> = match Self::find_object_by_addr(&self.heap, tuple_addr) {
+                        Some(Object::Tuple(gc)) => gc.as_ref().elements.clone(),
+                        _ => Vec::new(),
+                    };
+                    let value = match self.natives.get_by_id(fn_id) {
+                        Some(native) if native.name() == "vec_pop" => {
+                            crate::vec_ops::host_vec_pop_niche(&mut self.heap, &args)
+                        }
+                        Some(native) if native.name() == "vec_remove" => {
+                            crate::vec_ops::host_vec_remove_niche(&mut self.heap, &args)
+                        }
+                        Some(native) => match native.invoke(&mut self.heap, &args) {
+                            Ok(Some(value)) => match Self::find_object_by_addr(
+                                &self.heap,
+                                value.raw() as u64,
+                            ) {
+                                Some(Object::Enum(gc)) => gc
+                                    .as_ref()
+                                    .payload
+                                    .first()
+                                    .map(|member| match member {
+                                        Member::Object(object) => Value::from(object.addr()),
+                                        Member::Value(value) => *value,
+                                    })
+                                    .unwrap_or_default(),
+                                _ => Value::default(),
+                            },
+                            _ => Value::default(),
+                        },
+                        None => Value::default(),
+                    };
+                    self.stack.push(value);
+                }
+                Instruction::FloatChainStore => {
+                    let raw = opcode.operand_u32();
+                    let descriptor_idx = (raw & 0xFFFF) as usize;
+                    let dest = ((raw >> 16) & 0xFF) as usize;
+                    promise!(descriptor_idx < constants.len());
+                    let descriptor = unsafe { *constants.get_unchecked(descriptor_idx) };
+                    let op0 = descriptor as u8;
+                    let lhs0 = (descriptor >> 8) as u8 as usize;
+                    let rhs0 = (descriptor >> 16) as u8 as usize;
+                    let op1 = (descriptor >> 24) as u8;
+                    let rhs1 = (descriptor >> 32) as u8 as usize;
+                    let extended = descriptor & (1u64 << 63) != 0;
+                    let bin = |op: u8, lhs: f64, rhs: f64| match Instruction::from(op) {
+                        Instruction::ADDF => lhs + rhs,
+                        Instruction::SUBF => lhs - rhs,
+                        Instruction::MULF => lhs * rhs,
+                        Instruction::DIVF => lhs / rhs,
+                        Instruction::MODF => lhs % rhs,
+                        _ => f64::NAN,
+                    };
+                    let load_op = |idx: usize, is_const: bool| -> f64 {
+                        if is_const {
+                            promise!(idx < constants.len());
+                            Value::from(unsafe { *constants.get_unchecked(idx) }).as_float()
+                        } else {
+                            promise!(sp + idx < stack_cap);
+                            self.stack[sp + idx].as_float()
+                        }
+                    };
+                    let (lhs0_const, rhs0_const, rhs1_const, rhs2_const, s1_left, s2_left, has_s2) =
+                        if extended {
+                            (
+                                descriptor & (1 << 59) != 0,
+                                descriptor & (1 << 56) != 0,
+                                descriptor & (1 << 57) != 0,
+                                descriptor & (1 << 58) != 0,
+                                descriptor & (1 << 60) != 0,
+                                descriptor & (1 << 61) != 0,
+                                descriptor & (1 << 62) != 0,
+                            )
+                        } else {
+                            (false, false, false, false, false, false, false)
+                        };
+                    let mut acc = bin(
+                        op0,
+                        load_op(lhs0, lhs0_const),
+                        load_op(rhs0, rhs0_const),
+                    );
+                    let other1 = load_op(rhs1, rhs1_const);
+                    acc = if s1_left {
+                        bin(op1, other1, acc)
+                    } else {
+                        bin(op1, acc, other1)
+                    };
+                    if has_s2 {
+                        let op2 = (descriptor >> 40) as u8;
+                        let rhs2 = (descriptor >> 48) as u8 as usize;
+                        let other2 = load_op(rhs2, rhs2_const);
+                        acc = if s2_left {
+                            bin(op2, other2, acc)
+                        } else {
+                            bin(op2, acc, other2)
+                        };
+                    }
+                    promise!(sp + dest < stack_cap);
+                    self.stack[sp + dest] = Value::from(acc);
+                    if self.stack.tell() <= sp + dest {
+                        self.stack.seek(sp + dest + 1);
+                    }
+                }
+                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf` — no stack traffic.
+                Instruction::BinSlotSlotConstJmpf => {
+                    let (bin_op, a, desc_idx) = opcode.bin_slot_slot_const_jmpf_parts();
+                    promise!(desc_idx < constants.len());
+                    let packed = unsafe { *constants.get_unchecked(desc_idx) };
+                    let (b, cmp_op, float_idx, target) =
+                        RawByte::unpack_bin_slot_slot_const_jmpf_desc(packed);
+                    let b = b as usize;
+                    promise!(float_idx < constants.len());
+                    promise!(sp + a < stack_cap);
+                    promise!(sp + b < stack_cap);
+                    let va = self.stack[sp + a].as_float();
+                    let vb = self.stack[sp + b].as_float();
+                    let mag = match Instruction::from(bin_op) {
+                        Instruction::ADDF => va + vb,
+                        Instruction::SUBF => va - vb,
+                        Instruction::MULF => va * vb,
+                        Instruction::DIVF => va / vb,
+                        Instruction::MODF => va % vb,
+                        _ => f64::NAN,
+                    };
+                    let rhs = Value::from(unsafe { *constants.get_unchecked(float_idx) }).as_float();
+                    let taken = match Instruction::from(cmp_op) {
+                        Instruction::LEF => mag < rhs,
+                        Instruction::LEQF => mag <= rhs,
+                        Instruction::GTF => mag > rhs,
+                        Instruction::GEQF => mag >= rhs,
+                        _ => false,
+                    };
+                    if !taken {
+                        ip = target;
+                    }
+                }
                 Instruction::HALT => {
                     if let Some(out) = self.output.as_mut() {
                         let _ = out.flush();
@@ -2686,8 +3123,9 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
-                    // operands: tag (high 16), arity (low 16). Args read top-first
-                    // into declaration order; classify each as immediate or heap pointer.
+                    // operands: tag (high 16), arity (low 16). Codegen reverse-pushes
+                    // args; we read TOS-first into declaration-order payload.
+                    // Values stay on the stack until after alloc so GC can root them.
                     let operands = opcode.operand_u32();
                     let tag = operands >> 16;
                     let arity = (operands & 0xFFFF) as usize;
@@ -2699,45 +3137,44 @@ impl<const S: usize> Machine<S> {
                         continue;
                     }
 
-                    // Args are contiguous on the stack; classify the window
-                    // top-first straight into the payload (exact-size collect)
-                    // instead of popping element-by-element.
-                    let n = arity.min(self.stack.tell());
-                    let payload: Vec<Member> = self
-                        .stack
-                        .top_window(n)
-                        .iter()
-                        .rev()
-                        .map(|v| match Self::find_object_by_addr(&self.heap, v.raw() as u64) {
-                            Some(o) => Member::Object(o),
-                            None => Member::Value(*v),
-                        })
-                        .collect();
-                    self.stack.seek(self.stack.tell() - n);
+                    let sp = self.stack.tell();
+                    let n = arity.min(sp);
+                    if n <= 3 {
+                        note_make_fast();
+                    }
+                    let payload = Self::stack_copy_enum_payload(&self.heap, &self.stack, sp, n);
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
-                    // Root before GC — unmarked fresh enums are swept otherwise
-                    // (result-mode `return Ok(s)` after a heavy callee was flaky).
+                    // Drop args, then root the fresh enum before maybe-GC.
+                    self.stack.seek(sp - n);
                     self.stack.push(Value::from(object.addr()));
                     Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
                     let arity = (operands & 0xFFFF) as usize;
-                    // Elements already sit in declaration order on the stack:
-                    // copy the window in one memcpy, no pop loop or reverse.
-                    let n = arity.min(self.stack.tell());
-                    let values: Vec<Value> = self.stack.top_window(n).to_vec();
-                    self.stack.seek(self.stack.tell() - n);
+                    let sp = self.stack.tell();
+                    let n = arity.min(sp);
+                    let base = sp - n;
+                    if n <= 3 {
+                        note_make_fast();
+                    }
+                    // Declaration order; keep args on stack through alloc for rooting.
+                    let values = Self::stack_copy_decl(&self.stack, base, n);
                     let addr = if matches!(opcode.bytecode(), Instruction::MakeTuple) {
-                        let obj_tuple = ObjTuple { elements: values };
-                        let (object, _) = self.heap.alloc(obj_tuple, Object::Tuple);
+                        let (object, _) = self.heap.alloc(
+                            ObjTuple { elements: values },
+                            Object::Tuple,
+                        );
                         object.addr()
                     } else {
-                        let obj_array = ObjArray { elements: values };
-                        let (object, _) = self.heap.alloc(obj_array, Object::Array);
+                        let (object, _) = self.heap.alloc(
+                            ObjArray { elements: values },
+                            Object::Array,
+                        );
                         object.addr()
                     };
+                    self.stack.seek(base);
                     self.stack.push(Value::from(addr));
                     Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
                 }

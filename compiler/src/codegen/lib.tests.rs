@@ -1571,17 +1571,17 @@ impl Iterator<Counter> { \
 } \
 fn main() { let c = new Counter(0, 3); for x in c { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
-        let call_indirect = bc
+        let calls = bc
             .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::CallIndirect))
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
             .count();
         let jump_if_match = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
             .count();
         assert!(
-            call_indirect >= 2,
-            "custom for-in should CallIndirect into_iter and next; got {call_indirect}"
+            calls >= 2,
+            "custom for-in should CALL into_iter and next; got {calls}"
         );
         assert!(
             jump_if_match >= 1,
@@ -2690,8 +2690,8 @@ fn main() {
     }
 
     /// A peel over leaf args spills nothing: the only STOREs `main` emits are the
-    /// three `let`s, the peel's join temp and `let result`. The spilling peel
-    /// needed three more, one per argument.
+    /// three `let`s and the peel's join temp (`let result` is never read, so its
+    /// store is elided). The spilling peel needed three more, one per argument.
     #[test]
     fn predicate_peel_does_not_spill_leaf_args() {
         use common::Instruction;
@@ -2712,9 +2712,9 @@ fn main() {
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STORE | Instruction::StorePop))
             .count();
-        assert_eq!(
-            stores, 5,
-            "peel spilled args: expected 3 locals + join temp + result, got {stores} STOREs"
+        assert!(
+            stores <= 4,
+            "peel spilled args: expected 3 locals + join temp, got {stores} STOREs"
         );
     }
 
@@ -2790,7 +2790,7 @@ fn main() {
             },
         ]);
         assert!(
-            Compiler::match_predicate_peel_shape(&returned).is_some(),
+            Compiler::match_predicate_peel_shape(&returned, true).is_some(),
             "cond + JMPF + value + RETURN is a peelable base case"
         );
         let falls_through = guard(vec![
@@ -2801,7 +2801,7 @@ fn main() {
             },
         ]);
         assert!(
-            Compiler::match_predicate_peel_shape(&falls_through).is_none(),
+            Compiler::match_predicate_peel_shape(&falls_through, true).is_none(),
             "a base-case value that is not returned must not be peeled"
         );
     }
@@ -3726,7 +3726,7 @@ fn main() {
         );
     }
 
-    /// Custom `Length` instances lower via `CallIndirect`, not structural `ArrayLen`.
+    /// Custom `Length` instances lower via direct `CALL`, not structural `ArrayLen`.
     #[test]
     fn custom_length_impl_emits_call_not_array_len() {
         use common::Instruction;
@@ -3747,13 +3747,19 @@ fn main() {
             .count();
         assert_eq!(
             array_lens, 2,
-            "custom Length uses CallIndirect; string/vec thunks keep ArrayLen; ops={:?}",
+            "custom Length uses CALL; string/vec thunks keep ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
             bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "expected CALL to Length::len; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "expected CallIndirect to Length::len; ops={:?}",
+            "ground Length::len must not use CallIndirect; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

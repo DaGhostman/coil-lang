@@ -824,6 +824,7 @@ mod tests {
             }
             .is_plain_return()
         );
+        assert!(!IlOp::byte(Byte::new(Instruction::ReturnPair)).is_plain_return());
     }
 
     #[test]

@@ -5,8 +5,16 @@ use common::Instruction;
 use super::op::IlOp;
 use super::sp;
 
+/// Exact IEEE-754 `+0.0` / `+1.0` bit patterns (refuse NaN / −0.0).
+const F64_PLUS_ZERO: u64 = 0.0_f64.to_bits();
+const F64_PLUS_ONE: u64 = 1.0_f64.to_bits();
+
 /// Cheap identity / strength rewrites. Refuses when SP-in mid-window is Unknown.
-pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
+///
+/// `pool` supplies `ConstPool` payloads so float identities / const-fold can
+/// read bits and push IEEE results (same push style as lower's wide int fold).
+/// Pass an empty vec when the pool is unavailable (int-only peeps still apply).
+pub fn algebraic_simplify(ops: &mut Vec<IlOp>, pool: &mut Vec<u64>) {
     if ops.len() < 2 {
         return;
     }
@@ -36,6 +44,37 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
             continue;
         }
 
+        // ConstPool a; ConstPool b; float Bin/Cmp → ConstPool bits or Const 0/1.
+        // DIVF/MODF by ±0.0 refused; NaN/Inf kept as deterministic pool bits.
+        if i + 2 < ops.len()
+            && info.sp_before(i + 1).is_known()
+            && info.sp_before(i + 2).is_known()
+            && let (IlOp::ConstPool { idx: ia, loc }, IlOp::ConstPool { idx: ib, .. }, IlOp::Bin { op, .. }) =
+                (&ops[i], &ops[i + 1], &ops[i + 2])
+        {
+            let ia = *ia;
+            let ib = *ib;
+            let loc = *loc;
+            let op = *op;
+            if let (Some(a), Some(b)) = (
+                pool.get(ia as usize).copied(),
+                pool.get(ib as usize).copied(),
+            ) {
+                if let Some(bits) = eval_const_float_bin(op, a, b) {
+                    let idx = pool.len() as u32;
+                    pool.push(bits);
+                    out.push(IlOp::ConstPool { idx, loc });
+                    i += 3;
+                    continue;
+                }
+                if let Some(r) = eval_const_float_cmp(op, a, b) {
+                    out.push(IlOp::Const { imm: r, loc });
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
         // Double LogicalNot (NOT; NOT) → identity (drop both).
         if i + 1 < ops.len()
             && is_logical_not(&ops[i])
@@ -59,7 +98,7 @@ pub fn algebraic_simplify(ops: &mut Vec<IlOp>) {
         if i + 2 < ops.len()
             && info.sp_before(i + 1).is_known()
             && info.sp_before(i + 2).is_known()
-            && let Some(rewritten) = try_bin_identity(&ops[i], &ops[i + 1], &ops[i + 2])
+            && let Some(rewritten) = try_bin_identity(&ops[i], &ops[i + 1], &ops[i + 2], pool)
         {
             out.push(rewritten);
             i += 3;
@@ -146,6 +185,45 @@ fn eval_const_bin(op: Instruction, a: i32, b: i32) -> Option<i32> {
     }
 }
 
+/// IEEE float binop bits matching VM `as_float` + `to_bits`. Refuse ÷/% by ±0.0.
+fn eval_const_float_bin(op: Instruction, a_bits: u64, b_bits: u64) -> Option<u64> {
+    let a = f64::from_bits(a_bits);
+    let b = f64::from_bits(b_bits);
+    let r = match op {
+        Instruction::ADDF => a + b,
+        Instruction::SUBF => a - b,
+        Instruction::MULF => a * b,
+        Instruction::DIVF if b != 0.0 => a / b,
+        Instruction::MODF if b != 0.0 => a % b,
+        _ => return None,
+    };
+    Some(r.to_bits())
+}
+
+fn is_float_cmp(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::LEF | Instruction::LEQF | Instruction::GTF | Instruction::GEQF
+    )
+}
+
+/// Float compares → int 0/1 (same as VM `binary!(…, as_float)` without `to_bits`).
+fn eval_const_float_cmp(op: Instruction, a_bits: u64, b_bits: u64) -> Option<i32> {
+    if !is_float_cmp(op) {
+        return None;
+    }
+    let a = f64::from_bits(a_bits);
+    let b = f64::from_bits(b_bits);
+    let t = match op {
+        Instruction::LEF => a < b,
+        Instruction::LEQF => a <= b,
+        Instruction::GTF => a > b,
+        Instruction::GEQF => a >= b,
+        _ => return None,
+    };
+    Some(i32::from(t))
+}
+
 fn bin_slot_imm_identity(op: u8, slot: u8, imm: i16, loc: common::DebugLoc) -> Option<IlOp> {
     let insn = Instruction::from(op);
     let keep = match insn {
@@ -186,7 +264,22 @@ fn is_scalar_producer(op: &IlOp) -> bool {
     )
 }
 
-fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
+fn pool_bits(op: &IlOp, pool: &[u64]) -> Option<u64> {
+    match op {
+        IlOp::ConstPool { idx, .. } => pool.get(*idx as usize).copied(),
+        _ => None,
+    }
+}
+
+fn is_exact_plus_zero(bits: u64) -> bool {
+    bits == F64_PLUS_ZERO
+}
+
+fn is_exact_plus_one(bits: u64) -> bool {
+    bits == F64_PLUS_ONE
+}
+
+fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp, pool: &[u64]) -> Option<IlOp> {
     let IlOp::Bin { op, loc } = bin else {
         return None;
     };
@@ -209,6 +302,21 @@ fn try_bin_identity(a: &IlOp, b: &IlOp, bin: &IlOp) -> Option<IlOp> {
             } else {
                 None
             }
+        }
+        // Float: x + 0.0 / 0.0 + x → x (exact +0.0 pool bits only; refuse −0/NaN).
+        // Intentionally no SUBF ±0.0 identity (signed zero).
+        (Instruction::ADDF, x, c) | (Instruction::ADDF, c, x)
+            if is_scalar_producer(x)
+                && pool_bits(c, pool).is_some_and(is_exact_plus_zero) =>
+        {
+            Some(x.clone())
+        }
+        // Float: x * 1.0 / 1.0 * x → x (exact +1.0 only; refuse *0.0 / NaN).
+        (Instruction::MULF, x, c) | (Instruction::MULF, c, x)
+            if is_scalar_producer(x)
+                && pool_bits(c, pool).is_some_and(is_exact_plus_one) =>
+        {
+            Some(x.clone())
         }
         // x | 0 / x ^ 0 / x << 0 / x >> 0 → x
         (
@@ -292,7 +400,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
         assert!(matches!(ops[1], IlOp::Return { .. }));
     }
@@ -311,7 +419,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
     }
 
@@ -332,7 +440,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
     }
 
@@ -347,7 +455,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
     }
 
@@ -359,7 +467,7 @@ mod tests {
             IlOp::byte(common::Byte::new(Instruction::NOT)),
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
     }
@@ -375,7 +483,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Load { slot: 3, .. }));
     }
 
@@ -395,7 +503,7 @@ mod tests {
             IlOp::Return { loc: loc() },
         ];
         let before = ops.clone();
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         // Window starting at Load has Unknown SP-in after FfiInvoke.
         assert_eq!(ops.len(), before.len());
     }
@@ -414,7 +522,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Load { slot: 5, .. }));
         assert!(matches!(ops[1], IlOp::Return { .. }));
     }
@@ -430,7 +538,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 0, .. }));
     }
 
@@ -445,7 +553,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::ConstPool { idx: 3, .. }));
         assert!(matches!(ops[1], IlOp::Return { .. }));
     }
@@ -473,7 +581,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
         assert!(matches!(ops[1], IlOp::Return { .. }));
     }
@@ -492,7 +600,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
         assert!(matches!(ops[1], IlOp::Dup { .. }));
         assert!(matches!(
@@ -518,7 +626,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
     }
 
@@ -539,7 +647,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
         assert!(matches!(ops[1], IlOp::Const { imm: 1, .. }));
         assert!(matches!(ops[2], IlOp::Return { .. }));
@@ -557,7 +665,7 @@ mod tests {
             IlOp::Return { loc: loc() },
         ];
         let before = div0.clone();
-        algebraic_simplify(&mut div0);
+        algebraic_simplify(&mut div0, &mut Vec::new());
         assert_eq!(div0.len(), before.len(), "DIV by 0 must not fold");
 
         let mut mod0 = vec![
@@ -570,7 +678,7 @@ mod tests {
             IlOp::Return { loc: loc() },
         ];
         let before = mod0.clone();
-        algebraic_simplify(&mut mod0);
+        algebraic_simplify(&mut mod0, &mut Vec::new());
         assert_eq!(mod0.len(), before.len(), "MOD by 0 must not fold");
 
         let mut shl = vec![
@@ -586,7 +694,7 @@ mod tests {
             IlOp::Return { loc: loc() },
         ];
         let before = shl.clone();
-        algebraic_simplify(&mut shl);
+        algebraic_simplify(&mut shl, &mut Vec::new());
         assert_eq!(shl.len(), before.len(), "SHL amount ≥ 32 must not fold");
     }
 
@@ -604,7 +712,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut pow1);
+        algebraic_simplify(&mut pow1, &mut Vec::new());
         assert!(matches!(pow1[0], IlOp::Load { slot: 2, .. }));
         assert!(matches!(pow1[1], IlOp::Return { .. }));
 
@@ -620,7 +728,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut and0);
+        algebraic_simplify(&mut and0, &mut Vec::new());
         assert!(matches!(and0[0], IlOp::Const { imm: 0, .. }));
     }
 
@@ -637,7 +745,7 @@ mod tests {
             IlOp::Return { loc: loc() },
         ];
         let before_len = ops.len();
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert_eq!(
             ops.len(),
             before_len,
@@ -672,7 +780,7 @@ mod tests {
             },
             IlOp::Return { loc: loc() },
         ];
-        algebraic_simplify(&mut ops);
+        algebraic_simplify(&mut ops, &mut Vec::new());
         assert!(
             matches!(ops[3], IlOp::Index { .. }),
             "Index must survive Const 0; Index; MUL"
@@ -687,5 +795,421 @@ mod tests {
             ),
             "MUL must survive Const 0; Index; MUL"
         );
+    }
+
+    fn pool_with(bits: &[u64]) -> Vec<u64> {
+        bits.to_vec()
+    }
+
+    #[test]
+    fn float_add_plus_zero_folds_to_load() {
+        let mut pool = pool_with(&[F64_PLUS_ZERO]);
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn float_plus_zero_add_load_folds() {
+        let mut pool = pool_with(&[F64_PLUS_ZERO]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::Load { slot: 4, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn float_mul_plus_one_folds_to_load() {
+        let mut pool = pool_with(&[F64_PLUS_ONE]);
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn float_plus_one_mul_load_folds() {
+        let mut pool = pool_with(&[F64_PLUS_ONE]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::Load { slot: 3, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn float_refuses_subf_plus_zero() {
+        let mut pool = pool_with(&[F64_PLUS_ZERO]);
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.clone();
+        algebraic_simplify(&mut ops, &mut pool);
+        assert_eq!(ops.len(), before.len(), "x - 0.0 must not fold (signed zero)");
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn float_refuses_mulf_plus_zero() {
+        let mut pool = pool_with(&[F64_PLUS_ZERO]);
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.clone();
+        algebraic_simplify(&mut ops, &mut pool);
+        assert_eq!(ops.len(), before.len(), "x * 0.0 must not fold (NaN/−0)");
+    }
+
+    #[test]
+    fn float_refuses_neg_zero_and_nan() {
+        let neg_zero = (-0.0_f64).to_bits();
+        let nan = f64::NAN.to_bits();
+        let mut pool = pool_with(&[neg_zero, nan]);
+
+        let mut neg = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_neg = neg.len();
+        algebraic_simplify(&mut neg, &mut pool);
+        assert_eq!(neg.len(), before_neg, "−0.0 must not fold");
+
+        let mut nan_ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_nan = nan_ops.len();
+        algebraic_simplify(&mut nan_ops, &mut pool);
+        assert_eq!(nan_ops.len(), before_nan, "NaN must not fold");
+    }
+
+    #[test]
+    fn float_refuses_without_pool_bits() {
+        // ConstPool idx present but pool empty / missing — unknown constant.
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.len();
+        algebraic_simplify(&mut ops, &mut Vec::new());
+        assert_eq!(ops.len(), before, "missing pool bits must refuse float fold");
+    }
+
+    #[test]
+    fn float_refuses_non_const_rhs() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before = ops.len();
+        algebraic_simplify(&mut ops, &mut vec![F64_PLUS_ZERO]);
+        assert_eq!(ops.len(), before, "non-const RHS must refuse float identity");
+    }
+
+    #[test]
+    fn float_const_pool_add_folds_to_pool_result() {
+        let mut pool = pool_with(&[1.5_f64.to_bits(), 2.5_f64.to_bits()]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+        assert_eq!(pool[2], 4.0_f64.to_bits());
+    }
+
+    #[test]
+    fn float_const_pool_arith_ops_fold() {
+        let a = 8.0_f64.to_bits();
+        let b = 2.0_f64.to_bits();
+        for (op, expect) in [
+            (Instruction::SUBF, 6.0_f64),
+            (Instruction::MULF, 16.0_f64),
+            (Instruction::DIVF, 4.0_f64),
+            (Instruction::MODF, 0.0_f64),
+        ] {
+            let mut pool = pool_with(&[a, b]);
+            let mut ops = vec![
+                IlOp::ConstPool { idx: 0, loc: loc() },
+                IlOp::ConstPool { idx: 1, loc: loc() },
+                IlOp::Bin { op, loc: loc() },
+                IlOp::Return { loc: loc() },
+            ];
+            algebraic_simplify(&mut ops, &mut pool);
+            assert!(
+                matches!(ops[0], IlOp::ConstPool { idx: 2, .. }),
+                "{op:?} should fold to ConstPool"
+            );
+            assert_eq!(pool[2], expect.to_bits(), "{op:?} bits");
+        }
+    }
+
+    #[test]
+    fn float_const_pool_div_mod_zero_refused() {
+        let a = 1.0_f64.to_bits();
+        for (zero, op) in [
+            (0.0_f64.to_bits(), Instruction::DIVF),
+            ((-0.0_f64).to_bits(), Instruction::DIVF),
+            (0.0_f64.to_bits(), Instruction::MODF),
+            ((-0.0_f64).to_bits(), Instruction::MODF),
+        ] {
+            let mut pool = pool_with(&[a, zero]);
+            let mut ops = vec![
+                IlOp::ConstPool { idx: 0, loc: loc() },
+                IlOp::ConstPool { idx: 1, loc: loc() },
+                IlOp::Bin { op, loc: loc() },
+                IlOp::Return { loc: loc() },
+            ];
+            let before = ops.len();
+            algebraic_simplify(&mut ops, &mut pool);
+            assert_eq!(ops.len(), before, "{op:?} by ±0.0 must not fold");
+            assert_eq!(pool.len(), 2, "pool must not grow on refuse");
+        }
+    }
+
+    #[test]
+    fn float_const_pool_nan_inf_kept_as_bits() {
+        let nan = f64::NAN.to_bits();
+        let mut pool = pool_with(&[nan, 1.0_f64.to_bits()]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 2, .. }));
+        assert!(f64::from_bits(pool[2]).is_nan());
+
+        let mut pool_inf = pool_with(&[f64::INFINITY.to_bits(), 1.0_f64.to_bits()]);
+        let mut ops_inf = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops_inf, &mut pool_inf);
+        assert!(matches!(ops_inf[0], IlOp::ConstPool { idx: 2, .. }));
+        assert_eq!(pool_inf[2], f64::INFINITY.to_bits());
+    }
+
+    #[test]
+    fn float_const_pool_cmp_folds_to_inline_const() {
+        let mut pool = pool_with(&[1.0_f64.to_bits(), 2.0_f64.to_bits()]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::LEF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut ops, &mut pool);
+        assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+        assert_eq!(pool.len(), 2, "cmp fold must not push pool bits");
+
+        let mut pool2 = pool_with(&[3.0_f64.to_bits(), 1.0_f64.to_bits()]);
+        let mut gtf = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::GTF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        algebraic_simplify(&mut gtf, &mut pool2);
+        assert!(matches!(gtf[0], IlOp::Const { imm: 1, .. }));
+    }
+
+    #[test]
+    fn float_const_pool_refuses_reassoc_across_non_const() {
+        // Load; ConstPool; ADDF must not fold even with a pool float nearby.
+        let mut pool = pool_with(&[1.5_f64.to_bits(), 2.5_f64.to_bits()]);
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let before_len = ops.len();
+        algebraic_simplify(&mut ops, &mut pool);
+        assert_eq!(ops.len(), before_len);
+        assert!(matches!(ops[0], IlOp::Load { .. }));
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                ..
+            }
+        ));
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn float_const_pool_add_via_optimize_pipeline() {
+        use super::super::opt::{OptimizeOptions, optimize};
+        let mut pool = pool_with(&[1.5_f64.to_bits(), 2.5_f64.to_bits()]);
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        optimize(
+            &mut ops,
+            &OptimizeOptions {
+                jump_thread: false,
+                dead_block: false,
+                stack_dce: false,
+                mem_fwd: false,
+                copy_prop: false,
+                slot_promote: false,
+                algebraic: true,
+                licm: false,
+                loop_bounds: false,
+                return_convoy: false,
+                clone_shared_return: false,
+                bin_join_convoy: false,
+                multi_op_join_convoy: false,
+                invert_guard_branch: false,
+                slot_promote_tell: false,
+            },
+            &mut pool,
+        );
+        assert!(matches!(ops[0], IlOp::ConstPool { idx: 2, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+        assert_eq!(pool[2], 4.0_f64.to_bits());
     }
 }

@@ -32,6 +32,11 @@ pub fn licm(ops: &mut Vec<IlOp>) {
         }
         hoisted = true;
     }
+    // Run after casts so invariant float exprs (e.g. mandelbrot `ci`) see
+    // already-hoisted `(y as float)` / `(size as float)` temps.
+    if licm_float_expression_chain(ops) {
+        return;
+    }
     if hoisted {
         return;
     }
@@ -267,6 +272,136 @@ fn licm_stack_producers(ops: &mut Vec<IlOp>) {
         // Indices invalidated; only one hoist per call — rebuild on next pass.
         break;
     }
+}
+
+/// Hoist a self-contained pure float expression and replace it with a reload.
+///
+/// Unlike the older single-producer path, the preheader materializes the chain
+/// into a temp slot, so the loop gets a fresh stack value on every iteration.
+fn licm_float_expression_chain(ops: &mut Vec<IlOp>) -> bool {
+    let info = sp::analyze(ops);
+    let mut loops = find_natural_loops(ops);
+    loops.sort_by_key(|loop_| std::cmp::Reverse(loop_.header));
+
+    for lp in loops {
+        if !info.sp_before(lp.header).is_known() || loop_has_barrier(ops, &lp) {
+            continue;
+        }
+        let stored = slots_stored_in_loop(ops, &lp);
+        for start in lp.body_start()..lp.latch {
+            let Some((end, chain)) = collect_float_chain(ops, start, lp.latch, &stored) else {
+                continue;
+            };
+            if chain.len() < 2 {
+                continue;
+            }
+            let temp = max_slot_used(ops).saturating_add(1);
+            if temp > u8::MAX as u32 {
+                continue;
+            }
+            let loc = chain[0].loc();
+            let mut materialize = chain;
+            materialize.push(IlOp::StorePop { slot: temp, loc });
+            ops.splice(
+                start..end,
+                std::iter::once(IlOp::Load { slot: temp, loc }),
+            );
+            let Some(lp2) = find_natural_loops(ops)
+                .into_iter()
+                .find(|candidate| candidate.header_label == lp.header_label)
+            else {
+                return false;
+            };
+            insert_preheader_ops(ops, &lp2, materialize);
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_float_chain(
+    ops: &[IlOp],
+    start: usize,
+    latch: usize,
+    stored: &HashSet<u32>,
+) -> Option<(usize, Vec<IlOp>)> {
+    let mut end = start;
+    let mut height = 0i32;
+    let mut has_float = false;
+    let mut chain = Vec::new();
+    // Prefer the longest source-ordered pure float chain that ends at height 1.
+    // Intermediate height==1 (e.g. after `2.0 * (y/size)`) must not cut short a
+    // following `CONST; SUBF` continuation.
+    let mut last_good: Option<(usize, Vec<IlOp>)> = None;
+    while end < latch {
+        let op = &ops[end];
+        let Some(instruction) = pure_float_chain_instruction(op, stored) else {
+            break;
+        };
+        let Some(byte) = op.as_encode_byte() else {
+            break;
+        };
+        let Some(delta) = sp::byte_stack_delta(instruction, &byte) else {
+            break;
+        };
+        height += delta;
+        // Chain-relative height must stay positive: a leading CastIntToFloat
+        // (no producer in-chain) or an under-arity binop is not a valid expr.
+        if height < 1 {
+            break;
+        }
+        has_float |= is_float_arith(instruction)
+            || instruction == Instruction::CastIntToFloat
+            || matches!(
+                instruction,
+                Instruction::BinSlotImm | Instruction::BinSlotSlot
+            );
+        chain.push(op.clone());
+        end += 1;
+        if height == 1 && has_float && chain.len() >= 2 {
+            last_good = Some((end, chain.clone()));
+        }
+    }
+    last_good
+}
+
+fn pure_float_chain_instruction(op: &IlOp, stored: &HashSet<u32>) -> Option<Instruction> {
+    let byte = op.as_encode_byte()?;
+    let instruction = *byte.bytecode();
+    match instruction {
+        Instruction::CONST | Instruction::CastIntToFloat | Instruction::NEGF => Some(instruction),
+        Instruction::LOAD => {
+            let slot = byte.load_store_single_slot()?;
+            (!stored.contains(&slot)).then_some(instruction)
+        }
+        Instruction::BinSlotImm => {
+            let (inner, slot, _) = byte.bin_slot_imm_parts();
+            is_float_arith(Instruction::from(inner))
+                .then_some(slot as u32)
+                .filter(|slot| !stored.contains(slot))
+                .map(|_| instruction)
+        }
+        Instruction::BinSlotSlot => {
+            let (inner, a, b) = byte.bin_slot_slot_parts();
+            (is_float_arith(Instruction::from(inner))
+                && !stored.contains(&(a as u32))
+                && !stored.contains(&(b as u32)))
+            .then_some(instruction)
+        }
+        inner if is_float_arith(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+fn is_float_arith(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::ADDF
+            | Instruction::SUBF
+            | Instruction::MULF
+            | Instruction::DIVF
+            | Instruction::MODF
+    )
 }
 
 /// Hoist repeated table-indexed `STRING` key literals out of GetField/SetField loops
@@ -631,7 +766,7 @@ pub(super) fn insert_preheader_ops(ops: &mut Vec<IlOp>, lp: &NaturalLoop, materi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::DebugLoc;
+    use common::{Byte, DebugLoc};
 
     fn loc() -> DebugLoc {
         DebugLoc::unknown()
@@ -1008,6 +1143,153 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, IlOp::BinSlotSlot { a: 1, b: 2, .. })),
             "invariant BinSlotSlot should hoist before header"
+        );
+    }
+
+    #[test]
+    fn hoists_pure_float_expression_chain_into_temp() {
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::SUBF)),
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::ADDF)),
+            IlOp::StorePop {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+
+        licm(&mut ops);
+
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        assert!(
+            ops[..header]
+                .iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "the pure chain should be materialized in the preheader"
+        );
+        assert!(
+            ops[header..]
+                .iter()
+                .any(|op| matches!(op, IlOp::Load { slot: 5, .. })),
+            "the loop should reload the hoisted chain result"
+        );
+        assert!(
+            !ops[header..]
+                .iter()
+                .any(|op| matches!(op, IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::SUBF)),
+            "the invariant chain should leave the loop body"
+        );
+    }
+
+    #[test]
+    fn hoists_multi_stage_float_chain_past_intermediate_height_one() {
+        // Mandelbrot-shaped `2.0 * (a/b) - 1.0`: height returns to 1 after MULF,
+        // then CONST; SUBF continues. The collector must keep the full chain.
+        let mut ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::BinSlotSlot {
+                op: Instruction::DIVF as u8,
+                a: 1,
+                b: 2,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::MULF)),
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::SUBF)),
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Halt { loc: loc() },
+        ];
+
+        licm(&mut ops);
+
+                let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .unwrap();
+        let pre = &ops[..header];
+        assert!(
+            pre.iter()
+                .any(|op| matches!(op, IlOp::Bin { op: Instruction::MULF, .. }))
+                && pre
+                    .iter()
+                    .any(|op| matches!(op, IlOp::Bin { op: Instruction::SUBF, .. }))
+                && pre.iter().any(|op| {
+                    matches!(
+                        op,
+                        IlOp::BinSlotSlot {
+                            op: o,
+                            a: 1,
+                            b: 2,
+                            ..
+                        } if *o == Instruction::DIVF as u8
+                    )
+                }),
+            "full multi-stage chain should materialize in the preheader"
+        );
+        assert!(
+            ops[header..]
+                .iter()
+                .any(|op| matches!(op, IlOp::Load { slot: 4, .. })),
+            "the loop should reload the hoisted chain result"
+        );
+        assert!(
+            !ops[header..].iter().any(|op| {
+                matches!(op, IlOp::Bin { op: Instruction::MULF | Instruction::SUBF, .. })
+                    || matches!(
+                        op,
+                        IlOp::BinSlotSlot {
+                            op: o,
+                            ..
+                        } if *o == Instruction::DIVF as u8
+                    )
+            }),
+            "no stage of the invariant chain should remain in the loop body"
         );
     }
 

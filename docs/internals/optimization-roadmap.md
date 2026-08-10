@@ -14,7 +14,7 @@ Run the repeatable matrix with:
 ```
 
 The script builds the release binary, checks each benchmark checksum, compares
-the four cross-language benchmarks against Lua and Node, runs the Coil-only
+the four cross-language benchmarks (plus restored `fib`) against Lua and Node, runs the Coil-only
 examples, and writes raw `poop` output plus metadata under
 `/tmp/coil_perf_matrix/`. Set `OUT_DIR` for another location, `DURATION_MS`
 for longer samples, or `RUN_MASSIF=1` to collect optional Valgrind Massif files.
@@ -28,6 +28,10 @@ The 2026-08-08 release baseline used precompiled Coil archives and 6-second
 | `tak` | 2.09 ms | 1.31 ms | 13.4 ms | recursive direct-call/frame overhead |
 | `nsieve` | 2.72 ms | 1.00 ms | 14.2 ms | array mutation, indexing, and bounds/object checks |
 | `binary_trees` | 12.9 ms | 9.24 ms | 15.2 ms | heap allocation and GC |
+
+Post–float-fusion soft baseline (`./scripts/poop_baseline.sh`, 2026-08-10):
+`mandelbrot` ~19.6 ms / 392M instructions, `tak` ~2.17 ms, `nsieve` ~2.73 ms,
+`binary_trees` ~12.4 ms (still directional; re-run `perf_matrix.sh` for cross-lang).
 
 Coil used about 5.9–7.4 MB RSS, Lua 2.7–3.2 MB, and Node 89–91 MB. These are
 directional comparisons rather than language rankings: the ports have
@@ -55,25 +59,57 @@ The repository also has Coil-only `numeric`, `operators_loop`, and `match_sum`
 benchmarks. Their current results are retained by the matrix, but they have no
 Lua or Node ports.
 
+## Recently landed (float AOT)
+
+Source-ordered float work on the interpreter path (no FMA / reassociation):
+
+- LICM: full invariant float expression chains (past intermediate height-1).
+- `FloatChainStore`: up to three stages; `BinSlotSlot` stage0; const-pool operands.
+- `BinSlotSlotConstJmpf`: float mag arith + pool compare + `JMPF`.
+- `NEGF` unary float negate.
+- Algebraic: exact `+0.0` / `+1.0` float identities; const-pool float binop fold.
+- Codegen: `new Class(args).field` scalar replacement (no temp instance).
+
+Next AOT priorities below remain the main gap vs Lua on `mandelbrot` /
+`tak` / `nsieve` / `binary_trees`.
+
 ## AOT priorities
 
 ### 1. Local slot promotion and SSA-like values
 
-Priority: high (first slice landed).
+Priority: highest. **Status: Phases 1–4 of register-win harvest landed**
+(`perf/register-wins-harvest`; docs ledger in § Opcode candidate ledger below).
 
 The shared operand/local stack still makes repeated `LOAD` / `STORE` traffic
-expensive. `gvn.rs` explicitly has no SSA slot rename, and the cursor-safe copy
-propagation in `opt/dce.rs` is intentionally straight-line.
+expensive. `gvn.rs` explicitly has no SSA slot rename, and the new
+cursor-safe copy propagation in `opt/dce.rs` is intentionally straight-line.
 
-`opt/slot_promote.rs` takes the first slice using `tell` as the safety proof: a
-`STORE t` reached with the cursor at `t + 1` is writing TOS back to its own
-address, and the reload run in front of a `TailCall` is re-pushing values the
-call already finds on the stack. Together those take argument-materialization
-temps out of the frame — `tak` went from 4 LOAD words / 9 slots / 3 STOREs to 3
-LOAD words / 6 slots / 0 STOREs. Joins are free: `tell` poisons a point whose
-predecessors disagree, so `Known` is agreement.
+**Landed (Phases 1–4, IL-only — no new opcodes):**
 
-What it does *not* do, and what the next slice needs (see
+- store-destination coalescing and peel-param raise (`opt/slot_promote.rs`);
+- copy-only latch elision when live-out / unique in-loop def allow;
+- Phase 4 fuse-feed audit: FCS / `BinSlotSlotConstJmpf` / packed peels held;
+  residual near-misses tallied in `perf_metrics` for the ledger.
+
+**Harvested without opcodes (shape inventory):**
+
+- `tak`: LOAD 11→7, STORE 7→3, `slot_move` 4→0 (coalesce + peel raise);
+- fuse windows intact across mandelbrot / tak / numeric / nsieve.
+
+Still deferred for a later SSA-like slice: overlapping live-range φ shuffles
+(mandelbrot `tr`→`zr`), full rename across disagreeing joins, and operand-stack
+retention across calls. Measure residual candidates against the ledger before
+appending opcodes.
+
+A second, narrower slice sits at the end of the pipeline: `slot_promote_at`
+uses `tell` as the whole safety proof — a `STORE t` reached with the cursor at
+`t + 1` writes TOS back to its own address, and the reload run in front of a
+`TailCall` re-pushes values the call already finds on the stack. Together those
+take argument-materialization temps out of the frame (`tak`: 4 LOAD words / 9
+slots / 3 STOREs → 3 LOAD words / 6 slots / 0 STOREs). Joins are free: `tell`
+poisons a point whose predecessors disagree, so `Known` is agreement.
+
+What neither slice does yet (see
 [limitations](limitations.md#il-optimizations-low) for the full refusal table):
 
 - **Real slot liveness.** Without it, promotion must leave every slot with a
@@ -163,18 +199,19 @@ JIT.
 
 ### 4. Direct-call and closure specialization
 
-Priority: medium (predicate peel landed; the recursive peel was measured and
-refused).
+Priority: medium. **Status: partial (B4 landed).** The caller-side predicate
+peel landed; the recursive peel was measured and refused.
 
-The compiler already has tiny direct-call inlining and monomorphization, but
-generic dictionaries and `CallIndirect` still carry runtime work. Extend
-specialization only when the target, arity, and evidence are statically known:
+Landed for monomorphic known targets:
 
-- devirtualize ground method and dictionary calls;
-- inline small monomorphic bodies with no host, FFI, coroutine, or dynamic
-  operations;
-- preserve the existing `CallIndirect` and generic fallback;
-- measure `tak` call count and frame traffic before and after.
+- ground trait / instance method sites emit direct `CALL` instead of
+  `CodePtr` + `CallIndirect` when the entry and arity are static;
+- self-recursive predicate peels (provisional body spans) so nested `tak`
+  calls skip base-case frames;
+- existing tiny direct-call inlining / monomorphization unchanged.
+
+Still use `CallIndirect` for PolyFn locals, dictionary `Index` targets, and
+generic shared-body evidence that is not static at the call site.
 
 `tak`'s frame traffic has been measured and is **not** worth peeling: a frame
 costs about two dispatches here, so the caller-side predicate peel loses to it
@@ -194,7 +231,31 @@ Priority: medium to low until measured.
 typed/fused opcodes. Larger universal superinstructions or short trace fusion
 should be considered only if they improve multiple benchmarks. Keep symbolic IL
 and the single `il::lower` pass as the source of truth; do not add an opcode
-for one benchmark shape.
+for one benchmark shape. Residual fuse near-misses after Phases 1–4 are scored
+in the opcode candidate ledger below — none are an unconditional **add**.
+
+## Opcode candidate ledger (register-win harvest Phase 5)
+
+Scored after IL opts on Phases 1–4. **Docs only — no new opcodes from this
+ledger until a candidate clears the gates.** Evidence is static shape inventory
+in `compiler/tests/perf_metrics.rs` plus estimated dynamic weight on hot
+benches. Append-only opcode rules still apply ([AGENTS.md](../../AGENTS.md)).
+
+**Gates for `add`:** residual dynamic weight still material after Phases 1–4;
+pattern universal (not a single-bench special); no safe IL rewrite exposes an
+existing opcode; fits append-only opcode ABI.
+
+| Family | Evidence (post Phases 1–4) | Est. dynamic weight | Recommendation | Rationale |
+|--------|----------------------------|---------------------|----------------|-----------|
+| `*Jmpt` counterparts (`CmpJmpt` / `BinSlot*Jmpt` / `BinSlotSlotConstJmpt` / …) | mandelbrot `would_be_jmpt_after_invert=1` (`BinSlotSlotConstJmpf`; `JMP`); bare `JMPT` only for non-fusable bools | ~1.28M/run (iter escape) | **needs more proof** | Invert intentionally refuses fused `*Jmpf` — would trade one fused dispatch for two. A true `*Jmpt` twin could collapse the escape `JMP`, but only if invert savings beat opcode + decode cost and the shape shows up beyond mandelbrot. Prefer measuring invert-with-`*Jmpt` prototype cost before appending. |
+| Cast spill → `FloatChainStore` | mandelbrot `float_chain_cast_blocked=1` (`cr`) | material in mandelbrot float body | **defer** (no opcode) | Codegen/temp spill of `CastIntToFloat` would expose existing `FloatChainStore`. Prefer IL/codegen fix over a cast-in-chain opcode. |
+| `FloatChain` 4-stage / wider | `float_chain_stage_cap_leftover=0` | — | **defer** | No truncation leftover on current benches; zero evidence for a wider opcode. |
+| `MoveSlot` / φ shuffle | mandelbrot `loop_carried_phi_shuffle=1` (`tr`→`zr`); IL opts refused overlapping live ranges | ~2.56M dispatches/run (LOAD+STORE latch) | **needs more proof** (or defer pending benches) | Largest residual dispatch count, but mandelbrot-heavy; tak/numeric/nsieve have 0 latch shuffles. Needs universality proof (more loop-carried programs) before an append-only `MoveSlot` / rename op. Overlapping ranges may still need SSA rename rather than a 1-op shuffle. |
+| Unchecked `Index` / `StoreIndex` | nsieve static Index=1 + StoreIndex=1 in hot loops | nsieve-dominant | **needs more proof** | Align with roadmap §2: diagnostics and bounds proofs first; opcode only after proof-only analysis shows a universal safe fast path. |
+| Unary slot / float `BinSlotImm` / packing holes | 0 on mandelbrot/tak/numeric/nsieve | — | **defer** | Zero evidence on the hot matrix. |
+| Slot move (non-latch) | numeric `slot_move` ≤3 (format/host temp) | low | **defer** | Not loop-carried; format-path noise, not a fuse candidate. |
+
+**Already harvested without opcodes:** see §1 (tak LOAD/STORE/`slot_move`; fuse windows held). Next opcode work should re-run `perf_metrics` inventories and only promote a ledger row that still passes the `add` gates.
 
 ### 6. Auto-par fork-site profitability
 

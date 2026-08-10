@@ -24,7 +24,7 @@ use common::{BUILTIN_CRYPTO_ERROR_VARIANTS, Value};
 
 use crate::crypto_hasher_state::{HasherAlg, ObjCryptoHasher};
 use crate::io::{alloc_result_err, alloc_result_ok, value_as_bytes, value_as_string};
-use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjTuple, Object};
+use crate::memory::{Heap, Member, ObjArray, ObjTuple, Object};
 
 /// Tag indices for [`CryptoError`](common::BUILTIN_CRYPTO_ERROR_ENUM).
 #[repr(u32)]
@@ -52,8 +52,7 @@ pub fn alloc_crypto_error(heap: &mut Heap, tag: CryptoErrorTag) -> Value {
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 pub fn alloc_bytes(heap: &mut Heap, bytes: &[u8]) -> Value {

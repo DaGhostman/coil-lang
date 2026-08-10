@@ -1083,6 +1083,102 @@
     }
 
     #[test]
+    fn stack_dce_drops_discarded_enum_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 2,
+                loc,
+            },
+            IlOp::Pop { loc },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_unwraps_unary_enum_without_heap_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 1,
+                loc,
+            },
+            IlOp::byte(Byte::new(Instruction::Unpack).with_operand_u32(1)),
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_reads_unary_enum_field_without_heap_construction() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 3,
+                arity: 1,
+                loc,
+            },
+            IlOp::LoadField { index: 0, loc },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(ops[1], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn stack_dce_threads_direct_constructor_match() {
+        let loc = common::DebugLoc::unknown();
+        let target = crate::il::op::Label(7);
+        let mut ops = vec![
+            IlOp::Const { imm: 42, loc },
+            IlOp::MakeEnum {
+                tag: 1,
+                arity: 1,
+                loc,
+            },
+            IlOp::Jump {
+                kind: crate::il::op::IlJumpKind::JumpIfMatch { tag: 1, arity: 1 },
+                target,
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+
+        stack_dce(&mut ops);
+
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0], IlOp::Const { imm: 42, .. }));
+        assert!(matches!(
+            ops[1],
+            IlOp::Jump {
+                kind: crate::il::op::IlJumpKind::Unconditional,
+                target: crate::il::op::Label(7),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn mem_fwd_store_pop_load_becomes_dup_store() {
         // Need height before StorePop > slot+1 (cursor-safe Dup;Store).
         let loc = common::DebugLoc::unknown();
@@ -1234,6 +1330,33 @@
     }
 
     #[test]
+    fn copy_prop_forwards_bin_slot_slot_producer() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotSlot {
+                op: Instruction::ADD as u8,
+                a: 0,
+                b: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        copy_prop(&mut ops, 3);
+
+        assert!(matches!(
+            ops[2],
+            IlOp::BinSlotSlot {
+                a: 0,
+                b: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn copy_prop_forwards_string_producer_and_drops_copy_store() {
         let loc = common::DebugLoc::unknown();
         let mut ops = vec![
@@ -1259,6 +1382,26 @@
                 op: Instruction::ADD as u8,
                 slot: 0,
                 imm: 1,
+                loc,
+            },
+            IlOp::StorePop { slot: 2, loc },
+            IlOp::Return { loc },
+        ];
+
+        dead_store_at(&mut ops, 3);
+
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], IlOp::Return { .. }));
+    }
+
+    #[test]
+    fn dead_store_removes_unused_bin_slot_slot_producer_when_cursor_allows() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::BinSlotSlot {
+                op: Instruction::SUB as u8,
+                a: 0,
+                b: 1,
                 loc,
             },
             IlOp::StorePop { slot: 2, loc },
@@ -1496,16 +1639,19 @@
                 stack_dce: false,
                 mem_fwd: true,
                 copy_prop: true,
+                slot_promote: false,
                 algebraic: false,
                 licm: false,
+                loop_bounds: false,
                 return_convoy: false,
                 clone_shared_return: false,
                 bin_join_convoy: false,
                 multi_op_join_convoy: false,
                 invert_guard_branch: false,
-                slot_promote: false,
+                slot_promote_tell: false,
             },
             3,
+            &mut Vec::new(),
         );
         assert!(!ops.iter().any(|op| matches!(op, IlOp::StorePop { .. })));
         assert!(!ops.iter().any(|op| matches!(op, IlOp::Load { .. })));
@@ -3108,7 +3254,7 @@
             },
         ];
         let funcs = vec![crate::il::IlFunc::new("f", None, 2, 6)];
-        optimize_per_func(&mut ops, &funcs, &OptimizeOptions::default());
+        optimize_per_func(&mut ops, &funcs, &OptimizeOptions::default(), &mut Vec::new());
 
         assert!(
             matches!(ops[0], IlOp::Dup { .. }) && matches!(ops[1], IlOp::Pop { .. }),

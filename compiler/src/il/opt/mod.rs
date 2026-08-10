@@ -17,10 +17,14 @@ pub struct OptimizeOptions {
     pub mem_fwd: bool,
     /// Forward pure producer copies through cursor-safe straight-line regions.
     pub copy_prop: bool,
+    /// Promote slots to virtual values (straight-line + same-def joins).
+    pub slot_promote: bool,
     /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
     pub algebraic: bool,
     /// Hoist invariant Const/Load out of Known-SP natural loops.
     pub licm: bool,
+    /// Counted-loop ArrayLen hoist + Index/StoreIndex bounds proofs.
+    pub loop_bounds: bool,
     /// Sink identical `LOAD`/`CONST` producers into a join `RETURN` and fuse.
     pub return_convoy: bool,
     /// Clone plain `RETURN` onto jump-only preds of mixed return joins.
@@ -32,8 +36,8 @@ pub struct OptimizeOptions {
     /// `JMPF A; JMP B; A:` → `JMPT B` for non-fusable guard conditions.
     pub invert_guard_branch: bool,
     /// Drop `LOAD`/`STORE` the shared cursor proves redundant, promoting the
-    /// slot out of the frame.
-    pub slot_promote: bool,
+    /// slot out of the frame. Runs last, after every slot-tracking pass.
+    pub slot_promote_tell: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -44,25 +48,30 @@ impl Default for OptimizeOptions {
             stack_dce: true,
             mem_fwd: true,
             copy_prop: true,
+            slot_promote: true,
             algebraic: true,
             licm: true,
+            loop_bounds: true,
             return_convoy: true,
             clone_shared_return: true,
             bin_join_convoy: true,
             multi_op_join_convoy: true,
             invert_guard_branch: true,
-            slot_promote: true,
+            slot_promote_tell: true,
         }
     }
 }
 
 /// Run IL opts in place. Safe to call before [`super::lower`].
-pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions) {
-    optimize_at(ops, opts, 0);
+///
+/// Pass the const pool when available so algebraic float peeps can read
+/// `ConstPool` bits and push folded IEEE results; an empty vec disables those.
+pub fn optimize(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, pool: &mut Vec<u64>) {
+    optimize_at(ops, opts, 0, pool);
 }
 
 /// Like [`optimize`], seeding SP analysis at `entry_sp` for the op buffer.
-pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
+pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, pool: &mut Vec<u64>) {
     if opts.jump_thread {
         jump_thread(ops);
     }
@@ -83,12 +92,20 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
         dead_store_at(ops, entry_tell);
     }
     if opts.algebraic {
-        super::algebraic::algebraic_simplify(ops);
+        super::algebraic::algebraic_simplify(ops, pool);
     }
     if opts.licm {
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.
         let _ = entry_sp;
         super::licm::licm(ops);
+    }
+    if opts.loop_bounds {
+        super::bounds::loop_bounds(ops);
+    }
+    // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
+    if opts.slot_promote {
+        slot_promote(ops, entry_tell);
+        dead_store_at(ops, entry_tell);
     }
     if opts.clone_shared_return {
         clone_shared_return(ops);
@@ -108,7 +125,7 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
     }
     // After every slot-tracking pass: promotion leaves a slot defined only by
     // the push that lands on it, which earlier passes would not see.
-    if opts.slot_promote {
+    if opts.slot_promote_tell {
         slot_promote_at(ops, entry_tell);
     }
 }
@@ -124,14 +141,19 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32) {
 /// Whole-buffer [`multi_op_join_convoy`] is required: scoped multi_op can treat
 /// JMPF/fall-through diamonds as SP-known and mis-sink (e.g. `examples/fib.hy`).
 #[allow(dead_code)]
-pub fn optimize_per_func(ops: &mut Vec<IlOp>, funcs: &[super::IlFunc], opts: &OptimizeOptions) {
+pub fn optimize_per_func(
+    ops: &mut Vec<IlOp>,
+    funcs: &[super::IlFunc],
+    opts: &OptimizeOptions,
+    pool: &mut Vec<u64>,
+) {
     if funcs.is_empty() {
-        optimize(ops, opts);
+        optimize(ops, opts, pool);
         return;
     }
 
     let mut module = super::IlModule::from_flat(ops, funcs);
-    *ops = module.optimize_and_flatten(opts);
+    *ops = module.optimize_and_flatten(opts, pool);
 }
 
 /// Map inclusive-exclusive emitting indices to a raw op range, including
@@ -178,6 +200,7 @@ mod slot_promote;
 use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};
 use dce::{copy_prop, dead_store_at, mem_fwd, stack_dce};
 use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
+use slot_promote::slot_promote;
 pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;
 pub(crate) use slot_promote::slot_promote_at;

@@ -796,6 +796,12 @@ pub struct Compiler {
     /// Qualified names of `async fn` declarations (emit `MakeCoro` at call sites).
     coroutine_fns: std::collections::HashSet<String>,
 
+    /// Memoized pair-ABI verdicts, keyed by the name codegen looks a function up
+    /// by. The type env fills in as bodies are compiled, so an unmemoized query
+    /// can answer differently for a body and for a later caller — see
+    /// [`Compiler::pair_return_kind`].
+    pair_return_kinds: std::cell::RefCell<HashMap<String, Option<bool>>>,
+
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
 
@@ -849,6 +855,24 @@ pub struct Compiler {
     /// True while compiling a function whose return type is inferred
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
+
+    /// Force ground pointer-niche `Option` expressions back to heap enums
+    /// while using legacy pattern lowering or an unknown boundary.
+    force_heap_option: bool,
+    /// Force a contextually typed `Option::None` / `Option::Some` onto the
+    /// pointer-niche path when its constructor node has no standalone type.
+    force_niche_option: bool,
+
+    /// Emit and consume the two-slot `[payload, tag]` ABI for a unary
+    /// `Option`/`Result` return while compiling a statically known function.
+    compiling_pair_mode: bool,
+    /// Whether [`Self::compiling_pair_mode`]'s return is an `Option` (tag 0 is
+    /// then payload-less `None`). Travels in the `ReturnPair` operand so a host
+    /// entry can re-box the pair.
+    compiling_pair_is_option: bool,
+    /// The current expression is allowed to remain in the pair ABI instead of
+    /// being materialized back into a heap enum.
+    pair_value_context: bool,
 
     /// Harness metadata: `(description, bytecode offset)` for each
     /// top-level `test("…") { … }` case, in source order.
@@ -968,6 +992,12 @@ impl Default for Compiler {
             active_fn_name: None,
             compiling_method: false,
             compiling_result_mode: false,
+            force_heap_option: false,
+            force_niche_option: false,
+            compiling_pair_mode: false,
+            compiling_pair_is_option: false,
+            pair_return_kinds: std::cell::RefCell::new(HashMap::new()),
+            pair_value_context: false,
             test_cases: Vec::new(),
             user_main_defined: false,
             include_tests: false,
