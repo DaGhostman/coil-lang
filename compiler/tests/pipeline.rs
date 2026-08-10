@@ -4074,6 +4074,9 @@ fn main() {
 }
 
 /// A `SelfCall` combine rebuilds the outer N-ary call from the joined arms.
+///
+/// `tak(24, 22, 20)` looks big but is 53 calls — the work score refuses it, so
+/// this uses a load whose tree is genuinely deep.
 #[test]
 fn auto_par_self_call_combine_emits_spec() {
     let src = r#"
@@ -4087,7 +4090,7 @@ fn tak(int a, int b, int c) -> int {
     return tak(tak(a - 1, b, c), tak(b - 1, c, a), tak(c - 1, a, b));
 }
 fn main() {
-    write(stdout(), to_bytes(format("%i", tak(24, 22, 20))));
+    write(stdout(), to_bytes(format("%i", tak(21, 12, 6))));
 }
 "#;
     let mut pipeline = Pipeline::new();
@@ -4095,13 +4098,45 @@ fn main() {
         .compile_src(src)
         .expect("auto-par self-call should compile");
     assert!(
+        pipeline.function_offset("__coil_par_tak_21_12_6").is_some(),
+        "expected a multi-arg specialization for tak(21, 12, 6)"
+    );
+    assert!(
         pipeline
             .function_offset("__coil_par_tak_24_22_20")
-            .is_some(),
-        "expected a multi-arg specialization for tak(24, 22, 20)"
+            .is_none(),
+        "a narrow x - y gap must not specialize"
     );
     let output = run_bytecode(bytecode, constants, &pipeline, None);
-    assert_eq!(output, "21");
+    assert_eq!(output, "12");
+}
+
+/// The fair `tak(18, 12, 6)` benchmark load scores just under the threshold, so
+/// it must keep running on the sequential original.
+#[test]
+fn auto_par_fair_tak_load_stays_sequential() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(4096)]
+fn tak(int a, int b, int c) -> int {
+    if b >= a {
+        return c;
+    }
+    return tak(tak(a - 1, b, c), tak(b - 1, c, a), tak(c - 1, a, b));
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", tak(18, 12, 6))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("fair tak should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_tak_18_12_6").is_none(),
+        "fair tak(18, 12, 6) must not get a parallel specialization"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "7");
 }
 
 /// Impure recursive binops must not grow `__coil_par_*` clones.
@@ -4132,9 +4167,41 @@ fn main() {
     );
 }
 
-/// Independent pure helper arms (not self-recursion) still fork-join.
+/// Independent pure helper arms (not self-recursion) still fork-join — the
+/// arms' own subtrees are what the work score charges the site for.
 #[test]
 fn auto_par_pure_helper_arms_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn pair_fib(int n) -> int {
+    if n <= 0 { return 0; }
+    return fib(n) + fib(n - 1);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", pair_fib(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("helper-arm IPA should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_pair_fib_22").is_some(),
+        "expected a specialization for pair_fib(22)"
+    );
+    // fib(22) + fib(21)
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "28657");
+}
+
+/// Trivial helper arms are cheaper than a spawn, so they stay sequential.
+#[test]
+fn auto_par_trivial_helper_arms_stay_sequential() {
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -4152,10 +4219,10 @@ fn main() {
     let mut pipeline = Pipeline::new();
     let (bytecode, constants) = pipeline
         .compile_src(src)
-        .expect("helper-arm IPA should compile");
+        .expect("trivial helper arms should compile");
     assert!(
-        pipeline.function_offset("__coil_par_pair_sq_22").is_some(),
-        "expected a specialization for pair_sq(22)"
+        pipeline.function_offset("__coil_par_pair_sq_22").is_none(),
+        "two multiplies must not buy a spawn"
     );
     // 22² + 21²
     let output = run_bytecode(bytecode, constants, &pipeline, None);
