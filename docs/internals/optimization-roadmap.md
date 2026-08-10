@@ -33,6 +33,24 @@ Coil used about 5.9–7.4 MB RSS, Lua 2.7–3.2 MB, and Node 89–91 MB. These a
 directional comparisons rather than language rankings: the ports have
 different runtime startup, library, and allocation behavior.
 
+After the AOT harvest below (slot promotion, the counted-loop length proofs, the
+aggregate builders, the argument-spill peel), a 3-second re-run of the same
+matrix reads:
+
+| Benchmark | Coil | Lua | Node |
+|-----------|------|-----|------|
+| `mandelbrot` | 31.1 ms | 14.8 ms | 15.7 ms |
+| `tak` | 1.92 ms | 1.33 ms | 12.9 ms |
+| `nsieve` | 2.52 ms | 0.98 ms | 14.0 ms |
+| `binary_trees` | 12.3 ms | 9.18 ms | 15.1 ms |
+
+Every checksum matched and no benchmark regressed. The matrix runs each
+cross-language row twice — once with `COIL_AUTO_PAR=0` and once with auto-par at
+its default — and the two rows are now indistinguishable within noise on all
+four, because under the work score of item 6 none of these loads has a fork site
+that scores above the threshold. That is the intended reading: fair sequential
+benchmarks pay nothing for auto-par being compiled in.
+
 The repository also has Coil-only `numeric`, `operators_loop`, and `match_sum`
 benchmarks. Their current results are retained by the matrix, but they have no
 Lua or Node ports.
@@ -110,25 +128,43 @@ What is still open (full refusal table in
 
 ### 3. Allocation and GC fast paths
 
-Priority: high for heap-heavy code.
+Priority: high for heap-heavy code (aggregate builders inspected; the win is in
+the allocator, not the copy).
 
-`MakeTuple` and `MakeArray` currently collect stack values into a temporary
-`Vec<Value>` before allocating the managed object. Profile
-`machine/src/memory/heap.rs` and the aggregate handlers before changing
-ownership:
+The premise this item started from was wrong. `MakeTuple` / `MakeArray` do not
+collect into a *temporary* `Vec<Value>`: `ObjTuple`/`ObjArray` take that vector
+by value (`elements`), as `ObjEnum` does with `payload`, so the collect already
+*is* the object's payload. There was no second allocation to remove, and the one
+that remains cannot be dropped by a fixed-arity fast path — only by giving
+aggregates inline element storage, which is a layout change.
 
-- add allocation and collection counters under `vm_profile`;
-- measure temporary vector allocations and live bytes;
-- evaluate direct payload construction or a small fixed-arity fast path;
-- keep GC rooting correct before and after allocation;
-- consider region/batch allocation only after object lifetime boundaries are
-  explicit.
+What the pass over the handlers did change is the shape of the copy. Elements
+already sit contiguously in declaration order on the operand stack, so
+`Stack::top_window` lets a builder borrow its whole argument window:
+`MakeTuple`/`MakeArray` take it in one `to_vec` memcpy instead of a pop loop
+plus a reverse, and `MakeEnum` classifies the window top-first through an
+exact-size collect. Same opcodes, layouts, element order and GC rooting. This
+measured **performance-neutral** on `binary_trees` — within `poop` noise — which
+is the useful result: aggregate construction is not copy-bound.
 
-This is the most direct path for `binary_trees`; it is independent of a JIT.
+The remaining cost per object is in `Heap::alloc` itself, and it is structural:
+
+- one `Box::new(GcData::new(..))` per object, on top of the payload vector;
+- one `addr_index` insert per allocation and one removal per sweep, because
+  `find_object_by_addr` is a hash lookup keyed by raw address;
+- `alloc_bytes` versus `gc_next_threshold` as the only collection trigger.
+
+So the next slice is the allocator and the address index — arena/region backing
+for `GcData`, or a cheaper object-identity scheme than a per-address hash — not
+the aggregate opcodes. Keep GC rooting correct before and after allocation, and
+consider batch allocation only once object lifetime boundaries are explicit.
+This remains the most direct path for `binary_trees` and is independent of a
+JIT.
 
 ### 4. Direct-call and closure specialization
 
-Priority: medium.
+Priority: medium (predicate peel landed; the recursive peel was measured and
+refused).
 
 The compiler already has tiny direct-call inlining and monomorphization, but
 generic dictionaries and `CallIndirect` still carry runtime work. Extend
@@ -143,10 +179,12 @@ specialization only when the target, arity, and evidence are statically known:
 `tak`'s frame traffic has been measured and is **not** worth peeling: a frame
 costs about two dispatches here, so the caller-side predicate peel loses to it
 (+73.5% VM instructions on `tak`). The peel now only removes argument spills,
-which is a win wherever it already fired. See `limitations.md` for the cost
-model. Further `tak` work has to remove the call itself — real inlining of a
-recursive body, or a frame representation cheaper than `CALL` — not move the
-guard.
+which is a win wherever it already fired: arguments that compile to a single
+pure byte are re-materialized in the guard instead of spilled, worth 4.28G →
+3.29G instructions and 189 ms → 152 ms on a peel-heavy loop. See
+`limitations.md` for the cost model and the full refusal table. Further `tak`
+work has to remove the call itself — real inlining of a recursive body, or a
+frame representation cheaper than `CALL` — not move the guard.
 
 ### 5. Dispatch and trace fusion
 
@@ -157,6 +195,29 @@ typed/fused opcodes. Larger universal superinstructions or short trace fusion
 should be considered only if they improve multiple benchmarks. Keep symbolic IL
 and the single `il::lower` pass as the source of truth; do not add an opcode
 for one benchmark shape.
+
+### 6. Auto-par fork-site profitability
+
+Priority: landed; the cutoff itself is unchanged.
+
+IPA specialization used to gate on `max(args)`, which reads argument
+*magnitude* as work. `par_profit.rs` now scores a fork site by counting the
+guard-pruned fork-site nodes a concrete arg vector reaches, then converts that
+count back into fib-equivalent units, so `COIL_PAR_THRESHOLD` keeps its
+calibration and the default stayed at **20**. What changed is only the verdict
+on shapes that are not fib-shaped: `tak(24, 22, 20)` (53 real calls) now
+refuses, and the fair `tak(18, 12, 6)` bench load lands exactly on the cutoff
+and stays sequential. Every imprecision resolves downwards, so unknown
+structure can only refuse. Full formula and verdict table in
+[auto-par](auto-par.md#the-work-score).
+
+The work cost is compile-time and bounded by construction: the walk is memoized
+per `(fn, arg vector)`, capped at 256 levels deep and 2^14 memo entries, and
+saturates one node past the cutoff — counting further cannot change the answer.
+The specialization closure on top of it is breadth-first and capped at 64
+clones per function. Nothing runs at execution time, and below-threshold or
+dynamic arg sites stay on the sequential original, so there is no hot-path
+threshold tax.
 
 ## Cranelift JIT feasibility
 
