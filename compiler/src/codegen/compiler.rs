@@ -1406,8 +1406,8 @@ impl Compiler {
         true
     }
 
-    /// Opening shape: `cond…; JumpIfFalse; (Const|Load) [; Return]; Label? …`
-    /// with an imm/slot base return. `arity_hint` is 1 + max slot referenced.
+    /// Opening shape: `cond…; JumpIfFalse; (Const|Load); Return; …` with an
+    /// imm/slot base return. `arity_hint` is 1 + max slot referenced.
     fn match_predicate_peel_shape(ops: &[IlOp]) -> Option<PredicatePeel> {
         // Skip leading labels.
         let mut i = 0usize;
@@ -1545,24 +1545,17 @@ impl Compiler {
                     }
                 }
             };
-            let mut end = then_start;
-            if then_start + 1 < ops.len() && ops[then_start + 1].is_plain_return() {
-                end = then_start + 1;
-            } else if then_start + 1 < ops.len() && matches!(ops[then_start + 1], IlOp::Label(_)) {
-                // fall through after value (unusual); still ok if JMPF target
-            } else if then_start + 1 < ops.len()
-                && !matches!(ops[then_start + 1], IlOp::Label(_))
-                && !ops[then_start + 1].is_plain_return()
-            {
+            // The value must be returned, not fall through: a peel replaces the
+            // callee's `return`, so a bare value would be the wrong result.
+            if then_start + 1 >= ops.len() || !ops[then_start + 1].is_plain_return() {
                 return None;
             }
-            (v, end)
+            (v, then_start + 1)
         };
         // After then-arm there should be more body (otherwise tiny-inline diamond
         // would have taken it). Require at least one emitting op past the peel.
         let after = then_end + 1;
-        let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
-        if !has_rest {
+        if !ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_))) {
             return None;
         }
         let mut arity_hint = 0usize;

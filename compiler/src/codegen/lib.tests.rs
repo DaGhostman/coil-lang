@@ -2688,6 +2688,65 @@ fn main() {
         );
     }
 
+    /// The peel replaces the callee's `return`, so a matched base-case value must
+    /// actually be returned — a bare value falling through is not a base case.
+    #[test]
+    fn predicate_peel_shape_requires_returned_base_value() {
+        let mut buf = CodeBuf::default();
+        let target = buf.fresh_label();
+        let guard = |tail: Vec<IlOp>| {
+            let mut ops = vec![
+                IlOp::Load {
+                    slot: 0,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Const {
+                    imm: 0,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Bin {
+                    op: Instruction::LE,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    target,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Load {
+                    slot: 1,
+                    loc: DebugLoc::unknown(),
+                },
+            ];
+            ops.extend(tail);
+            ops
+        };
+        let returned = guard(vec![
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+        ]);
+        assert!(
+            Compiler::match_predicate_peel_shape(&returned).is_some(),
+            "cond + JMPF + value + RETURN is a peelable base case"
+        );
+        let falls_through = guard(vec![
+            IlOp::Label(target),
+            IlOp::Load {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+        ]);
+        assert!(
+            Compiler::match_predicate_peel_shape(&falls_through).is_none(),
+            "a base-case value that is not returned must not be peeled"
+        );
+    }
+
     /// Codegen test 25 : two `let` bindings in the same
     /// scope emit two `STORE_POP`s — one per binding, with
     /// distinct slot operands (0 and 1).
