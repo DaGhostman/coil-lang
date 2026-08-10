@@ -885,10 +885,10 @@ pub struct Compiler {
 
     /// Self-recursive pure function names eligible for auto fork-join.
     recursive_pure: HashSet<String>,
-    /// Detected `f(n-a) ⊕ f(n-b)` shapes for recursive-pure fns.
-    par_shapes: HashMap<String, crate::typechecking::RecParShape>,
-    /// Concrete int args requiring `__coil_par_*` specializations.
-    par_spec_args: HashMap<String, BTreeSet<i64>>,
+    /// Detected independent-parallel-arm fork sites for recursive-pure fns.
+    par_shapes: HashMap<String, crate::typechecking::ParForkSite>,
+    /// Concrete arg vectors requiring `__coil_par_*` specializations.
+    par_spec_args: HashMap<String, BTreeSet<Vec<i64>>>,
 
     /// Operand-stack capacity for the VM (from recursion-depth analysis).
     operand_stack_slots: u32,

@@ -25,9 +25,20 @@ Disable the transform with `COIL_AUTO_PAR=0` (or `false` / `off` / `no`).
 
 ## Static profitability (no runtime threshold checks)
 
-[`par_profit`](../../compiler/src/typechecking/par_profit.rs) detects the unary
-shape `f(n - a) ⊕ f(n - b)` on recursive-pure functions and collects **constant**
-call-site arguments (`fib(32)`, …).
+[`par_profit`](../../compiler/src/typechecking/par_profit.rs) detects **fork
+sites** on recursive-pure functions — expressions whose operands are two or more
+independent self-calls — and collects **constant** call-site arguments
+(`fib(32)`, …). Three combine shapes are recognized:
+
+| Combine | Source shape |
+|---|---|
+| `BinOp` | `f(n - a) ⊕ f(n - b)` |
+| `EnumCtor` | `E::V(f(…), f(…))` |
+| `SelfCall` | `f(f(…), f(…), f(…))` (tak-style) |
+
+Arms are described structurally (`ArgForm::Const` / `Param` / `ParamMinus`), so
+any arity works and child arg vectors are derived statically. Codegen currently
+lowers only the unary `BinOp` case.
 
 For each demanded `N > COIL_PAR_THRESHOLD` (default **20**), codegen emits a
 nullary specialization `__coil_par_{f}_{N}` that **always** forks:

@@ -7,6 +7,42 @@ type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
 #[cfg(not(any(test, feature = "dissect")))]
 type FinalizeIlOut = ();
 
+/// Unary `f(n - a) ⊕ f(n - b)` view of a [`ParForkSite`].
+///
+/// The current specialization emitter only handles this narrow case; other
+/// combines (enum constructor, self-call rebuild) are detected but not yet
+/// lowered.
+struct UnaryBinFork {
+    fn_name: String,
+    left_sub: i64,
+    right_sub: i64,
+    op: crate::typechecking::ParBinOp,
+}
+
+impl UnaryBinFork {
+    fn from_site(site: &crate::typechecking::ParForkSite) -> Option<Self> {
+        use crate::typechecking::{ArgForm, ParArm, ParCombine};
+        let ParCombine::BinOp(op) = site.combine else {
+            return None;
+        };
+        if site.param_count != 1 || site.arms.len() != 2 {
+            return None;
+        }
+        let sub_of = |arm: &ParArm| match arm {
+            ParArm::SelfCall { args } => match args.as_slice() {
+                [ArgForm::ParamMinus { param: 0, sub }] => Some(*sub),
+                _ => None,
+            },
+        };
+        Some(Self {
+            fn_name: site.fn_name.clone(),
+            left_sub: sub_of(&site.arms[0])?,
+            right_sub: sub_of(&site.arms[1])?,
+            op,
+        })
+    }
+}
+
 impl Compiler {
     /// Expose inferred state to language tooling after a module is checked.
     pub fn checker(&self) -> &crate::typechecking::Checker {
@@ -4690,11 +4726,11 @@ impl Compiler {
         let Expression::Integer(n) = unwrap_expr_output(&args[0]).1.as_ref() else {
             return false;
         };
-        if !crate::typechecking::const_arg_worth_parallel(*n) {
+        if !crate::typechecking::const_args_worth_parallel(&[*n]) {
             return false;
         }
         let key = Self::par_shape_key(fname);
-        let spec = crate::typechecking::par_specialization_name(key, *n);
+        let spec = crate::typechecking::par_specialization_name(key, &[*n]);
         let Some(&offset) = self.functions.get(&spec) else {
             return false;
         };
@@ -4708,8 +4744,11 @@ impl Compiler {
         bare_name: &str,
         table_key: &str,
     ) {
-        let Some(shape) = self.par_shapes.get(bare_name).cloned() else {
+        let Some(site) = self.par_shapes.get(bare_name) else {
             return;
+        };
+        let Some(shape) = UnaryBinFork::from_site(site) else {
+            return; // multi-arg / ctor / self-call combines land in a later phase
         };
         let Some(ns) = self.par_spec_args.get(bare_name).cloned() else {
             return;
@@ -4721,13 +4760,16 @@ impl Compiler {
         else {
             return;
         };
-        let thresh = crate::typechecking::par_int_threshold();
+        let thresh = crate::typechecking::par_cost_threshold();
         let bin_op = match shape.op {
             crate::typechecking::ParBinOp::Add => Instruction::ADD,
             crate::typechecking::ParBinOp::Sub => Instruction::SUB,
             crate::typechecking::ParBinOp::Mul => Instruction::MUL,
         };
-        for n in ns {
+        for args in ns {
+            let [n] = args[..] else {
+                continue;
+            };
             self.emit_one_par_specialization(
                 &shape,
                 n,
@@ -4740,13 +4782,13 @@ impl Compiler {
 
     fn emit_one_par_specialization(
         &mut self,
-        shape: &crate::typechecking::RecParShape,
+        shape: &UnaryBinFork,
         n: i64,
         orig_offset: u32,
         thresh: i64,
         bin_op: Instruction,
     ) {
-        let spec_name = crate::typechecking::par_specialization_name(&shape.fn_name, n);
+        let spec_name = crate::typechecking::par_specialization_name(&shape.fn_name, &[n]);
         if self.functions.contains_key(&spec_name) {
             return;
         }
@@ -4858,13 +4900,13 @@ impl Compiler {
     /// Callable for one recursive arm: `(entry, arity, needs_int_arg)`.
     fn par_arm_callable(
         &self,
-        shape: &crate::typechecking::RecParShape,
+        shape: &UnaryBinFork,
         child_n: i64,
         orig_offset: u32,
         thresh: i64,
     ) -> (u32, u32, bool) {
         if child_n > thresh {
-            let spec = crate::typechecking::par_specialization_name(&shape.fn_name, child_n);
+            let spec = crate::typechecking::par_specialization_name(&shape.fn_name, &[child_n]);
             if let Some(&off) = self.functions.get(&spec) {
                 return (off as u32, 0, false);
             }
@@ -4874,7 +4916,7 @@ impl Compiler {
 
     fn emit_par_arm_call(
         &mut self,
-        shape: &crate::typechecking::RecParShape,
+        shape: &UnaryBinFork,
         child_n: i64,
         orig_offset: u32,
         thresh: i64,
@@ -12556,7 +12598,7 @@ impl Compiler {
         };
         if auto_par_enabled() && !self.recursive_pure.is_empty() {
             self.par_shapes =
-                crate::typechecking::analyze_rec_par_shapes(ast, &self.recursive_pure);
+                crate::typechecking::analyze_par_fork_sites(ast, &self.recursive_pure);
             self.par_spec_args =
                 crate::typechecking::collect_par_specialization_args(ast, &self.par_shapes);
         } else {

@@ -1,18 +1,21 @@
-//! Static profitability for auto-parallel recursion (no runtime threshold checks).
+//! Static shape + profitability analysis for Independent Parallel Arms (IPA).
 //!
-//! Detects unary recursive-pure shapes `f(n-a) ⊕ f(n-b)` and decides whether a
-//! concrete int argument is worth forking. Call sites with constant args above
-//! [`par_int_threshold`] are rewritten to specialized nullary clones that always
-//! fork (fully static).
+//! A *fork site* is an expression whose operands are two or more mutually
+//! independent self-calls: `f(a) ⊕ f(b)`, `E::V(f(a), f(b))`, or the tak-style
+//! `f(f(a), f(b), f(c))`. Arms are described structurally ([`ArgForm`]) rather
+//! than by function allowlists, so any arity and any combine shape below is
+//! recognized. Call sites with constant args above [`par_cost_threshold`] are
+//! rewritten to specialized nullary clones that always fork (fully static, no
+//! runtime threshold checks).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use parser::ast::{Expression, Output};
+use parser::ast::{EnumConstructPayload, Expression, Output};
 
 use super::purity::RecursivePureSet;
 
 /// Compile-time fork threshold (`COIL_PAR_THRESHOLD`, default 20).
-pub fn par_int_threshold() -> i64 {
+pub fn par_cost_threshold() -> i64 {
     static T: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         std::env::var("COIL_PAR_THRESHOLD")
@@ -22,7 +25,7 @@ pub fn par_int_threshold() -> i64 {
     })
 }
 
-/// Binary op used at the recursive fork site.
+/// Binary op used at a [`ParCombine::BinOp`] fork site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParBinOp {
     Add,
@@ -30,268 +33,408 @@ pub enum ParBinOp {
     Mul,
 }
 
-/// Unary recursive-pure function with `f(n - left) ⊕ f(n - right)` shape.
-#[derive(Debug, Clone)]
-pub struct RecParShape {
+/// One argument of a self-call arm, expressed in terms of the enclosing
+/// function's parameters so child arg vectors can be derived statically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ArgForm {
+    /// Literal integer.
+    Const(i64),
+    /// Parameter forwarded unchanged (`x`).
+    Param(usize),
+    /// `param - sub` with `sub > 0`; requires an int-like parameter.
+    ParamMinus { param: usize, sub: i64 },
+}
+
+/// One independent arm of a fork site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParArm {
+    /// Call to the enclosing function; one [`ArgForm`] per parameter.
+    SelfCall { args: Vec<ArgForm> },
+}
+
+/// How arm results are recombined once every arm has been joined.
+///
+/// The combine always consumes the arm results positionally and in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParCombine {
+    /// `arm0 ⊕ arm1` (exactly two arms).
+    BinOp(ParBinOp),
+    /// Rebuild by calling the same fn with the arm results as args (tak-style).
+    SelfCall,
+    /// `EnumName::Variant(arm0, arm1, …)`.
+    EnumCtor {
+        enum_name: String,
+        variant_name: String,
+    },
+}
+
+/// A recursive-pure function's primary parallelizable fork site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParForkSite {
     pub fn_name: String,
-    #[allow(dead_code)]
-    pub param: String,
-    /// `f(n - left_sub)`.
-    pub left_sub: i64,
-    /// `f(n - right_sub)`.
-    pub right_sub: i64,
-    pub op: ParBinOp,
-    /// From `if n <= base_le` / `n < base_lt` when present (informational).
-    #[allow(dead_code)]
-    pub base_bound: Option<i64>,
+    /// Declared parameter count; every arm supplies exactly this many args.
+    pub param_count: usize,
+    /// Independent self-calls (at least two).
+    pub arms: Vec<ParArm>,
+    pub combine: ParCombine,
 }
 
-/// True when a known int argument should use the parallel clone.
-pub fn const_arg_worth_parallel(arg: i64) -> bool {
-    arg > par_int_threshold()
+/// True when a concrete arg vector is expensive enough to fork.
+///
+/// Cost is approximated by the largest argument; empty vectors never fork.
+pub fn const_args_worth_parallel(args: &[i64]) -> bool {
+    args.iter()
+        .copied()
+        .max()
+        .is_some_and(|m| m > par_cost_threshold())
 }
 
-/// Specialized nullary entry name for `fn_name` at concrete `n`.
-pub fn par_specialization_name(fn_name: &str, n: i64) -> String {
-    format!("__coil_par_{fn_name}_{n}")
-}
-
-/// Collect shapes for recursive-pure functions that match the fork pattern.
-pub fn analyze_rec_par_shapes(
-    ast: &Output<'_>,
-    recursive_pure: &RecursivePureSet,
-) -> HashMap<String, RecParShape> {
-    let mut out = HashMap::new();
-    collect_shapes(ast, recursive_pure, &mut out);
+/// Specialized nullary entry name for `fn_name` at concrete `args`.
+///
+/// `("fib", &[22])` → `__coil_par_fib_22`; `("tak", &[18, 12, 6])` →
+/// `__coil_par_tak_18_12_6`.
+pub fn par_specialization_name(fn_name: &str, args: &[i64]) -> String {
+    let mut out = format!("__coil_par_{fn_name}");
+    for a in args {
+        out.push('_');
+        out.push_str(&a.to_string());
+    }
     out
 }
 
-/// Constant call-site arguments to recursive-pure functions (and the full
-/// specialization chains they require).
+/// Concrete child args for `arm` given the enclosing call's `parent_args`.
+pub fn eval_arm_args(arm: &ParArm, parent_args: &[i64]) -> Option<Vec<i64>> {
+    let ParArm::SelfCall { args } = arm;
+    args.iter().map(|f| eval_arg_form(f, parent_args)).collect()
+}
+
+fn eval_arg_form(form: &ArgForm, parent_args: &[i64]) -> Option<i64> {
+    match form {
+        ArgForm::Const(k) => Some(*k),
+        ArgForm::Param(i) => parent_args.get(*i).copied(),
+        ArgForm::ParamMinus { param, sub } => parent_args.get(*param).map(|v| v - sub),
+    }
+}
+
+/// Collect the primary fork site of every recursive-pure function.
+///
+/// One site per function: the first profitable one found walking the body,
+/// preferring sites on a `return` / implicit-return path.
+pub fn analyze_par_fork_sites(
+    ast: &Output<'_>,
+    recursive_pure: &RecursivePureSet,
+) -> HashMap<String, ParForkSite> {
+    let mut out = HashMap::new();
+    collect_sites(ast, recursive_pure, &mut out);
+    out
+}
+
+/// Constant call-site arg vectors for fork-site functions, closed under the
+/// arm transforms so every specialization a clone can reach also exists.
 pub fn collect_par_specialization_args(
     ast: &Output<'_>,
-    shapes: &HashMap<String, RecParShape>,
-) -> HashMap<String, BTreeSet<i64>> {
-    let mut demanded: HashMap<String, BTreeSet<i64>> = HashMap::new();
-    collect_const_calls(ast, shapes, &mut demanded);
-    let t = par_int_threshold();
-    // Close under left/right subtractions down to threshold+1.
-    let names: Vec<String> = demanded.keys().cloned().collect();
-    for name in names {
-        let Some(shape) = shapes.get(&name) else {
+    sites: &HashMap<String, ParForkSite>,
+) -> HashMap<String, BTreeSet<Vec<i64>>> {
+    let mut demanded: HashMap<String, BTreeSet<Vec<i64>>> = HashMap::new();
+    collect_const_calls(ast, sites, &mut demanded);
+    for (name, set) in demanded.iter_mut() {
+        let Some(site) = sites.get(name) else {
             continue;
         };
-        let mut set = demanded.remove(&name).unwrap_or_default();
-        let mut stack: Vec<i64> = set.iter().copied().collect();
-        let mut seen = HashSet::new();
-        while let Some(n) = stack.pop() {
-            if n <= t || !seen.insert(n) {
+        let mut stack: Vec<Vec<i64>> = set.iter().cloned().collect();
+        let mut seen: HashSet<Vec<i64>> = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.clone()) {
                 continue;
             }
-            set.insert(n);
-            let left = n - shape.left_sub;
-            let right = n - shape.right_sub;
-            if left > t {
-                stack.push(left);
+            for arm in &site.arms {
+                let Some(child) = eval_arm_args(arm, &cur) else {
+                    continue;
+                };
+                if const_args_worth_parallel(&child) && !seen.contains(&child) {
+                    stack.push(child);
+                }
             }
-            if right > t {
-                stack.push(right);
-            }
-        }
-        set.retain(|n| *n > t);
-        if !set.is_empty() {
-            demanded.insert(name, set);
+            set.insert(cur);
         }
     }
+    demanded.retain(|_, set| {
+        set.retain(|args| const_args_worth_parallel(args));
+        !set.is_empty()
+    });
     demanded
 }
 
-fn collect_shapes(
+// ---------------------------------------------------------------------------
+// Fork-site detection
+// ---------------------------------------------------------------------------
+
+/// Parameters of the function currently being scanned.
+struct FnCtx<'a> {
+    fn_name: &'a str,
+    param_names: Vec<String>,
+    /// `param - k` forms are only meaningful for int-like parameters.
+    param_int_like: Vec<bool>,
+}
+
+impl FnCtx<'_> {
+    fn param_index(&self, name: &str) -> Option<usize> {
+        self.param_names.iter().position(|p| p == name)
+    }
+}
+
+fn collect_sites(
     ast: &Output<'_>,
     recursive_pure: &RecursivePureSet,
-    out: &mut HashMap<String, RecParShape>,
+    out: &mut HashMap<String, ParForkSite>,
 ) {
     match ast.1.as_ref() {
         Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
             for item in items {
-                collect_shapes(item, recursive_pure, out);
+                collect_sites(item, recursive_pure, out);
             }
         }
-        Expression::Module(_, body) => collect_shapes(body, recursive_pure, out),
+        Expression::Module(_, body) => collect_sites(body, recursive_pure, out),
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
-        | Expression::Group(inner) => collect_shapes(inner, recursive_pure, out),
+        | Expression::Group(inner) => collect_sites(inner, recursive_pure, out),
         Expression::Function {
             name,
             args,
             body: Some(body),
             ..
         } if recursive_pure.contains(*name) => {
-            if let Some(shape) = detect_shape(name, args, body) {
-                out.insert((*name).to_string(), shape);
+            if let Some(site) = detect_fork_site(name, args, body) {
+                out.insert((*name).to_string(), site);
             }
-            collect_shapes(body, recursive_pure, out);
+            collect_sites(body, recursive_pure, out);
         }
         Expression::Function {
             body: Some(body), ..
-        } => collect_shapes(body, recursive_pure, out),
+        } => collect_sites(body, recursive_pure, out),
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                collect_shapes(m, recursive_pure, out);
+                collect_sites(m, recursive_pure, out);
             }
         }
         Expression::Method(_, inner) | Expression::Member(inner) => {
-            collect_shapes(inner, recursive_pure, out);
+            collect_sites(inner, recursive_pure, out);
         }
         _ => {}
     }
 }
 
-fn detect_shape(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<RecParShape> {
-    let param = single_int_param_name(args)?;
-    let (base_bound, fork) = find_base_and_fork(body, name, &param)?;
-    let (left_sub, right_sub, op) = fork;
-    if left_sub <= 0 || right_sub <= 0 {
-        return None;
-    }
-    Some(RecParShape {
-        fn_name: name.to_string(),
-        param,
-        left_sub,
-        right_sub,
-        op,
-        base_bound,
-    })
+fn detect_fork_site(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<ParForkSite> {
+    let (param_names, param_int_like) = fn_params(args)?;
+    let ctx = FnCtx {
+        fn_name: name,
+        param_names,
+        param_int_like,
+    };
+    let mut found: Vec<(bool, ParForkSite)> = Vec::new();
+    scan(body, &ctx, false, &mut found);
+    let best = found
+        .iter()
+        .find(|(on_return, _)| *on_return)
+        .or_else(|| found.first())?;
+    Some(best.1.clone())
 }
 
-fn single_int_param_name(args: &Output<'_>) -> Option<String> {
+/// `(names, int_like)` for the declared parameters, in order.
+fn fn_params(args: &Output<'_>) -> Option<(Vec<String>, Vec<bool>)> {
     let items = match args.1.as_ref() {
         Expression::Fragment(items) | Expression::Block(items) => items.as_slice(),
         _ => return None,
     };
-    let mut found = None;
+    let mut names = Vec::new();
+    let mut int_like = Vec::new();
     for item in items {
-        let arg = peel(item);
-        let Expression::Argument { name, ty, .. } = arg.1.as_ref() else {
+        let Expression::Argument { name, ty, .. } = peel(item).1.as_ref() else {
             continue;
         };
-        let Some(ty) = ty else {
-            return None;
-        };
-        let ty_name = match peel(ty).1.as_ref() {
-            Expression::Type(t) | Expression::Identifier(t) => *t,
-            _ => continue,
-        };
-        if !matches!(ty_name, "int" | "byte") {
-            return None;
-        }
-        if found.is_some() {
-            return None; // must be unary
-        }
-        found = Some((*name).to_string());
+        let ty_name = ty.as_ref().and_then(|t| match peel(t).1.as_ref() {
+            Expression::Type(n) | Expression::Identifier(n) => Some(*n),
+            _ => None,
+        });
+        names.push((*name).to_string());
+        int_like.push(matches!(ty_name, Some("int") | Some("byte")));
     }
-    found
+    Some((names, int_like))
 }
 
-/// Walk body for optional `if n <= K` / `n < K` and a recursive binop return.
-fn find_base_and_fork(
-    body: &Output<'_>,
-    fn_name: &str,
-    param: &str,
-) -> Option<(Option<i64>, (i64, i64, ParBinOp))> {
-    let mut base = None;
-    let mut fork = None;
-    walk_for_shape(body, fn_name, param, &mut base, &mut fork);
-    fork.map(|f| (base, f))
-}
-
-fn walk_for_shape(
-    ast: &Output<'_>,
-    fn_name: &str,
-    param: &str,
-    base: &mut Option<i64>,
-    fork: &mut Option<(i64, i64, ParBinOp)>,
-) {
+/// Depth-first body walk recording every fork site, tagged with whether it sits
+/// on a return path (those win when picking the function's primary site).
+fn scan(ast: &Output<'_>, ctx: &FnCtx<'_>, on_return: bool, found: &mut Vec<(bool, ParForkSite)>) {
+    if let Some(site) = match_fork(ast, ctx) {
+        found.push((on_return, site));
+    }
     match ast.1.as_ref() {
         Expression::Program(items)
         | Expression::Block(items)
         | Expression::Fragment(items)
+        | Expression::List(items)
+        | Expression::Array(items)
+        | Expression::Tuple(items)
         | Expression::If(items) => {
             for item in items {
-                walk_for_shape(item, fn_name, param, base, fork);
+                scan(item, ctx, on_return, found);
             }
         }
-        Expression::Branch(cond, body) => {
-            if let Some(c) = cond {
-                if let Some(b) = match_base_bound(c, param) {
-                    *base = Some(b);
-                }
-            }
-            walk_for_shape(body, fn_name, param, base, fork);
+        Expression::Return(inner) | Expression::ImplicitReturn(inner) => {
+            scan(inner, ctx, true, found);
         }
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
         | Expression::Group(inner)
-        | Expression::Return(inner)
-        | Expression::ImplicitReturn(inner) => {
-            if let Some(f) = match_rec_binop(inner, fn_name, param) {
-                *fork = Some(f);
-            }
-            walk_for_shape(inner, fn_name, param, base, fork);
+        | Expression::Negate(inner)
+        | Expression::Positive(inner)
+        | Expression::Not(inner)
+        | Expression::LogicalNot(inner)
+        | Expression::Cast(inner, _)
+        | Expression::Try(inner)
+        | Expression::Readonly(inner) => scan(inner, ctx, on_return, found),
+        Expression::Add(a, b)
+        | Expression::Sub(a, b)
+        | Expression::Mul(a, b)
+        | Expression::Div(a, b)
+        | Expression::Mod(a, b)
+        | Expression::Eq(a, b)
+        | Expression::Neq(a, b)
+        | Expression::Le(a, b)
+        | Expression::Gt(a, b)
+        | Expression::Leq(a, b)
+        | Expression::Geq(a, b)
+        | Expression::Coalesce(a, b)
+        | Expression::Assignment(a, b) => {
+            scan(a, ctx, on_return, found);
+            scan(b, ctx, on_return, found);
         }
-        Expression::Add(a, b) => {
-            if let Some(f) = match_rec_binop(ast, fn_name, param) {
-                *fork = Some(f);
+        Expression::Call { name, args } => {
+            scan(name, ctx, on_return, found);
+            for a in args.iter().flatten() {
+                scan(a, ctx, on_return, found);
             }
-            walk_for_shape(a, fn_name, param, base, fork);
-            walk_for_shape(b, fn_name, param, base, fork);
         }
-        Expression::Sub(a, b) | Expression::Mul(a, b) => {
-            if let Some(f) = match_rec_binop(ast, fn_name, param) {
-                *fork = Some(f);
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    scan(item, ctx, on_return, found);
+                }
             }
-            walk_for_shape(a, fn_name, param, base, fork);
-            walk_for_shape(b, fn_name, param, base, fork);
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    scan(&f.value, ctx, on_return, found);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
+        Expression::Branch(cond, body) => {
+            if let Some(c) = cond {
+                scan(c, ctx, on_return, found);
+            }
+            scan(body, ctx, on_return, found);
         }
+        // Arms are scanned independently — a fork never spans two arms.
+        Expression::Match { scrutinee, arms } => {
+            scan(scrutinee, ctx, on_return, found);
+            for arm in arms {
+                scan(&arm.body, ctx, on_return, found);
+            }
+        }
+        Expression::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(i) = init {
+                scan(i, ctx, on_return, found);
+            }
+            scan(cond, ctx, on_return, found);
+            if let Some(s) = step {
+                scan(s, ctx, on_return, found);
+            }
+            scan(body, ctx, on_return, found);
+        }
+        Expression::Loop { iterable, body, .. } => {
+            scan(iterable, ctx, on_return, found);
+            scan(body, ctx, on_return, found);
+        }
+        Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
+            scan(init, ctx, on_return, found)
+        }
+        Expression::LetDestructure { rhs, .. } => scan(rhs, ctx, on_return, found),
         _ => {}
     }
 }
 
-fn match_base_bound(cond: &Output<'_>, param: &str) -> Option<i64> {
-    let cond = peel(cond);
-    match cond.1.as_ref() {
-        Expression::Leq(lhs, rhs) | Expression::Le(lhs, rhs) => {
-            let lhs = peel(lhs);
-            let rhs = peel(rhs);
-            let is_le = matches!(cond.1.as_ref(), Expression::Leq(_, _));
-            match (lhs.1.as_ref(), rhs.1.as_ref()) {
-                (Expression::Identifier(p), Expression::Integer(k)) if *p == param => {
-                    // n <= k → bound k; n < k → bound k-1 for "last base"
-                    Some(if is_le { *k } else { *k - 1 })
-                }
-                _ => None,
-            }
+/// Recognize the three IPA fork shapes at `expr` (no recursion).
+fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParForkSite> {
+    let expr = peel(expr);
+    match expr.1.as_ref() {
+        Expression::Add(a, b) => binop_site(ctx, a, b, ParBinOp::Add),
+        Expression::Sub(a, b) => binop_site(ctx, a, b, ParBinOp::Sub),
+        Expression::Mul(a, b) => binop_site(ctx, a, b, ParBinOp::Mul),
+        Expression::Construct {
+            enum_name,
+            variant_name,
+            fields: EnumConstructPayload::Tuple(items),
+        } => {
+            let arms = self_call_arms(items, ctx)?;
+            site(
+                ctx,
+                arms,
+                ParCombine::EnumCtor {
+                    enum_name: (*enum_name).to_string(),
+                    variant_name: (*variant_name).to_string(),
+                },
+            )
+        }
+        Expression::Call {
+            name,
+            args: Some(args),
+        } if callee_name(name) == Some(ctx.fn_name) => {
+            let arms = self_call_arms(args, ctx)?;
+            site(ctx, arms, ParCombine::SelfCall)
         }
         _ => None,
     }
 }
 
-fn match_rec_binop(expr: &Output<'_>, fn_name: &str, param: &str) -> Option<(i64, i64, ParBinOp)> {
-    let expr = peel(expr);
-    let (a, b, op) = match expr.1.as_ref() {
-        Expression::Add(a, b) => (a, b, ParBinOp::Add),
-        Expression::Sub(a, b) => (a, b, ParBinOp::Sub),
-        Expression::Mul(a, b) => (a, b, ParBinOp::Mul),
-        _ => return None,
-    };
-    let left = match_rec_call_sub(a, fn_name, param)?;
-    let right = match_rec_call_sub(b, fn_name, param)?;
-    Some((left, right, op))
+fn binop_site(
+    ctx: &FnCtx<'_>,
+    a: &Output<'_>,
+    b: &Output<'_>,
+    op: ParBinOp,
+) -> Option<ParForkSite> {
+    let arms = vec![self_call_arm(a, ctx)?, self_call_arm(b, ctx)?];
+    site(ctx, arms, ParCombine::BinOp(op))
 }
 
-fn match_rec_call_sub(expr: &Output<'_>, fn_name: &str, param: &str) -> Option<i64> {
+fn site(ctx: &FnCtx<'_>, arms: Vec<ParArm>, combine: ParCombine) -> Option<ParForkSite> {
+    if arms.len() < 2 {
+        return None;
+    }
+    Some(ParForkSite {
+        fn_name: ctx.fn_name.to_string(),
+        param_count: ctx.param_names.len(),
+        arms,
+        combine,
+    })
+}
+
+/// Every operand must be an independent self-call: the combine consumes arm
+/// results positionally, so a mixed operand list is not representable.
+fn self_call_arms(items: &[Output<'_>], ctx: &FnCtx<'_>) -> Option<Vec<ParArm>> {
+    if items.len() < 2 {
+        return None;
+    }
+    items.iter().map(|i| self_call_arm(i, ctx)).collect()
+}
+
+fn self_call_arm(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParArm> {
     let expr = peel(expr);
     let Expression::Call {
         name,
@@ -300,40 +443,59 @@ fn match_rec_call_sub(expr: &Output<'_>, fn_name: &str, param: &str) -> Option<i
     else {
         return None;
     };
-    if args.len() != 1 {
+    if callee_name(name) != Some(ctx.fn_name) || args.len() != ctx.param_names.len() {
         return None;
     }
-    let callee = match peel(name).1.as_ref() {
-        Expression::Identifier(n) => *n,
-        _ => return None,
-    };
-    if callee != fn_name {
-        return None;
-    }
-    match_param_minus_const(peel(&args[0]), param)
+    let forms = args
+        .iter()
+        .map(|a| arg_form(a, ctx))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ParArm::SelfCall { args: forms })
 }
 
-fn match_param_minus_const(expr: &Output<'_>, param: &str) -> Option<i64> {
+fn arg_form(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ArgForm> {
     let expr = peel(expr);
     match expr.1.as_ref() {
+        Expression::Integer(k) => Some(ArgForm::Const(*k)),
+        Expression::Identifier(p) => ctx.param_index(p).map(ArgForm::Param),
         Expression::Sub(lhs, rhs) => {
-            let lhs = peel(lhs);
-            let rhs = peel(rhs);
-            match (lhs.1.as_ref(), rhs.1.as_ref()) {
-                (Expression::Identifier(p), Expression::Integer(k)) if *p == param && *k > 0 => {
-                    Some(*k)
-                }
-                _ => None,
+            let (Expression::Identifier(p), Expression::Integer(k)) =
+                (peel(lhs).1.as_ref(), peel(rhs).1.as_ref())
+            else {
+                return None;
+            };
+            if *k <= 0 {
+                return None;
             }
+            let idx = ctx.param_index(p)?;
+            ctx.param_int_like
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+                .then_some(ArgForm::ParamMinus {
+                    param: idx,
+                    sub: *k,
+                })
         }
         _ => None,
     }
 }
 
+fn callee_name<'a>(name: &'a Output<'a>) -> Option<&'a str> {
+    match peel(name).1.as_ref() {
+        Expression::Identifier(n) => Some(*n),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constant call-site collection
+// ---------------------------------------------------------------------------
+
 fn collect_const_calls(
     ast: &Output<'_>,
-    shapes: &HashMap<String, RecParShape>,
-    out: &mut HashMap<String, BTreeSet<i64>>,
+    sites: &HashMap<String, ParForkSite>,
+    out: &mut HashMap<String, BTreeSet<Vec<i64>>>,
 ) {
     match ast.1.as_ref() {
         Expression::Program(items)
@@ -344,7 +506,7 @@ fn collect_const_calls(
         | Expression::Tuple(items)
         | Expression::If(items) => {
             for item in items {
-                collect_const_calls(item, shapes, out);
+                collect_const_calls(item, sites, out);
             }
         }
         Expression::Module(_, body)
@@ -360,7 +522,7 @@ fn collect_const_calls(
         | Expression::Positive(body)
         | Expression::Cast(body, _)
         | Expression::Try(body)
-        | Expression::Readonly(body) => collect_const_calls(body, shapes, out),
+        | Expression::Readonly(body) => collect_const_calls(body, sites, out),
         Expression::Add(a, b)
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
@@ -374,40 +536,62 @@ fn collect_const_calls(
         | Expression::Leq(a, b)
         | Expression::Geq(a, b)
         | Expression::Coalesce(a, b) => {
-            collect_const_calls(a, shapes, out);
-            collect_const_calls(b, shapes, out);
+            collect_const_calls(a, sites, out);
+            collect_const_calls(b, sites, out);
         }
         Expression::Call { name, args } => {
-            collect_const_calls(name, shapes, out);
-            if let Some(args) = args {
-                for a in args {
-                    collect_const_calls(a, shapes, out);
-                }
-                if args.len() == 1 {
-                    if let Expression::Identifier(fname) = peel(name).1.as_ref() {
-                        if shapes.contains_key(*fname) {
-                            if let Expression::Integer(n) = peel(&args[0]).1.as_ref() {
-                                if const_arg_worth_parallel(*n) {
-                                    out.entry((*fname).to_string())
-                                        .or_default()
-                                        .insert(*n);
-                                }
-                            }
-                        }
-                    }
+            collect_const_calls(name, sites, out);
+            let Some(args) = args else {
+                return;
+            };
+            for a in args {
+                collect_const_calls(a, sites, out);
+            }
+            let Some(fname) = callee_name(name) else {
+                return;
+            };
+            let Some(site) = sites.get(fname) else {
+                return;
+            };
+            if args.len() != site.param_count {
+                return;
+            }
+            let consts = args
+                .iter()
+                .map(|a| match peel(a).1.as_ref() {
+                    Expression::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(consts) = consts {
+                if const_args_worth_parallel(&consts) {
+                    out.entry(fname.to_string()).or_default().insert(consts);
                 }
             }
         }
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    collect_const_calls(item, sites, out);
+                }
+            }
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    collect_const_calls(&f.value, sites, out);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {
-                collect_const_calls(c, shapes, out);
+                collect_const_calls(c, sites, out);
             }
-            collect_const_calls(body, shapes, out);
+            collect_const_calls(body, sites, out);
         }
         Expression::Match { scrutinee, arms } => {
-            collect_const_calls(scrutinee, shapes, out);
+            collect_const_calls(scrutinee, sites, out);
             for arm in arms {
-                collect_const_calls(&arm.body, shapes, out);
+                collect_const_calls(&arm.body, sites, out);
             }
         }
         Expression::For {
@@ -417,13 +601,13 @@ fn collect_const_calls(
             body,
         } => {
             if let Some(i) = init {
-                collect_const_calls(i, shapes, out);
+                collect_const_calls(i, sites, out);
             }
-            collect_const_calls(cond, shapes, out);
+            collect_const_calls(cond, sites, out);
             if let Some(s) = step {
-                collect_const_calls(s, shapes, out);
+                collect_const_calls(s, sites, out);
             }
-            collect_const_calls(body, shapes, out);
+            collect_const_calls(body, sites, out);
         }
         Expression::Loop {
             identifier,
@@ -431,26 +615,27 @@ fn collect_const_calls(
             body,
         } => {
             if let Some(id) = identifier {
-                collect_const_calls(id, shapes, out);
+                collect_const_calls(id, sites, out);
             }
-            collect_const_calls(iterable, shapes, out);
-            collect_const_calls(body, shapes, out);
+            collect_const_calls(iterable, sites, out);
+            collect_const_calls(body, sites, out);
         }
         Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
-            collect_const_calls(init, shapes, out);
+            collect_const_calls(init, sites, out);
         }
+        Expression::LetDestructure { rhs, .. } => collect_const_calls(rhs, sites, out),
         Expression::Function {
             body: Some(body), ..
         }
         | Expression::Lambda { body, .. }
-        | Expression::Defer { body, .. } => collect_const_calls(body, shapes, out),
+        | Expression::Defer { body, .. } => collect_const_calls(body, sites, out),
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                collect_const_calls(m, shapes, out);
+                collect_const_calls(m, sites, out);
             }
         }
         Expression::Method(_, inner) | Expression::Member(inner) => {
-            collect_const_calls(inner, shapes, out);
+            collect_const_calls(inner, sites, out);
         }
         _ => {}
     }
@@ -479,6 +664,17 @@ mod tests {
         Pratt::default().parse(owned).expect("parse")
     }
 
+    fn sites_of(src: &str) -> HashMap<String, ParForkSite> {
+        let ast = parse(src);
+        let pure = analyze_recursive_pure(&ast);
+        analyze_par_fork_sites(&ast, &pure)
+    }
+
+    fn arm_args(site: &ParForkSite, i: usize) -> &[ArgForm] {
+        let ParArm::SelfCall { args } = &site.arms[i];
+        args
+    }
+
     #[test]
     fn detects_fib_shape_and_const_calls() {
         let ast = parse(
@@ -495,23 +691,23 @@ fn main() {
         );
         let pure = analyze_recursive_pure(&ast);
         assert!(pure.contains("fib"));
-        let shapes = analyze_rec_par_shapes(&ast, &pure);
-        let fib = shapes.get("fib").expect("fib shape");
-        assert_eq!(fib.left_sub, 1);
-        assert_eq!(fib.right_sub, 2);
-        assert_eq!(fib.op, ParBinOp::Add);
-        assert_eq!(fib.param, "n");
-        assert_eq!(fib.base_bound, Some(2));
-        let demanded = collect_par_specialization_args(&ast, &shapes);
+        let sites = analyze_par_fork_sites(&ast, &pure);
+        let fib = sites.get("fib").expect("fib fork site");
+        assert_eq!(fib.param_count, 1);
+        assert_eq!(fib.combine, ParCombine::BinOp(ParBinOp::Add));
+        assert_eq!(arm_args(fib, 0), [ArgForm::ParamMinus { param: 0, sub: 1 }]);
+        assert_eq!(arm_args(fib, 1), [ArgForm::ParamMinus { param: 0, sub: 2 }]);
+
+        let demanded = collect_par_specialization_args(&ast, &sites);
         let set = demanded.get("fib").expect("fib demands");
-        assert!(set.contains(&32));
-        assert!(set.contains(&21)); // chain toward threshold
-        assert!(!set.contains(&20));
+        assert!(set.contains(&vec![32]));
+        assert!(set.contains(&vec![21])); // chain toward threshold
+        assert!(!set.contains(&vec![20]));
     }
 
     #[test]
-    fn detects_mul_rec_par_shape() {
-        let ast = parse(
+    fn detects_mul_binop_fork() {
+        let sites = sites_of(
             r#"
 fn tree(int n) -> int {
     if n <= 1 { return 1; }
@@ -520,17 +716,21 @@ fn tree(int n) -> int {
 fn main() { return; }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
-        let shapes = analyze_rec_par_shapes(&ast, &pure);
-        let tree = shapes.get("tree").expect("tree shape");
-        assert_eq!(tree.op, ParBinOp::Mul);
-        assert_eq!(tree.left_sub, 1);
-        assert_eq!(tree.right_sub, 2);
+        let tree = sites.get("tree").expect("tree fork site");
+        assert_eq!(tree.combine, ParCombine::BinOp(ParBinOp::Mul));
+        assert_eq!(
+            arm_args(tree, 0),
+            [ArgForm::ParamMinus { param: 0, sub: 1 }]
+        );
+        assert_eq!(
+            arm_args(tree, 1),
+            [ArgForm::ParamMinus { param: 0, sub: 2 }]
+        );
     }
 
     #[test]
-    fn rejects_non_dual_recursive_binop() {
-        let ast = parse(
+    fn rejects_single_recursive_arm() {
+        let sites = sites_of(
             r#"
 fn fib(int n) -> int {
     if n <= 1 { return n; }
@@ -539,18 +739,117 @@ fn fib(int n) -> int {
 fn main() { return; }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
-        assert!(pure.contains("fib"));
-        let shapes = analyze_rec_par_shapes(&ast, &pure);
         assert!(
-            !shapes.contains_key("fib"),
-            "single recursive arm must not be a par shape: {shapes:?}"
+            !sites.contains_key("fib"),
+            "single recursive arm must not be a fork site: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn detects_enum_ctor_fork() {
+        let sites = sites_of(
+            r#"
+enum Tree {
+    Leaf,
+    Node(Tree, Tree),
+}
+fn build(int n) -> Tree {
+    if n <= 1 { return Tree::Leaf; }
+    return Tree::Node(build(n - 1), build(n - 2));
+}
+fn main() { return; }
+"#,
+        );
+        let build = sites.get("build").expect("build fork site");
+        assert_eq!(
+            build.combine,
+            ParCombine::EnumCtor {
+                enum_name: "Tree".to_string(),
+                variant_name: "Node".to_string(),
+            }
+        );
+        assert_eq!(build.arms.len(), 2);
+        assert_eq!(
+            arm_args(build, 0),
+            [ArgForm::ParamMinus { param: 0, sub: 1 }]
+        );
+    }
+
+    #[test]
+    fn detects_tak_self_call_combine() {
+        let sites = sites_of(
+            r#"
+fn tak(int x, int y, int z) -> int {
+    if y < x {
+        return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y));
+    }
+    return z;
+}
+fn main() { return; }
+"#,
+        );
+        let tak = sites.get("tak").expect("tak fork site");
+        assert_eq!(tak.combine, ParCombine::SelfCall);
+        assert_eq!(tak.param_count, 3);
+        assert_eq!(tak.arms.len(), 3);
+        assert_eq!(
+            arm_args(tak, 0),
+            [
+                ArgForm::ParamMinus { param: 0, sub: 1 },
+                ArgForm::Param(1),
+                ArgForm::Param(2)
+            ]
+        );
+        assert_eq!(
+            arm_args(tak, 2),
+            [
+                ArgForm::ParamMinus { param: 2, sub: 1 },
+                ArgForm::Param(0),
+                ArgForm::Param(1)
+            ]
+        );
+        assert_eq!(
+            eval_arm_args(&tak.arms[1], &[18, 12, 6]),
+            Some(vec![11, 6, 18])
+        );
+    }
+
+    #[test]
+    fn detects_fork_inside_match_arm() {
+        let sites = sites_of(
+            r#"
+enum Mode {
+    Fast,
+    Slow,
+}
+fn pick(int n) -> Mode {
+    if n <= 1 { return Mode::Fast; }
+    return Mode::Slow;
+}
+fn fibm(int n) -> int {
+    return match pick(n) {
+        Mode::Fast => 1,
+        Mode::Slow => fibm(n - 1) + fibm(n - 2),
+    };
+}
+fn main() { return; }
+"#,
+        );
+        let fibm = sites.get("fibm").expect("fibm fork site");
+        assert_eq!(fibm.combine, ParCombine::BinOp(ParBinOp::Add));
+        assert_eq!(
+            arm_args(fibm, 0),
+            [ArgForm::ParamMinus { param: 0, sub: 1 }]
+        );
+        assert_eq!(
+            arm_args(fibm, 1),
+            [ArgForm::ParamMinus { param: 0, sub: 2 }]
         );
     }
 
     #[test]
     fn below_threshold_and_dynamic_args_do_not_demand_specs() {
-        let t = par_int_threshold();
+        let t = par_cost_threshold();
         let ast = parse(&format!(
             r#"
 fn fib(int n) -> int {{
@@ -566,14 +865,23 @@ fn main() {{
 "#
         ));
         let pure = analyze_recursive_pure(&ast);
-        let shapes = analyze_rec_par_shapes(&ast, &pure);
-        let demanded = collect_par_specialization_args(&ast, &shapes);
+        let sites = analyze_par_fork_sites(&ast, &pure);
+        let demanded = collect_par_specialization_args(&ast, &sites);
         assert!(
             demanded.get("fib").is_none(),
             "arg == threshold and dynamic args must not demand specs: {demanded:?}"
         );
-        assert!(!const_arg_worth_parallel(t));
-        assert!(const_arg_worth_parallel(t + 1));
-        assert_eq!(par_specialization_name("fib", t + 1), format!("__coil_par_fib_{}", t + 1));
+        assert!(!const_args_worth_parallel(&[t]));
+        assert!(const_args_worth_parallel(&[t + 1]));
+        assert!(!const_args_worth_parallel(&[]));
+    }
+
+    #[test]
+    fn specialization_names_cover_multi_arg() {
+        assert_eq!(par_specialization_name("fib", &[22]), "__coil_par_fib_22");
+        assert_eq!(
+            par_specialization_name("tak", &[18, 12, 6]),
+            "__coil_par_tak_18_12_6"
+        );
     }
 }

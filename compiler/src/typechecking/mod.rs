@@ -30,8 +30,9 @@ pub use infer::{CStructDef, CallbackSigDef, Checker, ForInInfo, ForInKind};
 pub use kind::Kind;
 #[allow(unused_imports)] // public API re-export
 pub use par_profit::{
-    ParBinOp, RecParShape, analyze_rec_par_shapes, collect_par_specialization_args,
-    const_arg_worth_parallel, par_int_threshold, par_specialization_name,
+    ArgForm, ParArm, ParBinOp, ParCombine, ParForkSite, analyze_par_fork_sites,
+    collect_par_specialization_args, const_args_worth_parallel, eval_arm_args, par_cost_threshold,
+    par_specialization_name,
 };
 #[allow(unused_imports)] // public API re-export
 pub use purity::{RecursivePureSet, analyze_recursive_fns, analyze_recursive_pure};

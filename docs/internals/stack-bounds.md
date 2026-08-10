@@ -54,8 +54,7 @@ recursive function. Valid only on `fn` (see [Syntax — Attributes](../reference
 
 ## Relation to auto-par
 
-[`par_profit`](../../compiler/src/typechecking/par_profit.rs) still uses its own
-unary-int + binary `⊕` fork detector for auto-par profitability. Stack-bound
-analysis is the more general path (multi-arg measures, any number of decreasing
-self-calls, const tracing) and runs even when `COIL_AUTO_PAR=0`, including for
-impure recursive functions.
+[`par_profit`](../../compiler/src/typechecking/par_profit.rs) uses its own
+fork-site detector for auto-par profitability. Stack-bound analysis remains the
+more general path (arbitrary measures, const tracing) and runs even when
+`COIL_AUTO_PAR=0`, including for impure recursive functions.
