@@ -885,7 +885,7 @@ pub struct Compiler {
 
     /// Self-recursive pure function names eligible for auto fork-join.
     recursive_pure: HashSet<String>,
-    /// Detected independent-parallel-arm fork sites for recursive-pure fns.
+    /// Detected independent-parallel-arm fork sites for pure fns.
     par_shapes: HashMap<String, crate::typechecking::ParForkSite>,
     /// Concrete arg vectors requiring `__coil_par_*` specializations.
     par_spec_args: HashMap<String, BTreeSet<Vec<i64>>>,

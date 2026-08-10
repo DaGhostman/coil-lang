@@ -12,8 +12,10 @@ type FinalizeIlOut = ();
 enum ParCombinePlan {
     /// `ADD` / `SUB` / `MUL` over exactly two arms.
     Bin(Instruction),
-    /// Rebuild the outer call with the arm results as arguments (tak-style).
-    SelfCall { entry: u32, arity: u32 },
+    /// Rebuild a call with the arm results as arguments.
+    Call { entry: u32, arity: u32 },
+    /// `(arm0, …)` tuple pack.
+    Tuple { arity: u32 },
     /// `MakeEnum` with the variant's tag and payload arity.
     Enum { tag: u16, arity: u16 },
 }
@@ -4781,10 +4783,15 @@ impl Compiler {
         };
         // Resolved before the clone is bound so an arm that reproduces
         // `parent_args` cannot bind to the clone itself (infinite CALL).
-        let callables: Vec<(u32, u32, bool)> = child_args
+        let Some(callables) = site
+            .arms
             .iter()
-            .map(|c| self.par_arm_callable_args(&site.fn_name, c, orig_offset))
-            .collect();
+            .zip(child_args.iter())
+            .map(|(arm, c)| self.par_arm_callable(arm, c))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
 
         self.bind_function_entry(spec_name.clone());
         self.fn_arities.insert(spec_name.clone(), (0, false));
@@ -4923,15 +4930,30 @@ impl Compiler {
                 if arms != site.param_count {
                     return None;
                 }
-                // `CALL` takes its frame base below the args: arg 0 pushed first.
                 Some((
-                    ParCombinePlan::SelfCall {
+                    ParCombinePlan::Call {
                         entry: orig_offset,
                         arity: arms as u32,
                     },
                     (0..arms).collect(),
                 ))
             }
+            ParCombine::ApplyCall { fn_name } => {
+                let entry = self.resolve_par_fn_entry(fn_name)? as u32;
+                Some((
+                    ParCombinePlan::Call {
+                        entry,
+                        arity: arms as u32,
+                    },
+                    (0..arms).collect(),
+                ))
+            }
+            ParCombine::Tuple => Some((
+                ParCombinePlan::Tuple {
+                    arity: arms as u32,
+                },
+                (0..arms).collect(),
+            )),
             ParCombine::EnumCtor {
                 enum_name,
                 variant_name,
@@ -4955,30 +4977,50 @@ impl Compiler {
     fn emit_par_combine(&mut self, plan: &ParCombinePlan) {
         match plan {
             ParCombinePlan::Bin(op) => self.bytecode.push(Byte::new(*op)),
-            ParCombinePlan::SelfCall { entry, arity } => self
+            ParCombinePlan::Call { entry, arity } => self
                 .bytecode
                 .push(Byte::new(Instruction::CALL).with_call_packed(*arity, *entry)),
+            ParCombinePlan::Tuple { arity } => self.bytecode.push_make_tuple(*arity),
             ParCombinePlan::Enum { tag, arity } => self.bytecode.push_make_enum(*tag, *arity),
         }
+    }
+
+    /// Look up a bare / FQN function entry used by IPA arms and combines.
+    fn resolve_par_fn_entry(&self, name: &str) -> Option<usize> {
+        self.functions
+            .get(name)
+            .copied()
+            .or_else(|| {
+                let fqn = format!("{}::{}", self.namespace, name);
+                self.functions.get(&fqn).copied()
+            })
+            .or_else(|| {
+                // Unnamespaced bare keys sometimes live next to FQNs.
+                self.functions
+                    .iter()
+                    .find(|(k, _)| k.rsplit("::").next() == Some(name) && !k.starts_with("__coil_par_"))
+                    .map(|(_, &off)| off)
+            })
     }
 
     /// Callable for one arm: `(entry, arity, needs_push_args)`.
     ///
     /// A child level that is itself specialized is invoked as its nullary
-    /// clone; otherwise the original function is called with concrete args.
-    fn par_arm_callable_args(
+    /// clone; otherwise the callee is called with concrete args.
+    fn par_arm_callable(
         &self,
-        fn_name: &str,
+        arm: &crate::typechecking::ParArm,
         child_args: &[i64],
-        orig_offset: u32,
-    ) -> (u32, u32, bool) {
+    ) -> Option<(u32, u32, bool)> {
+        let callee = crate::typechecking::arm_callee(arm);
         if crate::typechecking::const_args_worth_parallel(child_args) {
-            let spec = crate::typechecking::par_specialization_name(fn_name, child_args);
+            let spec = crate::typechecking::par_specialization_name(callee, child_args);
             if let Some(&off) = self.functions.get(&spec) {
-                return (off as u32, 0, false);
+                return Some((off as u32, 0, false));
             }
         }
-        (orig_offset, child_args.len() as u32, true)
+        let entry = self.resolve_par_fn_entry(callee)? as u32;
+        Some((entry, child_args.len() as u32, true))
     }
 
     fn emit_par_arm_call_args(&mut self, callable: (u32, u32, bool), child_args: &[i64]) {
@@ -12880,23 +12922,18 @@ impl Compiler {
         } else {
             HashSet::new()
         };
-        if auto_par_enabled() && !self.recursive_pure.is_empty() {
-            self.par_shapes =
-                crate::typechecking::analyze_par_fork_sites(ast, &self.recursive_pure);
+        if auto_par_enabled() {
+            // IPA sites on any pure function (self-recursion or helper arms).
+            let pure = crate::typechecking::analyze_pure_fns(ast);
+            self.par_shapes = crate::typechecking::analyze_par_fork_sites(ast, &pure);
             self.par_spec_args =
                 crate::typechecking::collect_par_specialization_args(ast, &self.par_shapes);
+            self.loop_par_sites = crate::typechecking::analyze_loop_par_sites(ast, &pure);
         } else {
             self.par_shapes.clear();
             self.par_spec_args.clear();
+            self.loop_par_sites = crate::typechecking::LoopParSites::new();
         }
-        // Loop IPA is independent of the recursive fork-site analysis: a
-        // counted loop needs no self-recursion, only pure body calls.
-        self.loop_par_sites = if auto_par_enabled() {
-            let pure = crate::typechecking::analyze_pure_fns(ast);
-            crate::typechecking::analyze_loop_par_sites(ast, &pure)
-        } else {
-            crate::typechecking::LoopParSites::new()
-        };
         self.emit_builtin_dict_thunks();
         self.emit_vec_method_thunks();
         // Builtin dictionary thunks are emitted immediately after the
