@@ -12,6 +12,10 @@
 //! - Elide unused `<producer>; STORE b` when tell allows **or** a later
 //!   straight-line store to a higher-or-equal slot dominates the cursor floor
 //!   (labels/jumps/calls refuse).
+//! - Store-destination coalescing: `STORE t; …; LOAD t; STORE s` rewrites
+//!   defs/uses of `t` to `s` when slot liveness proves `t`/`s` do not
+//!   interfere and tell still covers the store floor (`s >= t`, or the usual
+//!   remove-store proof). Overlapping ranges (mandelbrot `tr`/`zr`) refuse.
 //! - Uses `il::tell` known-cursor as a gate on LOAD→producer replacement
 //!   (same proof surface as `copy_prop`); dead stores are left to
 //!   `dead_store_at` except for the alias-elide cleanup above.
@@ -19,9 +23,6 @@
 //! **Deferred**
 //! - Full SSA rename / φ nodes / general loop-carried promotion.
 //! - Keeping values on the operand stack across calls or unknown SP.
-//! - Store-destination coalescing (`STORE t; …; LOAD t; STORE s`) — live-range
-//!   overlap (e.g. mandelbrot `tr`/`zr`) makes this unsafe without richer
-//!   liveness.
 //! - Address-taken / aggregate / residual `Byte` promotion.
 
 use std::collections::{HashMap, HashSet};
@@ -374,6 +375,153 @@ fn rewrite_slot_uses(op: &mut IlOp, from: u32, to: u32) -> bool {
             }
             changed
         }
+        IlOp::Byte { byte, .. } => rewrite_byte_slot_uses(byte, from, to),
+        _ => false,
+    }
+}
+
+fn rewrite_slot_def(op: &mut IlOp, from: u32, to: u32) -> bool {
+    match op {
+        IlOp::StorePop { slot, .. } if *slot == from => {
+            *slot = to;
+            true
+        }
+        IlOp::Byte { byte, .. } => rewrite_byte_slot_def(byte, from, to),
+        _ => false,
+    }
+}
+
+fn rewrite_byte_slot_uses(byte: &mut common::Byte, from: u32, to: u32) -> bool {
+    if to > 255 && from <= 255 {
+        return false;
+    }
+    let insn = *byte.bytecode();
+    match insn {
+        Instruction::LOAD | Instruction::LoadReturnSlot => {
+            let n = byte.load_store_count();
+            let mut slots: Vec<u32> = (0..n).map(|k| byte.load_store_slot_at(k)).collect();
+            let mut changed = false;
+            for s in &mut slots {
+                if *s == from {
+                    *s = to;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return false;
+            }
+            if n == 1 {
+                *byte = common::Byte::new(insn).with_load_store_slot(slots[0]);
+            } else if to <= 255 && slots.iter().all(|s| *s <= 255) {
+                *byte = common::Byte::new(insn).with_load_store_packed(
+                    n as u8,
+                    slots[0] as u8,
+                    slots.get(1).copied().unwrap_or(0) as u8,
+                    slots.get(2).copied().unwrap_or(0) as u8,
+                );
+            } else {
+                return false;
+            }
+            true
+        }
+        Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+            let (op, slot, imm) = byte.bin_slot_imm_parts();
+            if slot as u32 != from || to > 255 {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_bin_slot_imm(op, to as u8, imm as i16);
+            true
+        }
+        Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+            let (op, a, b) = byte.bin_slot_slot_parts();
+            if to > 255 {
+                return false;
+            }
+            let mut na = a as u8;
+            let mut nb = b as u8;
+            let mut changed = false;
+            if a as u32 == from {
+                na = to as u8;
+                changed = true;
+            }
+            if b as u32 == from {
+                nb = to as u8;
+                changed = true;
+            }
+            if !changed {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_bin_slot_slot(op, na, nb);
+            true
+        }
+        Instruction::BinSlotSlotStore => {
+            let (op, a, b, dest) = byte.bin_slot_slot_store_parts();
+            if to > 255 {
+                return false;
+            }
+            let mut na = a as u8;
+            let mut nb = b as u8;
+            let mut changed = false;
+            if a as u32 == from {
+                na = to as u8;
+                changed = true;
+            }
+            if b as u32 == from {
+                nb = to as u8;
+                changed = true;
+            }
+            if !changed {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_bin_slot_slot_store(op, na, nb, dest as u8);
+            true
+        }
+        Instruction::BinSlotImmStore => {
+            let (op, src, pool_idx) = byte.bin_slot_imm_store_parts();
+            if src as u32 != from || to > 255 {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_bin_slot_imm_store(op, to as u8, pool_idx as u16);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_byte_slot_def(byte: &mut common::Byte, from: u32, to: u32) -> bool {
+    if to > 255 && from <= 255 {
+        return false;
+    }
+    let insn = *byte.bytecode();
+    match insn {
+        Instruction::STORE | Instruction::StorePop => {
+            let Some(slot) = byte.load_store_single_slot() else {
+                return false;
+            };
+            if slot != from {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_load_store_slot(to);
+            true
+        }
+        Instruction::BinSlotSlotStore => {
+            let (op, a, b, dest) = byte.bin_slot_slot_store_parts();
+            if dest as u32 != from || to > 255 {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_bin_slot_slot_store(op, a as u8, b as u8, to as u8);
+            true
+        }
+        Instruction::FloatChainStore => {
+            let op = byte.operand_u32();
+            let dest = op >> 16;
+            let di = op & 0xffff;
+            if dest != from || to > 0xffff {
+                return false;
+            }
+            *byte = common::Byte::new(insn).with_operand_u32((to << 16) | di);
+            true
+        }
         _ => false,
     }
 }
@@ -492,6 +640,11 @@ pub(super) fn slot_promote(ops: &mut Vec<IlOp>, entry_tell: u32) {
     if ops.len() < 2 {
         return;
     }
+
+    // Prefer writing the final destination before alias forwarding rewrites
+    // uses of `s` back to temp `t` (`LOAD t; STORE s` → Alias(t)).
+    coalesce_store_destinations(ops, entry_tell);
+
     let blocks = build_blocks(ops);
     if blocks.is_empty() {
         return;
@@ -541,6 +694,321 @@ pub(super) fn slot_promote(ops: &mut Vec<IlOp>, entry_tell: u32) {
     // dead_store_at treats labels/jumps as barriers (loop-carried caution), so
     // elide `LOAD a; STORE b` here when `b` has no remaining uses and tell allows.
     elide_unused_alias_stores(ops, entry_tell);
+}
+
+/// Per-op slot use/def for liveness. `opaque` means residual forms whose slot
+/// footprint is incomplete — coalescing that touches those ops is refused.
+fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
+    let mut uses = HashSet::new();
+    let mut defs = HashSet::new();
+    let mut opaque = false;
+    match op {
+        IlOp::Load { slot, .. } | IlOp::LoadReturnSlot { slot, .. } => {
+            uses.insert(*slot);
+        }
+        IlOp::StorePop { slot, .. } => {
+            defs.insert(*slot);
+        }
+        IlOp::BinSlotImm { slot, .. } => {
+            uses.insert(*slot as u32);
+        }
+        IlOp::BinSlotSlot { a, b, .. } => {
+            uses.insert(*a as u32);
+            uses.insert(*b as u32);
+        }
+        IlOp::Byte { byte, .. } => {
+            let insn = *byte.bytecode();
+            match insn {
+                Instruction::LOAD | Instruction::LoadReturnSlot => {
+                    for k in 0..byte.load_store_count() {
+                        uses.insert(byte.load_store_slot_at(k));
+                    }
+                }
+                Instruction::STORE | Instruction::StorePop => {
+                    for k in 0..byte.load_store_count() {
+                        defs.insert(byte.load_store_slot_at(k));
+                    }
+                }
+                Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+                    let (_, slot, _) = byte.bin_slot_imm_parts();
+                    uses.insert(slot as u32);
+                }
+                Instruction::BinSlotImmStore => {
+                    let (_, src, _) = byte.bin_slot_imm_store_parts();
+                    uses.insert(src as u32);
+                    // Dest lives in the const pool; treat as opaque def.
+                    opaque = true;
+                }
+                Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+                    let (_, a, b) = byte.bin_slot_slot_parts();
+                    uses.insert(a as u32);
+                    uses.insert(b as u32);
+                }
+                Instruction::BinSlotSlotStore => {
+                    let (_, a, b, dest) = byte.bin_slot_slot_store_parts();
+                    uses.insert(a as u32);
+                    uses.insert(b as u32);
+                    defs.insert(dest as u32);
+                }
+                Instruction::BinSlotSlotConstJmpf => {
+                    let o = byte.operand_u32();
+                    uses.insert(((o >> 16) & 0xff) as u32);
+                    // Second slot is pool-backed — fail closed.
+                    opaque = true;
+                }
+                Instruction::FloatChainStore => {
+                    let dest = byte.operand_u32() >> 16;
+                    defs.insert(dest);
+                    // Stage sources live in the descriptor pool.
+                    opaque = true;
+                }
+                _ => opaque = true,
+            }
+        }
+        IlOp::Label(_)
+        | IlOp::Jump { .. }
+        | IlOp::Const { .. }
+        | IlOp::ConstPool { .. }
+        | IlOp::String { .. }
+        | IlOp::Dup { .. }
+        | IlOp::Pop { .. }
+        | IlOp::Bin { .. }
+        | IlOp::Return { .. }
+        | IlOp::Halt { .. }
+        | IlOp::ConstReturnImm { .. } => {}
+        _ => opaque = true,
+    }
+    (uses, defs, opaque)
+}
+
+struct SlotLiveness {
+    /// Slots live immediately before each op.
+    live_before: Vec<HashSet<u32>>,
+    /// Ops whose slot footprint is incompletely known.
+    opaque: Vec<bool>,
+}
+
+fn analyze_slot_liveness(ops: &[IlOp], blocks: &[Block]) -> SlotLiveness {
+    let n = ops.len();
+    let mut use_b: Vec<HashSet<u32>> = vec![HashSet::new(); blocks.len()];
+    let mut def_b: Vec<HashSet<u32>> = vec![HashSet::new(); blocks.len()];
+    let mut opaque = vec![false; n];
+
+    for (bi, block) in blocks.iter().enumerate() {
+        let mut defined = HashSet::new();
+        for i in block.start..block.end {
+            let (uses, defs, is_opaque) = op_slot_use_def(&ops[i]);
+            opaque[i] = is_opaque;
+            for u in &uses {
+                if !defined.contains(u) {
+                    use_b[bi].insert(*u);
+                }
+            }
+            for d in &defs {
+                defined.insert(*d);
+                def_b[bi].insert(*d);
+            }
+        }
+    }
+
+    let mut live_in: Vec<HashSet<u32>> = vec![HashSet::new(); blocks.len()];
+    let mut live_out: Vec<HashSet<u32>> = vec![HashSet::new(); blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..blocks.len()).rev() {
+            let mut out = HashSet::new();
+            for &s in &blocks[bi].succs {
+                out.extend(live_in[s].iter().copied());
+            }
+            if out != live_out[bi] {
+                live_out[bi] = out;
+                changed = true;
+            }
+            let mut inn = use_b[bi].clone();
+            for s in &live_out[bi] {
+                if !def_b[bi].contains(s) {
+                    inn.insert(*s);
+                }
+            }
+            if inn != live_in[bi] {
+                live_in[bi] = inn;
+                changed = true;
+            }
+        }
+    }
+
+    let mut live_before = vec![HashSet::new(); n];
+    for (bi, block) in blocks.iter().enumerate() {
+        let mut live = live_out[bi].clone();
+        for i in (block.start..block.end).rev() {
+            let (uses, defs, _) = op_slot_use_def(&ops[i]);
+            // `live` is live-after op i; compute live-before.
+            for d in &defs {
+                live.remove(d);
+            }
+            live.extend(uses.iter().copied());
+            live_before[i] = live.clone();
+        }
+    }
+
+    SlotLiveness {
+        live_before,
+        opaque,
+    }
+}
+
+fn coalesce_tell_ok(
+    ops: &[IlOp],
+    cursor: &crate::il::tell::TellInfo,
+    copy_idx: usize,
+    t: u32,
+    s: u32,
+) -> bool {
+    if cursor.can_remove_one_value_store(copy_idx, s)
+        || later_store_dominates_floor(ops, copy_idx + 1, s)
+    {
+        return true;
+    }
+    // Redirecting STORE t → STORE s with s >= t raises the floor at least as
+    // high as the copy store, so removing the copy keeps the cursor safe.
+    s >= t
+}
+
+/// Coalesce `STORE t; …; LOAD t; STORE s` into defs/uses of `s` when live
+/// ranges do not interfere and tell still proves the store floor.
+///
+/// Only the reaching def and uses in `(def, copy]` are rewritten — other live
+/// ranges of `t` stay put (global rename would clobber unrelated defs).
+fn coalesce_store_destinations(ops: &mut Vec<IlOp>, entry_tell: u32) {
+    if ops.len() < 2 {
+        return;
+    }
+    let mut guard = 0;
+    while guard < 64 {
+        guard += 1;
+        let blocks = build_blocks(ops);
+        if blocks.is_empty() {
+            return;
+        }
+        let live = analyze_slot_liveness(ops, &blocks);
+        let cursor = crate::il::tell::analyze_il_at(ops, entry_tell);
+
+        let mut chosen: Option<(usize, usize, u32, u32)> = None;
+        let mut i = 0;
+        while i + 1 < ops.len() {
+            if let (
+                IlOp::Load { slot: t, .. },
+                IlOp::StorePop { slot: s, .. },
+            ) = (&ops[i], &ops[i + 1])
+            {
+                let t = *t;
+                let s = *s;
+                if t != s
+                    && coalesce_tell_ok(ops, &cursor, i, t, s)
+                    && let Some(def_idx) = find_coalesce_def(ops, &live, i, t, s)
+                {
+                    chosen = Some((def_idx, i, t, s));
+                    break;
+                }
+            }
+            i += 1;
+        }
+
+        let Some((def_idx, copy_idx, t, s)) = chosen else {
+            return;
+        };
+
+        if !rewrite_slot_def(&mut ops[def_idx], t, s) {
+            return;
+        }
+        for op in ops.iter_mut().take(copy_idx + 1).skip(def_idx + 1) {
+            rewrite_slot_uses(op, t, s);
+        }
+        // Copy is now LOAD s; STORE s — drop it.
+        if matches!(
+            (&ops[copy_idx], &ops[copy_idx + 1]),
+            (IlOp::Load { slot: a, .. }, IlOp::StorePop { slot: b, .. }) if *a == s && *b == s
+        ) {
+            ops.remove(copy_idx + 1);
+            ops.remove(copy_idx);
+        } else {
+            return;
+        }
+    }
+}
+
+/// Nearest preceding def of `t` that can be redirected to `s`, or `None`.
+/// Nearest preceding def of `t` that can be redirected to `s`, or `None`.
+///
+/// Restricted to the same basic block with no labels/jumps between def and
+/// copy — cross-block coalescing needs richer dominance than Phase 1 proves.
+fn find_coalesce_def(
+    ops: &[IlOp],
+    live: &SlotLiveness,
+    copy_idx: usize,
+    t: u32,
+    s: u32,
+) -> Option<usize> {
+    let mut def_idx = None;
+    for j in (0..copy_idx).rev() {
+        match &ops[j] {
+            IlOp::Label(_) | IlOp::Jump { .. } => return None,
+            _ => {}
+        }
+        let (_uses, defs, opaque) = op_slot_use_def(&ops[j]);
+        if opaque {
+            return None;
+        }
+        if defs.contains(&s) {
+            return None;
+        }
+        if defs.contains(&t) {
+            def_idx = Some(j);
+            break;
+        }
+    }
+    let def_idx = def_idx?;
+
+    // The copy's LOAD must be the last use of this def — otherwise rewriting
+    // the store to `s` leaves later `t` reads without a reaching def.
+    if copy_idx + 2 < live.live_before.len() {
+        for i in copy_idx + 2..live.live_before.len() {
+            if live.live_before[i].contains(&t) {
+                return None;
+            }
+        }
+    }
+
+    // `s` must not be live anywhere in (def, copy] — otherwise the early store
+    // would clobber a value still needed (mandelbrot tr/zr).
+    for i in def_idx + 1..=copy_idx {
+        if live.live_before[i].contains(&s) {
+            return None;
+        }
+        if live.opaque[i] {
+            return None;
+        }
+    }
+
+    let alt = if t == 0 { 1 } else { 0 };
+    {
+        let mut probe = ops[def_idx].clone();
+        if !rewrite_slot_def(&mut probe, t, alt) {
+            return None;
+        }
+    }
+    for op in ops.iter().take(copy_idx + 1).skip(def_idx + 1) {
+        let (uses, _, _) = op_slot_use_def(op);
+        if uses.contains(&t) {
+            let mut probe = op.clone();
+            if !rewrite_slot_uses(&mut probe, t, alt) {
+                return None;
+            }
+        }
+    }
+
+    Some(def_idx)
 }
 
 fn slot_used_anywhere(ops: &[IlOp], slot: u32) -> bool {
@@ -620,6 +1088,27 @@ fn later_store_dominates_floor(ops: &[IlOp], store_idx: usize, dest: u32) -> boo
     false
 }
 
+/// True when an earlier straight-line `STORE` to `slot >= dest` already raised
+/// the cursor floor (e.g. after store-dest coalesce moved a higher store up).
+fn earlier_store_covers_floor(ops: &[IlOp], store_idx: usize, dest: u32) -> bool {
+    for op in ops[..store_idx].iter().rev() {
+        match op {
+            IlOp::StorePop { slot, .. } if *slot >= dest => return true,
+            IlOp::Label(_)
+            | IlOp::Jump { .. }
+            | IlOp::Entry { .. }
+            | IlOp::HostInvoke { .. }
+            | IlOp::Print { .. }
+            | IlOp::Return { .. }
+            | IlOp::Halt { .. }
+            | IlOp::Byte { .. } => return false,
+            other if promote_barrier(other) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Drop `LOAD a; STORE b` when `b` is unused afterward and either the cursor
 /// proof or a dominating later store shows the floor is redundant.
 ///
@@ -644,7 +1133,8 @@ fn elide_unused_alias_stores(ops: &mut Vec<IlOp>, entry_tell: u32) {
                 rest.push(op.clone());
             }
             let floor_ok = cursor.can_remove_one_value_store(i, dest)
-                || later_store_dominates_floor(ops, i + 1, dest);
+                || later_store_dominates_floor(ops, i + 1, dest)
+                || earlier_store_covers_floor(ops, i + 1, dest);
             if !slot_used_anywhere(&rest, dest) && floor_ok {
                 remove.insert(i);
                 remove.insert(i + 1);
@@ -950,5 +1440,209 @@ mod tests {
         ];
         slot_promote(&mut ops, 3);
         assert!(matches!(ops[3], IlOp::Load { slot: 1, .. }));
+    }
+
+    #[test]
+    fn coalesces_store_dest_when_ranges_do_not_interfere() {
+        // STORE t; use t; LOAD t; STORE s → write s directly (s dead until copy).
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 5,
+                imm: 1,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 6,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 6,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 7);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 6, .. })),
+            "def should store to coalesced dest 6"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "temp store to 5 should be rewritten away"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::BinSlotImm { slot: 6, .. })),
+            "uses of temp should read dest 6"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { .. }, IlOp::StorePop { .. })
+            )),
+            "copy LOAD/STORE should be gone"
+        );
+    }
+
+    #[test]
+    fn refuses_coalesce_when_dest_live_across_temp_def() {
+        // Mandelbrot-style: STORE tr; use zr; LOAD tr; STORE zr — overlap.
+        let mut ops = vec![
+            IlOp::ConstPool { idx: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 7,
+                loc: loc(),
+            },
+            IlOp::ConstPool { idx: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 12,
+                loc: loc(),
+            },
+            IlOp::BinSlotSlot {
+                op: Instruction::MULF as u8,
+                a: 7,
+                b: 7,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load {
+                slot: 12,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 7,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 7,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 13);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 12, .. })),
+            "temp tr store must remain (not coalesced into live zr)"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::BinSlotSlot { a: 7, b: 7, .. })),
+            "zi-style use must still read old zr in slot 7"
+        );
+    }
+
+    #[test]
+    fn coalesces_tak_style_call_result_temps() {
+        // Mimic tak: CALL results into 6/11/16 then shuffle copies to 7/12/17.
+        let mut ops = vec![
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 3,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 6, loc: loc() },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 3,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 11, loc: loc() },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 3,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 16, loc: loc() },
+            IlOp::Load { slot: 6, loc: loc() },
+            IlOp::StorePop { slot: 7, loc: loc() },
+            IlOp::Load { slot: 11, loc: loc() },
+            IlOp::StorePop { slot: 12, loc: loc() },
+            IlOp::Load { slot: 16, loc: loc() },
+            IlOp::StorePop { slot: 17, loc: loc() },
+            IlOp::Load { slot: 7, loc: loc() },
+            IlOp::Load { slot: 12, loc: loc() },
+            IlOp::Load { slot: 17, loc: loc() },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 16, .. }, IlOp::StorePop { slot: 17, .. })
+            )),
+            "should coalesce 16->17"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 17, .. })),
+            "result should land in 17"
+        );
+        // After STORE 17 raises tell, unused 6->7 / 11->12 copies should elide.
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { .. }, IlOp::StorePop { .. })
+            )),
+            "post-call tell-floor copies should elide after coalesce"
+        );
+    }
+
+    #[test]
+    fn coalesces_when_higher_dest_covers_tell_floor() {
+        // STORE 3; LOAD 3; STORE 4 — copy only exists to raise tell; s > t.
+        let mut ops = vec![
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 4, .. })),
+            "should store directly to 4"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 3, .. })),
+            "temp 3 should be coalesced away"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { .. }, IlOp::StorePop { .. })
+            )),
+            "copy should be removed"
+        );
     }
 }
