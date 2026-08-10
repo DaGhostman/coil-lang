@@ -34,6 +34,19 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially against the VM; any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test.
 
+Only the *bytecode* half of that model is under the differential gate, and the gap has already cost one bug: `effect_il` gave `Entry{Call}` a delta of `arity - 1` (the correct rule for `JumpIfMatch`) instead of `1 - arity`, so every symbolic-IL cursor past a call was wrong. Extending `cursor_model.rs` to diff the symbolic-IL path as well would close it.
+
+**Slot promotion only moves what the cursor proves.** `opt::slot_promote` drops a `STORE t` reached with the cursor at `t + 1` (TOS already *is* slot `t`, so the write and the store's own floor are both no-ops) together with the reload run in front of a `TailCall` whose arguments are already the top `arity` stack positions. It fires only when every surviving reference to the slot is dropped with it, because eliding the store leaves the slot defined by a bare push that no slot-tracking pass can see — hence it also runs *after* per-body GVN. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Store to a slot nothing reads | Dead code, not promotion — `dead_store`'s cursor proof owns that call |
+| Reload run in front of `CALL` | The callee frame base is `tell - arity`; a lower `tell` moves it down over caller slots, which needs slot liveness |
+| `LOAD t; RETURN` (cursor-provable) | Measured net loss: it is the suffix the whole-buffer return convoys sink into a join, and eliding it in one predecessor kills the sink |
+| Coalescing a copy whose destination is read in between | `mandelbrot`'s `tr → zr` needs the def sunk past the `zi` read — scheduling, not promotion |
+| Anything inside a loop whose body raises the cursor | The header cursor is genuinely `Unknown` (see `il::tell`), so no store in the body is provably redundant. This is what still holds `mandelbrot`'s 13 STOREs: normalizing the back edge with a `Seek` would make the header `Known` and turn all three inner temps into self-stores, at one dispatch per iteration |
+| Pool-packed fused slot operands (`BinSlot*Store` / `BinSlot*Jmpf`), `Seek`, `UnpackAt` | Destination slot is not readable from symbolic IL — the whole body is refused |
+
 **`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`.
 
 ## Test / CI reliability (high–medium)

@@ -41,24 +41,36 @@ Lua or Node ports.
 
 ### 1. Local slot promotion and SSA-like values
 
-Priority: highest.
+Priority: high (first slice landed).
 
 The shared operand/local stack still makes repeated `LOAD` / `STORE` traffic
-expensive. `gvn.rs` explicitly has no SSA slot rename, and the new
-cursor-safe copy propagation in `opt/dce.rs` is intentionally straight-line.
-The next pass should promote slots to virtual values within a function:
+expensive. `gvn.rs` explicitly has no SSA slot rename, and the cursor-safe copy
+propagation in `opt/dce.rs` is intentionally straight-line.
 
-- build per-function definitions and uses over symbolic `IlOp` blocks;
-- retain values across straight-line code and joins only when all incoming
-  definitions agree;
-- invalidate or flush at calls, host effects, field mutation, unknown bytes,
-  and address-sensitive operations;
-- lower virtual values back to `LOAD` / `STORE` at boundaries;
-- use the existing `tell` model as the safety proof for cursor changes.
+`opt/slot_promote.rs` takes the first slice using `tell` as the safety proof: a
+`STORE t` reached with the cursor at `t + 1` is writing TOS back to its own
+address, and the reload run in front of a `TailCall` is re-pushing values the
+call already finds on the stack. Together those take argument-materialization
+temps out of the frame — `tak` went from 4 LOAD words / 9 slots / 3 STOREs to 3
+LOAD words / 6 slots / 0 STOREs. Joins are free: `tell` poisons a point whose
+predecessors disagree, so `Known` is agreement.
 
-This should be measured first on `mandelbrot` and `tak`, where it can expose
-more `BinSlot*` and fused branch opportunities without changing the archive
-format.
+What it does *not* do, and what the next slice needs (see
+[limitations](limitations.md#il-optimizations-low) for the full refusal table):
+
+- **Real slot liveness.** Without it, promotion must leave every slot with a
+  visible def, which rules out `CALL` operand runs (the callee frame base is
+  `tell - arity`) and any store whose slot is still read.
+- **Cursor normalization at loop back edges.** `mandelbrot`'s inner loop enters
+  with cursor 10 and re-enters with 13, so its header is `Unknown` and none of
+  its 3 body stores are provably redundant. A `Seek` on the back edge would make
+  the header `Known` and turn all three into self-stores — one dispatch per
+  iteration against three stores, worth measuring.
+- **Scheduling.** `mandelbrot`'s `tr → zr` copy cannot coalesce because `zr` is
+  read between the def and the copy; sinking the def past that read is the fix.
+- **`Bin(slot, TOS)` operand shapes.** `mandelbrot`'s remaining `LOAD 5` / `LOAD
+  6` feed an `ADDF` whose other operand is on the stack, which no existing fused
+  form accepts. That is an opcode question, not a promotion one.
 
 ### 2. Loop range and bounds analysis
 
