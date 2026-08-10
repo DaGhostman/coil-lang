@@ -72,12 +72,28 @@ check_archive() {
 }
 
 for name in "${CROSS_LANG[@]}"; do
+    # Fair sequential row vs Lua/Node (IPA off). Same sources; only COIL_AUTO_PAR differs.
     archive="$OUT_DIR/${name}.hyc"
-    "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
+    COIL_AUTO_PAR=0 "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
     touch "$archive"
     check_archive "$name" "$archive"
     run_pooped "$name" \
         "$BIN run $archive" \
+        "lua benchmarks/${name}.lua" \
+        "node benchmarks/${name}.js"
+
+    # Default IPA on — evidence that principle-based auto-par helps when sites exist.
+    archive_par="$OUT_DIR/${name}_autopar.hyc"
+    "$BIN" compile "examples/perf/${name}.hy" -o "$archive_par" >/dev/null
+    touch "$archive_par"
+    got_par="$("$BIN" run "$archive_par")"
+    if [[ "$got_par" != "${EXPECTED[$name]}" ]]; then
+        echo "checksum mismatch for ${name}_autopar: expected ${EXPECTED[$name]}, got $got_par" >&2
+        exit 1
+    fi
+    printf -- '- checksum `%s_autopar`: `%s`\n' "$name" "$got_par" >>"$OUT_DIR/README.md"
+    run_pooped "${name}_autopar" \
+        "$BIN run $archive_par" \
         "lua benchmarks/${name}.lua" \
         "node benchmarks/${name}.js"
 

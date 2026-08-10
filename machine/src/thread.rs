@@ -530,6 +530,16 @@ fn encode_value(
         }
         _ => {}
     }
+    // Immortal unit enums are address-shared singletons; re-visits are DAG
+    // sharing, not cycles — encode by tag without consulting `visited`.
+    if let Object::Enum(gc) = &obj
+        && gc.as_ref().payload.is_empty()
+    {
+        return Ok(PortableValue::Enum {
+            tag: gc.as_ref().tag,
+            payload: vec![],
+        });
+    }
     if !visited.insert(addr) {
         return Err(ThreadErrorTag::NotSendable);
     }
@@ -1409,6 +1419,35 @@ mod tests {
         };
         assert_eq!(tag, 3);
         assert_eq!(payload, vec![PortableValue::Immediate(11)]);
+    }
+
+    /// Immortal unit-enum singletons are address-shared; a DAG that points at
+    /// the same Leaf twice must still encode (recursive IPA EnumCtor trees).
+    #[test]
+    fn portable_allows_shared_unit_enum_dag() {
+        let mut heap = Heap::default();
+        let leaf = heap.immortal_unit_enum(0);
+        let (node, _) = heap.alloc(
+            ObjEnum {
+                tag: 1,
+                payload: vec![Member::Object(leaf), Member::Object(leaf)],
+            },
+            Object::Enum,
+        );
+        let pv = value_to_portable(&heap, Value::from(node.addr())).expect("shared Leaf DAG");
+        let PortableValue::Enum { tag, payload } = pv else {
+            panic!("expected enum portable");
+        };
+        assert_eq!(tag, 1);
+        assert_eq!(payload.len(), 2);
+        assert!(matches!(
+            &payload[0],
+            PortableValue::Enum { tag: 0, payload: p } if p.is_empty()
+        ));
+        assert!(matches!(
+            &payload[1],
+            PortableValue::Enum { tag: 0, payload: p } if p.is_empty()
+        ));
     }
 
     #[test]

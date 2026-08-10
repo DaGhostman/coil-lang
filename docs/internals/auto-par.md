@@ -45,22 +45,23 @@ independent self-calls — and collects **constant** call-site arguments
 | `SelfCall` | `f(f(…), f(…), f(…))` (tak-style) |
 
 Arms are described structurally (`ArgForm::Const` / `Param` / `ParamMinus`), so
-any arity works and child arg vectors are derived statically. Codegen currently
-lowers only the unary `BinOp` case.
+any arity works and child arg vectors are derived statically.
 
-For each demanded `N > COIL_PAR_THRESHOLD` (default **20**), codegen emits a
-nullary specialization `__coil_par_{f}_{N}` that **always** forks:
+For each demanded constant argument vector whose **cost** (max component)
+exceeds `COIL_PAR_THRESHOLD` (default **20**), and that still reaches the fork
+under the site's path guards, codegen emits a nullary specialization
+`__coil_par_{f}_{a}_{b}_…` that **always** forks:
 
-1. `MakeFn` of `__coil_par_f_{N-a}` when that level is also specialized,
-   otherwise `MakeFn` of the original `f` with constant arg `N-a`.
-2. `thread_spawn` into the work-stealing reactor (no `GT` gate).
-3. On `Ok(handle)`: evaluate the other arm (spec or `f(N-b)`), `join`
-   (help-steals), apply `⊕`.
-4. On `Err`: sequential fallback of both arms.
+1. `MakeFn` of a child specialization when one exists for an arm's derived args,
+   otherwise `MakeFn` of the original `f` with those concrete args.
+2. `thread_spawn` the first arm into the work-stealing reactor (no `GT` gate).
+3. On `Ok(handle)`: evaluate remaining arms locally, `join` (help-steals), apply
+   the site's combine (`BinOp`, rebuild `SelfCall`, or `MakeEnum` for `EnumCtor`).
+4. On `Err` (spawn or non-sendable join): sequential fallback of all arms + combine.
 
-Call sites `f(N)` rewrite to `CALL __coil_par_f_N`. Levels at or below the
-threshold stay on the original sequential `f`. Dynamic `f(n)` with unknown `n`
-is **not** auto-parallelized (correctness-preserving; no runtime check tax).
+Call sites with matching const args rewrite to `CALL` the specialization.
+Below-threshold / dynamic args stay on the original sequential `f` (no hot-path
+runtime threshold tax).
 
 ## Loop IPA: chunked fork-join over an induction range
 
