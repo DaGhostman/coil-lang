@@ -8,7 +8,7 @@
 //! rewritten to specialized nullary clones that always fork (fully static, no
 //! runtime threshold checks).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use parser::ast::{EnumConstructPayload, Expression, Output};
 
@@ -68,6 +68,35 @@ pub enum ParCombine {
     },
 }
 
+/// Integer comparison in a fork-site [`ParGuard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Leq,
+    Gt,
+    Geq,
+    Eq,
+    Neq,
+}
+
+/// A condition that must hold for control to reach the fork site.
+///
+/// A specialized clone skips the function's base case entirely, so it may only
+/// be entered at arg vectors that actually reach the fork. [`Self::Opaque`]
+/// stands for any condition the analysis cannot evaluate and never holds, so
+/// unrecognized guards simply disable specialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParGuard {
+    Cmp {
+        lhs: ArgForm,
+        op: CmpOp,
+        rhs: ArgForm,
+        /// Whether the comparison must be true or false at the fork site.
+        expect: bool,
+    },
+    Opaque,
+}
+
 /// A recursive-pure function's primary parallelizable fork site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParForkSite {
@@ -77,6 +106,34 @@ pub struct ParForkSite {
     /// Independent self-calls (at least two).
     pub arms: Vec<ParArm>,
     pub combine: ParCombine,
+    /// Conditions, all of which must hold for the fork site to be reached.
+    pub guards: Vec<ParGuard>,
+}
+
+/// True when every guard holds for a concrete arg vector.
+pub fn guards_hold(guards: &[ParGuard], args: &[i64]) -> bool {
+    guards.iter().all(|g| match g {
+        ParGuard::Opaque => false,
+        ParGuard::Cmp {
+            lhs,
+            op,
+            rhs,
+            expect,
+        } => {
+            let (Some(l), Some(r)) = (eval_arg_form(lhs, args), eval_arg_form(rhs, args)) else {
+                return false;
+            };
+            let holds = match op {
+                CmpOp::Lt => l < r,
+                CmpOp::Leq => l <= r,
+                CmpOp::Gt => l > r,
+                CmpOp::Geq => l >= r,
+                CmpOp::Eq => l == r,
+                CmpOp::Neq => l != r,
+            };
+            holds == *expect
+        }
+    })
 }
 
 /// True when a concrete arg vector is expensive enough to fork.
@@ -129,8 +186,18 @@ pub fn analyze_par_fork_sites(
     out
 }
 
+/// Per-function cap on demanded specializations.
+///
+/// Each entry becomes an emitted clone that always forks, so multi-arg sites
+/// (whose closure grows combinatorially) need a code-size and spawn budget.
+/// Levels dropped by the budget simply stay on the sequential original.
+const PAR_SPEC_BUDGET: usize = 64;
+
 /// Constant call-site arg vectors for fork-site functions, closed under the
 /// arm transforms so every specialization a clone can reach also exists.
+///
+/// The closure is breadth-first (shallowest levels are the profitable ones)
+/// and bounded by [`PAR_SPEC_BUDGET`].
 pub fn collect_par_specialization_args(
     ast: &Output<'_>,
     sites: &HashMap<String, ParForkSite>,
@@ -141,22 +208,37 @@ pub fn collect_par_specialization_args(
         let Some(site) = sites.get(name) else {
             continue;
         };
-        let mut stack: Vec<Vec<i64>> = set.iter().cloned().collect();
-        let mut seen: HashSet<Vec<i64>> = HashSet::new();
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.clone()) {
-                continue;
+        // A clone has no base case, so it may only stand in for arg vectors
+        // that actually reach the fork site.
+        set.retain(|args| guards_hold(&site.guards, args));
+        let mut queue: VecDeque<Vec<i64>> = set.iter().cloned().collect();
+        let mut seen: HashSet<Vec<i64>> = set.iter().cloned().collect();
+        while let Some(cur) = queue.pop_front() {
+            if seen.len() >= PAR_SPEC_BUDGET {
+                break;
             }
             for arm in &site.arms {
                 let Some(child) = eval_arm_args(arm, &cur) else {
                     continue;
                 };
-                if const_args_worth_parallel(&child) && !seen.contains(&child) {
-                    stack.push(child);
+                // Negative args are base-case territory. Without this an arm
+                // that rotates a large param (tak's `f(z-1, x, y)`) keeps the
+                // max above the threshold forever and the closure diverges.
+                if child.iter().any(|a| *a < 0)
+                    || !const_args_worth_parallel(&child)
+                    || !guards_hold(&site.guards, &child)
+                {
+                    continue;
+                }
+                if seen.len() >= PAR_SPEC_BUDGET {
+                    break;
+                }
+                if seen.insert(child.clone()) {
+                    queue.push_back(child);
                 }
             }
-            set.insert(cur);
         }
+        *set = seen.into_iter().collect();
     }
     demanded.retain(|_, set| {
         set.retain(|args| const_args_worth_parallel(args));
@@ -232,8 +314,13 @@ fn detect_fork_site(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<
         param_names,
         param_int_like,
     };
-    let mut found: Vec<(bool, ParForkSite)> = Vec::new();
-    scan(body, &ctx, false, &mut found);
+    let mut scan = Scan {
+        ctx: &ctx,
+        guards: Vec::new(),
+        found: Vec::new(),
+    };
+    scan.walk(body, false);
+    let found = scan.found;
     let best = found
         .iter()
         .find(|(on_return, _)| *on_return)
@@ -264,26 +351,203 @@ fn fn_params(args: &Output<'_>) -> Option<(Vec<String>, Vec<bool>)> {
 }
 
 /// Depth-first body walk recording every fork site, tagged with whether it sits
-/// on a return path (those win when picking the function's primary site).
-fn scan(ast: &Output<'_>, ctx: &FnCtx<'_>, on_return: bool, found: &mut Vec<(bool, ParForkSite)>) {
-    if let Some(site) = match_fork(ast, ctx) {
-        found.push((on_return, site));
+/// on a return path (those win when picking the function's primary site) and
+/// with the path condition that must hold to reach it.
+struct Scan<'a> {
+    ctx: &'a FnCtx<'a>,
+    guards: Vec<ParGuard>,
+    found: Vec<(bool, ParForkSite)>,
+}
+
+impl Scan<'_> {
+    /// Walk `body` under one extra guard, then restore the guard stack.
+    fn walk_guarded(&mut self, body: &Output<'_>, on_return: bool, guard: ParGuard) {
+        let depth = self.guards.len();
+        self.guards.push(guard);
+        self.walk(body, on_return);
+        self.guards.truncate(depth);
     }
+
+    /// Statement list: each item may narrow the path condition for its successors.
+    fn walk_block(&mut self, items: &[Output<'_>], on_return: bool) {
+        let depth = self.guards.len();
+        for item in items {
+            self.walk(item, on_return);
+            match diverging_if_negation(item, self.ctx) {
+                Some(guard) => self.guards.push(guard),
+                // Any other statement that might return leaves the path
+                // condition unknown for everything after it.
+                None if contains_return(item) => self.guards.push(ParGuard::Opaque),
+                None => {}
+            }
+        }
+        self.guards.truncate(depth);
+    }
+
+    fn walk(&mut self, ast: &Output<'_>, on_return: bool) {
+        if let Some(site) = match_fork(ast, self.ctx, &self.guards) {
+            self.found.push((on_return, site));
+        }
+        match ast.1.as_ref() {
+            Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
+                self.walk_block(items, on_return);
+            }
+            Expression::List(items) | Expression::Array(items) | Expression::Tuple(items) => {
+                for item in items {
+                    self.walk(item, on_return);
+                }
+            }
+            // Else-if chain: every earlier condition failed for a later arm.
+            Expression::If(items) => {
+                let depth = self.guards.len();
+                for item in items {
+                    self.walk(item, on_return);
+                    if let Expression::Branch(Some(cond), _) = peel(item).1.as_ref() {
+                        self.guards.push(guard_from_cond(cond, self.ctx, false));
+                    }
+                }
+                self.guards.truncate(depth);
+            }
+            Expression::Return(inner) | Expression::ImplicitReturn(inner) => {
+                self.walk(inner, true);
+            }
+            Expression::Statement(inner)
+            | Expression::Expr(inner)
+            | Expression::ExprStatement(inner)
+            | Expression::Group(inner)
+            | Expression::Negate(inner)
+            | Expression::Positive(inner)
+            | Expression::Not(inner)
+            | Expression::LogicalNot(inner)
+            | Expression::Cast(inner, _)
+            | Expression::Try(inner)
+            | Expression::Readonly(inner) => self.walk(inner, on_return),
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Gt(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Geq(a, b)
+            | Expression::Coalesce(a, b)
+            | Expression::Assignment(a, b) => {
+                self.walk(a, on_return);
+                self.walk(b, on_return);
+            }
+            Expression::Call { name, args } => {
+                self.walk(name, on_return);
+                for a in args.iter().flatten() {
+                    self.walk(a, on_return);
+                }
+            }
+            Expression::Construct { fields, .. } => match fields {
+                EnumConstructPayload::Tuple(items) => {
+                    for item in items {
+                        self.walk(item, on_return);
+                    }
+                }
+                EnumConstructPayload::Record(fields) => {
+                    for f in fields {
+                        self.walk(&f.value, on_return);
+                    }
+                }
+                EnumConstructPayload::Unit => {}
+            },
+            Expression::Branch(cond, body) => match cond {
+                Some(c) => {
+                    self.walk(c, on_return);
+                    self.walk_guarded(body, on_return, guard_from_cond(c, self.ctx, true));
+                }
+                None => self.walk(body, on_return),
+            },
+            // Arms are scanned independently — a fork never spans two arms.
+            // Pattern tests are not evaluable, so arm bodies are opaque.
+            Expression::Match { scrutinee, arms } => {
+                self.walk(scrutinee, on_return);
+                for arm in arms {
+                    self.walk_guarded(&arm.body, on_return, ParGuard::Opaque);
+                }
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(i) = init {
+                    self.walk(i, on_return);
+                }
+                self.walk(cond, on_return);
+                if let Some(s) = step {
+                    self.walk(s, on_return);
+                }
+                self.walk_guarded(body, on_return, ParGuard::Opaque);
+            }
+            Expression::Loop { iterable, body, .. } => {
+                self.walk(iterable, on_return);
+                self.walk_guarded(body, on_return, ParGuard::Opaque);
+            }
+            Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
+                self.walk(init, on_return)
+            }
+            Expression::LetDestructure { rhs, .. } => self.walk(rhs, on_return),
+            _ => {}
+        }
+    }
+}
+
+/// `if cond { … return … }` with no `else`: everything after it runs with
+/// `cond` false. Returns `None` for statements that are not a diverging `if`.
+fn diverging_if_negation(item: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParGuard> {
+    let Expression::If(branches) = peel(item).1.as_ref() else {
+        return None;
+    };
+    let [branch] = branches.as_slice() else {
+        return None;
+    };
+    let Expression::Branch(Some(cond), body) = peel(branch).1.as_ref() else {
+        return None;
+    };
+    block_always_returns(body).then(|| guard_from_cond(cond, ctx, false))
+}
+
+/// True when the last statement of `body` is a `return` / `raise`.
+fn block_always_returns(body: &Output<'_>) -> bool {
+    let body = peel(body);
+    let last = match body.1.as_ref() {
+        Expression::Block(items) | Expression::Fragment(items) | Expression::Program(items) => {
+            match items.last() {
+                Some(last) => last,
+                None => return false,
+            }
+        }
+        _ => body,
+    };
+    matches!(
+        peel(last).1.as_ref(),
+        Expression::Return(_) | Expression::ImplicitReturn(_) | Expression::Raise(_)
+    )
+}
+
+/// Whether a statement can transfer control out of the enclosing function.
+///
+/// Covers the same node set as [`Scan::walk`]; anything else is a leaf
+/// expression that cannot hold a `return`.
+fn contains_return(ast: &Output<'_>) -> bool {
+    let any = |items: &[Output<'_>]| items.iter().any(contains_return);
     match ast.1.as_ref() {
+        Expression::Return(_) | Expression::ImplicitReturn(_) | Expression::Raise(_) => true,
         Expression::Program(items)
         | Expression::Block(items)
         | Expression::Fragment(items)
         | Expression::List(items)
         | Expression::Array(items)
         | Expression::Tuple(items)
-        | Expression::If(items) => {
-            for item in items {
-                scan(item, ctx, on_return, found);
-            }
-        }
-        Expression::Return(inner) | Expression::ImplicitReturn(inner) => {
-            scan(inner, ctx, true, found);
-        }
+        | Expression::If(items) => any(items),
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
@@ -294,7 +558,10 @@ fn scan(ast: &Output<'_>, ctx: &FnCtx<'_>, on_return: bool, found: &mut Vec<(boo
         | Expression::LogicalNot(inner)
         | Expression::Cast(inner, _)
         | Expression::Try(inner)
-        | Expression::Readonly(inner) => scan(inner, ctx, on_return, found),
+        | Expression::Readonly(inner)
+        | Expression::Variable(_, Some(inner))
+        | Expression::Constant(_, Some(inner))
+        | Expression::LetDestructure { rhs: inner, .. } => contains_return(inner),
         Expression::Add(a, b)
         | Expression::Sub(a, b)
         | Expression::Mul(a, b)
@@ -307,41 +574,22 @@ fn scan(ast: &Output<'_>, ctx: &FnCtx<'_>, on_return: bool, found: &mut Vec<(boo
         | Expression::Leq(a, b)
         | Expression::Geq(a, b)
         | Expression::Coalesce(a, b)
-        | Expression::Assignment(a, b) => {
-            scan(a, ctx, on_return, found);
-            scan(b, ctx, on_return, found);
-        }
+        | Expression::Assignment(a, b) => contains_return(a) || contains_return(b),
         Expression::Call { name, args } => {
-            scan(name, ctx, on_return, found);
-            for a in args.iter().flatten() {
-                scan(a, ctx, on_return, found);
-            }
+            contains_return(name) || args.iter().flatten().any(contains_return)
         }
         Expression::Construct { fields, .. } => match fields {
-            EnumConstructPayload::Tuple(items) => {
-                for item in items {
-                    scan(item, ctx, on_return, found);
-                }
-            }
+            EnumConstructPayload::Tuple(items) => any(items),
             EnumConstructPayload::Record(fields) => {
-                for f in fields {
-                    scan(&f.value, ctx, on_return, found);
-                }
+                fields.iter().any(|f| contains_return(&f.value))
             }
-            EnumConstructPayload::Unit => {}
+            EnumConstructPayload::Unit => false,
         },
         Expression::Branch(cond, body) => {
-            if let Some(c) = cond {
-                scan(c, ctx, on_return, found);
-            }
-            scan(body, ctx, on_return, found);
+            cond.as_ref().is_some_and(contains_return) || contains_return(body)
         }
-        // Arms are scanned independently — a fork never spans two arms.
         Expression::Match { scrutinee, arms } => {
-            scan(scrutinee, ctx, on_return, found);
-            for arm in arms {
-                scan(&arm.body, ctx, on_return, found);
-            }
+            contains_return(scrutinee) || arms.iter().any(|a| contains_return(&a.body))
         }
         Expression::For {
             init,
@@ -349,34 +597,67 @@ fn scan(ast: &Output<'_>, ctx: &FnCtx<'_>, on_return: bool, found: &mut Vec<(boo
             step,
             body,
         } => {
-            if let Some(i) = init {
-                scan(i, ctx, on_return, found);
-            }
-            scan(cond, ctx, on_return, found);
-            if let Some(s) = step {
-                scan(s, ctx, on_return, found);
-            }
-            scan(body, ctx, on_return, found);
+            init.as_ref().is_some_and(contains_return)
+                || contains_return(cond)
+                || step.as_ref().is_some_and(contains_return)
+                || contains_return(body)
         }
         Expression::Loop { iterable, body, .. } => {
-            scan(iterable, ctx, on_return, found);
-            scan(body, ctx, on_return, found);
+            contains_return(iterable) || contains_return(body)
         }
-        Expression::Variable(_, Some(init)) | Expression::Constant(_, Some(init)) => {
-            scan(init, ctx, on_return, found)
-        }
-        Expression::LetDestructure { rhs, .. } => scan(rhs, ctx, on_return, found),
-        _ => {}
+        _ => false,
+    }
+}
+
+/// Recognize `cond` as an integer comparison over parameters; anything else is
+/// [`ParGuard::Opaque`] so the fork site is never specialized.
+fn guard_from_cond(cond: &Output<'_>, ctx: &FnCtx<'_>, expect: bool) -> ParGuard {
+    let cond = peel(cond);
+    if let Expression::LogicalNot(inner) | Expression::Not(inner) = cond.1.as_ref() {
+        return guard_from_cond(inner, ctx, !expect);
+    }
+    let (op, a, b) = match cond.1.as_ref() {
+        Expression::Le(a, b) => (CmpOp::Lt, a, b),
+        Expression::Leq(a, b) => (CmpOp::Leq, a, b),
+        Expression::Gt(a, b) => (CmpOp::Gt, a, b),
+        Expression::Geq(a, b) => (CmpOp::Geq, a, b),
+        Expression::Eq(a, b) => (CmpOp::Eq, a, b),
+        Expression::Neq(a, b) => (CmpOp::Neq, a, b),
+        _ => return ParGuard::Opaque,
+    };
+    match (guard_operand(a, ctx), guard_operand(b, ctx)) {
+        (Some(lhs), Some(rhs)) => ParGuard::Cmp {
+            lhs,
+            op,
+            rhs,
+            expect,
+        },
+        _ => ParGuard::Opaque,
+    }
+}
+
+/// Comparison operand: an int literal or an int-like parameter (± a literal).
+fn guard_operand(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ArgForm> {
+    let form = arg_form(expr, ctx)?;
+    match form {
+        ArgForm::Const(_) => Some(form),
+        ArgForm::Param(i) => ctx
+            .param_int_like
+            .get(i)
+            .copied()
+            .unwrap_or(false)
+            .then_some(form),
+        ArgForm::ParamMinus { .. } => Some(form),
     }
 }
 
 /// Recognize the three IPA fork shapes at `expr` (no recursion).
-fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParForkSite> {
+fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>, guards: &[ParGuard]) -> Option<ParForkSite> {
     let expr = peel(expr);
     match expr.1.as_ref() {
-        Expression::Add(a, b) => binop_site(ctx, a, b, ParBinOp::Add),
-        Expression::Sub(a, b) => binop_site(ctx, a, b, ParBinOp::Sub),
-        Expression::Mul(a, b) => binop_site(ctx, a, b, ParBinOp::Mul),
+        Expression::Add(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Add),
+        Expression::Sub(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Sub),
+        Expression::Mul(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Mul),
         Expression::Construct {
             enum_name,
             variant_name,
@@ -385,6 +666,7 @@ fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParForkSite> {
             let arms = self_call_arms(items, ctx)?;
             site(
                 ctx,
+                guards,
                 arms,
                 ParCombine::EnumCtor {
                     enum_name: (*enum_name).to_string(),
@@ -397,7 +679,7 @@ fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParForkSite> {
             args: Some(args),
         } if callee_name(name) == Some(ctx.fn_name) => {
             let arms = self_call_arms(args, ctx)?;
-            site(ctx, arms, ParCombine::SelfCall)
+            site(ctx, guards, arms, ParCombine::SelfCall)
         }
         _ => None,
     }
@@ -405,15 +687,21 @@ fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParForkSite> {
 
 fn binop_site(
     ctx: &FnCtx<'_>,
+    guards: &[ParGuard],
     a: &Output<'_>,
     b: &Output<'_>,
     op: ParBinOp,
 ) -> Option<ParForkSite> {
     let arms = vec![self_call_arm(a, ctx)?, self_call_arm(b, ctx)?];
-    site(ctx, arms, ParCombine::BinOp(op))
+    site(ctx, guards, arms, ParCombine::BinOp(op))
 }
 
-fn site(ctx: &FnCtx<'_>, arms: Vec<ParArm>, combine: ParCombine) -> Option<ParForkSite> {
+fn site(
+    ctx: &FnCtx<'_>,
+    guards: &[ParGuard],
+    arms: Vec<ParArm>,
+    combine: ParCombine,
+) -> Option<ParForkSite> {
     if arms.len() < 2 {
         return None;
     }
@@ -422,6 +710,7 @@ fn site(ctx: &FnCtx<'_>, arms: Vec<ParArm>, combine: ParCombine) -> Option<ParFo
         param_count: ctx.param_names.len(),
         arms,
         combine,
+        guards: guards.to_vec(),
     })
 }
 
@@ -874,6 +1163,111 @@ fn main() {{
         assert!(!const_args_worth_parallel(&[t]));
         assert!(const_args_worth_parallel(&[t + 1]));
         assert!(!const_args_worth_parallel(&[]));
+    }
+
+    /// `f(z - 1, x, y)` keeps a large param alive in every child, so the
+    /// closure only terminates because negative args and the budget cut it.
+    #[test]
+    fn tak_specialization_closure_is_bounded() {
+        let ast = parse(
+            r#"
+fn tak(int x, int y, int z) -> int {
+    if y < x {
+        return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y));
+    }
+    return z;
+}
+fn main() {
+    let a = tak(21, 12, 6);
+    return;
+}
+"#,
+        );
+        let pure = analyze_recursive_pure(&ast);
+        let sites = analyze_par_fork_sites(&ast, &pure);
+        let demanded = collect_par_specialization_args(&ast, &sites);
+        let set = demanded.get("tak").expect("tak demands");
+        assert!(
+            set.contains(&vec![21, 12, 6]),
+            "root call site must survive"
+        );
+        assert!(
+            set.len() <= PAR_SPEC_BUDGET,
+            "budget exceeded: {}",
+            set.len()
+        );
+        assert!(
+            set.iter().all(|args| args.iter().all(|a| *a >= 0)),
+            "negative arg vectors must not be demanded: {set:?}"
+        );
+    }
+
+    /// A clone has no base case, so arg vectors that take the early return
+    /// must never be specialized (`tak(0, 0, 21)` returns `z` immediately).
+    #[test]
+    fn base_case_arg_vectors_are_not_specialized() {
+        let ast = parse(
+            r#"
+fn tak(int x, int y, int z) -> int {
+    if y >= x {
+        return z;
+    }
+    return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y));
+}
+fn main() {
+    let a = tak(21, 1, 0);
+    let b = tak(0, 0, 21);
+    return;
+}
+"#,
+        );
+        let pure = analyze_recursive_pure(&ast);
+        let sites = analyze_par_fork_sites(&ast, &pure);
+        let tak = sites.get("tak").expect("tak fork site");
+        assert_eq!(
+            tak.guards,
+            vec![ParGuard::Cmp {
+                lhs: ArgForm::Param(1),
+                op: CmpOp::Geq,
+                rhs: ArgForm::Param(0),
+                expect: false,
+            }]
+        );
+        let demanded = collect_par_specialization_args(&ast, &sites);
+        let set = demanded.get("tak").expect("tak demands");
+        assert!(set.contains(&vec![21, 1, 0]));
+        assert!(
+            !set.contains(&vec![0, 0, 21]),
+            "base-case vector must not be specialized: {set:?}"
+        );
+    }
+
+    /// An early return the analysis cannot evaluate must disable the site.
+    #[test]
+    fn opaque_guard_blocks_specialization() {
+        let ast = parse(
+            r#"
+fn f(int n) -> int {
+    if n % 2 == 0 { return 1; }
+    return f(n - 1) + f(n - 2);
+}
+fn main() {
+    let a = f(32);
+    return;
+}
+"#,
+        );
+        let pure = analyze_recursive_pure(&ast);
+        let sites = analyze_par_fork_sites(&ast, &pure);
+        assert_eq!(
+            sites.get("f").map(|s| s.guards.as_slice()),
+            Some(&[ParGuard::Opaque][..])
+        );
+        let demanded = collect_par_specialization_args(&ast, &sites);
+        assert!(
+            demanded.get("f").is_none(),
+            "unevaluable guard must block specialization: {demanded:?}"
+        );
     }
 
     #[test]
