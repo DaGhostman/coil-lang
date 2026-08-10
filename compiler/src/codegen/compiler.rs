@@ -5035,10 +5035,10 @@ impl Compiler {
             };
             vals.push(*n);
         }
-        if !crate::typechecking::const_args_worth_parallel(&vals) {
+        let key = Self::par_shape_key(fname);
+        if !crate::typechecking::args_worth_parallel(&self.par_shapes, key, &vals) {
             return false;
         }
-        let key = Self::par_shape_key(fname);
         let spec = crate::typechecking::par_specialization_name(key, &vals);
         let Some(&offset) = self.functions.get(&spec) else {
             return false;
@@ -5341,7 +5341,7 @@ impl Compiler {
         child_args: &[i64],
     ) -> Option<(u32, u32, bool)> {
         let callee = crate::typechecking::arm_callee(arm);
-        if crate::typechecking::const_args_worth_parallel(child_args) {
+        if crate::typechecking::args_worth_parallel(&self.par_shapes, callee, child_args) {
             let spec = crate::typechecking::par_specialization_name(callee, child_args);
             if let Some(&off) = self.functions.get(&spec) {
                 return Some((off as u32, 0, false));

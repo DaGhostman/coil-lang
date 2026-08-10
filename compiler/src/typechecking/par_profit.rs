@@ -139,16 +139,6 @@ pub fn guards_hold(guards: &[ParGuard], args: &[i64]) -> bool {
     })
 }
 
-/// True when a concrete arg vector is expensive enough to fork.
-///
-/// Cost is approximated by the largest argument; empty vectors never fork.
-pub fn const_args_worth_parallel(args: &[i64]) -> bool {
-    args.iter()
-        .copied()
-        .max()
-        .is_some_and(|m| m > par_cost_threshold())
-}
-
 // ---------------------------------------------------------------------------
 // Structural work score
 // ---------------------------------------------------------------------------
@@ -272,7 +262,6 @@ pub fn par_work_units(sites: &HashMap<String, ParForkSite>, fn_name: &str, args:
 }
 
 /// True when `fn_name(args)` carries more work than [`par_cost_threshold`].
-#[allow(dead_code)] // used by codegen's specialization gates
 pub fn args_worth_parallel(
     sites: &HashMap<String, ParForkSite>,
     fn_name: &str,
