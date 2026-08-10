@@ -1503,6 +1503,7 @@
                 bin_join_convoy: false,
                 multi_op_join_convoy: false,
                 invert_guard_branch: false,
+                slot_promote: false,
             },
             3,
         );
