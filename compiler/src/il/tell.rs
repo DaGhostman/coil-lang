@@ -563,6 +563,63 @@ mod tests {
         assert_eq!(info.tell_before(4).known(), Some(4));
     }
 
+    /// Arity 0 is the sharpest anti-regression vs the old `arity - 1` delta (+0):
+    /// a zero-arg call must still push one result (`delta = +1`).
+    #[test]
+    fn symbolic_il_call_arity_zero_pushes_one() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 2);
+        assert_eq!(info.tell_before(0).known(), Some(2));
+        assert_eq!(info.tell_before(1).known(), Some(3));
+    }
+
+    /// `MakeCoro` shares `call_arity_delta` with `Call` — keep them locked together.
+    #[test]
+    fn symbolic_il_make_coro_matches_call_delta() {
+        let loc = common::DebugLoc::unknown();
+        for arity in [0u32, 1, 3] {
+            let call = vec![
+                IlOp::Entry {
+                    kind: crate::il::op::EntryKind::Call,
+                    arity,
+                    target: Label(0),
+                    loc,
+                },
+                IlOp::Return { loc },
+            ];
+            let coro = vec![
+                IlOp::Entry {
+                    kind: crate::il::op::EntryKind::MakeCoro,
+                    arity,
+                    target: Label(0),
+                    loc,
+                },
+                IlOp::Return { loc },
+            ];
+            let entry = arity + 1;
+            let after_call = analyze_il_at(&call, entry).tell_before(1).known();
+            let after_coro = analyze_il_at(&coro, entry).tell_before(1).known();
+            assert_eq!(
+                after_call, after_coro,
+                "MakeCoro arity {arity} must match Call"
+            );
+            assert_eq!(
+                after_call,
+                Some(entry + 1 - arity),
+                "Call/MakeCoro arity {arity}"
+            );
+        }
+    }
+
     /// Unlike bytecode JumpIfMatch, IL carries arity so the taken edge is modelled.
     #[test]
     fn symbolic_il_jump_if_match_models_taken_edge_with_arity() {
