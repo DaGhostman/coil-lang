@@ -33,7 +33,7 @@ pub use kind::Kind;
 pub use loop_par::{LoopParSite, LoopParSites, LoopReduceOp, analyze_loop_par_sites};
 #[allow(unused_imports)] // public API re-export
 pub use par_profit::{
-    ArgForm, ParArm, ParBinOp, ParCombine, ParForkSite, analyze_par_fork_sites,
+    ArgForm, ParArm, ParBinOp, ParCombine, ParForkSite, analyze_par_fork_sites, arm_callee,
     collect_par_specialization_args, const_args_worth_parallel, eval_arm_args, par_cost_threshold,
     par_specialization_name,
 };

@@ -1,18 +1,16 @@
 //! Static shape + profitability analysis for Independent Parallel Arms (IPA).
 //!
 //! A *fork site* is an expression whose operands are two or more mutually
-//! independent self-calls: `f(a) ⊕ f(b)`, `E::V(f(a), f(b))`, or the tak-style
-//! `f(f(a), f(b), f(c))`. Arms are described structurally ([`ArgForm`]) rather
-//! than by function allowlists, so any arity and any combine shape below is
-//! recognized. Call sites with constant args above [`par_cost_threshold`] are
-//! rewritten to specialized nullary clones that always fork (fully static, no
-//! runtime threshold checks).
+//! independent **pure** calls — self-recursion is common but not required:
+//! `f(a) ⊕ f(b)`, `h(a) + h(b)`, `E::V(f(a), f(b))`, `(f(a), f(b))`, the
+//! tak-style `f(f(a), f(b), f(c))`, or `g(f(a), f(b))`. Arms are described
+//! structurally ([`ArgForm`]) rather than by function allowlists. Call sites
+//! with constant args above [`par_cost_threshold`] rewrite to specialized
+//! nullary clones that always fork (fully static, no runtime threshold checks).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use parser::ast::{EnumConstructPayload, Expression, Output};
-
-use super::purity::RecursivePureSet;
+use parser::ast::{EnumConstructPayload, Expression, Output, Pattern};
 
 /// Compile-time fork threshold (`COIL_PAR_THRESHOLD`, default 20).
 pub fn par_cost_threshold() -> i64 {
@@ -48,8 +46,8 @@ pub enum ArgForm {
 /// One independent arm of a fork site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParArm {
-    /// Call to the enclosing function; one [`ArgForm`] per parameter.
-    SelfCall { args: Vec<ArgForm> },
+    /// Call to a pure function (often self); one [`ArgForm`] per callee parameter.
+    Call { callee: String, args: Vec<ArgForm> },
 }
 
 /// How arm results are recombined once every arm has been joined.
@@ -59,8 +57,12 @@ pub enum ParArm {
 pub enum ParCombine {
     /// `arm0 ⊕ arm1` (exactly two arms).
     BinOp(ParBinOp),
-    /// Rebuild by calling the same fn with the arm results as args (tak-style).
+    /// Rebuild by calling the enclosing fn with the arm results as args (tak-style).
     SelfCall,
+    /// Call some other pure fn with the arm results as args.
+    ApplyCall { fn_name: String },
+    /// `(arm0, arm1, …)` tuple pack.
+    Tuple,
     /// `EnumName::Variant(arm0, arm1, …)`.
     EnumCtor {
         enum_name: String,
@@ -97,13 +99,13 @@ pub enum ParGuard {
     Opaque,
 }
 
-/// A recursive-pure function's primary parallelizable fork site.
+/// A pure function's primary parallelizable fork site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParForkSite {
     pub fn_name: String,
-    /// Declared parameter count; every arm supplies exactly this many args.
+    /// Declared parameter count of the enclosing function (for specialization keys).
     pub param_count: usize,
-    /// Independent self-calls (at least two).
+    /// Independent pure calls (at least two).
     pub arms: Vec<ParArm>,
     pub combine: ParCombine,
     /// Conditions, all of which must hold for the fork site to be reached.
@@ -161,8 +163,14 @@ pub fn par_specialization_name(fn_name: &str, args: &[i64]) -> String {
 
 /// Concrete child args for `arm` given the enclosing call's `parent_args`.
 pub fn eval_arm_args(arm: &ParArm, parent_args: &[i64]) -> Option<Vec<i64>> {
-    let ParArm::SelfCall { args } = arm;
+    let ParArm::Call { args, .. } = arm;
     args.iter().map(|f| eval_arg_form(f, parent_args)).collect()
+}
+
+/// Callee bare name for a [`ParArm::Call`].
+pub fn arm_callee(arm: &ParArm) -> &str {
+    let ParArm::Call { callee, .. } = arm;
+    callee
 }
 
 fn eval_arg_form(form: &ArgForm, parent_args: &[i64]) -> Option<i64> {
@@ -173,16 +181,16 @@ fn eval_arg_form(form: &ArgForm, parent_args: &[i64]) -> Option<i64> {
     }
 }
 
-/// Collect the primary fork site of every recursive-pure function.
+/// Collect the primary fork site of every pure function that has one.
 ///
-/// One site per function: the first profitable one found walking the body,
-/// preferring sites on a `return` / implicit-return path.
+/// One site per function: the first profitable clear-path site found walking
+/// the body, preferring return-path sites without opaque guards.
 pub fn analyze_par_fork_sites(
     ast: &Output<'_>,
-    recursive_pure: &RecursivePureSet,
+    pure_fns: &HashSet<String>,
 ) -> HashMap<String, ParForkSite> {
     let mut out = HashMap::new();
-    collect_sites(ast, recursive_pure, &mut out);
+    collect_sites(ast, pure_fns, &mut out);
     out
 }
 
@@ -257,62 +265,74 @@ struct FnCtx<'a> {
     param_names: Vec<String>,
     /// `param - k` forms are only meaningful for int-like parameters.
     param_int_like: Vec<bool>,
+    /// Pure callees allowed as fork arms (includes the enclosing fn when pure).
+    pure_fns: &'a HashSet<String>,
 }
 
 impl FnCtx<'_> {
     fn param_index(&self, name: &str) -> Option<usize> {
         self.param_names.iter().position(|p| p == name)
     }
+
+    fn is_pure_callee(&self, name: &str) -> bool {
+        self.pure_fns.contains(name)
+    }
 }
 
 fn collect_sites(
     ast: &Output<'_>,
-    recursive_pure: &RecursivePureSet,
+    pure_fns: &HashSet<String>,
     out: &mut HashMap<String, ParForkSite>,
 ) {
     match ast.1.as_ref() {
         Expression::Program(items) | Expression::Block(items) | Expression::Fragment(items) => {
             for item in items {
-                collect_sites(item, recursive_pure, out);
+                collect_sites(item, pure_fns, out);
             }
         }
-        Expression::Module(_, body) => collect_sites(body, recursive_pure, out),
+        Expression::Module(_, body) => collect_sites(body, pure_fns, out),
         Expression::Statement(inner)
         | Expression::Expr(inner)
         | Expression::ExprStatement(inner)
-        | Expression::Group(inner) => collect_sites(inner, recursive_pure, out),
+        | Expression::Group(inner) => collect_sites(inner, pure_fns, out),
         Expression::Function {
             name,
             args,
             body: Some(body),
             ..
-        } if recursive_pure.contains(*name) => {
-            if let Some(site) = detect_fork_site(name, args, body) {
+        } if pure_fns.contains(*name) => {
+            if let Some(site) = detect_fork_site(name, args, body, pure_fns) {
                 out.insert((*name).to_string(), site);
             }
-            collect_sites(body, recursive_pure, out);
+            collect_sites(body, pure_fns, out);
         }
         Expression::Function {
             body: Some(body), ..
-        } => collect_sites(body, recursive_pure, out),
+        } => collect_sites(body, pure_fns, out),
         Expression::Implementation { methods, .. } => {
             for m in methods {
-                collect_sites(m, recursive_pure, out);
+                collect_sites(m, pure_fns, out);
             }
         }
         Expression::Method(_, inner) | Expression::Member(inner) => {
-            collect_sites(inner, recursive_pure, out);
+            collect_sites(inner, pure_fns, out);
         }
         _ => {}
     }
 }
 
-fn detect_fork_site(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<ParForkSite> {
+fn detect_fork_site(
+    name: &str,
+    args: &Output<'_>,
+    body: &Output<'_>,
+    pure_fns: &HashSet<String>,
+) -> Option<ParForkSite> {
     let (param_names, param_int_like) = fn_params(args)?;
     let ctx = FnCtx {
         fn_name: name,
         param_names,
         param_int_like,
+        pure_fns,
     };
     let mut scan = Scan {
         ctx: &ctx,
@@ -321,9 +341,15 @@ fn detect_fork_site(name: &str, args: &Output<'_>, body: &Output<'_>) -> Option<
     };
     scan.walk(body, false);
     let found = scan.found;
+    let clear = |s: &ParForkSite| !s.guards.iter().any(|g| matches!(g, ParGuard::Opaque));
+    // Prefer return-path sites whose path conditions are fully evaluable so
+    // AlwaysPar clones stay sound; fall back to any clear site, then any site
+    // (opaque ones are kept for detection tests but never specialize).
     let best = found
         .iter()
-        .find(|(on_return, _)| *on_return)
+        .find(|(on_return, s)| *on_return && clear(s))
+        .or_else(|| found.iter().find(|(_, s)| clear(s)))
+        .or_else(|| found.iter().find(|(on_return, _)| *on_return))
         .or_else(|| found.first())?;
     Some(best.1.clone())
 }
@@ -465,11 +491,20 @@ impl Scan<'_> {
                 None => self.walk(body, on_return),
             },
             // Arms are scanned independently — a fork never spans two arms.
-            // Pattern tests are not evaluable, so arm bodies are opaque.
+            // Constructor patterns are not evaluable from const int args, so
+            // those bodies stay opaque. Irrefutable Binding / Wildcard arms
+            // inherit only the outer path guards (fork-inside-arm is OK).
             Expression::Match { scrutinee, arms } => {
                 self.walk(scrutinee, on_return);
                 for arm in arms {
-                    self.walk_guarded(&arm.body, on_return, ParGuard::Opaque);
+                    match &arm.pattern.1 {
+                        Pattern::Wildcard | Pattern::Binding { .. } => {
+                            self.walk(&arm.body, on_return);
+                        }
+                        Pattern::Constructor { .. } => {
+                            self.walk_guarded(&arm.body, on_return, ParGuard::Opaque);
+                        }
+                    }
                 }
             }
             Expression::For {
@@ -651,19 +686,40 @@ fn guard_operand(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ArgForm> {
     }
 }
 
-/// Recognize the three IPA fork shapes at `expr` (no recursion).
+/// Recognize the IPA fork shapes at `expr` (no recursion into subtrees).
 fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>, guards: &[ParGuard]) -> Option<ParForkSite> {
     let expr = peel(expr);
     match expr.1.as_ref() {
         Expression::Add(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Add),
         Expression::Sub(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Sub),
         Expression::Mul(a, b) => binop_site(ctx, guards, a, b, ParBinOp::Mul),
+        Expression::Tuple(items) => {
+            let arms = pure_call_arms(items, ctx)?;
+            site(ctx, guards, arms, ParCombine::Tuple)
+        }
         Expression::Construct {
             enum_name,
             variant_name,
             fields: EnumConstructPayload::Tuple(items),
         } => {
-            let arms = self_call_arms(items, ctx)?;
+            let arms = pure_call_arms(items, ctx)?;
+            site(
+                ctx,
+                guards,
+                arms,
+                ParCombine::EnumCtor {
+                    enum_name: (*enum_name).to_string(),
+                    variant_name: (*variant_name).to_string(),
+                },
+            )
+        }
+        Expression::Construct {
+            enum_name,
+            variant_name,
+            fields: EnumConstructPayload::Record(fields),
+        } => {
+            let items: Vec<&Output<'_>> = fields.iter().map(|f| &f.value).collect();
+            let arms = pure_call_arm_refs(&items, ctx)?;
             site(
                 ctx,
                 guards,
@@ -677,9 +733,19 @@ fn match_fork(expr: &Output<'_>, ctx: &FnCtx<'_>, guards: &[ParGuard]) -> Option
         Expression::Call {
             name,
             args: Some(args),
-        } if callee_name(name) == Some(ctx.fn_name) => {
-            let arms = self_call_arms(args, ctx)?;
-            site(ctx, guards, arms, ParCombine::SelfCall)
+        } => {
+            let arms = pure_call_arms(args, ctx)?;
+            let callee = callee_name(name)?;
+            let combine = if callee == ctx.fn_name {
+                ParCombine::SelfCall
+            } else if ctx.is_pure_callee(callee) {
+                ParCombine::ApplyCall {
+                    fn_name: callee.to_string(),
+                }
+            } else {
+                return None;
+            };
+            site(ctx, guards, arms, combine)
         }
         _ => None,
     }
@@ -692,7 +758,7 @@ fn binop_site(
     b: &Output<'_>,
     op: ParBinOp,
 ) -> Option<ParForkSite> {
-    let arms = vec![self_call_arm(a, ctx)?, self_call_arm(b, ctx)?];
+    let arms = vec![pure_call_arm(a, ctx)?, pure_call_arm(b, ctx)?];
     site(ctx, guards, arms, ParCombine::BinOp(op))
 }
 
@@ -714,16 +780,23 @@ fn site(
     })
 }
 
-/// Every operand must be an independent self-call: the combine consumes arm
+/// Every operand must be an independent pure call: the combine consumes arm
 /// results positionally, so a mixed operand list is not representable.
-fn self_call_arms(items: &[Output<'_>], ctx: &FnCtx<'_>) -> Option<Vec<ParArm>> {
+fn pure_call_arms(items: &[Output<'_>], ctx: &FnCtx<'_>) -> Option<Vec<ParArm>> {
     if items.len() < 2 {
         return None;
     }
-    items.iter().map(|i| self_call_arm(i, ctx)).collect()
+    items.iter().map(|i| pure_call_arm(i, ctx)).collect()
 }
 
-fn self_call_arm(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParArm> {
+fn pure_call_arm_refs(items: &[&Output<'_>], ctx: &FnCtx<'_>) -> Option<Vec<ParArm>> {
+    if items.len() < 2 {
+        return None;
+    }
+    items.iter().map(|i| pure_call_arm(i, ctx)).collect()
+}
+
+fn pure_call_arm(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParArm> {
     let expr = peel(expr);
     let Expression::Call {
         name,
@@ -732,14 +805,20 @@ fn self_call_arm(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ParArm> {
     else {
         return None;
     };
-    if callee_name(name) != Some(ctx.fn_name) || args.len() != ctx.param_names.len() {
+    let callee = callee_name(name)?;
+    if !ctx.is_pure_callee(callee) {
         return None;
     }
+    // Arms of the enclosing specialization are keyed by the *enclosing*
+    // function's params; each arm's forms must still parse under that ctx.
     let forms = args
         .iter()
         .map(|a| arg_form(a, ctx))
         .collect::<Option<Vec<_>>>()?;
-    Some(ParArm::SelfCall { args: forms })
+    Some(ParArm::Call {
+        callee: callee.to_string(),
+        args: forms,
+    })
 }
 
 fn arg_form(expr: &Output<'_>, ctx: &FnCtx<'_>) -> Option<ArgForm> {
@@ -944,7 +1023,7 @@ fn peel<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::purity::analyze_recursive_pure;
+    use crate::typechecking::purity::analyze_pure_fns;
     use parser::Pratt;
 
     fn parse(src: &str) -> Output<'static> {
@@ -955,13 +1034,17 @@ mod tests {
 
     fn sites_of(src: &str) -> HashMap<String, ParForkSite> {
         let ast = parse(src);
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         analyze_par_fork_sites(&ast, &pure)
     }
 
     fn arm_args(site: &ParForkSite, i: usize) -> &[ArgForm] {
-        let ParArm::SelfCall { args } = &site.arms[i];
+        let ParArm::Call { args, .. } = &site.arms[i];
         args
+    }
+
+    fn arm_callee_at(site: &ParForkSite, i: usize) -> &str {
+        arm_callee(&site.arms[i])
     }
 
     #[test]
@@ -978,7 +1061,7 @@ fn main() {
 }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         assert!(pure.contains("fib"));
         let sites = analyze_par_fork_sites(&ast, &pure);
         let fib = sites.get("fib").expect("fib fork site");
@@ -1176,7 +1259,7 @@ fn main() {{
 }}
 "#
         ));
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         let sites = analyze_par_fork_sites(&ast, &pure);
         let demanded = collect_par_specialization_args(&ast, &sites);
         assert!(
@@ -1206,7 +1289,7 @@ fn main() {
 }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         let sites = analyze_par_fork_sites(&ast, &pure);
         let demanded = collect_par_specialization_args(&ast, &sites);
         let set = demanded.get("tak").expect("tak demands");
@@ -1244,7 +1327,7 @@ fn main() {
 }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         let sites = analyze_par_fork_sites(&ast, &pure);
         let tak = sites.get("tak").expect("tak fork site");
         assert_eq!(
@@ -1280,7 +1363,7 @@ fn main() {
 }
 "#,
         );
-        let pure = analyze_recursive_pure(&ast);
+        let pure = analyze_pure_fns(&ast);
         let sites = analyze_par_fork_sites(&ast, &pure);
         assert_eq!(
             sites.get("f").map(|s| s.guards.as_slice()),
@@ -1290,6 +1373,82 @@ fn main() {
         assert!(
             demanded.get("f").is_none(),
             "unevaluable guard must block specialization: {demanded:?}"
+        );
+    }
+
+    #[test]
+    fn detects_independent_pure_helper_arms() {
+        let sites = sites_of(
+            r#"
+fn sq(int n) -> int {
+    return n * n;
+}
+fn pair_sq(int n) -> int {
+    if n <= 0 { return 0; }
+    return sq(n) + sq(n - 1);
+}
+fn main() { return; }
+"#,
+        );
+        let site = sites.get("pair_sq").expect("helper-arm fork site");
+        assert_eq!(site.combine, ParCombine::BinOp(ParBinOp::Add));
+        assert_eq!(arm_callee_at(site, 0), "sq");
+        assert_eq!(arm_callee_at(site, 1), "sq");
+        assert_eq!(arm_args(site, 0), [ArgForm::Param(0)]);
+        assert_eq!(
+            arm_args(site, 1),
+            [ArgForm::ParamMinus { param: 0, sub: 1 }]
+        );
+    }
+
+    #[test]
+    fn detects_apply_call_and_tuple_combines() {
+        let sites = sites_of(
+            r#"
+fn id(int n) -> int { return n; }
+fn add2(int a, int b) -> int { return a + b; }
+fn pack(int n) -> (int, int) {
+    if n <= 0 { return (0, 0); }
+    return (id(n), id(n - 1));
+}
+fn join(int n) -> int {
+    if n <= 0 { return 0; }
+    return add2(id(n), id(n - 1));
+}
+fn main() { return; }
+"#,
+        );
+        let pack = sites.get("pack").expect("tuple fork");
+        assert_eq!(pack.combine, ParCombine::Tuple);
+        let join = sites.get("join").expect("apply-call fork");
+        assert_eq!(
+            join.combine,
+            ParCombine::ApplyCall {
+                fn_name: "add2".to_string()
+            }
+        );
+    }
+
+    /// Irrefutable match arms inherit outer path guards so fork-inside-arm emits.
+    #[test]
+    fn irrefutable_match_arm_fork_keeps_clear_guards() {
+        let sites = sites_of(
+            r#"
+fn fibm(int n) -> int {
+    if n <= 1 { return n; }
+    return match n {
+        _ => fibm(n - 1) + fibm(n - 2),
+    };
+}
+fn main() { return; }
+"#,
+        );
+        let fibm = sites.get("fibm").expect("fibm fork site");
+        assert_eq!(fibm.combine, ParCombine::BinOp(ParBinOp::Add));
+        assert!(
+            !fibm.guards.iter().any(|g| matches!(g, ParGuard::Opaque)),
+            "irrefutable match arm must not opaque the fork: {:?}",
+            fibm.guards
         );
     }
 
