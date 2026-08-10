@@ -4225,6 +4225,58 @@ fn main() {
     assert_eq!(output, "8555,780");
 }
 
+/// A recursive-pure callee inside a chunk worker nests loop IPA under recursive
+/// IPA — the join has to help-steal rather than deadlock on a busy pool.
+#[test]
+fn auto_par_loop_over_recursive_pure_callee() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 25 {
+        acc = acc + fib(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // sum(fib(i)) for i in 0..25 = fib(26) - 1.
+    assert_eq!(output, "121392");
+}
+
+/// Bit operators and nested arithmetic in the reduction operand survive the
+/// re-emit into the worker's frame.
+#[test]
+fn auto_par_loop_bit_arithmetic_operand() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 40 {
+        acc = acc + ((i << 1) & 7);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // (2i mod 8) cycles 0,2,4,6 ten times.
+    assert_eq!(output, "120");
+}
+
 /// A body write the analysis cannot prove independent keeps the loop sequential.
 #[test]
 fn impure_loop_body_skips_par_worker() {
