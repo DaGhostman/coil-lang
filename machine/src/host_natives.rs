@@ -767,4 +767,39 @@ mod tests {
         assert_eq!(sig.args, vec![FfiType::Int, FfiType::Int, FfiType::Int]);
         assert_eq!(sig.ret, FfiType::Int);
     }
+
+    /// Auto-par specializations spawn N-ary recursive calls; the host native
+    /// must accept 1..=1+MAX args and still reject garbage beyond that.
+    #[test]
+    fn thread_spawn_arity_range_covers_max_thread_spawn_args() {
+        let natives = build_standard_host_natives(|_, _| {});
+        let spawn = natives
+            .iter()
+            .find(|n| n.name() == "thread_spawn")
+            .expect("thread_spawn");
+        let mut heap = crate::Heap::default();
+        let max = 1 + common::MAX_THREAD_SPAWN_ARGS;
+
+        let too_few = spawn.invoke(&mut heap, &[]);
+        assert!(
+            matches!(too_few, Err(crate::ffi::FfiError::ArityMismatch { .. })),
+            "zero args must fail arity: {too_few:?}"
+        );
+
+        let too_many: Vec<Value> = (0..=max).map(|i| Value::from(i as i64)).collect();
+        let over = spawn.invoke(&mut heap, &too_many);
+        assert!(
+            matches!(over, Err(crate::ffi::FfiError::ArityMismatch { .. })),
+            "above MAX_THREAD_SPAWN_ARGS must fail arity: {over:?}"
+        );
+
+        // Arity at the upper bound is accepted; the spawn itself fails because
+        // the first arg is not a callable — that still proves the range gate.
+        let at_max: Vec<Value> = (0..max).map(|i| Value::from(i as i64)).collect();
+        let at = spawn.invoke(&mut heap, &at_max);
+        assert!(
+            !matches!(at, Err(crate::ffi::FfiError::ArityMismatch { .. })),
+            "1+MAX args must pass the arity gate: {at:?}"
+        );
+    }
 }

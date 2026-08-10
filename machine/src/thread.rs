@@ -1450,6 +1450,32 @@ mod tests {
         ));
     }
 
+    /// Non-unit enums are not immortal singletons — address sharing is a real
+    /// cycle/DAG and must stay NotSendable so the unit-leaf carve-out cannot
+    /// widen to payload-bearing nodes.
+    #[test]
+    fn portable_rejects_shared_payload_enum_dag() {
+        let mut heap = Heap::default();
+        let (shared, _) = heap.alloc(
+            ObjEnum {
+                tag: 0,
+                payload: vec![Member::Value(Value::from(7_i64))],
+            },
+            Object::Enum,
+        );
+        let (node, _) = heap.alloc(
+            ObjEnum {
+                tag: 1,
+                payload: vec![Member::Object(shared), Member::Object(shared)],
+            },
+            Object::Enum,
+        );
+        assert_eq!(
+            value_to_portable(&heap, Value::from(node.addr())),
+            Err(ThreadErrorTag::NotSendable)
+        );
+    }
+
     #[test]
     fn portable_rejects_fn_object() {
         let mut heap = Heap::default();
