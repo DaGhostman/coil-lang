@@ -1272,6 +1272,15 @@ impl Compiler {
         false
     }
 
+    /// Shared refusals for the predicate peel: rest params, coroutines and
+    /// un-monomorphized generics change the callee ABI the peel replicates.
+    fn peel_callee_shape_ok(&self, fqn: &str, lookup: &str) -> bool {
+        !self.checker.fn_has_rest(lookup)
+            && !self.coroutine_fns.contains(fqn)
+            && !self.coroutine_fns.contains(lookup)
+            && !self.checker.is_generic_fn(lookup)
+    }
+
     fn try_predicate_peel_call_into(
         &mut self,
         fqn: &str,
@@ -1284,13 +1293,7 @@ impl Compiler {
             return false;
         };
         let lookup = strip_overload_key(fqn).to_string();
-        if self.checker.fn_has_rest(&lookup) {
-            return false;
-        }
-        if self.coroutine_fns.contains(fqn) || self.coroutine_fns.contains(&lookup) {
-            return false;
-        }
-        if self.checker.is_generic_fn(&lookup) {
+        if !self.peel_callee_shape_ok(fqn, &lookup) {
             return false;
         }
         let ops = self.bytecode.code_slice_raw_ops(start, end);
