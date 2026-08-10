@@ -10,7 +10,14 @@ User code does not name these directly; the compiler emits them:
 | `DeclareFFI` | `declare` |
 | `FfiInvoke` | `invoke` |
 | `HostInvoke` | Host-registered closure |
+| `HostInvokeNiche` | Allocation-free niche `Option<T>` Vec native |
+| `OptionNicheToHeap` / `HeapOptionToNiche` | Cross a pointer-niche `Option<T>` boundary |
+| `PairToHeap` / `HeapToPair` | Box or unbox a unary `[payload, tag]` pair |
+| `ReturnPair` | Return a unary pair without changing `Value` |
 | `Panic` | Abort after writing `panic: <msg>` |
+| `FloatChainStore` | Execute two or three source-ordered float stages and store (slots and/or const-pool operands; no FMA/reassoc) |
+| `BinSlotSlotConstJmpf` | `BinSlotSlot` float-arith + pool `CONST` + float `CmpJmpf` in one dispatch (e.g. mandelbrot `|z|² > 4`) |
+| `NEGF` | Float unary negate (IEEE sign-bit flip); replaces `CONST -1; MULF` |
 
 ---
 

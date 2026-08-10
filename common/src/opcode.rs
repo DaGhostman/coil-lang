@@ -267,6 +267,49 @@ pub enum Instruction {
     /// `payload_base` even when prior `STORE`s raised the high-water mark
     /// (shared stack/locals; see match-in-loop bindings).
     Seek,
+
+    /// Convert a pointer-niche `Option<T>` (`0` / heap payload) to a boxed
+    /// `Option<T>` enum at a representation boundary.
+    OptionNicheToHeap,
+    /// Convert a boxed `Option<T>` enum to its pointer-niche representation.
+    HeapOptionToNiche,
+
+    /// Test the tag at the top of a unary stack pair `[payload, tag]`.
+    /// A matching tag is consumed and branches to the packed target.
+    PairJumpIfTag,
+    /// Box a unary stack pair `[payload, tag]` as a heap enum.
+    PairToHeap,
+    /// Unbox a unary heap enum into `[payload, tag]`.
+    HeapToPair,
+    /// Return a unary stack pair `[payload, tag]` to the caller.
+    ReturnPair,
+    /// Invoke a known host native that returns pointer-niche `Option<T>`.
+    HostInvokeNiche,
+    /// Evaluate two or three source-ordered float binary stages and store.
+    ///
+    /// Opcode operand: `[31:16] dest_slot`, `[15:0] descriptor pool index`.
+    ///
+    /// Legacy descriptor (bit 63 clear): two stages, slot operands only —
+    /// `[7:0] op0`, `[15:8] lhs0`, `[23:16] rhs0`, `[31:24] op1`, `[39:32] rhs1`.
+    /// Acc starts as `op0(slot[lhs0], slot[rhs0])`, then `op1(acc, slot[rhs1])`.
+    ///
+    /// Extended (bit 63 set): optional third stage and const-pool operands —
+    /// same low fields, plus `[47:40] op2`, `[55:48] rhs2`, flags in `[62:56]`:
+    /// bit56 rhs0_const, bit57 rhs1_const, bit58 rhs2_const, bit59 lhs0_const,
+    /// bit60 stage1_other_on_left, bit61 stage2_other_on_left, bit62 has_stage2.
+    /// When `other_on_left`, that stage is `op(other, acc)` (stack const-under).
+    FloatChainStore,
+
+    /// `BinSlotSlot <float-arith>; CONST pool; CmpJmpf <float-cmp>` — one dispatch.
+    ///
+    /// Operands: `[31:24] bin_op`, `[23:16] a`, `[15:0] descriptor pool index`.
+    /// Descriptor: `[7:0] b`, `[15:8] cmp_op`, `[31:16] float_pool_idx`,
+    /// `[63:32] false-branch target PC`. Evaluates `bin_op(slot[a], slot[b])`
+    /// then compares with the pool float (source order; no FMA/reassoc).
+    BinSlotSlotConstJmpf,
+
+    /// Float unary negate (IEEE sign-bit flip). Replaces `CONST -1; MULF`.
+    NEGF,
 }
 
 impl From<u8> for Instruction {
@@ -402,6 +445,16 @@ impl Instruction {
             Self::BinSlotImmStore => "BinSlotImmStore",
             Self::BinSlotSlotStore => "BinSlotSlotStore",
             Self::Seek => "Seek",
+            Self::OptionNicheToHeap => "OptionNicheToHeap",
+            Self::HeapOptionToNiche => "HeapOptionToNiche",
+            Self::PairJumpIfTag => "PairJumpIfTag",
+            Self::PairToHeap => "PairToHeap",
+            Self::HeapToPair => "HeapToPair",
+            Self::ReturnPair => "ReturnPair",
+            Self::HostInvokeNiche => "HostInvokeNiche",
+            Self::FloatChainStore => "FloatChainStore",
+            Self::BinSlotSlotConstJmpf => "BinSlotSlotConstJmpf",
+            Self::NEGF => "NEGF",
         }
     }
 }
@@ -635,6 +688,44 @@ impl Byte {
             (o >> 24) as u8,
             ((o >> 16) & 0xFF) as usize,
             (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// BinSlotSlotConstJmpf: [31:24] bin_op, [23:16] a, [15:0] descriptor pool index.
+    pub fn with_bin_slot_slot_const_jmpf(mut self, bin_op: u8, a: u8, pool_idx: u16) -> Self {
+        self.operands = ((bin_op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_slot_const_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// Pack descriptor for [`Instruction::BinSlotSlotConstJmpf`].
+    pub fn pack_bin_slot_slot_const_jmpf_desc(
+        b: u8,
+        cmp_op: u8,
+        float_pool_idx: u16,
+        target: u32,
+    ) -> u64 {
+        (b as u64)
+            | ((cmp_op as u64) << 8)
+            | ((float_pool_idx as u64) << 16)
+            | ((target as u64) << 32)
+    }
+
+    /// Unpack descriptor for [`Instruction::BinSlotSlotConstJmpf`].
+    pub fn unpack_bin_slot_slot_const_jmpf_desc(packed: u64) -> (u8, u8, usize, usize) {
+        (
+            packed as u8,
+            (packed >> 8) as u8,
+            ((packed >> 16) & 0xFFFF) as usize,
+            (packed >> 32) as usize,
         )
     }
 
@@ -943,6 +1034,21 @@ impl ArchivedByte {
         )
     }
 
+    pub fn with_bin_slot_slot_const_jmpf(mut self, bin_op: u8, a: u8, pool_idx: u16) -> Self {
+        let packed = ((bin_op as u32) << 24) | ((a as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_slot_const_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
     pub fn bin_slot_imm_store_parts(&self) -> (u8, usize, usize) {
         let o: u32 = self.operands.into();
         (
@@ -1149,7 +1255,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::Seek as u8;
+        let last = Instruction::NEGF as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1158,9 +1264,36 @@ mod tests {
     fn mnemonic_covers_first_and_last_variants() {
         assert_eq!(Instruction::HALT.mnemonic(), "HALT");
         assert_eq!(Instruction::Seek.mnemonic(), "Seek");
+        assert_eq!(Instruction::ReturnPair.mnemonic(), "ReturnPair");
+        assert_eq!(Instruction::HostInvokeNiche.mnemonic(), "HostInvokeNiche");
+        assert_eq!(Instruction::FloatChainStore.mnemonic(), "FloatChainStore");
+        assert_eq!(
+            Instruction::BinSlotSlotConstJmpf.mnemonic(),
+            "BinSlotSlotConstJmpf"
+        );
+        assert_eq!(Instruction::NEGF.mnemonic(), "NEGF");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
+    }
+
+    #[test]
+    fn bin_slot_slot_const_jmpf_pack() {
+        let b = Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+            Instruction::ADDF as u8,
+            10,
+            3,
+        );
+        assert_eq!(
+            b.bin_slot_slot_const_jmpf_parts(),
+            (Instruction::ADDF as u8, 10, 3)
+        );
+        let desc = Byte::pack_bin_slot_slot_const_jmpf_desc(11, Instruction::GTF as u8, 6, 815);
+        let (slot_b, cmp, fidx, target) = Byte::unpack_bin_slot_slot_const_jmpf_desc(desc);
+        assert_eq!(slot_b, 11);
+        assert_eq!(cmp, Instruction::GTF as u8);
+        assert_eq!(fidx, 6);
+        assert_eq!(target, 815);
     }
 
     #[test]

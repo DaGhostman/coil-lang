@@ -2438,9 +2438,34 @@ fn attr_test_fn_discovered_by_harness() {
 }
 
 #[test]
+fn example_perf_tak_prints_expected() {
+    let output = run_example("examples/perf/tak.hy");
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn example_perf_fib_prints_checksum() {
+    // Prefer `COIL_AUTO_PAR=0` when timing; checksum is identical either way.
+    let output = run_example("examples/perf/fib.hy");
+    assert_eq!(output, "2178309");
+}
+
+#[test]
 fn example_perf_numeric_prints_expected_sum() {
     let output = run_example("examples/perf/numeric.hy");
     assert_eq!(output, "1999000");
+}
+
+#[test]
+fn example_perf_mandelbrot_prints_checksum() {
+    let output = run_example("examples/perf/mandelbrot.hy");
+    assert_eq!(output, "625885");
+}
+
+#[test]
+fn example_perf_binary_trees_prints_checksum() {
+    let output = run_example("examples/perf/binary_trees.hy");
+    assert_eq!(output, "135854");
 }
 
 #[test]
@@ -4141,6 +4166,289 @@ fn main() {
 }
 
 #[test]
+fn copy_prop_preserves_spilled_call_result_alias() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn produce() -> int {
+    return 41;
+}
+fn use_copy() -> int {
+    let value = produce();
+    let copy = value;
+    return copy + 1;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", use_copy())));
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn copy_prop_preserves_field_aliases() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn sum(Point point) -> int {
+    let alias = point;
+    return alias.x + alias.y;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", sum(new Point(3, 4)))));
+}
+"#,
+    );
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn copy_prop_preserves_match_aliases() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Choice {
+    Empty,
+    Value(int),
+}
+fn unwrap(Choice choice) -> int {
+    return match choice {
+        Choice::Empty => 0,
+        Choice::Value(value) => value,
+    };
+}
+fn main() {
+    let value = Choice::Value(42);
+    let alias = value;
+    write(stdout(), to_bytes(format("%i", unwrap(alias))));
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn copy_prop_preserves_loop_carried_writes() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sum_alias() -> int {
+    let seed = 3;
+    let alias = seed;
+    let i = 0;
+    let total = 0;
+    while i < 4 {
+        total = total + alias;
+        i = i + 1;
+    }
+    return total;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", sum_alias())));
+}
+"#,
+    );
+    assert_eq!(output, "12");
+}
+
+/// MakeEnum one-pass payload build must keep mixed Value/Object order for match.
+#[test]
+fn make_enum_mixed_payload_survives_match() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Pair {
+    Both(int, string),
+}
+fn describe(Pair p) -> int {
+    return match p {
+        Pair::Both(n, s) => n + len(s),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", describe(Pair::Both(7, "abcd")))));
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+#[test]
+fn direct_enum_consumers_avoid_heap_construction() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Choice {
+    Value(int),
+}
+enum Point {
+    Point { x: int },
+}
+fn main() {
+    let unwrapped = match Choice::Value(42) {
+        Choice::Value(value) => value,
+    };
+    let field = Point::Point { x: 9 }.x;
+    write(stdout(), to_bytes(format("%i,%i", unwrapped, field)));
+}
+"#,
+    );
+    assert_eq!(output, "42,9");
+}
+
+#[test]
+fn direct_class_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    let x = new Point(5, 6).x;
+    write(stdout(), to_bytes(format("%i", x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("class field source");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "direct class field access should not allocate or touch fields"
+    );
+}
+
+#[test]
+fn pointer_niche_option_match_and_coalesce() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn show(Option<string> value) -> string {
+    return match value {
+        Option::Some(text) => text,
+        Option::None => "none",
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%s,%s", show(Option::Some("ok")), show(Option::None))));
+}
+"#,
+    );
+    assert_eq!(output, "ok,none");
+}
+
+#[test]
+fn direct_result_pair_match_and_try() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn parse(int value) {
+    if value < 0 {
+        raise "bad";
+    }
+    return value;
+}
+fn inc(int value) {
+    let parsed = parse(value)?;
+    return parsed + 1;
+}
+fn main() {
+    let ok = match parse(4) {
+        Result::Ok(value) => value,
+        Result::Err(_) => -1,
+    };
+    let bad = match inc(-1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    let direct_bad = match parse(-1) {
+        Result::Ok(_) => 0,
+        Result::Err(_) => 1,
+    };
+    write(
+        stdout(),
+        to_bytes(format("%i,%i,%i", ok, bad, direct_bad)),
+    );
+}
+"#,
+    );
+    assert_eq!(output, "4,1,1");
+}
+
+#[test]
+fn custom_iterator_uses_pointer_niche_option() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class TextCounter {
+    cur: int,
+    end: int,
+    text: string,
+}
+impl IntoIterator<TextCounter> {
+    type Item = string;
+    type IntoIter = TextCounter;
+    fn into_iter(TextCounter value) -> TextCounter {
+        return value;
+    }
+}
+impl Iterator<TextCounter> {
+    type Item = string;
+    fn next(TextCounter value) -> Option<string> {
+        if value.cur < value.end {
+            value.cur = value.cur + 1;
+            return Option::Some(value.text);
+        }
+        return Option::None;
+    }
+}
+fn main() {
+    let value = new TextCounter(0, 2, "x");
+    for text in value {
+        write(stdout(), to_bytes(format("%s", text)));
+    }
+}
+"#,
+    );
+    assert_eq!(output, "xx");
+}
+
+#[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");
     assert_eq!(output, "42");
@@ -4477,20 +4785,33 @@ fn main() {
 }
 
 #[test]
-fn aggregate_float_negate_uses_mulf_not_int_neg() {
+fn aggregate_float_negate_uses_negf_not_int_neg() {
     // Regression: float aggregate unary `-` must not emit int `NEG`
-    // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
-    let output = run_example_src(
-        r#"
+    // (which bit-twiddles a float as i64). Float path is `NEGF`.
+    use common::Instruction;
+    let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
 fn main() {
     let d = -(1.5, 2.0);
     write(stdout(), to_bytes(format("%f,%f", d[0], d[1])));
 }
-"#,
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::NEGF)),
+        "expected NEGF for float aggregate negate"
     );
-    assert_eq!(output, "-1.5,-2.0");
+    assert!(
+        !bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::NEG)),
+        "float aggregate negate must not emit int NEG"
+    );
+    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "-1.5,-2.0");
 }
 
 #[test]

@@ -30,6 +30,7 @@ pub struct Heap {
     gc_gray: Vec<Object>,
     gc_root_objects: Vec<Object>,
     gc_roots: Vec<u64>,
+    gc_dangling_strings: Vec<RefString>,
 }
 
 impl Default for Heap {
@@ -46,6 +47,7 @@ impl Default for Heap {
             gc_gray: Vec::new(),
             gc_root_objects: Vec::new(),
             gc_roots: Vec::new(),
+            gc_dangling_strings: Vec::new(),
         }
     }
 }
@@ -76,6 +78,7 @@ impl Heap {
         self.head = Some(object);
         self.alloc_bytes += size;
         self.addr_index.insert(object.addr(), object);
+        crate::vm::note_heap_alloc();
 
         (object, content)
     }
@@ -87,6 +90,29 @@ impl Heap {
         if let Some(s) = self.strings.find(&data, hash) {
             return s;
         }
+        self.intern_new(data, hash)
+    }
+
+    /// Intern a borrowed string without allocating when it is already cached.
+    pub fn intern_str(&mut self, data: &str) -> RefString {
+        let hash = ObjString::hash(data);
+        if let Some(s) = self.strings.find(data, hash) {
+            return s;
+        }
+        self.intern_new(data.to_owned(), hash)
+    }
+
+    /// Register an existing string object in the intern table when needed.
+    pub fn intern_ref(&mut self, string: RefString) -> RefString {
+        let data = string.as_ref();
+        if let Some(s) = self.strings.find(&data.data, data.hash) {
+            return s;
+        }
+        self.strings.insert(string, ());
+        string
+    }
+
+    fn intern_new(&mut self, data: String, hash: u32) -> RefString {
         let obj_string = ObjString { data, hash };
         let (_, s) = self.alloc(obj_string, Object::String);
         self.strings.insert(s, ());
@@ -107,6 +133,16 @@ impl Heap {
         self.alloc(obj_lib, Object::Library)
     }
 
+    /// Allocate an enum value, reusing the immortal object for unit variants.
+    pub fn alloc_enum_value(&mut self, tag: u32, payload: Vec<Member>) -> common::Value {
+        let object = if payload.is_empty() {
+            self.immortal_unit_enum(tag)
+        } else {
+            self.alloc(ObjEnum { tag, payload }, Object::Enum).0
+        };
+        common::Value::from(object.addr())
+    }
+
     /// Releases all objects that aren't marked. This method also removes
     /// interned strings when no object is referencing them.
     ///
@@ -119,13 +155,14 @@ impl Heap {
         let mut prev_obj: Option<Object> = None;
         let mut curr_obj = self.head;
 
-        let mut dangling_strings = Vec::with_capacity(self.strings.len());
+        let mut dangling_strings = std::mem::take(&mut self.gc_dangling_strings);
+        dangling_strings.clear();
         for (k, ()) in self.strings.iter() {
             if !k.is_marked() {
                 dangling_strings.push(k);
             }
         }
-        for s in dangling_strings {
+        for s in dangling_strings.drain(..) {
             self.strings.remove(s);
         }
 
@@ -148,6 +185,7 @@ impl Heap {
         }
 
         self.gc_next_threshold = self.alloc_bytes * self.gc_growth_factor;
+        self.gc_dangling_strings = dangling_strings;
     }
 
     /// Returns the number of bytes that are being allocated.
@@ -1939,6 +1977,47 @@ mod tests {
         assert!(heap.find_object_by_addr(addr.wrapping_add(1)).is_none());
     }
 
+    #[test]
+    fn borrowed_intern_reuses_existing_string_without_heap_growth() {
+        let mut heap = Heap::default();
+        let first = heap.intern("literal".to_owned());
+        let size = heap.size();
+        let second = heap.intern_str("literal");
+
+        assert!(Gc::ptr_eq(first, second));
+        assert_eq!(heap.size(), size);
+        assert_eq!(
+            heap.into_iter()
+                .filter(|obj| matches!(obj, Object::String(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn intern_ref_registers_an_existing_string_without_copying() {
+        let mut heap = Heap::default();
+        let (object, string) = heap.alloc(ObjString::from("raw"), Object::String);
+        let resolved = heap.intern_ref(string);
+        let found = heap.intern_str("raw");
+
+        assert_eq!(object.addr(), resolved.as_ptr() as u64);
+        assert!(Gc::ptr_eq(resolved, found));
+    }
+
+    #[test]
+    fn sweep_reuses_dangling_string_scratch() {
+        let mut heap = Heap::default();
+        let _ = heap.intern("first".to_owned());
+        unsafe { heap.sweep() };
+        let capacity = heap.gc_dangling_strings.capacity();
+        assert!(capacity >= 1);
+
+        let _ = heap.intern("second".to_owned());
+        unsafe { heap.sweep() };
+        assert_eq!(heap.gc_dangling_strings.capacity(), capacity);
+    }
+
     /// Byte-threshold GC: under threshold → no collect; after a rooted sweep the
     /// threshold scales with live bytes so a single surviving object does not
     /// trigger on every subsequent alloc.
@@ -2009,6 +2088,21 @@ mod tests {
             heap.immortal_unit_enum(7).addr(),
             immortal_addr,
             "post-sweep lookup must reuse the same singleton"
+        );
+    }
+
+    #[test]
+    fn alloc_enum_value_reuses_unit_singletons() {
+        let mut heap = Heap::default();
+        let first = heap.alloc_enum_value(3, Vec::new());
+        let second = heap.alloc_enum_value(3, Vec::new());
+
+        assert_eq!(first.raw(), second.raw());
+        assert_eq!(
+            heap.into_iter()
+                .filter(|obj| matches!(obj, Object::Enum(_)))
+                .count(),
+            1
         );
     }
 

@@ -953,6 +953,7 @@ impl Compiler {
                     | Instruction::CmpJmpf
                     | Instruction::BinSlotImmJmpf
                     | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotSlotConstJmpf
                     | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
@@ -1058,15 +1059,39 @@ impl Compiler {
         }
     }
 
+    /// Resolve a function body byte span, including provisional self-bodies.
+    ///
+    /// While a function is still streaming into `self.bytecode`, the span is
+    /// recorded as `(start, start)`. Callers then use `bytecode.len()` as the
+    /// live end so self-recursive peels can see the opening predicate.
+    /// The third flag is `true` when the body is still incomplete (no "rest"
+    /// required for peel matching).
+    fn resolve_fn_span(&self, fqn: &str) -> Option<(usize, usize, bool)> {
+        let &(start, end) = self.fn_bytecode_spans.get(fqn)?;
+        if end > start {
+            return Some((start, end, false));
+        }
+        let cur = self.bytecode.len();
+        if cur > start {
+            Some((start, cur, true))
+        } else {
+            None
+        }
+    }
+
     fn try_inline_direct_call_into(
         &mut self,
         fqn: &str,
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        // Incomplete self-bodies are not safe to tiny-inline (missing else/rest).
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
+        if provisional {
+            return false;
+        }
         let lookup = strip_overload_key(fqn).to_string();
         if self.checker.fn_has_rest(&lookup) {
             return false;
@@ -1184,9 +1209,13 @@ impl Compiler {
         args: Option<&[Output<'_>]>,
         bytecode: &mut Vec<Byte>,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        // Need a finished body: mid-compile self-unroll would copy a partial CFG.
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
+        if provisional {
+            return false;
+        }
         let lookup = strip_overload_key(fqn).to_string();
         if self.checker.fn_has_rest(&lookup) {
             return false;
@@ -1267,7 +1296,7 @@ impl Compiler {
         target_offset: u32,
         is_indirect: bool,
     ) -> bool {
-        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
         let lookup = strip_overload_key(fqn).to_string();
@@ -1281,7 +1310,7 @@ impl Compiler {
             return false;
         }
         let ops = self.bytecode.code_slice_raw_ops(start, end);
-        let Some(peel) = Self::match_predicate_peel_shape(&ops) else {
+        let Some(peel) = Self::match_predicate_peel_shape(&ops, !provisional) else {
             return false;
         };
         drop(ops);
@@ -1395,7 +1424,10 @@ impl Compiler {
 
     /// Opening shape: `cond…; JumpIfFalse; (Const|Load) [; Return]; Label? …`
     /// with an imm/slot base return. `arity_hint` is 1 + max slot referenced.
-    fn match_predicate_peel_shape(ops: &[IlOp]) -> Option<PredicatePeel> {
+    ///
+    /// When `require_rest` is false (provisional self-body), accept an opening
+    /// early-return even if the recursive remainder has not been emitted yet.
+    fn match_predicate_peel_shape(ops: &[IlOp], require_rest: bool) -> Option<PredicatePeel> {
         // Skip leading labels.
         let mut i = 0usize;
         while i < ops.len() && matches!(ops[i], IlOp::Label(_)) {
@@ -1546,11 +1578,14 @@ impl Compiler {
             (v, end)
         };
         // After then-arm there should be more body (otherwise tiny-inline diamond
-        // would have taken it). Require at least one emitting op past the peel.
+        // would have taken it). Require at least one emitting op past the peel
+        // unless this is a provisional self-body (rest not emitted yet).
         let after = then_end + 1;
-        let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
-        if !has_rest {
-            return None;
+        if require_rest {
+            let has_rest = ops[after..].iter().any(|op| !matches!(op, IlOp::Label(_)));
+            if !has_rest {
+                return None;
+            }
         }
         let mut arity_hint = 0usize;
         let bump_slot = |slot: u32, hint: &mut usize| {
@@ -2482,7 +2517,7 @@ impl Compiler {
             self.append_with_existential_pack(bytecode, arg);
             if box_generic {
                 if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                    self.emit_generic_arg_box(bytecode, &arg_ty);
                 }
             }
         }
@@ -2491,7 +2526,7 @@ impl Compiler {
                 self.append_with_existential_pack(bytecode, arg);
                 if box_generic {
                     if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                        self.emit_generic_arg_box(bytecode, &arg_ty);
                     }
                 }
             }
@@ -2702,7 +2737,7 @@ impl Compiler {
             self.append_with_existential_pack(bytecode, arg);
             if box_generic {
                 if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                    self.emit_generic_arg_box(bytecode, &arg_ty);
                 }
             }
             let tmp = self.alloc_temp_slot();
@@ -2721,7 +2756,7 @@ impl Compiler {
                 self.append_with_existential_pack(bytecode, arg);
                 if box_generic {
                     if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                        self.emit_generic_arg_box(bytecode, &arg_ty);
                     }
                 }
                 let tmp = self.alloc_temp_slot();
@@ -2751,7 +2786,7 @@ impl Compiler {
                 self.append_with_existential_pack(bytecode, arg);
                 if box_generic {
                     if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                        self.emit_generic_arg_box(bytecode, &arg_ty);
                     }
                 }
                 let tmp = self.alloc_temp_slot();
@@ -2789,7 +2824,7 @@ impl Compiler {
                 self.append_with_existential_pack(bytecode, arg);
                 if box_generic {
                     if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                        self.emit_generic_arg_box(bytecode, &arg_ty);
                     }
                 }
             }
@@ -2804,7 +2839,9 @@ impl Compiler {
         self.bytecode.append(&mut staged);
         if box_generic {
             if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                Self::emit_box_if_needed(&mut self.bytecode, &arg_ty);
+                let mut box_bc = Vec::new();
+                self.emit_generic_arg_box(&mut box_bc, &arg_ty);
+                self.bytecode.extend(box_bc);
             }
         }
         let tmp = self.alloc_temp_slot();
@@ -2913,6 +2950,15 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
+    /// Direct `CALL` when the callee entry is statically known (no stack target).
+    ///
+    /// Prefer this over [`Self::emit_call_indirect`] for ground method / instance
+    /// thunks: same frame ABI, one fewer dispatch, no `CodePtr` materialization.
+    /// Keep `CallIndirect` for PolyFn / locals / dictionary `Index` targets.
+    fn emit_known_target_call(bytecode: &mut impl EmitBuf, target_offset: u32, arity: u32) {
+        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(arity, target_offset));
+    }
+
     /// Lower an operator selected by HM inference to the uniform dictionary
     /// calling convention: two boxed values, the hidden trailing dictionary,
     /// then its method entry loaded from the dictionary tuple.
@@ -2980,7 +3026,7 @@ impl Compiler {
                 (AggregateOp::Mod, true) => Instruction::MODF,
                 (AggregateOp::Pow, false) => Instruction::Pow,
                 (AggregateOp::Pow, true) => Instruction::PowF,
-                // Neg is handled by `emit_neg_tos` (float uses MULF −1; no NEGF).
+                // Neg is handled by `emit_neg_tos` (float uses NEGF).
                 (AggregateOp::Neg, _) => Instruction::NEG,
             }
         };
@@ -3326,13 +3372,10 @@ impl Compiler {
         true
     }
 
-    /// Negate TOS: int via `NEG`; float via `MULF` by −1 (no `NEGF` opcode).
+    /// Negate TOS: int via `NEG`; float via `NEGF`.
     fn emit_neg_tos(&mut self, bytecode: &mut Vec<Byte>, is_float: bool) {
         if is_float {
-            let bits = Value::from(-1.0f64).raw() as u64;
-            let idx = self.intern_constant(bits);
-            bytecode.push_const_pool(idx);
-            bytecode.push(Byte::new(Instruction::MULF));
+            bytecode.push(Byte::new(Instruction::NEGF));
         } else {
             bytecode.push(Byte::new(Instruction::NEG));
         }
@@ -3718,7 +3761,7 @@ impl Compiler {
         bytecode.push_store_pop(rhs_slot);
         bytecode.push_load(lhs_slot);
         bytecode.push_load(rhs_slot);
-        Self::emit_call_indirect(bytecode, offset as u32, 2);
+        Self::emit_known_target_call(bytecode, offset as u32, 2);
         true
     }
 
@@ -4139,7 +4182,7 @@ impl Compiler {
                 self.bytecode.append(&mut arg_bc);
                 // Box using the lookup head so enum Constructs get Enum tag.
                 Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
-                Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                Self::emit_known_target_call(&mut self.bytecode, offset as u32, 1);
                 return;
             }
         }
@@ -4194,7 +4237,7 @@ impl Compiler {
                     && let Some(&offset) = self.functions.get(&fqn)
                 {
                     Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
-                    Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                    Self::emit_known_target_call(&mut self.bytecode, offset as u32, 1);
                 } else {
                     self.bytecode.push(Byte::new(Instruction::STRINGIFY));
                 }
@@ -5226,6 +5269,31 @@ impl Compiler {
                 .push_host_invoke(slots.len() as u32);
             compiler.bytecode.push_return();
         };
+        let emit_host_niche =
+            |compiler: &mut Self, fqn: String, native: &str, slots: &[u32]| {
+                if compiler.functions.contains_key(&fqn) {
+                    return;
+                }
+                let Some(native_id) = compiler.native_id(native) else {
+                    return;
+                };
+                compiler.bind_function_entry(fqn);
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                for &slot in slots {
+                    compiler.bytecode.push_load(slot);
+                }
+                compiler
+                    .bytecode
+                    .push_make_tuple(slots.len() as u32);
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::HostInvokeNiche).with_operand_u32(
+                        slots.len() as u32,
+                    ));
+                compiler.bytecode.push_return();
+            };
 
         // static fn new() -> Vec<T>
         {
@@ -5275,6 +5343,13 @@ impl Compiler {
         emit_host(self, format!("{owner}::remove"), "vec_remove", &[0, 1]);
         emit_host(self, format!("{owner}::reserve"), "vec_reserve", &[0, 1]);
         emit_host(self, format!("{owner}::insert"), "vec_insert", &[0, 1, 2]);
+        emit_host_niche(self, format!("{owner}::__niche_pop"), "vec_pop", &[0]);
+        emit_host_niche(
+            self,
+            format!("{owner}::__niche_remove"),
+            "vec_remove",
+            &[0, 1],
+        );
     }
 
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
@@ -5348,6 +5423,133 @@ impl Compiler {
         Some(Self::peel_fn_return_ty(&applied))
     }
 
+    fn pair_value_ty_supported(ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(_) | Ty::Fun(_, _) | Ty::Existential { .. } | Ty::Forall { .. } => false,
+            Ty::Array {
+                length: crate::typechecking::ty::ArrayLength::Static(_),
+                ..
+            } => false,
+            Ty::Readonly(inner) | Ty::Constructor { owner: inner, .. } => {
+                Self::pair_value_ty_supported(inner)
+            }
+            Ty::App(_, args) => args.iter().all(Self::pair_value_ty_supported),
+            Ty::List(inner) => Self::pair_value_ty_supported(inner),
+            Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
+                payload
+                    .field_types()
+                    .into_iter()
+                    .all(Self::pair_value_ty_supported)
+            }),
+            Ty::Tuple(items) => items.iter().all(Self::pair_value_ty_supported),
+            Ty::Record { fields } => fields
+                .iter()
+                .all(|(_, field)| Self::pair_value_ty_supported(field)),
+            Ty::Array {
+                length: crate::typechecking::ty::ArrayLength::Dynamic,
+                ..
+            }
+            | Ty::Con(_)
+            | Ty::Never => true,
+        }
+    }
+
+    /// Return `Some(is_option)` for a compiled function whose unary return
+    /// can use the pair ABI. Pointer-niche options stay on the niche path.
+    fn pair_return_kind(&self, name: &str) -> Option<bool> {
+        if self.coroutine_fns.contains(name) {
+            return None;
+        }
+        let ret = self
+            .checker
+            .fn_return_ty(name)
+            .or_else(|| self.fn_return_ty(name))?;
+        if let Some((ok, err)) = crate::typechecking::ty::result_ok_err(&ret) {
+            return Self::pair_value_ty_supported(&ok)
+                .then_some(false)
+                .filter(|_| Self::pair_value_ty_supported(&err));
+        }
+        if let Some(inner) = crate::typechecking::ty::option_inner(&ret) {
+            if self.niche_option_inner_ty(&ret).is_some() {
+                return None;
+            }
+            return Self::pair_value_ty_supported(&inner).then_some(true);
+        }
+        None
+    }
+
+    fn pair_call_candidate(&self, callee: &Output) -> bool {
+        let name = match callee.1.as_ref() {
+            Expression::Identifier(name) => self
+                .aliases
+                .get(*name)
+                .cloned()
+                .unwrap_or_else(|| (*name).to_string()),
+            Expression::QualifiedAccess { owner, member } => {
+                format!("{}::{}", owner, member)
+            }
+            Expression::Access(receiver, method) => {
+                let ty = self.receiver_type(receiver).or_else(|| self.codegen_expr_ty(receiver));
+                let Some(owner) = ty
+                    .as_ref()
+                    .and_then(Checker::class_name_of_ty)
+                    .map(str::to_string)
+                else {
+                    return false;
+                };
+                let Some(methods) = self.context.methods.get(&owner) else {
+                    return false;
+                };
+                let Some(name) = methods.get(*method) else {
+                    return false;
+                };
+                name.clone()
+            }
+            _ => return false,
+        };
+        if !self.functions.contains_key(&name) {
+            return false;
+        }
+        self.pair_return_kind(&name).is_some()
+    }
+
+    fn expr_is_pair_producer(&self, expr: &Output) -> bool {
+        match expr.1.as_ref() {
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                ..
+            } => {
+                (common::is_builtin_option_enum(enum_name)
+                    || common::is_builtin_result_enum(enum_name))
+                    && self.checker.arity_for(enum_name, variant_name).is_some_and(|n| n <= 1)
+            }
+            Expression::Call { name, .. } => self.pair_call_candidate(name),
+            Expression::Group(inner) | Expression::Expr(inner) => self.expr_is_pair_producer(inner),
+            _ => false,
+        }
+    }
+
+    fn expr_pair_enum_kind(&self, expr: &Output) -> Option<bool> {
+        let ty = self.codegen_expr_ty(expr)?;
+        if crate::typechecking::ty::result_ok_err(&ty).is_some() {
+            return Some(false);
+        }
+        if crate::typechecking::ty::option_inner(&ty).is_some()
+            && self.niche_option_inner_ty(&ty).is_none()
+        {
+            return Some(true);
+        }
+        None
+    }
+
+    fn emit_host_option_boundary(&mut self, expr: &Output) {
+        if self.expr_is_niche_option(expr) {
+            self.bytecode
+                .push(Byte::new(Instruction::HeapOptionToNiche));
+        }
+    }
+
     /// Emit defers + unit fall-through return when a body does not end in a return.
     ///
     /// Non-unit missing returns are diagnosed by HM (E0111). This epilogue only
@@ -5356,10 +5558,15 @@ impl Compiler {
     fn emit_fallthrough_return(&mut self, _name: &str, _span: SimpleSpan) {
         self.emit_run_defers();
         self.bytecode.push_const(0);
-        if self.compiling_result_mode {
+        if self.compiling_pair_mode {
+            self.bytecode.push_const(0);
+            self.bytecode.push(Byte::new(Instruction::ReturnPair));
+        } else if self.compiling_result_mode {
             Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+            self.bytecode.push_return();
+        } else {
+            self.bytecode.push_return();
         }
-        self.bytecode.push_return();
     }
 
     /// True when IL ops in `[op_start, ops.len())` end with a return terminator
@@ -5377,6 +5584,9 @@ impl Compiler {
                 | IlOp::ConstReturnImm { .. }
                 | IlOp::BinReturn { .. }
                 | IlOp::Halt { .. } => return true,
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::ReturnPair => {
+                    return true;
+                }
                 op if op.is_plain_return() => return true,
                 _ => return false,
             }
@@ -5391,6 +5601,13 @@ impl Compiler {
         if let Some(tag) = Self::ty_to_value_tag(ty) {
             bytecode.push_box_value(tag as u32);
         }
+    }
+
+    fn emit_generic_arg_box(&self, bytecode: &mut impl EmitBuf, ty: &Ty) {
+        if self.niche_option_inner_ty(ty).is_some() {
+            bytecode.push(Byte::new(Instruction::OptionNicheToHeap));
+        }
+        Self::emit_box_if_needed(bytecode, ty);
     }
 
     /// Emit an `UnboxValue` instruction for a concrete `Ty` at a generic
@@ -5448,6 +5665,8 @@ impl Compiler {
 
         let prev_result_mode = self.compiling_result_mode;
         self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+        let prev_pair_mode = self.compiling_pair_mode;
+        self.compiling_pair_mode = !*is_coro && self.pair_return_kind(&qualified).is_some();
         let prev_fn_defers = std::mem::take(&mut self.fn_defers);
 
         let mut a = self.do_compile(args);
@@ -5472,6 +5691,7 @@ impl Compiler {
 
         self.fn_defers = prev_fn_defers;
         self.compiling_result_mode = prev_result_mode;
+        self.compiling_pair_mode = prev_pair_mode;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
         self.polyfn_sources = prev_polyfn_sources;
@@ -6422,7 +6642,7 @@ impl Compiler {
     ///
     /// Trait instance methods unbox type-parameter args in their prologue
     /// (`ValueTag::Instance` for classes), so call sites must `BoxValue`
-    /// the carrier before `CallIndirect`.
+    /// the carrier before the direct CALL.
     fn emit_for_in_custom(
         &mut self,
         iterable: &Output<'_>,
@@ -6430,6 +6650,7 @@ impl Compiler {
         binding_name: &str,
         into_iter_fqn: &str,
         next_fqn: &str,
+        item_ty: Option<&Ty>,
     ) {
         let into_off = self.functions.get(into_iter_fqn).copied().unwrap_or(0) as u32;
         let next_off = self.functions.get(next_fqn).copied().unwrap_or(0) as u32;
@@ -6438,12 +6659,13 @@ impl Compiler {
             .tag_for(common::BUILTIN_OPTION_ENUM, "None")
             .unwrap_or(0);
         let carrier_tag = ValueTag::Instance as u32;
+        let niche_next = item_ty.is_some_and(|ty| Self::niche_heap_only_ty(ty, &self.checker));
 
         let it_slot = self.alloc_temp_slot();
         let iter_bc = self.do_compile(iterable);
         self.bytecode.extend(iter_bc);
         self.bytecode.push_box_value(carrier_tag);
-        Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
+        Self::emit_known_target_call(&mut self.bytecode, into_off, 1);
         self.bytecode.push_store_pop(it_slot);
 
         let _ = self.next_emit_id();
@@ -6456,20 +6678,30 @@ impl Compiler {
 
         self.bytecode.push_load(it_slot);
         self.bytecode.push_box_value(carrier_tag);
-        Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
+        Self::emit_known_target_call(&mut self.bytecode, next_off, 1);
 
-        // `Option::None` → exit (JumpIfMatch pops unit None).
-        bb.emit_jump_to(
-            exit_label,
-            BbJumpKind::JumpIfMatch {
-                tag: none_tag,
-                arity: 0,
-            },
-            self.bytecode.il_mut(),
-        );
-        // Fall-through: Some(v) — unpack payload into binding.
-        self.bytecode
-            .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
+        if niche_next {
+            self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+            self.bytecode.push(Byte::new(Instruction::LogNot));
+            bb.emit_jump_to(
+                exit_label,
+                BbJumpKind::JumpIfTrue,
+                self.bytecode.il_mut(),
+            );
+        } else {
+            // `Option::None` → exit (JumpIfMatch pops unit None).
+            bb.emit_jump_to(
+                exit_label,
+                BbJumpKind::JumpIfMatch {
+                    tag: none_tag,
+                    arity: 0,
+                },
+                self.bytecode.il_mut(),
+            );
+            // Fall-through: Some(v) — unpack payload into binding.
+            self.bytecode
+                .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
+        }
         self.bytecode.push_store_pop(binding_slot);
 
         self.loop_stack.push((top_label, exit_label));
@@ -6486,8 +6718,65 @@ impl Compiler {
 
         bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
         bb.bind_label(exit_label, self.bytecode.il_mut());
+        if niche_next {
+            self.bytecode.push_pop();
+        }
         bb.finalize()
             .expect("BlockBuilder::finalize: for-in custom labels bound");
+    }
+
+    /// Replace `new Class(args).field` with the selected constructor argument.
+    ///
+    /// The temporary object has no observable identity because it is consumed
+    /// immediately. Arguments still evaluate in declaration order and are
+    /// staged into slots so non-selected arguments retain their side effects.
+    fn try_emit_direct_class_field_access(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        receiver: &Output<'_>,
+        field: &str,
+    ) -> bool {
+        let receiver = match receiver.1.as_ref() {
+            Expression::Group(inner) | Expression::Expr(inner) => inner,
+            _ => receiver,
+        };
+        let Expression::Instantiate(class, Some(args)) = receiver.1.as_ref() else {
+            return false;
+        };
+        let Expression::Identifier(class_name) = class.1.as_ref() else {
+            return false;
+        };
+        if self.decorated_class_ctors.contains_key(*class_name) {
+            return false;
+        }
+        if args.iter().any(|arg| self.arg_emits_on_self_bytecode(arg)) {
+            return false;
+        }
+        let Some(fields) = self.context.classes.get(*class_name).cloned() else {
+            return false;
+        };
+        if args.len() != fields.len() {
+            return false;
+        }
+        let Some((field_index, _)) = fields
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| name == field)
+        else {
+            return false;
+        };
+
+        let mut arg_slots = Vec::with_capacity(args.len());
+        for arg in args {
+            let mut arg_bc = Vec::new();
+            self.append_with_existential_pack(&mut arg_bc, arg);
+            bytecode.append(&mut arg_bc);
+            let slot = self.alloc_temp_slot();
+            bytecode.push_store_pop(slot);
+            arg_slots.push(slot);
+        }
+        bytecode.push_load(arg_slots[field_index]);
+        true
     }
 
     fn emit_field_name(&mut self, bytecode: &mut impl EmitBuf, field: &str) {
@@ -7376,6 +7665,88 @@ impl Compiler {
                 .codegen_expr_ty(expr)
                 .map(|t| is_option_ty(&t))
                 .unwrap_or(false),
+        }
+    }
+
+    /// Return the payload type when `Option<T>` can use `0` as `None`.
+    ///
+    /// Only ground heap values qualify: immediates and stack-shaped
+    /// aggregates keep the existing boxed enum representation.
+    fn niche_option_inner_ty(&self, ty: &Ty) -> Option<Ty> {
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::{is_option_ty, option_inner};
+
+        let ty = apply_ty_prune(self.checker.subst(), ty);
+        if !is_option_ty(&ty) {
+            return None;
+        }
+        let inner = option_inner(&ty)?;
+        if Self::niche_heap_only_ty(&inner, &self.checker) {
+            Some(inner)
+        } else {
+            None
+        }
+    }
+
+    fn expr_is_niche_option(&self, expr: &Output) -> bool {
+        self.codegen_expr_ty(expr)
+            .is_some_and(|ty| self.niche_option_inner_ty(&ty).is_some())
+    }
+
+    fn is_option_construct(expr: &Output) -> bool {
+        match expr.1.as_ref() {
+            Expression::Construct { enum_name, .. } => {
+                common::is_builtin_option_enum(enum_name)
+            }
+            Expression::Group(inner) | Expression::Expr(inner) => Self::is_option_construct(inner),
+            _ => false,
+        }
+    }
+
+    fn niche_heap_only_ty(ty: &Ty, checker: &Checker) -> bool {
+        match ty {
+            Ty::Readonly(inner) | Ty::Constructor { owner: inner, .. } => {
+                Self::niche_heap_only_ty(inner, checker)
+            }
+            Ty::Con(name) => name == "string" || checker.is_class(name),
+            Ty::App(head, args) => {
+                let Ty::Con(name) = head.as_ref() else {
+                    return false;
+                };
+                checker.is_class(name)
+                    && args.iter().all(|arg| Self::niche_ground_ty(arg, checker))
+            }
+            Ty::List(_) | Ty::Sum { .. } | Ty::Tuple(_) | Ty::Record { .. } => {
+                Self::niche_ground_ty(ty, checker)
+            }
+            _ => false,
+        }
+    }
+
+    fn niche_ground_ty(ty: &Ty, checker: &Checker) -> bool {
+        match ty {
+            Ty::Var(_) | Ty::Fun(_, _) | Ty::Existential { .. } | Ty::Forall { .. } => false,
+            Ty::Con(name) => name == "string" || checker.is_class(name),
+            Ty::App(head, args) => {
+                let Ty::Con(name) = head.as_ref() else {
+                    return false;
+                };
+                checker.is_class(name)
+                    && args.iter().all(|arg| Self::niche_ground_ty(arg, checker))
+            }
+            Ty::List(inner) | Ty::Readonly(inner) => Self::niche_ground_ty(inner, checker),
+            Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
+                payload
+                    .field_types()
+                    .into_iter()
+                    .all(|field| Self::niche_ground_ty(field, checker))
+            }),
+            Ty::Constructor { owner, .. } => Self::niche_ground_ty(owner, checker),
+            Ty::Tuple(items) => items.iter().all(|item| Self::niche_ground_ty(item, checker)),
+            Ty::Record { fields } => fields
+                .iter()
+                .all(|(_, field)| Self::niche_ground_ty(field, checker)),
+            Ty::Array { .. } | Ty::Never => false,
         }
     }
 
@@ -8358,6 +8729,9 @@ impl Compiler {
 
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+                let prev_pair_mode = self.compiling_pair_mode;
+                self.compiling_pair_mode =
+                    !*is_coro && self.pair_return_kind(&table_key).is_some();
 
                 let mut a = self.do_compile(args);
 
@@ -8391,6 +8765,10 @@ impl Compiler {
                 self.bytecode.append(&mut a);
 
                 let body_start = self.bytecode.len();
+                // Provisional span so self-recursive peels can see the opening
+                // predicate while the body is still streaming into `self.bytecode`.
+                self.fn_bytecode_spans
+                    .insert(table_key.clone(), (body_start, body_start));
                 let body_op_start = self.bytecode.ops().len();
                 let prev_field_keys = std::mem::take(&mut self.field_key_slots);
                 self.emit_field_key_prologue(body);
@@ -8407,6 +8785,7 @@ impl Compiler {
 
                 self.fn_defers = prev_fn_defers;
                 self.compiling_result_mode = prev_result_mode;
+                self.compiling_pair_mode = prev_pair_mode;
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
@@ -8648,7 +9027,10 @@ impl Compiler {
             Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
                 let tail_match = self.return_is_tail_match(expr);
-                if !tail_match && self.try_emit_tail_call_expr(expr, &mut bytecode) {
+                if !self.compiling_pair_mode
+                    && !tail_match
+                    && self.try_emit_tail_call_expr(expr, &mut bytecode)
+                {
                     if self.compiling_result_mode {
                         Self::emit_ok_or_some_wrap(&mut bytecode, false);
                     }
@@ -8662,16 +9044,36 @@ impl Compiler {
                 // Each defer thunk returns a sentinel that we POP so the
                 // pending return value stays on top for RETURN.
                 // Flush the value into `self.bytecode` before labeled defers.
+                let pair_expr = self.compiling_pair_mode && self.expr_is_pair_producer(expr);
+                let pair_enum_kind = self.expr_pair_enum_kind(expr);
+                let previous_pair_context = self.pair_value_context;
+                self.pair_value_context = pair_expr;
                 self.append_with_existential_pack(&mut bytecode, expr);
+                self.pair_value_context = previous_pair_context;
                 self.match_tail_call = false;
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
-                if self.compiling_result_mode {
+                if self.compiling_pair_mode {
+                    if !pair_expr {
+                        if let Some(is_option) = pair_enum_kind {
+                            bytecode.push(
+                                Byte::new(Instruction::HeapToPair)
+                                    .with_operand_u32(u32::from(is_option)),
+                            );
+                        } else {
+                            bytecode.push_const(0);
+                        }
+                    }
+                } else if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
                 }
                 self.bytecode.append(&mut bytecode);
                 self.emit_run_defers();
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
-                    self.bytecode.push_return();
+                    if self.compiling_pair_mode {
+                        self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    } else {
+                        self.bytecode.push_return();
+                    }
                 }
             }
             Expression::Yield(expr) => {
@@ -8871,6 +9273,7 @@ impl Compiler {
                         .and_then(|id| self.checker.for_in_info_at(id))
                         .or_else(|| self.checker.for_in_info_for_span(span.start, span.end))
                         .cloned();
+                    let item_ty = info.as_ref().map(|i| i.item_ty.clone());
                     let kind = info.map(|i| i.kind).unwrap_or(ForInKind::Coroutine);
                     match kind {
                         ForInKind::Array => {
@@ -8898,6 +9301,7 @@ impl Compiler {
                                 &binding_name,
                                 &into_iter_fqn,
                                 &next_fqn,
+                                item_ty.as_ref(),
                             );
                         }
                     }
@@ -10380,6 +10784,8 @@ impl Compiler {
 
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
+                let prev_pair_mode = self.compiling_pair_mode;
+                self.compiling_pair_mode = self.pair_return_kind(&fn_name).is_some();
 
                 let body_op_start = self.bytecode.ops().len();
                 let prev_field_keys = std::mem::take(&mut self.field_key_slots);
@@ -10393,6 +10799,7 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.compiling_pair_mode = prev_pair_mode;
                 self.field_key_slots = prev_field_keys;
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
@@ -10490,6 +10897,60 @@ impl Compiler {
                 };
                 let arity = self.checker.arity_for(enum_name, variant_name).unwrap_or(0);
 
+                let pair_enum = self.pair_value_context
+                    && (common::is_builtin_option_enum(enum_name)
+                        || common::is_builtin_result_enum(enum_name))
+                    && arity <= 1;
+                if pair_enum {
+                    match fields {
+                        EnumConstructPayload::Unit if arity == 0 => {
+                            // Keep a payload slot for `Option::None` so every
+                            // pair has the same `[payload, tag]` shape.
+                            bytecode.push_const(0);
+                        }
+                        EnumConstructPayload::Tuple(args) if args.len() == 1 => {
+                            bytecode.append(&mut self.do_compile(&args[0]));
+                        }
+                        EnumConstructPayload::Record(parts) if parts.len() == 1 => {
+                            bytecode.append(&mut self.do_compile(&parts[0].value));
+                        }
+                        _ => {}
+                    }
+                    if matches!(fields, EnumConstructPayload::Unit) && arity != 0 {
+                        // Invalid constructor shapes are already reported by
+                        // typechecking; keep the stack balanced for recovery.
+                        bytecode.push_const(0);
+                    }
+                    bytecode.push_const(tag as i32);
+                    return bytecode;
+                }
+
+                if common::is_builtin_option_enum(enum_name)
+                    && !self.force_heap_option
+                    && self
+                        .codegen_expr_ty(ast)
+                        .is_some_and(|ty| self.niche_option_inner_ty(&ty).is_some())
+                    || (common::is_builtin_option_enum(enum_name)
+                        && !self.force_heap_option
+                        && self.force_niche_option)
+                {
+                    match (*variant_name, fields) {
+                        ("None", EnumConstructPayload::Unit) => {
+                            bytecode.push_const(0);
+                            return bytecode;
+                        }
+                        ("Some", EnumConstructPayload::Tuple(args)) if args.len() == 1 => {
+                            bytecode.append(&mut self.do_compile(&args[0]));
+                            return bytecode;
+                        }
+                        ("Some", EnumConstructPayload::Record(parts)) if parts.len() == 1 => {
+                            bytecode.append(&mut self.do_compile(&parts[0].value));
+                            return bytecode;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Emit args in reverse declaration order for MAKE_ENUM stack discipline.
                 match fields {
                     EnumConstructPayload::Unit => {}
@@ -10541,6 +11002,9 @@ impl Compiler {
             // receiver bytecode + LoadField(index) or GetField(name) for
             // dicts / class instances.
             Expression::Access(receiver, field) => {
+                if self.try_emit_direct_class_field_access(&mut bytecode, receiver, field) {
+                    return bytecode;
+                }
                 bytecode.append(&mut self.do_compile(receiver));
 
                 let receiver_ty = self.receiver_type(receiver);
@@ -10610,10 +11074,18 @@ impl Compiler {
                 // `raise e` → push e, wrap Err(e), RETURN.
                 let expr_bc = self.do_compile(expr);
                 self.emit_bytes(*span, &expr_bc);
-                Self::emit_result_err(&mut self.bytecode);
+                if self.compiling_pair_mode {
+                    self.bytecode.push_const(1);
+                } else {
+                    Self::emit_result_err(&mut self.bytecode);
+                }
                 self.pad_debug_locs();
                 let loc = self.loc_for_span(*span);
-                self.bytecode.push_return_at(loc);
+                if self.compiling_pair_mode {
+                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                } else {
+                    self.bytecode.push_return_at(loc);
+                }
                 self.debug_locs.push(loc);
             }
             Expression::Panic(expr) => {
@@ -10655,22 +11127,83 @@ impl Compiler {
                 let is_option = self.expr_is_option(inner);
                 let success_tag: u32 = if is_option { 1 } else { 0 }; // Some=1, Ok=0
 
+                let pair_inner = self.compiling_pair_mode && self.expr_is_pair_producer(inner);
+                let previous_pair_context = self.pair_value_context;
+                self.pair_value_context = pair_inner;
                 let inner_bc = self.do_compile(inner);
+                self.pair_value_context = previous_pair_context;
                 self.bytecode.extend(inner_bc);
 
                 let mut bb = BlockBuilder::new();
                 let success = bb.fresh_label(self.bytecode.il_mut());
-                bb.emit_jump_to(
-                    success,
-                    BbJumpKind::JumpIfMatch {
-                        tag: success_tag,
-                        arity: 1,
-                    },
-                    self.bytecode.il_mut(),
-                );
-                // Miss: failure value still on stack — propagate via RETURN.
-                self.bytecode.push_return();
-                bb.bind_label(success, self.bytecode.il_mut());
+                if pair_inner {
+                    let failure = bb.fresh_label(self.bytecode.il_mut());
+                    let after_failure = bb.fresh_label(self.bytecode.il_mut());
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push_const(success_tag as i32);
+                    self.bytecode.push(Byte::new(Instruction::EQ));
+                    self.bytecode.push(Byte::new(Instruction::NOOP));
+                    bb.emit_jump_to(
+                        failure,
+                        BbJumpKind::JumpIfFalse,
+                        self.bytecode.il_mut(),
+                    );
+                    self.bytecode.push_pop();
+                    bb.emit_jump_to(
+                        after_failure,
+                        BbJumpKind::Unconditional,
+                        self.bytecode.il_mut(),
+                    );
+                    bb.bind_label(failure, self.bytecode.il_mut());
+                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    bb.bind_label(after_failure, self.bytecode.il_mut());
+                } else if self.expr_is_niche_option(inner) {
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push(Byte::new(Instruction::LogNot));
+                    self.bytecode.push(Byte::new(Instruction::NOOP));
+                    bb.emit_jump_to(
+                        success,
+                        BbJumpKind::JumpIfFalse,
+                        self.bytecode.il_mut(),
+                    );
+                    if self.compiling_pair_mode {
+                        self.bytecode.push_pop();
+                        self.bytecode.push_const(0);
+                        self.bytecode.push_const(0);
+                        self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    } else {
+                        self.bytecode.push_return();
+                    }
+                    bb.bind_label(success, self.bytecode.il_mut());
+                } else if self.compiling_pair_mode {
+                    bb.emit_jump_to(
+                        success,
+                        BbJumpKind::JumpIfMatch {
+                            tag: success_tag,
+                            arity: 1,
+                        },
+                        self.bytecode.il_mut(),
+                    );
+                    self.bytecode.push(
+                        Byte::new(Instruction::HeapToPair)
+                            .with_operand_u32(u32::from(is_option)),
+                    );
+                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    bb.bind_label(success, self.bytecode.il_mut());
+                } else {
+                    bb.emit_jump_to(
+                        success,
+                        BbJumpKind::JumpIfMatch {
+                            tag: success_tag,
+                            arity: 1,
+                        },
+                        self.bytecode.il_mut(),
+                    );
+                    // Miss: failure value still on stack — propagate via
+                    // the ordinary boxed return.
+                    self.bytecode.push_return();
+                    bb.bind_label(success, self.bytecode.il_mut());
+                }
                 bb.finalize()
                     .expect("BlockBuilder::finalize: Try success label bound");
                 // Payload left on stack for the caller (e.g. StorePop).
@@ -10718,27 +11251,81 @@ impl Compiler {
                 // `a ?? b` → Ok/Some payload, else evaluate b.
                 let is_option = self.expr_is_option(lhs);
                 let success_tag: u32 = if is_option { 1 } else { 0 };
+                let niche_lhs = self.expr_is_niche_option(lhs)
+                    || (is_option
+                        && self
+                            .codegen_expr_ty(rhs)
+                            .is_some_and(|ty| Self::niche_heap_only_ty(&ty, &self.checker)));
 
+                let direct_pair_lhs = matches!(
+                    lhs.1.as_ref(),
+                    Expression::Call { .. } | Expression::Construct { .. }
+                );
+                let pair_lhs = !niche_lhs
+                    && self.expr_is_pair_producer(lhs)
+                    && (self.compiling_pair_mode || direct_pair_lhs);
+                let previous_pair_context = self.pair_value_context;
+                self.pair_value_context = pair_lhs;
+                let previous_niche_context = self.force_niche_option;
+                self.force_niche_option = niche_lhs;
                 let lhs_bc = self.do_compile(lhs);
+                self.force_niche_option = previous_niche_context;
+                self.pair_value_context = previous_pair_context;
                 self.bytecode.extend(lhs_bc);
 
                 let mut bb = BlockBuilder::new();
                 let success = bb.fresh_label(self.bytecode.il_mut());
                 let end = bb.fresh_label(self.bytecode.il_mut());
-                bb.emit_jump_to(
-                    success,
-                    BbJumpKind::JumpIfMatch {
-                        tag: success_tag,
-                        arity: 1,
-                    },
-                    self.bytecode.il_mut(),
-                );
-                // Miss: discard failure, evaluate rhs, jump to end.
-                self.bytecode.push_pop();
-                let rhs_bc = self.do_compile(rhs);
-                self.bytecode.extend(rhs_bc);
-                bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
-                bb.bind_label(success, self.bytecode.il_mut());
+                if pair_lhs {
+                    let failure = bb.fresh_label(self.bytecode.il_mut());
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push_const(success_tag as i32);
+                    self.bytecode.push(Byte::new(Instruction::EQ));
+                    self.bytecode.push(Byte::new(Instruction::NOOP));
+                    bb.emit_jump_to(
+                        failure,
+                        BbJumpKind::JumpIfFalse,
+                        self.bytecode.il_mut(),
+                    );
+                    self.bytecode.push_pop();
+                    bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                    bb.bind_label(failure, self.bytecode.il_mut());
+                    self.bytecode.push_pop();
+                    self.bytecode.push_pop();
+                    let rhs_bc = self.do_compile(rhs);
+                    self.bytecode.extend(rhs_bc);
+                    bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                    bb.bind_label(success, self.bytecode.il_mut());
+                } else if niche_lhs {
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push(Byte::new(Instruction::LogNot));
+                    self.bytecode.push(Byte::new(Instruction::NOOP));
+                    bb.emit_jump_to(
+                        success,
+                        BbJumpKind::JumpIfFalse,
+                        self.bytecode.il_mut(),
+                    );
+                    self.bytecode.push_pop();
+                    let rhs_bc = self.do_compile(rhs);
+                    self.bytecode.extend(rhs_bc);
+                    bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                    bb.bind_label(success, self.bytecode.il_mut());
+                } else {
+                    bb.emit_jump_to(
+                        success,
+                        BbJumpKind::JumpIfMatch {
+                            tag: success_tag,
+                            arity: 1,
+                        },
+                        self.bytecode.il_mut(),
+                    );
+                    // Miss: discard failure, evaluate rhs, jump to end.
+                    self.bytecode.push_pop();
+                    let rhs_bc = self.do_compile(rhs);
+                    self.bytecode.extend(rhs_bc);
+                    bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
+                    bb.bind_label(success, self.bytecode.il_mut());
+                }
                 // Success: payload already on stack from JumpIfMatch.
                 bb.bind_label(end, self.bytecode.il_mut());
                 bb.finalize()
@@ -10746,8 +11333,75 @@ impl Compiler {
             }
             Expression::OptionalAccess(receiver, field) => {
                 // `opt?.field` → None if opt is None, else Some(opt.field).
+                if self.expr_is_niche_option(receiver)
+                    && self
+                        .codegen_expr_ty(ast)
+                        .is_some_and(|ty| self.niche_option_inner_ty(&ty).is_some())
+                {
+                    let recv_bc = self.do_compile(receiver);
+                    self.bytecode.extend(recv_bc);
+
+                    let mut bb = BlockBuilder::new();
+                    let end = bb.fresh_label(self.bytecode.il_mut());
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push(Byte::new(Instruction::LogNot));
+                    bb.emit_jump_to(
+                        end,
+                        BbJumpKind::JumpIfTrue,
+                        self.bytecode.il_mut(),
+                    );
+                    // Some(payload) is represented by the payload itself.
+                    let inner_ty = self
+                        .codegen_expr_ty(receiver)
+                        .and_then(|ty| crate::typechecking::ty::option_inner(&ty));
+                    let is_record =
+                        matches!(&inner_ty, Some(crate::typechecking::Ty::Record { .. }));
+                    let is_class = inner_ty
+                        .as_ref()
+                        .is_some_and(|ty| self.checker.ty_is_class(ty));
+                    let enum_field_index = if !is_record && !is_class {
+                        inner_ty
+                            .as_ref()
+                            .and_then(extract_enum_name)
+                            .and_then(|name| {
+                                if self.checker.is_class(&name) {
+                                    return None;
+                                }
+                                self.checker
+                                    .field_index_for(&name, field)
+                                    .map(|(_variant, idx)| idx)
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(field_index) = enum_field_index {
+                        self.bytecode.push_load_field(field_index as u32);
+                    } else if is_record || is_class {
+                        let mut field_bc = Vec::new();
+                        self.emit_field_name(&mut field_bc, field);
+                        self.bytecode.extend(field_bc);
+                        self.bytecode.push_get_field();
+                    } else {
+                        self.bytecode.push_load_field(0);
+                    }
+                    bb.bind_label(end, self.bytecode.il_mut());
+                    bb.finalize()
+                        .expect("BlockBuilder::finalize: niche OptionalAccess labels bound");
+                    return bytecode;
+                }
+
+                let receiver_is_niche = self.expr_is_niche_option(receiver);
+                let previous_force = self.force_heap_option;
+                if receiver_is_niche {
+                    self.force_heap_option = true;
+                }
                 let recv_bc = self.do_compile(receiver);
+                self.force_heap_option = previous_force;
                 self.bytecode.extend(recv_bc);
+                if receiver_is_niche && !Self::is_option_construct(receiver) {
+                    self.bytecode
+                        .push(Byte::new(Instruction::OptionNicheToHeap));
+                }
 
                 let mut bb = BlockBuilder::new();
                 let success = bb.fresh_label(self.bytecode.il_mut());
@@ -10844,6 +11498,290 @@ impl Compiler {
         scrutinee: &Output<'compiler>,
         arms: &[MatchArm<'compiler>],
     ) -> Vec<Byte> {
+        if (self.compiling_pair_mode
+            || matches!(scrutinee.1.as_ref(), Expression::Call { .. }))
+            && self.expr_is_pair_producer(scrutinee)
+            && self.expr_pair_enum_kind(scrutinee).is_some()
+            && self.try_compile_pair_match(scrutinee, arms)
+        {
+            return Vec::new();
+        }
+        if self.expr_is_niche_option(scrutinee) {
+            if self.try_compile_niche_option_match(scrutinee, arms) {
+                return Vec::new();
+            }
+
+            // Existing pattern lowering requires an ObjEnum. Force direct
+            // constructors onto the boxed path before entering it.
+            let previous = self.force_heap_option;
+            self.force_heap_option = true;
+            let result = self.compile_match_expr_boxed(scrutinee, arms);
+            self.force_heap_option = previous;
+            return result;
+        }
+        self.compile_match_expr_boxed(scrutinee, arms)
+    }
+
+    fn try_compile_pair_match<'compiler>(
+        &mut self,
+        scrutinee: &Output<'compiler>,
+        arms: &[MatchArm<'compiler>],
+    ) -> bool {
+        if arms.len() != 2 {
+            return false;
+        }
+        let Some(first) = Self::pair_match_arm_info(&self.checker, &arms[0]) else {
+            return false;
+        };
+        let Some(second) = Self::pair_match_arm_info(&self.checker, &arms[1]) else {
+            return false;
+        };
+        if first.0 == second.0 {
+            return false;
+        }
+
+        self.bytecode
+            .push_seek(self.context.variables.len() as u32);
+        let previous_pair_context = self.pair_value_context;
+        self.pair_value_context = true;
+        let scrutinee_bc = self.do_compile(scrutinee);
+        self.pair_value_context = previous_pair_context;
+        self.bytecode.extend(scrutinee_bc);
+
+        let mut bb = BlockBuilder::new();
+        let fallback = bb.fresh_label(self.bytecode.il_mut());
+        let end = bb.fresh_label(self.bytecode.il_mut());
+        self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+        self.bytecode.push_const(first.0 as i32);
+        self.bytecode.push(Byte::new(Instruction::EQ));
+        self.bytecode.push(Byte::new(Instruction::NOOP));
+        bb.emit_jump_to(
+            fallback,
+            BbJumpKind::JumpIfFalse,
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop(); // tag
+        let first_slot = self.alloc_pair_match_binding(first.1);
+        if let Some(slot) = first_slot {
+            self.bytecode.push_store_pop(slot);
+        } else {
+            self.bytecode.push_pop(); // payload
+        }
+        self.compile_pair_match_body(&arms[0], first.1, first_slot);
+        bb.emit_jump_to(end, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(fallback, self.bytecode.il_mut());
+        self.bytecode.push_pop(); // second tag
+        let second_slot = self.alloc_pair_match_binding(second.1);
+        if let Some(slot) = second_slot {
+            self.bytecode.push_store_pop(slot);
+        } else {
+            self.bytecode.push_pop(); // payload
+        }
+        self.compile_pair_match_body(&arms[1], second.1, second_slot);
+        bb.bind_label(end, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: pair match labels bound");
+        true
+    }
+
+    fn pair_match_arm_info<'a>(
+        checker: &Checker,
+        arm: &'a MatchArm<'a>,
+    ) -> Option<(u32, Option<&'a str>)> {
+        let Pattern::Constructor {
+            enum_name,
+            variant_name,
+            payload,
+        } = &arm.pattern.1
+        else {
+            return None;
+        };
+        if !common::is_builtin_option_enum(enum_name)
+            && !common::is_builtin_result_enum(enum_name)
+        {
+            return None;
+        }
+        let tag = checker.tag_for(enum_name, variant_name)?;
+        let binding = match payload {
+            PatternPayload::Unit => None,
+            PatternPayload::Tuple(parts) if parts.len() == 1 => match &parts[0].1 {
+                Pattern::Binding { name } => Some(*name),
+                Pattern::Wildcard => None,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((tag, binding))
+    }
+
+    fn alloc_pair_match_binding(&mut self, binding: Option<&str>) -> Option<u32> {
+        let name = binding?;
+        let slot = self.context.variables.len() as u32;
+        self.context
+            .variables
+            .intern(format!("__pair_match{}", slot));
+        self.record_debug_local(name, slot);
+        Some(slot)
+    }
+
+    fn compile_pair_match_body(
+        &mut self,
+        arm: &MatchArm<'_>,
+        binding: Option<&str>,
+        slot: Option<u32>,
+    ) {
+        let saved_bindings = self.context.match_bindings.take();
+        let mut bindings = HashMap::new();
+        if let (Some(name), Some(slot)) = (binding, slot) {
+            bindings.insert(name.to_string(), slot);
+        }
+        self.context.match_bindings = Some(bindings);
+        let body_bc = self.do_compile(&arm.body);
+        self.bytecode.extend(body_bc);
+        self.context.match_bindings = saved_bindings;
+    }
+
+    /// Compile a niche-option match when both arms only inspect the null
+    /// sentinel and optionally bind the payload.
+    fn try_compile_niche_option_match<'compiler>(
+        &mut self,
+        scrutinee: &Output<'compiler>,
+        arms: &[MatchArm<'compiler>],
+    ) -> bool {
+        if arms.len() != 2 || !self.expr_is_niche_option(scrutinee) {
+            return false;
+        }
+
+        let mut some: Option<(usize, Option<&str>)> = None;
+        let mut fallback: Option<(usize, Option<&str>)> = None;
+        for (index, arm) in arms.iter().enumerate() {
+            match &arm.pattern.1 {
+                Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    payload: PatternPayload::Tuple(parts),
+                } if common::is_builtin_option_enum(enum_name)
+                    && *variant_name == "Some"
+                    && parts.len() == 1 =>
+                {
+                    let binding = match &parts[0].1 {
+                        Pattern::Binding { name } => Some(*name),
+                        Pattern::Wildcard => None,
+                        _ => return false,
+                    };
+                    some = Some((index, binding));
+                }
+                Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    payload: PatternPayload::Unit,
+                } if common::is_builtin_option_enum(enum_name)
+                    && *variant_name == "None" =>
+                {
+                    fallback = Some((index, None));
+                }
+                Pattern::Wildcard => {
+                    fallback = Some((index, None));
+                }
+                Pattern::Binding { name } => {
+                    fallback = Some((index, Some(*name)));
+                }
+                _ => return false,
+            }
+        }
+        let Some((some_index, some_binding)) = some else {
+            return false;
+        };
+        let Some((fallback_index, fallback_binding)) = fallback else {
+            return false;
+        };
+
+        self.bytecode
+            .push_seek(self.context.variables.len() as u32);
+        let previous_niche_context = self.force_niche_option;
+        self.force_niche_option = true;
+        let scrutinee_bc = self.do_compile(scrutinee);
+        self.force_niche_option = previous_niche_context;
+        self.bytecode.extend(scrutinee_bc);
+
+        let mut bb = BlockBuilder::new();
+        let fallback_label = bb.fresh_label(self.bytecode.il_mut());
+        let end_label = bb.fresh_label(self.bytecode.il_mut());
+
+        // Keep the niche value for the selected arm while testing a duplicate.
+        self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+        self.bytecode.push(Byte::new(Instruction::LogNot));
+        bb.emit_jump_to(
+            fallback_label,
+            BbJumpKind::JumpIfTrue,
+            self.bytecode.il_mut(),
+        );
+
+        let some_slot = some_binding.map(|name| {
+            let slot = self.context.variables.len() as u32;
+            self.context
+                .variables
+                .intern(format!("__niche_match{}", slot));
+            self.record_debug_local(name, slot);
+            slot
+        });
+        if let Some(slot) = some_slot {
+            self.bytecode.push_store_pop(slot);
+        } else {
+            self.bytecode.push_pop();
+        }
+        self.compile_niche_match_body(&arms[some_index], some_binding, some_slot);
+        bb.emit_jump_to(end_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(fallback_label, self.bytecode.il_mut());
+        let fallback_slot = fallback_binding.map(|name| {
+            let slot = self.context.variables.len() as u32;
+            self.context
+                .variables
+                .intern(format!("__niche_match{}", slot));
+            self.record_debug_local(name, slot);
+            slot
+        });
+        if let Some(slot) = fallback_slot {
+            self.bytecode.push_store_pop(slot);
+        } else {
+            self.bytecode.push_pop();
+        }
+        self.compile_niche_match_body(&arms[fallback_index], fallback_binding, fallback_slot);
+
+        bb.bind_label(end_label, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: niche option labels bound");
+        true
+    }
+
+    fn compile_niche_match_body(
+        &mut self,
+        arm: &MatchArm<'_>,
+        binding: Option<&str>,
+        slot: Option<u32>,
+    ) {
+        let saved_bindings = self.context.match_bindings.take();
+        let mut bindings = HashMap::new();
+        if let (Some(name), Some(slot)) = (binding, slot) {
+            bindings.insert(name.to_string(), slot);
+        }
+        self.context.match_bindings = Some(bindings);
+        if let Some(slot) = slot {
+            self.record_debug_local(binding.unwrap_or(""), slot);
+        }
+        let body_bc = self.do_compile(&arm.body);
+        self.bytecode.extend(body_bc);
+        self.context.match_bindings = saved_bindings;
+    }
+
+    #[inline(never)]
+    fn compile_match_expr_boxed<'compiler>(
+        &mut self,
+        scrutinee: &Output<'compiler>,
+        arms: &[MatchArm<'compiler>],
+    ) -> Vec<Byte> {
         let mut bytecode = vec![];
         if arms.is_empty() {
             bytecode.append(&mut self.do_compile(scrutinee));
@@ -10885,6 +11823,13 @@ impl Compiler {
             // (e.g. `match try_recv(rx)` after print→write_all).
             let scrutinee_bc = self.do_compile(scrutinee);
             self.bytecode.extend(scrutinee_bc);
+            if self.force_heap_option
+                && self.expr_is_niche_option(scrutinee)
+                && !Self::is_option_construct(scrutinee)
+            {
+                self.bytecode
+                    .push(Byte::new(Instruction::OptionNicheToHeap));
+            }
 
             // First payload slot after locals + scrutinee temps.
             // JumpIfMatch/Unpack push payloads onto the stack
@@ -11478,6 +12423,7 @@ impl Compiler {
                     | crate::typechecking::StringBuiltin::ToBytes => {
                         if let Some(native_name) = kind.native_name() {
                             self.emit_host_native_invoke(native_name, arg_slice);
+                            self.emit_host_option_boundary(ast);
                         }
                     }
                 }
@@ -11498,6 +12444,7 @@ impl Compiler {
                     | crate::typechecking::StringBuiltin::ToBytes => {
                         if let Some(native_name) = kind.native_name() {
                             self.emit_host_native_invoke(native_name, arg_slice);
+                            self.emit_host_option_boundary(ast);
                         }
                     }
                 }
@@ -11581,18 +12528,21 @@ impl Compiler {
             && let Some(kind) = self.checker.io_fn_in_scope(fname)
         {
             self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+            self.emit_host_option_boundary(ast);
             return bytecode;
         }
         if let Expression::Identifier(fname) = name.1.as_ref()
             && let Some(kind) = self.checker.thread_fn_in_scope(fname)
         {
             self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+            self.emit_host_option_boundary(ast);
             return bytecode;
         }
         if let Expression::Identifier(fname) = name.1.as_ref()
             && let Some(kind) = self.checker.gc_fn_in_scope(fname)
         {
             self.emit_host_native_invoke(kind.native_name(), args.as_deref().unwrap_or(&[]));
+            self.emit_host_option_boundary(ast);
             return bytecode;
         }
         if let Expression::Identifier(fname) = name.1.as_ref()
@@ -11613,6 +12563,7 @@ impl Compiler {
                 ));
             }
             self.emit_host_native_invoke(registry, args.as_deref().unwrap_or(&[]));
+            self.emit_host_option_boundary(ast);
             return bytecode;
         }
 
@@ -11679,8 +12630,8 @@ impl Compiler {
         if let Expression::Access(recv, method) = name.1.borrow() {
             // Ground trait method (`recv.into()`, …): typechecker
             // discharged a concrete instance into `call_dicts_at`.
-            // Emit receiver + args + dictionary, then CallIndirect to
-            // the instance method (dict ABI, `dict_arity = 1`).
+            // Emit receiver + args + dictionary, then direct CALL to
+            // the instance method (dict ABI, trailing dict arg).
             let ground_trait = self_id
                 .and_then(|id| self.checker.call_dicts_at(id))
                 .or_else(|| self.checker.call_dicts_for_span(span.start, span.end))
@@ -11723,7 +12674,7 @@ impl Compiler {
                 ) {
                     nargs += 1; // trailing dictionary
                 }
-                Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                Self::emit_known_target_call(&mut bytecode, offset as u32, nargs);
                 return bytecode;
             }
 
@@ -11806,6 +12757,20 @@ impl Compiler {
                     fqn_base
                 };
                 if let Some(offset) = self.functions.get(&fqn).copied() {
+                    let niche_vec_method = (self.expr_is_niche_option(ast)
+                        || self.force_niche_option)
+                        && (fqn == format!("{}::pop", common::BUILTIN_VEC_TYPE)
+                            || fqn == format!("{}::remove", common::BUILTIN_VEC_TYPE));
+                    let call_offset = if niche_vec_method {
+                        let niche_name = if fqn.ends_with("::pop") {
+                            format!("{}::__niche_pop", common::BUILTIN_VEC_TYPE)
+                        } else {
+                            format!("{}::__niche_remove", common::BUILTIN_VEC_TYPE)
+                        };
+                        self.functions.get(&niche_name).copied().unwrap_or(offset)
+                    } else {
+                        offset
+                    };
                     // Inline `Vec::push` as ArrayPush — avoids CALL/frame for fill loops.
                     if fqn == format!("{}::push", common::BUILTIN_VEC_TYPE)
                         && args.as_ref().map(|a| a.len()) == Some(1)
@@ -11924,9 +12889,16 @@ impl Compiler {
                     bytecode.push(
                         Byte::new(Instruction::CALL).with_call_packed(
                             1 + nargs + dict_count as u32,
-                            offset as u32,
+                            call_offset as u32,
                         ),
                     );
+                    if !niche_vec_method
+                        && (self.expr_is_niche_option(ast) || self.force_niche_option)
+                        && (lookup_name == format!("{}::pop", common::BUILTIN_VEC_TYPE)
+                            || lookup_name == format!("{}::remove", common::BUILTIN_VEC_TYPE))
+                    {
+                        bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
+                    }
                     if is_generic && self.generic_return_is_boxed(&lookup_name) {
                         if let Some(call_ty) = self.codegen_expr_ty(ast) {
                             Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
@@ -12019,7 +12991,7 @@ impl Compiler {
                             && let Some(&offset) = self.functions.get(&fqn)
                         {
                             bytecode.append(&mut self.do_compile(&items[0]));
-                            Self::emit_call_indirect(
+                            Self::emit_known_target_call(
                                 &mut bytecode,
                                 offset as u32,
                                 1,
@@ -12177,6 +13149,7 @@ impl Compiler {
                 let mono_offset = self.mono_call_offset(&n, args.as_ref());
                 let target_offset = mono_offset.unwrap_or(offset);
                 let lookup_name = strip_overload_key(&n).to_string();
+                let pair_kind = self.pair_return_kind(&lookup_name);
                 let is_generic =
                     self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
                 // Only box bare `T` args for the shared dict ABI. Nested
@@ -12192,7 +13165,8 @@ impl Compiler {
                     return bytecode;
                 }
 
-                if !is_generic
+                if pair_kind.is_none()
+                    && !is_generic
                     && !self.coroutine_fns.contains(&n)
                     && !self.coroutine_fns.contains(&lookup_name)
                     && self.try_emit_inline_direct_call(&n, Some(arg_slice), &mut bytecode)
@@ -12202,7 +13176,8 @@ impl Compiler {
 
                 // One-level self-unroll: peel recursive callee body once;
                 // nested self-calls remain CALL/Entry.
-                if !is_generic
+                if pair_kind.is_none()
+                    && !is_generic
                     && !self.coroutine_fns.contains(&n)
                     && !self.coroutine_fns.contains(&lookup_name)
                     && self.try_emit_self_unroll_call(&n, Some(arg_slice), &mut bytecode)
@@ -12212,8 +13187,9 @@ impl Compiler {
 
                 // Caller-side base-case peel: cmp-jmp before CALL when
                 // the callee opens with fused/unfused compare + imm/slot return.
-                let peel_indirect = is_instance_method_fqn(&self.checker, &lookup_name);
-                if !is_generic
+                // Instance methods with known entries use CALL (not CallIndirect).
+                if pair_kind.is_none()
+                    && !is_generic
                     && !self.coroutine_fns.contains(&n)
                     && !self.coroutine_fns.contains(&lookup_name)
                     && self.try_emit_predicate_peel_call(
@@ -12221,7 +13197,7 @@ impl Compiler {
                         Some(arg_slice),
                         &mut bytecode,
                         target_offset as u32,
-                        peel_indirect,
+                        /*is_indirect=*/ false,
                     )
                 {
                     return bytecode;
@@ -12260,7 +13236,7 @@ impl Compiler {
                                 None
                             }
                         });
-                if let Some(mask) = fill_mask {
+                if let Some(mask) = fill_mask.filter(|_| pair_kind.is_none()) {
                     // Emit filled values in declaration order (already
                     // the order of `flat_arg_slice` after named reorder at TC).
                     for arg in &flat_arg_slice {
@@ -12346,7 +13322,9 @@ impl Compiler {
 
                 let arity = value_arity + dict_count as u32;
                 if is_instance_method_fqn(&self.checker, &lookup_name) {
-                    Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
+                    // Ground instance methods have a fixed entry — use CALL
+                    // (dict evidence already pushed as trailing args when needed).
+                    Self::emit_known_target_call(&mut bytecode, target_offset as u32, arity);
                 } else if self.coroutine_fns.contains(&lookup_name)
                     || self.coroutine_fns.contains(&n)
                 {
@@ -12361,6 +13339,31 @@ impl Compiler {
                             .with_call_packed(arity, target_offset as u32),
                     );
                 }
+                let vec_option_call = [
+                    format!("{}::pop", common::BUILTIN_VEC_TYPE),
+                    format!("{}::remove", common::BUILTIN_VEC_TYPE),
+                ]
+                .iter()
+                .any(|name| {
+                    lookup_name == *name
+                        || self
+                            .functions
+                            .get(name)
+                            .is_some_and(|offset| *offset == target_offset)
+                });
+                if (self.expr_is_niche_option(ast) || self.force_niche_option)
+                    && vec_option_call
+                {
+                    bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
+                }
+                if let Some(is_option) = pair_kind
+                    && !self.pair_value_context
+                {
+                    bytecode.push(
+                        Byte::new(Instruction::PairToHeap)
+                            .with_operand_u32(u32::from(is_option)),
+                    );
+                }
                 // Generic→concrete unbox: only when the return type
                 // parameter was boxed as a top-level argument
                 // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
@@ -12369,6 +13372,9 @@ impl Compiler {
                 if is_generic && self.generic_return_is_boxed(&lookup_name) {
                     if let Some(call_ty) = self.codegen_expr_ty(ast) {
                         Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                        if self.niche_option_inner_ty(&call_ty).is_some() {
+                            bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
+                        }
                     }
                 }
             } else if let Some(slot) = self.lookup_slot(&identifier) {
@@ -12430,6 +13436,15 @@ impl Compiler {
                     Byte::new(Instruction::CallIndirect)
                         .with_operand_u32(value_arity | (dict_count << 16)),
                 );
+                if polyfn_source.is_none()
+                    && !self.pair_value_context
+                    && let Some(is_option) = self.expr_pair_enum_kind(ast)
+                {
+                    bytecode.push(
+                        Byte::new(Instruction::PairToHeap)
+                            .with_operand_u32(u32::from(is_option)),
+                    );
+                }
                 // Generic→concrete unbox for polyfn call site.
                 if self.local_polyfn_call_needs_unbox(
                     &identifier,
@@ -12469,6 +13484,9 @@ impl Compiler {
                     };
                     if let Some(ty) = unbox_ty {
                         Self::emit_unbox_if_needed(&mut bytecode, &ty);
+                        if self.niche_option_inner_ty(&ty).is_some() {
+                            bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
+                        }
                     }
                 }
             } else {
@@ -12509,6 +13527,10 @@ impl Compiler {
         self.static_const_values.clear();
         self.current_function_qualified = None;
         self.current_function_table_key = None;
+        self.force_heap_option = false;
+        self.force_niche_option = false;
+        self.compiling_pair_mode = false;
+        self.pair_value_context = false;
         self.fn_bytecode_spans.clear();
         // `use` aliases are per-module; leftovers from a prior
         // `compile_module` would otherwise redirect bare names.

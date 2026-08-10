@@ -1571,17 +1571,17 @@ impl Iterator<Counter> { \
 } \
 fn main() { let c = new Counter(0, 3); for x in c { write(stdout(), to_bytes(format(\"%i\", x))); } }",
         );
-        let call_indirect = bc
+        let calls = bc
             .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::CallIndirect))
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
             .count();
         let jump_if_match = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
             .count();
         assert!(
-            call_indirect >= 2,
-            "custom for-in should CallIndirect into_iter and next; got {call_indirect}"
+            calls >= 2,
+            "custom for-in should CALL into_iter and next; got {calls}"
         );
         assert!(
             jump_if_match >= 1,
@@ -3571,7 +3571,7 @@ fn main() {
         );
     }
 
-    /// Custom `Length` instances lower via `CallIndirect`, not structural `ArrayLen`.
+    /// Custom `Length` instances lower via direct `CALL`, not structural `ArrayLen`.
     #[test]
     fn custom_length_impl_emits_call_not_array_len() {
         use common::Instruction;
@@ -3592,13 +3592,19 @@ fn main() {
             .count();
         assert_eq!(
             array_lens, 2,
-            "custom Length uses CallIndirect; string/vec thunks keep ArrayLen; ops={:?}",
+            "custom Length uses CALL; string/vec thunks keep ArrayLen; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
             bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "expected CALL to Length::len; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "expected CallIndirect to Length::len; ops={:?}",
+            "ground Length::len must not use CallIndirect; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

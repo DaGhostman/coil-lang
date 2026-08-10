@@ -2,7 +2,9 @@
 
 use common::{BUILTIN_FFI_ERROR_KIND_VARIANTS, BUILTIN_FFI_ERROR_VARIANT, Value};
 
-use crate::memory::{Heap, Member, ObjEnum, Object};
+use crate::memory::{Heap, Member};
+#[cfg(test)]
+use crate::memory::Object;
 
 use super::signature::FfiError;
 
@@ -67,8 +69,7 @@ pub fn alloc_result_ffi_err(heap: &mut Heap, kind: FfiErrorKindTag, message: Str
 }
 
 fn alloc_enum(heap: &mut Heap, tag: u32, payload: Vec<Member>) -> Value {
-    let (obj, _) = heap.alloc(ObjEnum { tag, payload }, Object::Enum);
-    Value::from(obj.addr())
+    heap.alloc_enum_value(tag, payload)
 }
 
 fn member_from_value(heap: &Heap, value: Value) -> Member {

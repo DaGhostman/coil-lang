@@ -165,6 +165,7 @@ pub(super) fn is_return_terminator(op: &IlOp) -> bool {
         Some(b) if matches!(
             *b.bytecode(),
             Instruction::RETURN
+                | Instruction::ReturnPair
                 | Instruction::HALT
                 | Instruction::LoadReturnSlot
                 | Instruction::ConstReturnImm

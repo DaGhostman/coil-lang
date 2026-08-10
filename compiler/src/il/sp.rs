@@ -158,21 +158,29 @@ pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option
         | Instruction::XOR
         | Instruction::AND
         | Instruction::OR => Some(-1),
-        Instruction::NOT | Instruction::NEG => Some(0),
+        Instruction::NOT | Instruction::NEG | Instruction::NEGF => Some(0),
         Instruction::BinSlotImm | Instruction::BinSlotSlot => Some(1),
         Instruction::BinSlotImmJmpf
         | Instruction::BinSlotSlotJmpf
+        | Instruction::BinSlotSlotConstJmpf
         | Instruction::BinSlotImmStore
         | Instruction::BinSlotSlotStore => Some(0),
         Instruction::CmpJmpf => Some(-2),
         Instruction::LogNotJmpf => Some(-1),
-        Instruction::RETURN | Instruction::LoadReturnSlot | Instruction::ConstReturnImm => Some(-1),
+        Instruction::RETURN
+        | Instruction::LoadReturnSlot
+        | Instruction::ConstReturnImm => Some(-1),
+        Instruction::ReturnPair => Some(-2),
         Instruction::BinReturn => Some(-2),
         Instruction::HALT | Instruction::NOOP => Some(0),
         Instruction::JMP => Some(0),
         Instruction::JMPF | Instruction::JMPT => Some(-1),
         Instruction::Index => Some(-1),
         Instruction::BoxValue | Instruction::UnboxValue | Instruction::LoadField => Some(0),
+        Instruction::OptionNicheToHeap
+        | Instruction::HeapOptionToNiche => Some(0),
+        Instruction::PairToHeap => Some(-1),
+        Instruction::HeapToPair => Some(1),
         Instruction::CastIntToFloat
         | Instruction::CastFloatToInt
         | Instruction::CastIntToByte
@@ -190,7 +198,8 @@ pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option
             Some(1 - arity as i32)
         }
         Instruction::TailCall => None,
-        Instruction::HostInvoke => Some(-1),
+        Instruction::HostInvoke | Instruction::HostInvokeNiche => Some(-1),
+        Instruction::FloatChainStore => Some(0),
         Instruction::PRINT | Instruction::GetField => Some(-1),
         Instruction::SetField => Some(-2),
         // STRING pushes the ObjString; DATA is a stack-neutral archive tombstone.
@@ -230,6 +239,7 @@ fn is_terminator(op: &IlOp) -> bool {
         Some(b) if matches!(
             *b.bytecode(),
             Instruction::RETURN
+                | Instruction::ReturnPair
                 | Instruction::HALT
                 | Instruction::LoadReturnSlot
                 | Instruction::ConstReturnImm

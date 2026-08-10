@@ -2,7 +2,9 @@
         ArchivedByte as Byte, ArchivedInstruction as Instruction, Byte as RawByte, Value,
     };
 
-    use super::{dispatch_count, reset_dispatch_count};
+    use super::{
+        alloc_count, dispatch_count, make_fast_count, reset_alloc_profile, reset_dispatch_count,
+    };
     use crate::{Heap, Machine, ObjArray, ObjEnum, Object};
     use std::sync::{Arc, Mutex};
 
@@ -202,6 +204,246 @@
         let idx = strings.len() as u32;
         strings.push(s.to_string());
         vec![Byte::new(Instruction::STRING).with_operand_u32(idx)]
+    }
+
+    #[test]
+    fn repeated_program_string_reuses_one_heap_object() {
+        let strings = vec!["literal".to_owned()];
+        let code = vec![
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::POP),
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+
+        let value = vm.pop();
+        assert_eq!(
+            vm.heap()
+                .into_iter()
+                .filter(|obj| matches!(obj, Object::String(_)))
+                .count(),
+            1
+        );
+        assert!(vm.heap().find_object_by_addr(value.raw() as u64).is_some());
+    }
+
+    #[test]
+    fn intern_key_reuses_heap_string_handle() {
+        let mut vm = Machine::<8>::default();
+        let key = vm.heap_mut().intern("field".to_owned());
+        let value = Value::from(key.as_ptr() as u64);
+        let resolved = Machine::<8>::intern_key(vm.heap_mut(), value);
+
+        assert!(crate::memory::Gc::ptr_eq(key, resolved));
+    }
+
+    #[test]
+    fn intern_key_non_string_falls_back_to_empty() {
+        let mut vm = Machine::<8>::default();
+        let empty = vm.heap_mut().intern_str("");
+        let resolved = Machine::<8>::intern_key(vm.heap_mut(), Value::from(42i64));
+
+        assert!(crate::memory::Gc::ptr_eq(empty, resolved));
+        assert_eq!(resolved.as_ref().data, "");
+    }
+
+    #[test]
+    fn make_dict_set_field_get_field_roundtrip_via_intern_key() {
+        let strings = vec!["k".to_owned()];
+        let mut code = Vec::new();
+        code.push(const_int(1));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
+        code.push(store_pop(0));
+        // SetField pops name, target, value — push value, dict, key.
+        code.push(const_int(99));
+        code.push(load(0));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::SetField));
+        code.push(Byte::new(Instruction::POP));
+        code.push(load(0));
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(Byte::new(Instruction::GetField));
+        code.push(Byte::new(Instruction::HALT));
+
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        assert_eq!(vm.pop().as_int(), 99);
+        assert_eq!(
+            vm.heap()
+                .into_iter()
+                .filter(|obj| matches!(obj, Object::String(_)))
+                .count(),
+            1,
+            "MakeDict/SetField/GetField must reuse the program string key"
+        );
+    }
+
+    #[test]
+    fn make_enum_mixed_int_and_string_payload_order() {
+        use crate::memory::Member;
+
+        let strings = vec!["payload".to_owned()];
+        let mut code = Vec::new();
+        // Declaration order (int, string): push string then int so payload[0]=int.
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        code.push(const_int(7));
+        code.push(make_enum(3, 2));
+        code.push(Byte::new(Instruction::HALT));
+
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(&code, &[], &strings, 0);
+        let enum_addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(enum_addr) {
+            Some(Object::Enum(gc)) => {
+                let e = gc.as_ref();
+                assert_eq!(e.tag, 3);
+                assert_eq!(e.payload.len(), 2);
+                match &e.payload[0] {
+                    Member::Value(v) => assert_eq!(v.as_int(), 7),
+                    Member::Object(_) => panic!("payload[0] should be int Value"),
+                }
+                match &e.payload[1] {
+                    Member::Object(Object::String(s)) => {
+                        assert_eq!(s.as_ref().data, "payload");
+                    }
+                    _ => panic!("payload[1] should be string Object"),
+                }
+            }
+            _ => panic!("expected enum on stack"),
+        }
+    }
+
+    /// MakeTuple fixed-arity fast path: declaration-order elements, no reverse.
+    #[test]
+    fn make_tuple_arity2_and_3_preserve_declaration_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        let addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Tuple(gc)) => {
+                let e = &gc.as_ref().elements;
+                assert_eq!(e.len(), 2);
+                assert_eq!(e[0].as_int(), 10);
+                assert_eq!(e[1].as_int(), 20);
+            }
+            _ => panic!("expected tuple"),
+        }
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 2);
+    }
+
+    /// MakeArray fixed-arity fast path mirrors MakeTuple order.
+    #[test]
+    fn make_array_arity2_preserves_declaration_order() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(6),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 5);
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(6),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 6);
+    }
+
+    /// Empty MakeTuple / MakeArray still allocate a rooted aggregate.
+    #[test]
+    fn make_tuple_and_array_arity0() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            Byte::new(Instruction::MakeArray).with_operand_u32(0),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// Tree-node shape: MakeEnum arity-2 hits the fixed-arity fast path and
+    /// keeps pop-order payload (codegen reverse-pushes).
+    #[test]
+    fn make_enum_arity2_fast_path_tree_node_shape() {
+        reset_alloc_profile();
+        let mut vm = Machine::<8>::default();
+        // Leaf singletons + Node(left, right): push right leaf, left leaf.
+        vm.run(&[
+            make_enum(0, 0),
+            make_enum(0, 0),
+            make_enum(1, 2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert!(
+            make_fast_count() >= 1,
+            "arity-2 MakeEnum should take the fixed-arity fast path"
+        );
+        assert!(alloc_count() >= 1, "Node must allocate one enum object");
+        let node = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(node) {
+            Some(Object::Enum(gc)) => {
+                let e = gc.as_ref();
+                assert_eq!(e.tag, 1);
+                assert_eq!(e.payload.len(), 2);
+            }
+            _ => panic!("expected Node enum"),
+        }
+    }
+
+    /// Large arity still works (slow Vec path) and preserves order.
+    #[test]
+    fn make_tuple_arity4_slow_path_preserves_order() {
+        reset_alloc_profile();
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            const_int(4),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(4),
+            const_int(3),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 4);
+        // arity 4 must not bump the fixed-arity fast counter for this op.
+        // (Other setup may be zero — only this MakeTuple ran.)
+        assert_eq!(make_fast_count(), 0);
     }
 
     /// `ArrayLen` must report string/tuple/dict lengths (structural `len`).
@@ -1932,6 +2174,241 @@
     }
 
     #[test]
+    fn option_niche_round_trip_preserves_heap_payload() {
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::STRING).with_operand_u32(0),
+                Byte::new(Instruction::OptionNicheToHeap),
+                Byte::new(Instruction::HeapOptionToNiche),
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+            &["ok".to_string()],
+            0,
+        );
+        let value = vm.pop();
+        match vm.heap().find_object_by_addr(value.raw() as u64) {
+            Some(Object::String(string)) => assert_eq!(string.as_ref().data, "ok"),
+            other => panic!(
+                "niche round-trip lost string payload (object present: {})",
+                other.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn pair_box_round_trip_preserves_tag_and_payload() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            Byte::new(Instruction::PairToHeap),
+            Byte::new(Instruction::HeapToPair),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    #[test]
+    fn float_chain_store_preserves_separate_operation_rounding() {
+        let a = 1.0 + 2f64.powi(-27);
+        let b = 1.0 - 2f64.powi(-27);
+        let c = -1.0;
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::ADDF as u64) << 24)
+            | (2_u64 << 32);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST)
+                    .with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((3 << 16) | 3),
+                load(3),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(a).raw() as u64,
+                Value::from(b).raw() as u64,
+                Value::from(c).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+
+        // Separate MULF then ADDF rounds the product to 1.0 before adding -1.
+        assert_eq!(vm.pop().as_float(), 0.0);
+    }
+
+    #[test]
+    fn float_chain_store_preserves_special_float_values() {
+        let descriptor = (Instruction::ADDF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (2_u64 << 32);
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+            store_pop(0),
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+            store_pop(1),
+            Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+            store_pop(2),
+            Byte::new(Instruction::FloatChainStore).with_operand_u32((3 << 16) | 3),
+            load(3),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &code,
+            &[
+                Value::from(-0.0_f64).raw() as u64,
+                Value::from(-0.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        let signed_zero = vm.pop().as_float();
+        assert_eq!(signed_zero, 0.0);
+        assert!(signed_zero.is_sign_negative());
+
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &code,
+            &[
+                Value::from(f64::NAN).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert!(vm.pop().as_float().is_nan());
+    }
+
+    #[test]
+    fn float_chain_store_three_stage_const_under_matches_separate_ops() {
+        // 2.0 * (zr * zi) + ci with intermediate rounding, const-under MULF.
+        let zr = 1.0 + 2f64.powi(-27);
+        let zi = 1.0 - 2f64.powi(-27);
+        let ci = -1.0;
+        let two = 2.0_f64;
+        let separate = {
+            let t = zr * zi;
+            let t = two * t;
+            t + ci
+        };
+        // EXT | has_stage2 | stage1_left | rhs1_const
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (3_u64 << 32) // pool idx of 2.0
+            | ((Instruction::ADDF as u64) << 40)
+            | (2_u64 << 48) // ci slot
+            | (1 << 57) // rhs1 const
+            | (1 << 60) // stage1 other on left
+            | (1 << 62) // has stage2
+            | (1u64 << 63);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((4 << 16) | 4),
+                load(4),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(zr).raw() as u64,
+                Value::from(zi).raw() as u64,
+                Value::from(ci).raw() as u64,
+                Value::from(two).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_float(), separate);
+    }
+
+    #[test]
+    fn float_chain_store_three_stage_preserves_nan() {
+        let descriptor = (Instruction::MULF as u64)
+            | (0_u64 << 8)
+            | (1_u64 << 16)
+            | ((Instruction::MULF as u64) << 24)
+            | (3_u64 << 32)
+            | ((Instruction::ADDF as u64) << 40)
+            | (2_u64 << 48)
+            | (1 << 57)
+            | (1 << 60)
+            | (1 << 62)
+            | (1u64 << 63);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG),
+                store_pop(0),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 1),
+                store_pop(1),
+                Byte::new(Instruction::CONST).with_operand_u32(common::Byte::POOL_FLAG | 2),
+                store_pop(2),
+                Byte::new(Instruction::FloatChainStore).with_operand_u32((4 << 16) | 4),
+                load(4),
+                Byte::new(Instruction::HALT),
+            ],
+            &[
+                Value::from(f64::NAN).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(1.0_f64).raw() as u64,
+                Value::from(2.0_f64).raw() as u64,
+                descriptor,
+            ],
+            &[],
+            0,
+        );
+        assert!(vm.pop().as_float().is_nan());
+    }
+
+    #[test]
+    fn vec_niche_pop_does_not_allocate_an_option_enum() {
+        let mut vm = Machine::<16>::default();
+        let (object, _) = vm.heap.alloc(
+            ObjArray {
+                elements: vec![Value::from(7_i64)],
+            },
+            Object::Array,
+        );
+        let before = vm.heap.live_object_count();
+        let value = crate::vec_ops::host_vec_pop_niche(
+            &mut vm.heap,
+            &[Value::from(object.addr())],
+        );
+
+        assert_eq!(value.as_int(), 7);
+        assert_eq!(vm.heap.live_object_count(), before);
+    }
+
+    #[test]
     fn inc_prefix_returns_new_value() {
         let mut vm = Machine::<8>::default();
         vm.run(&[
@@ -3239,6 +3716,67 @@
                 Byte::new(Instruction::HALT),
             ],
             &[5u64],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    /// BinSlotSlotConstJmpf: ADDF(slots) > pool float — fall through / jump.
+    #[test]
+    fn bin_slot_slot_const_jmpf_addf_gtf() {
+        let four = 4.0f64.to_bits();
+        let three = 3.0f64.to_bits();
+        let one = 1.0f64.to_bits();
+        let two = 2.0f64.to_bits();
+        // Code layout: setup(0..3), fused(4), fall(5..6), jump(7..8).
+        // 3.0+1.0=4.0; 4.0 > 4.0 is false → jump to 7 → push 0
+        let desc_jump =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, one, four, desc_jump],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // 3.0+2.0=5.0; 5.0 > 4.0 → fall through → push 1
+        let desc_fall =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, two, four, desc_fall],
             &[],
             0,
         );

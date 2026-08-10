@@ -5,6 +5,7 @@
 //! encodings along the way — no post-shrink jump relocation.
 
 mod algebraic;
+mod bounds;
 mod builder;
 mod codebuf;
 mod emit_buf;
@@ -17,6 +18,8 @@ mod op;
 mod opt;
 mod sp;
 pub mod tell;
+
+pub use bounds::{BoundsStats, last_bounds_stats};
 
 pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;

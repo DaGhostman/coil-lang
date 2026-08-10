@@ -125,6 +125,7 @@ fn effect(byte: &Byte, pool: &[u64]) -> Effect {
         | Instruction::LoadReturnSlot
         | Instruction::ConstReturnImm
         | Instruction::BinReturn
+        | Instruction::ReturnPair
         | Instruction::TailCall => Effect::Terminator,
         other => match super::sp::byte_stack_delta(other, byte) {
             Some(d) => Effect::Delta(d),
@@ -142,6 +143,7 @@ fn effect(byte: &Byte, pool: &[u64]) -> Effect {
 fn edge_effects(byte: &Byte, pool: &[u64]) -> (Effect, Effect) {
     match *byte.bytecode() {
         Instruction::JumpIfMatch => (Effect::Delta(0), Effect::Unknown),
+        Instruction::PairJumpIfTag => (Effect::Delta(0), Effect::Delta(-1)),
         _ => {
             let e = effect(byte, pool);
             (e, e)
@@ -218,7 +220,14 @@ fn jump_target(byte: &Byte, pool: &[u64]) -> Option<usize> {
             let (_, _, pool_idx) = byte.bin_slot_slot_jmpf_parts();
             Some((*pool.get(pool_idx)? >> 32) as usize)
         }
-        Instruction::JumpIfMatch => Some(byte.jump_if_match_target(pool)),
+        Instruction::BinSlotSlotConstJmpf => {
+            let (_, _, pool_idx) = byte.bin_slot_slot_const_jmpf_parts();
+            let packed = *pool.get(pool_idx)?;
+            Some((packed >> 32) as usize)
+        }
+        Instruction::JumpIfMatch | Instruction::PairJumpIfTag => {
+            Some(byte.jump_if_match_target(pool))
+        }
         _ => None,
     }
 }
@@ -229,6 +238,7 @@ fn is_unconditional_transfer(byte: &Byte) -> bool {
         *byte.bytecode(),
         Instruction::JMP
             | Instruction::RETURN
+            | Instruction::ReturnPair
             | Instruction::HALT
             | Instruction::LoadReturnSlot
             | Instruction::ConstReturnImm
