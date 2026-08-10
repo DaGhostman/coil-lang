@@ -11,6 +11,7 @@ pub mod generics;
 pub mod id;
 pub mod infer;
 pub mod kind;
+pub mod loop_par;
 pub mod pretty;
 pub mod par_profit;
 pub mod purity;
@@ -29,13 +30,17 @@ pub use infer::{CStructDef, CallbackSigDef, Checker, ForInInfo, ForInKind};
 #[allow(unused_imports)] // public API for kind-aware callers / tests
 pub use kind::Kind;
 #[allow(unused_imports)] // public API re-export
+pub use loop_par::{LoopParSite, LoopParSites, LoopReduceOp, analyze_loop_par_sites};
+#[allow(unused_imports)] // public API re-export
 pub use par_profit::{
     ArgForm, ParArm, ParBinOp, ParCombine, ParForkSite, analyze_par_fork_sites,
     collect_par_specialization_args, const_args_worth_parallel, eval_arm_args, par_cost_threshold,
     par_specialization_name,
 };
 #[allow(unused_imports)] // public API re-export
-pub use purity::{RecursivePureSet, analyze_recursive_fns, analyze_recursive_pure};
+pub use purity::{
+    RecursivePureSet, analyze_pure_fns, analyze_recursive_fns, analyze_recursive_pure,
+};
 #[allow(unused_imports)] // public API re-export
 pub use stack_bound::{
     BoundSource, DEFAULT_OPERAND_STACK_SLOTS, FnStackBound, MAX_OPERAND_STACK_SLOTS, StackBoundReport,
