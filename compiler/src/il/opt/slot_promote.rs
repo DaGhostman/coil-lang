@@ -2316,4 +2316,374 @@ mod tests {
             "φ-like multi-pred latch must keep shuffle"
         );
     }
+
+    #[test]
+    fn refuses_coalesce_when_temp_still_live_after_copy() {
+        // STORE t; LOAD t; STORE s; LOAD t — post-copy use of t must refuse.
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 4, .. }, IlOp::StorePop { slot: 5, .. })
+            )),
+            "post-copy live temp must keep the shuffle"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 4, .. })),
+            "temp store must remain when t is still live after the copy"
+        );
+    }
+
+    #[test]
+    fn refuses_coalesce_across_control_flow() {
+        // Same-block only: a jump between def and copy must refuse.
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 4, .. })),
+            "cross-block coalesce must refuse without dominance"
+        );
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 4, .. }, IlOp::StorePop { slot: 5, .. })
+            )),
+            "copy after a jump must remain"
+        );
+    }
+
+    #[test]
+    fn refuses_coalesce_when_dest_lower_without_tell_proof() {
+        // s < t: redirecting STORE 5→3 would drop tell before CALL. The post-call
+        // LOAD 3 keeps the copy live so alias-elision cannot paper over the gap.
+        let mut ops = vec![
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 0);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 5, .. }, IlOp::StorePop { slot: 3, .. })
+            )),
+            "lowering the store floor (s < t) before CALL must refuse coalesce"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "original STORE t must remain to keep the CALL cursor floor"
+        );
+    }
+
+    #[test]
+    fn coalesces_lower_dest_when_later_store_covers_original_floor() {
+        // s < t is OK when a later STORE covers the original floor height t.
+        let mut ops = vec![
+            IlOp::Const { imm: 9, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 0);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 3, .. })),
+            "def should redirect into lower dest when later STORE covers t"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 5, .. }, IlOp::StorePop { slot: 3, .. })
+            )),
+            "copy should elide once later floor covers original t"
+        );
+    }
+
+    #[test]
+    fn refuses_unused_alias_elision_across_call() {
+        // LOAD a; STORE b with b unused — CALL blocks later_store floor proof,
+        // and tell does not allow bare drop across the call.
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 2,
+                loc: loc(),
+            },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 1);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 2, .. })),
+            "unused alias store before CALL must remain (cursor floor)"
+        );
+    }
+
+    #[test]
+    fn refuses_coalesce_when_opaque_between_def_and_copy() {
+        // FloatChainStore is opaque — coalescing across it must fail closed.
+        let chain = common::Byte::new(Instruction::FloatChainStore).with_operand_u32((7 << 16) | 0);
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::Byte {
+                byte: chain,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 4, .. }, IlOp::StorePop { slot: 5, .. })
+            )),
+            "opaque FloatChainStore between def and copy must refuse coalesce"
+        );
+    }
+
+    #[test]
+    fn coalesces_bin_slot_slot_store_def_into_dest() {
+        // Residual BinSlotSlotStore writing t then LOAD t; STORE s → write s.
+        let fused = common::Byte::new(Instruction::BinSlotSlotStore).with_bin_slot_slot_store(
+            Instruction::ADD as u8,
+            1,
+            2,
+            4,
+        );
+        let mut ops = vec![
+            IlOp::Byte {
+                byte: fused,
+                loc: loc(),
+            },
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 4,
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 6,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 6,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        let redirected = ops.iter().any(|op| match op {
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::BinSlotSlotStore => {
+                let (_, _, _, dest) = byte.bin_slot_slot_store_parts();
+                dest == 6
+            }
+            _ => false,
+        });
+        assert!(
+            redirected,
+            "BinSlotSlotStore def should redirect dest 4→6"
+        );
+        assert!(
+            !ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 4, .. }, IlOp::StorePop { slot: 6, .. })
+            )),
+            "copy after BinSlotSlotStore coalesce should be gone"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::BinSlotImm { slot: 6, .. })),
+            "uses of temp should read coalesced dest 6"
+        );
+    }
+
+    #[test]
+    fn refuses_latch_when_temp_still_live_out() {
+        // Latch LOAD t; STORE s but t remains live out of the latch (not copy-only).
+        let mut ops = vec![
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::BinSlotImm {
+                op: Instruction::ADD as u8,
+                slot: 5,
+                imm: 0,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Const { imm: 7, loc: loc() },
+            IlOp::StorePop {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            // Header still needs t=3 next iter via a separate path use — keep t live
+            // by also reading it after the shuffle in the latch before the jump.
+            IlOp::Load {
+                slot: 3,
+                loc: loc(),
+            },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Return { loc: loc() },
+        ];
+        slot_promote(&mut ops, 3);
+        assert!(
+            ops.windows(2).any(|w| matches!(
+                (&w[0], &w[1]),
+                (IlOp::Load { slot: 3, .. }, IlOp::StorePop { slot: 5, .. })
+            )),
+            "latch shuffle must remain when t is live-out"
+        );
+    }
 }
