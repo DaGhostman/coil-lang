@@ -47,6 +47,22 @@ Only the *bytecode* half of that model is under the differential gate, and the g
 | Anything inside a loop whose body raises the cursor | The header cursor is genuinely `Unknown` (see `il::tell`), so no store in the body is provably redundant. This is what still holds `mandelbrot`'s 13 STOREs: normalizing the back edge with a `Seek` would make the header `Known` and turn all three inner temps into self-stores, at one dispatch per iteration |
 | Pool-packed fused slot operands (`BinSlot*Store` / `BinSlot*Jmpf`), `Seek`, `UnpackAt` | Destination slot is not readable from symbolic IL — the whole body is refused |
 
+**Counted-loop bounds analysis proves length invariance, not in-bounds indices.** `il::bounds` answers one question per natural loop: can the length of the arrays this loop addresses change while it runs? Element writes cannot — `StoreIndex` overwrites a slot in place — so `while i < len(a) { a[i] = 0; }` has an invariant `len(a)` even though the array is mutated. On that proof two invariant materializations move to the preheader: the `LOAD a; ArrayLen; STORE t` triple codegen leaves in the loop header, and the `CONST imm; STORE t` pair that materializes a constant addressing operand (`vec_scan` 6.58M → 5.01M dispatches, `nsieve` 545.6k → 469.9k). **No bounds check is removed**: `Index` / `StoreIndex` keep the in-VM range test, so an out-of-range read still yields `-1` and an out-of-range write is still a no-op.
+
+The safety argument is the cursor, not liveness: the preheader `STORE t` floors the cursor at `t + 1`, and because the cursor is monotone in its input, proving every in-loop stack height stays at or above the header's proves every in-loop push lands above `t`. That is why the pass needs only `il::sp`, and why it works where `slot_promote` cannot — it *adds* a floor instead of removing one. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Any call, host native, `GetField`/`SetField`, or unmodelled op in the body | The callee could hold another reference to the array and `push`/`pop` it. This is the single biggest coverage gap: most stdlib `while i < len(b)` loops call a helper on `b[i]` |
+| `ArrayPush` / `MakeArray` / `MakeDict` / `CodePtr` / `MakePolyFn` in the body | Length can change (`tests/positive/while_len_grow.hy`) or user code can run |
+| A rebound `Vec` local (`slots_stored_in_loop`) | A different array each pass, so its length is not invariant |
+| An `Index` / `StoreIndex` whose target is not a plain slot load | Nested `a[i][j]`, a `Dup`, a call result: the walk-back cannot name the array, so the whole loop is refused |
+| A loop that computes `len(a)` but addresses no array | Outside P2's remit; nothing licenses reasoning about aliasing there |
+| A body whose stack height dips below the header's | The preheader floor would not survive, so a later push could land on the temp |
+| A temp read before its def in the body, or outside the loop | The hoist changes what the earlier read observes; the cursor floor also stops protecting the slot once control leaves the loop |
+| **`0 <= i < len` itself** | Implemented nowhere: with no unchecked opcode there is no consumer for the fact. Induction-variable detection plus a monotonicity proof is the next slice, and it only pays off together with an `IndexUnchecked`-style form or an in-VM object-lookup cache — both opcode/ABI decisions |
+| The `find_object_by_addr` lookup each `Index` still pays | Caching the resolved array across a loop means keeping a heap address live in IL across a GC point; the length is an `int`, which is why it hoists and the object does not |
+
 **`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`.
 
 ## Test / CI reliability (high–medium)
