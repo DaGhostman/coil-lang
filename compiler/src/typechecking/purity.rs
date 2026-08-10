@@ -128,29 +128,46 @@ fn collect_toplevel_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) 
     }
 }
 
+/// Names of user functions with no observable side effects.
+///
+/// Unlike [`analyze_recursive_pure`] this keeps non-recursive functions, so
+/// callers that only need "safe to evaluate on another thread" (loop IPA) can
+/// admit ordinary helpers such as `fn sq(int i) -> int { i * i }`.
+pub fn analyze_pure_fns(ast: &Output<'_>) -> HashSet<String> {
+    let facts = collect_fn_facts(ast);
+    let impure = impure_closure(&facts);
+    facts
+        .keys()
+        .filter(|name| !impure.contains(*name))
+        .cloned()
+        .collect()
+}
+
 /// Analyze top-level / nested `fn` declarations and return self-recursive pure names.
 pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
     let facts = collect_fn_facts(ast);
-    let user_fns: HashSet<String> = facts.keys().cloned().collect();
+    let impure = impure_closure(&facts);
+    facts
+        .iter()
+        .filter(|(name, f)| !impure.contains(*name) && f.callees.contains(*name))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
 
-    // Fixed-point: impure if local_impure or any callee is impure / non-user.
+/// Fixed point of "impure if locally impure, or any callee is impure / not a
+/// user `fn`" over the call graph.
+fn impure_closure(facts: &HashMap<String, FnFacts>) -> HashSet<String> {
+    let user_fns: HashSet<&String> = facts.keys().collect();
     let mut impure: HashSet<String> = HashSet::new();
-    for (name, f) in &facts {
-        if f.local_impure {
+    for (name, f) in facts {
+        if f.local_impure || f.callees.iter().any(|c| !user_fns.contains(c)) {
             impure.insert(name.clone());
-            continue;
-        }
-        for c in &f.callees {
-            if !user_fns.contains(c) {
-                impure.insert(name.clone());
-                break;
-            }
         }
     }
     let mut changed = true;
     while changed {
         changed = false;
-        for (name, f) in &facts {
+        for (name, f) in facts {
             if impure.contains(name) {
                 continue;
             }
@@ -160,17 +177,7 @@ pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
             }
         }
     }
-
-    let mut out = RecursivePureSet::new();
-    for (name, f) in &facts {
-        if impure.contains(name) {
-            continue;
-        }
-        if f.callees.contains(name) {
-            out.insert(name.clone());
-        }
-    }
-    out
+    impure
 }
 
 fn collect_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) {
@@ -654,6 +661,28 @@ fn main() { return; }
 "#,
         );
         assert!(!set.contains("add"));
+    }
+
+    /// `analyze_pure_fns` keeps the non-recursive helpers that loop IPA needs.
+    #[test]
+    fn analyze_pure_fns_keeps_non_recursive_helpers() {
+        let ast = parse_ast(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn add(int a, int b) -> int { return a + b; }
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn relay(int n) -> int { return shout(n); }
+fn main() { return; }
+"#,
+        );
+        let set = analyze_pure_fns(&ast);
+        assert!(set.contains("add"), "{set:?}");
+        assert!(!set.contains("shout"), "{set:?}");
+        assert!(!set.contains("relay"), "impurity propagates: {set:?}");
     }
 
     #[test]
