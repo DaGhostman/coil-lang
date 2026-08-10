@@ -83,6 +83,25 @@ fn load_store_shape(bytecode: &[Byte], start: usize, end: usize) -> LoadStoreSha
     shape
 }
 
+/// Tightest backward-branch range `[target, jmp)` in a PC window — the innermost
+/// loop body of a well-nested function.
+fn innermost_loop_range(bytecode: &[Byte], start: usize, end: usize) -> (usize, usize) {
+    let mut best: Option<(usize, usize)> = None;
+    for (pc, b) in bytecode[start..end].iter().enumerate().map(|(i, b)| (start + i, b)) {
+        if *b.bytecode() != Instruction::JMP {
+            continue;
+        }
+        let target = b.operand_u32() as usize;
+        if target >= pc || target < start {
+            continue;
+        }
+        if best.is_none_or(|(t, _)| target > t) {
+            best = Some((target, pc));
+        }
+    }
+    best.expect("function has a backward branch")
+}
+
 /// Fused `BinSlot*` words in a PC range — the slot-addressed shapes that
 /// already bypass a stack round-trip.
 fn count_bin_slot_family_in(bytecode: &[Byte], start: usize, end: usize) -> usize {
@@ -377,7 +396,10 @@ fn aot_p1_p4_tak_residual_load_store_and_call_density() {
 }
 
 /// P2 baseline: `nsieve`'s hot loops keep exactly one `Index` and one
-/// `StoreIndex` alongside 5 LOADs / 5 STOREs.
+/// `StoreIndex` alongside 5 LOADs / 5 STOREs. Landed: `il::bounds` proved the
+/// `flags[k] = 0` operand temp invariant across the element writes, so the
+/// `CONST 0; STORE t` pair that materialized it left both loops — the sieve's
+/// innermost body is down to 6 words.
 #[test]
 fn aot_p2_nsieve_index_shape_inventory() {
     let (bc, _, _, _, pipeline) = compile("examples/perf/nsieve.hy");
@@ -386,7 +408,11 @@ fn aot_p2_nsieve_index_shape_inventory() {
     let index = count_opcodes_in(&bc, start, end, Instruction::Index);
     let store_index = count_opcodes_in(&bc, start, end, Instruction::StoreIndex);
     let shape = load_store_shape(&bc, start, end);
-    eprintln!("[P2] nsieve::nsieve index={index} store_index={store_index} {shape:?}");
+    let (inner_start, inner_end) = innermost_loop_range(&bc, start, end);
+    eprintln!(
+        "[P2] nsieve::nsieve index={index} store_index={store_index} {shape:?} inner_words={}",
+        inner_end - inner_start
+    );
 
     // `flags[p]` read and `flags[k] = 0` write — one site each in source.
     assert_eq!(index, 1, "nsieve Index count changed");
@@ -405,6 +431,77 @@ fn aot_p2_nsieve_index_shape_inventory() {
         count_opcodes_in(&bc, start, end, Instruction::CALL),
         1,
         "nsieve call count changed"
+    );
+    // The `flags[k] = 0` sieve loop: guard, packed LOAD, StoreIndex, POP,
+    // stride add, back edge. Nothing may re-materialize the stored constant.
+    assert!(
+        inner_end - inner_start <= 5,
+        "nsieve sieve loop grew: {} words",
+        inner_end - inner_start
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, inner_start, inner_end, Instruction::CONST),
+        0,
+        "the StoreIndex operand constant must stay hoisted"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, inner_start, inner_end, Instruction::STORE),
+        0,
+        "the StoreIndex operand temp store must stay hoisted"
+    );
+}
+
+/// P2: `while i < len(v)` keeps its `Index` / `StoreIndex` bounds checks, but the
+/// invariant `LOAD v; ArrayLen; STORE t` triple codegen leaves in the header
+/// moves to the preheader — including in `fill`, where the loop writes elements.
+#[test]
+fn aot_p2_len_loop_hoists_invariant_array_len() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/vec_scan.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    for (name, index, store_index) in [("scan", 1usize, 0usize), ("fill", 0, 1)] {
+        let (start, end) = fn_pc_range(&syms, name, bc.len());
+        let (inner_start, inner_end) = innermost_loop_range(&bc, start, end);
+        let in_loop = count_opcodes_in(&bc, inner_start, inner_end, Instruction::ArrayLen);
+        let total = count_opcodes_in(&bc, start, end, Instruction::ArrayLen);
+        eprintln!("[P2] vec_scan::{name} array_len={total} in_loop={in_loop}");
+        assert_eq!(
+            in_loop, 0,
+            "{name} must not recompute len(v) every iteration"
+        );
+        assert_eq!(
+            count_opcodes_in(&bc, start, end, Instruction::Index),
+            index,
+            "{name} Index count changed"
+        );
+        assert_eq!(
+            count_opcodes_in(&bc, start, end, Instruction::StoreIndex),
+            store_index,
+            "{name} StoreIndex count changed"
+        );
+    }
+}
+
+#[test]
+fn aot_p2_vec_scan_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/vec_scan.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    eprintln!("[P2] vec_scan dispatches={dispatches}");
+    // 64 rounds over a 4096-element Vec, both loops hoisted (~5.0M).
+    assert!(
+        dispatches < 5_300_000,
+        "vec_scan dispatch count regressed: {dispatches}"
+    );
+}
+
+#[test]
+fn aot_p2_nsieve_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/nsieve.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    eprintln!("[P2] nsieve dispatches={dispatches}");
+    // ~470k with the sieve loop's operand materialization hoisted.
+    assert!(
+        dispatches < 490_000,
+        "nsieve dispatch count regressed: {dispatches}"
     );
 }
 
