@@ -256,6 +256,33 @@
         );
     }
 
+    /// Underfull stacks keep the pre-`top_window` truncate: `n = arity.min(tell)`.
+    #[test]
+    fn make_tuple_truncates_when_stack_short() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(99),
+            const_int(42),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            Byte::new(Instruction::HALT),
+        ]);
+
+        let addr = vm.pop().raw() as u64;
+        match vm.heap().find_object_by_addr(addr) {
+            Some(Object::Tuple(gc)) => {
+                assert_eq!(
+                    gc.as_ref().elements.len(),
+                    2,
+                    "must take only what is on the stack"
+                );
+                assert_eq!(gc.as_ref().elements[0].as_int(), 99);
+                assert_eq!(gc.as_ref().elements[1].as_int(), 42);
+            }
+            _ => panic!("underfull MakeTuple must still allocate"),
+        }
+        assert_eq!(vm.tell(), 0, "operand window must be fully consumed");
+    }
+
     /// `MakeEnum` stores its payload top-first and tags each arg as immediate
     /// or heap pointer; that classification is what GC tracing walks.
     #[test]
