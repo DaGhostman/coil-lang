@@ -63,6 +63,19 @@ The safety argument is the cursor, not liveness: the preheader `STORE t` floors 
 | **`0 <= i < len` itself** | Implemented nowhere: with no unchecked opcode there is no consumer for the fact. Induction-variable detection plus a monotonicity proof is the next slice, and it only pays off together with an `IndexUnchecked`-style form or an in-VM object-lookup cache — both opcode/ABI decisions |
 | The `find_object_by_addr` lookup each `Index` still pays | Caching the resolved array across a loop means keeping a heap address live in IL across a GC point; the length is an `int`, which is why it hoists and the object does not |
 
+**The caller-side predicate peel only pays when it spills nothing.** When a callee opens with a pure guard over its parameters and returns an immediate or a parameter from that arm, codegen evaluates the guard at the call site so base cases skip the frame. Arguments that compile to a single pure byte (one slot load, one constant) are re-materialized in both the guard and the argument prep instead of being stored to a temp, which drops one `STORE` plus one spill `LOAD` per argument and leaves the guard reading the caller's own locals (peel-heavy loop: 4.28G → 3.29G instructions, 189ms → 152ms). Anything longer than a byte still takes a temp, because the guard copy and the call copy would each pay for it.
+
+That byte budget is the whole profitability margin, and it is what rules out peeling a *self*-recursive call. A frame in this VM costs about two dispatches — `CALL`, then a fused `LoadReturnSlot` / `ConstReturnImm` that returns the base-case value — while the callee's guard is usually one fused `BinSlotSlotJmpf`. A peeled site has to re-emit that guard unfused (the operands are now caller expressions, not callee slots), add a `JMP` over the base arm, and store the join value, so it costs more than the frame it avoids *and* non-base calls pay the guard twice. Measured on `tak`, where 54% of the 63,609 calls hit the base case immediately: peeling all three inner self-calls grew the body from 13 to 41 words and cost +73.5% VM instructions and +31.4% wall time. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Self-recursive call sites | Callee span is not recorded until its body is compiled; reading the in-progress body works, but the peel loses to the frame (above) |
+| A base-case value that is not returned | The peel replaces the callee's `return`; a value that falls through to the join is a different result |
+| An argument longer than one pure byte, in the guard | Re-materializing it duplicates real work; it keeps its spill slot |
+| Any argument with a side effect | The guard reads some arguments before the others are evaluated, and the false path evaluates them again |
+| Instance methods, rest params, coroutines, un-monomorphized generics | The peel replicates the callee ABI, and `CallIndirect` receivers are not covered |
+| A call site that is not saturated | Partial application lowers to `MakeFn`, not `CALL` |
+
 **`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`.
 
 ## Test / CI reliability (high–medium)

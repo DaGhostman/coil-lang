@@ -140,6 +140,14 @@ specialization only when the target, arity, and evidence are statically known:
 - preserve the existing `CallIndirect` and generic fallback;
 - measure `tak` call count and frame traffic before and after.
 
+`tak`'s frame traffic has been measured and is **not** worth peeling: a frame
+costs about two dispatches here, so the caller-side predicate peel loses to it
+(+73.5% VM instructions on `tak`). The peel now only removes argument spills,
+which is a win wherever it already fired. See `limitations.md` for the cost
+model. Further `tak` work has to remove the call itself — real inlining of a
+recursive body, or a frame representation cheaper than `CALL` — not move the
+guard.
+
 ### 5. Dispatch and trace fusion
 
 Priority: medium to low until measured.
