@@ -37,8 +37,8 @@ pub(super) enum Refusal {
     UnresolvedTarget,
     /// The loop addresses no array through a slot — nothing for P2 to prove.
     NoAddressedArray,
-    /// No `LOAD a; ArrayLen; STORE t` triple sits in the body.
-    NoLenTriple,
+    /// The loop is provably alias-safe but holds nothing invariant to move.
+    NoCandidate,
 }
 
 /// A body-resident `LOAD a; ArrayLen; STORE t` whose length is invariant.
@@ -50,6 +50,15 @@ pub(super) struct LenTriple {
     pub len_slot: u32,
 }
 
+/// A body-resident `CONST imm; STORE t` that materializes an addressing operand
+/// (the `0` in `a[i] = 0`) into a temp on every pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConstOperand {
+    /// Index of the `CONST`.
+    pub at: usize,
+    pub slot: u32,
+}
+
 /// What the analysis found for one natural loop.
 #[derive(Clone, Debug)]
 pub(super) struct LoopArrayFacts {
@@ -59,6 +68,7 @@ pub(super) struct LoopArrayFacts {
     /// `StoreIndex` sites addressing an invariant array slot.
     pub store_index_sites: usize,
     pub len_hoist: Option<LenTriple>,
+    pub operand_hoist: Option<ConstOperand>,
     pub refusal: Option<Refusal>,
 }
 
@@ -75,6 +85,7 @@ pub(super) fn loop_array_facts(ops: &[IlOp]) -> Vec<LoopArrayFacts> {
                 index_sites: 0,
                 store_index_sites: 0,
                 len_hoist: None,
+                operand_hoist: None,
                 refusal: None,
             };
             if !info.sp_before(lp.header).is_known() {
@@ -90,43 +101,46 @@ pub(super) fn loop_array_facts(ops: &[IlOp]) -> Vec<LoopArrayFacts> {
                 return facts;
             }
             let stored = slots_stored_in_loop(ops, lp);
-            match addressed_arrays(ops, lp) {
-                None => {
-                    facts.refusal = Some(Refusal::UnresolvedTarget);
-                    return facts;
+            let Some(sites) = addressed_arrays(ops, lp) else {
+                facts.refusal = Some(Refusal::UnresolvedTarget);
+                return facts;
+            };
+            let mut operand_slots: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for site in &sites {
+                // A rebound `Vec` local is a different array each pass.
+                if stored.contains(&site.target) {
+                    continue;
                 }
-                Some(sites) => {
-                    for (slot, reads, writes) in sites {
-                        // A rebound `Vec` local is a different array each pass.
-                        if stored.contains(&slot) {
-                            continue;
-                        }
-                        facts.index_sites += reads;
-                        facts.store_index_sites += writes;
-                    }
+                if site.writes {
+                    facts.store_index_sites += 1;
+                } else {
+                    facts.index_sites += 1;
                 }
+                operand_slots.extend(site.operand_slots.iter().copied());
             }
             if facts.index_sites + facts.store_index_sites == 0 {
                 facts.refusal = Some(Refusal::NoAddressedArray);
                 return facts;
             }
             facts.len_hoist = find_len_triple(ops, lp, &stored);
-            if facts.len_hoist.is_none() {
-                facts.refusal = Some(Refusal::NoLenTriple);
+            facts.operand_hoist = find_const_operand(ops, lp, &operand_slots);
+            if facts.len_hoist.is_none() && facts.operand_hoist.is_none() {
+                facts.refusal = Some(Refusal::NoCandidate);
             }
             facts
         })
         .collect()
 }
 
-/// Hoist every provably invariant `len(a)` out of its loop. Returns whether any
-/// loop was rewritten.
-pub(super) fn hoist_invariant_array_len(ops: &mut Vec<IlOp>) -> bool {
+/// Move every invariant `len(a)` and constant addressing operand out of the
+/// alias-safe loops that materialize them. Returns whether anything was
+/// rewritten.
+pub(super) fn hoist_loop_invariants(ops: &mut Vec<IlOp>) -> bool {
     let mut changed = false;
-    // One hoist per pass invalidates indices; a triple carried out of an inner
-    // loop becomes a candidate in the enclosing one, hence the per-loop budget.
-    for _ in 0..find_natural_loops(ops).len().saturating_mul(2) + 2 {
-        if !hoist_one_array_len(ops) {
+    // One hoist per pass invalidates indices, and a run carried out of an inner
+    // loop becomes a candidate in the enclosing one — hence the per-loop budget.
+    for _ in 0..find_natural_loops(ops).len().saturating_mul(4) + 4 {
+        if !hoist_one(ops) {
             break;
         }
         changed = true;
@@ -134,20 +148,22 @@ pub(super) fn hoist_invariant_array_len(ops: &mut Vec<IlOp>) -> bool {
     changed
 }
 
-fn hoist_one_array_len(ops: &mut Vec<IlOp>) -> bool {
-    let facts = loop_array_facts(ops);
-    for f in &facts {
-        let Some(triple) = f.len_hoist else {
-            continue;
-        };
-        let Some(lp) = find_natural_loops(ops)
-            .into_iter()
-            .find(|l| l.header_label == f.header_label)
-        else {
-            continue;
-        };
-        if hoist_materialization(ops, &lp, triple.at, 3, triple.len_slot) {
-            return true;
+fn hoist_one(ops: &mut Vec<IlOp>) -> bool {
+    for f in &loop_array_facts(ops) {
+        let candidates = [
+            f.len_hoist.map(|t| (t.at, 3, t.len_slot)),
+            f.operand_hoist.map(|c| (c.at, 2, c.slot)),
+        ];
+        for (at, len, dest) in candidates.into_iter().flatten() {
+            let Some(lp) = find_natural_loops(ops)
+                .into_iter()
+                .find(|l| l.header_label == f.header_label)
+            else {
+                continue;
+            };
+            if hoist_materialization(ops, &lp, at, len, dest) {
+                return true;
+            }
         }
     }
     false
@@ -254,28 +270,50 @@ fn find_len_triple(
     None
 }
 
-/// Read / write counts per array slot addressed by `Index` / `StoreIndex`.
-/// `None` when any site's target cannot be resolved to a slot.
-fn addressed_arrays(ops: &[IlOp], lp: &NaturalLoop) -> Option<Vec<(u32, usize, usize)>> {
-    let mut sites: Vec<(u32, usize, usize)> = Vec::new();
-    for i in lp.header..=lp.latch {
-        let operands = match indexing_operands(&ops[i]) {
-            Some(n) => n,
-            None => continue,
-        };
-        let slot = addressed_slot(ops, i, operands)?;
-        let entry = match sites.iter_mut().find(|(s, _, _)| *s == slot) {
-            Some(e) => e,
-            None => {
-                sites.push((slot, 0, 0));
-                sites.last_mut().expect("just pushed")
-            }
-        };
-        if operands == 2 {
-            entry.1 += 1;
-        } else {
-            entry.2 += 1;
+/// The invariant `CONST imm; STORE t` that feeds an addressing operand, if any.
+fn find_const_operand(
+    ops: &[IlOp],
+    lp: &NaturalLoop,
+    operand_slots: &std::collections::HashSet<u32>,
+) -> Option<ConstOperand> {
+    let mut i = lp.body_start();
+    while i + 1 < lp.latch {
+        if matches!(ops[i], IlOp::Const { .. } | IlOp::ConstPool { .. })
+            && let Some(slot) = single_store_slot(&ops[i + 1])
+            && operand_slots.contains(&slot)
+            && store_count_in_loop(ops, lp, slot) == 1
+        {
+            return Some(ConstOperand { at: i, slot });
         }
+        i += 1;
+    }
+    None
+}
+
+/// One resolved `Index` / `StoreIndex` site in a loop.
+struct AddressingSite {
+    /// Slot holding the addressed array.
+    target: u32,
+    /// Whether the site writes (`StoreIndex`) rather than reads.
+    writes: bool,
+    /// Slots the site loads as operands, target included.
+    operand_slots: Vec<u32>,
+}
+
+/// Every `Index` / `StoreIndex` site in the loop, or `None` when one of them
+/// cannot be resolved to a slot-held array.
+fn addressed_arrays(ops: &[IlOp], lp: &NaturalLoop) -> Option<Vec<AddressingSite>> {
+    let mut sites = Vec::new();
+    for i in lp.header..=lp.latch {
+        let Some(operands) = indexing_operands(&ops[i]) else {
+            continue;
+        };
+        let (target, operand_slots) = resolve_addressing(ops, i, operands)?;
+        sites.push(AddressingSite {
+            target,
+            writes: operands == 3,
+            operand_slots,
+        });
     }
     Some(sites)
 }
@@ -292,14 +330,15 @@ fn indexing_operands(op: &IlOp) -> Option<usize> {
     }
 }
 
-/// Slot holding the array an addressing op at `at` targets.
+/// Array slot an addressing op at `at` targets, plus the slots it loads.
 ///
 /// Walks back attributing one operand to each single-value producer (`CONST`,
 /// `LOAD`, a binop result, …) until the deepest one is reached; that one must be
 /// a slot load. Anything whose contribution we cannot attribute — a nested
 /// `Index`, a `Dup`, a jump — gives up.
-fn addressed_slot(ops: &[IlOp], at: usize, operands: usize) -> Option<u32> {
+fn resolve_addressing(ops: &[IlOp], at: usize, operands: usize) -> Option<(u32, Vec<u32>)> {
     let mut need = operands;
+    let mut seen: Vec<u32> = Vec::new();
     let mut i = at;
     while i > 0 && need > 0 {
         i -= 1;
@@ -308,8 +347,11 @@ fn addressed_slot(ops: &[IlOp], at: usize, operands: usize) -> Option<u32> {
         }
         let slots = load_slots(&ops[i]);
         if !slots.is_empty() {
+            let used = slots.len().min(need);
+            seen.extend(slots[slots.len() - used..].iter().copied());
             if need <= slots.len() {
-                return slots.get(slots.len() - need).copied();
+                let target = slots[slots.len() - need];
+                return Some((target, seen));
             }
             need -= slots.len();
             continue;
@@ -457,7 +499,7 @@ mod tests {
     #[test]
     fn hoists_invariant_len_out_of_a_read_loop() {
         let mut ops = read_loop();
-        assert!(hoist_invariant_array_len(&mut ops));
+        assert!(hoist_loop_invariants(&mut ops));
         assert_eq!(ops.iter().filter(|op| is_array_len(op)).count(), 1);
         assert_eq!(
             array_len_ops_before_header(&ops),
@@ -477,7 +519,7 @@ mod tests {
             .expect("index site");
         ops[idx] = store_index();
         ops.insert(idx, IlOp::Const { imm: 0, loc: loc() });
-        assert!(hoist_invariant_array_len(&mut ops));
+        assert!(hoist_loop_invariants(&mut ops));
         assert_eq!(array_len_ops_before_header(&ops), 1);
     }
 
@@ -491,7 +533,7 @@ mod tests {
             .expect("index site");
         ops[idx] = IlOp::byte(Byte::new(Instruction::ArrayPush));
         let before = ops.clone();
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert!(ops == before);
         assert_eq!(
             loop_array_facts(&ops)[0].refusal,
@@ -506,7 +548,7 @@ mod tests {
         ops.insert(latch, IlOp::StorePop { slot: 0, loc: loc() });
         ops.insert(latch, IlOp::Const { imm: 0, loc: loc() });
         let before = ops.clone();
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert!(ops == before, "a rebound Vec is a different array each pass");
     }
 
@@ -524,7 +566,7 @@ mod tests {
             loc: loc(),
         };
         let before = ops.clone();
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert!(ops == before);
         assert_eq!(loop_array_facts(&ops)[0].refusal, Some(Refusal::OpaqueOp));
     }
@@ -540,7 +582,7 @@ mod tests {
             .expect("index site");
         ops.splice(idx - 2..idx + 1, [IlOp::Const { imm: 1, loc: loc() }]);
         let before = ops.clone();
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert!(ops == before);
         assert_eq!(
             loop_array_facts(&ops)[0].refusal,
@@ -557,7 +599,7 @@ mod tests {
             .expect("index site");
         // Replace `LOAD a` with a `Dup`: the target is no longer a named slot.
         ops[idx - 2] = IlOp::Dup { loc: loc() };
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert_eq!(
             loop_array_facts(&ops)[0].refusal,
             Some(Refusal::UnresolvedTarget)
@@ -603,7 +645,7 @@ mod tests {
         ops.insert(header + 1, IlOp::Pop { loc: loc() });
         ops.insert(header + 1, IlOp::Load { slot: 3, loc: loc() });
         let before = ops.clone();
-        assert!(!hoist_invariant_array_len(&mut ops));
+        assert!(!hoist_loop_invariants(&mut ops));
         assert!(ops == before);
     }
 }

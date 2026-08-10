@@ -23,7 +23,7 @@ pub fn licm(ops: &mut Vec<IlOp>) {
     // Each pass clears one loop; a cast hoisted out of an inner loop becomes a
     // candidate in the enclosing one, so iterate until it reaches the outermost
     // level. Progress is monotone toward outer loops, hence the loop-count bound.
-    let mut hoisted = bounds::hoist_invariant_array_len(ops);
+    let mut hoisted = bounds::hoist_loop_invariants(ops);
     for _ in 0..find_natural_loops(ops).len() + 1 {
         // Triple form first: it migrates an existing materialization outward
         // without leaving a slot-to-slot copy behind.
