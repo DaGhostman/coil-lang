@@ -523,6 +523,78 @@ mod tests {
         assert_eq!(array_len_ops_before_header(&ops), 1);
     }
 
+    /// `while i < len(a) { a[i] = 0; … }` — codegen materializes the `0` into a
+    /// temp every pass; the pair belongs in the preheader.
+    fn const_operand_loop() -> Vec<IlOp> {
+        let mut ops = read_loop();
+        let idx = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Index { .. }))
+            .expect("index site");
+        ops.splice(
+            idx - 2..idx + 2,
+            [
+                IlOp::Const { imm: 0, loc: loc() },
+                IlOp::StorePop { slot: 5, loc: loc() },
+                IlOp::Load { slot: 0, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Load { slot: 5, loc: loc() },
+                store_index(),
+                IlOp::Pop { loc: loc() },
+            ],
+        );
+        ops
+    }
+
+    fn const_ops_before_header(ops: &[IlOp]) -> usize {
+        let header = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Label(Label(0))))
+            .expect("header survives");
+        ops[..header]
+            .iter()
+            .filter(|op| matches!(op, IlOp::Const { .. }))
+            .count()
+    }
+
+    #[test]
+    fn hoists_the_constant_operand_of_an_indexed_store() {
+        let mut ops = const_operand_loop();
+        let before = const_ops_before_header(&ops);
+        assert_eq!(
+            loop_array_facts(&ops)[0].operand_hoist.map(|c| c.slot),
+            Some(5)
+        );
+        assert!(hoist_loop_invariants(&mut ops));
+        assert_eq!(
+            const_ops_before_header(&ops),
+            before + 1,
+            "the operand constant should materialize once in the preheader"
+        );
+    }
+
+    #[test]
+    fn refuses_a_constant_operand_the_loop_rewrites() {
+        // A second def of the temp races the hoisted one.
+        let mut ops = const_operand_loop();
+        let latch = ops.len() - 4;
+        ops.insert(latch, IlOp::StorePop { slot: 5, loc: loc() });
+        ops.insert(latch, IlOp::Const { imm: 1, loc: loc() });
+        assert_eq!(loop_array_facts(&ops)[0].operand_hoist, None);
+    }
+
+    #[test]
+    fn refuses_a_constant_temp_that_feeds_no_addressing_site() {
+        let mut ops = const_operand_loop();
+        let at = ops
+            .iter()
+            .position(|op| matches!(op, IlOp::Load { slot: 5, .. }))
+            .expect("operand load");
+        // Address the store with `i` instead, leaving slot 5 unrelated.
+        ops[at] = IlOp::Load { slot: 2, loc: loc() };
+        assert_eq!(loop_array_facts(&ops)[0].operand_hoist, None);
+    }
+
     #[test]
     fn refuses_when_the_loop_pushes_to_the_array() {
         // `while len(a) < n { a.push(…) }` — the length changes every pass.
