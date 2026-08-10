@@ -889,6 +889,10 @@ pub struct Compiler {
     par_shapes: HashMap<String, crate::typechecking::ParForkSite>,
     /// Concrete arg vectors requiring `__coil_par_*` specializations.
     par_spec_args: HashMap<String, BTreeSet<Vec<i64>>>,
+    /// Counted loops whose iterations are independent arms, by loop span.
+    loop_par_sites: crate::typechecking::LoopParSites,
+    /// Chunk workers emitted so far, for `__coil_par_loop_*` naming.
+    loop_par_helpers: usize,
 
     /// Operand-stack capacity for the VM (from recursion-depth analysis).
     operand_stack_slots: u32,
@@ -963,6 +967,8 @@ impl Default for Compiler {
             recursive_pure: HashSet::new(),
             par_shapes: HashMap::new(),
             par_spec_args: HashMap::new(),
+            loop_par_sites: crate::typechecking::LoopParSites::new(),
+            loop_par_helpers: 0,
             operand_stack_slots: crate::typechecking::DEFAULT_OPERAND_STACK_SLOTS,
         }
     }

@@ -4992,6 +4992,212 @@ impl Compiler {
             .push(Byte::new(Instruction::CALL).with_call_packed(arity, entry));
     }
 
+    // -----------------------------------------------------------------------
+    // Loop IPA (chunked fork-join over an induction range)
+    // -----------------------------------------------------------------------
+
+    /// Emit a 2-way chunked fork-join for the counted loop at `span`, replacing
+    /// the sequential loop entirely. Returns `false` — with nothing emitted —
+    /// when any precondition fails, so the caller falls back to the plain loop.
+    ///
+    /// The chunk worker is a private `(lo, hi, acc)` function holding the
+    /// original body over `[lo, hi)`. `[mid, end)` is spawned onto the reactor
+    /// seeded with the reduction's identity, `[begin, mid)` runs inline seeded
+    /// with the live accumulator, and the partials fold with the site operator.
+    fn try_emit_par_loop(
+        &mut self,
+        span: SimpleSpan,
+        cond: &Output<'_>,
+        body: &Output<'_>,
+    ) -> bool {
+        use crate::typechecking::LoopReduceOp;
+
+        let Some(site) = self.loop_par_sites.get(&(span.start, span.end)).cloned() else {
+            return false;
+        };
+        // Reassociating a float reduction changes results, so both the
+        // induction variable and the per-iteration value must be `int`.
+        if !self.span_ty_is_int(site.index_span) || !self.span_ty_is_int(site.reduce_span) {
+            return false;
+        }
+        let (Some(index_slot), Some(acc_slot)) = (
+            self.lookup_slot(&site.index),
+            self.lookup_slot(&site.acc),
+        ) else {
+            return false;
+        };
+        let (Some(spawn_id), Some(join_id)) =
+            (self.native_id("thread_spawn"), self.native_id("thread_join"))
+        else {
+            return false;
+        };
+        let (Ok(begin), Ok(mid), Ok(end)) = (
+            i32::try_from(site.begin),
+            i32::try_from(site.midpoint()),
+            i32::try_from(site.end),
+        ) else {
+            return false;
+        };
+        let fold = match site.op {
+            LoopReduceOp::Add => Instruction::ADD,
+            LoopReduceOp::Mul => Instruction::MUL,
+        };
+        let identity = site.op.identity() as i32;
+
+        // The chunk worker tests `i < hi` against its own bound, but the
+        // condition's NodeIds still have to be consumed in walk order.
+        self.discard_compile(cond);
+
+        let mut bb = BlockBuilder::new();
+        let after_worker = bb.fresh_label(self.bytecode.il_mut());
+        bb.emit_jump_to(after_worker, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        let worker = self.emit_par_loop_worker(&site, body);
+        bb.bind_label(after_worker, self.bytecode.il_mut());
+
+        // MakeFn of the worker, then spawn the upper chunk.
+        self.bytecode.push_const(0);
+        self.bytecode
+            .push(Byte::new(Instruction::CodePtr).with_operand_u32(worker));
+        self.bytecode.push(
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(0, 0, 3, false)),
+        );
+        let fn_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(fn_tmp);
+
+        let have_handle = bb.fresh_label(self.bytecode.il_mut());
+        let seq = bb.fresh_label(self.bytecode.il_mut());
+        let joined = bb.fresh_label(self.bytecode.il_mut());
+        let done = bb.fresh_label(self.bytecode.il_mut());
+
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
+        self.bytecode.push_load(fn_tmp);
+        self.bytecode.push_const(mid);
+        self.bytecode.push_const(end);
+        self.bytecode.push_const(identity);
+        self.bytecode.push_make_tuple(4);
+        self.bytecode.push_host_invoke(4);
+        bb.emit_jump_to(
+            have_handle,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(have_handle, self.bytecode.il_mut());
+        let handle_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(handle_tmp);
+
+        // Lower chunk inline while the worker runs, seeded with the live `acc`.
+        self.bytecode.push_const(begin);
+        self.bytecode.push_const(mid);
+        self.bytecode.push_load(acc_slot);
+        self.bytecode
+            .push(Byte::new(Instruction::CALL).with_call_packed(3, worker));
+        let lower_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(lower_tmp);
+
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
+        self.bytecode.push_load(handle_tmp);
+        self.bytecode.push_make_tuple(1);
+        self.bytecode.push_host_invoke(1);
+        bb.emit_jump_to(
+            joined,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        // A failed join redoes the whole range sequentially; the worker is pure,
+        // so the discarded lower partial costs time but not correctness.
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(joined, self.bytecode.il_mut());
+        let upper_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(upper_tmp);
+        self.bytecode.push_load(lower_tmp);
+        self.bytecode.push_load(upper_tmp);
+        self.bytecode.push(Byte::new(fold));
+        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        // Spawn / join failed: one worker call over the whole range.
+        bb.bind_label(seq, self.bytecode.il_mut());
+        self.bytecode.push_const(begin);
+        self.bytecode.push_const(end);
+        self.bytecode.push_load(acc_slot);
+        self.bytecode
+            .push(Byte::new(Instruction::CALL).with_call_packed(3, worker));
+
+        bb.bind_label(done, self.bytecode.il_mut());
+        self.bytecode.push_store_pop(acc_slot);
+        // The loop exits with the induction variable one past its range;
+        // later reads of it must not see the pre-loop value.
+        self.bytecode.push_const(end);
+        self.bytecode.push_store_pop(index_slot);
+
+        bb.finalize()
+            .expect("BlockBuilder::finalize: loop-IPA labels bound");
+        true
+    }
+
+    /// Emit the chunk worker `(lo, hi, acc) -> acc'` and return its entry offset.
+    ///
+    /// Runs in a private frame with the induction variable, the chunk bound and
+    /// the accumulator as slots 0..2 — sound only because the site analysis
+    /// proved the body reads nothing else.
+    fn emit_par_loop_worker(
+        &mut self,
+        site: &crate::typechecking::LoopParSite,
+        body: &Output<'_>,
+    ) -> u32 {
+        const INDEX_SLOT: u32 = 0;
+        const BOUND_SLOT: u32 = 1;
+        const ACC_SLOT: u32 = 2;
+
+        self.loop_par_helpers += 1;
+        let name = format!("__coil_par_loop_{}", self.loop_par_helpers);
+        let (entry, _) = self.bind_function_entry(name.clone());
+        let entry = entry as u32;
+        self.fn_arities.insert(name, (3, false));
+
+        let prev_ctx = std::mem::take(&mut self.context);
+        let prev_depth = std::mem::replace(&mut self.expr_depth, 0);
+        self.context.variables.intern(site.index.clone());
+        self.context.variables.intern("__coil_par_hi".to_string());
+        self.context.variables.intern(site.acc.clone());
+
+        let mut bb = BlockBuilder::new();
+        let top = bb.fresh_label(self.bytecode.il_mut());
+        let exit = bb.fresh_label(self.bytecode.il_mut());
+        bb.bind_label(top, self.bytecode.il_mut());
+        self.bytecode.push_load(INDEX_SLOT);
+        self.bytecode.push_load(BOUND_SLOT);
+        self.bytecode.push(Byte::new(Instruction::LE));
+        bb.emit_jump_to(exit, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        bb.emit_jump_to(top, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(exit, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: loop-IPA worker labels bound");
+
+        self.bytecode.push_load(ACC_SLOT);
+        self.bytecode.push_return();
+
+        self.context = prev_ctx;
+        self.expr_depth = prev_depth;
+        entry
+    }
+
+    /// Whether the checker inferred `int` for the expression at `span`.
+    fn span_ty_is_int(&self, span: (usize, usize)) -> bool {
+        matches!(
+            self.checker.lookup_for_codegen_span(span.0, span.1),
+            Some(Ty::Con(ref c)) if c == "int"
+        )
+    }
+
     /// Push an `int` constant onto [`Self::bytecode`]; inline `CONST` cannot
     /// encode negatives (they collide with the pool flag) or values past `i32`.
     fn push_int_const(&mut self, n: i64) {
@@ -9026,6 +9232,9 @@ impl Compiler {
                         self.discard_compile(body);
                         return bytecode;
                     }
+                    if self.try_emit_par_loop(*span, iterable, body) {
+                        return bytecode;
+                    }
                     let mut bb = BlockBuilder::new();
                     let top_label = bb.fresh_label(self.bytecode.il_mut());
                     let exit_label = bb.fresh_label(self.bytecode.il_mut());
@@ -12680,6 +12889,14 @@ impl Compiler {
             self.par_shapes.clear();
             self.par_spec_args.clear();
         }
+        // Loop IPA is independent of the recursive fork-site analysis: a
+        // counted loop needs no self-recursion, only pure body calls.
+        self.loop_par_sites = if auto_par_enabled() {
+            let pure = crate::typechecking::analyze_pure_fns(ast);
+            crate::typechecking::analyze_loop_par_sites(ast, &pure)
+        } else {
+            crate::typechecking::LoopParSites::new()
+        };
         self.emit_builtin_dict_thunks();
         self.emit_vec_method_thunks();
         // Builtin dictionary thunks are emitted immediately after the
