@@ -292,7 +292,10 @@ fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
 //
 // Counter ownership:
 //   P1 — residual LOAD / STORE (op + slot counts, packed vs single) and the
-//        BinSlot* family that already avoids the stack round-trip.
+//        BinSlot* family that already avoids the stack round-trip. Landed:
+//        `il::opt::slot_promote`. Still open, and both out of its reach: the
+//        loop-carried cursor drift that leaves inner-loop stores non-redundant
+//        (`mandelbrot`), and `Bin(slot, TOS)` operand shapes.
 //   P2 — Index / StoreIndex in array-hot fns.
 //   P3 — MakeEnum / MakeTuple / MakeArray allocation sites.
 //   P4 — CALL / TailCall density in recursion-hot fns.
@@ -333,8 +336,10 @@ fn aot_p1_mandelbrot_residual_load_store_inventory() {
     );
 }
 
-/// P1 + P4 baseline: `tak` is call-dominated — 3 `CALL` + 1 `TailCall` over
-/// 4 packed LOADs (9 slots) and 3 single-slot STOREs.
+/// P1 + P4: `tak` is call-dominated — 3 `CALL` + 1 `TailCall`. Slot promotion
+/// took the three argument temps out of the frame, so the reload run in front of
+/// the `TailCall` and all three spill STOREs are gone (Phase 0: 4 packed LOADs
+/// over 9 slots, 3 single-slot STOREs).
 #[test]
 fn aot_p1_p4_tak_residual_load_store_and_call_density() {
     let (bc, _, _, _, pipeline) = compile("examples/perf/tak.hy");
@@ -350,21 +355,19 @@ fn aot_p1_p4_tak_residual_load_store_and_call_density() {
     );
 
     assert!(
-        shape.load_ops <= 4,
+        shape.load_ops <= 3,
         "tak residual LOAD regressed: {shape:?}"
     );
-    assert!(
-        shape.store_ops <= 3,
-        "tak residual STORE regressed: {shape:?}"
+    assert_eq!(
+        shape.store_ops, 0,
+        "tak argument temps must stay promoted out of the frame: {shape:?}"
     );
     // Argument setup for the three recursive calls is fully packed.
     assert_eq!(shape.packed_load_ops, shape.load_ops, "{shape:?}");
     assert!(
-        shape.load_slots >= 9,
-        "tak should still pack 9 argument loads: {shape:?}"
+        shape.load_slots >= 6,
+        "tak should still pack the 6 forwarded argument loads: {shape:?}"
     );
-    // STORE packing is unused here — P1 owns closing that gap.
-    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
     assert_eq!(calls, 3, "tak call density changed");
     assert!(
         tail_calls >= 1,
