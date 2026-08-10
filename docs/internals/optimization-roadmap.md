@@ -59,24 +59,29 @@ Next AOT priorities below remain the main gap vs Lua on `mandelbrot` /
 
 ### 1. Local slot promotion and SSA-like values
 
-Priority: highest.
+Priority: highest. **Status: Phases 1–4 of register-win harvest landed**
+(`perf/register-wins-harvest`; docs ledger in § Opcode candidate ledger below).
 
 The shared operand/local stack still makes repeated `LOAD` / `STORE` traffic
 expensive. `gvn.rs` explicitly has no SSA slot rename, and the new
 cursor-safe copy propagation in `opt/dce.rs` is intentionally straight-line.
-The next pass should promote slots to virtual values within a function:
 
-- build per-function definitions and uses over symbolic `IlOp` blocks;
-- retain values across straight-line code and joins only when all incoming
-  definitions agree;
-- invalidate or flush at calls, host effects, field mutation, unknown bytes,
-  and address-sensitive operations;
-- lower virtual values back to `LOAD` / `STORE` at boundaries;
-- use the existing `tell` model as the safety proof for cursor changes.
+**Landed (Phases 1–4, IL-only — no new opcodes):**
 
-This should be measured first on `mandelbrot` and `tak`, where it can expose
-more `BinSlot*` and fused branch opportunities without changing the archive
-format.
+- store-destination coalescing and peel-param raise (`opt/slot_promote.rs`);
+- copy-only latch elision when live-out / unique in-loop def allow;
+- Phase 4 fuse-feed audit: FCS / `BinSlotSlotConstJmpf` / packed peels held;
+  residual near-misses tallied in `perf_metrics` for the ledger.
+
+**Harvested without opcodes (shape inventory):**
+
+- `tak`: LOAD 11→7, STORE 7→3, `slot_move` 4→0 (coalesce + peel raise);
+- fuse windows intact across mandelbrot / tak / numeric / nsieve.
+
+Still deferred for a later SSA-like slice: overlapping live-range φ shuffles
+(mandelbrot `tr`→`zr`), full rename across disagreeing joins, and operand-stack
+retention across calls. Measure residual candidates against the ledger before
+appending opcodes.
 
 ### 2. Loop range and bounds analysis
 
@@ -135,7 +140,31 @@ Priority: medium to low until measured.
 typed/fused opcodes. Larger universal superinstructions or short trace fusion
 should be considered only if they improve multiple benchmarks. Keep symbolic IL
 and the single `il::lower` pass as the source of truth; do not add an opcode
-for one benchmark shape.
+for one benchmark shape. Residual fuse near-misses after Phases 1–4 are scored
+in the opcode candidate ledger below — none are an unconditional **add**.
+
+## Opcode candidate ledger (register-win harvest Phase 5)
+
+Scored after IL opts on Phases 1–4. **Docs only — no new opcodes from this
+ledger until a candidate clears the gates.** Evidence is static shape inventory
+in `compiler/tests/perf_metrics.rs` plus estimated dynamic weight on hot
+benches. Append-only opcode rules still apply ([AGENTS.md](../../AGENTS.md)).
+
+**Gates for `add`:** residual dynamic weight still material after Phases 1–4;
+pattern universal (not a single-bench special); no safe IL rewrite exposes an
+existing opcode; fits append-only opcode ABI.
+
+| Family | Evidence (post Phases 1–4) | Est. dynamic weight | Recommendation | Rationale |
+|--------|----------------------------|---------------------|----------------|-----------|
+| `*Jmpt` counterparts (`CmpJmpt` / `BinSlot*Jmpt` / `BinSlotSlotConstJmpt` / …) | mandelbrot `would_be_jmpt_after_invert=1` (`BinSlotSlotConstJmpf`; `JMP`); bare `JMPT` only for non-fusable bools | ~1.28M/run (iter escape) | **needs more proof** | Invert intentionally refuses fused `*Jmpf` — would trade one fused dispatch for two. A true `*Jmpt` twin could collapse the escape `JMP`, but only if invert savings beat opcode + decode cost and the shape shows up beyond mandelbrot. Prefer measuring invert-with-`*Jmpt` prototype cost before appending. |
+| Cast spill → `FloatChainStore` | mandelbrot `float_chain_cast_blocked=1` (`cr`) | material in mandelbrot float body | **defer** (no opcode) | Codegen/temp spill of `CastIntToFloat` would expose existing `FloatChainStore`. Prefer IL/codegen fix over a cast-in-chain opcode. |
+| `FloatChain` 4-stage / wider | `float_chain_stage_cap_leftover=0` | — | **defer** | No truncation leftover on current benches; zero evidence for a wider opcode. |
+| `MoveSlot` / φ shuffle | mandelbrot `loop_carried_phi_shuffle=1` (`tr`→`zr`); IL opts refused overlapping live ranges | ~2.56M dispatches/run (LOAD+STORE latch) | **needs more proof** (or defer pending benches) | Largest residual dispatch count, but mandelbrot-heavy; tak/numeric/nsieve have 0 latch shuffles. Needs universality proof (more loop-carried programs) before an append-only `MoveSlot` / rename op. Overlapping ranges may still need SSA rename rather than a 1-op shuffle. |
+| Unchecked `Index` / `StoreIndex` | nsieve static Index=1 + StoreIndex=1 in hot loops | nsieve-dominant | **needs more proof** | Align with roadmap §2: diagnostics and bounds proofs first; opcode only after proof-only analysis shows a universal safe fast path. |
+| Unary slot / float `BinSlotImm` / packing holes | 0 on mandelbrot/tak/numeric/nsieve | — | **defer** | Zero evidence on the hot matrix. |
+| Slot move (non-latch) | numeric `slot_move` ≤3 (format/host temp) | low | **defer** | Not loop-carried; format-path noise, not a fuse candidate. |
+
+**Already harvested without opcodes:** see §1 (tak LOAD/STORE/`slot_move`; fuse windows held). Next opcode work should re-run `perf_metrics` inventories and only promote a ledger row that still passes the `add` gates.
 
 ## Cranelift JIT feasibility
 
