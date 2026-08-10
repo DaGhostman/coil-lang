@@ -4070,6 +4070,217 @@ fn main() {
     );
 }
 
+/// A pure counted loop above the threshold must split into chunk workers and
+/// still fold to the sequential sum.
+#[test]
+fn auto_par_loop_sum_splits_and_matches_sequential() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 100 {
+        acc = acc + sq(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i,%i", acc, i)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par loop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_some(),
+        "expected a chunk worker for the counted loop"
+    );
+    // Sum of i*i for i in 0..100, and the induction variable past its range.
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "328350,100");
+}
+
+/// The reduction operator drives the fold: a `*` chunk pair recombines by `MUL`
+/// with `1` seeding every chunk but the first. A non-identity seed would square
+/// the accumulator's initial value.
+#[test]
+fn auto_par_loop_product_uses_multiplicative_identity() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let prod = 3;
+    let i = 0;
+    while i <= 29 {
+        prod = prod * 2;
+        i += 1;
+    }
+    write(stdout(), to_bytes(format("%i", prod)));
+}
+"#,
+    );
+    // 3 * 2^30; seeding both chunks with 3 would give 9 * 2^30.
+    assert_eq!(output, "3221225472");
+}
+
+/// Loop-private temps are re-emitted into the worker's frame.
+#[test]
+fn auto_par_loop_body_temps_still_correct() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn twice(int i) -> int {
+    return i + i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 64 {
+        let d = twice(i);
+        let w = d + 1;
+        acc = acc + w;
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // sum(2i + 1) for i in 0..64 = 63*64 + 64.
+    assert_eq!(output, "4096");
+}
+
+/// The accumulator lives in a nested block of a non-`main` function, so the
+/// chunk fold has to resolve its slot through the block-binding overlay.
+#[test]
+fn auto_par_loop_inside_nested_block_of_function() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn step(int i) -> int {
+    return i + 3;
+}
+fn total(int gate) -> int {
+    if gate > 0 {
+        let acc = 5;
+        let i = 0;
+        while i < 50 {
+            acc = acc + step(i);
+            i = i + 1;
+        }
+        return acc;
+    }
+    return 0;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", total(1))));
+}
+"#,
+    );
+    // 5 + sum(i + 3) for i in 0..50 = 5 + 1225 + 150.
+    assert_eq!(output, "1380");
+}
+
+/// Two independent loops in one function each get their own chunk worker.
+#[test]
+fn auto_par_two_loops_emit_distinct_workers() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let a = 0;
+    let i = 0;
+    while i < 30 {
+        a = a + sq(i);
+        i = i + 1;
+    }
+    let b = 0;
+    let j = 0;
+    while j < 40 {
+        b = b + j;
+        j = j + 1;
+    }
+    write(stdout(), to_bytes(format("%i,%i", a, b)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("two auto-par loops should compile");
+    for name in ["__coil_par_loop_1", "__coil_par_loop_2"] {
+        assert!(
+            pipeline.function_offset(name).is_some(),
+            "expected a chunk worker named {name}"
+        );
+    }
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "8555,780");
+}
+
+/// A body write the analysis cannot prove independent keeps the loop sequential.
+#[test]
+fn impure_loop_body_skips_par_worker() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 100 {
+        write(stdout(), to_bytes(format("%i", i)));
+        acc = acc + i;
+        i = i + 1;
+    }
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let _ = pipeline
+        .compile_src(src)
+        .expect("impure loop should still compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_none(),
+        "an observable body must not be chunked"
+    );
+}
+
+/// A trip count at or below the threshold must stay on the sequential loop.
+#[test]
+fn below_threshold_loop_skips_par_worker() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 20 {
+        acc = acc + sq(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("short loop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_none(),
+        "a 20-trip loop cannot pay for a spawn"
+    );
+    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "2470");
+}
+
 /// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not
 /// turn StorePop;Load into Dup;Store when the store extends tell past TOS
 /// (shared-stack CmpJmpf would eat the local — broke http `parse_url`).
