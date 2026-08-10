@@ -3970,6 +3970,78 @@ fn main() {
     assert_eq!(output, "17711");
 }
 
+/// An `EnumCtor` combine forks both arms into a constructor, not a binop.
+#[test]
+fn auto_par_enum_ctor_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Tree {
+    Leaf,
+    Node(Tree, Tree),
+}
+#[max_depth(64)]
+fn build(int n) -> Tree {
+    if n <= 1 {
+        return Tree::Leaf();
+    }
+    return Tree::Node(build(n - 1), build(n - 2));
+}
+#[max_depth(64)]
+fn leaves(Tree t) -> int {
+    return match t {
+        Tree::Leaf => 1,
+        Tree::Node(l, r) => leaves(l) + leaves(r),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", leaves(build(21)))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par enum-ctor should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_build_21").is_some(),
+        "expected an enum-ctor specialization for build(21)"
+    );
+    // `build` shares fib's recurrence, so the leaf count is fib(22).
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "17711");
+}
+
+/// A `SelfCall` combine rebuilds the outer N-ary call from the joined arms.
+#[test]
+fn auto_par_self_call_combine_emits_spec() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(4096)]
+fn tak(int a, int b, int c) -> int {
+    if b >= a {
+        return c;
+    }
+    return tak(tak(a - 1, b, c), tak(b - 1, c, a), tak(c - 1, a, b));
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", tak(24, 22, 20))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par self-call should compile");
+    assert!(
+        pipeline
+            .function_offset("__coil_par_tak_24_22_20")
+            .is_some(),
+        "expected a multi-arg specialization for tak(24, 22, 20)"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "21");
+}
+
 /// Impure recursive binops must not grow `__coil_par_*` clones.
 #[test]
 fn impure_recursive_binop_skips_par_specialization() {

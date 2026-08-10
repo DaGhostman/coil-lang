@@ -7,40 +7,15 @@ type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
 #[cfg(not(any(test, feature = "dissect")))]
 type FinalizeIlOut = ();
 
-/// Unary `f(n - a) ⊕ f(n - b)` view of a [`ParForkSite`].
-///
-/// The current specialization emitter only handles this narrow case; other
-/// combines (enum constructor, self-call rebuild) are detected but not yet
-/// lowered.
-struct UnaryBinFork {
-    fn_name: String,
-    left_sub: i64,
-    right_sub: i64,
-    op: crate::typechecking::ParBinOp,
-}
-
-impl UnaryBinFork {
-    fn from_site(site: &crate::typechecking::ParForkSite) -> Option<Self> {
-        use crate::typechecking::{ArgForm, ParArm, ParCombine};
-        let ParCombine::BinOp(op) = site.combine else {
-            return None;
-        };
-        if site.param_count != 1 || site.arms.len() != 2 {
-            return None;
-        }
-        let sub_of = |arm: &ParArm| match arm {
-            ParArm::SelfCall { args } => match args.as_slice() {
-                [ArgForm::ParamMinus { param: 0, sub }] => Some(*sub),
-                _ => None,
-            },
-        };
-        Some(Self {
-            fn_name: site.fn_name.clone(),
-            left_sub: sub_of(&site.arms[0])?,
-            right_sub: sub_of(&site.arms[1])?,
-            op,
-        })
-    }
+/// Lowered form of a [`ParCombine`](crate::typechecking::ParCombine): the single
+/// instruction that folds the joined arm results once they are all on the stack.
+enum ParCombinePlan {
+    /// `ADD` / `SUB` / `MUL` over exactly two arms.
+    Bin(Instruction),
+    /// Rebuild the outer call with the arm results as arguments (tak-style).
+    SelfCall { entry: u32, arity: u32 },
+    /// `MakeEnum` with the variant's tag and payload arity.
+    Enum { tag: u16, arity: u16 },
 }
 
 impl Compiler {
@@ -4710,7 +4685,7 @@ impl Compiler {
         short.rsplit("::").next().unwrap_or(short)
     }
 
-    /// Rewrite `f(N)` to `CALL __coil_par_f_N` when a specialization exists.
+    /// Rewrite `f(N, …)` to `CALL __coil_par_f_N_…` when a specialization exists.
     fn try_emit_par_specialized_call(
         &mut self,
         fname: &str,
@@ -4720,17 +4695,21 @@ impl Compiler {
         let Some(args) = args else {
             return false;
         };
-        if args.len() != 1 {
+        if args.is_empty() {
             return false;
         }
-        let Expression::Integer(n) = unwrap_expr_output(&args[0]).1.as_ref() else {
-            return false;
-        };
-        if !crate::typechecking::const_args_worth_parallel(&[*n]) {
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            let Expression::Integer(n) = unwrap_expr_output(arg).1.as_ref() else {
+                return false;
+            };
+            vals.push(*n);
+        }
+        if !crate::typechecking::const_args_worth_parallel(&vals) {
             return false;
         }
         let key = Self::par_shape_key(fname);
-        let spec = crate::typechecking::par_specialization_name(key, &[*n]);
+        let spec = crate::typechecking::par_specialization_name(key, &vals);
         let Some(&offset) = self.functions.get(&spec) else {
             return false;
         };
@@ -4738,19 +4717,12 @@ impl Compiler {
         true
     }
 
-    /// Emit nullary `__coil_par_{fn}_{n}` clones that always fork (no RT threshold).
-    fn emit_par_specializations_for(
-        &mut self,
-        bare_name: &str,
-        table_key: &str,
-    ) {
-        let Some(site) = self.par_shapes.get(bare_name) else {
+    /// Emit nullary `__coil_par_{fn}_{args…}` clones that always fork (no RT threshold).
+    fn emit_par_specializations_for(&mut self, bare_name: &str, table_key: &str) {
+        let Some(site) = self.par_shapes.get(bare_name).cloned() else {
             return;
         };
-        let Some(shape) = UnaryBinFork::from_site(site) else {
-            return; // multi-arg / ctor / self-call combines land in a later phase
-        };
-        let Some(ns) = self.par_spec_args.get(bare_name).cloned() else {
+        let Some(arg_sets) = self.par_spec_args.get(bare_name).cloned() else {
             return;
         };
         let Some(&orig_offset) = self
@@ -4760,47 +4732,61 @@ impl Compiler {
         else {
             return;
         };
-        let thresh = crate::typechecking::par_cost_threshold();
-        let bin_op = match shape.op {
-            crate::typechecking::ParBinOp::Add => Instruction::ADD,
-            crate::typechecking::ParBinOp::Sub => Instruction::SUB,
-            crate::typechecking::ParBinOp::Mul => Instruction::MUL,
-        };
-        for args in ns {
-            let [n] = args[..] else {
-                continue;
-            };
-            self.emit_one_par_specialization(
-                &shape,
-                n,
-                orig_offset as u32,
-                thresh,
-                bin_op,
-            );
+        // Cheapest arg vectors first: arms shrink their args, so a parent then
+        // finds its children's nullary clones already bound.
+        let mut ordered: Vec<Vec<i64>> = arg_sets.into_iter().collect();
+        ordered.sort_by(|a, b| (a.iter().sum::<i64>(), a).cmp(&(b.iter().sum::<i64>(), b)));
+        for args in &ordered {
+            self.emit_one_par_specialization(&site, args, orig_offset as u32);
         }
     }
 
+    /// Emit one always-fork nullary clone of `site.fn_name` at `parent_args`.
+    ///
+    /// Arm 0 is spawned onto the work-stealing reactor, the remaining arms run
+    /// inline, and the joined results are folded by the site's combine. A
+    /// failed spawn falls back to evaluating every arm sequentially.
     fn emit_one_par_specialization(
         &mut self,
-        shape: &UnaryBinFork,
-        n: i64,
+        site: &crate::typechecking::ParForkSite,
+        parent_args: &[i64],
         orig_offset: u32,
-        thresh: i64,
-        bin_op: Instruction,
     ) {
-        let spec_name = crate::typechecking::par_specialization_name(&shape.fn_name, &[n]);
+        if site.arms.len() < 2 || parent_args.len() != site.param_count {
+            return;
+        }
+        let spec_name = crate::typechecking::par_specialization_name(&site.fn_name, parent_args);
         if self.functions.contains_key(&spec_name) {
             return;
         }
+        let Some(child_args) = site
+            .arms
+            .iter()
+            .map(|arm| crate::typechecking::eval_arm_args(arm, parent_args))
+            .collect::<Option<Vec<Vec<i64>>>>()
+        else {
+            return;
+        };
+        if child_args[0].len() > common::MAX_THREAD_SPAWN_ARGS {
+            return;
+        }
+        let Some((plan, push_order)) = self.par_combine_plan(site, orig_offset) else {
+            return;
+        };
         let Some(spawn_id) = self.native_id("thread_spawn") else {
             return;
         };
         let Some(join_id) = self.native_id("thread_join") else {
             return;
         };
+        // Resolved before the clone is bound so an arm that reproduces
+        // `parent_args` cannot bind to the clone itself (infinite CALL).
+        let callables: Vec<(u32, u32, bool)> = child_args
+            .iter()
+            .map(|c| self.par_arm_callable_args(&site.fn_name, c, orig_offset))
+            .collect();
 
-        let (fn_offset, _) = self.bind_function_entry(spec_name.clone());
-        let _ = fn_offset;
+        self.bind_function_entry(spec_name.clone());
         self.fn_arities.insert(spec_name.clone(), (0, false));
 
         let prev_fn_vars = std::mem::take(&mut self.context.variables);
@@ -4810,23 +4796,14 @@ impl Compiler {
         let entry_sp = 0u32;
 
         let body_start = self.bytecode.len();
-        let left_n = n - shape.left_sub;
-        let right_n = n - shape.right_sub;
 
-        // MakeFn for the left arm (nullary spec or unary original).
-        let (left_entry, left_arity, left_has_arg) =
-            self.par_arm_callable(shape, left_n, orig_offset, thresh);
+        // MakeFn for arm 0 (nullary child clone, or the original with args).
+        let (entry0, arity0, push_args0) = callables[0];
         self.bytecode.push_const(0);
+        self.bytecode
+            .push(Byte::new(Instruction::CodePtr).with_operand_u32(entry0));
         self.bytecode.push(
-            Byte::new(Instruction::CodePtr).with_operand_u32(left_entry),
-        );
-        self.bytecode.push(
-            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
-                0,
-                0,
-                left_arity,
-                false,
-            )),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(0, 0, arity0, false)),
         );
         let fn_tmp = self.alloc_temp_slot();
         self.bytecode.push_store_pop(fn_tmp);
@@ -4836,16 +4813,17 @@ impl Compiler {
         let seq = bb.fresh_label(self.bytecode.il_mut());
         let done = bb.fresh_label(self.bytecode.il_mut());
 
-        // AlwaysPar: thread_spawn(fn[, left_n])
+        // AlwaysPar: thread_spawn(fn[, child args…])
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
         self.bytecode.push_load(fn_tmp);
-        let spawn_arity = if left_has_arg {
-            self.bytecode.push_const(left_n as i32);
-            2
-        } else {
-            1
-        };
+        let mut spawn_arity = 1;
+        if push_args0 {
+            for a in child_args[0].clone() {
+                self.push_int_const(a);
+                spawn_arity += 1;
+            }
+        }
         self.bytecode.push_make_tuple(spawn_arity);
         self.bytecode.push_host_invoke(spawn_arity);
 
@@ -4861,25 +4839,48 @@ impl Compiler {
         let handle_tmp = self.alloc_temp_slot();
         self.bytecode.push_store_pop(handle_tmp);
 
-        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
-        let right_tmp = self.alloc_temp_slot();
-        self.bytecode.push_store_pop(right_tmp);
+        // Inline arms first, then join arm 0 — every result is parked in a
+        // slot so the combine can push them in whatever order it needs.
+        let mut arm_tmps = vec![0u32; callables.len()];
+        for i in 1..callables.len() {
+            self.emit_par_arm_call_args(callables[i], &child_args[i]);
+            let slot = self.alloc_temp_slot();
+            self.bytecode.push_store_pop(slot);
+            arm_tmps[i] = slot;
+        }
 
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
         self.bytecode.push_load(handle_tmp);
         self.bytecode.push_make_tuple(1);
         self.bytecode.push_host_invoke(1);
-        self.emit_result_unwrap_or_panic();
+        // A failed join (worker result was not sendable, handle already taken)
+        // redoes the whole site sequentially rather than propagating an error.
+        let joined = bb.fresh_label(self.bytecode.il_mut());
+        bb.emit_jump_to(
+            joined,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(joined, self.bytecode.il_mut());
+        arm_tmps[0] = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(arm_tmps[0]);
 
-        self.bytecode.push_load(right_tmp);
-        self.bytecode.push(Byte::new(bin_op));
+        for &idx in &push_order {
+            self.bytecode.push_load(arm_tmps[idx]);
+        }
+        self.emit_par_combine(&plan);
         bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
 
+        // Spawn failed: arms are pure, so evaluating them straight into the
+        // combine's push order is equivalent.
         bb.bind_label(seq, self.bytecode.il_mut());
-        self.emit_par_arm_call(shape, left_n, orig_offset, thresh);
-        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
-        self.bytecode.push(Byte::new(bin_op));
+        for &idx in &push_order {
+            self.emit_par_arm_call_args(callables[idx], &child_args[idx]);
+        }
+        self.emit_par_combine(&plan);
 
         bb.bind_label(done, self.bytecode.il_mut());
         bb.finalize()
@@ -4897,36 +4898,110 @@ impl Compiler {
         self.context.variables = prev_fn_vars;
     }
 
-    /// Callable for one recursive arm: `(entry, arity, needs_int_arg)`.
-    fn par_arm_callable(
+    /// Lower `site.combine` to a fold instruction plus the arm push order it
+    /// expects on the stack. `None` when the combine cannot be lowered here.
+    fn par_combine_plan(
         &self,
-        shape: &UnaryBinFork,
-        child_n: i64,
+        site: &crate::typechecking::ParForkSite,
         orig_offset: u32,
-        thresh: i64,
+    ) -> Option<(ParCombinePlan, Vec<usize>)> {
+        use crate::typechecking::{ParBinOp, ParCombine};
+        let arms = site.arms.len();
+        match &site.combine {
+            ParCombine::BinOp(op) => {
+                if arms != 2 {
+                    return None;
+                }
+                let ins = match op {
+                    ParBinOp::Add => Instruction::ADD,
+                    ParBinOp::Sub => Instruction::SUB,
+                    ParBinOp::Mul => Instruction::MUL,
+                };
+                Some((ParCombinePlan::Bin(ins), vec![0, 1]))
+            }
+            ParCombine::SelfCall => {
+                if arms != site.param_count {
+                    return None;
+                }
+                // `CALL` takes its frame base below the args: arg 0 pushed first.
+                Some((
+                    ParCombinePlan::SelfCall {
+                        entry: orig_offset,
+                        arity: arms as u32,
+                    },
+                    (0..arms).collect(),
+                ))
+            }
+            ParCombine::EnumCtor {
+                enum_name,
+                variant_name,
+            } => {
+                let tag = self.checker.tag_for(enum_name, variant_name)?;
+                if self.checker.arity_for(enum_name, variant_name) != Some(arms) {
+                    return None;
+                }
+                // `MakeEnum` pops into declaration order, so arm 0 goes last.
+                Some((
+                    ParCombinePlan::Enum {
+                        tag: u16::try_from(tag).ok()?,
+                        arity: u16::try_from(arms).ok()?,
+                    },
+                    (0..arms).rev().collect(),
+                ))
+            }
+        }
+    }
+
+    fn emit_par_combine(&mut self, plan: &ParCombinePlan) {
+        match plan {
+            ParCombinePlan::Bin(op) => self.bytecode.push(Byte::new(*op)),
+            ParCombinePlan::SelfCall { entry, arity } => self
+                .bytecode
+                .push(Byte::new(Instruction::CALL).with_call_packed(*arity, *entry)),
+            ParCombinePlan::Enum { tag, arity } => self.bytecode.push_make_enum(*tag, *arity),
+        }
+    }
+
+    /// Callable for one arm: `(entry, arity, needs_push_args)`.
+    ///
+    /// A child level that is itself specialized is invoked as its nullary
+    /// clone; otherwise the original function is called with concrete args.
+    fn par_arm_callable_args(
+        &self,
+        fn_name: &str,
+        child_args: &[i64],
+        orig_offset: u32,
     ) -> (u32, u32, bool) {
-        if child_n > thresh {
-            let spec = crate::typechecking::par_specialization_name(&shape.fn_name, &[child_n]);
+        if crate::typechecking::const_args_worth_parallel(child_args) {
+            let spec = crate::typechecking::par_specialization_name(fn_name, child_args);
             if let Some(&off) = self.functions.get(&spec) {
                 return (off as u32, 0, false);
             }
         }
-        (orig_offset, 1, true)
+        (orig_offset, child_args.len() as u32, true)
     }
 
-    fn emit_par_arm_call(
-        &mut self,
-        shape: &UnaryBinFork,
-        child_n: i64,
-        orig_offset: u32,
-        thresh: i64,
-    ) {
-        let (entry, arity, needs_arg) = self.par_arm_callable(shape, child_n, orig_offset, thresh);
-        if needs_arg {
-            self.bytecode.push_const(child_n as i32);
+    fn emit_par_arm_call_args(&mut self, callable: (u32, u32, bool), child_args: &[i64]) {
+        let (entry, arity, push_args) = callable;
+        if push_args {
+            for a in child_args.to_vec() {
+                self.push_int_const(a);
+            }
         }
         self.bytecode
             .push(Byte::new(Instruction::CALL).with_call_packed(arity, entry));
+    }
+
+    /// Push an `int` constant onto [`Self::bytecode`]; inline `CONST` cannot
+    /// encode negatives (they collide with the pool flag) or values past `i32`.
+    fn push_int_const(&mut self, n: i64) {
+        if (0..=i32::MAX as i64).contains(&n) {
+            self.bytecode.push_const(n as i32);
+        } else {
+            let bits = Value::from(n).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode.push_const_pool(idx);
+        }
     }
 
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
