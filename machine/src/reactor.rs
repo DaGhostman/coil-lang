@@ -116,7 +116,7 @@ impl Reactor {
     pub fn submit(self: &Arc<Self>, job: Job) {
         self.ensure_started();
         self.inflight.fetch_add(1, Ordering::SeqCst);
-        match try_push_local(job) {
+        match try_push_local(self, job) {
             Ok(()) => {}
             Err(job) => self.injector.push(job),
         }
@@ -226,22 +226,53 @@ fn steal_cursor() -> &'static AtomicUsize {
 }
 
 thread_local! {
-    static LOCAL_WORKER: std::cell::RefCell<Option<Worker<Job>>> =
+    /// Pool-worker local deque, tagged with the owning [`Reactor`] identity.
+    ///
+    /// Submits and join-help must only use this deque when it belongs to the
+    /// same reactor; otherwise jobs leak across concurrent Machines (parallel
+    /// tests) or nested reactors on one OS thread.
+    static LOCAL_WORKER: std::cell::RefCell<Option<LocalWorkerBinding>> =
         const { std::cell::RefCell::new(None) };
     static IS_POOL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// TLS binding of a work-stealing deque to the reactor that registered it.
+struct LocalWorkerBinding {
+    reactor: *const Reactor,
+    worker: Worker<Job>,
 }
 
 fn is_pool_worker() -> bool {
     IS_POOL_WORKER.with(|c| c.get())
 }
 
-fn try_push_local(job: Job) -> Result<(), Job> {
+fn reactor_id(reactor: &Reactor) -> *const Reactor {
+    reactor as *const Reactor
+}
+
+/// Push onto this thread's local deque only when it belongs to `reactor`.
+fn try_push_local(reactor: &Reactor, job: Job) -> Result<(), Job> {
+    let want = reactor_id(reactor);
     LOCAL_WORKER.with(|slot| {
-        if let Some(w) = slot.borrow_mut().as_mut() {
-            w.push(job);
-            Ok(())
-        } else {
-            Err(job)
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some(local) if local.reactor == want => {
+                local.worker.push(job);
+                Ok(())
+            }
+            _ => Err(job),
+        }
+    })
+}
+
+/// Borrow the local deque when it is owned by `reactor`.
+fn with_owned_local_worker<R>(reactor: &Reactor, f: impl FnOnce(&Worker<Job>) -> R) -> Option<R> {
+    let want = reactor_id(reactor);
+    LOCAL_WORKER.with(|slot| {
+        let slot = slot.borrow();
+        match slot.as_ref() {
+            Some(local) if local.reactor == want => Some(f(&local.worker)),
+            _ => None,
         }
     })
 }
@@ -267,17 +298,20 @@ fn worker_loop(reactor: Arc<Reactor>) {
     vm.set_reactor(Arc::clone(&reactor));
 
     IS_POOL_WORKER.with(|c| c.set(true));
-    LOCAL_WORKER.with(|slot| *slot.borrow_mut() = Some(local));
+    let binding_id = Arc::as_ptr(&reactor);
+    LOCAL_WORKER.with(|slot| {
+        *slot.borrow_mut() = Some(LocalWorkerBinding {
+            reactor: binding_id,
+            worker: local,
+        });
+    });
 
     loop {
         if reactor.shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let job = LOCAL_WORKER.with(|slot| {
-            let w = slot.borrow();
-            let local_ref = w.as_ref().expect("pool worker local queue");
-            reactor.find_job(local_ref)
-        });
+        let job = with_owned_local_worker(&reactor, |local_ref| reactor.find_job(local_ref))
+            .flatten();
         match job {
             Some(job) => {
                 ensure_operand_capacity(&mut vm, job.program.operand_stack_slots);
@@ -305,14 +339,20 @@ fn wait_join_on_worker(
         if let Some(r) = state.try_take_result() {
             return r;
         }
-        let job = LOCAL_WORKER.with(|slot| {
-            let w = slot.borrow();
-            let local_ref = w.as_ref()?;
-            reactor.find_job(local_ref)
-        });
+        // Only help from this reactor's local deque — a foreign TLS binding
+        // (nested / concurrent Machines) must not be drained here.
+        let job =
+            with_owned_local_worker(reactor, |local_ref| reactor.find_job(local_ref)).flatten();
         if let Some(job) = job {
             // Heap-allocate the help VM so nested join-help does not blow the
             // OS stack with stacked `Machine` values.
+            let mut vm = machine_for_program(&job.program);
+            run_job_on_vm(&mut vm, job);
+            continue;
+        }
+        // Also steal from this reactor's injector/peers when local is empty or
+        // foreign — same as non-worker join help.
+        if let Some(job) = reactor.steal_job() {
             let mut vm = machine_for_program(&job.program);
             run_job_on_vm(&mut vm, job);
             continue;
@@ -349,6 +389,7 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         io_reactor,
     } = job;
 
+    let clear_print = shared_print.is_some();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.install_natives(&natives);
         vm.set_thread_program(Arc::clone(&program));
@@ -380,6 +421,9 @@ fn run_job_on_vm(vm: &mut Machine<WORKER_STACK_SLOTS>, job: Job) {
         }
         value_to_portable(vm.heap(), ret)
     }));
+    if clear_print {
+        crate::io::set_shared_print_redirect(None);
+    }
 
     let stored = match result {
         Ok(Ok(pv)) => Ok(pv),
@@ -511,6 +555,62 @@ mod tests {
         let rb = reactor.wait_join(&b).expect("B");
         assert_eq!(ra, PortableValue::Immediate(1));
         assert_eq!(rb, PortableValue::Immediate(2));
+    }
+
+    /// A TLS local deque owned by reactor A must not swallow submits for B.
+    #[test]
+    fn submit_rejects_foreign_local_worker_deque() {
+        let owner = Reactor::new(1);
+        let foreign = Reactor::new(1);
+        let local = Worker::new_fifo();
+        // Install a deque tagged as `owner` on this (non-pool) thread.
+        LOCAL_WORKER.with(|slot| {
+            *slot.borrow_mut() = Some(LocalWorkerBinding {
+                reactor: Arc::as_ptr(&owner),
+                worker: local,
+            });
+        });
+        let state = Arc::new(JoinState::new());
+        let job = Job {
+            entry: 0,
+            args: Vec::new(),
+            state: Arc::clone(&state),
+            program: const_return_program(9),
+            natives: Natives::new(),
+            shared_print: None,
+            live_threads: crate::thread::new_live_thread_registry(),
+            reactor: Arc::clone(&foreign),
+            io_reactor: crate::io_reactor::IoReactor::new(),
+        };
+        // Must not push onto owner's deque — job goes to `foreign`'s injector.
+        assert!(
+            try_push_local(&foreign, job).is_err(),
+            "foreign reactor must not use a mismatched TLS deque"
+        );
+        // Clean up TLS so later tests on this thread are not poisoned.
+        LOCAL_WORKER.with(|slot| *slot.borrow_mut() = None);
+        owner.shutdown();
+        foreign.shutdown();
+    }
+
+    /// Concurrent reactors on many threads must not cross-feed local deques.
+    #[test]
+    fn concurrent_reactors_complete_independent_jobs() {
+        let n = 8usize;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            handles.push(thread::spawn(move || {
+                let reactor = Reactor::new(2);
+                let imm = (i as i32) + 100;
+                let state = submit_const_job(&reactor, imm);
+                let pv = reactor.wait_join(&state).expect("job");
+                assert_eq!(pv, PortableValue::Immediate(imm as u64));
+                reactor.shutdown();
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
     }
 
     #[test]

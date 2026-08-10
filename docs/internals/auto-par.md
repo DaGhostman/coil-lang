@@ -124,3 +124,8 @@ idle workers steal. `thread::spawn` / auto-par share this pool — no per-call
 | `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2). |
 | `COIL_AUTO_PAR` | `0` / `false` / `off` / `no` disables auto fork-join codegen. |
 | `COIL_PAR_THRESHOLD` | Compile-time profitability cutoff — recursion arg size and loop trip count (default 20). |
+
+Pool workers pin a TLS local deque tagged with the owning reactor identity.
+`submit` / join-help only push or pop that deque when it belongs to the same
+reactor; otherwise work goes through the shared injector. That keeps concurrent
+`Machine`s (parallel tests) and nested reactors from cross-feeding jobs.
