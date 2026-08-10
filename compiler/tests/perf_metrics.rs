@@ -48,6 +48,60 @@ fn count_opcodes_in(bytecode: &[Byte], start: usize, end: usize, op: Instruction
         .count()
 }
 
+/// Residual `LOAD`/`STORE` shape in a PC range.
+///
+/// `*_ops` counts instruction words, `*_slots` the slots they move (a packed
+/// word carries up to 3). `packed_*_ops` are the words with `n > 1`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LoadStoreShape {
+    load_ops: usize,
+    load_slots: usize,
+    packed_load_ops: usize,
+    store_ops: usize,
+    store_slots: usize,
+    packed_store_ops: usize,
+}
+
+fn load_store_shape(bytecode: &[Byte], start: usize, end: usize) -> LoadStoreShape {
+    let mut shape = LoadStoreShape::default();
+    for b in &bytecode[start..end] {
+        let n = b.load_store_count();
+        match *b.bytecode() {
+            Instruction::LOAD => {
+                shape.load_ops += 1;
+                shape.load_slots += n;
+                shape.packed_load_ops += usize::from(n > 1);
+            }
+            Instruction::STORE => {
+                shape.store_ops += 1;
+                shape.store_slots += n;
+                shape.packed_store_ops += usize::from(n > 1);
+            }
+            _ => {}
+        }
+    }
+    shape
+}
+
+/// Fused `BinSlot*` words in a PC range — the slot-addressed shapes that
+/// already bypass a stack round-trip.
+fn count_bin_slot_family_in(bytecode: &[Byte], start: usize, end: usize) -> usize {
+    bytecode[start..end]
+        .iter()
+        .filter(|b| {
+            matches!(
+                *b.bytecode(),
+                Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotImmStore
+                    | Instruction::BinSlotSlotStore
+            )
+        })
+        .count()
+}
+
 fn run_dispatch(
     bytecode: Vec<Byte>,
     constants: Vec<u64>,
@@ -225,5 +279,187 @@ fn perf_mandelbrot_squares_fuse_into_bin_slot_slot() {
     assert!(
         self_mulf >= 2,
         "zr*zr and zi*zi should each fuse to one self-MULF op, got {self_mulf}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AOT harvest — Phase 0 inventory
+//
+// Soft ceilings on the bytecode shapes that later phases are supposed to move.
+// Each ceiling is the count measured at Phase 0, so a regression trips the
+// assert and a real win makes the ceiling stale (tighten it in that phase).
+// Every test also prints its measured shape under `--nocapture`.
+//
+// Counter ownership:
+//   P1 — residual LOAD / STORE (op + slot counts, packed vs single) and the
+//        BinSlot* family that already avoids the stack round-trip.
+//   P2 — Index / StoreIndex in array-hot fns.
+//   P3 — MakeEnum / MakeTuple / MakeArray allocation sites.
+//   P4 — CALL / TailCall density in recursion-hot fns.
+// ---------------------------------------------------------------------------
+
+/// P1 + P4 baseline: `mandelbrot`'s float loops keep 8 LOADs / 13 STOREs, all
+/// single-slot, against 13 already-fused `BinSlot*` words and zero calls.
+#[test]
+fn aot_p1_mandelbrot_residual_load_store_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
+    let shape = load_store_shape(&bc, start, end);
+    let fused = count_bin_slot_family_in(&bc, start, end);
+    eprintln!("[P1] mandelbrot::mandelbrot {shape:?} bin_slot_family={fused}");
+
+    assert!(
+        shape.load_ops <= 8,
+        "mandelbrot residual LOAD regressed: {shape:?}"
+    );
+    assert!(
+        shape.store_ops <= 13,
+        "mandelbrot residual STORE regressed: {shape:?}"
+    );
+    // Nothing in the float loops packs today: every LOAD/STORE moves one slot.
+    assert_eq!(shape.load_slots, shape.load_ops, "{shape:?}");
+    assert_eq!(shape.store_slots, shape.store_ops, "{shape:?}");
+    assert_eq!(shape.packed_load_ops, 0, "{shape:?}");
+    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
+    assert!(
+        fused >= 13,
+        "mandelbrot lost fused BinSlot* coverage: {fused}"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::CALL),
+        0,
+        "mandelbrot must stay call-free"
+    );
+}
+
+/// P1 + P4 baseline: `tak` is call-dominated — 3 `CALL` + 1 `TailCall` over
+/// 4 packed LOADs (9 slots) and 3 single-slot STOREs.
+#[test]
+fn aot_p1_p4_tak_residual_load_store_and_call_density() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/tak.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "tak", bc.len());
+    let shape = load_store_shape(&bc, start, end);
+    let calls = count_opcodes_in(&bc, start, end, Instruction::CALL);
+    let tail_calls = count_opcodes_in(&bc, start, end, Instruction::TailCall);
+    let fused = count_bin_slot_family_in(&bc, start, end);
+    eprintln!(
+        "[P1/P4] tak::tak {shape:?} call={calls} tail_call={tail_calls} bin_slot_family={fused} words={}",
+        end - start
+    );
+
+    assert!(
+        shape.load_ops <= 4,
+        "tak residual LOAD regressed: {shape:?}"
+    );
+    assert!(
+        shape.store_ops <= 3,
+        "tak residual STORE regressed: {shape:?}"
+    );
+    // Argument setup for the three recursive calls is fully packed.
+    assert_eq!(shape.packed_load_ops, shape.load_ops, "{shape:?}");
+    assert!(
+        shape.load_slots >= 9,
+        "tak should still pack 9 argument loads: {shape:?}"
+    );
+    // STORE packing is unused here — P1 owns closing that gap.
+    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
+    assert_eq!(calls, 3, "tak call density changed");
+    assert!(
+        tail_calls >= 1,
+        "tak outer self-call should stay a TailCall"
+    );
+    assert!(fused >= 4, "tak lost fused BinSlot* coverage: {fused}");
+}
+
+/// P2 baseline: `nsieve`'s hot loops keep exactly one `Index` and one
+/// `StoreIndex` alongside 5 LOADs / 5 STOREs.
+#[test]
+fn aot_p2_nsieve_index_shape_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/nsieve.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, "nsieve", bc.len());
+    let index = count_opcodes_in(&bc, start, end, Instruction::Index);
+    let store_index = count_opcodes_in(&bc, start, end, Instruction::StoreIndex);
+    let shape = load_store_shape(&bc, start, end);
+    eprintln!("[P2] nsieve::nsieve index={index} store_index={store_index} {shape:?}");
+
+    // `flags[p]` read and `flags[k] = 0` write — one site each in source.
+    assert_eq!(index, 1, "nsieve Index count changed");
+    assert_eq!(store_index, 1, "nsieve StoreIndex count changed");
+    assert!(
+        shape.load_ops <= 5,
+        "nsieve residual LOAD regressed: {shape:?}"
+    );
+    assert!(
+        shape.store_ops <= 5,
+        "nsieve residual STORE regressed: {shape:?}"
+    );
+    assert_eq!(shape.packed_store_ops, 0, "{shape:?}");
+    // `flags.push(1)` is still an out-of-line Vec::push call.
+    assert_eq!(
+        count_opcodes_in(&bc, start, end, Instruction::CALL),
+        1,
+        "nsieve call count changed"
+    );
+}
+
+/// P3 + P4 baseline: `bottom_up` allocates both `Tree` variants (2 `MakeEnum`)
+/// per level and `item_check` unpacks without re-allocating.
+#[test]
+fn aot_p3_binary_trees_make_enum_inventory() {
+    let (bc, _, _, _, pipeline) = compile("examples/perf/binary_trees.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let mut total_enums = 0usize;
+    let mut total_tuples = 0usize;
+    let mut total_arrays = 0usize;
+    let mut total_calls = 0usize;
+    for name in ["bottom_up", "item_check", "main"] {
+        let (start, end) = fn_pc_range(&syms, name, bc.len());
+        let make_enum = count_opcodes_in(&bc, start, end, Instruction::MakeEnum);
+        let make_tuple = count_opcodes_in(&bc, start, end, Instruction::MakeTuple);
+        let make_array = count_opcodes_in(&bc, start, end, Instruction::MakeArray);
+        let calls = count_opcodes_in(&bc, start, end, Instruction::CALL);
+        eprintln!(
+            "[P3/P4] binary_trees::{name} make_enum={make_enum} make_tuple={make_tuple} make_array={make_array} call={calls}"
+        );
+        total_enums += make_enum;
+        total_tuples += make_tuple;
+        total_arrays += make_array;
+        total_calls += calls;
+    }
+
+    let (bottom_up_start, bottom_up_end) = fn_pc_range(&syms, "bottom_up", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, bottom_up_start, bottom_up_end, Instruction::MakeEnum),
+        2,
+        "bottom_up should allocate exactly Leaf + Node"
+    );
+    let (check_start, check_end) = fn_pc_range(&syms, "item_check", bc.len());
+    assert_eq!(
+        count_opcodes_in(&bc, check_start, check_end, Instruction::MakeEnum),
+        0,
+        "item_check must not re-allocate while walking"
+    );
+    assert_eq!(
+        count_opcodes_in(&bc, check_start, check_end, Instruction::Unpack),
+        1,
+        "item_check should keep one payload Unpack"
+    );
+
+    // User fns only: `format` needs 2 MakeTuple in main, no arrays anywhere.
+    assert!(
+        total_enums <= 2,
+        "binary_trees user MakeEnum regressed: {total_enums}"
+    );
+    assert!(
+        total_tuples <= 2,
+        "binary_trees user MakeTuple regressed: {total_tuples}"
+    );
+    assert_eq!(total_arrays, 0, "binary_trees should not build arrays");
+    assert!(
+        total_calls <= 11,
+        "binary_trees user CALL density regressed: {total_calls}"
     );
 }
