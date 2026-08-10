@@ -516,3 +516,462 @@ fn perf_mandelbrot_slot_promote_drops_ci_temp_copy() {
         "mandelbrot STORE count regressed after slot promote: {stores}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 0 — register-win shape inventory + opcode-candidate gap tallies
+// ---------------------------------------------------------------------------
+//
+// Helpers return structs so Phase 1+ can assert deltas. Ceilings are headroom-
+// based (like dispatch_count tests), not brittle exact equals. Static counts
+// annotate estimated dynamic weight where the hot-loop structure is known.
+
+/// Existing-opcode health for a named fn body (post-lower bytecode).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpcodeHealth {
+    load: usize,
+    store: usize,
+    bin_slot_imm: usize,
+    bin_slot_slot: usize,
+    bin_slot_imm_store: usize,
+    bin_slot_slot_store: usize,
+    bin_slot_imm_jmpf: usize,
+    bin_slot_slot_jmpf: usize,
+    bin_slot_slot_const_jmpf: usize,
+    cmp_jmpf: usize,
+    log_not_jmpf: usize,
+    float_chain_store: usize,
+    jmpf: usize,
+    jmpt: usize,
+    /// Residual unfused float binary ops (ADDF/SUBF/MULF/DIVF/MODF).
+    float_arith: usize,
+    index: usize,
+    store_index: usize,
+    packed_load_n2: usize,
+    packed_load_n3: usize,
+}
+
+impl OpcodeHealth {
+    fn fused_bin_slot_total(&self) -> usize {
+        self.bin_slot_imm
+            + self.bin_slot_slot
+            + self.bin_slot_imm_store
+            + self.bin_slot_slot_store
+    }
+
+    fn fused_jmpf_total(&self) -> usize {
+        self.bin_slot_imm_jmpf
+            + self.bin_slot_slot_jmpf
+            + self.bin_slot_slot_const_jmpf
+            + self.cmp_jmpf
+            + self.log_not_jmpf
+    }
+}
+
+/// Near-miss / residual shapes that existing opcodes do not absorb.
+///
+/// `*Jmpt` counterparts: hard to prove statically that invert-refused a fusable
+/// guard; we tally bare `JMPF` + `JMPT` as the observable proxy (see comments
+/// on [`OpcodeGaps::jmpt_counterpart_proxy`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpcodeGaps {
+    /// Bare JMPF remaining in the body (fusion miss or non-fusable guard).
+    bare_jmpf: usize,
+    /// JMPT usage (invert of non-fusable bool guards only today).
+    jmpt: usize,
+    /// `LOAD; CONST(pool); float-arith` — int/bool `BinSlotImm` only.
+    bin_slot_imm_float_miss: usize,
+    /// `LOAD; NEGF|NOT|NEG|LogNot; STORE` — no general UnarySlot(Store).
+    unary_slot_beyond_inc_dec: usize,
+    /// `FloatChainStore` count (cap 3 stages + store).
+    float_chain_store: usize,
+    /// Leftover float binary ops in the same fn (wider / store-free proxy).
+    residual_float_arith: usize,
+    /// `BinSlotSlot` float-arith then separate float cmp+JMPF (not ConstJmpf).
+    bin_slot_slot_branch_without_cmp_fuse: usize,
+    /// Adjacent `LOAD a; STORE b` with `a != b` (MoveSlot / CopySlot candidate).
+    slot_move_copy: usize,
+    /// Adjacent single-slot LOADs (`n==0|1`) that packing could have merged.
+    call_arg_peel_packing_holes: usize,
+    index: usize,
+    store_index: usize,
+}
+
+impl OpcodeGaps {
+    /// Proxy for `*Jmpt` counterpart demand: bare JMPF + JMPT.
+    /// True “invert refused fusable *Jmpf” is not recoverable from bytecode alone.
+    fn jmpt_counterpart_proxy(&self) -> usize {
+        self.bare_jmpf + self.jmpt
+    }
+}
+
+fn is_float_arith(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::ADDF
+            | Instruction::SUBF
+            | Instruction::MULF
+            | Instruction::DIVF
+            | Instruction::MODF
+    )
+}
+
+fn is_float_cmp(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::LEF | Instruction::LEQF | Instruction::GTF | Instruction::GEQF
+    )
+}
+
+fn is_unary_slot_candidate(op: Instruction) -> bool {
+    matches!(
+        op,
+        Instruction::NEGF | Instruction::NOT | Instruction::NEG | Instruction::LogNot
+    )
+}
+
+fn const_is_pool(b: &Byte) -> bool {
+    *b.bytecode() == Instruction::CONST && (b.operand_u32() & Byte::POOL_FLAG) != 0
+}
+
+fn single_load_slot(b: &Byte) -> Option<u32> {
+    if *b.bytecode() != Instruction::LOAD {
+        return None;
+    }
+    b.load_store_single_slot()
+}
+
+fn single_store_slot(b: &Byte) -> Option<u32> {
+    if !matches!(*b.bytecode(), Instruction::STORE | Instruction::StorePop) {
+        return None;
+    }
+    b.load_store_single_slot()
+}
+
+fn inventory_health(body: &[Byte]) -> OpcodeHealth {
+    let mut h = OpcodeHealth::default();
+    for b in body {
+        match *b.bytecode() {
+            Instruction::LOAD => {
+                h.load += 1;
+                match b.load_store_count() {
+                    2 => h.packed_load_n2 += 1,
+                    3 => h.packed_load_n3 += 1,
+                    _ => {}
+                }
+            }
+            Instruction::STORE | Instruction::StorePop => h.store += 1,
+            Instruction::BinSlotImm => h.bin_slot_imm += 1,
+            Instruction::BinSlotSlot => h.bin_slot_slot += 1,
+            Instruction::BinSlotImmStore => h.bin_slot_imm_store += 1,
+            Instruction::BinSlotSlotStore => h.bin_slot_slot_store += 1,
+            Instruction::BinSlotImmJmpf => h.bin_slot_imm_jmpf += 1,
+            Instruction::BinSlotSlotJmpf => h.bin_slot_slot_jmpf += 1,
+            Instruction::BinSlotSlotConstJmpf => h.bin_slot_slot_const_jmpf += 1,
+            Instruction::CmpJmpf => h.cmp_jmpf += 1,
+            Instruction::LogNotJmpf => h.log_not_jmpf += 1,
+            Instruction::FloatChainStore => h.float_chain_store += 1,
+            Instruction::JMPF => h.jmpf += 1,
+            Instruction::JMPT => h.jmpt += 1,
+            Instruction::Index => h.index += 1,
+            Instruction::StoreIndex => h.store_index += 1,
+            op if is_float_arith(op) => h.float_arith += 1,
+            _ => {}
+        }
+    }
+    h
+}
+
+fn inventory_gaps(body: &[Byte]) -> OpcodeGaps {
+    let health = inventory_health(body);
+    let mut g = OpcodeGaps {
+        bare_jmpf: health.jmpf,
+        jmpt: health.jmpt,
+        float_chain_store: health.float_chain_store,
+        residual_float_arith: health.float_arith,
+        index: health.index,
+        store_index: health.store_index,
+        ..OpcodeGaps::default()
+    };
+
+    let n = body.len();
+    for i in 0..n {
+        // LOAD; CONST(pool); float-arith
+        if i + 2 < n
+            && single_load_slot(&body[i]).is_some()
+            && const_is_pool(&body[i + 1])
+            && is_float_arith(*body[i + 2].bytecode())
+        {
+            g.bin_slot_imm_float_miss += 1;
+        }
+
+        // LOAD; unary; STORE
+        if i + 2 < n
+            && single_load_slot(&body[i]).is_some()
+            && is_unary_slot_candidate(*body[i + 1].bytecode())
+            && single_store_slot(&body[i + 2]).is_some()
+        {
+            g.unary_slot_beyond_inc_dec += 1;
+        }
+
+        // Slot move: LOAD a; STORE b, a != b
+        if i + 1 < n
+            && let (Some(a), Some(b_slot)) =
+                (single_load_slot(&body[i]), single_store_slot(&body[i + 1]))
+            && a != b_slot
+        {
+            g.slot_move_copy += 1;
+        }
+
+        // Packing hole: adjacent single-slot LOADs (n==0|1) not already packed.
+        if i + 1 < n
+            && single_load_slot(&body[i]).is_some()
+            && single_load_slot(&body[i + 1]).is_some()
+        {
+            g.call_arg_peel_packing_holes += 1;
+        }
+
+        // BinSlotSlot float-arith → separate float cmp + JMPF / CmpJmpf window.
+        if *body[i].bytecode() == Instruction::BinSlotSlot {
+            let (op, _, _) = body[i].bin_slot_slot_parts();
+            if is_float_arith(Instruction::from(op)) {
+                let window = &body[i + 1..n.min(i + 1 + 6)];
+                let mut saw_cmp_jmp = false;
+                let mut j = 0;
+                while j < window.len() {
+                    let opj = *window[j].bytecode();
+                    if opj == Instruction::BinSlotSlotConstJmpf {
+                        break;
+                    }
+                    if opj == Instruction::CmpJmpf
+                        && is_float_cmp(Instruction::from(window[j].cmp_jmpf_parts().0))
+                    {
+                        saw_cmp_jmp = true;
+                        break;
+                    }
+                    if is_float_cmp(opj)
+                        && j + 1 < window.len()
+                        && *window[j + 1].bytecode() == Instruction::JMPF
+                    {
+                        saw_cmp_jmp = true;
+                        break;
+                    }
+                    if const_is_pool(&window[j])
+                        && j + 2 < window.len()
+                        && is_float_cmp(*window[j + 1].bytecode())
+                        && *window[j + 2].bytecode() == Instruction::JMPF
+                    {
+                        saw_cmp_jmp = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if saw_cmp_jmp {
+                    g.bin_slot_slot_branch_without_cmp_fuse += 1;
+                }
+            }
+        }
+    }
+    g
+}
+
+fn fn_body<'a>(bc: &'a [Byte], pipeline: &Pipeline, name: &str) -> &'a [Byte] {
+    let syms = pipeline.program_debug().fn_symbols;
+    let (start, end) = fn_pc_range(&syms, name, bc.len());
+    &bc[start..end]
+}
+
+fn compile_fn_inventory(path: &str, fn_name: &str) -> (OpcodeHealth, OpcodeGaps) {
+    let (bc, _, _, _, pipeline) = compile(path);
+    let body = fn_body(&bc, &pipeline, fn_name);
+    (inventory_health(body), inventory_gaps(body))
+}
+
+#[test]
+fn perf_phase0_mandelbrot_shape_inventory() {
+    // Dynamic weight: size=160, max_iter=50 → ~160*160*50 ≈ 1.28M iter-body
+    // trips; x-loop ≈ 25.6k; y-loop ≈ 160. Static × weight for residual ops
+    // in the iter body dominates any outer-loop residual.
+    //
+    // Phase 0 baseline (static in `mandelbrot`):
+    //   health: LOAD=6 STORE=10 BinSlotImmStore=3 BinSlotSlotStore=3
+    //           BinSlotSlotJmpf=3 BinSlotSlotConstJmpf=1 FloatChainStore=3
+    //           float_arith=3 packed_load=0
+    //   gaps:   slot_move=1 residual_float_arith=3; all other gap families 0
+    let (h, g) = compile_fn_inventory("examples/perf/mandelbrot.hy", "mandelbrot");
+
+    // Existing-opcode health (post slot_promote / FloatChain / *Jmpf).
+    assert!(h.load <= 8, "mandelbrot LOAD budget: {h:?}");
+    assert!(h.store <= 12, "mandelbrot STORE budget: {h:?}");
+    assert!(
+        h.float_chain_store >= 2,
+        "mandelbrot should keep FloatChainStore fuse: {h:?}"
+    );
+    assert!(
+        h.bin_slot_slot_const_jmpf >= 1,
+        "escape test should stay BinSlotSlotConstJmpf: {h:?}"
+    );
+    assert!(
+        h.fused_jmpf_total() >= 4,
+        "y/x/iter headers + escape: {h:?}"
+    );
+    assert_eq!(h.jmpt, 0, "no *Jmpt path; guards stay *Jmpf: {h:?}");
+    assert_eq!(h.jmpf, 0, "no bare JMPF in mandelbrot: {h:?}");
+
+    // Opcode-candidate gaps (ledger rows).
+    // *Jmpt: cannot detect invert-refused fusable guards statically; proxy=0 here.
+    assert_eq!(
+        g.jmpt_counterpart_proxy(),
+        0,
+        "*Jmpt proxy (bare JMPF+JMPT) should be 0; hard to detect refused invert: {g:?}"
+    );
+    assert_eq!(
+        g.bin_slot_imm_float_miss, 0,
+        "float pool-imm near-miss should stay fused or absent: {g:?}"
+    );
+    assert_eq!(
+        g.unary_slot_beyond_inc_dec, 0,
+        "unary slot gap should be absent: {g:?}"
+    );
+    // FloatChain wider/store-free: chains=3; residual ADDF/SUBF/MULF=3 (cr scale).
+    assert!(
+        g.float_chain_store >= 2 && g.residual_float_arith <= 6,
+        "FloatChain + residual float arith: {g:?}"
+    );
+    assert_eq!(
+        g.bin_slot_slot_branch_without_cmp_fuse, 0,
+        "escape stays ConstJmpf; no BinSlotSlot→branch miss: {g:?}"
+    );
+    // Loop-carried φ-like shuffle: at minimum slot-move tally (promotion residue).
+    // Baseline slot_move=1; Phase 1 coalescing should drive this toward 0.
+    assert!(
+        g.slot_move_copy <= 3,
+        "slot move/copy (φ-like latch proxy) budget: {g:?}"
+    );
+    assert_eq!(
+        g.call_arg_peel_packing_holes, 0,
+        "no adjacent n=1 LOAD packing holes: {g:?}"
+    );
+    assert_eq!(g.index, 0, "mandelbrot has no Index: {g:?}");
+}
+
+#[test]
+fn perf_phase0_tak_shape_inventory() {
+    // Dynamic weight: tak(18,12,6) is deep recursion (~1.5–3M dispatches);
+    // each recursive arm re-executes entry guard + peels. Static residuals in
+    // `tak` body are multiplied by call count, not loop trips.
+    //
+    // Phase 0 baseline (static in `tak`):
+    //   health: LOAD=11 STORE=7 BinSlotImmStore=3 BinSlotSlotJmpf=4
+    //           packed_load_n3=4
+    //   gaps:   slot_move=4; packing_holes=0; float/Index families 0
+    let (h, g) = compile_fn_inventory("examples/perf/tak.hy", "tak");
+
+    assert!(h.load <= 16, "tak LOAD budget: {h:?}");
+    assert!(h.store <= 10, "tak STORE budget: {h:?}");
+    assert!(
+        h.fused_jmpf_total() >= 4,
+        "entry + 3 peels should stay fused *Jmpf: {h:?}"
+    );
+    assert!(
+        h.fused_bin_slot_total() >= 3,
+        "x-1/y-1/z-1 peels should use BinSlot*: {h:?}"
+    );
+    assert!(h.packed_load_n3 >= 3, "peel args pack as LOAD n=3: {h:?}");
+
+    // *Jmpt: peels/guards are *Jmpf; JMPT unused. Proxy documents static blindness.
+    assert_eq!(h.jmpt, 0, "tak has no JMPT: {h:?}");
+    assert_eq!(h.jmpf, 0, "tak has no bare JMPF: {h:?}");
+    // Arg shuffles / latch copies — Phase 1–3 coalescing target.
+    assert!(
+        g.slot_move_copy <= 6,
+        "tak slot-move (arg shuffle / φ-like) budget: {g:?}"
+    );
+    assert_eq!(
+        g.call_arg_peel_packing_holes, 0,
+        "tak peels stay packed (no n=1 adjacent LOADs): {g:?}"
+    );
+    assert_eq!(g.bin_slot_imm_float_miss, 0, "tak is int-only: {g:?}");
+    assert_eq!(g.float_chain_store, 0, "tak is int-only: {g:?}");
+    assert_eq!(g.index, 0, "tak has no Index: {g:?}");
+}
+
+#[test]
+fn perf_phase0_numeric_shape_inventory() {
+    // Dynamic weight: while i < 2000 → ~2000 trips of loop body.
+    //
+    // Phase 0 baseline (static in `main`):
+    //   health: LOAD=4 STORE=6 BinSlotImmStore=1 BinSlotSlotStore=1
+    //           BinSlotImmJmpf=1 packed_load_n2=1
+    //   gaps:   slot_move=1; other gap families 0
+    let (h, g) = compile_fn_inventory("examples/perf/numeric.hy", "main");
+
+    assert!(h.load <= 6, "numeric LOAD budget: {h:?}");
+    assert!(h.store <= 8, "numeric STORE budget: {h:?}");
+    assert!(
+        h.bin_slot_imm_jmpf >= 1,
+        "loop compare should stay BinSlotImmJmpf: {h:?}"
+    );
+    assert!(
+        h.bin_slot_imm_store + h.bin_slot_imm >= 1,
+        "i+=1 / acc+=i should use BinSlotImm*: {h:?}"
+    );
+
+    assert_eq!(g.jmpt, 0, "numeric loop uses *Jmpf not JMPT: {g:?}");
+    assert_eq!(h.jmpf, 0, "numeric has no bare JMPF: {h:?}");
+    assert!(
+        g.slot_move_copy <= 3,
+        "numeric slot-move budget: {g:?}"
+    );
+    assert_eq!(
+        g.call_arg_peel_packing_holes, 0,
+        "numeric has no packing holes: {g:?}"
+    );
+    assert_eq!(g.bin_slot_imm_float_miss, 0, "numeric is int-only: {g:?}");
+    assert_eq!(g.index, 0, "numeric has no Index: {g:?}");
+}
+
+#[test]
+fn perf_phase0_nsieve_shape_inventory() {
+    // Dynamic weight: n=1<<14; fill loop n; p-loop ~n; inner k-stride ~n/p.
+    // Index/StoreIndex in hot bodies dominate; proofs are counter-only today.
+    //
+    // Phase 0 baseline (static in `nsieve`):
+    //   health: LOAD=5 STORE=5 BinSlotImmStore=3 BinSlotSlotStore=2
+    //           BinSlotSlotJmpf=3 CmpJmpf=1 Index=1 StoreIndex=1
+    //           packed_load_n2=1 packed_load_n3=1
+    //   gaps:   index=1 store_index=1; slot_move=0; packing_holes=0
+    let (h, g) = compile_fn_inventory("examples/perf/nsieve.hy", "nsieve");
+
+    assert!(h.load <= 10, "nsieve LOAD budget: {h:?}");
+    assert!(h.store <= 10, "nsieve STORE budget: {h:?}");
+    assert!(
+        h.fused_jmpf_total() + h.jmpf >= 3,
+        "fill/p/k loop guards: {h:?}"
+    );
+    assert!(h.index >= 1, "nsieve keeps Index: {h:?}");
+    assert!(h.store_index >= 1, "nsieve keeps StoreIndex: {h:?}");
+
+    // Index / StoreIndex fast-path candidate family (roadmap §2).
+    assert_eq!(g.index, 1, "nsieve Index gap row: {g:?}");
+    assert_eq!(g.store_index, 1, "nsieve StoreIndex gap row: {g:?}");
+    assert_eq!(
+        g.slot_move_copy, 0,
+        "nsieve slot-move should stay 0: {g:?}"
+    );
+    assert_eq!(
+        g.call_arg_peel_packing_holes, 0,
+        "nsieve packing holes: {g:?}"
+    );
+    assert_eq!(g.bin_slot_imm_float_miss, 0, "nsieve is int-only: {g:?}");
+}
+
+#[test]
+fn perf_phase0_nsieve_dispatch_regression() {
+    let (bc, pool, strings, statics, pipeline) = compile("examples/perf/nsieve.hy");
+    let dispatches = run_dispatch(bc, pool, strings, statics, &pipeline);
+    // n=1<<14 sieve + write_all; measured multi-million on debug Machine.
+    assert!(
+        dispatches < 80_000_000,
+        "nsieve dispatch count regressed: {dispatches}"
+    );
+}
