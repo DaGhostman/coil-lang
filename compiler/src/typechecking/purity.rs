@@ -748,4 +748,81 @@ fn main() { return; }
             "only self-recursive pure fns are auto-par candidates: {set:?}"
         );
     }
+
+    /// Skipping `Construct` payloads hid IO inside `Tree::Node(shout(n), …)`.
+    #[test]
+    fn impure_call_in_enum_ctor_payload_marks_impure() {
+        let set = pure_set(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Box {
+    Wrap(int),
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn pack(int n) -> Box {
+    if n <= 0 { return Box::Wrap(0); }
+    return Box::Wrap(shout(n));
+}
+fn main() { return; }
+"#,
+        );
+        assert!(!set.contains("shout"), "shout uses IO: {set:?}");
+        assert!(
+            !set.contains("pack"),
+            "impurity in a constructor payload must reach the enclosing fn: {set:?}"
+        );
+    }
+
+    /// Self-calls that only appear inside `Tree::Node(…)` must still mark the
+    /// builder recursive-pure so EnumCtor IPA can fire.
+    #[test]
+    fn self_recursion_only_via_enum_ctor_is_recursive_pure() {
+        let set = pure_set(
+            r#"
+enum Tree {
+    Leaf,
+    Node(Tree, Tree),
+}
+fn build(int n) -> Tree {
+    if n <= 1 { return Tree::Leaf; }
+    return Tree::Node(build(n - 1), build(n - 2));
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            set.contains("build"),
+            "enum-building self-recursion must be recursive-pure: {set:?}"
+        );
+    }
+
+    /// Record-payload constructors are walked the same way as tuple ones.
+    #[test]
+    fn impure_call_in_record_enum_ctor_payload_marks_impure() {
+        let set = pure_set(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Cell {
+    Val { x: int },
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn pack(int n) -> Cell {
+    return Cell::Val { x: shout(n) };
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            !set.contains("pack"),
+            "record ctor payloads must not hide impurity: {set:?}"
+        );
+    }
 }
