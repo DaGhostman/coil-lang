@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use parser::ast::{Expression, Output};
+use parser::ast::{EnumConstructPayload, Expression, Output};
 
 /// Names of user functions that are pure and self-recursive.
 pub type RecursivePureSet = HashSet<String>;
@@ -301,6 +301,19 @@ fn collect_nested_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) {
                 collect_nested_fns(&arm.body, facts);
             }
         }
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    collect_nested_fns(item, facts);
+                }
+            }
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    collect_nested_fns(&f.value, facts);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
         Expression::For {
             init,
             cond,
@@ -472,6 +485,21 @@ fn walk_body(ast: &Output<'_>, facts: &mut FnFacts) {
                 walk_body(&arm.body, facts);
             }
         }
+        // Constructor payloads hold arbitrary expressions — skipping them hid
+        // both impure calls and enum-building self-recursion.
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    walk_body(item, facts);
+                }
+            }
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    walk_body(&f.value, facts);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
         Expression::For {
             init,
             cond,
