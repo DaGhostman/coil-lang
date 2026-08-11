@@ -120,6 +120,7 @@ pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> 
 /// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
 pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
     super::bounds::reset_bounds_stats();
+    super::canon::reset_canon_stats();
     let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default(), pool);
     lower_optimized(&flat, pool)
 }
@@ -2077,6 +2078,35 @@ mod tests {
                 .iter()
                 .any(|b| matches!(*b.bytecode(), Instruction::BinSlotImm)),
             "expected BinSlotImm after canon+fuse; got {:?}",
+            lowered
+                .bytecode
+                .iter()
+                .map(|b| *b.bytecode())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Int `ConstPool; Load; ADD` demotes then fuses to `BinSlotImm`.
+    #[test]
+    fn canon_demotes_const_pool_then_fuses_bin_slot_imm() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::ConstPool { idx: 0, loc },
+            IlOp::Load { slot: 0, loc },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let mut pool = vec![common::Value::from(3_i64).raw() as u64];
+        let lowered = lower(&ops, &mut pool);
+        assert!(
+            lowered
+                .bytecode
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::BinSlotImm)),
+            "expected BinSlotImm after ConstPool demote+canon+fuse; got {:?}",
             lowered
                 .bytecode
                 .iter()

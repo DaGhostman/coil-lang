@@ -180,6 +180,12 @@ fn is_gt_cmp(op: &IlOp) -> bool {
             .is_some_and(|b| *b.bytecode() == Instruction::GT)
 }
 
+/// Exposed for unit tests: `(index_slot, bound_slot)` from the loop header guard.
+#[cfg(test)]
+fn header_lt_bound_for_test(ops: &[IlOp], lp: &NaturalLoop) -> Option<(u32, u32)> {
+    header_lt_bound(ops, lp)
+}
+
 fn slots_stored_in_loop(ops: &[IlOp], lp: &NaturalLoop) -> HashSet<u32> {
     let mut s = HashSet::new();
     for i in lp.header..=lp.latch {
@@ -2007,7 +2013,7 @@ mod tests {
         reset_bounds_stats();
         // slot(p)=3 > slot(n)=0 → canon rewrites LE into GT; bounds must still prove.
         let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLe);
-        canonicalize_operand_order(&mut ops);
+        canonicalize_operand_order(&mut ops, &[]);
         assert!(
             ops.iter().any(|op| matches!(
                 op,
@@ -2210,5 +2216,105 @@ mod tests {
             "ArrayLen should be outside loop; body_lens={body_lens}"
         );
         assert!(stats.array_len_hoists >= 1, "{stats:?}");
+    }
+
+    /// Post-canon header `Load bound; Load index; GT; JMPF` still resolves
+    /// `(index, bound)` and proves Index under a fill-equal length.
+    #[test]
+    fn header_gt_form_proves_index_after_fill() {
+        // n=0, flags=1, i=2, p=3 — same as fill-then-scan fixture, but the
+        // scan guard is the canon shape Load n; Load p; GT (n > p iff p < n).
+        reset_bounds_stats();
+        let mut ops = vec![
+            IlOp::Const { imm: 4, loc: loc() },
+            IlOp::StorePop { slot: 0, loc: loc() },
+            IlOp::byte(Byte::new(Instruction::MakeArray).with_operand_u32(0)),
+            IlOp::StorePop { slot: 1, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop { slot: 2, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::LE,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::byte(Byte::new(Instruction::ArrayPush)),
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 2, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const { imm: 0, loc: loc() },
+            IlOp::StorePop { slot: 3, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(2)),
+            // Canon shape: Load n; Load p; GT; JMPF  (p < n)
+            IlOp::Load { slot: 0, loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::GT,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfFalse,
+                target: Label(3),
+                loc: loc(),
+            },
+            IlOp::Load { slot: 1, loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Index { loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Load { slot: 3, loc: loc() },
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::StorePop { slot: 3, loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(2),
+                loc: loc(),
+            },
+            IlOp::Label(Label(3)),
+            IlOp::Halt { loc: loc() },
+        ];
+        let loops = find_natural_loops(&ops);
+        assert!(
+            loops.iter().any(|lp| header_lt_bound_for_test(&ops, lp) == Some((3, 0))),
+            "GT header should resolve index=3 bound=0; loops={loops:?}"
+        );
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert!(
+            stats.proven_index >= 1,
+            "Index after fill with GT header should be proven; stats={stats:?}"
+        );
     }
 }

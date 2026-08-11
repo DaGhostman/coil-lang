@@ -1483,3 +1483,35 @@ fn aot_p3_binary_trees_make_enum_inventory() {
         "binary_trees user CALL density regressed: {total_calls}"
     );
 }
+
+/// Operand-order canon hit inventory (soft smoke; tighten after stable runs).
+#[test]
+fn perf_canon_stats_inventory() {
+    // Observed 2026-08-11 (debug `examples/perf/*`):
+    //   mandelbrot: load_load=5 cmp_flips=5 demotes=0 refused_sp=5 const_load=0
+    //   tak:        load_load=3 cmp_flips=3 demotes=0 refused_sp=5 const_load=0
+    //   nsieve:     load_load=6 cmp_flips=5 demotes=0 refused_sp=5 const_load=0
+    //   numeric:    load_load=2 cmp_flips=2 demotes=0 refused_sp=6 const_load=0
+    // ConstPool demotes stay 0: codegen already emits inline CONST for 0..=i32::MAX.
+    for path in [
+        "examples/perf/mandelbrot.hy",
+        "examples/perf/tak.hy",
+        "examples/perf/nsieve.hy",
+        "examples/perf/numeric.hy",
+    ] {
+        let (_bc, _, _, _, _) = compile(path);
+        let s = compiler::last_canon_stats();
+        assert_eq!(
+            s.const_pool_demotes, 0,
+            "{path}: ConstPool demotes unexpected on perf suite: {s:?}"
+        );
+        assert!(
+            s.load_load_swaps <= 32,
+            "{path}: load/load swap volume: {s:?}"
+        );
+        assert!(
+            s.const_load_swaps <= 32,
+            "{path}: const/load swap volume: {s:?}"
+        );
+    }
+}

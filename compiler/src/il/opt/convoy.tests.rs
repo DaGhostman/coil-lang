@@ -1641,6 +1641,7 @@
                 copy_prop: true,
                 slot_promote: false,
                 canon: false,
+                cast_spill: false,
                 algebraic: false,
                 licm: false,
                 loop_bounds: false,
