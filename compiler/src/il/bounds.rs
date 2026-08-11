@@ -1761,12 +1761,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn proves_index_after_fill_loop_eq_bound() {
-        reset_bounds_stats();
-        // flags = MakeArray 0; i=0; while i < n { push; i++ }; then while p < n { Index }
+    /// Scan-loop compare shape after fill-to-`n` (nsieve-like).
+    #[derive(Clone, Copy)]
+    enum ScanHeader {
+        /// `Load p; Load n; LE` — pre-canon form when slot(p) ≤ slot(n) fails.
+        LoadLoadLe,
+        /// `Load n; Load p; GT` — post-canon when slot(p) > slot(n).
+        LoadLoadGt,
+        /// Fused `BinSlotSlot GT n,p` — same polarity as [`Self::LoadLoadGt`].
+        BinSlotSlotGt,
+        /// Residual `Byte(GT)` between loads (is_gt_cmp encode path).
+        LoadLoadByteGt,
+    }
+
+    /// flags = MakeArray 0; i=0; while i < n { push; i++ }; then while p < n { Index }.
+    /// n=slot0, flags=1, i=2, p=3.
+    fn fill_then_scan_ops(scan: ScanHeader) -> Vec<IlOp> {
         let mut ops = vec![
-            // n in slot 0, flags → slot 1, i → 2, p → 3
             IlOp::MakeArray {
                 arity: 0,
                 loc: loc(),
@@ -1780,7 +1791,6 @@ mod tests {
                 slot: 2,
                 loc: loc(),
             },
-            // fill loop
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(0),
@@ -1838,25 +1848,72 @@ mod tests {
                 slot: 3,
                 loc: loc(),
             },
-            // scan loop
             IlOp::Jump {
                 kind: IlJumpKind::Unconditional,
                 target: Label(2),
                 loc: loc(),
             },
             IlOp::Label(Label(2)),
-            IlOp::Load {
-                slot: 3,
-                loc: loc(),
-            },
-            IlOp::Load {
-                slot: 0,
-                loc: loc(),
-            },
-            IlOp::Bin {
-                op: Instruction::LE,
-                loc: loc(),
-            },
+        ];
+        match scan {
+            ScanHeader::LoadLoadLe => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::LE,
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::LoadLoadGt => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::GT,
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::BinSlotSlotGt => {
+                ops.push(IlOp::BinSlotSlot {
+                    op: Instruction::GT as u8,
+                    a: 0,
+                    b: 3,
+                    loc: loc(),
+                });
+            }
+            ScanHeader::LoadLoadByteGt => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Byte {
+                        byte: Byte::new(Instruction::GT),
+                        loc: loc(),
+                    },
+                ]);
+            }
+        }
+        ops.extend([
             IlOp::Jump {
                 kind: IlJumpKind::JumpIfFalse,
                 target: Label(3),
@@ -1892,12 +1949,80 @@ mod tests {
             },
             IlOp::Label(Label(3)),
             IlOp::Halt { loc: loc() },
-        ];
+        ]);
+        ops
+    }
+
+    #[test]
+    fn proves_index_after_fill_loop_eq_bound() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLe);
         loop_bounds(&mut ops);
         let stats = last_bounds_stats();
         assert!(
             stats.proven_index >= 1,
             "Index after fill-to-n should be proven; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn proves_index_with_post_canon_gt_header() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadGt);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert!(
+            stats.proven_index >= 1,
+            "post-canon Load n; Load p; GT must prove Index; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn proves_index_with_bin_slot_slot_gt_header() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::BinSlotSlotGt);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert!(
+            stats.proven_index >= 1,
+            "BinSlotSlot GT n,p must prove Index; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn proves_index_with_byte_gt_header() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadByteGt);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert!(
+            stats.proven_index >= 1,
+            "Byte(GT) header must prove Index via is_gt_cmp; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn canon_then_bounds_proves_index_when_slots_invert() {
+        use super::super::canon::canonicalize_operand_order;
+        reset_bounds_stats();
+        // slot(p)=3 > slot(n)=0 → canon rewrites LE into GT; bounds must still prove.
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLe);
+        canonicalize_operand_order(&mut ops);
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                IlOp::Bin {
+                    op: Instruction::GT,
+                    ..
+                }
+            )),
+            "expected canon to emit GT for high-then-low LE"
+        );
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert!(
+            stats.proven_index >= 1,
+            "canon→GT then loop_bounds must still prove Index; stats={stats:?}"
         );
     }
 
