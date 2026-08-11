@@ -424,4 +424,147 @@ mod tests {
         assert!(matches!(ops[2], IlOp::Bin { op: Instruction::ADD, .. }));
         assert!(matches!(ops[3], IlOp::Return { .. }));
     }
+
+    #[test]
+    fn const_load_div_and_pow_refused() {
+        for op in [Instruction::DIV, Instruction::Pow, Instruction::SHL] {
+            let mut ops = vec![
+                IlOp::Const { imm: 2, loc: loc() },
+                IlOp::Load {
+                    slot: 0,
+                    loc: loc(),
+                },
+                IlOp::Bin { op, loc: loc() },
+            ];
+            let before = ops.clone();
+            canonicalize_operand_order(&mut ops);
+            assert!(ops == before, "must refuse non-commutative {:?}", op);
+        }
+    }
+
+    #[test]
+    fn const_pool_load_add_refused() {
+        let mut ops = vec![
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        canonicalize_operand_order(&mut ops);
+        assert!(ops == before, "ConstPool must not rewrite like Const");
+    }
+
+    #[test]
+    fn const_load_addf_refused() {
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADDF,
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        canonicalize_operand_order(&mut ops);
+        assert!(ops == before, "float ops must not reassoc via canon");
+    }
+
+    #[test]
+    fn load_high_load_low_bitand_keeps_op() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                loc: loc(),
+            },
+        ];
+        canonicalize_operand_order(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Load { slot: 5, .. }));
+        assert!(matches!(
+            ops[2],
+            IlOp::Bin {
+                op: Instruction::BITAND,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn optimize_with_canon_disabled_keeps_const_load() {
+        use super::super::opt::{OptimizeOptions, optimize};
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        optimize(
+            &mut ops,
+            &OptimizeOptions {
+                canon: false,
+                algebraic: false,
+                ..OptimizeOptions::default()
+            },
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(ops[0], IlOp::Const { imm: 1, .. }),
+            "canon:false must leave Const;Load;ADD"
+        );
+    }
+
+    #[test]
+    fn successive_windows_both_canonicalize() {
+        let mut ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc: loc(),
+            },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MUL,
+                loc: loc(),
+            },
+        ];
+        canonicalize_operand_order(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 0, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 1, .. }));
+        assert!(matches!(ops[3], IlOp::Load { slot: 1, .. }));
+        assert!(matches!(ops[4], IlOp::Const { imm: 2, .. }));
+    }
 }
