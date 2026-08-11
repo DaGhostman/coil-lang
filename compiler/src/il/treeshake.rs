@@ -405,4 +405,180 @@ mod tests {
         assert!(functions.contains_key("foo"));
         assert!(functions.contains_key("main"));
     }
+
+    #[test]
+    fn preserves_static_init_gap_between_thunk_and_main() {
+        let mut buf = CodeBuf::new();
+        let mut functions = HashMap::new();
+        let mut labels = HashMap::new();
+
+        // Packed builtin thunk; without preserve_emit_start its span would
+        // swallow the interstitial setup ops through main's entry PC.
+        let dead_l = buf.bind_fresh_entry();
+        functions.insert("Hash__unit__hash".into(), 0usize);
+        labels.insert("Hash__unit__hash".into(), dead_l);
+        buf.push_const(0);
+        buf.push_return();
+
+        let preserve = buf.len();
+        buf.push_const(11); // static-init / setup payload that must survive
+        buf.push_pop();
+
+        let main_pc = buf.len();
+        let main_l = buf.bind_fresh_entry();
+        functions.insert("main".into(), main_pc);
+        labels.insert("main".into(), main_l);
+        buf.push_const(1);
+        buf.push_return();
+
+        let mut locals = HashMap::new();
+        let mut tests = Vec::new();
+        let roots = vec!["main".into()];
+        let (dropped, _) = prune_unused_functions(
+            &mut buf,
+            TreeshakeInput {
+                functions: &mut functions,
+                fn_entry_labels: &mut labels,
+                fn_debug_locals: &mut locals,
+                test_cases: &mut tests,
+                root_names: &roots,
+                include_tests: false,
+                preserve_emit_start: Some(preserve),
+            },
+        );
+        assert_eq!(dropped, 1);
+        assert!(!functions.contains_key("Hash__unit__hash"));
+        assert!(functions.contains_key("main"));
+        assert!(
+            buf.ops()
+                .iter()
+                .any(|op| matches!(op, IlOp::Const { imm: 11, .. })),
+            "static-init CONST must survive thunk shake"
+        );
+        assert_eq!(functions["main"], 2); // setup CONST;POP then main
+    }
+
+    #[test]
+    fn include_tests_roots_test_case_fn() {
+        let mut buf = CodeBuf::new();
+        let mut functions = HashMap::new();
+        let mut labels = HashMap::new();
+
+        let test_pc = buf.len();
+        let test_l = buf.bind_fresh_entry();
+        functions.insert("test_add".into(), test_pc);
+        labels.insert("test_add".into(), test_l);
+        buf.push_const(3);
+        buf.push_return();
+
+        let main_pc = buf.len();
+        let main_l = buf.bind_fresh_entry();
+        functions.insert("main".into(), main_pc);
+        labels.insert("main".into(), main_l);
+        buf.push_const(1);
+        buf.push_return();
+
+        let mut locals = HashMap::new();
+        let mut tests = vec![("add".into(), test_pc as u32)];
+        let roots = vec!["main".into()];
+        let (dropped, _) = prune_unused_functions(
+            &mut buf,
+            TreeshakeInput {
+                functions: &mut functions,
+                fn_entry_labels: &mut labels,
+                fn_debug_locals: &mut locals,
+                test_cases: &mut tests,
+                root_names: &roots,
+                include_tests: true,
+                preserve_emit_start: None,
+            },
+        );
+        assert_eq!(dropped, 0);
+        assert!(functions.contains_key("test_add"));
+        assert_eq!(tests.len(), 1);
+    }
+
+    #[test]
+    fn absolute_call_byte_keeps_callee() {
+        let mut buf = CodeBuf::new();
+        let mut functions = HashMap::new();
+        let mut labels = HashMap::new();
+
+        let foo_pc = buf.len();
+        let foo_l = buf.bind_fresh_entry();
+        functions.insert("foo".into(), foo_pc);
+        labels.insert("foo".into(), foo_l);
+        buf.push_const(7);
+        buf.push_return();
+
+        let main_pc = buf.len();
+        let main_l = buf.bind_fresh_entry();
+        functions.insert("main".into(), main_pc);
+        labels.insert("main".into(), main_l);
+        buf.push_op(IlOp::byte(
+            common::Byte::new(Instruction::CALL).with_call_packed(0, foo_pc as u32),
+        ));
+        buf.push_pop();
+        buf.push_return();
+
+        let mut locals = HashMap::new();
+        let mut tests = Vec::new();
+        let roots = vec!["main".into()];
+        let (dropped, _) = prune_unused_functions(
+            &mut buf,
+            TreeshakeInput {
+                functions: &mut functions,
+                fn_entry_labels: &mut labels,
+                fn_debug_locals: &mut locals,
+                test_cases: &mut tests,
+                root_names: &roots,
+                include_tests: false,
+                preserve_emit_start: None,
+            },
+        );
+        assert_eq!(dropped, 0);
+        assert!(functions.contains_key("foo"));
+        assert!(functions.contains_key("main"));
+    }
+
+    #[test]
+    fn retains_live_func_entry_sp_metadata() {
+        let mut buf = CodeBuf::new();
+        let mut functions = HashMap::new();
+        let mut labels = HashMap::new();
+
+        let dead_l = buf.bind_fresh_entry();
+        functions.insert("dead".into(), 0usize);
+        labels.insert("dead".into(), dead_l);
+        buf.push_const(0);
+        buf.push_return();
+        buf.record_func_with_sp("dead", Some(dead_l), 0, 2, 1);
+
+        let main_pc = buf.len();
+        let main_l = buf.bind_fresh_entry();
+        functions.insert("main".into(), main_pc);
+        labels.insert("main".into(), main_l);
+        buf.push_const(1);
+        buf.push_return();
+        buf.record_func_with_sp("main", Some(main_l), main_pc, main_pc + 2, 4);
+
+        let mut locals = HashMap::new();
+        let mut tests = Vec::new();
+        let roots = vec!["main".into()];
+        let _ = prune_unused_functions(
+            &mut buf,
+            TreeshakeInput {
+                functions: &mut functions,
+                fn_entry_labels: &mut labels,
+                fn_debug_locals: &mut locals,
+                test_cases: &mut tests,
+                root_names: &roots,
+                include_tests: false,
+                preserve_emit_start: None,
+            },
+        );
+        assert_eq!(buf.funcs().len(), 1);
+        assert_eq!(buf.funcs()[0].name, "main");
+        assert_eq!(buf.funcs()[0].entry_sp, 4);
+    }
 }
