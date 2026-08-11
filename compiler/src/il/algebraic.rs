@@ -1196,6 +1196,7 @@ mod tests {
                 mem_fwd: false,
                 copy_prop: false,
                 slot_promote: false,
+                canon: false,
                 algebraic: true,
                 licm: false,
                 loop_bounds: false,

@@ -173,6 +173,13 @@ fn is_le_cmp(op: &IlOp) -> bool {
             .is_some_and(|b| *b.bytecode() == Instruction::LE)
 }
 
+fn is_gt_cmp(op: &IlOp) -> bool {
+    matches!(op, IlOp::Bin { op: Instruction::GT, .. })
+        || op
+            .as_encode_byte()
+            .is_some_and(|b| *b.bytecode() == Instruction::GT)
+}
+
 fn slots_stored_in_loop(ops: &[IlOp], lp: &NaturalLoop) -> HashSet<u32> {
     let mut s = HashSet::new();
     for i in lp.header..=lp.latch {
@@ -478,10 +485,12 @@ fn resolve_index_slot(ops: &[IlOp], lp: &NaturalLoop, cmp_slot: u32) -> Option<u
 }
 
 fn header_lt_bound(ops: &[IlOp], lp: &NaturalLoop) -> Option<(u32, u32)> {
-    // Scan from body_start for the first LE + JMPF exit pattern.
+    // Scan from body_start for the first `i < bound` + JMPF exit pattern.
+    // Operand-order canon may rewrite `Load i; Load b; LE` into
+    // `Load b; Load i; GT` when slot(i) > slot(b) — both mean `i < b`.
     let mut i = lp.body_start();
     while i + 1 < lp.latch {
-        // LOAD a; LOAD b; LE; JMPF
+        // LOAD a; LOAD b; LE; JMPF  →  (index=a, bound=b)
         if let IlOp::Load { slot: a, .. } = &ops[i]
             && i + 3 < lp.latch
             && let IlOp::Load { slot: b, .. } = &ops[i + 1]
@@ -496,7 +505,22 @@ fn header_lt_bound(ops: &[IlOp], lp: &NaturalLoop) -> Option<(u32, u32)> {
         {
             return Some((*a, *b));
         }
-        // BinSlotSlot LE a,b ; JMPF
+        // LOAD a; LOAD b; GT; JMPF  →  a > b iff b < a  →  (index=b, bound=a)
+        if let IlOp::Load { slot: a, .. } = &ops[i]
+            && i + 3 < lp.latch
+            && let IlOp::Load { slot: b, .. } = &ops[i + 1]
+            && is_gt_cmp(&ops[i + 2])
+            && matches!(
+                &ops[i + 3],
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    ..
+                }
+            )
+        {
+            return Some((*b, *a));
+        }
+        // BinSlotSlot LE a,b ; JMPF  →  (index=a, bound=b)
         if let IlOp::BinSlotSlot { op, a, b, .. } = &ops[i]
             && *op == Instruction::LE as u8
             && i + 1 < lp.latch
@@ -509,6 +533,20 @@ fn header_lt_bound(ops: &[IlOp], lp: &NaturalLoop) -> Option<(u32, u32)> {
             )
         {
             return Some((*a as u32, *b as u32));
+        }
+        // BinSlotSlot GT a,b ; JMPF  →  (index=b, bound=a)
+        if let IlOp::BinSlotSlot { op, a, b, .. } = &ops[i]
+            && *op == Instruction::GT as u8
+            && i + 1 < lp.latch
+            && matches!(
+                &ops[i + 1],
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    ..
+                }
+            )
+        {
+            return Some((*b as u32, *a as u32));
         }
         i += 1;
     }

@@ -6,6 +6,7 @@
 
 mod algebraic;
 mod bounds;
+mod canon;
 mod builder;
 mod codebuf;
 mod emit_buf;

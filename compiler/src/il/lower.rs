@@ -2054,4 +2054,34 @@ mod tests {
             "stack value from pred Load must still return"
         );
     }
+
+    /// Operand-order canon turns `Const; Load; ADD` into `Load; Const; ADD`,
+    /// which fuse-select encodes as `BinSlotImm`.
+    #[test]
+    fn canon_feeds_bin_slot_imm_fuse_shape() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Load { slot: 0, loc },
+            IlOp::Bin {
+                op: Instruction::ADD,
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = lower(&ops, &mut pool);
+        assert!(
+            lowered
+                .bytecode
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::BinSlotImm)),
+            "expected BinSlotImm after canon+fuse; got {:?}",
+            lowered
+                .bytecode
+                .iter()
+                .map(|b| *b.bytecode())
+                .collect::<Vec<_>>()
+        );
+    }
 }

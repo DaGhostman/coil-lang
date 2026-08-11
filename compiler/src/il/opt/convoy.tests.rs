@@ -1640,6 +1640,7 @@
                 mem_fwd: true,
                 copy_prop: true,
                 slot_promote: false,
+                canon: false,
                 algebraic: false,
                 licm: false,
                 loop_bounds: false,
