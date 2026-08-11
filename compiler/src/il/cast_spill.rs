@@ -465,4 +465,104 @@ mod tests {
         spill_cast_before_float_chain(&mut ops);
         assert!(ops == before);
     }
+
+    #[test]
+    fn refuses_when_jump_interrupts_float_window() {
+        use super::super::op::{IlJumpKind, Label};
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: loc(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 1,
+                loc: loc(),
+            },
+        ];
+        let before = ops.clone();
+        spill_cast_before_float_chain(&mut ops);
+        assert!(ops == before);
+    }
+
+    #[test]
+    fn optimize_with_cast_spill_disabled_keeps_inline_cast() {
+        use super::super::opt::{OptimizeOptions, optimize};
+        let mut ops = vec![
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Load {
+                slot: 13,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::DIVF,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        optimize(
+            &mut ops,
+            &OptimizeOptions {
+                cast_spill: false,
+                canon: false,
+                algebraic: false,
+                licm: false,
+                loop_bounds: false,
+                slot_promote: false,
+                mem_fwd: false,
+                copy_prop: false,
+                ..OptimizeOptions::default()
+            },
+            &mut Vec::new(),
+        );
+        // Cast stays between Load and float arith — no Cast;STORE spill prefix.
+        assert!(is_cast_int_to_float(&ops[2]));
+        assert!(!matches!(ops[3], IlOp::StorePop { .. }));
+    }
 }
