@@ -1594,6 +1594,43 @@
     }
 
     #[test]
+    fn dead_store_drops_assignment_only_local_across_jump() {
+        // Slot 5 is stored then control jumps, but nothing ever loads it.
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 42,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store_at(&mut ops, 6);
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "assignment-only slot should die across Jump"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Const { imm: 42, .. })),
+            "dead producer should be removed with the store"
+        );
+    }
+
+    #[test]
     fn dead_store_keeps_store_when_bin_slot_imm_uses_slot() {
         let mut ops = vec![
             IlOp::Const {
