@@ -416,7 +416,7 @@ fn try_fuse_float_chain_const_under(
         return None;
     }
     let const_idx = u8::try_from(const_pool_index(&slot_as_byte(&window[0])?)?).ok()?;
-    let (stage0_len, op0, lhs0, rhs0) = parse_float_stage0(&window[1..])?;
+    let (stage0_len, op0, lhs0, lhs0_const, rhs0, rhs0_const) = parse_float_stage0(&window[1..])?;
     let mut i = 1 + stage0_len;
     let op1 = float_arith_byte(&slot_as_byte(window.get(i)?)?)?;
     i += 1;
@@ -445,9 +445,9 @@ fn try_fuse_float_chain_const_under(
     let descriptor = pack_float_chain_ext(
         op0,
         lhs0,
-        false,
+        lhs0_const,
         rhs0,
-        false,
+        rhs0_const,
         op1,
         const_idx,
         true,
@@ -466,7 +466,7 @@ fn try_fuse_float_chain_standard(
     window: &[Slot],
     pool: &mut Vec<u64>,
 ) -> Option<(Slot, usize)> {
-    let (stage0_len, op0, lhs0, rhs0) = parse_float_stage0(window)?;
+    let (stage0_len, op0, lhs0, lhs0_const, rhs0, rhs0_const) = parse_float_stage0(window)?;
     let mut i = stage0_len;
     let (i1, op1, rhs1, rhs1_const, stage1_left) = parse_float_continuation(&window[i..])?;
     i += i1;
@@ -490,14 +490,20 @@ fn try_fuse_float_chain_standard(
     let dest = store_slot_u8(&slot_as_byte(window.get(i)?)?)?;
     i += 1;
 
-    let use_ext = has_stage2 || rhs1_const || rhs2_const || stage1_left || stage2_left;
+    let use_ext = has_stage2
+        || lhs0_const
+        || rhs0_const
+        || rhs1_const
+        || rhs2_const
+        || stage1_left
+        || stage2_left;
     let descriptor = if use_ext {
         pack_float_chain_ext(
             op0,
             lhs0,
-            false,
+            lhs0_const,
             rhs0,
-            false,
+            rhs0_const,
             op1,
             rhs1,
             rhs1_const,
@@ -582,8 +588,11 @@ fn pack_float_chain_ext(
     d
 }
 
-/// Stage0: `LOAD a; LOAD b; float-op` or float `BinSlotSlot`.
-fn parse_float_stage0(window: &[Slot]) -> Option<(usize, u8, u8, u8)> {
+/// Stage0: `LOAD a; LOAD b; float-op`, float `BinSlotSlot`, or mixed
+/// `LOAD`/`CONST` pool float + float-op (sets `lhs0_const` / `rhs0_const`).
+///
+/// `LOAD; CONST; op` is the post-`cast_spill` shape for mandelbrot `cr`/`ci`.
+fn parse_float_stage0(window: &[Slot]) -> Option<(usize, u8, u8, bool, u8, bool)> {
     if window.is_empty() {
         return None;
     }
@@ -593,17 +602,31 @@ fn parse_float_stage0(window: &[Slot]) -> Option<(usize, u8, u8, u8)> {
         if !is_float_arith_op(Instruction::from(op)) {
             return None;
         }
-        return Some((1, op, a as u8, b as u8));
+        return Some((1, op, a as u8, false, b as u8, false));
     }
     if window.len() < 3 {
         return None;
     }
     let b1 = slot_as_byte(&window[1])?;
     let b2 = slot_as_byte(&window[2])?;
-    let lhs = load_slot(&b0)?;
-    let rhs = load_slot(&b1)?;
     let op = float_arith_byte(&b2)?;
-    Some((3, op, lhs, rhs))
+    if let (Some(lhs), Some(rhs)) = (load_slot(&b0), load_slot(&b1)) {
+        return Some((3, op, lhs, false, rhs, false));
+    }
+    if let (Some(lhs), Some(idx)) = (load_slot(&b0), const_pool_u8(&b1)) {
+        return Some((3, op, lhs, false, idx, true));
+    }
+    if let (Some(idx), Some(rhs)) = (const_pool_u8(&b0), load_slot(&b1)) {
+        return Some((3, op, idx, true, rhs, false));
+    }
+    if let (Some(l), Some(r)) = (const_pool_u8(&b0), const_pool_u8(&b1)) {
+        return Some((3, op, l, true, r, true));
+    }
+    None
+}
+
+fn const_pool_u8(byte: &Byte) -> Option<u8> {
+    u8::try_from(const_pool_index(byte)?).ok()
 }
 
 /// Continuation: `LOAD slot; float-op` or `CONST pool; float-op`.
@@ -1676,6 +1699,87 @@ mod tests {
         assert_eq!((descriptor >> 24) as u8, Instruction::ADDF as u8);
         assert_eq!((descriptor >> 32) as u8, 3);
         assert_eq!(descriptor & (1u64 << 63), 0);
+    }
+
+    /// Stage0 `LOAD; CONST; op` (post-cast_spill shape) fuses with continuations.
+    #[test]
+    fn lower_fuses_load_const_stage0_float_chain_store() {
+        let mut pool = vec![
+            Value::from(2.0_f64).raw() as u64,
+            Value::from(1.5_f64).raw() as u64,
+        ];
+        let mut il = IlBuilder::new();
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(10));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_pool(0));
+        il.push_byte(Byte::new(Instruction::MULF));
+        il.push_byte(Byte::new(Instruction::LOAD).with_operand_u32(11));
+        il.push_byte(Byte::new(Instruction::DIVF));
+        il.push_byte(Byte::new(Instruction::CONST).with_const_pool(1));
+        il.push_byte(Byte::new(Instruction::SUBF));
+        il.push_byte(Byte::new(Instruction::STORE).with_operand_u32(5));
+
+        let lowered = lower(il.ops(), &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1);
+        assert!(matches!(
+            *lowered.bytecode[0].bytecode(),
+            Instruction::FloatChainStore
+        ));
+        let descriptor = pool[lowered.bytecode[0].operand_u32() as usize & 0xFFFF];
+        assert_ne!(descriptor & (1u64 << 63), 0);
+        assert_eq!(descriptor as u8, Instruction::MULF as u8);
+        assert_eq!((descriptor >> 8) as u8, 10);
+        assert_eq!((descriptor >> 16) as u8, 0); // pool idx 0
+        assert_ne!(descriptor & (1 << 56), 0); // rhs0 const
+        assert_eq!((descriptor >> 24) as u8, Instruction::DIVF as u8);
+        assert_eq!((descriptor >> 32) as u8, 11);
+        assert_ne!(descriptor & (1 << 62), 0); // has stage2
+        assert_eq!((descriptor >> 40) as u8, Instruction::SUBF as u8);
+        assert_eq!((descriptor >> 48) as u8, 1);
+        assert_ne!(descriptor & (1 << 58), 0); // rhs2 const
+    }
+
+    /// `CastIntToFloat` spill + const-under stage0 → `FloatChainStore` (mandelbrot `cr`).
+    #[test]
+    fn cast_spill_feeds_float_chain_store() {
+        let loc = DebugLoc::unknown();
+        let mut pool = vec![
+            Value::from(2.0_f64).raw() as u64,
+            Value::from(1.5_f64).raw() as u64,
+        ];
+        // CONST 2; LOAD x; Cast; LOAD size_f; DIVF; MULF; CONST 1.5; SUBF; STORE
+        let ops = vec![
+            IlOp::ConstPool { idx: 0, loc },
+            IlOp::Load { slot: 4, loc },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Load { slot: 13, loc },
+            IlOp::Bin {
+                op: Instruction::DIVF,
+                loc,
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc,
+            },
+            IlOp::ConstPool { idx: 1, loc },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc,
+            },
+            IlOp::StorePop { slot: 5, loc },
+        ];
+        let lowered = lower(&ops, &mut pool);
+        assert!(
+            lowered
+                .bytecode
+                .iter()
+                .any(|b| matches!(*b.bytecode(), Instruction::FloatChainStore)),
+            "cast_spill + const-under should fuse; got {:?}",
+            lowered
+                .bytecode
+                .iter()
+                .map(|b| *b.bytecode())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

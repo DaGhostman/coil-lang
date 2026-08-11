@@ -54,9 +54,9 @@ impl Default for OptimizeOptions {
             copy_prop: true,
             slot_promote: true,
             canon: true,
-            // Off by default: measured mandelbrot regression (LOAD/STORE up,
-            // residual float_arith up) without raising FloatChainStore count.
-            cast_spill: false,
+            // On: spill casts that block float chains; fuse stage0 accepts
+            // LOAD;CONST so the spilled shape becomes FloatChainStore.
+            cast_spill: true,
             algebraic: true,
             licm: true,
             loop_bounds: true,

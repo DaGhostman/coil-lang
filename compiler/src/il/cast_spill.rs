@@ -1,47 +1,43 @@
-//! Spill `CastIntToFloat` that sits inside a float-arith→STORE window.
+//! Spill `CastIntToFloat` that blocks a float-arith→STORE fuse window.
 //!
-//! Fuse-select's `FloatChainStore` stage0 only accepts `LOAD; LOAD; op` or
-//! float `BinSlotSlot`. An intervening cast blocks that shape (mandelbrot `cr`).
-//! Rewriting `CastIntToFloat` → `CastIntToFloat; STORE t; LOAD t` leaves a
-//! float `LOAD` for the chain while preserving stack height (net-zero).
+//! Mandelbrot `cr`/`ci` are typically `CONST; LOAD; Cast; …; STORE`. Inline
+//! `Cast; STORE t; LOAD t` leaves glue between the const and stage0. This peep
+//! hoists every `LOAD; Cast` in the window into a prefix of
+//! `LOAD; Cast; STORE t`, then rewrites the body to `LOAD t` so fuse can match
+//! const-under / `LOAD; CONST` `FloatChainStore` shapes.
 
 use common::Instruction;
 
 use super::op::IlOp;
-use super::sp;
 
-/// Spill casts that block a float-arith→STORE window. Fail-closed on Unknown SP.
+/// Hoist casts that block a float-arith→STORE window into float temps.
 pub fn spill_cast_before_float_chain(ops: &mut Vec<IlOp>) {
     if ops.len() < 4 {
         return;
     }
     let mut max_slot = max_slot_used(ops);
     loop {
-        let info = sp::analyze(ops);
         let mut spilled = false;
         let mut i = 0;
         while i < ops.len() {
-            if !is_cast_int_to_float(&ops[i]) || !info.sp_before(i).is_known() {
+            if !is_cast_int_to_float(&ops[i]) {
                 i += 1;
                 continue;
             }
-            if i + 2 < ops.len()
-                && let (IlOp::StorePop { slot: s1, .. }, IlOp::Load { slot: s2, .. }) =
-                    (&ops[i + 1], &ops[i + 2])
-                && s1 == s2
-            {
+            // Already a hoisted `Cast; STORE t` (LOAD of t appears in the body).
+            if i + 1 < ops.len() && matches!(ops[i + 1], IlOp::StorePop { .. }) {
                 i += 1;
                 continue;
             }
-            if !cast_blocks_float_chain(ops, i) {
+            let Some(store_i) = float_chain_store_after(ops, i) else {
                 i += 1;
                 continue;
-            }
-            let loc = ops[i].loc();
-            max_slot = max_slot.saturating_add(1);
-            let temp = max_slot;
-            ops.insert(i + 1, IlOp::StorePop { slot: temp, loc });
-            ops.insert(i + 2, IlOp::Load { slot: temp, loc });
+            };
+            let Some(new_max) = hoist_casts_in_window(ops, i, store_i, max_slot) else {
+                i += 1;
+                continue;
+            };
+            max_slot = new_max;
             spilled = true;
             break;
         }
@@ -49,6 +45,115 @@ pub fn spill_cast_before_float_chain(ops: &mut Vec<IlOp>) {
             break;
         }
     }
+}
+
+/// Rewrite `[window_start, store_i]` so all `LOAD; Cast` sites become a prefix
+/// of spills and `LOAD temp` in the float body. `cast_i` is any cast in the window.
+fn hoist_casts_in_window(
+    ops: &mut Vec<IlOp>,
+    cast_i: usize,
+    store_i: usize,
+    mut max_slot: u32,
+) -> Option<u32> {
+    let mut start = cast_i;
+    if cast_i > 0 && is_load(&ops[cast_i - 1]) {
+        start = cast_i - 1;
+    }
+    // Pull left through leading CONST/ConstPool so they stay with the float body
+    // after the cast prefix (const-under stage0).
+    while start > 0 && is_float_const(&ops[start - 1]) {
+        start -= 1;
+    }
+
+    let mut sites: Vec<(usize, usize)> = Vec::new();
+    let mut j = start;
+    while j < store_i {
+        if is_cast_int_to_float(&ops[j]) {
+            if j > start && is_load(&ops[j - 1]) {
+                if j + 1 < ops.len() && matches!(ops[j + 1], IlOp::StorePop { .. }) {
+                    j += 1;
+                    continue;
+                }
+                sites.push((j - 1, j));
+                j += 1;
+                continue;
+            }
+            return None;
+        }
+        j += 1;
+    }
+    if sites.is_empty() {
+        return None;
+    }
+
+    let mut temps: Vec<u32> = Vec::with_capacity(sites.len());
+    for _ in &sites {
+        max_slot = max_slot.saturating_add(1);
+        temps.push(max_slot);
+    }
+
+    let mut prefix: Vec<IlOp> = Vec::new();
+    for (k, &(load_i, cast_idx)) in sites.iter().enumerate() {
+        let loc = ops[cast_idx].loc();
+        let slot = match &ops[load_i] {
+            IlOp::Load { slot, .. } => *slot,
+            _ => return None,
+        };
+        prefix.push(IlOp::Load { slot, loc });
+        prefix.push(ops[cast_idx].clone());
+        prefix.push(IlOp::StorePop {
+            slot: temps[k],
+            loc,
+        });
+    }
+
+    let site_load: std::collections::HashSet<usize> = sites.iter().map(|(l, _)| *l).collect();
+    let site_cast: std::collections::HashMap<usize, u32> = sites
+        .iter()
+        .enumerate()
+        .map(|(k, &(_, c))| (c, temps[k]))
+        .collect();
+
+    let mut body: Vec<IlOp> = Vec::new();
+    for idx in start..store_i {
+        if site_load.contains(&idx) {
+            continue;
+        }
+        if let Some(&temp) = site_cast.get(&idx) {
+            body.push(IlOp::Load {
+                slot: temp,
+                loc: ops[idx].loc(),
+            });
+            continue;
+        }
+        body.push(ops[idx].clone());
+    }
+    body.push(ops[store_i].clone());
+
+    let mut rebuilt = prefix;
+    rebuilt.extend(body);
+    ops.splice(start..=store_i, rebuilt);
+    Some(max_slot)
+}
+
+fn float_chain_store_after(ops: &[IlOp], cast_i: usize) -> Option<usize> {
+    let window_end = ops.len().min(cast_i + 1 + 12);
+    let mut float_ops = 0usize;
+    for (idx, op) in ops.iter().enumerate().take(window_end).skip(cast_i + 1) {
+        if is_float_arith(op) {
+            float_ops += 1;
+        }
+        if is_store(op) {
+            return (float_ops >= 2).then_some(idx);
+        }
+        if matches!(
+            op,
+            IlOp::Jump { .. } | IlOp::Label(_) | IlOp::Return { .. } | IlOp::Halt { .. }
+        ) {
+            return None;
+        }
+    }
+    None
 }
 
 fn max_slot_used(ops: &[IlOp]) -> u32 {
@@ -72,6 +177,20 @@ fn max_slot_used(ops: &[IlOp]) -> u32 {
         }
     }
     m
+}
+
+fn is_load(op: &IlOp) -> bool {
+    matches!(op, IlOp::Load { .. })
+        || op
+            .as_encode_byte()
+            .is_some_and(|b| *b.bytecode() == Instruction::LOAD && b.load_store_count() == 1)
+}
+
+fn is_float_const(op: &IlOp) -> bool {
+    matches!(op, IlOp::ConstPool { .. })
+        || op.as_encode_byte().is_some_and(|b| {
+            *b.bytecode() == Instruction::CONST && b.operand_u32() & common::Byte::POOL_FLAG != 0
+        })
 }
 
 fn is_cast_int_to_float(op: &IlOp) -> bool {
@@ -124,30 +243,6 @@ fn is_store(op: &IlOp) -> bool {
         })
 }
 
-fn cast_blocks_float_chain(ops: &[IlOp], cast_i: usize) -> bool {
-    let window_end = ops.len().min(cast_i + 1 + 10);
-    let mut float_ops = 0usize;
-    let mut saw_store = false;
-    for op in ops.iter().take(window_end).skip(cast_i + 1) {
-        if is_float_arith(op) {
-            float_ops += 1;
-        }
-        if is_store(op) {
-            saw_store = true;
-            break;
-        }
-        if is_cast_int_to_float(op)
-            || matches!(
-                op,
-                IlOp::Jump { .. } | IlOp::Label(_) | IlOp::Return { .. } | IlOp::Halt { .. }
-            )
-        {
-            break;
-        }
-    }
-    saw_store && float_ops >= 2
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,9 +282,170 @@ mod tests {
             },
         ];
         spill_cast_before_float_chain(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 0, .. }));
         assert!(is_cast_int_to_float(&ops[1]));
-        assert!(matches!(ops[2], IlOp::StorePop { slot: 2, .. }));
-        assert!(matches!(ops[3], IlOp::Load { slot: 2, .. }));
+        assert!(matches!(ops[2], IlOp::StorePop { .. }));
+        assert!(matches!(ops[3], IlOp::Load { .. }));
+    }
+
+    #[test]
+    fn spills_both_casts_in_two_cast_float_window() {
+        let mut ops = vec![
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 1,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Bin {
+                op: Instruction::DIVF,
+                loc: loc(),
+            },
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 2,
+                loc: loc(),
+            },
+        ];
+        spill_cast_before_float_chain(&mut ops);
+        let cast_store_pairs = ops
+            .windows(2)
+            .filter(|w| {
+                is_cast_int_to_float(&w[0]) && matches!(w[1], IlOp::StorePop { .. })
+            })
+            .count();
+        assert_eq!(cast_store_pairs, 2);
+        let body_start = ops
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| {
+                is_cast_int_to_float(&w[0]) && matches!(w[1], IlOp::StorePop { .. })
+            })
+            .map(|(i, _)| i + 2)
+            .max()
+            .unwrap();
+        assert!(ops[body_start..ops.len() - 1]
+            .iter()
+            .all(|o| !is_cast_int_to_float(o)));
+    }
+
+    #[test]
+    fn spills_const_under_mid_chain_cast() {
+        let mut ops = vec![
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Load {
+                slot: 13,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::DIVF,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+        ];
+        spill_cast_before_float_chain(&mut ops);
+        assert!(matches!(ops[0], IlOp::Load { slot: 4, .. }));
+        assert!(is_cast_int_to_float(&ops[1]));
+        assert!(matches!(ops[2], IlOp::StorePop { .. }));
+        assert!(matches!(ops[3], IlOp::ConstPool { idx: 0, .. }));
+        assert!(matches!(ops[4], IlOp::Load { .. }));
+        assert!(ops[4..ops.len() - 1]
+            .iter()
+            .all(|o| !is_cast_int_to_float(o)));
+    }
+
+    /// Exact pre-opt mandelbrot `cr` IL (two casts, const-under).
+    #[test]
+    fn spills_mandelbrot_cr_two_cast_const_under() {
+        let mut ops = vec![
+            IlOp::ConstPool {
+                idx: 0,
+                loc: loc(),
+            },
+            IlOp::Load {
+                slot: 4,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Load {
+                slot: 0,
+                loc: loc(),
+            },
+            IlOp::byte(Byte::new(Instruction::CastIntToFloat)),
+            IlOp::Bin {
+                op: Instruction::DIVF,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::MULF,
+                loc: loc(),
+            },
+            IlOp::ConstPool {
+                idx: 1,
+                loc: loc(),
+            },
+            IlOp::Bin {
+                op: Instruction::SUBF,
+                loc: loc(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+        ];
+        spill_cast_before_float_chain(&mut ops);
+        assert_eq!(
+            ops
+                .windows(2)
+                .filter(|w| {
+                    is_cast_int_to_float(&w[0]) && matches!(w[1], IlOp::StorePop { .. })
+                })
+                .count(),
+            2
+        );
+        assert!(matches!(ops[6], IlOp::ConstPool { idx: 0, .. }));
     }
 
     #[test]
