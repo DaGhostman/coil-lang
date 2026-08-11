@@ -37,6 +37,24 @@ Coil used about 5.9–7.4 MB RSS, Lua 2.7–3.2 MB, and Node 89–91 MB. These a
 directional comparisons rather than language rankings: the ports have
 different runtime startup, library, and allocation behavior.
 
+After the AOT harvest below (slot promotion, the counted-loop length proofs, the
+aggregate builders, the argument-spill peel), a 3-second re-run of the same
+matrix reads:
+
+| Benchmark | Coil | Lua | Node |
+|-----------|------|-----|------|
+| `mandelbrot` | 31.1 ms | 14.8 ms | 15.7 ms |
+| `tak` | 1.92 ms | 1.33 ms | 12.9 ms |
+| `nsieve` | 2.52 ms | 0.98 ms | 14.0 ms |
+| `binary_trees` | 12.3 ms | 9.18 ms | 15.1 ms |
+
+Every checksum matched and no benchmark regressed. The matrix runs each
+cross-language row twice — once with `COIL_AUTO_PAR=0` and once with auto-par at
+its default — and the two rows are now indistinguishable within noise on all
+four, because under the work score of item 6 none of these loads has a fork site
+that scores above the threshold. That is the intended reading: fair sequential
+benchmarks pay nothing for auto-par being compiled in.
+
 The repository also has Coil-only `numeric`, `operators_loop`, and `match_sum`
 benchmarks. Their current results are retained by the matrix, but they have no
 Lua or Node ports.
@@ -83,43 +101,106 @@ Still deferred for a later SSA-like slice: overlapping live-range φ shuffles
 retention across calls. Measure residual candidates against the ledger before
 appending opcodes.
 
+A second, narrower slice sits at the end of the pipeline: `slot_promote_at`
+uses `tell` as the whole safety proof — a `STORE t` reached with the cursor at
+`t + 1` writes TOS back to its own address, and the reload run in front of a
+`TailCall` re-pushes values the call already finds on the stack. Together those
+take argument-materialization temps out of the frame (`tak`: 4 LOAD words / 9
+slots / 3 STOREs → 3 LOAD words / 6 slots / 0 STOREs). Joins are free: `tell`
+poisons a point whose predecessors disagree, so `Known` is agreement.
+
+What neither slice does yet (see
+[limitations](limitations.md#il-optimizations-low) for the full refusal table):
+
+- **Real slot liveness.** Without it, promotion must leave every slot with a
+  visible def, which rules out `CALL` operand runs (the callee frame base is
+  `tell - arity`) and any store whose slot is still read.
+- **Cursor normalization at loop back edges.** `mandelbrot`'s inner loop enters
+  with cursor 10 and re-enters with 13, so its header is `Unknown` and none of
+  its 3 body stores are provably redundant. A `Seek` on the back edge would make
+  the header `Known` and turn all three into self-stores — one dispatch per
+  iteration against three stores, worth measuring.
+- **Scheduling.** `mandelbrot`'s `tr → zr` copy cannot coalesce because `zr` is
+  read between the def and the copy; sinking the def past that read is the fix.
+- **`Bin(slot, TOS)` operand shapes.** `mandelbrot`'s remaining `LOAD 5` / `LOAD
+  6` feed an `ADDF` whose other operand is on the stack, which no existing fused
+  form accepts. That is an opcode question, not a promotion one.
+
 ### 2. Loop range and bounds analysis
 
-Priority: high.
+Priority: high (first slice landed).
 
-`Index` and `StoreIndex` currently perform runtime object lookup and signed
-bounds checks in `machine/src/vm.rs`. Add a proof-only IL analysis for common
-counted loops:
+`Index` and `StoreIndex` still perform runtime object lookup and signed bounds
+checks in `machine/src/vm.rs`, and that has not changed: the landed slice is
+proof-only and touches no VM handler.
 
-- identify an invariant array/tuple value and a loop index;
-- prove `0 <= i < len` for the loop body;
-- hoist invariant length/object-kind information where the alias rules allow;
-- keep the checked instruction on unknown or mutation-sensitive paths.
+`il::bounds.rs` proves **length invariance** per natural loop instead of
+per-index bounds. `StoreIndex` overwrites an element in place, so a loop that
+writes `a[i]` still has an invariant `len(a)`; `ArrayPush`, a call, a host
+native or any unmodelled op refuses the region. Two invariant materializations
+move to the preheader on that proof — the `LOAD a; ArrayLen; STORE t` triple
+codegen leaves in the header of `while i < len(a)`, and the `CONST imm; STORE t`
+pair that materializes a constant addressing operand in `a[i] = 0`. `nsieve`'s
+sieve loop went from 8 words per iteration to 6 (545.6k → 469.9k dispatches);
+`examples/perf/vec_scan.hy`, the `while i < len(v)` scan/fill shape, from 6.58M
+to 5.01M. Safety comes from the cursor: the preheader store floors it at
+`t + 1`, and every in-loop stack height staying at or above the header's proves
+no in-loop push can reach `t`.
 
-Start with diagnostics and bytecode-shape counters before adding a new opcode.
-This targets `nsieve` and avoids benchmark-specific assumptions.
+What is still open (full refusal table in
+[limitations](limitations.md#il-optimizations-low)):
+
+- **`0 <= i < len` is not proven at all.** Induction-variable detection was
+  deliberately left out because nothing consumes the fact: without an unchecked
+  addressing form the proof cannot change a single emitted word. Pair it with
+  that opcode decision, not with this pass.
+- **Loops that call a helper on `b[i]`.** Most stdlib `while i < len(b)` loops do,
+  and a call could `push` to the array through another reference. Wiring the
+  existing purity/effect summaries into the barrier test is the widest available
+  win here.
+- **The `find_object_by_addr` lookup per `Index`.** Hoisting the resolved array
+  means keeping a heap address live across a GC point in IL; the length hoists
+  precisely because it is an `int`.
 
 ### 3. Allocation and GC fast paths
 
-Priority: high for heap-heavy code.
+Priority: high for heap-heavy code (aggregate builders inspected; the win is in
+the allocator, not the copy).
 
-`MakeTuple` and `MakeArray` currently collect stack values into a temporary
-`Vec<Value>` before allocating the managed object. Profile
-`machine/src/memory/heap.rs` and the aggregate handlers before changing
-ownership:
+The premise this item started from was wrong. `MakeTuple` / `MakeArray` do not
+collect into a *temporary* `Vec<Value>`: `ObjTuple`/`ObjArray` take that vector
+by value (`elements`), as `ObjEnum` does with `payload`, so the collect already
+*is* the object's payload. There was no second allocation to remove, and the one
+that remains cannot be dropped by a fixed-arity fast path — only by giving
+aggregates inline element storage, which is a layout change.
 
-- add allocation and collection counters under `vm_profile`;
-- measure temporary vector allocations and live bytes;
-- evaluate direct payload construction or a small fixed-arity fast path;
-- keep GC rooting correct before and after allocation;
-- consider region/batch allocation only after object lifetime boundaries are
-  explicit.
+What the pass over the handlers did change is the shape of the copy. Elements
+already sit contiguously in declaration order on the operand stack, so
+`Stack::top_window` lets a builder borrow its whole argument window:
+`MakeTuple`/`MakeArray` take it in one `to_vec` memcpy instead of a pop loop
+plus a reverse, and `MakeEnum` classifies the window top-first through an
+exact-size collect. Same opcodes, layouts, element order and GC rooting. This
+measured **performance-neutral** on `binary_trees` — within `poop` noise — which
+is the useful result: aggregate construction is not copy-bound.
 
-This is the most direct path for `binary_trees`; it is independent of a JIT.
+The remaining cost per object is in `Heap::alloc` itself, and it is structural:
+
+- one `Box::new(GcData::new(..))` per object, on top of the payload vector;
+- one `addr_index` insert per allocation and one removal per sweep, because
+  `find_object_by_addr` is a hash lookup keyed by raw address;
+- `alloc_bytes` versus `gc_next_threshold` as the only collection trigger.
+
+So the next slice is the allocator and the address index — arena/region backing
+for `GcData`, or a cheaper object-identity scheme than a per-address hash — not
+the aggregate opcodes. Keep GC rooting correct before and after allocation, and
+consider batch allocation only once object lifetime boundaries are explicit.
+This remains the most direct path for `binary_trees` and is independent of a
+JIT.
 
 ### 4. Direct-call and closure specialization
 
-Priority: medium. **Status: partial (B4 landed).**
+Priority: medium. **Status: partial (B4 landed).** The caller-side predicate
+peel landed; the recursive peel was measured and refused.
 
 Landed for monomorphic known targets:
 
@@ -131,6 +212,16 @@ Landed for monomorphic known targets:
 
 Still use `CallIndirect` for PolyFn locals, dictionary `Index` targets, and
 generic shared-body evidence that is not static at the call site.
+
+`tak`'s frame traffic has been measured and is **not** worth peeling: a frame
+costs about two dispatches here, so the caller-side predicate peel loses to it
+(+73.5% VM instructions on `tak`). The peel now only removes argument spills,
+which is a win wherever it already fired: arguments that compile to a single
+pure byte are re-materialized in the guard instead of spilled, worth 4.28G →
+3.29G instructions and 189 ms → 152 ms on a peel-heavy loop. See
+`limitations.md` for the cost model and the full refusal table. Further `tak`
+work has to remove the call itself — real inlining of a recursive body, or a
+frame representation cheaper than `CALL` — not move the guard.
 
 ### 5. Dispatch and trace fusion
 
@@ -165,6 +256,29 @@ existing opcode; fits append-only opcode ABI.
 | Slot move (non-latch) | numeric `slot_move` ≤3 (format/host temp) | low | **defer** | Not loop-carried; format-path noise, not a fuse candidate. |
 
 **Already harvested without opcodes:** see §1 (tak LOAD/STORE/`slot_move`; fuse windows held). Next opcode work should re-run `perf_metrics` inventories and only promote a ledger row that still passes the `add` gates.
+
+### 6. Auto-par fork-site profitability
+
+Priority: landed; the cutoff itself is unchanged.
+
+IPA specialization used to gate on `max(args)`, which reads argument
+*magnitude* as work. `par_profit.rs` now scores a fork site by counting the
+guard-pruned fork-site nodes a concrete arg vector reaches, then converts that
+count back into fib-equivalent units, so `COIL_PAR_THRESHOLD` keeps its
+calibration and the default stayed at **20**. What changed is only the verdict
+on shapes that are not fib-shaped: `tak(24, 22, 20)` (53 real calls) now
+refuses, and the fair `tak(18, 12, 6)` bench load lands exactly on the cutoff
+and stays sequential. Every imprecision resolves downwards, so unknown
+structure can only refuse. Full formula and verdict table in
+[auto-par](auto-par.md#the-work-score).
+
+The work cost is compile-time and bounded by construction: the walk is memoized
+per `(fn, arg vector)`, capped at 256 levels deep and 2^14 memo entries, and
+saturates one node past the cutoff — counting further cannot change the answer.
+The specialization closure on top of it is breadth-first and capped at 64
+clones per function. Nothing runs at execution time, and below-threshold or
+dynamic arg sites stay on the sequential original, so there is no hot-path
+threshold tax.
 
 ## Cranelift JIT feasibility
 

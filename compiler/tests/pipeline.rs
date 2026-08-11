@@ -3995,6 +3995,175 @@ fn main() {
     assert_eq!(output, "17711");
 }
 
+/// An `EnumCtor` combine forks both arms into a constructor, not a binop.
+#[test]
+fn auto_par_enum_ctor_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Tree {
+    Leaf,
+    Node(Tree, Tree),
+}
+#[max_depth(64)]
+fn build(int n) -> Tree {
+    if n <= 1 {
+        return Tree::Leaf();
+    }
+    return Tree::Node(build(n - 1), build(n - 2));
+}
+#[max_depth(64)]
+fn leaves(Tree t) -> int {
+    return match t {
+        Tree::Leaf => 1,
+        Tree::Node(l, r) => leaves(l) + leaves(r),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", leaves(build(21)))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par enum-ctor should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_build_21").is_some(),
+        "expected an enum-ctor specialization for build(21)"
+    );
+    // `build` shares fib's recurrence, so the leaf count is fib(22).
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "17711");
+}
+
+/// Impurity nested only inside an enum constructor payload must still block
+/// `__coil_par_*` clones (purity used to skip Construct payloads entirely).
+#[test]
+fn impure_call_in_enum_ctor_payload_skips_par_specialization() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Cell {
+    Val(int),
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn rec(int n) -> int {
+    if n <= 1 { return n; }
+    let _ = Cell::Val(shout(n));
+    return rec(n - 1) + rec(n - 2);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", rec(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let _ = pipeline
+        .compile_src(src)
+        .expect("impure ctor-payload rec should still compile");
+    assert!(
+        pipeline.function_offset("__coil_par_rec_22").is_none(),
+        "impurity inside a Construct payload must block auto-par"
+    );
+}
+
+/// Subtraction combines are first-class IPA arms, not only Add/Mul.
+#[test]
+fn auto_par_sub_binop_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn diff(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return diff(n - 1) - diff(n - 2);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", diff(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par sub binop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_diff_22").is_some(),
+        "expected a Sub specialization for diff(22)"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    // d(n)=d(n-1)-d(n-2) with d(0)=0,d(1)=1 is period-6; d(22)=-1.
+    assert_eq!(output, "-1");
+}
+
+/// A `SelfCall` combine rebuilds the outer N-ary call from the joined arms.
+///
+/// `tak(24, 22, 20)` looks big but is 53 calls — the work score refuses it, so
+/// this uses a load whose tree is genuinely deep.
+#[test]
+fn auto_par_self_call_combine_emits_spec() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(4096)]
+fn tak(int a, int b, int c) -> int {
+    if b >= a {
+        return c;
+    }
+    return tak(tak(a - 1, b, c), tak(b - 1, c, a), tak(c - 1, a, b));
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", tak(21, 12, 6))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par self-call should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_tak_21_12_6").is_some(),
+        "expected a multi-arg specialization for tak(21, 12, 6)"
+    );
+    assert!(
+        pipeline
+            .function_offset("__coil_par_tak_24_22_20")
+            .is_none(),
+        "a narrow x - y gap must not specialize"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "12");
+}
+
+/// The fair `tak(18, 12, 6)` benchmark load scores just under the threshold, so
+/// it must keep running on the sequential original.
+#[test]
+fn auto_par_fair_tak_load_stays_sequential() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(4096)]
+fn tak(int a, int b, int c) -> int {
+    if b >= a {
+        return c;
+    }
+    return tak(tak(a - 1, b, c), tak(b - 1, c, a), tak(c - 1, a, b));
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", tak(18, 12, 6))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("fair tak should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_tak_18_12_6").is_none(),
+        "fair tak(18, 12, 6) must not get a parallel specialization"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "7");
+}
+
 /// Impure recursive binops must not grow `__coil_par_*` clones.
 #[test]
 fn impure_recursive_binop_skips_par_specialization() {
@@ -4021,6 +4190,360 @@ fn main() {
         pipeline.function_offset("__coil_par_rec_22").is_none(),
         "impure recursion must not emit auto-par specializations"
     );
+}
+
+/// Independent pure helper arms (not self-recursion) still fork-join — the
+/// arms' own subtrees are what the work score charges the site for.
+#[test]
+fn auto_par_pure_helper_arms_emits_spec_and_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn pair_fib(int n) -> int {
+    if n <= 0 { return 0; }
+    return fib(n) + fib(n - 1);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", pair_fib(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("helper-arm IPA should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_pair_fib_22").is_some(),
+        "expected a specialization for pair_fib(22)"
+    );
+    // fib(22) + fib(21)
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "28657");
+}
+
+/// Trivial helper arms are cheaper than a spawn, so they stay sequential.
+#[test]
+fn auto_par_trivial_helper_arms_stay_sequential() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int n) -> int {
+    return n * n;
+}
+fn pair_sq(int n) -> int {
+    if n <= 0 { return 0; }
+    return sq(n) + sq(n - 1);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", pair_sq(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("trivial helper arms should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_pair_sq_22").is_none(),
+        "two multiplies must not buy a spawn"
+    );
+    // 22² + 21²
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "925");
+}
+
+/// Fork inside an irrefutable match arm keeps evaluable path guards.
+#[test]
+fn auto_par_irrefutable_match_arm_emits_spec() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(64)]
+fn fibm(int n) -> int {
+    if n <= 1 { return n; }
+    return match n {
+        _ => fibm(n - 1) + fibm(n - 2),
+    };
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", fibm(22))));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("match-arm IPA should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_fibm_22").is_some(),
+        "irrefutable match arm must still specialize"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "17711");
+}
+
+/// A pure counted loop above the threshold must split into chunk workers and
+/// still fold to the sequential sum.
+#[test]
+fn auto_par_loop_sum_splits_and_matches_sequential() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 100 {
+        acc = acc + sq(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i,%i", acc, i)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("auto-par loop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_some(),
+        "expected a chunk worker for the counted loop"
+    );
+    // Sum of i*i for i in 0..100, and the induction variable past its range.
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "328350,100");
+}
+
+/// The reduction operator drives the fold: a `*` chunk pair recombines by `MUL`
+/// with `1` seeding every chunk but the first. A non-identity seed would square
+/// the accumulator's initial value.
+#[test]
+fn auto_par_loop_product_uses_multiplicative_identity() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let prod = 3;
+    let i = 0;
+    while i <= 29 {
+        prod = prod * 2;
+        i += 1;
+    }
+    write(stdout(), to_bytes(format("%i", prod)));
+}
+"#,
+    );
+    // 3 * 2^30; seeding both chunks with 3 would give 9 * 2^30.
+    assert_eq!(output, "3221225472");
+}
+
+/// Loop-private temps are re-emitted into the worker's frame.
+#[test]
+fn auto_par_loop_body_temps_still_correct() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn twice(int i) -> int {
+    return i + i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 64 {
+        let d = twice(i);
+        let w = d + 1;
+        acc = acc + w;
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // sum(2i + 1) for i in 0..64 = 63*64 + 64.
+    assert_eq!(output, "4096");
+}
+
+/// The accumulator lives in a nested block of a non-`main` function, so the
+/// chunk fold has to resolve its slot through the block-binding overlay.
+#[test]
+fn auto_par_loop_inside_nested_block_of_function() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn step(int i) -> int {
+    return i + 3;
+}
+fn total(int gate) -> int {
+    if gate > 0 {
+        let acc = 5;
+        let i = 0;
+        while i < 50 {
+            acc = acc + step(i);
+            i = i + 1;
+        }
+        return acc;
+    }
+    return 0;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", total(1))));
+}
+"#,
+    );
+    // 5 + sum(i + 3) for i in 0..50 = 5 + 1225 + 150.
+    assert_eq!(output, "1380");
+}
+
+/// Two independent loops in one function each get their own chunk worker.
+#[test]
+fn auto_par_two_loops_emit_distinct_workers() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let a = 0;
+    let i = 0;
+    while i < 30 {
+        a = a + sq(i);
+        i = i + 1;
+    }
+    let b = 0;
+    let j = 0;
+    while j < 40 {
+        b = b + j;
+        j = j + 1;
+    }
+    write(stdout(), to_bytes(format("%i,%i", a, b)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("two auto-par loops should compile");
+    for name in ["__coil_par_loop_1", "__coil_par_loop_2"] {
+        assert!(
+            pipeline.function_offset(name).is_some(),
+            "expected a chunk worker named {name}"
+        );
+    }
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "8555,780");
+}
+
+/// A recursive-pure callee inside a chunk worker nests loop IPA under recursive
+/// IPA — the join has to help-steal rather than deadlock on a busy pool.
+#[test]
+fn auto_par_loop_over_recursive_pure_callee() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn fib(int n) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 25 {
+        acc = acc + fib(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // sum(fib(i)) for i in 0..25 = fib(26) - 1.
+    assert_eq!(output, "121392");
+}
+
+/// Bit operators and nested arithmetic in the reduction operand survive the
+/// re-emit into the worker's frame.
+#[test]
+fn auto_par_loop_bit_arithmetic_operand() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 40 {
+        acc = acc + ((i << 1) & 7);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#,
+    );
+    // (2i mod 8) cycles 0,2,4,6 ten times.
+    assert_eq!(output, "120");
+}
+
+/// A body write the analysis cannot prove independent keeps the loop sequential.
+#[test]
+fn impure_loop_body_skips_par_worker() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 100 {
+        write(stdout(), to_bytes(format("%i", i)));
+        acc = acc + i;
+        i = i + 1;
+    }
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let _ = pipeline
+        .compile_src(src)
+        .expect("impure loop should still compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_none(),
+        "an observable body must not be chunked"
+    );
+}
+
+/// A trip count at or below the threshold must stay on the sequential loop.
+#[test]
+fn below_threshold_loop_skips_par_worker() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn sq(int i) -> int {
+    return i * i;
+}
+fn main() {
+    let acc = 0;
+    let i = 0;
+    while i < 20 {
+        acc = acc + sq(i);
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", acc)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("short loop should compile");
+    assert!(
+        pipeline.function_offset("__coil_par_loop_1").is_none(),
+        "a 20-trip loop cannot pay for a spawn"
+    );
+    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "2470");
 }
 
 /// Nested CALL + `let x = f(); if x == k` must not hang: mem_fwd must not

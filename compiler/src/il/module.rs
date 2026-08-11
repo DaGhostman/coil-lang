@@ -126,6 +126,10 @@ impl IlModule {
         // Guard inversion removes JMPs that whole-buffer multi_op matches on.
         let run_invert = per.invert_guard_branch;
         per.invert_guard_branch = false;
+        // GVN reasons about slot defs; promotion removes the store that makes one
+        // visible, so it runs after GVN has seen the body.
+        let run_slot_promote_tell = per.slot_promote_tell;
+        per.slot_promote_tell = false;
 
         if self.funcs.is_empty() {
             let mut ops = self.to_flat();
@@ -136,6 +140,9 @@ impl IlModule {
         for body in &mut self.funcs {
             opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32, pool);
             super::gvn::cfg_gvn(&mut body.ops);
+            if run_slot_promote_tell {
+                opt::slot_promote_at(&mut body.ops, body.meta.entry_sp);
+            }
         }
 
         let mut flat = self.to_flat();
@@ -377,6 +384,7 @@ mod tests {
                 bin_join_convoy: false,
                 multi_op_join_convoy: true,
                 invert_guard_branch: false,
+                slot_promote_tell: false,
             },
             &mut Vec::new(),
         );

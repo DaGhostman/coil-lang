@@ -112,6 +112,16 @@ impl<T: Default + Copy> Stack<T> {
         &self.stack[..self.cursor]
     }
 
+    /// The top `n` operands in push order (bottom-to-top). Lets aggregate
+    /// builders read a whole argument window instead of popping one at a time;
+    /// callers must clamp `n` to [`Self::tell`].
+    #[inline]
+    pub fn top_window(&self, n: usize) -> &[T] {
+        promise!(n <= self.cursor);
+        // SAFETY: `n <= cursor <= capacity`, and every slot is pre-filled.
+        unsafe { self.stack.get_unchecked(self.cursor - n..self.cursor) }
+    }
+
     /// Full backing storage (including slots below the cursor).
     /// Used by the GC to root live locals that share the operand stack.
     #[inline]
@@ -167,6 +177,20 @@ mod tests {
         assert_eq!(s.tell(), 2);
         assert_eq!(s.pop(), 7);
         assert_eq!(s.pop(), 7);
+    }
+
+    #[test]
+    fn top_window_borrows_the_top_operands_in_push_order() {
+        let mut s = Stack::<i64>::with_capacity(8);
+        s.push(10);
+        s.push(20);
+        s.push(30);
+
+        assert_eq!(s.top_window(2), &[20, 30]);
+        assert_eq!(s.top_window(3), &[10, 20, 30]);
+        assert!(s.top_window(0).is_empty());
+        // Borrowing must not consume: aggregate builders seek afterwards.
+        assert_eq!(s.tell(), 3);
     }
 
     #[test]

@@ -7,6 +7,19 @@ type FinalizeIlOut = Option<crate::dissect::IlSnapshot>;
 #[cfg(not(any(test, feature = "dissect")))]
 type FinalizeIlOut = ();
 
+/// Lowered form of a [`ParCombine`](crate::typechecking::ParCombine): the single
+/// instruction that folds the joined arm results once they are all on the stack.
+enum ParCombinePlan {
+    /// `ADD` / `SUB` / `MUL` over exactly two arms.
+    Bin(Instruction),
+    /// Rebuild a call with the arm results as arguments.
+    Call { entry: u32, arity: u32 },
+    /// `(arm0, …)` tuple pack.
+    Tuple { arity: u32 },
+    /// `MakeEnum` with the variant's tag and payload arity.
+    Enum { tag: u16, arity: u16 },
+}
+
 impl Compiler {
     /// Expose inferred state to language tooling after a module is checked.
     pub fn checker(&self) -> &crate::typechecking::Checker {
@@ -1288,6 +1301,15 @@ impl Compiler {
         false
     }
 
+    /// Shared refusals for both peel flavours: rest params, coroutines and
+    /// un-monomorphized generics change the callee ABI the peel replicates.
+    fn peel_callee_shape_ok(&self, fqn: &str, lookup: &str) -> bool {
+        !self.checker.fn_has_rest(lookup)
+            && !self.coroutine_fns.contains(fqn)
+            && !self.coroutine_fns.contains(lookup)
+            && !self.checker.is_generic_fn(lookup)
+    }
+
     fn try_predicate_peel_call_into(
         &mut self,
         fqn: &str,
@@ -1299,14 +1321,15 @@ impl Compiler {
         let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
             return false;
         };
+        // A self-recursive site reads its own in-progress body, which works, but
+        // the peel loses to the frame it avoids: on `tak` it grows the body from
+        // 13 to 28 words and re-emits the guard unfused at every non-base call.
+        // See `docs/internals/limitations.md` for the measurement.
+        if provisional {
+            return false;
+        }
         let lookup = strip_overload_key(fqn).to_string();
-        if self.checker.fn_has_rest(&lookup) {
-            return false;
-        }
-        if self.coroutine_fns.contains(fqn) || self.coroutine_fns.contains(&lookup) {
-            return false;
-        }
-        if self.checker.is_generic_fn(&lookup) {
+        if !self.peel_callee_shape_ok(fqn, &lookup) {
             return false;
         }
         let ops = self.bytecode.code_slice_raw_ops(start, end);
@@ -1420,6 +1443,338 @@ impl Compiler {
         self.bytecode.push_store_pop(result);
         bytecode.push_load(result);
         true
+    }
+
+    /// Max guard ops the re-materializing peel will rewrite at a call site.
+    const PEEL_REMAT_MAX_COND_OPS: usize = 8;
+
+    /// Caller-side predicate peel that reads leaf arguments in place instead of
+    /// spilling them into frame slots.
+    ///
+    /// [`Self::try_predicate_peel_call_into`] stores every argument to a temp so
+    /// the peeled guard and the `CALL` can both read it. An argument that compiles
+    /// to a single pure byte needs no such slot: the byte is simply emitted in both
+    /// places, which drops one `STORE` and one spill `LOAD` per argument and leaves
+    /// the guard reading the caller's own locals. Anything longer keeps its temp,
+    /// because the guard copy and the call copy would each pay for it.
+    fn try_emit_remat_peel_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+    ) -> bool {
+        let prefix = Self::emit_attempt_prefix(bytecode);
+        let rollback = self.bytecode.len();
+        if self.try_remat_peel_call_into(fqn, args, bytecode, target_offset) {
+            return true;
+        }
+        // Every refusal is decided before the first emit; this only guards
+        // against a future check slipping in after one.
+        self.bytecode.truncate(rollback);
+        Self::restore_emit_attempt(bytecode, prefix);
+        false
+    }
+
+    fn try_remat_peel_call_into(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+        target_offset: u32,
+    ) -> bool {
+        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+            return false;
+        };
+        let lookup = strip_overload_key(fqn).to_string();
+        if !self.peel_callee_shape_ok(fqn, &lookup) {
+            return false;
+        }
+        // Partial application lowers to `MakeFn`, not `CALL`, so only a
+        // saturated fixed-arity call site may be peeled.
+        let Some(&(fixed_arity, has_rest)) = self.fn_arities.get(fqn) else {
+            return false;
+        };
+        if has_rest {
+            return false;
+        }
+        let ops = self.bytecode.code_slice_raw_ops(start, end);
+        let Some(peel) = Self::match_predicate_peel_shape(&ops, true) else {
+            return false;
+        };
+        drop(ops);
+        if peel.cond.len() > Self::PEEL_REMAT_MAX_COND_OPS {
+            return false;
+        }
+        let flat = self.flatten_call_args_for_emit(args.unwrap_or(&[]));
+        if flat.len() != fixed_arity as usize || flat.len() < peel.arity_hint {
+            return false;
+        }
+        let Some(plan) = Self::peel_remat_plan(&peel, flat.len()) else {
+            return false;
+        };
+        // The guard reads some arguments ahead of the others and the false path
+        // evaluates them again, so no argument may carry a side effect.
+        if !flat.iter().all(Self::peel_arg_is_pure) {
+            return false;
+        }
+        // Guard-referenced arguments must be re-materializable up front: once an
+        // argument has been compiled a refusal can no longer be rolled back.
+        if !plan
+            .guard_args
+            .iter()
+            .all(|&i| Self::peel_arg_is_remat_shape(&flat[i]))
+        {
+            return false;
+        }
+
+        // The caller prefix belongs ahead of everything below, so flush it before
+        // compiling arguments — a spilled argument must not slip in front of it.
+        self.bytecode.append(bytecode);
+        let mut argv: Vec<Vec<Byte>> = Vec::with_capacity(flat.len());
+        for arg in &flat {
+            let value = match arg.1.as_ref() {
+                Expression::NamedArg(_, v) => v,
+                _ => arg,
+            };
+            let before = self.bytecode.len();
+            let mut bytes = self.do_compile(value);
+            let split = self.bytecode.len() != before;
+            if split || !Self::peel_remat_bytes_ok(&bytes) {
+                self.bytecode.append(&mut bytes);
+                let tmp = self.alloc_temp_slot();
+                self.bytecode.push_store_pop(tmp);
+                argv.push(vec![
+                    Byte::new(Instruction::LOAD).with_load_store_slot(tmp),
+                ]);
+            } else {
+                argv.push(bytes);
+            }
+        }
+
+        let do_call = self.bytecode.fresh_label();
+        let join = self.bytecode.fresh_label();
+        for op in &plan.cond {
+            self.emit_peel_remat_op(op, &argv);
+        }
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::JumpIfFalse,
+            target: do_call,
+            loc: DebugLoc::unknown(),
+        });
+        self.emit_peel_remat_op(&plan.then_value, &argv);
+        self.bytecode.push_op(IlOp::Jump {
+            kind: IlJumpKind::Unconditional,
+            target: join,
+            loc: DebugLoc::unknown(),
+        });
+        self.bytecode.bind_label(do_call);
+        for bytes in &argv {
+            for byte in bytes {
+                self.bytecode.push(*byte);
+            }
+        }
+        self.bytecode.push(
+            Byte::new(Instruction::CALL).with_call_packed(argv.len() as u32, target_offset),
+        );
+        self.bytecode.bind_label(join);
+        let result = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(result);
+        bytecode.push_load(result);
+        true
+    }
+
+    /// Rewrite a matched guard against caller arguments, or `None` when any op is
+    /// outside the re-materializable set or reads past `argc`.
+    fn peel_remat_plan(peel: &PredicatePeel, argc: usize) -> Option<PeelRematPlan> {
+        let mut guard_args = Vec::new();
+        let mut cond = Vec::with_capacity(peel.cond.len());
+        for op in &peel.cond {
+            cond.push(Self::peel_remat_op(op, argc, &mut guard_args)?);
+        }
+        let then_value = Self::peel_remat_op(&peel.then_value, argc, &mut guard_args)?;
+        Some(PeelRematPlan {
+            cond,
+            then_value,
+            guard_args,
+        })
+    }
+
+    fn peel_remat_op(op: &IlOp, argc: usize, args: &mut Vec<usize>) -> Option<PeelRematOp> {
+        fn note(idx: usize, argc: usize, args: &mut Vec<usize>) -> Option<usize> {
+            if idx >= argc {
+                return None;
+            }
+            if !args.contains(&idx) {
+                args.push(idx);
+            }
+            Some(idx)
+        }
+        match op {
+            IlOp::Load { slot, .. } => Some(PeelRematOp::Arg(note(*slot as usize, argc, args)?)),
+            IlOp::BinSlotImm {
+                op: bin, slot, imm, ..
+            } => Some(PeelRematOp::ArgImm {
+                op: Instruction::from(*bin),
+                idx: note(*slot as usize, argc, args)?,
+                imm: *imm as i32,
+            }),
+            IlOp::BinSlotSlot { op: bin, a, b, .. } => Some(PeelRematOp::ArgArg {
+                op: Instruction::from(*bin),
+                a: note(*a as usize, argc, args)?,
+                b: note(*b as usize, argc, args)?,
+            }),
+            IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::String { .. } | IlOp::Dup { .. } => {
+                Some(PeelRematOp::Copy(op.clone()))
+            }
+            IlOp::Bin { op: bin, .. } if Self::peel_remat_bin_ok(*bin) => {
+                Some(PeelRematOp::Copy(op.clone()))
+            }
+            other => {
+                let byte = other.as_plain_byte()?;
+                match *byte.bytecode() {
+                    Instruction::LOAD => Some(PeelRematOp::Arg(note(
+                        byte.load_store_single_slot()? as usize,
+                        argc,
+                        args,
+                    )?)),
+                    Instruction::BinSlotImm => {
+                        let (bin, slot, imm) = byte.bin_slot_imm_parts();
+                        Some(PeelRematOp::ArgImm {
+                            op: Instruction::from(bin),
+                            idx: note(slot, argc, args)?,
+                            imm: imm as i32,
+                        })
+                    }
+                    Instruction::BinSlotSlot => {
+                        let (bin, a, b) = byte.bin_slot_slot_parts();
+                        Some(PeelRematOp::ArgArg {
+                            op: Instruction::from(bin),
+                            a: note(a, argc, args)?,
+                            b: note(b, argc, args)?,
+                        })
+                    }
+                    Instruction::CONST | Instruction::DUPLICATE => {
+                        Some(PeelRematOp::Copy(other.clone()))
+                    }
+                    bin if Self::peel_remat_bin_ok(bin) => Some(PeelRematOp::Copy(other.clone())),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Integer binary ops the peel may duplicate: total, trap-free on the operand
+    /// shapes a guard produces, and unfusable back to a plain opcode.
+    fn peel_remat_bin_ok(op: Instruction) -> bool {
+        matches!(
+            op,
+            Instruction::ADD
+                | Instruction::SUB
+                | Instruction::MUL
+                | Instruction::BITAND
+                | Instruction::BITOR
+                | Instruction::XOR
+                | Instruction::EQ
+                | Instruction::NEQ
+                | Instruction::LE
+                | Instruction::LEQ
+                | Instruction::GT
+                | Instruction::GEQ
+                | Instruction::AND
+                | Instruction::OR
+        )
+    }
+
+    fn emit_peel_remat_op(&mut self, op: &PeelRematOp, argv: &[Vec<Byte>]) {
+        let push_arg = |buf: &mut CodeBuf, idx: usize| {
+            for byte in &argv[idx] {
+                buf.push(*byte);
+            }
+        };
+        match op {
+            PeelRematOp::Arg(idx) => push_arg(&mut self.bytecode, *idx),
+            PeelRematOp::ArgImm { op: bin, idx, imm } => {
+                push_arg(&mut self.bytecode, *idx);
+                self.bytecode.push_const(*imm);
+                self.bytecode.push(Byte::new(*bin));
+            }
+            PeelRematOp::ArgArg { op: bin, a, b } => {
+                push_arg(&mut self.bytecode, *a);
+                push_arg(&mut self.bytecode, *b);
+                self.bytecode.push(Byte::new(*bin));
+            }
+            PeelRematOp::Copy(il) => match il.as_plain_byte() {
+                Some(byte) => self.bytecode.push(byte),
+                None => self.bytecode.push_op(il.clone()),
+            },
+        }
+    }
+
+    /// Compiled argument that re-materializes for free: exactly one byte pushing
+    /// one value out of the caller's frame, independent of the operand stack. That
+    /// last part rules out `DUPLICATE`, whose two copies would read two tops.
+    fn peel_remat_bytes_ok(bytes: &[Byte]) -> bool {
+        let [byte] = bytes else {
+            return false;
+        };
+        match *byte.bytecode() {
+            // A packed multi-slot LOAD pushes more than one value.
+            Instruction::LOAD => byte.load_store_single_slot().is_some(),
+            Instruction::CONST | Instruction::BinSlotImm | Instruction::BinSlotSlot => true,
+            _ => false,
+        }
+    }
+
+    /// Side-effect-free argument expression: safe to evaluate out of order with
+    /// its siblings and, when the compiled bytes allow, more than once.
+    fn peel_arg_is_pure(expr: &Output<'_>) -> bool {
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v)
+            | Expression::Group(v)
+            | Expression::Expr(v)
+            | Expression::Negate(v)
+            | Expression::Not(v)
+            | Expression::LogicalNot(v)
+            | Expression::Positive(v)
+            | Expression::Cast(v, _) => Self::peel_arg_is_pure(v),
+            Expression::Identifier(_)
+            | Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::Bool(_) => true,
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Shl(a, b)
+            | Expression::Shr(a, b)
+            | Expression::Xor(a, b)
+            | Expression::And(a, b)
+            | Expression::BitAnd(a, b)
+            | Expression::Or(a, b)
+            | Expression::BitOr(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Geq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Gt(a, b) => Self::peel_arg_is_pure(a) && Self::peel_arg_is_pure(b),
+            _ => false,
+        }
+    }
+
+    /// Argument that can plausibly compile to one byte: a name or an int/bool
+    /// literal. Checked before anything is emitted, since a refusal after an
+    /// argument has been compiled can no longer be rolled back.
+    fn peel_arg_is_remat_shape(expr: &Output<'_>) -> bool {
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
+                Self::peel_arg_is_remat_shape(v)
+            }
+            Expression::Identifier(_) | Expression::Integer(_) | Expression::Bool(_) => true,
+            _ => false,
+        }
     }
 
     /// Opening shape: `cond…; JumpIfFalse; (Const|Load) [; Return]; Label? …`
@@ -1564,18 +1919,12 @@ impl Compiler {
                     }
                 }
             };
-            let mut end = then_start;
-            if then_start + 1 < ops.len() && ops[then_start + 1].is_plain_return() {
-                end = then_start + 1;
-            } else if then_start + 1 < ops.len() && matches!(ops[then_start + 1], IlOp::Label(_)) {
-                // fall through after value (unusual); still ok if JMPF target
-            } else if then_start + 1 < ops.len()
-                && !matches!(ops[then_start + 1], IlOp::Label(_))
-                && !ops[then_start + 1].is_plain_return()
-            {
+            // The value must be returned, not fall through: a peel replaces the
+            // callee's `return`, so a bare value would be the wrong result.
+            if then_start + 1 >= ops.len() || !ops[then_start + 1].is_plain_return() {
                 return None;
             }
-            (v, end)
+            (v, then_start + 1)
         };
         // After then-arm there should be more body (otherwise tiny-inline diamond
         // would have taken it). Require at least one emitting op past the peel
@@ -4717,7 +5066,7 @@ impl Compiler {
         short.rsplit("::").next().unwrap_or(short)
     }
 
-    /// Rewrite `f(N)` to `CALL __coil_par_f_N` when a specialization exists.
+    /// Rewrite `f(N, …)` to `CALL __coil_par_f_N_…` when a specialization exists.
     fn try_emit_par_specialized_call(
         &mut self,
         fname: &str,
@@ -4727,17 +5076,21 @@ impl Compiler {
         let Some(args) = args else {
             return false;
         };
-        if args.len() != 1 {
+        if args.is_empty() {
             return false;
         }
-        let Expression::Integer(n) = unwrap_expr_output(&args[0]).1.as_ref() else {
-            return false;
-        };
-        if !crate::typechecking::const_arg_worth_parallel(*n) {
-            return false;
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            let Expression::Integer(n) = unwrap_expr_output(arg).1.as_ref() else {
+                return false;
+            };
+            vals.push(*n);
         }
         let key = Self::par_shape_key(fname);
-        let spec = crate::typechecking::par_specialization_name(key, *n);
+        if !crate::typechecking::args_worth_parallel(&self.par_shapes, key, &vals) {
+            return false;
+        }
+        let spec = crate::typechecking::par_specialization_name(key, &vals);
         let Some(&offset) = self.functions.get(&spec) else {
             return false;
         };
@@ -4745,16 +5098,12 @@ impl Compiler {
         true
     }
 
-    /// Emit nullary `__coil_par_{fn}_{n}` clones that always fork (no RT threshold).
-    fn emit_par_specializations_for(
-        &mut self,
-        bare_name: &str,
-        table_key: &str,
-    ) {
-        let Some(shape) = self.par_shapes.get(bare_name).cloned() else {
+    /// Emit nullary `__coil_par_{fn}_{args…}` clones that always fork (no RT threshold).
+    fn emit_par_specializations_for(&mut self, bare_name: &str, table_key: &str) {
+        let Some(site) = self.par_shapes.get(bare_name).cloned() else {
             return;
         };
-        let Some(ns) = self.par_spec_args.get(bare_name).cloned() else {
+        let Some(arg_sets) = self.par_spec_args.get(bare_name).cloned() else {
             return;
         };
         let Some(&orig_offset) = self
@@ -4764,44 +5113,66 @@ impl Compiler {
         else {
             return;
         };
-        let thresh = crate::typechecking::par_int_threshold();
-        let bin_op = match shape.op {
-            crate::typechecking::ParBinOp::Add => Instruction::ADD,
-            crate::typechecking::ParBinOp::Sub => Instruction::SUB,
-            crate::typechecking::ParBinOp::Mul => Instruction::MUL,
-        };
-        for n in ns {
-            self.emit_one_par_specialization(
-                &shape,
-                n,
-                orig_offset as u32,
-                thresh,
-                bin_op,
-            );
+        // Cheapest arg vectors first: arms shrink their args, so a parent then
+        // finds its children's nullary clones already bound.
+        let mut ordered: Vec<Vec<i64>> = arg_sets.into_iter().collect();
+        ordered.sort_by(|a, b| (a.iter().sum::<i64>(), a).cmp(&(b.iter().sum::<i64>(), b)));
+        for args in &ordered {
+            self.emit_one_par_specialization(&site, args, orig_offset as u32);
         }
     }
 
+    /// Emit one always-fork nullary clone of `site.fn_name` at `parent_args`.
+    ///
+    /// Arm 0 is spawned onto the work-stealing reactor, the remaining arms run
+    /// inline, and the joined results are folded by the site's combine. A
+    /// failed spawn falls back to evaluating every arm sequentially.
     fn emit_one_par_specialization(
         &mut self,
-        shape: &crate::typechecking::RecParShape,
-        n: i64,
+        site: &crate::typechecking::ParForkSite,
+        parent_args: &[i64],
         orig_offset: u32,
-        thresh: i64,
-        bin_op: Instruction,
     ) {
-        let spec_name = crate::typechecking::par_specialization_name(&shape.fn_name, n);
+        if site.arms.len() < 2 || parent_args.len() != site.param_count {
+            return;
+        }
+        let spec_name = crate::typechecking::par_specialization_name(&site.fn_name, parent_args);
         if self.functions.contains_key(&spec_name) {
             return;
         }
+        let Some(child_args) = site
+            .arms
+            .iter()
+            .map(|arm| crate::typechecking::eval_arm_args(arm, parent_args))
+            .collect::<Option<Vec<Vec<i64>>>>()
+        else {
+            return;
+        };
+        if child_args[0].len() > common::MAX_THREAD_SPAWN_ARGS {
+            return;
+        }
+        let Some((plan, push_order)) = self.par_combine_plan(site, orig_offset) else {
+            return;
+        };
         let Some(spawn_id) = self.native_id("thread_spawn") else {
             return;
         };
         let Some(join_id) = self.native_id("thread_join") else {
             return;
         };
+        // Resolved before the clone is bound so an arm that reproduces
+        // `parent_args` cannot bind to the clone itself (infinite CALL).
+        let Some(callables) = site
+            .arms
+            .iter()
+            .zip(child_args.iter())
+            .map(|(arm, c)| self.par_arm_callable(arm, c))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
 
-        let (fn_offset, _) = self.bind_function_entry(spec_name.clone());
-        let _ = fn_offset;
+        self.bind_function_entry(spec_name.clone());
         self.fn_arities.insert(spec_name.clone(), (0, false));
 
         let prev_fn_vars = std::mem::take(&mut self.context.variables);
@@ -4811,23 +5182,14 @@ impl Compiler {
         let entry_sp = 0u32;
 
         let body_start = self.bytecode.len();
-        let left_n = n - shape.left_sub;
-        let right_n = n - shape.right_sub;
 
-        // MakeFn for the left arm (nullary spec or unary original).
-        let (left_entry, left_arity, left_has_arg) =
-            self.par_arm_callable(shape, left_n, orig_offset, thresh);
+        // MakeFn for arm 0 (nullary child clone, or the original with args).
+        let (entry0, arity0, push_args0) = callables[0];
         self.bytecode.push_const(0);
+        self.bytecode
+            .push(Byte::new(Instruction::CodePtr).with_operand_u32(entry0));
         self.bytecode.push(
-            Byte::new(Instruction::CodePtr).with_operand_u32(left_entry),
-        );
-        self.bytecode.push(
-            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
-                0,
-                0,
-                left_arity,
-                false,
-            )),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(0, 0, arity0, false)),
         );
         let fn_tmp = self.alloc_temp_slot();
         self.bytecode.push_store_pop(fn_tmp);
@@ -4837,16 +5199,17 @@ impl Compiler {
         let seq = bb.fresh_label(self.bytecode.il_mut());
         let done = bb.fresh_label(self.bytecode.il_mut());
 
-        // AlwaysPar: thread_spawn(fn[, left_n])
+        // AlwaysPar: thread_spawn(fn[, child args…])
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
         self.bytecode.push_load(fn_tmp);
-        let spawn_arity = if left_has_arg {
-            self.bytecode.push_const(left_n as i32);
-            2
-        } else {
-            1
-        };
+        let mut spawn_arity = 1;
+        if push_args0 {
+            for a in child_args[0].clone() {
+                self.push_int_const(a);
+                spawn_arity += 1;
+            }
+        }
         self.bytecode.push_make_tuple(spawn_arity);
         self.bytecode.push_host_invoke(spawn_arity);
 
@@ -4862,25 +5225,48 @@ impl Compiler {
         let handle_tmp = self.alloc_temp_slot();
         self.bytecode.push_store_pop(handle_tmp);
 
-        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
-        let right_tmp = self.alloc_temp_slot();
-        self.bytecode.push_store_pop(right_tmp);
+        // Inline arms first, then join arm 0 — every result is parked in a
+        // slot so the combine can push them in whatever order it needs.
+        let mut arm_tmps = vec![0u32; callables.len()];
+        for i in 1..callables.len() {
+            self.emit_par_arm_call_args(callables[i], &child_args[i]);
+            let slot = self.alloc_temp_slot();
+            self.bytecode.push_store_pop(slot);
+            arm_tmps[i] = slot;
+        }
 
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
         self.bytecode.push_load(handle_tmp);
         self.bytecode.push_make_tuple(1);
         self.bytecode.push_host_invoke(1);
-        self.emit_result_unwrap_or_panic();
+        // A failed join (worker result was not sendable, handle already taken)
+        // redoes the whole site sequentially rather than propagating an error.
+        let joined = bb.fresh_label(self.bytecode.il_mut());
+        bb.emit_jump_to(
+            joined,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(joined, self.bytecode.il_mut());
+        arm_tmps[0] = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(arm_tmps[0]);
 
-        self.bytecode.push_load(right_tmp);
-        self.bytecode.push(Byte::new(bin_op));
+        for &idx in &push_order {
+            self.bytecode.push_load(arm_tmps[idx]);
+        }
+        self.emit_par_combine(&plan);
         bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
 
+        // Spawn failed: arms are pure, so evaluating them straight into the
+        // combine's push order is equivalent.
         bb.bind_label(seq, self.bytecode.il_mut());
-        self.emit_par_arm_call(shape, left_n, orig_offset, thresh);
-        self.emit_par_arm_call(shape, right_n, orig_offset, thresh);
-        self.bytecode.push(Byte::new(bin_op));
+        for &idx in &push_order {
+            self.emit_par_arm_call_args(callables[idx], &child_args[idx]);
+        }
+        self.emit_par_combine(&plan);
 
         bb.bind_label(done, self.bytecode.il_mut());
         bb.finalize()
@@ -4898,36 +5284,351 @@ impl Compiler {
         self.context.variables = prev_fn_vars;
     }
 
-    /// Callable for one recursive arm: `(entry, arity, needs_int_arg)`.
-    fn par_arm_callable(
+    /// Lower `site.combine` to a fold instruction plus the arm push order it
+    /// expects on the stack. `None` when the combine cannot be lowered here.
+    fn par_combine_plan(
         &self,
-        shape: &crate::typechecking::RecParShape,
-        child_n: i64,
+        site: &crate::typechecking::ParForkSite,
         orig_offset: u32,
-        thresh: i64,
-    ) -> (u32, u32, bool) {
-        if child_n > thresh {
-            let spec = crate::typechecking::par_specialization_name(&shape.fn_name, child_n);
-            if let Some(&off) = self.functions.get(&spec) {
-                return (off as u32, 0, false);
+    ) -> Option<(ParCombinePlan, Vec<usize>)> {
+        use crate::typechecking::{ParBinOp, ParCombine};
+        let arms = site.arms.len();
+        match &site.combine {
+            ParCombine::BinOp(op) => {
+                if arms != 2 {
+                    return None;
+                }
+                let ins = match op {
+                    ParBinOp::Add => Instruction::ADD,
+                    ParBinOp::Sub => Instruction::SUB,
+                    ParBinOp::Mul => Instruction::MUL,
+                };
+                Some((ParCombinePlan::Bin(ins), vec![0, 1]))
+            }
+            ParCombine::SelfCall => {
+                if arms != site.param_count {
+                    return None;
+                }
+                Some((
+                    ParCombinePlan::Call {
+                        entry: orig_offset,
+                        arity: arms as u32,
+                    },
+                    (0..arms).collect(),
+                ))
+            }
+            ParCombine::ApplyCall { fn_name } => {
+                let entry = self.resolve_par_fn_entry(fn_name)? as u32;
+                Some((
+                    ParCombinePlan::Call {
+                        entry,
+                        arity: arms as u32,
+                    },
+                    (0..arms).collect(),
+                ))
+            }
+            ParCombine::Tuple => Some((
+                ParCombinePlan::Tuple {
+                    arity: arms as u32,
+                },
+                (0..arms).collect(),
+            )),
+            ParCombine::EnumCtor {
+                enum_name,
+                variant_name,
+            } => {
+                let tag = self.checker.tag_for(enum_name, variant_name)?;
+                if self.checker.arity_for(enum_name, variant_name) != Some(arms) {
+                    return None;
+                }
+                // `MakeEnum` pops into declaration order, so arm 0 goes last.
+                Some((
+                    ParCombinePlan::Enum {
+                        tag: u16::try_from(tag).ok()?,
+                        arity: u16::try_from(arms).ok()?,
+                    },
+                    (0..arms).rev().collect(),
+                ))
             }
         }
-        (orig_offset, 1, true)
     }
 
-    fn emit_par_arm_call(
-        &mut self,
-        shape: &crate::typechecking::RecParShape,
-        child_n: i64,
-        orig_offset: u32,
-        thresh: i64,
-    ) {
-        let (entry, arity, needs_arg) = self.par_arm_callable(shape, child_n, orig_offset, thresh);
-        if needs_arg {
-            self.bytecode.push_const(child_n as i32);
+    fn emit_par_combine(&mut self, plan: &ParCombinePlan) {
+        match plan {
+            ParCombinePlan::Bin(op) => self.bytecode.push(Byte::new(*op)),
+            ParCombinePlan::Call { entry, arity } => self
+                .bytecode
+                .push(Byte::new(Instruction::CALL).with_call_packed(*arity, *entry)),
+            ParCombinePlan::Tuple { arity } => self.bytecode.push_make_tuple(*arity),
+            ParCombinePlan::Enum { tag, arity } => self.bytecode.push_make_enum(*tag, *arity),
+        }
+    }
+
+    /// Look up a bare / FQN function entry used by IPA arms and combines.
+    fn resolve_par_fn_entry(&self, name: &str) -> Option<usize> {
+        self.functions
+            .get(name)
+            .copied()
+            .or_else(|| {
+                let fqn = format!("{}::{}", self.namespace, name);
+                self.functions.get(&fqn).copied()
+            })
+            .or_else(|| {
+                // Unnamespaced bare keys sometimes live next to FQNs.
+                self.functions
+                    .iter()
+                    .find(|(k, _)| k.rsplit("::").next() == Some(name) && !k.starts_with("__coil_par_"))
+                    .map(|(_, &off)| off)
+            })
+    }
+
+    /// Callable for one arm: `(entry, arity, needs_push_args)`.
+    ///
+    /// A child level that is itself specialized is invoked as its nullary
+    /// clone; otherwise the callee is called with concrete args.
+    fn par_arm_callable(
+        &self,
+        arm: &crate::typechecking::ParArm,
+        child_args: &[i64],
+    ) -> Option<(u32, u32, bool)> {
+        let callee = crate::typechecking::arm_callee(arm);
+        if crate::typechecking::args_worth_parallel(&self.par_shapes, callee, child_args) {
+            let spec = crate::typechecking::par_specialization_name(callee, child_args);
+            if let Some(&off) = self.functions.get(&spec) {
+                return Some((off as u32, 0, false));
+            }
+        }
+        let entry = self.resolve_par_fn_entry(callee)? as u32;
+        Some((entry, child_args.len() as u32, true))
+    }
+
+    fn emit_par_arm_call_args(&mut self, callable: (u32, u32, bool), child_args: &[i64]) {
+        let (entry, arity, push_args) = callable;
+        if push_args {
+            for a in child_args.to_vec() {
+                self.push_int_const(a);
+            }
         }
         self.bytecode
             .push(Byte::new(Instruction::CALL).with_call_packed(arity, entry));
+    }
+
+    // -----------------------------------------------------------------------
+    // Loop IPA (chunked fork-join over an induction range)
+    // -----------------------------------------------------------------------
+
+    /// Emit a 2-way chunked fork-join for the counted loop at `span`, replacing
+    /// the sequential loop entirely. Returns `false` — with nothing emitted —
+    /// when any precondition fails, so the caller falls back to the plain loop.
+    ///
+    /// The chunk worker is a private `(lo, hi, acc)` function holding the
+    /// original body over `[lo, hi)`. `[mid, end)` is spawned onto the reactor
+    /// seeded with the reduction's identity, `[begin, mid)` runs inline seeded
+    /// with the live accumulator, and the partials fold with the site operator.
+    fn try_emit_par_loop(
+        &mut self,
+        span: SimpleSpan,
+        cond: &Output<'_>,
+        body: &Output<'_>,
+    ) -> bool {
+        use crate::typechecking::LoopReduceOp;
+
+        let Some(site) = self.loop_par_sites.get(&(span.start, span.end)).cloned() else {
+            return false;
+        };
+        // Reassociating a float reduction changes results, so both the
+        // induction variable and the per-iteration value must be `int`.
+        if !self.span_ty_is_int(site.index_span) || !self.span_ty_is_int(site.reduce_span) {
+            return false;
+        }
+        let (Some(index_slot), Some(acc_slot)) = (
+            self.lookup_slot(&site.index),
+            self.lookup_slot(&site.acc),
+        ) else {
+            return false;
+        };
+        let (Some(spawn_id), Some(join_id)) =
+            (self.native_id("thread_spawn"), self.native_id("thread_join"))
+        else {
+            return false;
+        };
+        let (Ok(begin), Ok(mid), Ok(end)) = (
+            i32::try_from(site.begin),
+            i32::try_from(site.midpoint()),
+            i32::try_from(site.end),
+        ) else {
+            return false;
+        };
+        let fold = match site.op {
+            LoopReduceOp::Add => Instruction::ADD,
+            LoopReduceOp::Mul => Instruction::MUL,
+        };
+        let identity = site.op.identity() as i32;
+
+        // The chunk worker tests `i < hi` against its own bound, but the
+        // condition's NodeIds still have to be consumed in walk order.
+        self.discard_compile(cond);
+
+        let mut bb = BlockBuilder::new();
+        let after_worker = bb.fresh_label(self.bytecode.il_mut());
+        bb.emit_jump_to(after_worker, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        let worker = self.emit_par_loop_worker(&site, body);
+        bb.bind_label(after_worker, self.bytecode.il_mut());
+
+        // MakeFn of the worker, then spawn the upper chunk.
+        self.bytecode.push_const(0);
+        self.bytecode
+            .push(Byte::new(Instruction::CodePtr).with_operand_u32(worker));
+        self.bytecode.push(
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(0, 0, 3, false)),
+        );
+        let fn_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(fn_tmp);
+
+        let have_handle = bb.fresh_label(self.bytecode.il_mut());
+        let seq = bb.fresh_label(self.bytecode.il_mut());
+        let joined = bb.fresh_label(self.bytecode.il_mut());
+        let done = bb.fresh_label(self.bytecode.il_mut());
+
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(spawn_id as u32));
+        self.bytecode.push_load(fn_tmp);
+        self.bytecode.push_const(mid);
+        self.bytecode.push_const(end);
+        self.bytecode.push_const(identity);
+        self.bytecode.push_make_tuple(4);
+        self.bytecode.push_host_invoke(4);
+        bb.emit_jump_to(
+            have_handle,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(have_handle, self.bytecode.il_mut());
+        let handle_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(handle_tmp);
+
+        // Lower chunk inline while the worker runs, seeded with the live `acc`.
+        self.bytecode.push_const(begin);
+        self.bytecode.push_const(mid);
+        self.bytecode.push_load(acc_slot);
+        self.bytecode
+            .push(Byte::new(Instruction::CALL).with_call_packed(3, worker));
+        let lower_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(lower_tmp);
+
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(join_id as u32));
+        self.bytecode.push_load(handle_tmp);
+        self.bytecode.push_make_tuple(1);
+        self.bytecode.push_host_invoke(1);
+        bb.emit_jump_to(
+            joined,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            self.bytecode.il_mut(),
+        );
+        // A failed join redoes the whole range sequentially; the worker is pure,
+        // so the discarded lower partial costs time but not correctness.
+        self.bytecode.push_pop();
+        bb.emit_jump_to(seq, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        bb.bind_label(joined, self.bytecode.il_mut());
+        let upper_tmp = self.alloc_temp_slot();
+        self.bytecode.push_store_pop(upper_tmp);
+        self.bytecode.push_load(lower_tmp);
+        self.bytecode.push_load(upper_tmp);
+        self.bytecode.push(Byte::new(fold));
+        bb.emit_jump_to(done, BbJumpKind::Unconditional, self.bytecode.il_mut());
+
+        // Spawn / join failed: one worker call over the whole range.
+        bb.bind_label(seq, self.bytecode.il_mut());
+        self.bytecode.push_const(begin);
+        self.bytecode.push_const(end);
+        self.bytecode.push_load(acc_slot);
+        self.bytecode
+            .push(Byte::new(Instruction::CALL).with_call_packed(3, worker));
+
+        bb.bind_label(done, self.bytecode.il_mut());
+        self.bytecode.push_store_pop(acc_slot);
+        // The loop exits with the induction variable one past its range;
+        // later reads of it must not see the pre-loop value.
+        self.bytecode.push_const(end);
+        self.bytecode.push_store_pop(index_slot);
+
+        bb.finalize()
+            .expect("BlockBuilder::finalize: loop-IPA labels bound");
+        true
+    }
+
+    /// Emit the chunk worker `(lo, hi, acc) -> acc'` and return its entry offset.
+    ///
+    /// Runs in a private frame with the induction variable, the chunk bound and
+    /// the accumulator as slots 0..2 — sound only because the site analysis
+    /// proved the body reads nothing else.
+    fn emit_par_loop_worker(
+        &mut self,
+        site: &crate::typechecking::LoopParSite,
+        body: &Output<'_>,
+    ) -> u32 {
+        const INDEX_SLOT: u32 = 0;
+        const BOUND_SLOT: u32 = 1;
+        const ACC_SLOT: u32 = 2;
+
+        self.loop_par_helpers += 1;
+        let name = format!("__coil_par_loop_{}", self.loop_par_helpers);
+        let (entry, _) = self.bind_function_entry(name.clone());
+        let entry = entry as u32;
+        self.fn_arities.insert(name, (3, false));
+
+        let prev_ctx = std::mem::take(&mut self.context);
+        let prev_depth = std::mem::replace(&mut self.expr_depth, 0);
+        self.context.variables.intern(site.index.clone());
+        self.context.variables.intern("__coil_par_hi".to_string());
+        self.context.variables.intern(site.acc.clone());
+
+        let mut bb = BlockBuilder::new();
+        let top = bb.fresh_label(self.bytecode.il_mut());
+        let exit = bb.fresh_label(self.bytecode.il_mut());
+        bb.bind_label(top, self.bytecode.il_mut());
+        self.bytecode.push_load(INDEX_SLOT);
+        self.bytecode.push_load(BOUND_SLOT);
+        self.bytecode.push(Byte::new(Instruction::LE));
+        bb.emit_jump_to(exit, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        bb.emit_jump_to(top, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(exit, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: loop-IPA worker labels bound");
+
+        self.bytecode.push_load(ACC_SLOT);
+        self.bytecode.push_return();
+
+        self.context = prev_ctx;
+        self.expr_depth = prev_depth;
+        entry
+    }
+
+    /// Whether the checker inferred `int` for the expression at `span`.
+    fn span_ty_is_int(&self, span: (usize, usize)) -> bool {
+        matches!(
+            self.checker.lookup_for_codegen_span(span.0, span.1),
+            Some(Ty::Con(ref c)) if c == "int"
+        )
+    }
+
+    /// Push an `int` constant onto [`Self::bytecode`]; inline `CONST` cannot
+    /// encode negatives (they collide with the pool flag) or values past `i32`.
+    fn push_int_const(&mut self, n: i64) {
+        if (0..=i32::MAX as i64).contains(&n) {
+            self.bytecode.push_const(n as i32);
+        } else {
+            let bits = Value::from(n).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode.push_const_pool(idx);
+        }
     }
 
     /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
@@ -5457,6 +6158,26 @@ impl Compiler {
     /// Return `Some(is_option)` for a compiled function whose unary return
     /// can use the pair ABI. Pointer-niche options stay on the niche path.
     fn pair_return_kind(&self, name: &str) -> Option<bool> {
+        if let Some(cached) = self.pair_return_kinds.borrow().get(name) {
+            return *cached;
+        }
+        let kind = self.compute_pair_return_kind(name);
+        self.pair_return_kinds
+            .borrow_mut()
+            .insert(name.to_string(), kind);
+        kind
+    }
+
+    /// Pin a verdict so later queries cannot disagree with it. Definition sites
+    /// use this for shapes only they can see (a coroutine body never returns a
+    /// pair, however its return type reads).
+    fn pin_pair_return_kind(&self, name: &str, kind: Option<bool>) {
+        self.pair_return_kinds
+            .borrow_mut()
+            .insert(name.to_string(), kind);
+    }
+
+    fn compute_pair_return_kind(&self, name: &str) -> Option<bool> {
         if self.coroutine_fns.contains(name) {
             return None;
         }
@@ -5478,7 +6199,21 @@ impl Compiler {
         None
     }
 
+    /// Emit `ReturnPair`, tagging it with the enclosing function's pair kind so
+    /// the VM can re-box the two slots when the frame is a host entry.
+    fn push_return_pair(&mut self) {
+        self.bytecode.push(
+            Byte::new(Instruction::ReturnPair)
+                .with_operand_u32(u32::from(self.compiling_pair_is_option)),
+        );
+    }
+
     fn pair_call_candidate(&self, callee: &Output) -> bool {
+        self.pair_call_kind(callee).is_some()
+    }
+
+    /// `Some(is_option)` when calling `callee` leaves a pair on the stack.
+    fn pair_call_kind(&self, callee: &Output) -> Option<bool> {
         let name = match callee.1.as_ref() {
             Expression::Identifier(name) => self
                 .aliases
@@ -5490,44 +6225,101 @@ impl Compiler {
             }
             Expression::Access(receiver, method) => {
                 let ty = self.receiver_type(receiver).or_else(|| self.codegen_expr_ty(receiver));
-                let Some(owner) = ty
+                let owner = ty
                     .as_ref()
                     .and_then(Checker::class_name_of_ty)
-                    .map(str::to_string)
-                else {
-                    return false;
-                };
-                let Some(methods) = self.context.methods.get(&owner) else {
-                    return false;
-                };
-                let Some(name) = methods.get(*method) else {
-                    return false;
-                };
-                name.clone()
+                    .map(str::to_string)?;
+                self.context.methods.get(&owner)?.get(*method)?.clone()
             }
-            _ => return false,
+            _ => return None,
         };
         if !self.functions.contains_key(&name) {
-            return false;
+            return None;
         }
-        self.pair_return_kind(&name).is_some()
+        self.pair_return_kind(&name)
     }
 
     fn expr_is_pair_producer(&self, expr: &Output) -> bool {
+        self.expr_pair_producer_kind(expr).is_some()
+    }
+
+    /// `Some(is_option)` when the expression is emitted in the pair ABI, i.e. it
+    /// leaves `[payload, tag]` rather than a heap enum.
+    fn expr_pair_producer_kind(&self, expr: &Output) -> Option<bool> {
         match expr.1.as_ref() {
             Expression::Construct {
                 enum_name,
                 variant_name,
                 ..
             } => {
-                (common::is_builtin_option_enum(enum_name)
-                    || common::is_builtin_result_enum(enum_name))
-                    && self.checker.arity_for(enum_name, variant_name).is_some_and(|n| n <= 1)
+                let is_option = common::is_builtin_option_enum(enum_name);
+                ((is_option || common::is_builtin_result_enum(enum_name))
+                    && self.checker.arity_for(enum_name, variant_name).is_some_and(|n| n <= 1))
+                    .then_some(is_option)
             }
-            Expression::Call { name, .. } => self.pair_call_candidate(name),
-            Expression::Group(inner) | Expression::Expr(inner) => self.expr_is_pair_producer(inner),
-            _ => false,
+            Expression::Call { name, .. } => self.pair_call_kind(name),
+            Expression::Group(inner) | Expression::Expr(inner) => {
+                self.expr_pair_producer_kind(inner)
+            }
+            _ => None,
         }
+    }
+
+    /// True when the expression yields a pair that *is* the enclosing function's
+    /// return enum, so its tag can serve as the `ReturnPair` tag. An enum of the
+    /// other kind — or a same-kind enum nested one level down, as in
+    /// `Result<Result<int, E>, E>` — is an ordinary payload and must be boxed.
+    fn expr_pairs_with_return(&self, expr: &Output) -> bool {
+        self.compiling_pair_mode
+            && self.expr_pair_producer_kind(expr) == Some(self.compiling_pair_is_option)
+            && self.expr_ty_is_return_ty(expr)
+    }
+
+    /// `Some(is_option)` when a heap `expr` holds the very enum the enclosing
+    /// pair-mode function returns, so it can be split into `[payload, tag]`
+    /// rather than boxed as an `Ok`/`Some` payload.
+    fn expr_is_return_enum(&self, expr: &Output) -> Option<bool> {
+        let kind = self.expr_pair_enum_kind(expr)?;
+        (kind == self.compiling_pair_is_option && self.expr_ty_is_return_ty(expr)).then_some(kind)
+    }
+
+    /// Whether the expression's type is the enclosing function's return type.
+    /// Unknown on either side counts as a match: the caller has already checked
+    /// the enum kind, and that is then all the evidence there is.
+    fn expr_ty_is_return_ty(&self, expr: &Output) -> bool {
+        match (self.codegen_expr_ty(expr), self.compiling_fn_return_ty()) {
+            (Some(expr_ty), Some(ret_ty)) => Self::enum_nesting_eq(&expr_ty, &ret_ty),
+            _ => true,
+        }
+    }
+
+    /// Compare two types by how deeply `Option`/`Result` nest in them, so that
+    /// `Result<int, E>` and `Result<Result<int, E>, E>` are told apart. Peeling
+    /// with the `ty` accessors keeps this blind to which shape (`App`, `Sum`,
+    /// `Constructor`) each side happens to carry.
+    fn enum_nesting_eq(a: &Ty, b: &Ty) -> bool {
+        use crate::typechecking::ty::{option_inner, result_ok_err};
+        match (result_ok_err(a), result_ok_err(b)) {
+            (Some((a_ok, _)), Some((b_ok, _))) => return Self::enum_nesting_eq(&a_ok, &b_ok),
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+        match (option_inner(a), option_inner(b)) {
+            (Some(a_inner), Some(b_inner)) => Self::enum_nesting_eq(&a_inner, &b_inner),
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => a == b,
+        }
+    }
+
+    /// Return type of the function whose body is being compiled.
+    fn compiling_fn_return_ty(&self) -> Option<crate::typechecking::Ty> {
+        let name = self
+            .current_function_qualified
+            .as_deref()
+            .or(self.current_function_table_key.as_deref())?;
+        self.checker
+            .fn_return_ty(name)
+            .or_else(|| self.fn_return_ty(name))
     }
 
     fn expr_pair_enum_kind(&self, expr: &Output) -> Option<bool> {
@@ -5560,7 +6352,7 @@ impl Compiler {
         self.bytecode.push_const(0);
         if self.compiling_pair_mode {
             self.bytecode.push_const(0);
-            self.bytecode.push(Byte::new(Instruction::ReturnPair));
+            self.push_return_pair();
         } else if self.compiling_result_mode {
             Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
             self.bytecode.push_return();
@@ -5666,7 +6458,15 @@ impl Compiler {
         let prev_result_mode = self.compiling_result_mode;
         self.compiling_result_mode = self.checker.fn_is_result_mode(name);
         let prev_pair_mode = self.compiling_pair_mode;
-        self.compiling_pair_mode = !*is_coro && self.pair_return_kind(&qualified).is_some();
+        let prev_pair_is_option = self.compiling_pair_is_option;
+        let pair_kind = if *is_coro {
+            self.pin_pair_return_kind(&qualified, None);
+            None
+        } else {
+            self.pair_return_kind(&qualified)
+        };
+        self.compiling_pair_mode = pair_kind.is_some();
+        self.compiling_pair_is_option = pair_kind.unwrap_or(false);
         let prev_fn_defers = std::mem::take(&mut self.fn_defers);
 
         let mut a = self.do_compile(args);
@@ -5692,6 +6492,7 @@ impl Compiler {
         self.fn_defers = prev_fn_defers;
         self.compiling_result_mode = prev_result_mode;
         self.compiling_pair_mode = prev_pair_mode;
+        self.compiling_pair_is_option = prev_pair_is_option;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
         self.polyfn_sources = prev_polyfn_sources;
@@ -8730,8 +9531,15 @@ impl Compiler {
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(name);
                 let prev_pair_mode = self.compiling_pair_mode;
-                self.compiling_pair_mode =
-                    !*is_coro && self.pair_return_kind(&table_key).is_some();
+                let prev_pair_is_option = self.compiling_pair_is_option;
+                let pair_kind = if *is_coro {
+                    self.pin_pair_return_kind(&table_key, None);
+                    None
+                } else {
+                    self.pair_return_kind(&table_key)
+                };
+                self.compiling_pair_mode = pair_kind.is_some();
+                self.compiling_pair_is_option = pair_kind.unwrap_or(false);
 
                 let mut a = self.do_compile(args);
 
@@ -8786,6 +9594,7 @@ impl Compiler {
                 self.fn_defers = prev_fn_defers;
                 self.compiling_result_mode = prev_result_mode;
                 self.compiling_pair_mode = prev_pair_mode;
+                self.compiling_pair_is_option = prev_pair_is_option;
                 self.pop_const_env();
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
@@ -9044,8 +9853,8 @@ impl Compiler {
                 // Each defer thunk returns a sentinel that we POP so the
                 // pending return value stays on top for RETURN.
                 // Flush the value into `self.bytecode` before labeled defers.
-                let pair_expr = self.compiling_pair_mode && self.expr_is_pair_producer(expr);
-                let pair_enum_kind = self.expr_pair_enum_kind(expr);
+                let pair_expr = self.expr_pairs_with_return(expr);
+                let pair_enum_kind = self.expr_is_return_enum(expr);
                 let previous_pair_context = self.pair_value_context;
                 self.pair_value_context = pair_expr;
                 self.append_with_existential_pack(&mut bytecode, expr);
@@ -9070,7 +9879,7 @@ impl Compiler {
                 self.emit_run_defers();
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
                     if self.compiling_pair_mode {
-                        self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                        self.push_return_pair();
                     } else {
                         self.bytecode.push_return();
                     }
@@ -9311,6 +10120,9 @@ impl Compiler {
                     {
                         self.discard_compile(iterable);
                         self.discard_compile(body);
+                        return bytecode;
+                    }
+                    if self.try_emit_par_loop(*span, iterable, body) {
                         return bytecode;
                     }
                     let mut bb = BlockBuilder::new();
@@ -10785,7 +11597,10 @@ impl Compiler {
                 let prev_result_mode = self.compiling_result_mode;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
                 let prev_pair_mode = self.compiling_pair_mode;
-                self.compiling_pair_mode = self.pair_return_kind(&fn_name).is_some();
+                let prev_pair_is_option = self.compiling_pair_is_option;
+                let pair_kind = self.pair_return_kind(&fn_name);
+                self.compiling_pair_mode = pair_kind.is_some();
+                self.compiling_pair_is_option = pair_kind.unwrap_or(false);
 
                 let body_op_start = self.bytecode.ops().len();
                 let prev_field_keys = std::mem::take(&mut self.field_key_slots);
@@ -10800,6 +11615,7 @@ impl Compiler {
 
                 self.compiling_result_mode = prev_result_mode;
                 self.compiling_pair_mode = prev_pair_mode;
+                self.compiling_pair_is_option = prev_pair_is_option;
                 self.field_key_slots = prev_field_keys;
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
@@ -11082,7 +11898,7 @@ impl Compiler {
                 self.pad_debug_locs();
                 let loc = self.loc_for_span(*span);
                 if self.compiling_pair_mode {
-                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    self.push_return_pair();
                 } else {
                     self.bytecode.push_return_at(loc);
                 }
@@ -11127,7 +11943,7 @@ impl Compiler {
                 let is_option = self.expr_is_option(inner);
                 let success_tag: u32 = if is_option { 1 } else { 0 }; // Some=1, Ok=0
 
-                let pair_inner = self.compiling_pair_mode && self.expr_is_pair_producer(inner);
+                let pair_inner = self.expr_pairs_with_return(inner);
                 let previous_pair_context = self.pair_value_context;
                 self.pair_value_context = pair_inner;
                 let inner_bc = self.do_compile(inner);
@@ -11155,7 +11971,7 @@ impl Compiler {
                         self.bytecode.il_mut(),
                     );
                     bb.bind_label(failure, self.bytecode.il_mut());
-                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    self.push_return_pair();
                     bb.bind_label(after_failure, self.bytecode.il_mut());
                 } else if self.expr_is_niche_option(inner) {
                     self.bytecode.push(Byte::new(Instruction::DUPLICATE));
@@ -11170,7 +11986,7 @@ impl Compiler {
                         self.bytecode.push_pop();
                         self.bytecode.push_const(0);
                         self.bytecode.push_const(0);
-                        self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                        self.push_return_pair();
                     } else {
                         self.bytecode.push_return();
                     }
@@ -11188,7 +12004,7 @@ impl Compiler {
                         Byte::new(Instruction::HeapToPair)
                             .with_operand_u32(u32::from(is_option)),
                     );
-                    self.bytecode.push(Byte::new(Instruction::ReturnPair));
+                    self.push_return_pair();
                     bb.bind_label(success, self.bytecode.il_mut());
                 } else {
                     bb.emit_jump_to(
@@ -13185,6 +14001,22 @@ impl Compiler {
                     return bytecode;
                 }
 
+                // Base-case peel that reads leaf args in place instead of
+                // spilling them; falls through to the spilling peel below.
+                if !is_generic
+                    && !is_instance_method_fqn(&self.checker, &lookup_name)
+                    && !self.coroutine_fns.contains(&n)
+                    && !self.coroutine_fns.contains(&lookup_name)
+                    && self.try_emit_remat_peel_call(
+                        &n,
+                        Some(arg_slice),
+                        &mut bytecode,
+                        target_offset as u32,
+                    )
+                {
+                    return bytecode;
+                }
+
                 // Caller-side base-case peel: cmp-jmp before CALL when
                 // the callee opens with fused/unfused compare + imm/slot return.
                 // Instance methods with known entries use CALL (not CallIndirect).
@@ -13576,14 +14408,17 @@ impl Compiler {
         } else {
             HashSet::new()
         };
-        if auto_par_enabled() && !self.recursive_pure.is_empty() {
-            self.par_shapes =
-                crate::typechecking::analyze_rec_par_shapes(ast, &self.recursive_pure);
+        if auto_par_enabled() {
+            // IPA sites on any pure function (self-recursion or helper arms).
+            let pure = crate::typechecking::analyze_pure_fns(ast);
+            self.par_shapes = crate::typechecking::analyze_par_fork_sites(ast, &pure);
             self.par_spec_args =
                 crate::typechecking::collect_par_specialization_args(ast, &self.par_shapes);
+            self.loop_par_sites = crate::typechecking::analyze_loop_par_sites(ast, &pure);
         } else {
             self.par_shapes.clear();
             self.par_spec_args.clear();
+            self.loop_par_sites = crate::typechecking::LoopParSites::new();
         }
         self.emit_builtin_dict_thunks();
         self.emit_vec_method_thunks();

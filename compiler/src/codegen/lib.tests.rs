@@ -2659,8 +2659,9 @@ fn main() {
     fn call_arg_prep_packs_three_loads() {
         use common::Instruction;
         // Two early-return guards → not a single tiny-inline diamond.
-        // Predicate peel (2B) still applies: args land in temps, then a packed
-        // LOAD of those temps feeds the CALL.
+        // Predicate peel (2B) still applies, and since every arg is a plain
+        // local the re-materializing peel reads them in place — the packed
+        // LOAD feeding the CALL names `x, y, z`, not argument spills.
         let (bc, _pool) = compile_src(
             "fn add(int a, int b, int c) -> int { \
  if a < 0 { return 0; } \
@@ -2680,11 +2681,165 @@ fn main() {
         let packed = packed.expect("expected one LOAD with n=3 for add(x,y,z) arg prep");
         let (n, s0, s1, s2) = packed.load_store_parts();
         assert_eq!(n, 3, "packed LOAD must carry three slots");
-        // Locals x,y,z are 0,1,2; peel stores them into consecutive temps 3,4,5.
+        // Locals x,y,z are 0,1,2 and need no spill.
         assert_eq!(
             (s0, s1, s2),
-            (3, 4, 5),
-            "peel arg prep should LOAD temps in original order"
+            (0, 1, 2),
+            "peel arg prep should LOAD the locals in original order"
+        );
+    }
+
+    /// A peel over leaf args spills nothing: the only STOREs `main` emits are the
+    /// three `let`s and the peel's join temp (`let result` is never read, so its
+    /// store is elided). The spilling peel needed three more, one per argument.
+    #[test]
+    fn predicate_peel_does_not_spill_leaf_args() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b, int c) -> int { \
+ if a < 0 { return 0; } \
+ if b < 0 { return 0; } \
+ return a + b + c; \
+ } \
+ fn main() { \
+ let x = 1; \
+ let y = 2; \
+ let z = 3; \
+ let result = add(x, y, z); \
+ }",
+        );
+        let stores = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE | Instruction::StorePop))
+            .count();
+        assert!(
+            stores <= 4,
+            "peel spilled args: expected 3 locals + join temp, got {stores} STOREs"
+        );
+    }
+
+    /// An argument the guard reads but that needs more than one byte keeps its
+    /// spill — `x + 1` is staged to a temp, so the packed LOAD names temps.
+    #[test]
+    fn predicate_peel_spills_computed_guard_arg() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b, int c) -> int { \
+ if a < 0 { return 0; } \
+ if b < 0 { return 0; } \
+ return a + b + c; \
+ } \
+ fn main() { \
+ let x = 1; \
+ let y = 2; \
+ let z = 3; \
+ let result = add(x + 1, y, z); \
+ }",
+        );
+        let packed = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::LOAD) && b.load_store_count() == 3)
+            .expect("expected one LOAD with n=3 for the peeled arg prep");
+        let (_, s0, s1, s2) = packed.load_store_parts();
+        assert!(
+            s0 > 2 && s1 > 2 && s2 > 2,
+            "computed guard arg should fall back to the spilling peel; got ({s0}, {s1}, {s2})"
+        );
+    }
+
+    /// The peel replaces the callee's `return`, so a matched base-case value must
+    /// actually be returned — a bare value falling through is not a base case.
+    #[test]
+    fn predicate_peel_shape_requires_returned_base_value() {
+        let mut buf = CodeBuf::default();
+        let target = buf.fresh_label();
+        let guard = |tail: Vec<IlOp>| {
+            let mut ops = vec![
+                IlOp::Load {
+                    slot: 0,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Const {
+                    imm: 0,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Bin {
+                    op: Instruction::LE,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    target,
+                    loc: DebugLoc::unknown(),
+                },
+                IlOp::Load {
+                    slot: 1,
+                    loc: DebugLoc::unknown(),
+                },
+            ];
+            ops.extend(tail);
+            ops
+        };
+        let returned = guard(vec![
+            IlOp::Return {
+                loc: DebugLoc::unknown(),
+            },
+            IlOp::Load {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+        ]);
+        assert!(
+            Compiler::match_predicate_peel_shape(&returned, true).is_some(),
+            "cond + JMPF + value + RETURN is a peelable base case"
+        );
+        let falls_through = guard(vec![
+            IlOp::Label(target),
+            IlOp::Load {
+                slot: 2,
+                loc: DebugLoc::unknown(),
+            },
+        ]);
+        assert!(
+            Compiler::match_predicate_peel_shape(&falls_through, true).is_none(),
+            "a base-case value that is not returned must not be peeled"
+        );
+    }
+
+    /// Self-recursive sites stay unpeeled: the callee span is not ready while the
+    /// body is compiling, and peeling them was measured as a loss on `tak`.
+    #[test]
+    fn self_recursive_sites_are_not_predicate_peeled() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn tak(int x, int y, int z) -> int { \
+               if y >= x { return z; } \
+               return tak(tak(x - 1, y, z), tak(y - 1, z, x), tak(z - 1, x, y)); \
+             } \
+             fn main() { let r = tak(3, 2, 1); }",
+        );
+        let calls = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .count();
+        let tails = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::TailCall))
+            .count();
+        // Three inner self-calls stay CALL (or TailCall if TCO applies to outer);
+        // a self-peel would replace each with a cmp-jmp diamond and inflate the body.
+        assert!(
+            calls + tails >= 3,
+            "expected ≥3 recursive call sites; call={calls} tail={tails}; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let stores = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE | Instruction::StorePop))
+            .count();
+        assert!(
+            stores <= 8,
+            "self-peel would spill join temps per site; stores={stores}"
         );
     }
 

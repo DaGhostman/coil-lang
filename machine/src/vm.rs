@@ -1779,6 +1779,43 @@ impl<const S: usize> Machine<S> {
         self.nested_return.take().unwrap_or_default()
     }
 
+    /// Box a `(payload, tag)` pair-ABI value back into a heap `Option`/`Result`.
+    ///
+    /// `is_option` picks the arity of tag 0: `None` carries nothing, `Ok` carries
+    /// the payload.
+    fn alloc_pair_enum(&mut self, payload: Value, tag: u32, is_option: bool) -> Value {
+        let payload = if is_option && tag == 0 {
+            Vec::new()
+        } else {
+            vec![
+                Self::find_object_by_addr(&self.heap, payload.raw() as u64)
+                    .map(Member::Object)
+                    .unwrap_or(Member::Value(payload)),
+            ]
+        };
+        let (object, _) = self.heap.alloc(ObjEnum { tag, payload }, Object::Enum);
+        Value::from(object.addr())
+    }
+
+    /// Pair-ABI counterpart of [`Self::capture_nested_return`].
+    ///
+    /// A host entry (`spawn`, an FFI/IO callback) has no caller-side
+    /// `PairToHeap`, so the two slots are boxed here; without this the frame
+    /// unwinds past the [`Self::call_function`] entry and execution runs on into
+    /// whatever bytecode follows the callee.
+    #[inline]
+    fn capture_nested_pair_return(&mut self, payload: Value, tag: Value, is_option: bool) -> bool {
+        if unlikely(self.nested_depth > 0) {
+            let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+            if self.frames.len() == nested_target {
+                let boxed = self.alloc_pair_enum(payload, tag.as_int() as u32, is_option);
+                self.nested_return = Some(boxed);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Stash a return value when `execute` runs inside [`Self::call_function`].
     #[inline]
     fn capture_nested_return(&mut self, ret_val: Value) -> bool {
@@ -1979,21 +2016,8 @@ impl<const S: usize> Machine<S> {
                     let tag = self.stack.pop().as_int() as u32;
                     let payload = self.stack.pop();
                     let is_option = opcode.operand_u32() & 1 != 0;
-                    let arity = if is_option && tag == 0 { 0 } else { 1 };
-                    let payload = if arity == 0 {
-                        Vec::new()
-                    } else {
-                        vec![
-                            Self::find_object_by_addr(&self.heap, payload.raw() as u64)
-                                .map(Member::Object)
-                                .unwrap_or(Member::Value(payload)),
-                        ]
-                    };
-                    let (object, _) = self.heap.alloc(
-                        ObjEnum { tag, payload },
-                        Object::Enum,
-                    );
-                    self.stack.push(Value::from(object.addr()));
+                    let boxed = self.alloc_pair_enum(payload, tag, is_option);
+                    self.stack.push(boxed);
                     Self::maybe_gc_after_alloc(
                         &mut self.heap,
                         &self.stack,
@@ -2026,6 +2050,10 @@ impl<const S: usize> Machine<S> {
                 Instruction::ReturnPair => {
                     let tag = self.stack.pop();
                     let payload = self.stack.pop();
+                    if self.capture_nested_pair_return(payload, tag, opcode.operand_u32() & 1 != 0)
+                    {
+                        return false;
+                    }
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(payload);

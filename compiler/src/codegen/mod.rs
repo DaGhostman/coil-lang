@@ -720,6 +720,30 @@ struct PredicatePeel {
     /// One past the highest callee slot referenced by cond/then.
     arity_hint: usize,
 }
+
+/// A peeled guard op rewritten against the caller's argument expressions.
+enum PeelRematOp {
+    /// Re-materialize argument `idx`.
+    Arg(usize),
+    /// Argument `idx`, then `imm`, then the binary op (unfused `BinSlotImm`).
+    ArgImm {
+        op: Instruction,
+        idx: usize,
+        imm: i32,
+    },
+    /// Arguments `a` then `b`, then the binary op (unfused `BinSlotSlot`).
+    ArgArg { op: Instruction, a: usize, b: usize },
+    /// Argument-independent op, copied as the callee emitted it.
+    Copy(IlOp),
+}
+
+/// A callee guard ready to emit at a call site without spilling arguments.
+struct PeelRematPlan {
+    cond: Vec<PeelRematOp>,
+    then_value: PeelRematOp,
+    /// Argument indices the guard reads (must be re-materializable).
+    guard_args: Vec<usize>,
+}
 pub struct Compiler {
     namespace: String,
     /// Stack IL during emit; lowered `Vec<Byte>` after [`Self::finalize_bytecode`].
@@ -771,6 +795,12 @@ pub struct Compiler {
 
     /// Qualified names of `async fn` declarations (emit `MakeCoro` at call sites).
     coroutine_fns: std::collections::HashSet<String>,
+
+    /// Memoized pair-ABI verdicts, keyed by the name codegen looks a function up
+    /// by. The type env fills in as bodies are compiled, so an unmemoized query
+    /// can answer differently for a body and for a later caller — see
+    /// [`Compiler::pair_return_kind`].
+    pair_return_kinds: std::cell::RefCell<HashMap<String, Option<bool>>>,
 
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
@@ -836,6 +866,10 @@ pub struct Compiler {
     /// Emit and consume the two-slot `[payload, tag]` ABI for a unary
     /// `Option`/`Result` return while compiling a statically known function.
     compiling_pair_mode: bool,
+    /// Whether [`Self::compiling_pair_mode`]'s return is an `Option` (tag 0 is
+    /// then payload-less `None`). Travels in the `ReturnPair` operand so a host
+    /// entry can re-box the pair.
+    compiling_pair_is_option: bool,
     /// The current expression is allowed to remain in the pair ABI instead of
     /// being materialized back into a heap enum.
     pair_value_context: bool,
@@ -899,10 +933,14 @@ pub struct Compiler {
 
     /// Self-recursive pure function names eligible for auto fork-join.
     recursive_pure: HashSet<String>,
-    /// Detected `f(n-a) ⊕ f(n-b)` shapes for recursive-pure fns.
-    par_shapes: HashMap<String, crate::typechecking::RecParShape>,
-    /// Concrete int args requiring `__coil_par_*` specializations.
-    par_spec_args: HashMap<String, BTreeSet<i64>>,
+    /// Detected independent-parallel-arm fork sites for pure fns.
+    par_shapes: HashMap<String, crate::typechecking::ParForkSite>,
+    /// Concrete arg vectors requiring `__coil_par_*` specializations.
+    par_spec_args: HashMap<String, BTreeSet<Vec<i64>>>,
+    /// Counted loops whose iterations are independent arms, by loop span.
+    loop_par_sites: crate::typechecking::LoopParSites,
+    /// Chunk workers emitted so far, for `__coil_par_loop_*` naming.
+    loop_par_helpers: usize,
 
     /// Operand-stack capacity for the VM (from recursion-depth analysis).
     operand_stack_slots: u32,
@@ -957,6 +995,8 @@ impl Default for Compiler {
             force_heap_option: false,
             force_niche_option: false,
             compiling_pair_mode: false,
+            compiling_pair_is_option: false,
+            pair_return_kinds: std::cell::RefCell::new(HashMap::new()),
             pair_value_context: false,
             test_cases: Vec::new(),
             user_main_defined: false,
@@ -981,6 +1021,8 @@ impl Default for Compiler {
             recursive_pure: HashSet::new(),
             par_shapes: HashMap::new(),
             par_spec_args: HashMap::new(),
+            loop_par_sites: crate::typechecking::LoopParSites::new(),
+            loop_par_helpers: 0,
             operand_stack_slots: crate::typechecking::DEFAULT_OPERAND_STACK_SLOTS,
         }
     }

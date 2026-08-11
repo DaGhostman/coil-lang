@@ -247,15 +247,22 @@ fn is_unconditional_transfer(byte: &Byte) -> bool {
     )
 }
 
+/// `JumpIfMatch` taken edge: pop the scrutinee, push `arity` payloads.
 fn signed_arity_delta(arity: u32) -> i32 {
     arity.min(i32::MAX as u32) as i32 - 1
+}
+
+/// `CALL` / `MakeCoro`: pop `arity` args, push one result. The callee frame base
+/// is `tell - arity` and the matching return seeks back to it before pushing.
+fn call_arity_delta(arity: u32) -> i32 {
+    1 - arity.min(i32::MAX as u32) as i32
 }
 
 fn effect_il(op: &IlOp, pool: &[u64]) -> Effect {
     match op {
         IlOp::StorePop { slot, .. } => Effect::DeltaThenFloor(-1, slot.saturating_add(1)),
         IlOp::Entry { kind, arity, .. } => match kind {
-            EntryKind::Call | EntryKind::MakeCoro => Effect::Delta(signed_arity_delta(*arity)),
+            EntryKind::Call | EntryKind::MakeCoro => Effect::Delta(call_arity_delta(*arity)),
             EntryKind::TailCall => Effect::Terminator,
             EntryKind::CodePtr | EntryKind::MakePolyFn => Effect::Delta(1),
         },
@@ -543,6 +550,84 @@ mod tests {
         // Const → 1; JMPF pops → 0 on fall-through and taken.
         assert_eq!(info.tell_before(2).known(), Some(0));
         assert_eq!(info.tell_before(3).known(), Some(0));
+    }
+
+    /// `Entry{Call}` must agree with the bytecode `CALL` rule: `-arity + 1`.
+    #[test]
+    fn symbolic_il_call_pops_args_and_pushes_one_result() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Load { slot: 0, loc },
+            IlOp::Load { slot: 1, loc },
+            IlOp::Load { slot: 2, loc },
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 3,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 3);
+        assert_eq!(info.tell_before(3).known(), Some(6));
+        assert_eq!(info.tell_before(4).known(), Some(4));
+    }
+
+    /// Arity 0 is the sharpest anti-regression vs the old `arity - 1` delta (+0):
+    /// a zero-arg call must still push one result (`delta = +1`).
+    #[test]
+    fn symbolic_il_call_arity_zero_pushes_one() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Entry {
+                kind: crate::il::op::EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let info = analyze_il_at(&ops, 2);
+        assert_eq!(info.tell_before(0).known(), Some(2));
+        assert_eq!(info.tell_before(1).known(), Some(3));
+    }
+
+    /// `MakeCoro` shares `call_arity_delta` with `Call` — keep them locked together.
+    #[test]
+    fn symbolic_il_make_coro_matches_call_delta() {
+        let loc = common::DebugLoc::unknown();
+        for arity in [0u32, 1, 3] {
+            let call = vec![
+                IlOp::Entry {
+                    kind: crate::il::op::EntryKind::Call,
+                    arity,
+                    target: Label(0),
+                    loc,
+                },
+                IlOp::Return { loc },
+            ];
+            let coro = vec![
+                IlOp::Entry {
+                    kind: crate::il::op::EntryKind::MakeCoro,
+                    arity,
+                    target: Label(0),
+                    loc,
+                },
+                IlOp::Return { loc },
+            ];
+            let entry = arity + 1;
+            let after_call = analyze_il_at(&call, entry).tell_before(1).known();
+            let after_coro = analyze_il_at(&coro, entry).tell_before(1).known();
+            assert_eq!(
+                after_call, after_coro,
+                "MakeCoro arity {arity} must match Call"
+            );
+            assert_eq!(
+                after_call,
+                Some(entry + 1 - arity),
+                "Call/MakeCoro arity {arity}"
+            );
+        }
     }
 
     /// Unlike bytecode JumpIfMatch, IL carries arity so the taken edge is modelled.

@@ -69,6 +69,12 @@ pub const BUILTIN_THREAD_ERROR_VARIANTS: &[&str] = &[
     "Other",
 ];
 
+/// Largest argument count accepted by the `thread_spawn` host native.
+///
+/// Surface `spawn` takes at most one argument, but auto-par specialization
+/// spawns arbitrary-arity recursive calls directly.
+pub const MAX_THREAD_SPAWN_ARGS: usize = 16;
+
 /// Built-in `EnvError` enum name (virtual `env` module).
 pub const BUILTIN_ENV_ERROR_ENUM: &str = "EnvError";
 

@@ -50,6 +50,48 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially against the VM; any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test.
 
+Only the *bytecode* half of that model is under the differential gate, and the gap has already cost one bug: `effect_il` gave `Entry{Call}` a delta of `arity - 1` (the correct rule for `JumpIfMatch`) instead of `1 - arity`, so every symbolic-IL cursor past a call was wrong. Extending `cursor_model.rs` to diff the symbolic-IL path as well would close it.
+
+**Slot promotion only moves what the cursor proves.** `opt::slot_promote` drops a `STORE t` reached with the cursor at `t + 1` (TOS already *is* slot `t`, so the write and the store's own floor are both no-ops) together with the reload run in front of a `TailCall` whose arguments are already the top `arity` stack positions. It fires only when every surviving reference to the slot is dropped with it, because eliding the store leaves the slot defined by a bare push that no slot-tracking pass can see — hence it also runs *after* per-body GVN. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Store to a slot nothing reads | Dead code, not promotion — `dead_store`'s cursor proof owns that call |
+| Reload run in front of `CALL` | The callee frame base is `tell - arity`; a lower `tell` moves it down over caller slots, which needs slot liveness |
+| `LOAD t; RETURN` (cursor-provable) | Measured net loss: it is the suffix the whole-buffer return convoys sink into a join, and eliding it in one predecessor kills the sink |
+| Coalescing a copy whose destination is read in between | `mandelbrot`'s `tr → zr` needs the def sunk past the `zi` read — scheduling, not promotion |
+| Anything inside a loop whose body raises the cursor | The header cursor is genuinely `Unknown` (see `il::tell`), so no store in the body is provably redundant. This is what still holds `mandelbrot`'s 13 STOREs: normalizing the back edge with a `Seek` would make the header `Known` and turn all three inner temps into self-stores, at one dispatch per iteration |
+| Pool-packed fused slot operands (`BinSlot*Store` / `BinSlot*Jmpf`), `Seek`, `UnpackAt` | Destination slot is not readable from symbolic IL — the whole body is refused |
+
+**Counted-loop bounds analysis proves length invariance, not in-bounds indices.** `il::bounds` answers one question per natural loop: can the length of the arrays this loop addresses change while it runs? Element writes cannot — `StoreIndex` overwrites a slot in place — so `while i < len(a) { a[i] = 0; }` has an invariant `len(a)` even though the array is mutated. On that proof two invariant materializations move to the preheader: the `LOAD a; ArrayLen; STORE t` triple codegen leaves in the loop header, and the `CONST imm; STORE t` pair that materializes a constant addressing operand (`vec_scan` 6.58M → 5.01M dispatches, `nsieve` 545.6k → 469.9k). **No bounds check is removed**: `Index` / `StoreIndex` keep the in-VM range test, so an out-of-range read still yields `-1` and an out-of-range write is still a no-op.
+
+The safety argument is the cursor, not liveness: the preheader `STORE t` floors the cursor at `t + 1`, and because the cursor is monotone in its input, proving every in-loop stack height stays at or above the header's proves every in-loop push lands above `t`. That is why the pass needs only `il::sp`, and why it works where `slot_promote` cannot — it *adds* a floor instead of removing one. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Any call, host native, `GetField`/`SetField`, or unmodelled op in the body | The callee could hold another reference to the array and `push`/`pop` it. This is the single biggest coverage gap: most stdlib `while i < len(b)` loops call a helper on `b[i]` |
+| `ArrayPush` / `MakeArray` / `MakeDict` / `CodePtr` / `MakePolyFn` in the body | Length can change (`tests/positive/while_len_grow.hy`) or user code can run |
+| A rebound `Vec` local (`slots_stored_in_loop`) | A different array each pass, so its length is not invariant |
+| An `Index` / `StoreIndex` whose target is not a plain slot load | Nested `a[i][j]`, a `Dup`, a call result: the walk-back cannot name the array, so the whole loop is refused |
+| A loop that computes `len(a)` but addresses no array | Outside P2's remit; nothing licenses reasoning about aliasing there |
+| A body whose stack height dips below the header's | The preheader floor would not survive, so a later push could land on the temp |
+| A temp read before its def in the body, or outside the loop | The hoist changes what the earlier read observes; the cursor floor also stops protecting the slot once control leaves the loop |
+| **`0 <= i < len` itself** | Implemented nowhere: with no unchecked opcode there is no consumer for the fact. Induction-variable detection plus a monotonicity proof is the next slice, and it only pays off together with an `IndexUnchecked`-style form or an in-VM object-lookup cache — both opcode/ABI decisions |
+| The `find_object_by_addr` lookup each `Index` still pays | Caching the resolved array across a loop means keeping a heap address live in IL across a GC point; the length is an `int`, which is why it hoists and the object does not |
+
+**The caller-side predicate peel only pays when it spills nothing.** When a callee opens with a pure guard over its parameters and returns an immediate or a parameter from that arm, codegen evaluates the guard at the call site so base cases skip the frame. Arguments that compile to a single pure byte (one slot load, one constant) are re-materialized in both the guard and the argument prep instead of being stored to a temp, which drops one `STORE` plus one spill `LOAD` per argument and leaves the guard reading the caller's own locals (peel-heavy loop: 4.28G → 3.29G instructions, 189ms → 152ms). Anything longer than a byte still takes a temp, because the guard copy and the call copy would each pay for it.
+
+That byte budget is the whole profitability margin, and it is what rules out peeling a *self*-recursive call. A frame in this VM costs about two dispatches — `CALL`, then a fused `LoadReturnSlot` / `ConstReturnImm` that returns the base-case value — while the callee's guard is usually one fused `BinSlotSlotJmpf`. A peeled site has to re-emit that guard unfused (the operands are now caller expressions, not callee slots), add a `JMP` over the base arm, and store the join value, so it costs more than the frame it avoids *and* non-base calls pay the guard twice. Measured on `tak`, where 54% of the 63,609 calls hit the base case immediately: peeling all three inner self-calls grew the body from 13 to 41 words and cost +73.5% VM instructions and +31.4% wall time. Deliberately refused:
+
+| Refused | Why |
+|---------|-----|
+| Self-recursive call sites | Callee span is not recorded until its body is compiled; reading the in-progress body works, but the peel loses to the frame (above) |
+| A base-case value that is not returned | The peel replaces the callee's `return`; a value that falls through to the join is a different result |
+| An argument longer than one pure byte, in the guard | Re-materializing it duplicates real work; it keeps its spill slot |
+| Any argument with a side effect | The guard reads some arguments before the others are evaluated, and the false path evaluates them again |
+| Instance methods, rest params, coroutines, un-monomorphized generics | The peel replicates the callee ABI, and `CallIndirect` receivers are not covered |
+| A call site that is not saturated | Partial application lowers to `MakeFn`, not `CALL` |
+
 **`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `BinSlotSlotConstJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`. **Near-miss (Phase 4):** fused `*Jmpf; JMP` (mandelbrot escape break) is tallied as `would_be_jmpt_after_invert` in `perf_metrics`. Scored go/no-go for this and other residual families: [optimization-roadmap.md — Opcode candidate ledger](optimization-roadmap.md#opcode-candidate-ledger-register-win-harvest-phase-5) (Phase 5; no opcodes implemented from the ledger yet).
 
 ## Test / CI reliability (high–medium)

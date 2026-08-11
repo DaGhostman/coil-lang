@@ -103,16 +103,13 @@ check_archive() {
 compile_perf() {
     local name="$1"
     local archive="$2"
-    # fib(32) is a sequential recursion baseline; keep auto-par off so Coil
-    # matches the naive Lua/Node ports rather than fork-join specializations.
-    if [[ "$name" == "fib" ]]; then
-        COIL_AUTO_PAR=0 "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
-    else
-        "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
-    fi
+    # Sequential baseline row: keep auto-par off so Coil matches the naive
+    # Lua/Node ports rather than fork-join specializations (fib(32) especially).
+    COIL_AUTO_PAR=0 "$BIN" compile "examples/perf/${name}.hy" -o "$archive" >/dev/null
 }
 
 for name in "${CROSS_LANG[@]}"; do
+    # Fair sequential row vs Lua/Node (IPA off). Same sources; only COIL_AUTO_PAR differs.
     archive="$OUT_DIR/${name}.hyc"
     compile_perf "$name" "$archive"
     touch "$archive"
@@ -122,6 +119,21 @@ for name in "${CROSS_LANG[@]}"; do
         "lua benchmarks/${name}.lua" \
         "node benchmarks/${name}.js"
     run_resource_sample "$name" "$BIN run $archive"
+
+    # Default IPA on — evidence that principle-based auto-par helps when sites exist.
+    archive_par="$OUT_DIR/${name}_autopar.hyc"
+    "$BIN" compile "examples/perf/${name}.hy" -o "$archive_par" >/dev/null
+    touch "$archive_par"
+    got_par="$("$BIN" run "$archive_par")"
+    if [[ "$got_par" != "${EXPECTED[$name]}" ]]; then
+        echo "checksum mismatch for ${name}_autopar: expected ${EXPECTED[$name]}, got $got_par" >&2
+        exit 1
+    fi
+    printf -- '- checksum `%s_autopar`: `%s`\n' "$name" "$got_par" >>"$OUT_DIR/README.md"
+    run_pooped "${name}_autopar" \
+        "$BIN run $archive_par" \
+        "lua benchmarks/${name}.lua" \
+        "node benchmarks/${name}.js"
 
     if [[ "$RUN_MASSIF" == 1 ]] && command -v valgrind >/dev/null 2>&1; then
         valgrind --tool=massif \

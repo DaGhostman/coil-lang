@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use parser::ast::{Expression, Output};
+use parser::ast::{EnumConstructPayload, Expression, Output};
 
 /// Names of user functions that are pure and self-recursive.
 pub type RecursivePureSet = HashSet<String>;
@@ -128,29 +128,46 @@ fn collect_toplevel_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) 
     }
 }
 
+/// Names of user functions with no observable side effects.
+///
+/// Unlike [`analyze_recursive_pure`] this keeps non-recursive functions, so
+/// callers that only need "safe to evaluate on another thread" (loop IPA) can
+/// admit ordinary helpers such as `fn sq(int i) -> int { i * i }`.
+pub fn analyze_pure_fns(ast: &Output<'_>) -> HashSet<String> {
+    let facts = collect_fn_facts(ast);
+    let impure = impure_closure(&facts);
+    facts
+        .keys()
+        .filter(|name| !impure.contains(*name))
+        .cloned()
+        .collect()
+}
+
 /// Analyze top-level / nested `fn` declarations and return self-recursive pure names.
 pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
     let facts = collect_fn_facts(ast);
-    let user_fns: HashSet<String> = facts.keys().cloned().collect();
+    let impure = impure_closure(&facts);
+    facts
+        .iter()
+        .filter(|(name, f)| !impure.contains(*name) && f.callees.contains(*name))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
 
-    // Fixed-point: impure if local_impure or any callee is impure / non-user.
+/// Fixed point of "impure if locally impure, or any callee is impure / not a
+/// user `fn`" over the call graph.
+fn impure_closure(facts: &HashMap<String, FnFacts>) -> HashSet<String> {
+    let user_fns: HashSet<&String> = facts.keys().collect();
     let mut impure: HashSet<String> = HashSet::new();
-    for (name, f) in &facts {
-        if f.local_impure {
+    for (name, f) in facts {
+        if f.local_impure || f.callees.iter().any(|c| !user_fns.contains(c)) {
             impure.insert(name.clone());
-            continue;
-        }
-        for c in &f.callees {
-            if !user_fns.contains(c) {
-                impure.insert(name.clone());
-                break;
-            }
         }
     }
     let mut changed = true;
     while changed {
         changed = false;
-        for (name, f) in &facts {
+        for (name, f) in facts {
             if impure.contains(name) {
                 continue;
             }
@@ -160,17 +177,7 @@ pub fn analyze_recursive_pure(ast: &Output<'_>) -> RecursivePureSet {
             }
         }
     }
-
-    let mut out = RecursivePureSet::new();
-    for (name, f) in &facts {
-        if impure.contains(name) {
-            continue;
-        }
-        if f.callees.contains(name) {
-            out.insert(name.clone());
-        }
-    }
-    out
+    impure
 }
 
 fn collect_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) {
@@ -301,6 +308,19 @@ fn collect_nested_fns(ast: &Output<'_>, facts: &mut HashMap<String, FnFacts>) {
                 collect_nested_fns(&arm.body, facts);
             }
         }
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    collect_nested_fns(item, facts);
+                }
+            }
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    collect_nested_fns(&f.value, facts);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
         Expression::For {
             init,
             cond,
@@ -472,6 +492,21 @@ fn walk_body(ast: &Output<'_>, facts: &mut FnFacts) {
                 walk_body(&arm.body, facts);
             }
         }
+        // Constructor payloads hold arbitrary expressions — skipping them hid
+        // both impure calls and enum-building self-recursion.
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    walk_body(item, facts);
+                }
+            }
+            EnumConstructPayload::Record(fields) => {
+                for f in fields {
+                    walk_body(&f.value, facts);
+                }
+            }
+            EnumConstructPayload::Unit => {}
+        },
         Expression::For {
             init,
             cond,
@@ -628,6 +663,28 @@ fn main() { return; }
         assert!(!set.contains("add"));
     }
 
+    /// `analyze_pure_fns` keeps the non-recursive helpers that loop IPA needs.
+    #[test]
+    fn analyze_pure_fns_keeps_non_recursive_helpers() {
+        let ast = parse_ast(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn add(int a, int b) -> int { return a + b; }
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn relay(int n) -> int { return shout(n); }
+fn main() { return; }
+"#,
+        );
+        let set = analyze_pure_fns(&ast);
+        assert!(set.contains("add"), "{set:?}");
+        assert!(!set.contains("shout"), "{set:?}");
+        assert!(!set.contains("relay"), "impurity propagates: {set:?}");
+    }
+
     #[test]
     fn impurity_propagates_through_callees() {
         let set = pure_set(
@@ -689,6 +746,83 @@ fn main() { return; }
         assert!(
             !set.contains("a") && !set.contains("b"),
             "only self-recursive pure fns are auto-par candidates: {set:?}"
+        );
+    }
+
+    /// Skipping `Construct` payloads hid IO inside `Tree::Node(shout(n), …)`.
+    #[test]
+    fn impure_call_in_enum_ctor_payload_marks_impure() {
+        let set = pure_set(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Box {
+    Wrap(int),
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn pack(int n) -> Box {
+    if n <= 0 { return Box::Wrap(0); }
+    return Box::Wrap(shout(n));
+}
+fn main() { return; }
+"#,
+        );
+        assert!(!set.contains("shout"), "shout uses IO: {set:?}");
+        assert!(
+            !set.contains("pack"),
+            "impurity in a constructor payload must reach the enclosing fn: {set:?}"
+        );
+    }
+
+    /// Self-calls that only appear inside `Tree::Node(…)` must still mark the
+    /// builder recursive-pure so EnumCtor IPA can fire.
+    #[test]
+    fn self_recursion_only_via_enum_ctor_is_recursive_pure() {
+        let set = pure_set(
+            r#"
+enum Tree {
+    Leaf,
+    Node(Tree, Tree),
+}
+fn build(int n) -> Tree {
+    if n <= 1 { return Tree::Leaf; }
+    return Tree::Node(build(n - 1), build(n - 2));
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            set.contains("build"),
+            "enum-building self-recursion must be recursive-pure: {set:?}"
+        );
+    }
+
+    /// Record-payload constructors are walked the same way as tuple ones.
+    #[test]
+    fn impure_call_in_record_enum_ctor_payload_marks_impure() {
+        let set = pure_set(
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+enum Cell {
+    Val { x: int },
+}
+fn shout(int n) -> int {
+    write(stdout(), to_bytes(format("%i", n)));
+    return n;
+}
+fn pack(int n) -> Cell {
+    return Cell::Val { x: shout(n) };
+}
+fn main() { return; }
+"#,
+        );
+        assert!(
+            !set.contains("pack"),
+            "record ctor payloads must not hide impurity: {set:?}"
         );
     }
 }
