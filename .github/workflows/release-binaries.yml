@@ -52,8 +52,6 @@ jobs:
             libc: ""
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - name: Install system deps (Ubuntu glibc)
         if: runner.os == 'Linux' && matrix.libc == 'gnu'

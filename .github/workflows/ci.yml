@@ -63,8 +63,11 @@ jobs:
               mode: test
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
         with:
-          submodules: true
+          repository: ardax-corp/coil-stdlib
+          path: .deps/coil-stdlib
 
       - name: Install system deps (Ubuntu)
         if: runner.os == 'Linux'
@@ -118,7 +121,6 @@ jobs:
         if: matrix.features.id == 'default'
         run: |
           ./target/debug/coil test
-          ./target/debug/coil test stdlib/tests
 
       - name: Showcase project tests
         if: matrix.features.id == 'default'

@@ -1,7 +1,31 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Absolute path to coil-stdlib `src/` (sibling clone or `.deps/` checkout).
+fn workspace_stdlib() -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate parent");
+    if let Ok(p) = std::env::var("COIL_STDLIB") {
+        return PathBuf::from(p);
+    }
+    let candidates = [
+        workspace.join(".deps/coil-stdlib/src"),
+        workspace
+            .parent()
+            .unwrap_or(workspace)
+            .join("coil-stdlib/src"),
+    ];
+    for c in candidates {
+        if c.is_dir() {
+            return c;
+        }
+    }
+    workspace.join(".deps/coil-stdlib/src")
+}
 
 use compiler::Pipeline;
 use machine::Machine;
@@ -7553,9 +7577,6 @@ fn main() {
 /// COI-18: in-memory compile must not fail closed on warnings alone.
 #[test]
 fn compile_src_from_file_succeeds_with_only_warnings() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root");
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7580,7 +7601,7 @@ fn main() {
         dir.join("coil.toml"),
         format!(
             "[module]\nroots = [\"{}\"]\n[env]\nallow_exec = true\n",
-            workspace_root.join("stdlib").join("src").display()
+            workspace_stdlib().display()
         ),
     )
     .expect("write coil.toml");

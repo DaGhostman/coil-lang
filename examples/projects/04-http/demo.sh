@@ -27,9 +27,18 @@ cleanup() {
 trap cleanup EXIT
 
 # Absolute stdlib root so temp cwd still resolves http::*
+STDLIB=""
+if [[ -d "$ROOT/.deps/coil-stdlib/src" ]]; then
+  STDLIB="$ROOT/.deps/coil-stdlib/src"
+elif [[ -d "$ROOT/../coil-stdlib/src" ]]; then
+  STDLIB="$ROOT/../coil-stdlib/src"
+else
+  echo "clone coil-stdlib as ../coil-stdlib or $ROOT/.deps/coil-stdlib" >&2
+  exit 1
+fi
 cat > "$CLI_DIR/coil.toml" << EOF
 [module]
-roots = ["./src", "$ROOT/stdlib/src"]
+roots = ["./src", "$STDLIB"]
 EOF
 mkdir -p "$CLI_DIR/src"
 cp "$HERE/src/main.hy" "$CLI_DIR/src/main.hy"

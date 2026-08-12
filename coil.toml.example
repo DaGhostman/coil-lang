@@ -18,11 +18,11 @@
 # Search roots for `use` resolution. Each path is relative to the
 # directory containing this `coil.toml` file. The compiler searches
 # the roots in order; the first file that exists wins.
-# Include the coil-stdlib tree (`./stdlib/src` in this repo's submodule)
+# Include coil-stdlib `src/` (sibling clone or `.deps/coil-stdlib/src`)
 # to import `http::client`, etc.
 # After `spool install`, include `"./.spool/deps"` for managed library deps.
 # For unprefixed stdlib imports via spool, use `"./.spool/deps/stdlib"`.
-roots = ["./src", "./vendor", "./stdlib/src"]
+roots = ["./src", "./vendor", "../coil-stdlib/src"]
 
 # The default roots (when no `coil.toml` exists) are just `["src"]`.
 
@@ -55,7 +55,7 @@ roots = ["./src", "./vendor", "./stdlib/src"]
 #
 #   1. ./src/foo/bar/baz.hy          (one-item-per-file)
 #   2. ./src/foo/bar.hy              (item inside module file)
-#   3. ./vendor/... then ./stdlib/src/...
+#   3. ./vendor/... then ../coil-stdlib/src/...
 #
 # The first file that exists wins. The file's namespace is the path
 # RELATIVE to the matching root, with the extension stripped and

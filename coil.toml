@@ -1,9 +1,10 @@
 # Project manifest for the coil workspace / examples.
 # Roots include `examples/src` so `cargo run -- examples/modules.hy`
-# can resolve `use foo::sadge;`.
+# can resolve `use foo::sadge;`. Userland stdlib is [coil-stdlib](https://github.com/ardax-corp/coil-stdlib):
+# clone it as a sibling (`../coil-stdlib`) or under `.deps/coil-stdlib`.
 
 [module]
-roots = ["./src", "./examples/src", "./stdlib/src"]
+roots = ["./src", "./examples/src", "./.deps/coil-stdlib/src", "../coil-stdlib/src"]
 
 [ffi]
 search_paths = ["./examples"]
