@@ -405,6 +405,13 @@ impl CodeBuf {
         self.il.splice_code_at(code_pos, inserted);
     }
 
+    /// Splice another buffer's IL before logical code index `code_pos`,
+    /// remapping labels into this buffer's namespace.
+    pub fn splice_buf_at(&mut self, code_pos: usize, other: CodeBuf) {
+        self.invalidate_lowered();
+        self.il.splice_code_at(code_pos, other.il);
+    }
+
     pub fn insert_jump_at(&mut self, code_pos: usize, target: Label) {
         let mut emitting = 0usize;
         let mut raw_idx = self.il.raw_len();

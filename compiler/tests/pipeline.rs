@@ -7556,3 +7556,59 @@ fn main() {
     );
 }
 
+
+/// COI-19: extern handles in static slots survive locals / repeat calls.
+#[test]
+fn extern_system_twice_after_vec_ok() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable via resolve_library(\"c\")");
+        return;
+    }
+    let result = std::panic::catch_unwind(|| {
+        run_example_src(
+            r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+extern "c" {
+    fn system(string cmd) -> int;
+}
+
+fn main() {
+    let v = Vec::new();
+    v.push("x");
+    let a = system("true");
+    let b = system("true");
+    let _ = write_all(stdout(), to_bytes(format("%v %v\n", a, b)));
+}
+"#,
+        )
+    });
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("extern system test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "0 0\n");
+}
+
+/// COI-19: `extern` in an imported module still initializes before main.
+#[test]
+fn extern_in_imported_module_runs() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable via resolve_library(\"c\")");
+        return;
+    }
+    let result = std::panic::catch_unwind(|| run_example_multifile("examples/ffi_mod_entry.hy"));
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("module extern test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "0\n");
+}

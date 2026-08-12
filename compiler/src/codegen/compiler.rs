@@ -182,12 +182,10 @@ impl Compiler {
     }
 
     /// Prologue `JMP` target: static initializers and/or `extern` setup
-    /// run at `program_start_offset`; otherwise jump straight to `main`.
+    /// run at `setup_entry_offset`; otherwise jump straight to `main`.
     pub fn prologue_jmp_target(&self) -> u32 {
-        if self.static_slot_count() > 0 {
+        if self.static_slot_count() > 0 || self.has_extern_block() {
             self.setup_entry_offset
-        } else if self.has_extern_block() {
-            self.program_start_offset
         } else {
             self.functions
                 .get("main")
@@ -11556,18 +11554,26 @@ impl Compiler {
                 library,
                 declarations,
             } => {
-                // Append to self.bytecode so extern bytes run before main.
+                // Emit into `ffi_init` so setup is spliced into the prologue
+                // at finalize — works for `extern` in imported modules too.
+                std::mem::swap(&mut self.bytecode, &mut self.ffi_init);
+                // Extern lib / fn-id handles live in static slots so function
+                // locals (which share the prologue frame and restart at slot 0)
+                // cannot overwrite them — that produced `invalid library handle`
+                // on a second call or after any earlier `let`.
                 let lib_slot =
                     if let Some(&existing) = self.extern_runtime_libs.get(library.as_str()) {
                         existing
                     } else {
-                        let name = format!("__ext_lib_{}", library);
-                        let slot = self.context.variables.intern(name) as u32;
+                        let fqn = format!("__ext_lib_{}", library);
+                        let slot = self.checker.alloc_synthetic_static_slot(
+                            fqn,
+                            crate::typechecking::ty::int(),
+                        );
                         self.extern_runtime_libs.insert(library.clone(), slot);
                         slot
                     };
-                // 2. dlopen the library (only on the first
-                //    occurrence across the whole compile).
+                // dlopen once per library short name for the compile unit.
                 if !self.extern_runtime_libs_loaded.contains(library.as_str()) {
                     self.extern_runtime_libs_loaded.insert(library.clone());
                     let span: SimpleSpan = (0..0).into();
@@ -11579,10 +11585,11 @@ impl Compiler {
                     self.bytecode.append(&mut bc);
                     self.bytecode.push(Byte::new(Instruction::FfiLoad));
                     self.emit_result_unwrap_or_panic();
-                    self.bytecode.push_store_pop(lib_slot);
+                    self.bytecode
+                        .push(Byte::new(Instruction::StoreStatic).with_operand_u32(lib_slot));
                 }
-                // 3. For each declared function, emit declare(lib,
-                //    name, (arg_tags...), ret) and store fn id.
+                // For each declared function, emit declare(lib, name, …) and
+                // store the fn id in a static slot.
                 for decl in declarations {
                     let fn_name = decl.name.to_string();
                     let nfixed = if let Expression::Fragment(items) = decl.args.1.as_ref() {
@@ -11604,10 +11611,14 @@ impl Compiler {
                     if self.extern_runtime_functions.contains_key(&table_name) {
                         continue;
                     }
-                    let fn_id_slot_name = format!("__ext_fn_{}", table_name);
-                    let fn_id_slot = self.context.variables.intern(fn_id_slot_name) as u32;
+                    let fn_id_fqn = format!("__ext_fn_{}", table_name);
+                    let fn_id_slot = self.checker.alloc_synthetic_static_slot(
+                        fn_id_fqn,
+                        crate::typechecking::ty::int(),
+                    );
                     // Push the library handle.
-                    self.bytecode.push_load(lib_slot);
+                    self.bytecode
+                        .push(Byte::new(Instruction::LoadStatic).with_operand_u32(lib_slot));
                     // Push the function name (string literal).
                     let span: SimpleSpan = (0..0).into();
                     let sym = decl.symbol.unwrap_or(decl.name);
@@ -11679,10 +11690,12 @@ impl Compiler {
                         .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
                     self.emit_result_unwrap_or_panic();
                     // Store the function id.
-                    self.bytecode.push_store_pop(fn_id_slot);
+                    self.bytecode
+                        .push(Byte::new(Instruction::StoreStatic).with_operand_u32(fn_id_slot));
                     self.extern_runtime_functions
                         .insert(table_name, (lib_slot, fn_id_slot));
                 }
+                std::mem::swap(&mut self.bytecode, &mut self.ffi_init);
             }
             Expression::EnumDecl {
                 docs: _,
@@ -14065,8 +14078,10 @@ impl Compiler {
                 };
                 let variadic = self.checker.is_extern_variadic(&n);
                 let depth_on_entry = self.expr_depth;
-                self.bytecode.push_load(lib_slot);
-                self.bytecode.push_load(fn_id_slot);
+                self.bytecode
+                    .push(Byte::new(Instruction::LoadStatic).with_operand_u32(lib_slot));
+                self.bytecode
+                    .push(Byte::new(Instruction::LoadStatic).with_operand_u32(fn_id_slot));
                 self.expr_depth = depth_on_entry + 2;
                 if let Some(items) = args {
                     for arg in items {
@@ -14620,47 +14635,62 @@ impl Compiler {
     }
 
     fn finalize_bytecode_inner(&mut self, capture_il: bool) -> FinalizeIlOut {
-        // Splice static initializers into the IL before lower — no absolute
-        // target bumping required for symbolic jumps.
-        let static_init_region = if !self.static_init_bytecode.is_empty() {
-            let pos = self.program_start_offset as usize;
-            self.setup_entry_offset = pos as u32;
+        // Splice static initializers + `extern` setup into the IL before lower.
+        // Order: user static inits, then FFI dlopen/declare, then JMP → main.
+        let setup_pos = self.program_start_offset as usize;
+        let mut init_len = 0usize;
+
+        if !self.static_init_bytecode.is_empty() {
+            self.setup_entry_offset = setup_pos as u32;
             let inits = std::mem::take(&mut self.static_init_bytecode);
-            let init_len = inits.len();
-            self.bytecode.splice_bytes_at(pos, inits);
-            self.bytecode.bump_absolute_entry_targets(pos, init_len);
-            self.bytecode.bump_func_spans(pos, init_len);
-            // Splice inserts before any label at `pos`; ensure the init
-            // region itself is labeled so dead_block keeps it.
-            self.bytecode.entry_label_at(pos);
+            let n = inits.len();
+            self.bytecode.splice_bytes_at(setup_pos + init_len, inits);
+            self.bytecode
+                .bump_absolute_entry_targets(setup_pos + init_len, n);
+            self.bytecode.bump_func_spans(setup_pos + init_len, n);
+            init_len += n;
+        }
+
+        if !self.ffi_init.is_empty() {
+            self.setup_entry_offset = setup_pos as u32;
+            let ffi = std::mem::take(&mut self.ffi_init);
+            let n = ffi.len();
+            self.bytecode.splice_buf_at(setup_pos + init_len, ffi);
+            self.bytecode
+                .bump_absolute_entry_targets(setup_pos + init_len, n);
+            self.bytecode.bump_func_spans(setup_pos + init_len, n);
+            init_len += n;
+        }
+
+        let static_init_region = if init_len > 0 {
+            self.bytecode.entry_label_at(setup_pos);
             self.program_start_offset += init_len as u32;
             for offset in self.functions.values_mut() {
-                if *offset >= pos {
+                if *offset >= setup_pos {
                     *offset += init_len;
                 }
             }
             for (_, offset) in self.test_cases.iter_mut() {
-                if (*offset as usize) >= pos {
+                if (*offset as usize) >= setup_pos {
                     *offset += init_len as u32;
                 }
             }
             for offset in self.mono_offsets.values_mut() {
-                if *offset >= pos {
+                if *offset >= setup_pos {
                     *offset += init_len;
                 }
             }
-            Some((pos, init_len))
+            Some((setup_pos, init_len))
         } else {
             None
         };
 
-        // After static inits, insert JMP → main at the end of the init region.
-        // Prefer the entry label already bound when `main` was emitted.
+        // After setup region, insert JMP → main.
         let main_off = self.functions.get("main").copied();
         if let (Some((pos, init_len)), Some(main_off)) = (static_init_region, main_off) {
             let jmp_pos = pos + init_len;
-            let main_label = self.bytecode.entry_label_at(main_off);
-            self.bytecode.insert_jump_at(jmp_pos, main_label);
+            let target_label = self.bytecode.entry_label_at(main_off);
+            self.bytecode.insert_jump_at(jmp_pos, target_label);
             self.bytecode.bump_absolute_entry_targets(jmp_pos, 1);
             self.bytecode.bump_func_spans(jmp_pos, 1);
             for offset in self.functions.values_mut() {
