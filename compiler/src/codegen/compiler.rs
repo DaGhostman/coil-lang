@@ -2983,11 +2983,28 @@ impl Compiler {
                 self.expr_may_clobber_operand_stack(v)
             }
             Expression::Call { .. } | Expression::Match { .. } => true,
+            // `new Class(...)` StorePops the instance then Seek(tmp+1), which
+            // clears any live operand left under the constructor (e.g. the
+            // receiver of an inlined `Vec::push`).
+            Expression::Instantiate(_, _) => true,
+            Expression::Construct { fields, .. } => {
+                use parser::ast::EnumConstructPayload;
+                match fields {
+                    EnumConstructPayload::Unit => false,
+                    EnumConstructPayload::Tuple(args) => args
+                        .iter()
+                        .any(|a| self.expr_may_clobber_operand_stack(a)),
+                    EnumConstructPayload::Record(parts) => parts
+                        .iter()
+                        .any(|p| self.expr_may_clobber_operand_stack(&p.value)),
+                }
+            }
             Expression::Negate(e)
             | Expression::Not(e)
             | Expression::LogicalNot(e)
             | Expression::Positive(e)
-            | Expression::Cast(e, _) => self.expr_may_clobber_operand_stack(e),
+            | Expression::Cast(e, _)
+            | Expression::Try(e) => self.expr_may_clobber_operand_stack(e),
             Expression::Add(a, b)
             | Expression::Sub(a, b)
             | Expression::Mul(a, b)
@@ -13701,16 +13718,47 @@ impl Compiler {
                         offset
                     };
                     // Inline `Vec::push` as ArrayPush — avoids CALL/frame for fill loops.
+                    // Stage when the value may STORE/Seek (format, match, `new
+                    // Class`, …): locals and the operand stack share memory, so
+                    // leaving the vec under a clobbering emit drops the push.
+                    // Format/match/host write into `self.bytecode` (not the
+                    // local buffer), so those paths stage on `self.bytecode`
+                    // before returning.
                     if fqn == format!("{}::push", common::BUILTIN_VEC_TYPE)
                         && args.as_ref().map(|a| a.len()) == Some(1)
                     {
-                        bytecode.append(&mut self.do_compile(recv));
                         let arg = &args.as_ref().unwrap()[0];
                         let value = match arg.1.as_ref() {
                             Expression::NamedArg(_, v) => v,
                             _ => arg,
                         };
-                        bytecode.append(&mut self.do_compile(value));
+                        if self.arg_emits_on_self_bytecode(value) {
+                            let recv_bc = self.do_compile(recv);
+                            self.bytecode.extend(recv_bc);
+                            let recv_tmp = self.alloc_temp_slot();
+                            self.bytecode.push_store_pop(recv_tmp);
+                            let _ = self.do_compile(value);
+                            let val_tmp = self.alloc_temp_slot();
+                            self.bytecode.push_store_pop(val_tmp);
+                            self.bytecode.push_load(recv_tmp);
+                            self.bytecode.push_load(val_tmp);
+                            self.bytecode.push(Byte::new(Instruction::ArrayPush));
+                            self.bytecode.push_pop();
+                            self.bytecode.push_const(0);
+                            return bytecode;
+                        }
+                        bytecode.append(&mut self.do_compile(recv));
+                        if self.expr_may_clobber_operand_stack(value) {
+                            let recv_tmp = self.alloc_temp_slot();
+                            bytecode.push_store_pop(recv_tmp);
+                            bytecode.append(&mut self.do_compile(value));
+                            let val_tmp = self.alloc_temp_slot();
+                            bytecode.push_store_pop(val_tmp);
+                            bytecode.push_load(recv_tmp);
+                            bytecode.push_load(val_tmp);
+                        } else {
+                            bytecode.append(&mut self.do_compile(value));
+                        }
                         bytecode.push(Byte::new(Instruction::ArrayPush));
                         bytecode.push_pop();
                         bytecode.push_const(0);
