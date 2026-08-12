@@ -761,9 +761,9 @@ pub struct Compiler {
     /// Top-level items per namespace (legacy; disk `::*` no longer expands).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
-    /// Let-slot holding each extern library handle.
+    /// Let-slot holding each extern library handle (now a static slot index).
     extern_runtime_libs: HashMap<String, u32>,
-    /// Source name → (lib_slot, fn_id_slot) for runtime FFI calls.
+    /// Source name → (lib_static_slot, fn_id_static_slot) for runtime FFI calls.
     extern_runtime_functions: HashMap<String, (u32, u32)>,
     /// Records which FFI library short names have already
     /// been loaded in the current compilation unit. Cleared
@@ -847,6 +847,11 @@ pub struct Compiler {
 
     /// Bytecode for global static initializers (spliced at `program_start_offset`).
     static_init_bytecode: Vec<Byte>,
+
+    /// `extern` dlopen/declare setup accumulated across modules, spliced into
+    /// the prologue setup region at finalize (so imported-module `extern`
+    /// still runs before `main`).
+    ffi_init: CodeBuf,
 
     /// True while compiling an `impl` method — Function resets locals
     /// and reserves slot 0 for `self`.
@@ -1007,6 +1012,7 @@ impl Default for Compiler {
             mono_offsets: HashMap::new(),
             mono_codegen_var_types: Vec::new(),
             static_init_bytecode: Vec::new(),
+            ffi_init: CodeBuf::new(),
             current_source_file: None,
             source_file_indices: std::collections::BTreeMap::new(),
             source_file_list: Vec::new(),

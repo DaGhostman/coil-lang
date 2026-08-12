@@ -1170,8 +1170,8 @@ impl Pipeline {
             *byte = Byte::new(Instruction::JMP).with_operand_u32(jmp_target);
         }
 
-        // In-memory API: any diagnostic (error or warning) is a failure.
-        if !self.compiler_lazy_mut().get_messages().is_empty() {
+        // Warnings are kept for callers to inspect; only hard errors fail.
+        if self.had_errors() {
             return Err(());
         }
 
@@ -1224,7 +1224,8 @@ impl Pipeline {
             *byte = Byte::new(Instruction::JMP).with_operand_u32(jmp_target);
         }
 
-        if !self.compiler_lazy_mut().get_messages().is_empty() {
+        // Warnings are kept for callers to inspect; only hard errors fail.
+        if self.had_errors() {
             return Err(());
         }
 

@@ -848,7 +848,12 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
-    fn gc_collect(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
+    fn gc_collect(
+        heap: &mut Heap,
+        stack: &Stack<Value>,
+        resume_stack: &[ResumeCtx],
+        statics: &[Value],
+    ) {
         #[cfg(any(test, feature = "vm_profile"))]
         VM_GC_COUNT.with(|c| {
             c.fetch_add(1, Ordering::Relaxed);
@@ -856,6 +861,15 @@ impl<const S: usize> Machine<S> {
         let mut roots = heap.take_gc_roots();
         // Only live operand-stack slots (not the full capacity buffer).
         for v in stack.as_slice() {
+            let addr = v.raw() as u64;
+            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+                roots.push(addr);
+            }
+        }
+
+        // Global static slots (`LoadStatic` / `StoreStatic`), including
+        // `extern` library handles.
+        for v in statics {
             let addr = v.raw() as u64;
             if addr != 0 && heap.find_object_by_addr(addr).is_some() {
                 roots.push(addr);
@@ -904,9 +918,14 @@ impl<const S: usize> Machine<S> {
 
     /// Run GC when live heap bytes exceed the heap threshold.
     #[inline]
-    fn maybe_gc_after_alloc(heap: &mut Heap, stack: &Stack<Value>, resume_stack: &[ResumeCtx]) {
+    fn maybe_gc_after_alloc(
+        heap: &mut Heap,
+        stack: &Stack<Value>,
+        resume_stack: &[ResumeCtx],
+        statics: &[Value],
+    ) {
         if unlikely(heap.should_collect()) {
-            Self::gc_collect(heap, stack, resume_stack);
+            Self::gc_collect(heap, stack, resume_stack, statics);
         }
     }
 
@@ -1041,7 +1060,7 @@ impl<const S: usize> Machine<S> {
         let gc_string = self.heap.intern(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
-        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
     }
 
     fn push_program_string(&mut self, idx: usize) {
@@ -1049,7 +1068,7 @@ impl<const S: usize> Machine<S> {
         let gc_string = self.heap.intern_str(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
-        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
     }
 }
 
@@ -1236,7 +1255,7 @@ impl<const S: usize> Machine<S> {
 
     /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
-        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack);
+        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
     }
 
     fn with_coroutine_mut(&self, addr: u64, f: impl FnOnce(&mut ObjCoroutine)) {
@@ -1974,6 +1993,7 @@ impl<const S: usize> Machine<S> {
                             &mut self.heap,
                             &self.stack,
                             &self.resume_stack,
+                            &self.statics,
                         );
                     }
                 }
@@ -2022,6 +2042,7 @@ impl<const S: usize> Machine<S> {
                         &mut self.heap,
                         &self.stack,
                         &self.resume_stack,
+                        &self.statics,
                     );
                 }
                 Instruction::HeapToPair => {
@@ -2348,7 +2369,7 @@ impl<const S: usize> Machine<S> {
                     let _ = r.as_mut();
                     // Root before GC — same rule as `push_interned_string`.
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
@@ -2906,7 +2927,7 @@ impl<const S: usize> Machine<S> {
                     if is_gc_collect {
                         // Full stack-rooted collect; stub native is not used.
                         let before = self.heap.size();
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                         let freed = before.saturating_sub(self.heap.size());
                         self.stack.push(Value::from(freed as i64));
                     } else {
@@ -2946,7 +2967,7 @@ impl<const S: usize> Machine<S> {
                         }
                         let allocated = self.heap.live_object_count().saturating_sub(live_before);
                         if allocated > 0 {
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                         }
                     }
                 }
@@ -3148,7 +3169,7 @@ impl<const S: usize> Machine<S> {
                     // Drop args, then root the fresh enum before maybe-GC.
                     self.stack.seek(sp - n);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
@@ -3176,7 +3197,7 @@ impl<const S: usize> Machine<S> {
                     };
                     self.stack.seek(base);
                     self.stack.push(Value::from(addr));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::Index => {
                     let index_val = self.stack.pop();
@@ -3235,7 +3256,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
@@ -3364,7 +3385,7 @@ impl<const S: usize> Machine<S> {
                         Object::Array,
                     );
                     self.stack.push(Value::from(array_obj.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; pool index in operands[15:0]
@@ -3549,7 +3570,7 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
@@ -3715,7 +3736,7 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.stack.push(Value::from(object.addr()));
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                             continue;
                         }
 
@@ -3874,7 +3895,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::Fn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::LoadStatic => {
                     let slot = opcode.operand_u32() as usize;
@@ -3911,7 +3932,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let boxed = ObjBoxed { tag, payload };
                     let (object, _) = self.heap.alloc(boxed, Object::Boxed);
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::UnboxValue => {
@@ -3946,7 +3967,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::MakePolyFnCapture => {
                     let count = (opcode.operand_u32() & 0xFF) as usize;
@@ -3971,7 +3992,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack);
+                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
                 }
                 Instruction::DynAdd
                 | Instruction::DynSub

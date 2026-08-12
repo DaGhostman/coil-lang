@@ -15153,6 +15153,22 @@ impl Checker {
         }
     }
 
+    /// Allocate a synthetic static slot (e.g. `extern` library / fn-id handles).
+    ///
+    /// Reuses an existing index when `fqn` was already allocated. Unlike
+    /// [`Self::register_static_slot`], duplicates are not a type error — FFI
+    /// lowering may see the same library name across modules.
+    pub fn alloc_synthetic_static_slot(&mut self, fqn: String, ty: Ty) -> u32 {
+        if let Some(&(id, _)) = self.static_slots.get(&fqn) {
+            return id;
+        }
+        let id = self.next_static_slot;
+        self.next_static_slot += 1;
+        self.static_slots.insert(fqn.clone(), (id, true));
+        self.static_slot_types.insert(fqn, ty);
+        id
+    }
+
     fn register_static_slot(
         &mut self,
         fqn: String,

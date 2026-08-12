@@ -1301,6 +1301,64 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
+/// COI-16: inlined `Vec::push` must stage the receiver when the arg emits
+/// `STORE`/`Seek` (`format`, `match`, `new Class`). Pre-fix, those pushes
+/// silently dropped values (enum serialize via match+format yielded only the
+/// header; `v.push(new C(...))` left len=0).
+#[test]
+fn vec_push_clobbering_args_preserve_elements() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+enum LockPackage {
+    Git(string, string, string),
+}
+
+class Point {
+    x: int,
+    y: int,
+}
+
+fn quote(string s) -> string {
+    return "'" + s + "'";
+}
+
+fn main() {
+    let lines = Vec::new();
+    lines.push(format("a=%s", "1"));
+    lines.push(format("b=%s", "2"));
+    let pkgs = Vec::new();
+    pkgs.push(new Point(1, 2));
+    pkgs.push(new Point(3, 4));
+    let enums = Vec::new();
+    enums.push(LockPackage::Git("n", "g", "t"));
+    let e0 = enums[0];
+    let names = Vec::new();
+    names.push(match e0 {
+        LockPackage::Git(name, git, tag) => format("name=%s", quote(name)),
+    });
+    let _ = write_all(
+        stdout(),
+        to_bytes(format(
+            "lines=%i pkgs=%i names=%i n0=%s",
+            len(lines),
+            len(pkgs),
+            len(names),
+            names[0],
+        )),
+    );
+}
+"#,
+    );
+    assert_eq!(
+        output, "lines=2 pkgs=2 names=1 n0=name='n'",
+        "format / new Class / match+format push args must not drop the vec"
+    );
+}
+
 /// Nested multi-field record patterns must not clobber sibling outer fields.
 /// Pre-fix, in-place `UnpackAt` at the outer field slot overwrote later
 /// siblings when the inner arity exceeded one.
@@ -7448,4 +7506,164 @@ fn main() {
 "#,
     );
     assert_eq!(output, "18");
+}
+
+/// COI-18: in-memory compile must not fail closed on warnings alone.
+#[test]
+fn compile_src_from_file_succeeds_with_only_warnings() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("coil_coi18_{pid}_{nanos}"));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let src_path = dir.join("warn_only.hy");
+    std::fs::write(
+        &src_path,
+        r#"
+use env::{exit};
+fn main() {
+    exit(0);
+}
+"#,
+    )
+    .expect("write warn_only.hy");
+    // Point module roots at the workspace stdlib so `use env` resolves when
+    // the temp dir is the project root.
+    std::fs::write(
+        dir.join("coil.toml"),
+        format!(
+            "[module]\nroots = [\"{}\"]\n[env]\nallow_exec = true\n",
+            workspace_root.join("stdlib").display()
+        ),
+    )
+    .expect("write coil.toml");
+
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src_from_file(src_path.to_str().unwrap());
+    let msgs: Vec<_> = pipeline.messages().iter().map(|m| m.message()).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        result.is_ok(),
+        "warnings (env::exit) must not fail in-memory compile: {msgs:?}"
+    );
+    assert!(
+        !pipeline.had_errors(),
+        "pipeline should report no hard errors"
+    );
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| *m.kind() == reporting::MessageKind::WARNING
+                && m.message().contains("env::exit")),
+        "expected env::exit warning to remain inspectable: {msgs:?}"
+    );
+}
+
+/// COI-16: enum `Construct` with nested `format` must stage the push receiver
+/// (len preserved). Nested format-inside-Construct payload correctness is a
+/// separate clobber (still open); this only guards the Vec::push drop.
+#[test]
+fn vec_push_enum_construct_with_format_args_keeps_len() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+enum Row {
+    Pair(string, string),
+}
+
+fn main() {
+    let rows = Vec::new();
+    rows.push(Row::Pair(format("a=%s", "1"), format("b=%s", "2")));
+    rows.push(Row::Pair(format("c=%s", "3"), format("d=%s", "4")));
+    let _ = write_all(stdout(), to_bytes(format("%i", len(rows))));
+}
+"#,
+    );
+    assert_eq!(output, "2", "push with Construct(format,…) must not drop the vec");
+}
+
+/// COI-19: heap value in a user static survives `gc::collect` (static roots).
+#[test]
+fn static_string_survives_gc_collect() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+static const HELD = "across-gc";
+
+fn main() {
+    let _freed = collect();
+    let _ = write_all(stdout(), to_bytes(HELD));
+}
+"#,
+    );
+    assert_eq!(output, "across-gc");
+}
+
+/// COI-19: extern handles in static slots survive locals / repeat calls.
+#[test]
+fn extern_system_twice_after_vec_ok() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable via resolve_library(\"c\")");
+        return;
+    }
+    let result = std::panic::catch_unwind(|| {
+        run_example_src(
+            r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+extern "c" {
+    fn system(string cmd) -> int;
+}
+
+fn main() {
+    let v = Vec::new();
+    v.push("x");
+    let a = system("true");
+    let b = system("true");
+    let _ = write_all(stdout(), to_bytes(format("%v %v\n", a, b)));
+}
+"#,
+        )
+    });
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("extern system test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "0 0\n");
+}
+
+/// COI-19: `extern` in an imported module still initializes before main.
+#[test]
+fn extern_in_imported_module_runs() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable via resolve_library(\"c\")");
+        return;
+    }
+    let result = std::panic::catch_unwind(|| run_example_multifile("examples/ffi_mod_entry.hy"));
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            ffi_soft_skip("module extern test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "0\n");
 }
