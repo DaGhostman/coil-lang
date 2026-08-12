@@ -1183,24 +1183,68 @@ use string::{format, to_bytes};
              } \
              fn main() { return fib(10); }",
         );
-        // fib's body fuses `n <= 2` into `BinSlotImm` / `BinSlotImmJmpf`
-        // and may fuse tails into ConstReturnImm / BinReturn when the join
-        // is not a shared JMP-to-RETURN site (see fuse_slots_with_origins).
-        let bin_slot_imm = bc
-            .iter()
-            .filter(|b| *b.bytecode() == Instruction::BinSlotImm)
-            .count();
-        let bin_slot_imm_jmpf = bc
-            .iter()
-            .filter(|b| *b.bytecode() == Instruction::BinSlotImmJmpf)
-            .count();
-        let _ = (bin_slot_imm, bin_slot_imm_jmpf);
+        // Pure call arms leave both results on the operand stack (expr_depth
+        // pads temps above the stacked lhs), so lower fuses ADD;RETURN.
         assert!(
-            bc.iter().any(|b| matches!(
-                *b.bytecode(),
-                Instruction::ADD | Instruction::BinReturn | Instruction::BinSlotSlot
-            )),
-            "expected fib tail add present (fused or not)"
+            bc.iter()
+                .any(|b| *b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::ADD as u8),
+            "expected fib tail BinReturn ADD; ops={:?}",
+            bc.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| *b.bytecode() == Instruction::BinSlotImmJmpf),
+            "expected fused n <= 2 guard"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| *b.bytecode() == Instruction::ConstReturnImm),
+            "expected fused base-case ConstReturnImm"
+        );
+    }
+
+    /// Pure `f(…) + g(…)` keeps both call results on the operand stack (no
+    /// temp STORE between the arms), so lower can emit `BinReturn`.
+    #[test]
+    fn pure_call_binop_leaves_results_on_stack_for_bin_return() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn fib(int n) -> int { \
+               if n <= 2 { return 1; } \
+               return fib(n - 1) + fib(n - 2); \
+             } \
+             fn main() { return fib(10); }",
+        );
+        // Walk fib's body: after the base ConstReturnImm, the two recursive
+        // CALLs must be adjacent to arg prep with no STORE between them, and
+        // the join must be BinReturn.
+        let base = bc
+            .iter()
+            .position(|b| *b.bytecode() == Instruction::ConstReturnImm)
+            .expect("fused base return");
+        let body = &bc[base + 1..];
+        let call_pos: Vec<usize> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| *b.bytecode() == Instruction::CALL)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            call_pos.len() >= 2,
+            "expected two recursive CALLs; ops={:?}",
+            body.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+        let (c0, c1) = (call_pos[0], call_pos[1]);
+        assert!(
+            !(c0 + 1..c1).any(|i| *body[i].bytecode() == Instruction::STORE),
+            "STORE between fib arms regresses stack-across-CALL"
+        );
+        assert!(
+            body[c1 + 1..]
+                .iter()
+                .any(|b| *b.bytecode() == Instruction::BinReturn),
+            "expected BinReturn after stacked fib calls"
         );
     }
 
