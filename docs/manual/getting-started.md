@@ -54,7 +54,7 @@ Clone the repository and build from the root (builds `coil` plus helpers
 `coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed`):
 
 ```bash
-git clone git@github.com:DaGhostman/coil-lang.git
+git clone git@github.com:ardax-corp/coil-lang.git
 cd coil-lang
 cargo build
 ```
@@ -62,7 +62,7 @@ cargo build
 The GitHub repository is named **`coil-lang`**. If you previously cloned **`zero`** / **zero-script**, update the remote after the repository is renamed on GitHub, or clone fresh:
 
 ```bash
-git remote set-url origin git@github.com:DaGhostman/coil-lang.git
+git remote set-url origin git@github.com:ardax-corp/coil-lang.git
 ```
 
 For optimized binaries:
