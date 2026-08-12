@@ -96,13 +96,15 @@ jobs:
       - name: Workspace tests (${{ matrix.features.id }})
         if: matrix.features.mode == 'test'
         run: |
-          # macOS runners often have a low nofile soft limit; cargo then hits
-          # EAGAIN (WouldBlock) while listing many test binaries.
+          # macOS: cargo lists many test binaries in parallel and hits EAGAIN.
+          # Raise nofile and serialize package test runs so listing is sequential.
+          jobs=""
           if [ "${{ runner.os }}" = "macOS" ]; then
             ulimit -n 10240 || true
+            jobs="--jobs 1"
           fi
           n=0
-          until cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }}; do
+          until cargo test --workspace --lib --tests --bins $jobs ${{ matrix.features.flags }}; do
             n=$((n + 1))
             if [ "$n" -ge 5 ]; then
               exit 1
