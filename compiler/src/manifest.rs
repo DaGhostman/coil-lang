@@ -536,6 +536,8 @@ mod tests {
         let m = Manifest::default();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
         assert_eq!(m.entry, None);
+        assert!(m.package.is_none());
+        assert!(m.dependencies.is_empty());
     }
 
     #[test]
@@ -951,7 +953,13 @@ mod tests {
             [dependencies]
             http = { git = "https://example.com/http.git", version = "^1", path = "../x" }
         "#;
-        assert!(Manifest::parse(src).is_err());
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     #[test]
@@ -960,7 +968,119 @@ mod tests {
             [dependencies]
             http = { git = "https://example.com/http.git", version = "^1", rev = "abc" }
         "#;
-        assert!(Manifest::parse(src).is_err());
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_rejects_version_without_git() {
+        let src = r#"
+            [dependencies]
+            http = { version = "^1" }
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_rejects_path_with_version() {
+        let src = r#"
+            [dependencies]
+            http = { path = "../x", version = "^1" }
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_rejects_empty_inline_table_and_bare_string() {
+        let empty = "[dependencies]\nhttp = { }\n";
+        match Manifest::parse(empty).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+
+        let bare = "[dependencies]\nhttp = \"^1.0\"\n";
+        match Manifest::parse(bare).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_git_accepts_version_before_git() {
+        let src = r#"
+            [dependencies]
+            http = { version = "^0.2", git = "https://example.com/http.git" }
+        "#;
+        let m = Manifest::parse(src).unwrap();
+        assert_eq!(
+            m.dependencies,
+            vec![(
+                "http".into(),
+                DependencySpec::Git {
+                    url: "https://example.com/http.git".into(),
+                    version: "^0.2".into(),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_duplicate_package_keys_errors() {
+        let dup_name = "[package]\nname = \"a\"\nname = \"b\"\nversion = \"0.1.0\"\n";
+        match Manifest::parse(dup_name).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("duplicate key `package.name`"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+
+        let dup_version = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nversion = \"0.2.0\"\n";
+        match Manifest::parse(dup_version).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("duplicate key `package.version`"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_package_rejects_non_string_values() {
+        let bad_name = "[package]\nname = 1\nversion = \"0.1.0\"\n";
+        match Manifest::parse(bad_name).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected string"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+
+        let bad_version = "[package]\nname = \"a\"\nversion = true\n";
+        match Manifest::parse(bad_version).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected string"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     #[test]
@@ -989,5 +1109,64 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_reads_package_and_dependencies() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("coil_manifest_pkg_{pid}_{nanos}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("coil.toml"),
+            r#"
+[package]
+name = "spool_consumer"
+version = "0.1.0"
+
+[module]
+roots = ["./src", "./.spool/deps"]
+
+[dependencies]
+http = { git = "https://example.com/http.git", version = "^0.2" }
+local_lib = { path = "../local-lib" }
+"#,
+        )
+        .unwrap();
+
+        let m = Manifest::load(&tmp).unwrap();
+        assert_eq!(
+            m.package,
+            Some(PackageInfo {
+                name: "spool_consumer".into(),
+                version: "0.1.0".into(),
+            })
+        );
+        assert_eq!(
+            m.dependencies,
+            vec![
+                (
+                    "http".into(),
+                    DependencySpec::Git {
+                        url: "https://example.com/http.git".into(),
+                        version: "^0.2".into(),
+                    }
+                ),
+                (
+                    "local_lib".into(),
+                    DependencySpec::Path {
+                        path: PathBuf::from("../local-lib"),
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            m.roots,
+            vec![PathBuf::from("./src"), PathBuf::from("./.spool/deps")]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
