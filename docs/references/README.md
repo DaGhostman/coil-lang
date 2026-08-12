@@ -45,8 +45,8 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins |
 | [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | Userland | `bytes`, `text`, `collections`, `http`, `io::sync`, … |
 
-This repo vendors [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) at `stdlib/`
-(`./stdlib/src` on `[module].roots`). Do not document those APIs here.
+Do not document coil-stdlib APIs here; they live in that repo. Workspace
+`[module].roots` look for `./.deps/coil-stdlib/src` or `../coil-stdlib/src`.
 
 ## Related
 

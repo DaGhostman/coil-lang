@@ -75,7 +75,7 @@ ergonomics (no `coil test --project …` yet).
 | `01-todo` | `board.hy` + `main.hy` |
 | `02-adventure` | `world.hy` + `commands.hy` + `save.hy` + `main.hy` |
 | `03-echo` | `protocol.hy` + `server.hy` + `client.hy` + `main.hy` |
-| `04-http` | `server.hy` + `main.hy` + `stdlib/http/*` |
+| `04-http` | `server.hy` + `main.hy` + coil-stdlib `http/*` |
 
 ## Rolled-up language / tooling gaps
 

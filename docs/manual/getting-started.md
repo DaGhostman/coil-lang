@@ -54,8 +54,9 @@ Clone the repository and build from the root (builds `coil` plus helpers
 `coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed`):
 
 ```bash
-git clone --recurse-submodules git@github.com:ardax-corp/coil-lang.git
+git clone git@github.com:ardax-corp/coil-lang.git
 cd coil-lang
+git clone git@github.com:ardax-corp/coil-stdlib.git ../coil-stdlib
 cargo build
 ```
 

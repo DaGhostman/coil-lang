@@ -25,5 +25,5 @@ cd examples/projects/04-http && coil test
 | `src/server.hy` | One-shot HTTP/1.1 responder (drains request head first) |
 | `src/main.hy` | Client `get("http://127.0.0.1:41250/")` |
 
-Client sources live in the stdlib submodule: `stdlib/src/http/*.hy`.
+Client sources live in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (`src/http/*.hy`).
 API, limitations, and compiler workarounds: [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md).

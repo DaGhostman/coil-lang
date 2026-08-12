@@ -140,8 +140,8 @@ With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` fir
 ### Userland stdlib
 
 [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (same org as the language
-and [spool](https://github.com/ardax-corp/spool)) is vendored here as the
-`stdlib/` submodule. Workspace roots include `./stdlib/src`.
+and [spool](https://github.com/ardax-corp/spool)) is a separate package. Workspace
+roots look for `./.deps/coil-stdlib/src` or `../coil-stdlib/src`.
 
 How to consume it in other projects, module catalog, HTTP, and IO adapters:
 [coil-stdlib docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md).

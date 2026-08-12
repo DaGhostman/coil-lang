@@ -50,7 +50,7 @@ Unknown sections or keys are parse errors.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. For coil-stdlib, see [consume](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/consume.md) (`./stdlib/src` in this repo, or `.spool/deps/stdlib` after `spool add`). |
+| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. For coil-stdlib, see [consume](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/consume.md) (`../coil-stdlib/src`, `./.deps/coil-stdlib/src`, or `.spool/deps/stdlib` after `spool add`). |
 
 Example:
 
@@ -174,7 +174,7 @@ version = "0.1.0"
 # the directory containing this coil.toml file. The compiler
 # searches the roots in order; the first file that exists wins.
 # Include ./.spool/deps after `spool install` for library deps.
-roots = ["./src", "./vendor", "./stdlib/src"]
+roots = ["./src", "./vendor", "../coil-stdlib/src"]
 
 # Default when no coil.toml exists: roots = ["src"]
 
@@ -299,7 +299,7 @@ Use multiple roots for vendored libraries, stdlib, or **`spool`**-managed deps:
 
 ```toml
 [module]
-roots = ["./src", "./.spool/deps", "./stdlib/src"]
+roots = ["./src", "./.spool/deps", "../coil-stdlib/src"]
 ```
 
 Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `.spool/deps/foo/greet.hy` exist, the `src/` copy is used.
@@ -312,7 +312,7 @@ project/
 ├── coil.lock          # written by spool (when used)
 ├── src/               # application code (first priority)
 ├── .spool/deps/       # managed symlinks into the shared spool cache
-└── stdlib/            # optional coil-stdlib checkout (use stdlib/src as a root)
+└── .deps/coil-stdlib/ # optional local checkout (use .deps/coil-stdlib/src as a root)
 ```
 
 ---

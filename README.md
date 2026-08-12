@@ -3,8 +3,10 @@
 Statically typed scripting language with Hindley–Milner inference. Source files use the `.hy` extension; compiled archives are `.hyc`.
 
 ```bash
-git clone --recurse-submodules git@github.com:ardax-corp/coil-lang.git
+git clone git@github.com:ardax-corp/coil-lang.git
 cd coil-lang
+# Optional: userland stdlib for `io::sync`, `http`, showcase projects
+git clone git@github.com:ardax-corp/coil-stdlib.git ../coil-stdlib
 cargo build
 cargo run -- examples/fib.hy    # prints 55
 ```
@@ -33,7 +35,6 @@ coil/
 ├── compiler/   # HM typechecker, stack IL codegen, pipeline
 ├── machine/    # VM, heap/GC, FFI, host natives
 ├── coil-*/     # CLI helpers (debug, dissect, fmt, lsp, embed)
-├── stdlib/     # git submodule: ardax-corp/coil-stdlib (`src/` is the module root)
 ├── examples/   # Runnable demos
 ├── tests/      # Integration tests (`coil test`)
 └── docs/       # Manual, references, internals

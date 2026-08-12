@@ -6,8 +6,6 @@ IO adapters, whole-file helpers, and HTTP are **not** HostInvoke/opcodes — the
 live in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib)
 ([module catalog](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/modules.md)).
 
-This repo vendors that package as the `stdlib/` submodule.
-
 Still not a compiler builtin (and not coil-stdlib either):
 
 | Category | Examples | Where to look |

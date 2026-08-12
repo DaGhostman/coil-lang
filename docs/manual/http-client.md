@@ -5,5 +5,6 @@ not a compiler builtin.
 
 **Docs:** [coil-stdlib HTTP/1.1 client](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md)
 
-This repo vendors the package as a git submodule (`./stdlib/src` is already on
-workspace `[module].roots`). Showcase: [`examples/projects/04-http`](../../examples/projects/04-http).
+Clone [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) as a sibling
+(`../coil-stdlib`) or under `.deps/coil-stdlib` so workspace `[module].roots`
+can resolve it. Showcase: [`examples/projects/04-http`](../../examples/projects/04-http).
