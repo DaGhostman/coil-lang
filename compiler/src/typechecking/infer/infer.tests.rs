@@ -5943,6 +5943,178 @@ fn main() {
         );
     }
 
+    #[test]
+    fn use_reexports_cross_module_class() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("lib");
+        let def = r#"
+class Foo { name: string, }
+impl Foo {
+    static fn fresh() -> Foo { return new Foo("x"); }
+    fn len() -> int { return 1; }
+}
+"#;
+        let ast = parser.parse(def).expect("parse def");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics in def module: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.classes.contains_key("lib::Foo"),
+            "defining module must register FQN class key"
+        );
+        assert!(c.is_static_method("lib::Foo", "fresh"));
+
+        c.set_current_module("");
+        let importer = r#"
+use lib::{Foo};
+fn main() {
+    let x = new Foo("hi");
+    let y = Foo::fresh();
+    let n = x.len();
+    let z: Foo = x;
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics after class use: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.is_class("Foo"), "imported alias must resolve as class");
+        let scheme = c.env().lookup("Foo").expect("imported Foo scheme");
+        assert_eq!(scheme.ty, Ty::Con("lib::Foo".into()));
+    }
+
+    #[test]
+    fn use_reexports_class_alias() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("lib");
+        let def = r#"
+class Foo { name: string, }
+impl Foo {
+    static fn fresh() -> Foo { return new Foo("x"); }
+}
+"#;
+        let ast = parser.parse(def).expect("parse def");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+
+        c.set_current_module("");
+        let importer = r#"
+use lib::{Foo as HM};
+fn main() {
+    let x = new HM("hi");
+    let y = HM::fresh();
+    let z: HM = x;
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics after class alias: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.is_class("HM"));
+        let scheme = c.env().lookup("HM").expect("alias scheme");
+        assert_eq!(scheme.ty, Ty::Con("lib::Foo".into()));
+    }
+
+    #[test]
+    fn use_reexports_generic_class() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("lib");
+        let def = r#"
+class Cell<T> { value: T, }
+impl Cell<T> {
+    fn get() -> T { return self.value; }
+}
+"#;
+        let ast = parser.parse(def).expect("parse def");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(c.generics.generic_type_ctors.contains_key("lib::Cell"));
+
+        c.set_current_module("");
+        let importer = r#"
+use lib::{Cell};
+fn main() {
+    let c = new Cell(42);
+    let n: int = c.get();
+    let d: Cell<int> = c;
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics after generic class use: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn two_modules_can_export_same_class_short_name() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("a");
+        let ast = parser
+            .parse("class Client { n: int, }")
+            .expect("parse a");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+
+        c.set_current_module("b");
+        let ast = parser
+            .parse("class Client { n: int, }")
+            .expect("parse b");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert!(c.classes.contains_key("a::Client"));
+        assert!(c.classes.contains_key("b::Client"));
+
+        c.set_current_module("");
+        let importer = r#"
+use a::{Client as A};
+use b::{Client as B};
+fn main() {
+    let x = new A(1);
+    let y = new B(2);
+}
+"#;
+        let ast = parser.parse(importer).expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics for colliding class names: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.env().lookup("A").map(|s| s.ty.clone()),
+            Some(Ty::Con("a::Client".into()))
+        );
+        assert_eq!(
+            c.env().lookup("B").map(|s| s.ty.clone()),
+            Some(Ty::Con("b::Client".into()))
+        );
+    }
+
     /// `reexport_module_item` must not mark a local alias generic just because
     /// some *other* module registered `…::{same_local}` as generic.
     #[test]

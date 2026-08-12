@@ -21,7 +21,7 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 | Type | Module | Representation |
 |------|--------|----------------|
 | `HashMap<K,V>` | `collections::map` | Separate chaining: `heads: Vec<int>` + parallel `keys` / `vals` / `next` / `live` Vecs |
-| `HashSet<T>` | `collections::map` | `HashMap<T, bool>` wrapper (same module — userland class types are not importable across modules yet) |
+| `HashSet<T>` | `collections::map` | `HashMap<T, bool>` wrapper (can move to `collections::set` in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) now that class types import across modules) |
 | `List<T>` | `collections::list` | Mutable singly-linked `Node` class (`Option<Node<T>>`) |
 | `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel Vecs + child indices (avoids `Option` field moves) |
 

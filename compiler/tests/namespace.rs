@@ -914,6 +914,113 @@ fn check() -> int {
     assert_eq!(output, "1");
 }
 
+#[test]
+fn use_imports_user_class_across_modules() {
+    let manifest = manifest_src_and_stdlib();
+    let files = &[
+        (
+            "src/main.hy",
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+use point::{Point as P};
+fn main() {
+    let a = new P(3, 4);
+    write(stdout(), to_bytes(format("%i", a.sum())));
+    let b = P::origin();
+    write(stdout(), to_bytes(format("%i", b.x)));
+    let c: P = new P(1, 2);
+    write(stdout(), to_bytes(format("%i", c.y)));
+}
+"#,
+        ),
+        (
+            "src/point.hy",
+            r#"
+class Point {
+    x: int,
+    y: int,
+}
+impl Point {
+    static fn origin() -> Point {
+        return new Point(0, 0);
+    }
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("use_class_import", &manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "702");
+}
+
+#[test]
+fn use_imports_generic_class_across_modules() {
+    let manifest = manifest_src_and_stdlib();
+    let files = &[
+        (
+            "src/main.hy",
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+use box::{Cell};
+fn main() {
+    let c = new Cell(42);
+    write(stdout(), to_bytes(format("%i", c.get())));
+    let d: Cell<int> = c;
+    write(stdout(), to_bytes(format("%i", d.value)));
+}
+"#,
+        ),
+        (
+            "src/box.hy",
+            r#"
+class Cell<T> {
+    value: T,
+}
+impl Cell<T> {
+    fn get() -> T {
+        return self.value;
+    }
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("use_generic_class", &manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "4242");
+}
+
+#[test]
+fn two_modules_exporting_same_class_name_stay_distinct() {
+    let manifest = manifest_src_and_stdlib();
+    let files = &[
+        (
+            "src/main.hy",
+            r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+use left::{Client as L};
+use right::{Client as R};
+fn main() {
+    let a = new L(3);
+    let b = new R(5);
+    write(stdout(), to_bytes(format("%i", a.n)));
+    write(stdout(), to_bytes(format("%i", b.n)));
+}
+"#,
+        ),
+        ("src/left.hy", "class Client { n: int, }\n"),
+        ("src/right.hy", "class Client { n: int, }\n"),
+    ];
+    let (root, entry) = build_project("class_name_collision", &manifest, files, "src/main.hy");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "35");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);

@@ -33,7 +33,7 @@ Opaque **`Stream`** (`Ty::Con("Stream")`) is the handle type for the virtual [`i
 
 ## Type constructors (`Ty::Con`)
 
-Any identifier that is not a primitive becomes an opaque type constructor. User-defined **class** names also register as `Ty::Con(name)`.
+Any identifier that is not a primitive becomes an opaque type constructor. User-defined **class** names register as `Ty::Con(name)` in the entry file and `Ty::Con("module::Name")` when declared in a named module, so `use lib::{Foo}` binds the class type (not a dummy var) and two packages can both export `class Client`.
 
 Recursive enum references use isorecursive `Con(name)` inside variant payloads (not unfolded `Sum`), so recursive types like `Tree` are expressible without infinite-type errors during inference.
 
