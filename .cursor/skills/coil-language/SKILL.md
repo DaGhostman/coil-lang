@@ -11,7 +11,10 @@ description: >-
 
 coil is a **statically typed** scripting language with Hindley–Milner inference. Sources are `.hy`; the CLI compiles to versioned `.hyc` archives (`compile` / `run`) or runs in memory (default).
 
-**Do not invent stdlib APIs** — check [docs/references/not-builtins.md](docs/references/not-builtins.md). Compiler builtins live in virtual modules, not user `.hy` files.
+**Do not invent stdlib APIs** — userland helpers live in
+[coil-stdlib](https://github.com/ardax-corp/coil-stdlib)
+([docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md)).
+Compiler builtins live in virtual modules; see [docs/references/not-builtins.md](docs/references/not-builtins.md).
 
 **Prefer method-based APIs** — operations on a type should be `impl` methods (`m.insert(k, v)`), not free functions (`insert(m, k, v)`). Virtual-module host primitives (`io::read`) stay as free fns; stdlib collections and new language surface default to methods.
 
@@ -128,7 +131,7 @@ Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) 
 ## Common pitfalls
 
 1. **`main` + `test()`** — do not combine in one file.
-2. **Assuming stdlib** — no `sort`, `sqrt`, HTTP in VM; use `io` TCP + userland or FFI.
+2. **Assuming stdlib** — no `sort` or HTTP in the VM; add [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (or use `io` TCP / FFI). `sqrt` is prelude math.
 3. **Missing `use`** — `io`/`string` are not auto-imported.
 4. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
 5. **Stale `out.hyc`** — only from `coil compile`; delete before `coil run` if sources changed.
@@ -143,4 +146,5 @@ For hangs, wrong values, panics, breakpoints: use the **coil-debug** skill (`coi
 
 - Syntax cheat sheet + patterns: [reference.md](reference.md)
 - API lookup: [docs/references/README.md](docs/references/README.md)
+- Userland stdlib: [coil-stdlib docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md)
 - Internals (contributors): **coil-contributor** skill

@@ -1,6 +1,6 @@
 # `print` removal
 
-The `print` statement has been removed. Write to stdout through the virtual `io` module and convert strings to bytes through the virtual `string` module.
+The `print` statement has been removed. Write to stdout through the virtual `io` module and convert strings to bytes through the virtual `string` module. `write_all` is a [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md) adapter.
 
 Old:
 

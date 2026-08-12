@@ -9,12 +9,27 @@ use machine::Machine;
 
 // Tests change cwd; serialize with CWD_LOCK when running in parallel.
 
-/// Absolute path to workspace `stdlib/` for temp-project module roots.
+/// Absolute path to coil-stdlib `src/` (sibling clone or `.deps/` checkout).
 fn workspace_stdlib() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("compiler crate parent")
-        .join("stdlib")
+        .expect("compiler crate parent");
+    if let Ok(p) = std::env::var("COIL_STDLIB") {
+        return PathBuf::from(p);
+    }
+    let candidates = [
+        workspace.join(".deps/coil-stdlib/src"),
+        workspace
+            .parent()
+            .unwrap_or(workspace)
+            .join("coil-stdlib/src"),
+    ];
+    for c in candidates {
+        if c.is_dir() {
+            return c;
+        }
+    }
+    workspace.join(".deps/coil-stdlib/src")
 }
 
 /// Manifest with `./src` plus the real workspace stdlib (for `io::sync`, …).

@@ -1,22 +1,17 @@
 # What is NOT a builtin
 
 Compiler virtual modules cover systems I/O, threads, crypto, time, env, regex, FFI,
-and IEEE float math. A **userland** library under [`stdlib/`](../../stdlib/) adds
-text/bytes helpers, collections, numeric convenience helpers, path, and IO
-sugar — see [`stdlib/README.md`](../../stdlib/README.md).
+and IEEE float math. Collections, text/bytes helpers, decimal parse, path, blocking
+IO adapters, whole-file helpers, and HTTP are **not** HostInvoke/opcodes — they
+live in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib)
+([module catalog](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/modules.md)).
 
-Still not provided as **compiler builtins** (HostInvoke / opcodes):
+Still not a compiler builtin (and not coil-stdlib either):
 
-| Category | Examples | Userland alternative |
-|----------|----------|----------------------|
-| Collections API | `sort`; range→array; `HashMap` / `HashSet` / `List` / `TreeMap` | `collections::{sort,collect_ints}`; `collections::map` / `set` / `list` / `tree` (see [collections-vm-split](../internals/collections-vm-split.md)) |
-| String ops | slice, trim, split, replace, lines | `text::*` (byte-oriented) |
-| Bytes ops | find, replace, pad, repeat | `bytes::*` |
-| ASCII / parse | digit classify; `parse_int` / `int_to_dec` | `ascii::*`, `conv::*` |
-| Numeric conveniences | `abs`, `round`, `pow`, casual `random` | `num::{abs, min, pow, …}`, `random::{…}` (`sin` / `sqrt` / … are auto-imported from `prelude::math`; `pow` is userland) |
-| High-level file helpers | whole-file read/write | `io::file::*` |
-| HTTP | — | `http::client` (userland; TLS via virtual `io::net::tls`) |
-| Memory | `alloc`, `free` | `gc::Root` / `gc::Weak` |
+| Category | Examples | Where to look |
+|----------|----------|----------------|
+| Raw memory | `alloc`, `free` | [`gc::Root` / `gc::Weak`](gc.md) |
+| HTTP in the VM | opcodes / natives | [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md); TLS is virtual [`io::net::tls`](io.md) |
 
 Use **`io`** for streams, **FFI** for C libraries, or **host natives** when embedding the VM in Rust.
 
@@ -24,6 +19,7 @@ Use **`io`** for streams, **FFI** for C libraries, or **host natives** when embe
 
 ## Related
 
+- [coil-stdlib docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md)
 - [io](io.md)
 - [ffi](ffi.md)
 - [host-natives](host-natives.md)
