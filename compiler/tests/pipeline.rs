@@ -5636,6 +5636,25 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
+/// HostInvoke + virtual `env::args`: Ok payload is argv (length ≥ 1).
+#[test]
+fn env_args_ok_has_argv0_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use env::{args};
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+fn main() {
+    let a = args()?;
+    write(stdout(), to_bytes(format("%i", a.len())));
+}
+"#,
+    );
+    let n: i64 = output.parse().expect("argv length");
+    assert!(n >= 1, "expected argv0, got {output}");
+}
+
 /// HostInvoke + `io::net::tls::client`: enable on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
