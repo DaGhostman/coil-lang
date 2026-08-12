@@ -3294,6 +3294,41 @@
         assert_eq!(vm.pop().as_int(), 42);
     }
 
+    /// COI-19: heap objects reachable only via static slots must survive GC.
+    /// Pre-fix, `gc_collect` rooted the operand stack / coroutines but not
+    /// `Machine::statics`, so `StoreStatic` of an `FfiLoad` library (or any
+    /// heap value) could be swept while still live.
+    #[test]
+    fn static_slot_roots_heap_object_across_gc() {
+        let mut vm = Machine::<256>::default();
+        vm.heap_mut().set_gc_threshold_for_test(0);
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+
+        let strings = vec!["survive-static".to_string()];
+        let mut bytecode: Vec<Byte> = Vec::new();
+        // Intern + StoreStatic leaves the string only in statics (stack empty).
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::StoreStatic).with_operand_u32(0));
+        // Force many GC cycles with unreachable enums while the string is
+        // not a stack root.
+        let n = 96usize;
+        for _ in 0..n {
+            bytecode.push(const_int(0));
+            bytecode.push(make_enum(0, 1));
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run_with_pool(&bytecode, &[], &strings, 1);
+        assert!(!vm.panicked(), "LoadStatic after GC must not see a swept string");
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, "survive-static");
+    }
+
     /// TailCall reuses the current frame (no nest) and overwrites args in place.
     /// Manual sum_to(n, acc): if n <= 0 return acc; else TailCall(n-1, acc+n).
     #[test]
