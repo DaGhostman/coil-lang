@@ -21,7 +21,6 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 | Issue | Detail |
 |-------|--------|
 | `Option` field moves | `match` moves fields out — copy links before nested `match` on the same field |
-| Cross-module user classes | Userland class types not importable across modules (e.g. `HashSet` wrapper) |
 | User trait calls | Dictionary passing; only ground builtin bounds get direct monomorphized opcodes |
 
 ## IL optimizations (low)

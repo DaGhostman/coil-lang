@@ -7675,13 +7675,19 @@ impl Compiler {
         let Expression::Identifier(class_name) = class.1.as_ref() else {
             return false;
         };
-        if self.decorated_class_ctors.contains_key(*class_name) {
+        if self.decorated_class_ctors.contains_key(*class_name)
+            || self
+                .checker
+                .resolve_class_key(class_name)
+                .is_some_and(|k| self.decorated_class_ctors.contains_key(&k))
+        {
             return false;
         }
         if args.iter().any(|arg| self.arg_emits_on_self_bytecode(arg)) {
             return false;
         }
-        let Some(fields) = self.context.classes.get(*class_name).cloned() else {
+        let class_key = self.resolve_class_ident(class_name);
+        let Some(fields) = self.context.classes.get(&class_key).cloned() else {
             return false;
         };
         if args.len() != fields.len() {
@@ -8035,7 +8041,7 @@ impl Compiler {
                     // Prefer the span cache when present (covers `Class<T>`).
                     self.checker
                         .lookup_for_codegen_span(node.0.start, node.0.end)
-                        .or_else(|| Some(Ty::Con((*name).to_string())))
+                        .or_else(|| Some(Ty::Con(self.resolve_class_ident(name))))
                 }
                 _ => None,
             },
@@ -8495,6 +8501,17 @@ impl Compiler {
         } else {
             format!("{}::{}", self.namespace, name)
         }
+    }
+
+    /// Source ident / `use` alias → class table key (`module::Name`).
+    fn resolve_class_ident(&self, name: &str) -> String {
+        self.checker
+            .resolve_class_key(name)
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    fn class_member_fqn(&self, owner: &str, member: &str) -> String {
+        format!("{}::{}", self.resolve_class_ident(owner), member)
     }
 
     fn emit_static_initializer(&mut self, fqn: &str, init: &Output) {
@@ -9950,7 +9967,7 @@ impl Compiler {
                 bytecode.extend(inner_bc);
             }
             Expression::QualifiedAccess { owner, member } => {
-                let fqn = format!("{}::{}", owner, member);
+                let fqn = self.class_member_fqn(owner, member);
                 if let Some(slot) = self.checker.static_slot_index(&fqn) {
                     bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(slot));
                 }
@@ -10036,6 +10053,7 @@ impl Compiler {
                 ..
             } => {
                 use parser::ast::FieldModifier;
+                let class_key = self.resolve_class_ident(name);
                 let mut instance_fields: Vec<(String, usize)> = Vec::new();
                 let mut idx = 0usize;
                 for v in state {
@@ -10050,7 +10068,7 @@ impl Compiler {
                             let fname = self.resolve_variable(n);
                             if matches!(modifier, FieldModifier::Static) {
                                 if let Some(init_expr) = init {
-                                    let fqn = format!("{}::{}", name, fname);
+                                    let fqn = format!("{}::{}", class_key, fname);
                                     self.emit_static_initializer(&fqn, init_expr);
                                 }
                             } else {
@@ -10065,12 +10083,13 @@ impl Compiler {
                 }
                 self.context
                     .classes
-                    .insert(name.to_string(), instance_fields);
-                self.context.symbols.intern(name.to_string());
+                    .insert(class_key.clone(), instance_fields);
+                self.context.symbols.intern(class_key);
             }
             Expression::Implementation { owner, methods, .. } => {
                 let saved_ns = self.namespace.clone();
-                self.namespace = owner.to_string();
+                let owner_key = self.resolve_class_ident(owner);
+                self.namespace = owner_key.clone();
 
                 for method_node in methods {
                     match method_node.1.borrow() {
@@ -10080,7 +10099,7 @@ impl Compiler {
                                 name, is_static, ..
                             } = body.1.borrow()
                             {
-                                let fqn = format!("{}::{}", owner, name);
+                                let fqn = format!("{}::{}", owner_key, name);
                                 // Instance methods reserve slot 0 for `self`;
                                 // static methods start params at slot 0.
                                 self.compiling_method = !*is_static;
@@ -10088,7 +10107,7 @@ impl Compiler {
                                 self.compiling_method = false;
                                 self.context
                                     .methods
-                                    .entry(owner.to_string())
+                                    .entry(owner_key.clone())
                                     .or_default()
                                     .insert(name.to_string(), fqn);
                             } else {
@@ -10105,7 +10124,7 @@ impl Compiler {
 
                 self.context
                     .impementations
-                    .insert(owner.to_string(), owner.to_string());
+                    .insert(owner_key.clone(), owner_key);
                 self.namespace = saved_ns;
             }
             Expression::Method(_vis, body) => {
@@ -10122,6 +10141,7 @@ impl Compiler {
             }
             Expression::Instantiate(class, args) => {
                 let name = self.resolve_variable_checked(class);
+                let name = self.resolve_class_ident(&name);
                 let ctor_name = self
                     .decorated_class_ctors
                     .get(&name)
@@ -11381,7 +11401,7 @@ impl Compiler {
             }
             Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
                 Expression::QualifiedAccess { owner, member } => {
-                    let fqn = format!("{}::{}", owner, member);
+                    let fqn = self.class_member_fqn(owner, member);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push(Byte::new(Instruction::StoreStatic).with_operand_u32(slot));
@@ -11392,7 +11412,7 @@ impl Compiler {
                     variant_name,
                     fields,
                 } if matches!(fields, parser::ast::EnumConstructPayload::Unit) => {
-                    let fqn = format!("{}::{}", enum_name, variant_name);
+                    let fqn = self.class_member_fqn(enum_name, variant_name);
                     if let Some(slot) = self.checker.static_slot_index(&fqn) {
                         self.append_binding_rhs(&mut bytecode, value);
                         bytecode.push(Byte::new(Instruction::StoreStatic).with_operand_u32(slot));
@@ -11804,7 +11824,7 @@ impl Compiler {
                 // NodeId alignment, but do not emit MakeEnum (and do
                 // not panic: release builds use panic=abort).
                 let Some(tag) = self.checker.tag_for(enum_name, variant_name) else {
-                    let fqn = format!("{}::{}", enum_name, variant_name);
+                    let fqn = self.class_member_fqn(enum_name, variant_name);
                     // Match typechecker order for Unit form: static field
                     // wins over a same-named 0-arg static method.
                     if matches!(fields, EnumConstructPayload::Unit)
@@ -14572,8 +14592,19 @@ impl Compiler {
         // ID pre-walk / typecheck (see `crate::attrs::expand_program`).
         let expand = crate::attrs::expand_program(ast);
         self.messages.extend(expand.messages);
-        self.decorated_class_ctors
-            .extend(expand.decorated_class_ctors);
+        for (k, v) in expand.decorated_class_ctors {
+            let key = if module.is_empty() {
+                k
+            } else {
+                format!("{module}::{k}")
+            };
+            let ctor_fn = if module.is_empty() {
+                v
+            } else {
+                format!("{module}::{v}")
+            };
+            self.decorated_class_ctors.insert(key, ctor_fn);
+        }
         let _program_ty = self.checker.check_program(ast);
         // Recursion depth / `#[max_depth]` — independent of auto-par.
         let stack_bound = crate::typechecking::analyze_stack_bounds(ast);

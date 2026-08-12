@@ -206,6 +206,8 @@ Top-level functions register under:
 
 If the namespace is empty, the FQN is just `<function_name>`.
 
+User **classes** register the same way: `Ty::Con("point::Point")` for `class Point` in `src/point.hy`. `use point::{Point}` (and `as` aliases) bind that constructor so `new Point(...)`, `Point::static(...)`, fields, methods, and `Point<T>` annotations work in the importer. Two modules may both export `class Client`.
+
 The FQN shape depends on **which file** path resolution loaded (see [Path resolution algorithm](#path-resolution-algorithm)):
 
 **Convention A — one-item-per-file** (`use a::b::c;` → `<root>/a/b/c.hy`):

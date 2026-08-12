@@ -1491,7 +1491,14 @@ impl Checker {
         self.option_mode_fns.clear();
         self.test_case_names.clear();
         self.main_decl_span = None;
-        self.generics.generic_type_ctors.clear();
+        // Keep FQN class tables / generic ctors so later files can `use`
+        // `module::Class` (and `Class<T>`) after the defining module was
+        // checked. Bare entry-module keys are dropped like overload sets.
+        self.classes.retain(|k, _| k.contains("::"));
+        self.methods.retain(|k, _| k.contains("::"));
+        self.static_methods.retain(|k, _| k.contains("::"));
+        self.const_class_fields.retain(|k, _| k.contains("::"));
+        self.generics.generic_type_ctors.retain(|k, _| k.contains("::"));
         self.generics.register_builtin_type_ctors();
         // Keep module-qualified generic names so importers still see
         // `num::min` as generic after `num` was checked (dict-passing ABI).
@@ -2908,7 +2915,8 @@ impl Checker {
                 fields,
                 ..
             } => {
-                let _ = self.register_generic_type_ctor(name, type_params);
+                let key = self.qualify_module_name(name);
+                let _ = self.register_generic_type_ctor(&key, type_params);
                 let pushed = self.push_type_params_for_type_parsing(type_params);
                 self.register_class(name, fields, &range);
                 self.pop_type_params_for_type_parsing(pushed);
@@ -3064,7 +3072,7 @@ impl Checker {
                 readonly_ty(apply_ty_prune(&self.subst, &inner_ty))
             }
             Expression::QualifiedAccess { owner, member } => {
-                let fqn = format!("{}::{}", owner, member);
+                let fqn = self.class_member_fqn(owner, member);
                 if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
                     return apply_ty_prune(&self.subst, &ty);
                 }
@@ -3467,9 +3475,9 @@ impl Checker {
         range: Range<usize>,
     ) -> Ty {
         let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
-            && self.classes.contains_key(*name)
+            && let Some(key) = self.resolve_class_key(name)
         {
-            (*name).to_string()
+            key
         } else {
             let class_ty = self.infer(class_expr);
             let resolved = apply_ty_prune(&self.subst, &class_ty);
@@ -5146,7 +5154,7 @@ impl Checker {
         let ident = match name.1.as_ref() {
             Expression::Identifier(n) => n.to_string(),
             Expression::QualifiedAccess { owner, member } => {
-                let fqn = format!("{}::{}", owner, member);
+                let fqn = self.class_member_fqn(owner, member);
                 if self.static_slot_types.contains_key(&fqn) {
                     return self.error_with_help(
                         ErrorCode::GenericTypeError,
@@ -6929,7 +6937,7 @@ impl Checker {
                 }
             }
             Expression::QualifiedAccess { owner, member } => {
-                let fqn = format!("{}::{}", owner, member);
+                let fqn = self.class_member_fqn(owner, member);
                 if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
                     if self.is_static_const_fqn(&fqn) {
                         let _ = self.error_with_help(
@@ -6956,7 +6964,7 @@ impl Checker {
                 variant_name,
                 fields,
             } if matches!(fields, parser::ast::EnumConstructPayload::Unit) => {
-                let fqn = format!("{}::{}", enum_name, variant_name);
+                let fqn = self.class_member_fqn(enum_name, variant_name);
                 if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
                     if self.is_static_const_fqn(&fqn) {
                         let _ = self.error_with_help(
@@ -9754,6 +9762,9 @@ impl Checker {
                 {
                     return Ty::Con(canon);
                 }
+                if let Some(key) = self.resolve_class_key(name) {
+                    return Ty::Con(key);
+                }
                 // First-order instance heads (`int`, `MyType`, …).
                 self.parse_type_name_str_with_range(name, Some(arg.0.into_range()))
             }
@@ -9839,10 +9850,14 @@ impl Checker {
 
     fn nominal_head_from_instance_arg(&self, arg: &Output) -> Option<String> {
         match arg.1.as_ref() {
-            Expression::Type(name) | Expression::Identifier(name) => {
-                Some(Self::canonical_ctor_name(name))
-            }
-            Expression::TypeApp { name, .. } => Some(Self::canonical_ctor_name(name)),
+            Expression::Type(name) | Expression::Identifier(name) => Some(
+                self.resolve_class_key(name)
+                    .unwrap_or_else(|| Self::canonical_ctor_name(name)),
+            ),
+            Expression::TypeApp { name, .. } => Some(
+                self.resolve_class_key(name)
+                    .unwrap_or_else(|| Self::canonical_ctor_name(name)),
+            ),
             _ => None,
         }
     }
@@ -10002,10 +10017,13 @@ impl Checker {
             return self.expand_generic_alias(&def, &arg_tys);
         }
 
+        let ctor = self
+            .resolve_class_key(name)
+            .unwrap_or_else(|| name.to_string());
         if let Some(expected_arity) = self
             .generics
             .generic_type_ctors
-            .get(name)
+            .get(&ctor)
             .map(|params| params.len())
         {
             if expected_arity != arg_tys.len() {
@@ -10020,7 +10038,7 @@ impl Checker {
                     range,
                 ));
             }
-            return Ty::App(Box::new(Ty::Con(name.to_string())), arg_tys);
+            return Ty::App(Box::new(Ty::Con(ctor)), arg_tys);
         }
 
         self.messages.push(Message::error(
@@ -10071,10 +10089,12 @@ impl Checker {
             "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
             _ => {
+                if let Some(key) = self.resolve_class_key(name) {
+                    return Ty::Con(key);
+                }
                 // Prefer concrete type constructors over bare-class existentials
                 // when a name collision exists.
                 if self.enums.contains_key(name)
-                    || self.classes.contains_key(name)
                     || self.generics.generic_type_ctors.contains_key(name)
                     || self.generics.nominal_type_module(name).is_some()
                 {
@@ -10763,14 +10783,22 @@ impl Checker {
     // ============================================================
 
     /// Register a class: store its name and the (visibility, name,
-    /// type) of each field. The class itself becomes a `Ty::Con(name)`
-    /// constructor that's resolvable from any scope, so it can be
-    /// referenced as a type elsewhere.
+    /// type) of each field. The class itself becomes a `Ty::Con(key)`
+    /// constructor (`module::Name`, or `Name` in the entry file) so
+    /// later files can `use` it without colliding on the short name.
     ///
     /// Generic classes (`class Cell<T>`) store field types with
     /// `Con(param)` schema markers (schemaized from the in-scope type
     /// param vars) so each `new` site can freshen independently.
     fn register_class(&mut self, name: &str, fields: &[Output], range: &Range<usize>) {
+        let key = self.qualify_module_name(name);
+        // Bind the FQN before parsing fields so recursive types
+        // (`next: Option<Node<T>>`) resolve to `module::Node`, not a dummy Con.
+        self.classes.entry(key.clone()).or_insert_with(Vec::new);
+        self.generics
+            .register_nominal_type(&key, &self.current_module);
+        self.env
+            .insert_top(key.clone(), Scheme::mono(Ty::Con(key.clone())));
         let mut field_info = Vec::new();
         for field in fields {
             if let Expression::Field {
@@ -10806,7 +10834,7 @@ impl Checker {
                         ));
                         continue;
                     }
-                    let fqn = format!("{}::{}", name, fname_str);
+                    let fqn = format!("{}::{}", key, fname_str);
                     self.register_static_slot(fqn, false, ty.clone(), field.0.into_range());
                     if let Some(init_expr) = init {
                         let init_ty = self.infer(init_expr);
@@ -10822,7 +10850,7 @@ impl Checker {
                 }
                 if matches!(modifier, FieldModifier::Const) {
                     self.const_class_fields
-                        .entry(name.to_string())
+                        .entry(key.clone())
                         .or_default()
                         .insert(fname_str.clone());
                 }
@@ -10845,13 +10873,7 @@ impl Checker {
                 }
             }
         }
-        self.classes.insert(name.to_string(), field_info);
-        self.generics
-            .register_nominal_type(name, &self.current_module);
-        // Register the class as a type in the environment so
-        // `Foo`-as-a-type lookups succeed.
-        self.env
-            .insert_top(name.to_string(), Scheme::mono(Ty::Con(name.to_string())));
+        self.classes.insert(key, field_info);
         let _ = range;
     }
 
@@ -10871,9 +10893,10 @@ impl Checker {
         range: &Range<usize>,
     ) {
         let pushed = self.push_type_params_for_type_parsing(type_params);
+        let owner_key = self.qualify_module_name(owner);
 
         let owner_ty = if type_params.is_empty() {
-            Ty::Con(owner.to_string())
+            Ty::Con(owner_key.clone())
         } else {
             let frame = self
                 .type_params_in_scope
@@ -10883,7 +10906,7 @@ impl Checker {
                 .iter()
                 .map(|tp| Ty::Var(*frame.get(tp.name).expect("type param registered in frame")))
                 .collect();
-            Ty::App(Box::new(Ty::Con(owner.to_string())), args)
+            Ty::App(Box::new(Ty::Con(owner_key.clone())), args)
         };
 
         let param_vars: Vec<TyVarId> = if pushed {
@@ -10899,10 +10922,10 @@ impl Checker {
             Vec::new()
         };
 
-        if !self.classes.contains_key(owner) {
-            self.classes.insert(owner.to_string(), Vec::new());
+        if !self.classes.contains_key(&owner_key) {
+            self.classes.insert(owner_key.clone(), Vec::new());
             self.env
-                .insert_top(owner.to_string(), Scheme::mono(Ty::Con(owner.to_string())));
+                .insert_top(owner_key.clone(), Scheme::mono(Ty::Con(owner_key.clone())));
         }
 
         // `impl Foo<T: Eq + Hash>` bounds apply to every method body and to
@@ -10940,7 +10963,7 @@ impl Checker {
         self.active_constraints
             .extend(impl_constraints.iter().cloned());
 
-        let prev_impl_owner = self.impl_owner.replace(owner.to_string());
+        let prev_impl_owner = self.impl_owner.replace(owner_key.clone());
         // Register method schemes on the outer env (not a temporary frame).
         // Call-site dict emission looks them up by `Owner::method` FQN;
         // a push/pop around the loop used to drop those schemes.
@@ -10972,12 +10995,12 @@ impl Checker {
                         &method.0.into_range(),
                         self_ty,
                         *is_coro,
-                        Some(owner),
+                        Some(&owner_key),
                         *is_static,
                     );
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
-                    let fqn = format!("{}::{}", owner, name);
+                    let fqn = format!("{}::{}", owner_key, name);
                     if let Some(names) = self.fn_param_names.get(*name).cloned() {
                         self.fn_param_names.insert(fqn.clone(), names);
                     }
@@ -11031,12 +11054,12 @@ impl Checker {
                     );
                     if *is_static {
                         self.static_methods
-                            .entry(owner.to_string())
+                            .entry(owner_key.clone())
                             .or_default()
                             .insert(name.to_string());
                     }
                     self.methods
-                        .entry(owner.to_string())
+                        .entry(owner_key.clone())
                         .or_default()
                         .insert(name.to_string(), (*vis, scheme));
                 } else {
@@ -13234,7 +13257,7 @@ impl Checker {
         let tags = match self.enum_tags.get(&enum_str) {
             Some(t) => t.clone(),
             None => {
-                let static_fqn = format!("{}::{}", enum_name, variant_name);
+                let static_fqn = self.class_member_fqn(enum_name, variant_name);
                 // Bare / `()` Unit form: prefer static field, then 0-arg
                 // static method (`Counter::fresh()`).
                 if matches!(fields, EnumConstructPayload::Unit) {
@@ -15153,6 +15176,31 @@ impl Checker {
         }
     }
 
+    /// Resolve a source identifier or `use` alias to the class table key.
+    pub fn resolve_class_key(&self, name: &str) -> Option<String> {
+        if self.classes.contains_key(name) {
+            return Some(name.to_string());
+        }
+        let qualified = self.qualify_module_name(name);
+        if qualified != name && self.classes.contains_key(&qualified) {
+            return Some(qualified);
+        }
+        let scheme = self.env.lookup(name)?;
+        let n = Self::class_name_of_ty(&scheme.ty)?;
+        if self.classes.contains_key(n) {
+            Some(n.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn class_member_fqn(&self, owner: &str, member: &str) -> String {
+        let owner = self
+            .resolve_class_key(owner)
+            .unwrap_or_else(|| owner.to_string());
+        format!("{}::{}", owner, member)
+    }
+
     /// Allocate a synthetic static slot (e.g. `extern` library / fn-id handles).
     ///
     /// Reuses an existing index when `fqn` was already allocated. Unlike
@@ -15498,9 +15546,9 @@ impl Checker {
         Some(apply_ty_prune(&self.subst, &first))
     }
 
-    /// True if `name` is a registered class.
+    /// True if `name` is a registered class (source ident, alias, or FQN).
     pub fn is_class(&self, name: &str) -> bool {
-        self.classes.contains_key(name)
+        self.resolve_class_key(name).is_some()
     }
 
     /// Class name from `Con(C)` or `App(Con(C), _)` (Phase 7).
@@ -15547,15 +15595,21 @@ impl Checker {
 
     /// Method FQN lookup helper — returns whether the method exists.
     pub fn has_method(&self, owner: &str, method: &str) -> bool {
+        let owner = self
+            .resolve_class_key(owner)
+            .unwrap_or_else(|| owner.to_string());
         self.methods
-            .get(owner)
+            .get(&owner)
             .is_some_and(|m| m.contains_key(method))
     }
 
     /// True when `owner::method` was declared as `static fn`.
     pub fn is_static_method(&self, owner: &str, method: &str) -> bool {
+        let owner = self
+            .resolve_class_key(owner)
+            .unwrap_or_else(|| owner.to_string());
         self.static_methods
-            .get(owner)
+            .get(&owner)
             .is_some_and(|m| m.contains(method))
     }
 
@@ -15572,10 +15626,13 @@ impl Checker {
         if !self.is_static_method(owner, method) {
             return None;
         }
+        let owner = self
+            .resolve_class_key(owner)
+            .unwrap_or_else(|| owner.to_string());
         let fqn = format!("{}::{}", owner, method);
         let scheme = self
             .methods
-            .get(owner)
+            .get(&owner)
             .and_then(|m| m.get(method))
             .map(|(_, s)| s.clone())?;
         let fun_ty = self.instantiate_ty(&scheme);
