@@ -137,18 +137,14 @@ Given a `mod foo;` declaration:
 
 With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
 
-### Shipping / consuming `stdlib`
+### Userland stdlib
 
-The coil workspace manifest includes `./stdlib` in `[module].roots` so programs
-can `use http::client::{get, …};` (and future stdlib packages) without vendoring by
-hand. Project manifests should list the same root (or a path to a checkout):
+[coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (same org as the language
+and [spool](https://github.com/ardax-corp/spool)) is a separate package. Workspace
+roots look for `./.deps/coil-stdlib/src` or `../coil-stdlib/src`.
 
-```toml
-[module]
-roots = ["./src", "./stdlib"]
-```
-
-See [HTTP/1.1 client](../manual/http-client.md) for the HTTP API.
+How to consume it in other projects, module catalog, HTTP, and IO adapters:
+[coil-stdlib docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md).
 
 ### Library deps via `spool`
 
@@ -162,7 +158,7 @@ and that directory should be listed in `[module].roots`:
 roots = ["./src", "./.spool/deps"]
 ```
 
-`use http::client;` then resolves under `.spool/deps/http/…` with the same
+`use greet::hello;` then resolves under `.spool/deps/greet/hello.hy` with the same
 algorithm as any other root — first match wins; local `./src` still shadows
 deps. The compiler does **not** read `coil.lock` or inject roots automatically.
 See [Project configuration](project-config.md) for `[package]` / `[dependencies]`

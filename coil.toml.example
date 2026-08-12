@@ -18,9 +18,11 @@
 # Search roots for `use` resolution. Each path is relative to the
 # directory containing this `coil.toml` file. The compiler searches
 # the roots in order; the first file that exists wins.
-# Include a stdlib tree (e.g. coil's `./stdlib`) to import `http::client`, etc.
+# Include coil-stdlib `src/` (sibling clone or `.deps/coil-stdlib/src`)
+# to import `http::client`, etc.
 # After `spool install`, include `"./.spool/deps"` for managed library deps.
-roots = ["./src", "./vendor", "./stdlib"]
+# For unprefixed stdlib imports via spool, use `"./.spool/deps/stdlib"`.
+roots = ["./src", "./vendor", "../coil-stdlib/src"]
 
 # The default roots (when no `coil.toml` exists) are just `["src"]`.
 
@@ -53,7 +55,7 @@ roots = ["./src", "./vendor", "./stdlib"]
 #
 #   1. ./src/foo/bar/baz.hy          (one-item-per-file)
 #   2. ./src/foo/bar.hy              (item inside module file)
-#   3. ./vendor/... then ./stdlib/...
+#   3. ./vendor/... then ../coil-stdlib/src/...
 #
 # The first file that exists wins. The file's namespace is the path
 # RELATIVE to the matching root, with the extension stripped and
@@ -107,7 +109,7 @@ roots = ["./src", "./vendor", "./stdlib"]
 # other key is a parse error. Future versions may add:
 #
 #   [module]
-#   preludes = ["./stdlib"]  # auto-imported in every file
+#   preludes = ["./stdlib/src"]  # auto-imported in every file
 #   strict   = true          # reject undefined names at typecheck
 #
 # Accepted today (see docs/references/project-config.md):

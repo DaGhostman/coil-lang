@@ -9,4 +9,5 @@ out.hyc
 THREADS_PLAN.md
 # Per-machine hook state (session ids / mtimes) — regenerated, never source.
 .cursor/hooks/state/
-
+# Local coil-stdlib checkout (CI clones here; sibling `../coil-stdlib` also works).
+.deps/
