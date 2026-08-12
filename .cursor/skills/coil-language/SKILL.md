@@ -131,7 +131,7 @@ Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) 
 ## Common pitfalls
 
 1. **`main` + `test()`** — do not combine in one file.
-2. **Assuming stdlib** — no `sort` or HTTP in the VM; add [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (or use `io` TCP / FFI). `sqrt` is prelude math.
+2. **Assuming stdlib** — no `sort` or HTTP in the VM; add [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) for collections/IO adapters; HTTP is [coil-http](https://github.com/ardax-corp/coil-http) via spool. `sqrt` is prelude math.
 3. **Missing `use`** — `io`/`string` are not auto-imported.
 4. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
 5. **Stale `out.hyc`** — only from `coil compile`; delete before `coil run` if sources changed.

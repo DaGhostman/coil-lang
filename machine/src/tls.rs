@@ -356,6 +356,28 @@ struct ClientEnableOpts {
     ca_pem: Option<String>,
     ca_path: Option<String>,
     timeout_ms: i64,
+    alpn: String,
+}
+
+/// Map `alpn` opt (`""` = none, `"h2"`, `"http/1.1"`, or comma-separated) to rustls ALPN bytes.
+fn alpn_protocols_from_opt(alpn: &str) -> Vec<Vec<u8>> {
+    if alpn.is_empty() {
+        return Vec::new();
+    }
+    alpn.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+}
+
+fn client_config_with_alpn(mut config: ClientConfig, alpn: &str) -> Arc<ClientConfig> {
+    let protos = alpn_protocols_from_opt(alpn);
+    if protos.is_empty() {
+        return Arc::new(config);
+    }
+    config.alpn_protocols = protos;
+    Arc::new(config)
 }
 
 /// Decode `Option<string>` from a heap enum (`None` = 0, `Some` = 1).
@@ -390,6 +412,7 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErr
     let mut ca_pem: Option<Option<String>> = None;
     let mut ca_path: Option<Option<String>> = None;
     let mut timeout_ms: Option<i64> = None;
+    let mut alpn: Option<String> = None;
     for (key, member) in gc.as_ref().iter_fields() {
         let name = key.as_ref().data.as_str();
         match name {
@@ -415,6 +438,9 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErr
                 };
                 timeout_ms = Some(v.as_int());
             }
+            "alpn" => {
+                alpn = Some(value_as_string(heap, member_as_value(&member)?)?);
+            }
             _ => return Err(IoErrorTag::InvalidInput),
         }
     }
@@ -423,6 +449,7 @@ fn parse_tls_options(heap: &Heap, opts: Value) -> Result<ClientEnableOpts, IoErr
         ca_pem: ca_pem.ok_or(IoErrorTag::InvalidInput)?,
         ca_path: ca_path.ok_or(IoErrorTag::InvalidInput)?,
         timeout_ms: timeout_ms.ok_or(IoErrorTag::InvalidInput)?,
+        alpn: alpn.unwrap_or_default(),
     })
 }
 
@@ -443,10 +470,15 @@ pub fn tls_client_enable(
 ) -> Result<Value, IoErrorTag> {
     let opts = parse_tls_options(heap, opts)?;
     let server_name = parse_server_name(host)?;
-    let config = if !opts.verify {
+    let base = if !opts.verify {
         insecure_config()
     } else {
         verified_config_with_extras(opts.ca_pem.as_deref(), opts.ca_path.as_deref())?
+    };
+    let config = if opts.alpn.is_empty() {
+        base
+    } else {
+        client_config_with_alpn((*base).clone(), &opts.alpn)
     };
     let deadline = deadline_from_ms(opts.timeout_ms);
 
@@ -490,6 +522,16 @@ struct ServerEnableOpts {
     key: PrivateKeyDer<'static>,
     timeout_ms: i64,
     client_ca_pem: String,
+    alpn: String,
+}
+
+fn server_config_with_alpn(mut config: ServerConfig, alpn: &str) -> Arc<ServerConfig> {
+    let protos = alpn_protocols_from_opt(alpn);
+    if protos.is_empty() {
+        return Arc::new(config);
+    }
+    config.alpn_protocols = protos;
+    Arc::new(config)
 }
 
 /// Parse server `enable` opts: require `cert_pem`, `key_pem`, `timeout_ms`,
@@ -503,6 +545,7 @@ fn parse_server_enable_options(heap: &Heap, opts: Value) -> Result<ServerEnableO
     let mut key_pem: Option<String> = None;
     let mut timeout_ms: Option<i64> = None;
     let mut client_ca_pem: Option<String> = None;
+    let mut alpn: Option<String> = None;
     for (key, member) in gc.as_ref().iter_fields() {
         let name = key.as_ref().data.as_str();
         match name {
@@ -521,6 +564,9 @@ fn parse_server_enable_options(heap: &Heap, opts: Value) -> Result<ServerEnableO
             "client_ca_pem" => {
                 client_ca_pem = Some(value_as_string(heap, member_as_value(&member)?)?);
             }
+            "alpn" => {
+                alpn = Some(value_as_string(heap, member_as_value(&member)?)?);
+            }
             _ => return Err(IoErrorTag::InvalidInput),
         }
     }
@@ -532,6 +578,7 @@ fn parse_server_enable_options(heap: &Heap, opts: Value) -> Result<ServerEnableO
         key,
         timeout_ms: timeout_ms.ok_or(IoErrorTag::InvalidInput)?,
         client_ca_pem: client_ca_pem.ok_or(IoErrorTag::InvalidInput)?,
+        alpn: alpn.unwrap_or_default(),
     })
 }
 
@@ -602,7 +649,13 @@ pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<
 
     let opts = parse_server_enable_options(heap, opts)?;
     let deadline = deadline_from_ms(opts.timeout_ms);
-    let config = server_config_from_opts(opts)?;
+    let alpn = opts.alpn.clone();
+    let base = server_config_from_opts(opts)?;
+    let config = if alpn.is_empty() {
+        base
+    } else {
+        server_config_with_alpn((*base).clone(), &alpn)
+    };
 
     let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
     let hs = with_handshake(&mut tcp, deadline, |_tcp| {
@@ -818,6 +871,8 @@ mod tests {
         let k_ca = heap.intern("ca_pem".into());
         let k_path = heap.intern("ca_path".into());
         let k_to = heap.intern("timeout_ms".into());
+        let k_alpn = heap.intern("alpn".into());
+        let (alpn_obj, _) = heap.alloc(ObjString::from(""), Object::String);
         let ca_pem_m = option_string_member(heap, ca_pem);
         let ca_path_m = option_string_member(heap, ca_path);
         gc.as_mut()
@@ -826,6 +881,7 @@ mod tests {
         gc.as_mut().set(k_path, ca_path_m);
         gc.as_mut()
             .set(k_to, Member::Value(Value::from(timeout_ms)));
+        gc.as_mut().set(k_alpn, Member::Object(alpn_obj));
         Value::from(obj.addr())
     }
 
@@ -853,11 +909,14 @@ mod tests {
         let k_key = heap.intern("key_pem".into());
         let k_to = heap.intern("timeout_ms".into());
         let k_cca = heap.intern("client_ca_pem".into());
+        let k_alpn = heap.intern("alpn".into());
+        let (alpn_obj, _) = heap.alloc(ObjString::from(""), Object::String);
         gc.as_mut().set(k_cert, Member::Object(cert_obj));
         gc.as_mut().set(k_key, Member::Object(key_obj));
         gc.as_mut()
             .set(k_to, Member::Value(Value::from(timeout_ms)));
         gc.as_mut().set(k_cca, Member::Object(cca_obj));
+        gc.as_mut().set(k_alpn, Member::Object(alpn_obj));
         Value::from(obj.addr())
     }
 
@@ -1215,11 +1274,11 @@ mod tests {
         let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
         let k0 = heap.intern("verify".into());
-        let k1 = heap.intern("alpn".into());
+        let k1 = heap.intern("bogus".into());
         gc.as_mut().set(k0, Member::Value(Value::from(false)));
         gc.as_mut().set(
             k1,
-            Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)),
+            Member::Value(Value::from(heap.intern("x".into()).as_ptr() as u64)),
         );
         let opts = Value::from(obj.addr());
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
@@ -1376,12 +1435,12 @@ mod tests {
         let (key_obj, _) = heap.alloc(ObjString::from(key_pem.as_str()), Object::String);
         let k0 = heap.intern("cert_pem".into());
         let k1 = heap.intern("key_pem".into());
-        let k2 = heap.intern("alpn".into());
+        let k2 = heap.intern("bogus".into());
         gc.as_mut().set(k0, Member::Object(cert_obj));
         gc.as_mut().set(k1, Member::Object(key_obj));
         gc.as_mut().set(
             k2,
-            Member::Value(Value::from(heap.intern("h2".into()).as_ptr() as u64)),
+            Member::Value(Value::from(heap.intern("x".into()).as_ptr() as u64)),
         );
         let err = tls_server_enable(&mut heap, s, Value::from(obj.addr())).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);

@@ -5,7 +5,7 @@ Statically typed scripting language with Hindley–Milner inference. Source file
 ```bash
 git clone git@github.com:ardax-corp/coil-lang.git
 cd coil-lang
-# Optional: userland stdlib for `io::sync`, `http`, showcase projects
+# Optional: userland stdlib for `io::sync` and showcase projects
 git clone git@github.com:ardax-corp/coil-stdlib.git ../coil-stdlib
 cargo build
 cargo run -- examples/fib.hy    # prints 55
@@ -19,10 +19,11 @@ cargo run -- examples/fib.hy    # prints 55
 | Language reference | [docs/references/README.md](docs/references/README.md) |
 | Contributors | [AGENTS.md](AGENTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [docs/internals/](docs/internals/README.md) |
 | Userland stdlib | [coil-stdlib docs](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) |
+| HTTP client/server | [coil-http](https://github.com/ardax-corp/coil-http) via [spool](https://github.com/ardax-corp/spool) |
 
 ## Features
 
-Primitives (`int`, `float`, `string`, `bool`, `byte`), enums and `match`, records and dicts, generics and traits, classes, coroutines, `for x in`, ranges, FFI, non-blocking IO with sync adapters, OS threads, and a userland stdlib (`collections`, `text`, `bytes`, `http`, …).
+Primitives (`int`, `float`, `string`, `bool`, `byte`), enums and `match`, records and dicts, generics and traits, classes, coroutines, `for x in`, ranges, FFI, non-blocking IO with sync adapters, OS threads, and a userland stdlib (`collections`, `text`, `bytes`, …). HTTP is [coil-http](https://github.com/ardax-corp/coil-http) via spool.
 
 Full feature matrix: [docs/README.md](docs/README.md#language-at-a-glance).
 

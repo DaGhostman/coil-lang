@@ -780,6 +780,7 @@ impl Checker {
                     ("ca_pem".into(), opt_string.clone()),
                     ("ca_path".into(), opt_string),
                     ("timeout_ms".into(), int()),
+                    ("alpn".into(), string()),
                 ]);
                 fun(&[stream, string(), opts], res_stream)
             }
@@ -792,6 +793,7 @@ impl Checker {
                     ("key_pem".into(), string()),
                     ("timeout_ms".into(), int()),
                     ("client_ca_pem".into(), string()),
+                    ("alpn".into(), string()),
                 ]);
                 fun(&[stream, opts], res_stream)
             }

@@ -235,7 +235,7 @@ fn gvn_within_blocks(ops: &mut Vec<IlOp>, blocks: &[Block]) {
                 && matches!(
                     &ops[pi],
                     // STRING stays: Dup-CSE of identical table hits breaks
-                    // nested `"%s%s"` FORMAT concat (04-http request_build).
+                    // nested `"%s%s"` FORMAT concat (HTTP header lines).
                     IlOp::Const { .. } | IlOp::ConstPool { .. } | IlOp::Load { .. }
                 )
                 && matches!(

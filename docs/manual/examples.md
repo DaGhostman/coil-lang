@@ -2027,17 +2027,15 @@ Each project has its own `coil.toml`, co-located `tests/`, and `NOTES.md`.
 | `01-todo` | Classes, arrays, modules | `./examples/projects/01-todo/demo.sh` |
 | `02-adventure` | Interactive stdin REPL + save/load | `./examples/projects/02-adventure/demo.sh` (or `--ci`) |
 | `03-echo` | TCP + coroutines + protocol module | `./examples/projects/03-echo/demo.sh` |
-| `04-http` | Userland HTTP/1.1 client ([coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md)) | `./examples/projects/04-http/demo.sh` |
+
+HTTP client/server: [coil-http](https://github.com/ardax-corp/coil-http) via [spool](https://github.com/ardax-corp/spool) — see [HTTP stub](http-client.md).
 
 Convenience from repo root:
 
 ```bash
 ./examples/projects/run-demos.sh    # all demos (adventure uses transcript.txt)
-./examples/projects/run-tests.sh    # co-located tests for all four
+./examples/projects/run-tests.sh    # co-located tests for all three
 ```
-
-See also [HTTP/1.1 client](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md)
-([language-repo stub](http-client.md)).
 
 ### Playing `02-adventure`
 

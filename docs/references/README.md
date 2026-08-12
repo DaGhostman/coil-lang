@@ -43,7 +43,8 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [ord / char](ord-char.md) | Prelude | Single-byte string ↔ `byte` |
 | [host natives](host-natives.md) | Embedder API | Rust closures via `HostInvoke` |
 | [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins |
-| [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | Userland | `bytes`, `text`, `collections`, `http`, `io::sync`, … |
+| [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | Userland | `bytes`, `text`, `collections`, `io::sync`, … |
+| [coil-http](https://github.com/ardax-corp/coil-http/blob/main/docs/README.md) | Userland | HTTP/1.1 client + server — [install via spool](../manual/http-client.md) |
 
 Do not document coil-stdlib APIs here; they live in that repo. Workspace
 `[module].roots` look for `./.deps/coil-stdlib/src` or `../coil-stdlib/src`.
