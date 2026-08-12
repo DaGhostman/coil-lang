@@ -1,7 +1,8 @@
 # What is NOT a builtin
 
 Compiler virtual modules cover systems I/O, threads, crypto, time, env, regex, FFI,
-and IEEE float math. A **userland** library under [`stdlib/`](../../stdlib/) adds
+and IEEE float math. A **userland** library ([coil-stdlib](https://github.com/ardax-corp/coil-stdlib),
+vendored here as [`stdlib/`](../../stdlib/)) adds
 text/bytes helpers, collections, numeric convenience helpers, path, and IO
 sugar — see [`stdlib/README.md`](../../stdlib/README.md).
 

@@ -139,13 +139,26 @@ With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` fir
 
 ### Shipping / consuming `stdlib`
 
-The coil workspace manifest includes `./stdlib` in `[module].roots` so programs
-can `use http::client::{get, …};` (and future stdlib packages) without vendoring by
-hand. Project manifests should list the same root (or a path to a checkout):
+Userland stdlib lives in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib)
+(same org as the language and [spool](https://github.com/ardax-corp/spool)).
+This repo vendors it as a git submodule at `stdlib/`; the workspace manifest
+includes `./stdlib/src` in `[module].roots` so programs can
+`use http::client::{get, …};` without a separate checkout.
 
 ```toml
 [module]
-roots = ["./src", "./stdlib"]
+roots = ["./src", "./stdlib/src"]
+```
+
+Via **spool**, add the package and put the linked `src/` on the roots list
+(unprefixed `use ascii` / `use http::client`):
+
+```toml
+[dependencies]
+stdlib = { git = "https://github.com/ardax-corp/coil-stdlib.git", version = "^0.1" }
+
+[module]
+roots = ["./src", "./.spool/deps/stdlib"]
 ```
 
 See [HTTP/1.1 client](../manual/http-client.md) for the HTTP API.

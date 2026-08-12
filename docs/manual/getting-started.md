@@ -54,7 +54,7 @@ Clone the repository and build from the root (builds `coil` plus helpers
 `coil-debug`, `coil-dissect`, `coil-fmt`, and `coil-embed`):
 
 ```bash
-git clone git@github.com:DaGhostman/coil-lang.git
+git clone --recurse-submodules git@github.com:ardax-corp/coil-lang.git
 cd coil-lang
 cargo build
 ```

@@ -1,20 +1,22 @@
 # HTTP/1.1 client (`stdlib/http`)
 
-Coil ships a small **userland** HTTP/1.1 request builder under `stdlib/http/`.
+Coil ships a small **userland** HTTP/1.1 request builder in
+[coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (`http/`).
 It speaks cleartext TCP (`io::net::tcp::connect`) for `http://` and verified TLS
 (`tcp::connect` + `io::net::tls::client::enable(..., { verify: true, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })`)
 for `https://` — never insecure by default.
 
 ## Setup
 
-Add the stdlib root to your project `coil.toml`:
+Add the stdlib **source** root to your project `coil.toml` (this repo's submodule
+is `./stdlib/src`; a spool install is `.spool/deps/stdlib`):
 
 ```toml
 [module]
-roots = ["./src", "./stdlib"]   # or point at the coil checkout's stdlib/
+roots = ["./src", "./stdlib/src"]
 ```
 
-The workspace manifest already includes `./stdlib`. See
+The workspace manifest already includes `./stdlib/src`. See
 [`coil.toml.example`](../../coil.toml.example) and
 [project config](../references/project-config.md).
 

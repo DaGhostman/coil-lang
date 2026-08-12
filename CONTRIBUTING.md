@@ -45,7 +45,7 @@ Known gaps and workarounds: [docs/internals/limitations.md](docs/internals/limit
 | `docs/manual/` | Tutorials, getting started, examples catalog |
 | `docs/references/` | Syntax, per-API pages, error codes |
 | `docs/internals/` | Pipeline, VM, tooling |
-| `stdlib/` | `///` doc comments on public API |
+| `stdlib/` (submodule) | `///` doc comments on public API in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) |
 
 ## Commits
 

@@ -50,7 +50,7 @@ Unknown sections or keys are parse errors.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib` (or a path to coil's stdlib) for `http::client` and other userland libraries. |
+| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib/src` (coil-stdlib submodule) or `.spool/deps/stdlib` after `spool add stdlib` for `http::client` and other userland libraries. |
 
 Example:
 
@@ -174,7 +174,7 @@ version = "0.1.0"
 # the directory containing this coil.toml file. The compiler
 # searches the roots in order; the first file that exists wins.
 # Include ./.spool/deps after `spool install` for library deps.
-roots = ["./src", "./vendor", "./stdlib"]
+roots = ["./src", "./vendor", "./stdlib/src"]
 
 # Default when no coil.toml exists: roots = ["src"]
 
@@ -299,7 +299,7 @@ Use multiple roots for vendored libraries, stdlib, or **`spool`**-managed deps:
 
 ```toml
 [module]
-roots = ["./src", "./.spool/deps", "./stdlib"]
+roots = ["./src", "./.spool/deps", "./stdlib/src"]
 ```
 
 Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `.spool/deps/foo/greet.hy` exist, the `src/` copy is used.
@@ -312,7 +312,7 @@ project/
 ├── coil.lock          # written by spool (when used)
 ├── src/               # application code (first priority)
 ├── .spool/deps/       # managed symlinks into the shared spool cache
-└── stdlib/            # optional local stdlib checkout
+└── stdlib/            # optional coil-stdlib checkout (use stdlib/src as a root)
 ```
 
 ---
@@ -323,7 +323,7 @@ The parser currently accepts only the keys documented above. Future versions may
 
 ```toml
 [module]
-preludes = ["./stdlib"]   # customize auto-imports (not yet implemented)
+preludes = ["./stdlib/src"]   # customize auto-imports (not yet implemented)
 strict   = true           # reject undefined names at typecheck (not yet implemented)
 ```
 
