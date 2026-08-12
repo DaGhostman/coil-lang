@@ -1340,7 +1340,14 @@ use string::{format, to_bytes};
             .iter()
             .find(|m| m.message().contains("Cannot assign to constant `x`"));
         assert!(msg.is_some(), "got: {:?}", msgs);
-        assert!(msg.unwrap().help().is_some(), "missing help");
+        let msg = msg.unwrap();
+        assert!(msg.help().is_some(), "missing help");
+        assert_eq!(
+            msg.code(),
+            Some(ErrorCode::InvalidAssignment),
+            "const reassignment must use InvalidAssignment (E0107), got: {:?}",
+            msg.code()
+        );
     }
 
     #[test]

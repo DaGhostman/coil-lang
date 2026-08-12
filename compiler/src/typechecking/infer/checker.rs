@@ -6853,7 +6853,7 @@ impl Checker {
                         let ty = self.instantiate_ty(&s);
                         if self.is_const_binding(&ident) {
                             let mut msg = Message::error(
-                                ErrorCode::FormatSpecifierMismatch,
+                                ErrorCode::InvalidAssignment,
                                 format!("Cannot assign to constant `{}`", ident),
                                 range,
                             );
