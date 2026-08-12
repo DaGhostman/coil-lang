@@ -1,14 +1,25 @@
 # Example coil.toml — copy this to your project root as `coil.toml`.
 #
-# Phase 29 — `coil.toml` is the project manifest. It declares the
-# directories the compiler searches for `use foo::bar::baz;` imports
-# and an optional explicit entry point.
+# `coil.toml` is the project manifest. It declares the directories the
+# compiler searches for `use foo::bar::baz;` imports, an optional
+# explicit entry point, and optional package / dependency metadata
+# for the `spool` library dependency manager.
+#
+# Naming:
+#   spool          — library deps (install / add / update); Coil userland
+#   coil package   — embed a .hyc into a runner executable (unrelated)
+
+# Optional package identity (required keys when the section is present).
+# [package]
+# name = "my_app"
+# version = "0.1.0"
 
 [module]
 # Search roots for `use` resolution. Each path is relative to the
 # directory containing this `coil.toml` file. The compiler searches
 # the roots in order; the first file that exists wins.
 # Include a stdlib tree (e.g. coil's `./stdlib`) to import `http::client`, etc.
+# After `spool install`, include `"./.spool/deps"` for managed library deps.
 roots = ["./src", "./vendor", "./stdlib"]
 
 # The default roots (when no `coil.toml` exists) are just `["src"]`.
@@ -21,6 +32,19 @@ roots = ["./src", "./vendor", "./stdlib"]
 # file = "./src/main.hy"
 
 # --------------------------------------------------------------------------
+# Dependencies (`spool`)
+# --------------------------------------------------------------------------
+#
+# Declared for the `spool` package manager. The compiler parses and
+# stores these entries but does not fetch or inject roots — add
+# `"./.spool/deps"` to `[module].roots` after install so `use`
+# resolves packages by short name (never by git URL).
+#
+# [dependencies]
+# http = { git = "https://github.com/coil-lang/http.git", version = "^0.2" }
+# local_http = { path = "../local-http" }
+
+# --------------------------------------------------------------------------
 # Discovery algorithm
 # --------------------------------------------------------------------------
 #
@@ -29,7 +53,7 @@ roots = ["./src", "./vendor", "./stdlib"]
 #
 #   1. ./src/foo/bar/baz.hy          (one-item-per-file)
 #   2. ./src/foo/bar.hy              (item inside module file)
-#   3. ./vendor/... then ./builtins/...
+#   3. ./vendor/... then ./stdlib/...
 #
 # The first file that exists wins. The file's namespace is the path
 # RELATIVE to the matching root, with the extension stripped and
@@ -86,9 +110,15 @@ roots = ["./src", "./vendor", "./stdlib"]
 #   preludes = ["./stdlib"]  # auto-imported in every file
 #   strict   = true          # reject undefined names at typecheck
 #
-# Accepted today (see docs/reference/project-config.md):
+# Accepted today (see docs/references/project-config.md):
 #
 #   [env]
 #   allow_exec = true        # opt-in: enable env::exec at runtime (default is false)
+#
+#   [package]
+#   name / version           # package identity for spool
+#
+#   [dependencies]
+#   name = { git = "…", version = "…" } | { path = "…" }
 #
 # Other keys under those sections are still parse errors until documented.
