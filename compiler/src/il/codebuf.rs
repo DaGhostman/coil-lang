@@ -687,6 +687,24 @@ mod tests {
         assert!(matches!(ops[1], IlOp::StorePop { slot: 4, .. }));
     }
 
+    /// COI-19: `ffi_init` is spliced into the prologue via `splice_buf_at`.
+    #[test]
+    fn splice_buf_at_inserts_ops_before_code_pos() {
+        let mut dest = CodeBuf::new();
+        dest.push_const(1);
+        dest.push_const(2);
+        let mut src = CodeBuf::new();
+        src.push_const(9);
+        src.push_load(0);
+        dest.splice_buf_at(1, src);
+        let ops = dest.ops();
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(ops[0], IlOp::Const { imm: 1, .. }));
+        assert!(matches!(ops[1], IlOp::Const { imm: 9, .. }));
+        assert!(matches!(ops[2], IlOp::Load { slot: 0, .. }));
+        assert!(matches!(ops[3], IlOp::Const { imm: 2, .. }));
+    }
+
     #[test]
     fn record_func_tracks_spans_and_clear_drops_them() {
         let mut buf = CodeBuf::new();
