@@ -7545,17 +7545,72 @@ fn main() {
 
     let mut pipeline = Pipeline::new();
     let result = pipeline.compile_src_from_file(src_path.to_str().unwrap());
+    let msgs: Vec<_> = pipeline.messages().iter().map(|m| m.message()).collect();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         result.is_ok(),
-        "warnings (env::exit) must not fail in-memory compile"
+        "warnings (env::exit) must not fail in-memory compile: {msgs:?}"
     );
     assert!(
         !pipeline.had_errors(),
         "pipeline should report no hard errors"
     );
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| *m.kind() == reporting::MessageKind::WARNING
+                && m.message().contains("env::exit")),
+        "expected env::exit warning to remain inspectable: {msgs:?}"
+    );
 }
 
+/// COI-16: enum `Construct` with nested `format` must stage the push receiver
+/// (len preserved). Nested format-inside-Construct payload correctness is a
+/// separate clobber (still open); this only guards the Vec::push drop.
+#[test]
+fn vec_push_enum_construct_with_format_args_keeps_len() {
+    let output = run_example_src(
+        r#"
+use io::{stdout};
+use io::sync::{write_all};
+use string::{format, to_bytes};
+
+enum Row {
+    Pair(string, string),
+}
+
+fn main() {
+    let rows = Vec::new();
+    rows.push(Row::Pair(format("a=%s", "1"), format("b=%s", "2")));
+    rows.push(Row::Pair(format("c=%s", "3"), format("d=%s", "4")));
+    let _ = write_all(stdout(), to_bytes(format("%i", len(rows))));
+}
+"#,
+    );
+    assert_eq!(output, "2", "push with Construct(format,…) must not drop the vec");
+}
+
+/// COI-19: heap value in a user static survives `gc::collect` (static roots).
+#[test]
+fn static_string_survives_gc_collect() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout};
+use io::sync::{write_all};
+use string::{to_bytes};
+
+static const HELD = "across-gc";
+
+fn main() {
+    let _freed = collect();
+    let _ = write_all(stdout(), to_bytes(HELD));
+}
+"#,
+    );
+    assert_eq!(output, "across-gc");
+}
 
 /// COI-19: extern handles in static slots survive locals / repeat calls.
 #[test]
