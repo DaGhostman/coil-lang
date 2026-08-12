@@ -1,0 +1,227 @@
+name: release-binaries
+
+# Build packaging runners + a full CLI toolkit archive per host triple.
+# Artifacts on every main push / workflow_dispatch; GitHub Release assets on v* tags.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+  # Default-members: coil, coil-embed, coil-debug, coil-dissect, coil-fmt, coil-lsp
+  COIL_RELEASE_BINS: "coil coil-debug coil-dissect coil-fmt coil-lsp coil-embed"
+
+jobs:
+  build:
+    name: binaries (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            rust_toolchain: stable
+            libc: gnu
+          # Native musl build inside Alpine (libffi/pcre2 available as musl
+          # packages — avoids fragile glibc→musl cross-linking).
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-musl
+            rust_toolchain: stable
+            libc: musl
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            rust_toolchain: stable
+            libc: ""
+          - os: macos-13
+            triple: x86_64-apple-darwin
+            rust_toolchain: stable
+            libc: ""
+          # MinGW host so we can link the MSYS2 libffi/pcre2 packages
+          # (MSVC + MinGW libs is an ABI mismatch).
+          - os: windows-latest
+            triple: x86_64-pc-windows-gnu
+            rust_toolchain: stable-x86_64-pc-windows-gnu
+            libc: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (Ubuntu glibc)
+        if: runner.os == 'Linux' && matrix.libc == 'gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev libpcre2-dev build-essential
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libffi pcre2
+          pkg-config --exists libpcre2-8
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-libffi
+            mingw-w64-x86_64-pcre2
+            mingw-w64-x86_64-pkgconf
+
+      - name: Configure pkg-config (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          echo "PKG_CONFIG=$MINGW_PREFIX/bin/pkgconf.exe" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$MINGW_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$MINGW_PREFIX/bin" >> "$GITHUB_PATH"
+          pkgconf --exists libpcre2-8
+          pkgconf --exists libffi
+
+      - name: Install Rust toolchain
+        if: matrix.libc != 'musl'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust_toolchain }}
+
+      - name: Verify host triple
+        if: matrix.libc != 'musl'
+        shell: bash
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host=$host (matrix triple=${{ matrix.triple }})"
+          if [[ "$host" != "${{ matrix.triple }}" ]]; then
+            echo "::error::runner host triple '$host' does not match matrix '${{ matrix.triple }}'"
+            exit 1
+          fi
+
+      - name: Cache cargo
+        if: matrix.libc != 'musl'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-binaries-${{ matrix.triple }}
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Build release binaries
+        if: runner.os != 'Windows' && matrix.libc != 'musl'
+        run: cargo build --release
+
+      - name: Build release binaries (musl / Alpine)
+        if: matrix.libc == 'musl'
+        run: |
+          docker run --rm \
+            -e CARGO_HOME=/src/.cargo-musl \
+            -e CARGO_TARGET_DIR=/src/target-musl \
+            -v "$PWD":/src \
+            -w /src \
+            rust:1-alpine \
+            sh -c '
+              set -eu
+              apk add --no-cache build-base libffi-dev pcre2-dev pkgconf
+              host="$(rustc -vV | sed -n "s/^host: //p")"
+              echo "rustc host=$host (expected ${{ matrix.triple }})"
+              case "$host" in
+                *-linux-musl) ;;
+                *) echo "error: alpine rustc host is not musl: $host" >&2; exit 1 ;;
+              esac
+              # Prefer a mostly-static binary so runners are easier to drop
+              # onto musl-based hosts without matching shared-lib versions.
+              export RUSTFLAGS="-C target-feature=+crt-static ${RUSTFLAGS:-}"
+              cargo build --release
+            '
+          mkdir -p target/release
+          for b in $COIL_RELEASE_BINS; do
+            cp "target-musl/release/$b" "target/release/$b"
+          done
+          file "target/release/coil" || true
+          if command -v ldd >/dev/null && ldd "target/release/coil" 2>&1 | grep -qi 'libc\.so\.6\|ld-linux'; then
+            echo "::warning::musl artifact unexpectedly references glibc dynamic linker"
+            ldd "target/release/coil" || true
+          fi
+
+      - name: Build release binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          export PATH="$MINGW_PREFIX/bin:$HOME/.cargo/bin:$PATH"
+          rustc -vV
+          cargo build --release
+
+      - name: Stage embed binary and toolkit archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="${{ matrix.triple }}"
+          ext=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ext=".exe"
+          fi
+
+          mkdir -p dist "staging/coil-${triple}"
+          for b in $COIL_RELEASE_BINS; do
+            src="target/release/${b}${ext}"
+            test -f "$src"
+            cp "$src" "staging/coil-${triple}/${b}${ext}"
+          done
+
+          # Standalone packaging runner (same download name as before).
+          cp "target/release/coil-embed${ext}" "dist/coil-embed-${triple}${ext}"
+
+          # Full toolkit: compiler + debugger + LSP + fmt + dissect + embed.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            archive="dist/coil-${triple}.zip"
+            (cd staging && tar -a -cf "../${archive}" "coil-${triple}")
+          else
+            archive="dist/coil-${triple}.tar.gz"
+            tar -C staging -czf "${archive}" "coil-${triple}"
+          fi
+
+          ls -la dist/
+          ls -la "staging/coil-${triple}/"
+
+      - name: Upload binaries-${{ matrix.triple }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # Attach all matrix binaries to the GitHub Release for tag pushes (v*).
+  release:
+    name: publish release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la release-assets/
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/coil-embed-*
+            release-assets/coil-*.tar.gz
+            release-assets/coil-*.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
