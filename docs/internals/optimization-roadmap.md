@@ -69,6 +69,7 @@ Source-ordered float work on the interpreter path (no FMA / reassociation):
 - `NEGF` unary float negate.
 - Algebraic: exact `+0.0` / `+1.0` float identities; const-pool float binop fold.
 - Codegen: `new Class(args).field` scalar replacement (no temp instance).
+- Operand-order canon (`il::canon` + `CanonStats`): const-to-RHS / load-load slot order; int `ConstPool` demote into inline `CONST` when safe; bounds accepts post-canon `GT` headers.
 
 Next AOT priorities below remain the main gap vs Lua on `mandelbrot` /
 `tak` / `nsieve` / `binary_trees`.
@@ -248,7 +249,9 @@ existing opcode; fits append-only opcode ABI.
 | Family | Evidence (post Phases 1–4) | Est. dynamic weight | Recommendation | Rationale |
 |--------|----------------------------|---------------------|----------------|-----------|
 | `*Jmpt` counterparts (`CmpJmpt` / `BinSlot*Jmpt` / `BinSlotSlotConstJmpt` / …) | mandelbrot `would_be_jmpt_after_invert=1` (`BinSlotSlotConstJmpf`; `JMP`); bare `JMPT` only for non-fusable bools | ~1.28M/run (iter escape) | **needs more proof** | Invert intentionally refuses fused `*Jmpf` — would trade one fused dispatch for two. A true `*Jmpt` twin could collapse the escape `JMP`, but only if invert savings beat opcode + decode cost and the shape shows up beyond mandelbrot. Prefer measuring invert-with-`*Jmpt` prototype cost before appending. |
-| Cast spill → `FloatChainStore` | mandelbrot `float_chain_cast_blocked=1` (`cr`) | material in mandelbrot float body | **defer** (no opcode) | Codegen/temp spill of `CastIntToFloat` would expose existing `FloatChainStore`. Prefer IL/codegen fix over a cast-in-chain opcode. |
+| Cast spill → `FloatChainStore` | mandelbrot `cr`/`ci` casts | material in mandelbrot float body | **done** | Hoist `LOAD; Cast` to float temps (`il::cast_spill`, default on) + fuse stage0 `LOAD;CONST` / const-under (existing ext flags). |
+| Function tree-shake | eager `Hash__*`/`Show__*`/… thunks in archives | binary size / dissect noise | **done** | Reachability prune before lower (`il::treeshake`); roots = `main` (+ tests when included). |
+| Unused-slot DCE across jumps | assignment-only locals kept by jump-as-used | IL store noise | **done** | `dead_store` whole-body unread slots ignore Jump/Label; cursor proof unchanged. |
 | `FloatChain` 4-stage / wider | `float_chain_stage_cap_leftover=0` | — | **defer** | No truncation leftover on current benches; zero evidence for a wider opcode. |
 | `MoveSlot` / φ shuffle | mandelbrot `loop_carried_phi_shuffle=1` (`tr`→`zr`); IL opts refused overlapping live ranges | ~2.56M dispatches/run (LOAD+STORE latch) | **needs more proof** (or defer pending benches) | Largest residual dispatch count, but mandelbrot-heavy; tak/numeric/nsieve have 0 latch shuffles. Needs universality proof (more loop-carried programs) before an append-only `MoveSlot` / rename op. Overlapping ranges may still need SSA rename rather than a 1-op shuffle. |
 | Unchecked `Index` / `StoreIndex` | nsieve static Index=1 + StoreIndex=1 in hot loops | nsieve-dominant | **needs more proof** | Align with roadmap §2: diagnostics and bounds proofs first; opcode only after proof-only analysis shows a universal safe fast path. |

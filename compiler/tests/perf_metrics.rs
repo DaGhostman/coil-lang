@@ -255,6 +255,34 @@ fn perf_mandelbrot_dispatch_regression() {
 }
 
 #[test]
+fn perf_mandelbrot_tree_shakes_unused_builtin_thunks() {
+    let (_bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
+    let syms = pipeline.program_debug().fn_symbols;
+    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| *n == "mandelbrot"),
+        "mandelbrot must stay live: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| *n == "main"),
+        "main must stay live: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("Hash__")),
+        "unused Hash thunks should be tree-shaken: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("Show__")),
+        "unused Show thunks should be tree-shaken: {names:?}"
+    );
+    assert!(
+        names.len() <= 8,
+        "mandelbrot archive should only keep reachable symbols, got {}: {names:?}",
+        names.len()
+    );
+}
+
+#[test]
 fn perf_field_hot_reuses_repeated_string_keys() {
     let (bc, _, _, _, pipeline) = compile("examples/perf/field_hot.hy");
     let syms = pipeline.program_debug().fn_symbols;
@@ -518,11 +546,19 @@ fn perf_mandelbrot_hoists_invariant_ci_out_of_x_loop() {
         bin_slot_divf, 0,
         "ci's BinSlotSlot DIVF must leave the x-loop body (before iter header)"
     );
-    // `cr` still ends with SUBF in the x-loop; ci's trailing SUBF must not
-    // add a second one in the x-prefix (only cr's scale-subtract remains).
+    // `cr` fuses to FloatChainStore after cast_spill hoist; ci is already
+    // hoisted — x-prefix should have no residual SUBF.
     assert_eq!(
-        subf, 1,
-        "x-loop prefix should keep only cr's SUBF; ci SUBF must be hoisted (got {subf})"
+        subf, 0,
+        "x-loop prefix should not retain SUBF after cr FloatChain + ci hoist (got {subf})"
+    );
+    let fcs = x_prefix
+        .iter()
+        .filter(|b| *b.bytecode() == Instruction::FloatChainStore)
+        .count();
+    assert!(
+        fcs >= 1,
+        "cr should fuse to FloatChainStore in the x-loop prefix (got {fcs})"
     );
 }
 
@@ -557,7 +593,8 @@ fn perf_mandelbrot_slot_promote_drops_ci_temp_copy() {
         "slot promote should drop LOAD 15; STORE 6 after rewriting ci uses"
     );
 
-    // zi FloatChainStore should read the hoisted temp (15), not local slot 6.
+    // zi FloatChainStore should read a hoisted ci temp (LICM / cast_spill),
+    // not local slot 6.
     let mut zi_uses_temp = false;
     for b in body {
         if *b.bytecode() != Instruction::FloatChainStore {
@@ -570,14 +607,17 @@ fn perf_mandelbrot_slot_promote_drops_ci_temp_copy() {
             continue;
         }
         let d = pool[di];
+        let rhs1 = ((d >> 32) & 0xff) as u8;
         let rhs2 = ((d >> 48) & 0xff) as u8;
-        if rhs2 == 15 {
+        let has_s2 = d & (1u64 << 62) != 0;
+        let ci_slot = if has_s2 { rhs2 } else { rhs1 };
+        if ci_slot >= 13 && ci_slot != 6 {
             zi_uses_temp = true;
         }
     }
     assert!(
         zi_uses_temp,
-        "zi FloatChainStore should consume hoisted ci temp slot 15"
+        "zi FloatChainStore should consume hoisted ci temp (slot >= 13), not local 6"
     );
 
     let loads = count_opcodes_in(&bc, start, end, Instruction::LOAD);
@@ -588,7 +628,7 @@ fn perf_mandelbrot_slot_promote_drops_ci_temp_copy() {
         "mandelbrot LOAD count regressed after slot promote: {loads}"
     );
     assert!(
-        stores <= 10,
+        stores <= 11,
         "mandelbrot STORE count regressed after slot promote: {stores}"
     );
 }
@@ -961,21 +1001,21 @@ fn perf_phase0_mandelbrot_shape_inventory() {
     //   Residual: slot_move=1, loop_carried_phi_shuffle=1 (LOAD tr; STORE zr).
     //   Estimated dynamic weight: ~1.28M × (LOAD+STORE) ≈ 2.56M unreclaimed
     //   latch dispatches/run — Phase 5 MoveSlot / rename candidate.
-    // Phase 4 fuse-feed / near-miss audit (no IL shape fix in-scope):
+    // Phase 4 fuse-feed / near-miss audit:
     //   FCS≥2 / ConstJmpf≥1 / expand_dup squares intact; no promotion split.
     //   would_be_jmpt_after_invert=1 (escape `*Jmpf; JMP` break).
-    //   float_chain_cast_blocked=1 (cr: CastIntToFloat inside DIVF/MULF/SUBF→STORE;
-    //     spill cast → existing FloatChain). residual_float_arith=3 all cast-blocked;
-    //     float_chain_stage_cap_leftover=0 (no 4-stage truncation).
+    // Phase cast_spill: cr/ci casts hoist to temps; FloatChainStore=4,
+    //   residual float_arith=0, float_chain_cast_blocked=0; STORE budget +1.
+    //   float_chain_stage_cap_leftover=0 (no 4-stage truncation).
     //   unary / pool-imm / packing_holes / BinSlot→branch miss = 0.
     let (h, g) = compile_fn_inventory("examples/perf/mandelbrot.hy", "mandelbrot");
 
     // Existing-opcode health (post slot_promote / FloatChain / *Jmpf).
     assert!(h.load <= 6, "mandelbrot LOAD budget: {h:?}");
-    assert!(h.store <= 10, "mandelbrot STORE budget: {h:?}");
+    assert!(h.store <= 11, "mandelbrot STORE budget: {h:?}");
     assert!(
-        h.float_chain_store >= 2,
-        "mandelbrot should keep FloatChainStore fuse: {h:?}"
+        h.float_chain_store >= 4,
+        "mandelbrot should fuse cr via cast_spill + FloatChainStore: {h:?}"
     );
     assert!(
         h.bin_slot_slot_const_jmpf >= 1,
@@ -1007,17 +1047,16 @@ fn perf_phase0_mandelbrot_shape_inventory() {
         "unary slot gap should be absent: {g:?}"
     );
     assert_eq!(
-        g.float_chain_cast_blocked, 1,
-        "cr scale CastIntToFloat blocks FloatChain: {g:?}"
+        g.float_chain_cast_blocked, 0,
+        "cast_spill should clear CastIntToFloat FloatChain near-miss: {g:?}"
     );
     assert_eq!(
         g.float_chain_stage_cap_leftover, 0,
         "no 4-stage FloatChain truncation leftover: {g:?}"
     );
-    // FloatChain wider/store-free: chains=3; residual ADDF/SUBF/MULF=3 (cr cast).
     assert!(
-        g.float_chain_store >= 2 && g.residual_float_arith <= 6,
-        "FloatChain + residual float arith: {g:?}"
+        g.float_chain_store >= 4 && g.residual_float_arith == 0,
+        "FloatChain after cast_spill should clear residual float arith: {g:?}"
     );
     assert_eq!(
         g.bin_slot_slot_branch_without_cmp_fuse, 0,
@@ -1482,4 +1521,36 @@ fn aot_p3_binary_trees_make_enum_inventory() {
         total_calls <= 11,
         "binary_trees user CALL density regressed: {total_calls}"
     );
+}
+
+/// Operand-order canon hit inventory (soft smoke; tighten after stable runs).
+#[test]
+fn perf_canon_stats_inventory() {
+    // Observed 2026-08-11 (debug `examples/perf/*`):
+    //   mandelbrot: load_load=5 cmp_flips=5 demotes=0 refused_sp=5 const_load=0
+    //   tak:        load_load=3 cmp_flips=3 demotes=0 refused_sp=5 const_load=0
+    //   nsieve:     load_load=6 cmp_flips=5 demotes=0 refused_sp=5 const_load=0
+    //   numeric:    load_load=2 cmp_flips=2 demotes=0 refused_sp=6 const_load=0
+    // ConstPool demotes stay 0: codegen already emits inline CONST for 0..=i32::MAX.
+    for path in [
+        "examples/perf/mandelbrot.hy",
+        "examples/perf/tak.hy",
+        "examples/perf/nsieve.hy",
+        "examples/perf/numeric.hy",
+    ] {
+        let (_bc, _, _, _, _) = compile(path);
+        let s = compiler::last_canon_stats();
+        assert_eq!(
+            s.const_pool_demotes, 0,
+            "{path}: ConstPool demotes unexpected on perf suite: {s:?}"
+        );
+        assert!(
+            s.load_load_swaps <= 32,
+            "{path}: load/load swap volume: {s:?}"
+        );
+        assert!(
+            s.const_load_swaps <= 32,
+            "{path}: const/load swap volume: {s:?}"
+        );
+    }
 }

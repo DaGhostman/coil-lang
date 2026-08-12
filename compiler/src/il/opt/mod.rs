@@ -19,6 +19,10 @@ pub struct OptimizeOptions {
     pub copy_prop: bool,
     /// Promote slots to virtual values (straight-line + same-def joins).
     pub slot_promote: bool,
+    /// Operand-order canon (`Const;Load` → `Load;Const`, load/load slot order).
+    pub canon: bool,
+    /// Spill `CastIntToFloat` that blocks FloatChainStore fuse windows.
+    pub cast_spill: bool,
     /// Algebraic / strength peeps (x+0, x*1, cmp fold, …) when SP Known.
     pub algebraic: bool,
     /// Hoist invariant Const/Load out of Known-SP natural loops.
@@ -49,6 +53,10 @@ impl Default for OptimizeOptions {
             mem_fwd: true,
             copy_prop: true,
             slot_promote: true,
+            canon: true,
+            // On: spill casts that block float chains; fuse stage0 accepts
+            // LOAD;CONST so the spilled shape becomes FloatChainStore.
+            cast_spill: true,
             algebraic: true,
             licm: true,
             loop_bounds: true,
@@ -91,8 +99,14 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
     if opts.mem_fwd {
         dead_store_at(ops, entry_tell);
     }
+    if opts.canon {
+        super::canon::canonicalize_operand_order(ops, pool);
+    }
     if opts.algebraic {
         super::algebraic::algebraic_simplify(ops, pool);
+    }
+    if opts.cast_spill {
+        super::cast_spill::spill_cast_before_float_chain(ops);
     }
     if opts.licm {
         // LICM still seeds at 0; entry_sp plumbing is mem_fwd-critical today.

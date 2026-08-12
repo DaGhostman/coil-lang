@@ -6,6 +6,8 @@
 
 mod algebraic;
 mod bounds;
+mod canon;
+mod cast_spill;
 mod builder;
 mod codebuf;
 mod emit_buf;
@@ -18,8 +20,10 @@ mod op;
 mod opt;
 mod sp;
 pub mod tell;
+mod treeshake;
 
 pub use bounds::{BoundsStats, last_bounds_stats};
+pub use canon::{CanonStats, last_canon_stats};
 
 pub use builder::{IlBuilder, IlError};
 pub use codebuf::CodeBuf;
@@ -29,3 +33,4 @@ pub use func::IlFunc;
 pub use lower::{Lowered, lower, lower_module, lower_with_funcs};
 pub use module::IlModule;
 pub use op::{EntryKind, IlJumpKind, IlOp, Label};
+pub use treeshake::{TreeshakeInput, prune_unused_functions};

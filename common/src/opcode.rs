@@ -298,6 +298,7 @@ pub enum Instruction {
     /// bit56 rhs0_const, bit57 rhs1_const, bit58 rhs2_const, bit59 lhs0_const,
     /// bit60 stage1_other_on_left, bit61 stage2_other_on_left, bit62 has_stage2.
     /// When `other_on_left`, that stage is `op(other, acc)` (stack const-under).
+    /// Stage0 may be `LOAD;LOAD`, `BinSlotSlot`, or `LOAD`/`CONST` mix (const flags).
     FloatChainStore,
 
     /// `BinSlotSlot <float-arith>; CONST pool; CmpJmpf <float-cmp>` — one dispatch.

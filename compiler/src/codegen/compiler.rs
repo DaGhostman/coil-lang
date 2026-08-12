@@ -14522,6 +14522,41 @@ impl Compiler {
             }
         }
 
+        // Drop unused function bodies (eager builtin thunks, unreferenced user
+        // fns) before IL opts / lower. Skip when there is no `main` so snippet
+        // / unit-test compiles keep their bodies.
+        if self.functions.contains_key("main") {
+            let roots = vec!["main".to_string()];
+            let (_dropped, shrinks) = crate::il::prune_unused_functions(
+                &mut self.bytecode,
+                crate::il::TreeshakeInput {
+                    functions: &mut self.functions,
+                    fn_entry_labels: &mut self.fn_entry_labels,
+                    fn_debug_locals: &mut self.fn_debug_locals,
+                    test_cases: &mut self.test_cases,
+                    root_names: &roots,
+                    include_tests: self.include_tests,
+                    preserve_emit_start: Some(self.setup_entry_offset as usize),
+                },
+            );
+            for (threshold, delta) in shrinks {
+                for pc in self.mono_offsets.values_mut() {
+                    if *pc >= threshold {
+                        *pc -= delta;
+                    }
+                }
+                if (self.program_start_offset as usize) >= threshold {
+                    self.program_start_offset -= delta as u32;
+                }
+                if (self.setup_entry_offset as usize) >= threshold {
+                    self.setup_entry_offset -= delta as u32;
+                }
+            }
+            let live_pcs: std::collections::HashSet<usize> =
+                self.functions.values().copied().collect();
+            self.mono_offsets.retain(|_, pc| live_pcs.contains(pc));
+        }
+
         #[cfg(any(test, feature = "dissect"))]
         let il_snapshot = if capture_il {
             Some(crate::dissect::IlSnapshot::new(

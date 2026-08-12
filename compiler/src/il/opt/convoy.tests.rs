@@ -1594,6 +1594,100 @@
     }
 
     #[test]
+    fn dead_store_drops_assignment_only_local_across_jump() {
+        // Slot 5 is stored then control jumps, but nothing ever loads it.
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 42,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 5,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store_at(&mut ops, 6);
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 5, .. })),
+            "assignment-only slot should die across Jump"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::Const { imm: 42, .. })),
+            "dead producer should be removed with the store"
+        );
+    }
+
+    #[test]
+    fn dead_store_drops_assignment_only_local_across_label() {
+        // Same unread-slot rule, but the next control edge is a Label join.
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 7,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 3,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(2)),
+            IlOp::Const {
+                imm: 0,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store_at(&mut ops, 4);
+        assert!(
+            !ops.iter().any(|op| matches!(op, IlOp::StorePop { slot: 3, .. })),
+            "assignment-only slot should die across Label"
+        );
+    }
+
+    #[test]
+    fn dead_store_keeps_store_when_load_follows_label() {
+        // A later Load of the slot (after a Label) means Jump/Label must keep it.
+        let mut ops = vec![
+            IlOp::Const {
+                imm: 9,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::StorePop {
+                slot: 4,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Label(Label(3)),
+            IlOp::Load {
+                slot: 4,
+                loc: common::DebugLoc::unknown(),
+            },
+            IlOp::Return {
+                loc: common::DebugLoc::unknown(),
+            },
+        ];
+        dead_store_at(&mut ops, 5);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, IlOp::StorePop { slot: 4, .. })),
+            "slot read after Label must keep the store"
+        );
+    }
+
+    #[test]
     fn dead_store_keeps_store_when_bin_slot_imm_uses_slot() {
         let mut ops = vec![
             IlOp::Const {
@@ -1640,6 +1734,8 @@
                 mem_fwd: true,
                 copy_prop: true,
                 slot_promote: false,
+                canon: false,
+                cast_spill: false,
                 algebraic: false,
                 licm: false,
                 loop_bounds: false,

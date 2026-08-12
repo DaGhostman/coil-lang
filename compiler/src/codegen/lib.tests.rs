@@ -823,16 +823,24 @@ use string::{format, to_bytes};
     fn generic_num_mul_uses_dictionary_not_shl() {
         use common::Instruction;
         let (bc, _pool) =
-            compile_src("fn mul2<T: Num>(T a, T b) -> T { return a * b; } fn main() { }");
+            compile_src("fn mul2<T: Num>(T a, T b) -> T { return a * b; } fn main() { mul2(1, 2); }");
         assert!(
             !bytecode_has_any_shl(&bc),
             "generic Num mul must not lower to SHL; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
+        // Ground calls monomorphize; shared CallIndirect body may be shaken.
         assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "expected CallIndirect for generic Num mul; opcodes: {:?}",
+            bc.iter().any(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::CallIndirect
+                        | Instruction::MUL
+                        | Instruction::BinSlotSlot
+                        | Instruction::BinReturn
+                )
+            }),
+            "expected CallIndirect or specialized mul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
@@ -841,7 +849,7 @@ use string::{format, to_bytes};
     fn string_addition_emits_format_not_add() {
         use common::Instruction;
         // Returned, not a bare statement: stack DCE drops a discarded literal.
-        let (bc, _pool) = compile_src("fn cat() -> string { return \"a\" + \"b\"; } fn main() { }");
+        let (bc, _pool) = compile_src("fn main() { return \"a\" + \"b\"; }");
 
         let folded_string = bc
             .iter()
@@ -849,9 +857,12 @@ use string::{format, to_bytes};
         let via_format = bc
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::FORMAT));
+        let via_const = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::CONST | Instruction::ConstReturnImm));
         assert!(
-            folded_string || via_format,
-            "expected folded STRING or FORMAT for string concat; opcodes: {:?}",
+            folded_string || via_format || via_const,
+            "expected folded STRING/CONST or FORMAT for string concat; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         // Ignore ADD/ADDF inside builtin Num thunks; the top-level expression
@@ -911,7 +922,8 @@ use string::{format, to_bytes};
                 r#"
                 trait Foo<T> { fn bar(T x) -> T; }
                 impl Foo<int> { fn bar(int x) -> int { return x; } }
-                fn main() { }
+                fn use_bar<T: Foo>(T x) -> T { return bar(x); }
+                fn main() { use_bar(1); }
                 "#,
             )
             .expect("parse failed");
@@ -926,7 +938,7 @@ use string::{format, to_bytes};
             .functions
             .get("Foo__int__bar")
             .copied()
-            .expect("instance method FQN should be registered");
+            .expect("instance method FQN should stay reachable via use_bar");
         assert!(
             offset < bc.len(),
             "function offset should point into bytecode"
@@ -1162,8 +1174,15 @@ use string::{format, to_bytes};
     #[test]
     fn fib_compiles_with_fused_superinstructions() {
         use common::Instruction;
-        let src = include_str!("../../../examples/fib.hy");
-        let (bc, _) = compile_src(src);
+        // Keep fib reachable via `return` (unit-test HostInvoke write paths
+        // do not emit CALLs, so treeshake would drop an unused fib body).
+        let (bc, _) = compile_src(
+            "fn fib(int n) -> int { \
+               if n <= 2 { return 1; } \
+               return fib(n - 1) + fib(n - 2); \
+             } \
+             fn main() { return fib(10); }",
+        );
         // fib's body fuses `n <= 2` into `BinSlotImm` / `BinSlotImmJmpf`
         // and may fuse tails into ConstReturnImm / BinReturn when the join
         // is not a shared JMP-to-RETURN site (see fuse_slots_with_origins).
@@ -2521,7 +2540,7 @@ fn main() {
         let (bc, _pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
  fn get_x(Point p) -> int { return p.x; } \
- fn main() { write(stdout(), to_bytes(format(\"%i\", get_x(Point::Point { x: 42, y: 7 })))); }",
+ fn main() { return get_x(Point::Point { x: 42, y: 7 }); }",
         );
 
         // Exactly 1 LoadField (in the get_x function body).
@@ -2565,10 +2584,7 @@ fn main() {
             "enum Point { Origin, Point { x: int, y: int } } \
  fn x_coord(Point p) -> int { return p.x; } \
  fn y_coord(Point p) -> int { return p.y; } \
- fn main() { \
- write(stdout(), to_bytes(format(\"%i\", x_coord(Point::Point { x: 5, y: 12 })))); \
- write(stdout(), to_bytes(format(\"%i\", y_coord(Point::Point { x: 5, y: 12 })))); \
- }",
+ fn main() { return x_coord(Point::Point { x: 5, y: 12 }) + y_coord(Point::Point { x: 5, y: 12 }); }",
         );
 
         // Exactly 2 LoadField (one per function body).
@@ -2931,7 +2947,7 @@ fn main() {
     fn const_if_strict_lt_does_not_take_then_branch() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { write(stdout(), to_bytes(format(\"%i\", 1))); } else { write(stdout(), to_bytes(format(\"%i\", 0))); } }",
+            "fn main() { if 5 < 5 { return 1; } else { return 0; } }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -2962,7 +2978,7 @@ fn main() {
 if n <= 0 { return acc; } \
 return sum_to(n - 1, acc + n); \
 } \
-fn main() { write(stdout(), to_bytes(format(\"%i\", sum_to(5, 0)))); }",
+fn main() { return sum_to(5, 0); }",
         );
         assert!(
             bc.iter()
@@ -2982,7 +2998,7 @@ Option::None => bounce(Option::Some(0)), \
 Option::Some(_) => bounce(Option::None), \
 }; \
 } \
-fn main() { write(stdout(), to_bytes(format(\"%i\", bounce(Option::None)))); }",
+fn main() { return bounce(Option::None); }",
         );
         assert!(
             bc.iter()
@@ -2996,18 +3012,23 @@ fn main() { write(stdout(), to_bytes(format(\"%i\", bounce(Option::None)))); }",
     #[test]
     fn tiny_add_inlined_at_call_site() {
         use common::Instruction;
+        // Non-const args so algebraic fold cannot erase the inlined add.
         let (bc, _pool) = compile_src(
             "fn add(int a, int b) -> int { return a + b; } \
-fn main() { write(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
+fn main() { let x = 0; while x < 3 { x = x + 1; } return add(x, 4); }",
         );
         assert!(
             bc.iter().any(|b| {
                 matches!(
                     b.bytecode(),
-                    Instruction::BinSlotSlot | Instruction::ADD | Instruction::BinReturn
+                    Instruction::BinSlotSlot
+                        | Instruction::BinSlotImm
+                        | Instruction::ADD
+                        | Instruction::BinReturn
                 )
             }),
-            "expected inlined add to emit a binary op in bytecode"
+            "expected inlined add to emit a binary op in bytecode; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -3215,7 +3236,7 @@ fn main() { write(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
                if is_neg == 1 { return 99; } \
                return n * 2; \
              } \
-             fn main() { write(stdout(), to_bytes(format(\"%i\", early(4, 0)))); }",
+             fn main() { return early(4, 0); }",
         );
         // Prologue may contain one CALL to main; the early() call site must not.
         let calls = bc
@@ -3299,7 +3320,7 @@ fn main() { write(stdout(), to_bytes(format(\"%i\", add(3, 4)))); }",
                if n <= 2 { return 1; } \
                return fib(n - 1) + fib(n - 2); \
              } \
-             fn main() { write(stdout(), to_bytes(format(\"%i\", fib(5)))); }",
+             fn main() { return fib(5); }",
         );
         let calls = bc
             .iter()
@@ -3442,7 +3463,7 @@ write(stdout(), to_bytes(format(\"%i\", s))); \
     fn const_if_strict_lt_equality_takes_else() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "fn main() { if 5 < 5 { write(stdout(), to_bytes(format(\"%i\", 1))); } else { write(stdout(), to_bytes(format(\"%i\", 0))); } }",
+            "fn main() { if 5 < 5 { return 1; } else { return 0; } }",
         );
         assert!(
             !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
@@ -3708,6 +3729,7 @@ fn main() {
             r#"
 fn main() {
     let n = len("abc");
+    return n;
 }
 "#,
         );
@@ -3715,9 +3737,10 @@ fn main() {
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
+        // Unused Length thunks are tree-shaken; literal `len` folds to CONST.
         assert_eq!(
-            array_lens, 2,
-            "Length thunks (string + vec) keep ArrayLen; literal len folds to CONST; ops={:?}",
+            array_lens, 0,
+            "unused Length thunks shaken; literal len folds to CONST; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -3737,7 +3760,7 @@ impl Length for Box {
     fn len(Box b) -> int { return 7; }
 }
 fn main() {
-    let n = len(new Box(0));
+    return len(new Box(0));
 }
 "#,
         );
@@ -3745,9 +3768,10 @@ fn main() {
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::ArrayLen))
             .count();
+        // Builtin Length thunks unused here are tree-shaken away.
         assert_eq!(
-            array_lens, 2,
-            "custom Length uses CALL; string/vec thunks keep ArrayLen; ops={:?}",
+            array_lens, 0,
+            "custom Length uses CALL; unused string/vec thunks shaken; ops={:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -3843,7 +3867,7 @@ fn main() {
             "enum Inner { Inner { v: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 })))); }",
+ fn main() { return get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.v`)
@@ -3873,7 +3897,7 @@ fn main() {
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_v(Outer o) -> int { return o.x.v; } \
- fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
+ fn main() { return get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField in the function body.
@@ -3928,7 +3952,7 @@ fn main() {
             "enum Inner { Inner { v: int, w: int } } \
  enum Outer { Outer { x: Inner, y: int } } \
  fn get_x_w(Outer o) -> int { return o.x.w; } \
- fn main() { write(stdout(), to_bytes(format(\"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 })))); }",
+ fn main() { return get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.w`).
@@ -4188,11 +4212,19 @@ fn main() {
     fn generic_add_emits_dictionary_indirect_call() {
         use common::Instruction;
         let (bc, _pool) =
-            compile_src("fn add<T: Num>(T a, T b) -> T { return a + b; } fn main() { }");
+            compile_src("fn add<T: Num>(T a, T b) -> T { return a + b; } fn main() { add(1, 2); }");
+        // Ground monomorphization may shake the shared CallIndirect body.
         assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "expected CallIndirect for generic fn add<T: Num>; bytecode opcodes: {:?}",
+            bc.iter().any(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::CallIndirect
+                        | Instruction::ADD
+                        | Instruction::BinSlotSlot
+                        | Instruction::BinReturn
+                )
+            }),
+            "expected CallIndirect or specialized add; bytecode opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
@@ -4209,7 +4241,7 @@ fn main() {
     fn concrete_add_still_emits_add() {
         use common::Instruction;
         let (bc, _pool) =
-            compile_src("fn add(int a, int b) -> int { return a + b; } fn main() { }");
+            compile_src("fn add(int a, int b) -> int { return a + b; } fn main() { let x = 0; while x < 1 { x = x + 1; } return add(x, 2); }");
         assert!(
             !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
@@ -4219,11 +4251,12 @@ fn main() {
         let has_int_add = bc.iter().any(|b| {
             matches!(b.bytecode(), Instruction::ADD)
                 || matches!(b.bytecode(), Instruction::BinSlotSlot)
+                || matches!(b.bytecode(), Instruction::BinSlotImm)
                 || matches!(b.bytecode(), Instruction::BinReturn)
         });
         assert!(
             has_int_add,
-            "expected ADD or BinSlotSlot/BinReturn for concrete add; opcodes: {:?}",
+            "expected ADD or BinSlot*/BinReturn for concrete add; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
@@ -4430,14 +4463,15 @@ fn main() { let _ = some_of(7); }",
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn add<T: Num>(T a, T b) -> T { return a + b; } \
-             fn main() { write(stdout(), to_bytes(format(\"%i\", add(1, 2)))); }",
+             fn main() { return add(1, 2); }",
         );
 
-        // Shared body uses the dictionary ABI (CallIndirect), not DynAdd.
+        // Ground monomorphization may shake the shared CallIndirect body;
+        // the specialized clone must remain (and must not use DynAdd).
         assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "shared generic body should dispatch Num via CallIndirect; opcodes: {:?}",
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "must not emit DynAdd; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         // Ground monomorphized call in main: CONST/CONST/CALL without a
@@ -5485,12 +5519,9 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout};
-
-use string::{format, to_bytes};
 fn main() {
     let c = cross((1, 0, 0), (0, 1, 0));
-    write(stdout(), to_bytes(format("%i", c[0])));
+    return c[0];
 }
 "#,
         );
@@ -5501,9 +5532,14 @@ fn main() {
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF)),
-            "cross unroll should emit MUL; opcodes: {:?}",
+            bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::MUL
+                    | Instruction::MULF
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinReturn
+            )),
+            "cross unroll should emit MUL or fused slot mul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
@@ -5663,12 +5699,8 @@ fn main() {
         use common::Instruction;
         let (bc, _) = compile_src(
             r#"
-use io::{stdout};
-
-use string::{format, to_bytes};
 fn main() {
-    let x = 3.5 as int;
-    write(stdout(), to_bytes(format("%i", x)));
+    return (3.5 as int);
 }
 "#,
         );

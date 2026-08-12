@@ -7,7 +7,7 @@ mod dissect;
 // real VM cursor; the rest of the IL stays crate-private.
 pub(crate) mod il;
 pub use il::tell;
-pub use il::{BoundsStats, last_bounds_stats};
+pub use il::{BoundsStats, CanonStats, last_bounds_stats, last_canon_stats};
 mod manifest;
 mod monomorphize;
 mod pipeline;

@@ -250,6 +250,76 @@ impl CodeBuf {
         &self.funcs
     }
 
+    /// Clear recorded function spans (treeshake rebuilds them).
+    pub fn clear_funcs(&mut self) {
+        self.funcs.clear();
+    }
+
+    /// Keep only function records matching `pred` (treeshake after deletes).
+    pub fn retain_funcs(&mut self, mut pred: impl FnMut(&IlFunc) -> bool) {
+        self.funcs.retain(|f| pred(f));
+    }
+
+    /// Snapshot of entry-label bindings (emitting PC → label).
+    pub fn entry_labels(&self) -> impl Iterator<Item = (usize, Label)> + '_ {
+        self.entry_at_offset.iter().map(|(&pc, &l)| (pc, l))
+    }
+
+    /// Remove raw IL ops in `[raw_start, raw_end)`.
+    pub fn remove_raw_range(&mut self, raw_start: usize, raw_end: usize) {
+        self.invalidate_lowered();
+        if raw_start >= raw_end || raw_end > self.il.ops().len() {
+            return;
+        }
+        self.il.ops_mut().drain(raw_start..raw_end);
+    }
+
+    /// After deleting emitting ops `[start, end)`, drop entry PCs in that
+    /// range and subtract `end - start` from all greater PCs.
+    pub fn shift_entry_pcs_after_delete(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let delta = end - start;
+        let mut next = HashMap::with_capacity(self.entry_at_offset.len());
+        for (pc, label) in self.entry_at_offset.drain() {
+            if pc < start {
+                next.insert(pc, label);
+            } else if pc >= end {
+                next.insert(pc - delta, label);
+            }
+        }
+        self.entry_at_offset = next;
+    }
+
+    /// Shrink recorded func spans after deleting emitting ops `[start, end)`.
+    ///
+    /// Callers must drop overlapping records first; survivors are only those
+    /// entirely before `start` or entirely at/after `end`.
+    pub fn shrink_func_spans_after_delete(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let delta = end - start;
+        for f in &mut self.funcs {
+            if f.code_end <= start {
+                continue;
+            }
+            debug_assert!(
+                f.code_start >= end,
+                "overlapping IlFunc must be removed before shrink"
+            );
+            f.code_start -= delta;
+            f.code_end -= delta;
+        }
+    }
+
+    /// Drop func records whose span overlaps `[start, end)`.
+    pub fn remove_func_spans_overlapping(&mut self, start: usize, end: usize) {
+        self.funcs
+            .retain(|f| f.code_end <= start || f.code_start >= end);
+    }
+
     /// Shift recorded [`IlFunc`] emitting spans after a splice at `threshold`.
     pub fn bump_func_spans(&mut self, threshold: usize, delta: usize) {
         if delta == 0 {
