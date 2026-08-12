@@ -7449,3 +7449,52 @@ fn main() {
     );
     assert_eq!(output, "18");
 }
+
+/// COI-18: in-memory compile must not fail closed on warnings alone.
+#[test]
+fn compile_src_from_file_succeeds_with_only_warnings() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("coil_coi18_{pid}_{nanos}"));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let src_path = dir.join("warn_only.hy");
+    std::fs::write(
+        &src_path,
+        r#"
+use env::{exit};
+fn main() {
+    exit(0);
+}
+"#,
+    )
+    .expect("write warn_only.hy");
+    // Point module roots at the workspace stdlib so `use env` resolves when
+    // the temp dir is the project root.
+    std::fs::write(
+        dir.join("coil.toml"),
+        format!(
+            "[module]\nroots = [\"{}\"]\n[env]\nallow_exec = true\n",
+            workspace_root.join("stdlib").display()
+        ),
+    )
+    .expect("write coil.toml");
+
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src_from_file(src_path.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        result.is_ok(),
+        "warnings (env::exit) must not fail in-memory compile"
+    );
+    assert!(
+        !pipeline.had_errors(),
+        "pipeline should report no hard errors"
+    );
+}
+
