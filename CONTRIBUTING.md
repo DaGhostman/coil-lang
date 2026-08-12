@@ -43,9 +43,9 @@ Known gaps and workarounds: [docs/internals/limitations.md](docs/internals/limit
 | Tree | When to update |
 |------|----------------|
 | `docs/manual/` | Tutorials, getting started, examples catalog |
-| `docs/references/` | Syntax, per-API pages, error codes |
+| `docs/references/` | Syntax, per-API **builtin** pages, error codes |
 | `docs/internals/` | Pipeline, VM, tooling |
-| `stdlib/` (submodule) | `///` doc comments on public API in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) |
+| [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) | Userland API docs (`docs/` in that repo); `///` on public `.hy` |
 
 ## Commits
 

@@ -50,7 +50,7 @@ Unknown sections or keys are parse errors.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. Include `./stdlib/src` (coil-stdlib submodule) or `.spool/deps/stdlib` after `spool add stdlib` for `http::client` and other userland libraries. |
+| `roots` | array of strings | No (defaults to `["src"]`) | Directories searched for module files, relative to the project root. For coil-stdlib, see [consume](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/consume.md) (`./stdlib/src` in this repo, or `.spool/deps/stdlib` after `spool add`). |
 
 Example:
 
@@ -154,7 +154,7 @@ Typical roots after `spool install`:
 roots = ["./src", "./.spool/deps"]
 ```
 
-Then `use http::client;` resolves under `./.spool/deps/http/…` via the normal discovery algorithm (see [Modules](modules.md)).
+Then `use greet::hello;` resolves under `./.spool/deps/greet/hello.hy` via the normal discovery algorithm (see [Modules](modules.md)). For coil-stdlib unprefixed imports, add `.spool/deps/stdlib` as a root ([consume](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/consume.md)).
 
 ---
 

@@ -18,7 +18,7 @@ They share a lifecycle (cloned onto pool workers) but **never** put blocking IO 
 | `drive()` | Non-blocking `poll_once` on registered async waiters |
 | `wait_ready()` | Block until ≥1 registered waiter is ready (batch); no-op when none registered |
 | **`block_on(coro)`** (prelude) | Resume until `done`; calls `wait_ready` between resumes |
-| Userland `io::sync::{write_all, …}` | Coil loops over L0 + `await_*` (`stdlib/io/sync.hy`) — top-level park path |
+| Userland `io::sync::{write_all, …}` | Coil loops over L0 + `await_*` ([coil-stdlib IO](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md)) — top-level park path |
 
 Preferred DX — async work, sync boundary:
 

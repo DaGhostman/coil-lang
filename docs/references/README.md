@@ -42,11 +42,11 @@ Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets
 | [gc](gc.md) | Virtual module | `Root` / `Weak` pins |
 | [ord / char](ord-char.md) | Prelude | Single-byte string ↔ `byte` |
 | [host natives](host-natives.md) | Embedder API | Rust closures via `HostInvoke` |
-| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins; see also [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) |
+| [What is NOT a builtin](not-builtins.md) | Scope | Gaps vs builtins |
+| [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | Userland | `bytes`, `text`, `collections`, `http`, `io::sync`, … |
 
-Userland modules (include `stdlib/src` or `.spool/deps/stdlib` in `[module].roots`): `bytes`, `text`,
-`collections`, `num`, `random`, `path`, `io::sync` / `io::file`, `http`.
-See [`stdlib/README.md`](../../stdlib/README.md).
+This repo vendors [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) at `stdlib/`
+(`./stdlib/src` on `[module].roots`). Do not document those APIs here.
 
 ## Related
 

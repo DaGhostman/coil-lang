@@ -65,4 +65,5 @@ let t = TreeMap::new();
 t.insert(2, 20);
 ```
 
-Existing `collections::{sort, reverse, collect_ints, …}` stays in `stdlib/collections.hy`.
+Existing `collections::{sort, reverse, collect_ints, …}` stays in
+[coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (`src/collections.hy`).

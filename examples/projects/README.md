@@ -9,7 +9,7 @@ repo-root `tests/` (that tree is for language/compiler harness cases).
 | `01-todo` | Core language (classes, arrays, modules) | prints a seeded board summary |
 | `02-adventure` | Interactive stdin REPL + modules + save/load | playable text adventure |
 | `03-echo` | TCP + coroutines + protocol module | single-process echo → `ok` |
-| `04-http` | Userland `stdlib/http` client + local HTTP/1.1 server | cleartext `get` → `ok` |
+| `04-http` | Userland [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md) client + local HTTP/1.1 server | cleartext `get` → `ok` |
 
 ## Run demos (scripts)
 

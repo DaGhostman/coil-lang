@@ -74,13 +74,15 @@ See `examples/io_text.hy`.
 | `drive` | `() -> int` | Poll registered async waiters once; returns newly-ready count |
 | `wait_ready` | `() -> int` | Block until ≥1 registered waiter is ready (multiplex) |
 | `block_on` | prelude | Drive an `async fn` handle to completion (see [IO reactor](../../internals/io-reactor.md)) |
-| `io::sync::{write_all,read_exact,read_to_end}` | userland | Blocking adapters over L0 + `await_*` |
+| `io::sync::{write_all,read_exact,read_to_end}` | [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md) | Blocking adapters over L0 + `await_*` |
 | `io::net::tcp::{connect,listen,accept,…}` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |
 | `io::net::udp::{bind,send_to,recv_from,…}` | UDP | Datagram sockets; see below |
 | `io::net::tls::client::{enable,disable}` | TLS client | `enable` / `disable` (feature `tls`) |
 | `io::net::tls::server::{enable,disable}` | TLS server | `enable` / `disable` (feature `tls`) |
 
-For stdout text, call `write_all(stdout(), to_bytes(...))`.
+For stdout text, call `write_all(stdout(), to_bytes(...))`. Blocking adapters
+and `io::file` are documented in
+[coil-stdlib IO](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md).
 
 TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 (like `ffi::types`):

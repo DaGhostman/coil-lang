@@ -4,7 +4,7 @@ Non-blocking file / stdio / TCP / UDP streams. **Not** auto-imported:
 
 ```coil
 use io::{stdout, open, read, write, close};
-use io::sync::{write_all, read_to_end};   // optional blocking adapters (userland)
+use io::sync::{write_all, read_to_end};   // optional blocking adapters (coil-stdlib)
 ```
 
 | Export | Kind | Notes |
@@ -27,15 +27,9 @@ use io::sync::{write_all, read_to_end};   // optional blocking adapters (userlan
 
 ## Userland sync adapters (`io::sync`)
 
-Blocking helpers live in stdlib (`stdlib/io/sync.hy`), not as host natives:
-
-| Function | Notes |
-|----------|-------|
-| `write_all` / `read_exact` / `read_to_end` | L0 + `await_*` loops (`write_all` uses `write_from`) |
-| `accept_wait` | `accept` + `await_readable` |
-| `recv_from_wait` | `recv_from` + `await_readable` |
-| `print` / `println` / `eprintln` | UTF-8 stdout/stderr helpers |
-| `read_line` | Read until LF (strips CR); `None` on EOF with no bytes |
+Blocking helpers and whole-file IO are **coil-stdlib**, not host natives:
+[IO adapters](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md)
+(`write_all`, `read_to_end`, `print` / `println`, `io::file::{read_text, …}`).
 
 ```coil
 use io::{stdout};
@@ -63,7 +57,7 @@ TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
 non-empty PEM enables mTLS. `timeout_ms <= 0` means no handshake deadline.
 
-Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP remains userland (`stdlib/http`).
+Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland: [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 
@@ -72,5 +66,6 @@ See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examp
 ## Related
 
 - [IO tutorial](../manual/tutorial/10-io-streams.md)
+- [coil-stdlib IO adapters](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md)
 - [io::fs](io-fs.md)
 - [string](string.md)
