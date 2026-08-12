@@ -6,4 +6,5 @@ test("args ok has argv0") {
         Result::Err(_) => panic "args err",
     };
     assert(a.len() >= 1)?;
+    assert(len(a[0]) >= 1)?;
 }
