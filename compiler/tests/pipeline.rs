@@ -7373,3 +7373,79 @@ fn example_inline_wrapped_call_prints_13() {
         "left operand was clobbered by a leaked inline body"
     );
 }
+
+/// Stack-across-CALL for pure non-peel helper arms must keep both results
+/// (runtime anchor for `pure_helper_binop_stacks_across_call_for_bin_return`).
+#[test]
+fn pure_helper_binop_stack_across_call_prints_sum() {
+    // left(5) = 0+1+2+3+4 = 10; right(4) = 1+0+1+2+3 = 7; sum = 17
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn left(int n) -> int {
+    let s = 0;
+    let i = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+fn right(int n) -> int {
+    let s = 1;
+    let i = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", left(5) + right(4))));
+}
+"#,
+    );
+    assert_eq!(output, "17");
+}
+
+/// Tiny-inline binop arms must stage (not bury) — `add(x,y)+add(y,x)` == 14.
+#[test]
+fn tiny_inline_binop_arms_stage_prints_sum() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn add(int a, int b) -> int {
+    return a + b;
+}
+fn main() {
+    let x = 3;
+    let y = 4;
+    write(stdout(), to_bytes(format("%i", add(x, y) + add(y, x))));
+}
+"#,
+    );
+    assert_eq!(output, "14");
+}
+
+/// Nested call-arg arm must stage so `leaf(leaf(2))+leaf(3)` stays correct.
+#[test]
+fn nested_call_arg_binop_stages_prints_sum() {
+    // leaf(0)=1; leaf(1)=2; leaf(2)=4; leaf(3)=7; leaf(4)=11 → 11+7=18
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+#[max_depth(16)]
+fn leaf(int n) -> int {
+    if n <= 0 { return 1; }
+    return n + leaf(n - 1);
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", leaf(leaf(2)) + leaf(3))));
+}
+"#,
+    );
+    assert_eq!(output, "18");
+}

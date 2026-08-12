@@ -32,9 +32,11 @@
 //! - Full SSA rename / φ nodes / general loop-carried promotion across
 //!   overlapping live ranges (ledger: loop-carried φ-like shuffle).
 //! - Peel raise across CFG edges / opaque ops without stronger proofs.
-//! - Keeping values on the operand stack across calls or unknown SP.
 //! - Address-taken / aggregate / residual `Byte` promotion.
 //! - Coalesce / virtual rename across arbitrary CFG edges without stronger proofs.
+//!
+//! Stack-across-CALL for binary ops is handled in codegen (`compile_binary_operands`
+//! raises `expr_depth` for pure calls) rather than here.
 
 use std::collections::{HashMap, HashSet};
 

@@ -2972,7 +2972,8 @@ impl Compiler {
 
     /// True when compiling `expr` may `STORE` into a high temp that aliases the
     /// live expression-stack cursor (CALL receiver temps, HostInvoke, match).
-    /// Used so binary operands stage instead of leaving a value under a call.
+    /// Used so binary operands stage instead of leaving a value under a call
+    /// that is not [`Self::expr_is_stackable_direct_call`].
     fn expr_may_clobber_operand_stack(&self, expr: &Output<'_>) -> bool {
         if self.arg_emits_on_self_bytecode(expr) {
             return true;
@@ -3019,6 +3020,108 @@ impl Compiler {
             }
             _ => false,
         }
+    }
+
+    /// Leaf arg for a stackable call: no nested call/match/host and no STORE
+    /// during emit (identifiers, literals, and pure arith/cmp over those).
+    fn expr_is_call_arg_stack_leaf(&self, expr: &Output<'_>) -> bool {
+        if self.arg_emits_on_self_bytecode(expr) || self.expr_may_clobber_operand_stack(expr) {
+            return false;
+        }
+        match expr.1.as_ref() {
+            Expression::NamedArg(_, v) | Expression::Group(v) | Expression::Expr(v) => {
+                self.expr_is_call_arg_stack_leaf(v)
+            }
+            Expression::Identifier(_)
+            | Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::Bool(_)
+            | Expression::String(_) => true,
+            Expression::Negate(e)
+            | Expression::Not(e)
+            | Expression::LogicalNot(e)
+            | Expression::Positive(e)
+            | Expression::Cast(e, _) => self.expr_is_call_arg_stack_leaf(e),
+            Expression::Add(a, b)
+            | Expression::Sub(a, b)
+            | Expression::Mul(a, b)
+            | Expression::Div(a, b)
+            | Expression::Mod(a, b)
+            | Expression::Pow(a, b)
+            | Expression::Shl(a, b)
+            | Expression::Shr(a, b)
+            | Expression::Xor(a, b)
+            | Expression::And(a, b)
+            | Expression::BitAnd(a, b)
+            | Expression::Or(a, b)
+            | Expression::BitOr(a, b)
+            | Expression::Eq(a, b)
+            | Expression::Neq(a, b)
+            | Expression::Le(a, b)
+            | Expression::Leq(a, b)
+            | Expression::Gt(a, b)
+            | Expression::Geq(a, b) => {
+                self.expr_is_call_arg_stack_leaf(a) && self.expr_is_call_arg_stack_leaf(b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve a direct call's FQN the same way pair/call helpers do.
+    fn direct_call_fqn(&self, name: &Output<'_>) -> Option<String> {
+        match name.1.as_ref() {
+            Expression::Identifier(n) => {
+                let resolved = self
+                    .aliases
+                    .get(*n)
+                    .cloned()
+                    .unwrap_or_else(|| (*n).to_string());
+                Some(resolved)
+            }
+            Expression::QualifiedAccess { owner, member } => Some(format!("{owner}::{member}")),
+            _ => None,
+        }
+    }
+
+    /// True when `fqn`'s completed body is eligible for tiny-inline (which
+    /// always `STORE`s args into temps and can bury a sibling operand).
+    fn callee_is_tiny_inlineable(&self, fqn: &str) -> bool {
+        let Some((start, end, provisional)) = self.resolve_fn_span(fqn) else {
+            return false;
+        };
+        if provisional {
+            return false;
+        }
+        let ops = self.bytecode.code_slice_ops(start, end);
+        Self::is_tiny_inline_il(&ops)
+    }
+
+    /// Pure user `CALL` with leaf args that will emit a real `CALL` (not
+    /// tiny-inline / host). Safe to leave a sibling value under the args: the
+    /// VM preserves slots below the callee frame, and arg emit does not STORE.
+    fn expr_is_stackable_direct_call(&self, expr: &Output<'_>) -> bool {
+        let Expression::Call { name, args } = expr.1.as_ref() else {
+            return false;
+        };
+        if self.arg_emits_on_self_bytecode(expr) {
+            return false;
+        }
+        let arg_slice = args.as_deref().unwrap_or(&[]);
+        if !arg_slice
+            .iter()
+            .all(|a| self.expr_is_call_arg_stack_leaf(a))
+        {
+            return false;
+        }
+        let Some(fqn) = self.direct_call_fqn(name) else {
+            return false;
+        };
+        if !self.functions.contains_key(&fqn) && !self.functions.contains_key(strip_overload_key(&fqn))
+        {
+            // Method / unresolved — keep staging.
+            return false;
+        }
+        !self.callee_is_tiny_inlineable(&fqn)
     }
 
     /// Pure call arg: literals and pure arith/cmp/logic — no Call / HostInvoke /
@@ -6980,11 +7083,21 @@ impl Compiler {
         // advances `emit_idx` past lhs's entire subtree.
         let lhs_ty = self.codegen_expr_ty(lhs);
         let lhs_id = self.checker.id_table().ids().get(self.emit_idx).copied();
-        if self.expr_may_clobber_operand_stack(lhs) || self.expr_may_clobber_operand_stack(rhs) {
-            // CALL/HostInvoke temps share the operand/local stack. Leaving
-            // `acc` under `p.sum()` lets `STORE` of the call temp overwrite the
-            // stacked lhs. Stage into *this* buffer (not `self.bytecode`) so
-            // while/if label layout stays contiguous with the surrounding ops.
+        if self.expr_is_stackable_direct_call(lhs) && self.expr_is_stackable_direct_call(rhs) {
+            // Pure user `CALL`s with leaf args emit `push args; CALL` and leave
+            // the sibling below the callee frame. Raise `expr_depth` so any
+            // unexpected temp pads above the stacked lhs — enabling
+            // `CALL; CALL; ADD; RETURN` → `BinReturn` (fib).
+            let depth_on_entry = self.expr_depth;
+            self.append_with_existential_pack(bytecode, lhs);
+            self.expr_depth = depth_on_entry + 1;
+            self.append_with_existential_pack(bytecode, rhs);
+            self.expr_depth = depth_on_entry;
+        } else if self.expr_may_clobber_operand_stack(lhs)
+            || self.expr_may_clobber_operand_stack(rhs)
+        {
+            // HostInvoke / match / tiny-inline / nested calls: stage into *this*
+            // buffer so a stacked lhs cannot be buried by temp STOREs.
             let lhs_slot;
             let rhs_slot;
             self.append_with_existential_pack(bytecode, lhs);
