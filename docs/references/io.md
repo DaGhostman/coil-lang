@@ -58,7 +58,7 @@ TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
 non-empty PEM enables mTLS. `alpn: ""` leaves default; `"h2"` advertises HTTP/2.
 
-Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland: [coil-http](https://github.com/ardax-corp/coil-http/blob/main/docs/README.md).
+Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland [coil-http](https://github.com/ardax-corp/coil-http) — install via [spool](../manual/http-client.md).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 

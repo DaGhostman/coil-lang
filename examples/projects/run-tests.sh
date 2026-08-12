@@ -32,7 +32,7 @@ run_coil_test() {
 }
 
 failed=0
-for proj in 01-todo 02-adventure 03-echo 04-http; do
+for proj in 01-todo 02-adventure 03-echo; do
   echo "=== $proj tests ==="
   rm -f "$PROJECTS/$proj/out.hyc" "$ROOT/out.hyc"
   if (

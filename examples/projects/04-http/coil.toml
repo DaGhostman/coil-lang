@@ -1,3 +1,0 @@
-# HTTP/1.1 client+server tests (coil-http package)
-[module]
-roots = ["./tests", "../../../../coil-http/src", "../../../coil-stdlib/src", "../../../../coil-stdlib/src"]

@@ -59,7 +59,7 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `string::format(...)` | Supported compiler intrinsic (returns `string`; literal specifiers are checked) |
 
-Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo, HTTP client) live under [`examples/projects/`](../examples/projects/README.md). HTTP client API: [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md) ([stub](manual/http-client.md)).
+Browse runnable demos in [Examples](manual/examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo) live under [`examples/projects/`](../examples/projects/README.md). HTTP: install [coil-http](https://github.com/ardax-corp/coil-http) via [spool](https://github.com/ardax-corp/spool) ([stub](manual/http-client.md)).
 
 ## Documentation
 
@@ -90,7 +90,8 @@ Docs are split into three trees:
 | [11 — OS threads](manual/tutorial/11-threads.md) | `use thread::{spawn, join, …}`, channels, mutexes |
 | [Examples catalog](manual/examples.md) | Runnable demos in `examples/` (see catalog for expected output) |
 | [Showcase projects](../examples/projects/README.md) | Multi-file apps + co-located tests |
-| [Userland stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | coil-stdlib: consume, modules, HTTP, IO adapters |
+| [Userland stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/README.md) | coil-stdlib: consume, modules, IO adapters |
+| [HTTP (coil-http)](manual/http-client.md) | Userland client/server — install via spool |
 
 Classes (`class`, `impl`, `new`) — see [02 — Types & Variables](manual/tutorial/02-types-and-variables.md) and `examples/classes.hy`. Full API index: [References](references/README.md).
 

@@ -1,21 +1,25 @@
 # HTTP client and server
 
-HTTP is **userland** in [coil-http](https://github.com/ardax-corp/coil-http)
-(`ardax-corp/coil-http`), not a compiler builtin.
+HTTP is **userland** in [coil-http](https://github.com/ardax-corp/coil-http), not a compiler builtin.
+
+## Install via spool
+
+```toml
+[dependencies]
+http = { git = "https://github.com/ardax-corp/coil-http.git", version = "^0.1" }
+
+[module]
+roots = ["./src", "./.spool/deps/http"]
+```
+
+Run `spool install` in the project root, then:
+
+```coil
+use http::{Client, Server};
+```
 
 **Docs:** [coil-http](https://github.com/ardax-corp/coil-http/blob/main/docs/README.md)
 
-Add `../coil-http/src` (or `spool` install) to `[module].roots`. Showcase:
-[`examples/projects/04-http`](../../examples/projects/04-http).
+Transport uses virtual [`io::net::tcp`](../references/io.md) and [`io::net::tls`](../references/io.md).
 
-```coil
-use http::{Client, Server, Request, Response};
-
-fn main() {
-    let client = Client::new();
-    let r = client.get("http://127.0.0.1:8080/")?;
-}
-```
-
-Legacy function-oriented client lived in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib)
-until v0.2; use coil-http for new projects.
+For a sibling checkout instead of spool, add `../coil-http/src` to `[module].roots` (see [consume](https://github.com/ardax-corp/coil-http/blob/main/docs/consume.md)).
