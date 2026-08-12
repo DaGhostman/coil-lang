@@ -1248,6 +1248,179 @@ use string::{format, to_bytes};
         );
     }
 
+    /// Distinct pure non-tiny helpers with leaf args also stack-across-CALL
+    /// (not fib-only): no STORE between the two CALLs, and BinReturn fuse.
+    ///
+    /// Bodies use a loop so they are neither tiny-inlined nor predicate-peeled
+    /// (peel parks results via STORE and would confuse the inter-CALL check).
+    #[test]
+    fn pure_helper_binop_stacks_across_call_for_bin_return() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn left(int n) -> int { \
+               let s = 0; \
+               let i = 0; \
+               while i < n { s = s + i; i = i + 1; } \
+               return s; \
+             } \
+             fn right(int n) -> int { \
+               let s = 1; \
+               let i = 0; \
+               while i < n { s = s + i; i = i + 1; } \
+               return s; \
+             } \
+             fn main() { return left(4) + right(3); }",
+        );
+        let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
+        let call_pos: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| *b.bytecode() == Instruction::CALL)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            call_pos.len() >= 2,
+            "expected left/right CALLs in main; ops={ops:?}"
+        );
+        // Main's stacked arms are the last two CALLs (loop bodies have no CALL).
+        let (c0, c1) = (call_pos[call_pos.len() - 2], call_pos[call_pos.len() - 1]);
+        assert!(
+            !(c0 + 1..c1).any(|i| *bc[i].bytecode() == Instruction::STORE),
+            "STORE between pure helper arms regresses stack-across-CALL; between={:?}",
+            bc[c0..=c1].iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc[c1 + 1..]
+                .iter()
+                .any(|b| *b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::ADD as u8),
+            "expected BinReturn ADD after stacked helpers; ops={ops:?}"
+        );
+    }
+
+    /// Tiny-inlineable callees STORE args into temps — must stage binop arms
+    /// (not stack-across), or the sibling operand is buried.
+    #[test]
+    fn tiny_inline_binop_arms_stage_through_temps() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn add(int a, int b) -> int { return a + b; } \
+             fn main() { \
+               let x = 3; \
+               let y = 4; \
+               return add(x, y) + add(y, x); \
+             }",
+        );
+        let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
+        // Arms are tiny-inlined (arg STORE into temps) rather than real CALL;
+        // stack-across would leave CALL;CALL;BinReturn without result staging.
+        let main_calls = bc
+            .iter()
+            .filter(|b| *b.bytecode() == Instruction::CALL)
+            .count();
+        assert!(
+            main_calls <= 1,
+            "expected tiny-inline of add arms (≤1 prologue CALL); ops={ops:?}"
+        );
+        assert!(
+            !bc.iter().any(|b| {
+                *b.bytecode() == Instruction::BinReturn
+                    && b.bin_return_op() == Instruction::ADD as u8
+            }),
+            "BinReturn ADD would mean stack-across of tiny-inline arms; ops={ops:?}"
+        );
+        // Staging parks each inlined result then reloads: … STORE … STORE …
+        // LOAD; LOAD … before the join (or fused BinSlotSlot from those slots).
+        let stores = bc
+            .iter()
+            .filter(|b| *b.bytecode() == Instruction::STORE)
+            .count();
+        assert!(
+            stores >= 4,
+            "expected arg+result staging STOREs for tiny-inline arms; ops={ops:?}"
+        );
+        let reloaded = bc.windows(2).any(|w| {
+            *w[0].bytecode() == Instruction::LOAD && *w[1].bytecode() == Instruction::LOAD
+        }) || bc
+            .iter()
+            .any(|b| *b.bytecode() == Instruction::BinSlotSlot);
+        assert!(
+            reloaded,
+            "expected LOAD;LOAD or BinSlotSlot after staging tiny-inline arms; ops={ops:?}"
+        );
+    }
+
+    /// Nested call args are not stack leaves — binop arms must stage so the
+    /// nested CALL's temps cannot bury the stacked sibling.
+    #[test]
+    fn nested_call_arg_binop_arms_stage_through_temps() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn leaf(int n) -> int { \
+               if n <= 0 { return 1; } \
+               return n + leaf(n - 1); \
+             } \
+             fn main() { return leaf(leaf(2)) + leaf(3); }",
+        );
+        let call_pos: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| *b.bytecode() == Instruction::CALL)
+            .map(|(i, _)| i)
+            .collect();
+        // main: CALL leaf(2), CALL leaf(leaf(2)), CALL leaf(3) — at least 3.
+        assert!(
+            call_pos.len() >= 3,
+            "expected nested + sibling CALLs; ops={:?}",
+            bc.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+        // Between the outer nested CALL and the sibling CALL there must be a
+        // staging STORE (result of lhs parked before rhs emit).
+        let outer_nested = call_pos[call_pos.len() - 2];
+        let sibling = call_pos[call_pos.len() - 1];
+        assert!(
+            (outer_nested + 1..sibling).any(|i| *bc[i].bytecode() == Instruction::STORE),
+            "expected STORE staging between nested-arg arm and sibling; ops={:?}",
+            bc.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Match arms clobber the operand stack — binary ops must stage even when
+    /// the other arm is a stackable pure CALL.
+    #[test]
+    fn match_plus_pure_call_binop_stages() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn leaf(int n) -> int { \
+               if n <= 0 { return 1; } \
+               return n + leaf(n - 1); \
+             } \
+             fn main() { \
+               return match Option::Some(3) { \
+                 Option::Some(x) => leaf(x), \
+                 Option::None => 0, \
+               } + leaf(2); \
+             }",
+        );
+        let call_pos: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| *b.bytecode() == Instruction::CALL)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            call_pos.len() >= 2,
+            "expected match-arm + sibling CALLs; ops={:?}",
+            bc.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+        let (c0, c1) = (call_pos[call_pos.len() - 2], call_pos[call_pos.len() - 1]);
+        assert!(
+            (c0 + 1..c1).any(|i| *bc[i].bytecode() == Instruction::STORE),
+            "expected STORE staging between match arm and pure CALL; ops={:?}",
+            bc.iter().map(|b| *b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     // ============================================================
     // BlockBuilder for Loop and Match codegen
     // ============================================================
