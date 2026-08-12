@@ -308,13 +308,6 @@ mod tests {
         }
     }
 
-    fn array_len(heap: &Heap, v: Value) -> usize {
-        match heap.find_object_by_addr(v.raw() as u64) {
-            Some(Object::Array(gc)) => gc.as_ref().elements.len(),
-            _ => panic!("expected array"),
-        }
-    }
-
     fn make_string_array(heap: &mut Heap, items: &[&str]) -> Value {
         let elements: Vec<Value> = items
             .iter()
@@ -333,7 +326,9 @@ mod tests {
         let r = host_args(&mut heap, &[]);
         assert_eq!(enum_tag(&heap, r), Some(0));
         let arr = result_ok_payload(&heap, r);
-        assert!(array_len(&heap, arr) >= 1);
+        let got = value_as_string_array(&heap, arr).expect("Ok payload is string array");
+        let expect: Vec<String> = std::env::args().collect();
+        assert_eq!(got, expect, "argv must match process args including argv0");
     }
 
     #[test]
