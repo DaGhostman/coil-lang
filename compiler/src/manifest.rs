@@ -14,7 +14,6 @@ pub enum ManifestError {
     /// A required section is missing.
     MissingSection(&'static str),
     /// A required key is missing from a section.
-    #[allow(dead_code)] // reserved for future strict-mode validation
     MissingKey {
         section: &'static str,
         key: &'static str,
@@ -38,6 +37,22 @@ impl std::fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+/// `[package]` metadata. Parsed for spool / tooling; the
+/// compiler does not use it for module discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+}
+
+/// A `[dependencies]` entry: either a git source with a
+/// semver requirement, or a local path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencySpec {
+    Git { url: String, version: String },
+    Path { path: PathBuf },
+}
+
 /// Resolved project manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
@@ -52,6 +67,10 @@ pub struct Manifest {
     pub ffi_search_paths: Vec<PathBuf>,
     /// When false, `env::exec` fails at runtime with `ExecDisabled`.
     pub allow_exec: bool,
+    /// Optional `[package]` block (`name` + `version`).
+    pub package: Option<PackageInfo>,
+    /// `[dependencies]` entries in declaration order.
+    pub dependencies: Vec<(String, DependencySpec)>,
 }
 
 impl Default for Manifest {
@@ -64,6 +83,8 @@ impl Default for Manifest {
             entry: None,
             ffi_search_paths: Vec::new(),
             allow_exec: false,
+            package: None,
+            dependencies: Vec::new(),
         }
     }
 }
@@ -115,6 +136,10 @@ impl Manifest {
         let mut entry: Option<PathBuf> = None;
         let mut ffi_search_paths: Option<Vec<PathBuf>> = None;
         let mut allow_exec: Option<bool> = None;
+        let mut package_name: Option<String> = None;
+        let mut package_version: Option<String> = None;
+        let mut saw_package_section = false;
+        let mut dependencies: Vec<(String, DependencySpec)> = Vec::new();
         let mut current_section: Option<&'static str> = None;
 
         for (idx, raw_line) in source.lines().enumerate() {
@@ -135,6 +160,11 @@ impl Manifest {
                     "entry" => Some("entry"),
                     "ffi" => Some("ffi"),
                     "env" => Some("env"),
+                    "package" => {
+                        saw_package_section = true;
+                        Some("package")
+                    }
+                    "dependencies" => Some("dependencies"),
                     other => {
                         return Err(ManifestError::Parse {
                             line: line_num,
@@ -185,6 +215,48 @@ impl Manifest {
                     })?;
                     allow_exec = Some(parsed);
                 }
+                ("package", "name") => {
+                    let parsed = parse_string(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected string, got `{}`", value),
+                    })?;
+                    if package_name.is_some() {
+                        return Err(ManifestError::Parse {
+                            line: line_num,
+                            message: "duplicate key `package.name`".to_string(),
+                        });
+                    }
+                    package_name = Some(parsed);
+                }
+                ("package", "version") => {
+                    let parsed = parse_string(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected string, got `{}`", value),
+                    })?;
+                    if package_version.is_some() {
+                        return Err(ManifestError::Parse {
+                            line: line_num,
+                            message: "duplicate key `package.version`".to_string(),
+                        });
+                    }
+                    package_version = Some(parsed);
+                }
+                ("dependencies", dep_name) => {
+                    if dependencies.iter().any(|(n, _)| n == dep_name) {
+                        return Err(ManifestError::Parse {
+                            line: line_num,
+                            message: format!("duplicate dependency `{dep_name}`"),
+                        });
+                    }
+                    let spec = parse_dependency_spec(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!(
+                            "expected dependency table `{{ git = \"…\", version = \"…\" }}` \
+                             or `{{ path = \"…\" }}`, got `{value}`"
+                        ),
+                    })?;
+                    dependencies.push((dep_name.to_string(), spec));
+                }
                 (section, key) => {
                     return Err(ManifestError::Parse {
                         line: line_num,
@@ -194,11 +266,36 @@ impl Manifest {
             }
         }
 
+        let package = match (saw_package_section, package_name, package_version) {
+            (false, None, None) => None,
+            (true, None, None) => {
+                return Err(ManifestError::MissingKey {
+                    section: "package",
+                    key: "name",
+                });
+            }
+            (_, Some(name), Some(version)) => Some(PackageInfo { name, version }),
+            (_, None, Some(_)) => {
+                return Err(ManifestError::MissingKey {
+                    section: "package",
+                    key: "name",
+                });
+            }
+            (_, Some(_), None) => {
+                return Err(ManifestError::MissingKey {
+                    section: "package",
+                    key: "version",
+                });
+            }
+        };
+
         Ok(Self {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
             ffi_search_paths: ffi_search_paths.unwrap_or_default(),
             allow_exec: allow_exec.unwrap_or(false),
+            package,
+            dependencies,
         })
     }
 
@@ -363,6 +460,50 @@ fn parse_string_array(value: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// Parse a TOML-like inline table of string values:
+/// `{ git = "…", version = "^0.2" }`.
+fn parse_inline_table(value: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
+    let mut out = Vec::new();
+    for piece in inner.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (key, rhs) = parse_kv(piece)?;
+        out.push((key.to_string(), parse_string(rhs)?));
+    }
+    Some(out)
+}
+
+/// Parse a `[dependencies]` RHS into [`DependencySpec`].
+///
+/// Accepted forms:
+/// - `{ git = "url", version = "^0.2" }`
+/// - `{ path = "../local" }`
+fn parse_dependency_spec(value: &str) -> Option<DependencySpec> {
+    let entries = parse_inline_table(value)?;
+    let mut git: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut path: Option<String> = None;
+    for (key, val) in entries {
+        match key.as_str() {
+            "git" if git.is_none() => git = Some(val),
+            "version" if version.is_none() => version = Some(val),
+            "path" if path.is_none() => path = Some(val),
+            _ => return None,
+        }
+    }
+    match (git, version, path) {
+        (Some(url), Some(version), None) => Some(DependencySpec::Git { url, version }),
+        (None, None, Some(path)) => Some(DependencySpec::Path {
+            path: PathBuf::from(path),
+        }),
+        _ => None,
+    }
+}
+
 /// Convert a relative file path to a namespace string. Strips
 /// the file extension and replaces path separators with `::`.
 ///
@@ -511,6 +652,8 @@ mod tests {
             entry: None,
             ffi_search_paths: Vec::new(),
             allow_exec: true,
+            package: None,
+            dependencies: Vec::new(),
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
@@ -607,6 +750,8 @@ mod tests {
             entry: None,
             ffi_search_paths: Vec::new(),
             allow_exec: true,
+            package: None,
+            dependencies: Vec::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, Some("core::ffi::dload".to_string()));
@@ -627,6 +772,8 @@ mod tests {
             entry: None,
             ffi_search_paths: Vec::new(),
             allow_exec: true,
+            package: None,
+            dependencies: Vec::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, None);
@@ -683,5 +830,164 @@ mod tests {
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("./vendor")]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_package_and_dependencies() {
+        let src = r#"
+            [package]
+            name = "my_app"
+            version = "0.1.0"
+
+            [module]
+            roots = ["./src", "./.spool/deps"]
+
+            [dependencies]
+            http = { git = "https://github.com/coil-lang/http.git", version = "^0.2" }
+            local_http = { path = "../local-http" }
+        "#;
+        let m = Manifest::parse(src).unwrap();
+        assert_eq!(
+            m.package,
+            Some(PackageInfo {
+                name: "my_app".into(),
+                version: "0.1.0".into(),
+            })
+        );
+        assert_eq!(
+            m.dependencies,
+            vec![
+                (
+                    "http".into(),
+                    DependencySpec::Git {
+                        url: "https://github.com/coil-lang/http.git".into(),
+                        version: "^0.2".into(),
+                    }
+                ),
+                (
+                    "local_http".into(),
+                    DependencySpec::Path {
+                        path: PathBuf::from("../local-http"),
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            m.roots,
+            vec![PathBuf::from("./src"), PathBuf::from("./.spool/deps")]
+        );
+    }
+
+    #[test]
+    fn parse_legacy_manifest_without_package_still_works() {
+        let src = "[module]\nroots = [\"./src\"]\n[entry]\nfile = \"./src/main.hy\"\n";
+        let m = Manifest::parse(src).unwrap();
+        assert!(m.package.is_none());
+        assert!(m.dependencies.is_empty());
+        assert_eq!(m.roots, vec![PathBuf::from("./src")]);
+        assert_eq!(m.entry, Some(PathBuf::from("./src/main.hy")));
+    }
+
+    #[test]
+    fn parse_package_requires_name_and_version() {
+        let missing_version = "[package]\nname = \"only_name\"\n";
+        match Manifest::parse(missing_version).unwrap_err() {
+            ManifestError::MissingKey { section, key } => {
+                assert_eq!(section, "package");
+                assert_eq!(key, "version");
+            }
+            other => panic!("expected MissingKey, got {other:?}"),
+        }
+
+        let missing_name = "[package]\nversion = \"0.1.0\"\n";
+        match Manifest::parse(missing_name).unwrap_err() {
+            ManifestError::MissingKey { section, key } => {
+                assert_eq!(section, "package");
+                assert_eq!(key, "name");
+            }
+            other => panic!("expected MissingKey, got {other:?}"),
+        }
+
+        let empty_package = "[package]\n";
+        match Manifest::parse(empty_package).unwrap_err() {
+            ManifestError::MissingKey { section, key } => {
+                assert_eq!(section, "package");
+                assert_eq!(key, "name");
+            }
+            other => panic!("expected MissingKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_package_key_errors() {
+        let src = "[package]\nname = \"x\"\nversion = \"0.1.0\"\nauthors = \"nope\"\n";
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("unknown key `package.authors`"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_git_requires_version() {
+        let src = r#"
+            [dependencies]
+            http = { git = "https://example.com/http.git" }
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("expected dependency table"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dependency_rejects_git_and_path_together() {
+        let src = r#"
+            [dependencies]
+            http = { git = "https://example.com/http.git", version = "^1", path = "../x" }
+        "#;
+        assert!(Manifest::parse(src).is_err());
+    }
+
+    #[test]
+    fn parse_dependency_rejects_unknown_inline_key() {
+        let src = r#"
+            [dependencies]
+            http = { git = "https://example.com/http.git", version = "^1", rev = "abc" }
+        "#;
+        assert!(Manifest::parse(src).is_err());
+    }
+
+    #[test]
+    fn parse_duplicate_dependency_errors() {
+        let src = r#"
+            [dependencies]
+            http = { path = "../a" }
+            http = { path = "../b" }
+        "#;
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("duplicate dependency `http`"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_section_still_errors() {
+        let src = "[registry]\nurl = \"https://example.com\"\n";
+        let err = Manifest::parse(src).unwrap_err();
+        match err {
+            ManifestError::Parse { message, .. } => {
+                assert!(message.contains("unknown section"));
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 }
