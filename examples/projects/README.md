@@ -91,5 +91,5 @@ See each project's `NOTES.md` for detail. Highlights:
    `multi_file_io_hostinvoke_try_in_dependency` in
    `compiler/tests/namespace.rs`); demos may still keep Stream IO in the
    entry for layout clarity.
-7. Prefer a single explicit `use http::url::{…}` import graph for HTTP helpers —
-   importing overlapping facades can hide `url` symbols.
+7. Import HTTP types from the module that defines them (`http::url`,
+   `http::request`, `http::response`). `use` does not re-export.
