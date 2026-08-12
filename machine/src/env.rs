@@ -113,9 +113,12 @@ fn parse_name(heap: &Heap, v: Value) -> Result<String, EnvErrorTag> {
 }
 
 /// Command-line arguments (`std::env::args`, including argv0).
+///
+/// Always `Result::Ok` with the argv vector (matches `Result<Vec<string>, EnvError>`).
 pub fn host_args(heap: &mut Heap, _args: &[Value]) -> Value {
     let strings: Vec<String> = std::env::args().collect();
-    alloc_string_array(heap, &strings)
+    let arr = alloc_string_array(heap, &strings);
+    as_result_value(heap, Ok(arr))
 }
 
 /// `std::env::var` — `NotFound` when unset.
@@ -284,8 +287,7 @@ mod tests {
         assert_eq!(gc.as_ref().tag, 0);
         match &gc.as_ref().payload[0] {
             Member::Value(v) => *v,
-            Member::Object(Object::String(s)) => Value::from(s.as_ptr() as *mut u8 as u64),
-            Member::Object(_) => panic!("unexpected object in Ok payload"),
+            Member::Object(o) => Value::from(o.addr()),
         }
     }
 
@@ -306,13 +308,6 @@ mod tests {
         }
     }
 
-    fn array_len(heap: &Heap, v: Value) -> usize {
-        match heap.find_object_by_addr(v.raw() as u64) {
-            Some(Object::Array(gc)) => gc.as_ref().elements.len(),
-            _ => panic!("expected array"),
-        }
-    }
-
     fn make_string_array(heap: &mut Heap, items: &[&str]) -> Value {
         let elements: Vec<Value> = items
             .iter()
@@ -326,10 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn host_args_returns_heap_string_array() {
+    fn host_args_returns_ok_string_array() {
         let mut heap = Heap::default();
-        let arr = host_args(&mut heap, &[]);
-        assert!(array_len(&heap, arr) >= 1);
+        let r = host_args(&mut heap, &[]);
+        assert_eq!(enum_tag(&heap, r), Some(0));
+        let arr = result_ok_payload(&heap, r);
+        let got = value_as_string_array(&heap, arr).expect("Ok payload is string array");
+        let expect: Vec<String> = std::env::args().collect();
+        assert_eq!(got, expect, "argv must match process args including argv0");
     }
 
     #[test]

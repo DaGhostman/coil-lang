@@ -5636,6 +5636,48 @@ fn main() {
     assert_eq!(output, "coil_ok");
 }
 
+/// HostInvoke + virtual `env::args`: `?` yields argv; argv0 matches process.
+#[test]
+fn env_args_ok_has_argv0_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use env::{args};
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+fn main() {
+    let a = args()?;
+    write(stdout(), to_bytes(format("%s", a[0])));
+}
+"#,
+    );
+    let expect = std::env::args().next().expect("process argv0");
+    assert_eq!(output, expect, "args()? argv0 must match process");
+}
+
+/// HostInvoke + `match args()`: Ok arm binds a usable string vector.
+#[test]
+fn env_args_match_ok_exposes_argv_len() {
+    let output = run_example_src(
+        r#"
+use env::{args};
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+fn main() {
+    let n = match args() {
+        Result::Ok(v) => v.len(),
+        Result::Err(_) => -1,
+    };
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#,
+    );
+    let n: i64 = output.parse().expect("argv length");
+    let expect = std::env::args().count() as i64;
+    assert_eq!(n, expect, "match Ok len must match process argc");
+}
+
 /// HostInvoke + `io::net::tls::client`: enable on non-TCP → InvalidInput.
 #[cfg(feature = "tls")]
 #[test]
