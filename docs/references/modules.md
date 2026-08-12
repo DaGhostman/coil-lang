@@ -150,6 +150,25 @@ roots = ["./src", "./stdlib"]
 
 See [HTTP/1.1 client](../manual/http-client.md) for the HTTP API.
 
+### Library deps via `spool`
+
+Git/path library dependencies are declared in `coil.toml` `[dependencies]` and
+fetched by **`spool`** (not by the compiler). After install, spool maintains a
+managed root such as `.spool/deps/<package-name>` (symlinks into a shared cache)
+and that directory should be listed in `[module].roots`:
+
+```toml
+[module]
+roots = ["./src", "./.spool/deps"]
+```
+
+`use http::client;` then resolves under `.spool/deps/http/…` with the same
+algorithm as any other root — first match wins; local `./src` still shadows
+deps. The compiler does **not** read `coil.lock` or inject roots automatically.
+See [Project configuration](project-config.md) for `[package]` / `[dependencies]`
+schema and the **`spool` vs `coil package`** naming distinction (`coil package`
+builds an embedded executable; it is not the library dependency manager).
+
 ---
 
 ## Namespace rules
@@ -288,6 +307,8 @@ The pipeline runs in two passes:
 Module resolution depends on `[module].roots` from the project manifest. See [Project configuration](project-config.md) for manifest format and default behavior.
 
 Without a manifest, the compiler uses a single default root: `src/`.
+
+`[package]` and `[dependencies]` are accepted by the parser for **`spool`**, but they do not change discovery by themselves — only paths listed in `roots` are searched. Put `./.spool/deps` (or equivalent) in `roots` after `spool install` so dependency packages participate in `use` resolution.
 
 ---
 

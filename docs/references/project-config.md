@@ -1,6 +1,13 @@
 # Project configuration (`coil.toml`)
 
-The **`coil.toml`** file at a project's root tells the compiler where to find module files and optionally which file is the entry point.
+The **`coil.toml`** file at a project's root tells the compiler where to find module files and optionally which file is the entry point. It may also declare **`[package]`** / **`[dependencies]`** metadata for the **`spool`** library dependency manager (schema is parsed today; install/fetch is WIP).
+
+### `spool` vs `coil package`
+
+| Command | Role |
+|---------|------|
+| **`spool`** | Library dependency management (`install` / `add` / `update`): resolve git/path deps, write `coil.lock`, maintain a shared cache and project `.spool/deps` roots. Coil userland (not a Rust subcommand of `coil`). |
+| **`coil package`** | Build an embedded **executable** (`.hyc` + runner such as `coil-embed`). Unrelated to library deps — do not confuse the names. |
 
 ---
 
@@ -25,10 +32,11 @@ If `coil.toml` is absent, the compiler uses built-in defaults (see [Default beha
 
 The parser accepts a minimal TOML-like subset:
 
-- Section headers: `[module]`, `[entry]`, `[env]`
+- Section headers: `[module]`, `[entry]`, `[env]`, `[ffi]`, `[package]`, `[dependencies]`
 - Key-value lines: `key = value`
 - String values: double-quoted (`"./src"`)
 - Array values: `["a", "b"]`
+- Inline tables: `{ git = "…", version = "^0.2" }` (used under `[dependencies]`)
 - Comments: `#` to end of line
 - Blank lines are ignored
 
@@ -99,6 +107,55 @@ Example:
 allow_exec = true   # opt-in: enable env::exec for trusted scripts
 ```
 
+### `[package]`
+
+Optional package identity for publishing / consuming libraries via **`spool`**. When the section is present, both keys are required.
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `name` | string | Yes (if section present) | Short package name. Consumers import this name (`use http::…`), never the git URL. |
+| `version` | string | Yes (if section present) | Semver version of this package (e.g. `"0.1.0"`). |
+
+Example:
+
+```toml
+[package]
+name = "my_app"
+version = "0.1.0"
+```
+
+The compiler stores these fields but does **not** use them for module discovery. **`spool`** owns dependency semantics.
+
+### `[dependencies]`
+
+Declares library dependencies for **`spool`**. Each key is the short package name (must match that dependency’s `[package].name`). Values are inline tables — one of:
+
+| Form | Keys | Description |
+|------|------|-------------|
+| Git | `git` (string URL), `version` (semver range, e.g. `"^0.2"`) | Fetch from git; versions are semver tags (`v1.2.3` or `1.2.3`). |
+| Path | `path` (string) | Local checkout relative to the project root. |
+
+`git` and `path` must not be combined on the same entry. Unknown inline keys are parse errors. Duplicate dependency names are parse errors.
+
+Example:
+
+```toml
+[dependencies]
+http = { git = "https://github.com/coil-lang/http.git", version = "^0.2" }
+local_http = { path = "../local-http" }
+```
+
+**Compiler role:** parse and store the schema so manifests with deps still compile. **`spool`** (when available) resolves versions, writes `coil.lock`, fetches into a shared cache, and maintains a project-local managed root (e.g. `.spool/deps/<name>` symlinks) that should appear in `[module].roots`. The compiler does **not** read `coil.lock` or auto-inject roots.
+
+Typical roots after `spool install`:
+
+```toml
+[module]
+roots = ["./src", "./.spool/deps"]
+```
+
+Then `use http::client;` resolves under `./.spool/deps/http/…` via the normal discovery algorithm (see [Modules](modules.md)).
+
 ---
 
 ## Complete example
@@ -108,17 +165,26 @@ From `coil.toml.example`:
 ```toml
 # coil project manifest
 
+[package]
+name = "my_app"
+version = "0.1.0"
+
 [module]
 # Search roots for `use` resolution. Each path is relative to
 # the directory containing this coil.toml file. The compiler
 # searches the roots in order; the first file that exists wins.
-roots = ["./src", "./vendor", "./builtins"]
+# Include ./.spool/deps after `spool install` for library deps.
+roots = ["./src", "./vendor", "./stdlib"]
 
 # Default when no coil.toml exists: roots = ["src"]
 
 [entry]
 # Optional entry point. If omitted, use the file from the CLI.
 # file = "./src/main.hy"
+
+# [dependencies]
+# http = { git = "https://github.com/coil-lang/http.git", version = "^0.2" }
+# local_http = { path = "../local-http" }
 ```
 
 ---
@@ -229,23 +295,24 @@ The namespace test suite confirms that `use foo::greet;` resolves to `src/foo/gr
 
 ## Multiple roots in practice
 
-Use multiple roots to vendored or built-in libraries:
+Use multiple roots for vendored libraries, stdlib, or **`spool`**-managed deps:
 
 ```toml
 [module]
-roots = ["./src", "./vendor", "./builtins"]
+roots = ["./src", "./.spool/deps", "./stdlib"]
 ```
 
-Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `vendor/foo/greet.hy` exist, the `src/` copy is used.
+Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `.spool/deps/foo/greet.hy` exist, the `src/` copy is used.
 
 Typical layout:
 
 ```
 project/
 ├── coil.toml
-├── src/           # application code (first priority)
-├── vendor/        # third-party coil modules
-└── builtins/      # compiler-shipped helpers (e.g. FFI wrappers)
+├── coil.lock          # written by spool (when used)
+├── src/               # application code (first priority)
+├── .spool/deps/       # managed symlinks into the shared spool cache
+└── stdlib/            # optional local stdlib checkout
 ```
 
 ---
@@ -268,5 +335,6 @@ Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual m
 
 ## Related documentation
 
-- [Modules reference](modules.md) — `use` / `mod` syntax, FQN rules, glob semantics
+- [Modules reference](modules.md) — `use` / `mod` syntax, FQN rules, dep roots
 - [Tutorial: Modules](../manual/tutorial/06-modules.md) — walkthrough with `examples/modules.hy`
+- [Getting started](../manual/getting-started.md) — `coil package` (embed executable), unrelated to `spool`
