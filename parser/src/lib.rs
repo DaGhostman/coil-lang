@@ -16,7 +16,7 @@ use std::{
 pub use chumsky::span::SimpleSpan;
 use chumsky::{
     IterParser, Parser,
-    error::Rich,
+    error::{Rich, RichReason},
     extra,
     pratt::{infix, left, none, postfix, prefix, right},
     prelude::{any, choice, empty, just, none_of, recursive},
@@ -792,14 +792,51 @@ impl<'pratt> Pratt<'pratt> {
                         is_rest: false,
                     }),
                 )
+            })
+            .labelled("typed parameter (`Type name`)");
+        // Common mistake: Rust-style `name: Type` instead of coil `Type name`.
+        let rust_style_param = self
+            .docs_prefix()
+            .then(text::ident().padded())
+            .then_ignore(op!(":"))
+            .then(ty_parser.clone())
+            .try_map(|((docs, name), _ty), span| {
+                let _ = docs;
+                Err(Rich::custom(
+                    span,
+                    format!(
+                        "parameter `{name}` uses `name: Type` syntax; write `Type {name}` instead (for example `int {name}`)"
+                    ),
+                ))
             });
-        let arg = tuple_rest_arg.or(rest_arg).or(fixed_arg);
+        // Bare `name)` / `name,` — consume the trailing delimiter so the
+        // custom error span is at least as far as the typed-param failure
+        // (which otherwise wins on `found ')' expected identifier`).
+        let untyped_param = self
+            .docs_prefix()
+            .then(text::ident().padded())
+            .then(choice((op!(','), op!(')'))))
+            .try_map(|((docs, name), _), span| {
+                let _ = docs;
+                Err(Rich::custom(
+                    span,
+                    format!(
+                        "parameter `{name}` is missing a type; write `Type {name}` (for example `int {name}`)"
+                    ),
+                ))
+            });
+        let arg = tuple_rest_arg
+            .or(rest_arg)
+            .or(rust_style_param)
+            .or(fixed_arg)
+            .or(untyped_param);
 
         arg.separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
             .map_with(output!(Fragment))
             .delimited_by(op!("("), op!(")"))
+            .labelled("parameter list")
     }
 
     fn arg_list(
@@ -1218,13 +1255,13 @@ impl<'pratt> Pratt<'pratt> {
         // `recursive` enables `else if` to call back into this parser.
         recursive(|if_parser| {
             keyword!("if")
-                .ignore_then(expr.clone())
-                .then(self.block(stmt.clone()))
+                .ignore_then(expr.clone().labelled("condition"))
+                .then(self.block(stmt.clone()).labelled("block `{ ... }`"))
                 .then(
                     keyword!("else")
                         .ignore_then(choice((
                             // `else { body }` — a Block.
-                            self.block(stmt.clone()),
+                            self.block(stmt.clone()).labelled("block `{ ... }`"),
                             // `else if ...` — recurse into the if-parser.
                             if_parser,
                         )))
@@ -2008,8 +2045,8 @@ impl<'pratt> Pratt<'pratt> {
                 .or_not(),
             )
             .then(text::ident())
-            .then_ignore(op!(":"))
-            .then(self.type_annotation())
+            .then_ignore(op!(":").labelled("':' before field type"))
+            .then(self.type_annotation().labelled("field type"))
             .then(op!("=").ignore_then(self.expr()).or_not())
             .map_with(|(((((docs, vis), modifier), name), ty), init), e| {
                 let visibility = if vis.is_some() {
@@ -2031,6 +2068,7 @@ impl<'pratt> Pratt<'pratt> {
                     }),
                 )
             })
+            .labelled("class field (`name: Type`)")
     }
 
     /// Top-level `static let` / `static const` singleton binding.
@@ -3187,18 +3225,155 @@ impl<'pratt> Pratt<'pratt> {
                     .first()
                     .map(|err| err.span().into_range())
                     .unwrap_or_default();
-                let mut message =
-                    Message::error(ErrorCode::ParseError, "Parse error".to_string(), primary);
+                let title = errs
+                    .first()
+                    .map(|err| format_parse_error_title(input, err))
+                    .unwrap_or_else(|| "Parse error".to_string());
+                let mut message = Message::error(ErrorCode::ParseError, title, primary);
 
                 errs.iter().for_each(|err| {
-                    message.push(Label::new(err.to_string(), err.span().into_range()));
+                    message.push(Label::new(
+                        format_parse_error_label(input, err),
+                        err.span().into_range(),
+                    ));
                 });
+
+                if let Some(help) = errs.first().and_then(|err| parse_error_help(input, err)) {
+                    message.with_help(help);
+                }
 
                 Err(message)
             }
             Ok(ast) => Ok(ast),
         }
     }
+}
+
+/// Prefer custom chumsky messages as the diagnostic title; fall back to a short summary.
+fn format_parse_error_title(input: &str, err: &Rich<'_, char>) -> String {
+    if let Some(msg) = missing_param_type_message(input, err) {
+        return msg;
+    }
+    match err.reason() {
+        RichReason::Custom(msg) => msg.to_string(),
+        RichReason::ExpectedFound { expected, found } => {
+            let expected_label = expected
+                .iter()
+                .find_map(|pat| {
+                    let s = pat.to_string();
+                    // Prefer labelled productions over raw token dumps.
+                    if s.contains(' ') || s.contains('`') || s.starts_with('"') {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| expected.first().map(|p| p.to_string()));
+            match (found.as_ref().map(|c| c.to_string()), expected_label) {
+                (Some(found), Some(exp)) => format!("unexpected `{found}`, expected {exp}"),
+                (None, Some(exp)) => format!("unexpected end of input, expected {exp}"),
+                (Some(found), None) => format!("unexpected `{found}`"),
+                (None, None) => "Parse error".to_string(),
+            }
+        }
+    }
+}
+
+fn format_parse_error_label(input: &str, err: &Rich<'_, char>) -> String {
+    if let Some(msg) = missing_param_type_message(input, err) {
+        return msg;
+    }
+    match err.reason() {
+        RichReason::Custom(msg) => msg.to_string(),
+        _ => err.to_string(),
+    }
+}
+
+fn parse_error_help(input: &str, err: &Rich<'_, char>) -> Option<String> {
+    if missing_param_type_message(input, err).is_some() {
+        return Some(
+            "function parameters are written `Type name`, not `name` or `name: Type`".to_string(),
+        );
+    }
+    match err.reason() {
+        RichReason::Custom(msg)
+            if msg.contains("missing a type") || msg.contains("name: Type") =>
+        {
+            Some(
+                "function parameters are written `Type name`, not `name` or `name: Type`"
+                    .to_string(),
+            )
+        }
+        RichReason::ExpectedFound { expected, .. }
+            if expected.iter().any(|p| {
+                let s = p.to_string();
+                s.contains("block") || s.contains("`{ ... }`")
+            }) =>
+        {
+            Some("control-flow bodies use braces, e.g. `if cond { ... }`".to_string())
+        }
+        RichReason::ExpectedFound { expected, found }
+            if matches!(found.as_ref().map(|c| **c), Some('}'))
+                && expected.iter().any(|p| p.to_string().contains(':')) =>
+        {
+            Some("class fields are written `name: Type`".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Detect missing / Rust-style parameter types from the chumsky failure and nearby source.
+fn missing_param_type_message(input: &str, err: &Rich<'_, char>) -> Option<String> {
+    match err.reason() {
+        RichReason::Custom(msg)
+            if msg.contains("missing a type") || msg.contains("name: Type") =>
+        {
+            return Some(msg.to_string());
+        }
+        RichReason::ExpectedFound { expected, found }
+            if matches!(found.as_ref().map(|c| **c), Some(')') | Some(','))
+                && expected.iter().any(|p| p.to_string() == "identifier")
+                && expected.iter().any(|p| {
+                    let s = p.to_string();
+                    s.contains(':')
+                        || s.contains('<')
+                        || s.contains('.')
+                        || s.contains("something else")
+                }) =>
+        {
+            return Some(
+                "function parameter is missing a type; write `Type name` (for example `int n`)"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    // `fn f(n: int)` often fails after the colon with a confusing token error.
+    // Recover the parameter name from the source prefix when it looks like `name:`.
+    let start = err.span().start;
+    let head = input.get(..start.min(input.len())).unwrap_or("");
+    let trimmed = head.trim_end();
+    if let Some(before_colon) = trimmed.strip_suffix(':') {
+        let named = before_colon.trim_end();
+        let name = named
+            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let prefix = named
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            .trim_end();
+        if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && (prefix.ends_with('(') || prefix.ends_with(','))
+        {
+            return Some(format!(
+                "parameter `{name}` uses `name: Type` syntax; write `Type {name}` instead (for example `int {name}`)"
+            ));
+        }
+    }
+    None
 }
 
 
@@ -3208,6 +3383,9 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/tests_error_handling.rs"]
 mod tests_error_handling;
+#[cfg(test)]
+#[path = "tests/tests_diagnostics.rs"]
+mod tests_diagnostics;
 #[cfg(test)]
 #[path = "tests/tests_classes.rs"]
 mod tests_classes;

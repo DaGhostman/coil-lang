@@ -1,0 +1,144 @@
+use super::*;
+use reporting::ErrorCode;
+
+fn parse_err(src: &str) -> reporting::Message {
+    Pratt::default().parse(src).expect_err("expected parse failure")
+}
+
+fn err_text(src: &str) -> String {
+    let err = parse_err(src);
+    let mut out = err.message().to_string();
+    for label in err.labels() {
+        out.push('\n');
+        out.push_str(label.message());
+    }
+    if let Some(help) = err.help() {
+        out.push('\n');
+        out.push_str(help);
+    }
+    out
+}
+
+#[test]
+fn untyped_fn_param_mentions_missing_type() {
+    let text = err_text("fn fib(n) {}");
+    assert!(
+        text.contains("missing a type") || text.contains("Type name"),
+        "expected missing-type diagnostic, got:\n{text}"
+    );
+    assert!(
+        !text.contains("expected something else, ':', '<'"),
+        "should not dump raw type-token salad, got:\n{text}"
+    );
+    let err = parse_err("fn fib(n) {}");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+    assert!(
+        err.help()
+            .as_ref()
+            .is_some_and(|h| h.contains("Type name")),
+        "expected help about `Type name`, got: {:?}",
+        err.help()
+    );
+}
+
+#[test]
+fn untyped_fn_param_with_comma_mentions_missing_type() {
+    let text = err_text("fn fib(n, int m) {}");
+    assert!(
+        text.contains("missing a type") || text.contains("Type name"),
+        "expected missing-type diagnostic, got:\n{text}"
+    );
+}
+
+#[test]
+fn rust_style_param_is_rejected_clearly() {
+    // coil uses `Type name`, not `name: Type`.
+    let text = err_text("fn fib(n: int) {}");
+    assert!(
+        text.contains("name: Type") || text.contains("Type name") || text.contains("missing a type"),
+        "expected guidance toward `Type name`, got:\n{text}"
+    );
+    let err = parse_err("fn fib(n: int) {}");
+    assert!(
+        err.help()
+            .as_ref()
+            .is_some_and(|h| h.contains("Type name")),
+        "expected help about `Type name`, got: {:?}",
+        err.help()
+    );
+}
+
+#[test]
+fn if_without_block_mentions_braces() {
+    let text = err_text("fn main() { if true }");
+    assert!(
+        text.contains("block") || text.contains('{'),
+        "expected block guidance, got:\n{text}"
+    );
+    let err = parse_err("fn main() { if true }");
+    assert!(
+        err.help()
+            .as_ref()
+            .is_some_and(|h| h.contains("braces") || h.contains("if cond")),
+        "expected brace help, got: {:?}",
+        err.help()
+    );
+}
+
+#[test]
+fn class_field_without_type_mentions_annotation() {
+    let text = err_text("class C { x }");
+    assert!(
+        text.contains(':') || text.contains("field") || text.contains("Type"),
+        "expected field-type guidance, got:\n{text}"
+    );
+    let err = parse_err("class C { x }");
+    assert!(
+        err.help()
+            .as_ref()
+            .is_some_and(|h| h.contains("name: Type")),
+        "expected class-field help, got: {:?}",
+        err.help()
+    );
+}
+
+#[test]
+fn incomplete_enum_variant_payload_is_parse_error() {
+    let err = parse_err("enum E { A( }");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+    let text = err_text("enum E { A( }");
+    assert!(
+        !text.is_empty(),
+        "expected a non-empty incomplete-payload diagnostic"
+    );
+}
+
+#[test]
+fn empty_match_arms_is_parse_error() {
+    let err = parse_err("fn main() { match x { } }");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+}
+
+#[test]
+fn missing_fn_param_list_close_is_parse_error() {
+    let err = parse_err("fn main( { }");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+    let text = err_text("fn main( { }");
+    assert!(
+        text.contains(')') || text.contains("parameter") || text.contains("unexpected"),
+        "expected closing-paren / parameter-list guidance, got:\n{text}"
+    );
+}
+
+#[test]
+fn let_missing_initializer_expr_is_parse_error() {
+    let err = parse_err("fn main() { let x = }");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+}
+
+#[test]
+fn typed_fn_param_still_parses() {
+    Pratt::default()
+        .parse("fn fib(int n) { return n; }")
+        .expect("typed parameter should parse");
+}

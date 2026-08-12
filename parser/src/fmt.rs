@@ -2044,7 +2044,10 @@ mod tests {
             .expect_err("should fail");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("doc comment") || msg.contains("Parse error"),
+            msg.contains("doc comment")
+                || msg.contains("Parse error")
+                || msg.contains("unexpected")
+                || err.code() == Some(reporting::ErrorCode::ParseError),
             "{msg}"
         );
     }
