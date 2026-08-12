@@ -96,10 +96,19 @@ jobs:
       - name: Workspace tests (${{ matrix.features.id }})
         if: matrix.features.mode == 'test'
         run: |
-          # macOS runners occasionally hit EAGAIN (WouldBlock) while cargo
-          # lists many test binaries in parallel; one retry clears it.
-          cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }} \
-            || cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }}
+          # macOS runners often have a low nofile soft limit; cargo then hits
+          # EAGAIN (WouldBlock) while listing many test binaries.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ulimit -n 10240 || true
+          fi
+          n=0
+          until cargo test --workspace --lib --tests --bins ${{ matrix.features.flags }}; do
+            n=$((n + 1))
+            if [ "$n" -ge 5 ]; then
+              exit 1
+            fi
+            sleep 3
+          done
 
       - name: Language harness (`coil test`)
         if: matrix.features.id == 'default'
