@@ -1,4 +1,4 @@
-use collections::map::{HashSet};
+use collections::set::{HashSet};
 
 test("hashset basics") {
     let s = HashSet::new();

@@ -18,7 +18,8 @@ Virtual-module host primitives (`io::read`) stay as free fns.
 | `bytes` | `use bytes::{slice, concat, …};` | `[byte]` slice / concat / find / find_from / replace / pad / eq |
 | `text` | `use text::{trim, split, …};` | String helpers via UTF-8 bytes (virtual `string` owns `format` / `to_bytes`) |
 | `collections` | `use collections::{sort, …};` | Stable mergesort / `reverse` / `collect_ints` (range → array) |
-| `collections::map` | `use collections::map::{HashMap, HashSet};` | `HashMap` / `HashSet` (chaining; methods with `Eq`+`Hash`) |
+| `collections::map` | `use collections::map::{HashMap};` | `HashMap` (chaining; methods with `Eq`+`Hash`) |
+| `collections::set` | `use collections::set::{HashSet};` | `HashSet` (`HashMap<T, bool>` wrapper) |
 | `collections::list` | `use collections::list::{List};` | Mutable singly-linked list |
 | `collections::tree` | `use collections::tree::{TreeMap};` | Mutable BST map over `Ord`+`Eq` |
 | `num` | `use num::{abs, min, …};` | Numeric conveniences (`abs` overloads; `min`/`max`/`clamp` over `Ord`; `round`; `pow` int/float) |
