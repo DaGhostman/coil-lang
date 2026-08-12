@@ -29,7 +29,7 @@ trap cleanup EXIT
 # Absolute stdlib root so temp cwd still resolves http::*
 cat > "$CLI_DIR/coil.toml" << EOF
 [module]
-roots = ["./src", "$ROOT/stdlib"]
+roots = ["./src", "$ROOT/stdlib/src"]
 EOF
 mkdir -p "$CLI_DIR/src"
 cp "$HERE/src/main.hy" "$CLI_DIR/src/main.hy"

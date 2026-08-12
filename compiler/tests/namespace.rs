@@ -9,12 +9,13 @@ use machine::Machine;
 
 // Tests change cwd; serialize with CWD_LOCK when running in parallel.
 
-/// Absolute path to workspace `stdlib/` for temp-project module roots.
+/// Absolute path to the `coil-stdlib` submodule `src/` for temp-project roots.
 fn workspace_stdlib() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate parent")
         .join("stdlib")
+        .join("src")
 }
 
 /// Manifest with `./src` plus the real workspace stdlib (for `io::sync`, …).

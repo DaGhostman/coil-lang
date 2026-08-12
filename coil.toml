@@ -3,7 +3,7 @@
 # can resolve `use foo::sadge;`.
 
 [module]
-roots = ["./src", "./examples/src", "./stdlib"]
+roots = ["./src", "./examples/src", "./stdlib/src"]
 
 [ffi]
 search_paths = ["./examples"]

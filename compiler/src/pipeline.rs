@@ -1093,7 +1093,7 @@ impl Pipeline {
         self.module_deps.clear();
         self.entry_file = None;
 
-        // Discover disk modules (`stdlib/io/sync.hy`, …) referenced by `use`
+        // Discover disk modules (`stdlib/src/io/sync.hy`, …) referenced by `use`
         // before compiling the in-memory entry — same dependency order as
         // `compile_src_from_file`, without requiring a temp file.
         self.enqueue_uses(path, src, &ast);

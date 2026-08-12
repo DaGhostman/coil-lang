@@ -7580,7 +7580,7 @@ fn main() {
         dir.join("coil.toml"),
         format!(
             "[module]\nroots = [\"{}\"]\n[env]\nallow_exec = true\n",
-            workspace_root.join("stdlib").display()
+            workspace_root.join("stdlib").join("src").display()
         ),
     )
     .expect("write coil.toml");
