@@ -28,6 +28,15 @@ trap cleanup EXIT
 
 # Absolute stdlib root so temp cwd still resolves http::*
 STDLIB=""
+HTTP_PKG=""
+if [[ -d "$ROOT/../coil-http/src" ]]; then
+  HTTP_PKG="$ROOT/../coil-http/src"
+elif [[ -d "$ROOT/.deps/coil-http/src" ]]; then
+  HTTP_PKG="$ROOT/.deps/coil-http/src"
+else
+  echo "clone coil-http as ../coil-http or $ROOT/.deps/coil-http" >&2
+  exit 1
+fi
 if [[ -d "$ROOT/.deps/coil-stdlib/src" ]]; then
   STDLIB="$ROOT/.deps/coil-stdlib/src"
 elif [[ -d "$ROOT/../coil-stdlib/src" ]]; then
@@ -38,7 +47,7 @@ else
 fi
 cat > "$CLI_DIR/coil.toml" << EOF
 [module]
-roots = ["./src", "$STDLIB"]
+roots = ["./src", "$HTTP_PKG", "$STDLIB"]
 EOF
 mkdir -p "$CLI_DIR/src"
 cp "$HERE/src/main.hy" "$CLI_DIR/src/main.hy"

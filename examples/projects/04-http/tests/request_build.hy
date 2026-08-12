@@ -1,15 +1,16 @@
 use string::{to_bytes};
 use http::url::{
+    empty_headers,
+    find_bytes,
+    headers_have_crlf,
+    parse_url,
+};
+use http::request::{
     build_request_head,
     build_request_head_extras,
     concat_bytes,
-    empty_headers,
     extras_sanitize,
-    find_bytes,
     format_extra_headers_str,
-    header_add,
-    headers_have_crlf,
-    parse_url,
     request_line_ok,
 };
 
@@ -54,8 +55,8 @@ test("custom headers appear on the wire") {
         Result::Err(_) => panic "parse failed",
     };
     let hs = empty_headers();
-    hs = header_add(hs, "X-Trace", "abc");
-    hs = header_add(hs, "Accept", "text/plain");
+    hs.add("X-Trace", "abc");
+    hs.add("Accept", "text/plain");
     let extras = format_extra_headers_str(hs.names, hs.values);
     let msg = match build_request_head_extras("GET", u, extras, 0) {
         Result::Ok(m) => m,
@@ -128,10 +129,10 @@ test("reserved headers skipped in extras") {
         Result::Err(_) => panic "parse failed",
     };
     let hs = empty_headers();
-    hs = header_add(hs, "Host", "evil.example");
-    hs = header_add(hs, "Content-Length", "999");
-    hs = header_add(hs, "Connection", "keep-alive");
-    hs = header_add(hs, "X-Ok", "1");
+    hs.add("Host", "evil.example");
+    hs.add("Content-Length", "999");
+    hs.add("Connection", "keep-alive");
+    hs.add("X-Ok", "1");
     let extras = format_extra_headers_str(hs.names, hs.values);
     let msg = match build_request_head_extras("GET", u, extras, 0) {
         Result::Ok(m) => m,
@@ -155,19 +156,19 @@ test("reserved headers skipped in extras") {
 
 test("only reserved headers yield no extras") {
     let hs = empty_headers();
-    hs = header_add(hs, "host", "evil");
-    hs = header_add(hs, "content-length", "1");
-    hs = header_add(hs, "connection", "keep-alive");
+    hs.add("host", "evil");
+    hs.add("content-length", "1");
+    hs.add("connection", "keep-alive");
     let extras = format_extra_headers_str(hs.names, hs.values);
     assert(extras == "__NONE__", "sentinel when all reserved")?;
 }
 
 test("uppercase reserved header spellings are skipped") {
     let hs = empty_headers();
-    hs = header_add(hs, "HOST", "evil");
-    hs = header_add(hs, "CONTENT-LENGTH", "999");
-    hs = header_add(hs, "CONNECTION", "keep-alive");
-    hs = header_add(hs, "X-Ok", "1");
+    hs.add("HOST", "evil");
+    hs.add("CONTENT-LENGTH", "999");
+    hs.add("CONNECTION", "keep-alive");
+    hs.add("X-Ok", "1");
     let extras = format_extra_headers_str(hs.names, hs.values);
     let eb = to_bytes(extras);
     let okb = to_bytes("X-Ok: 1");

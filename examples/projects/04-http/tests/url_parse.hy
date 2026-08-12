@@ -51,8 +51,6 @@ test("https defaults to port 443") {
 }
 
 test("query path with explicit slash") {
-    // Prefer `/?q=` — bare `http://host?q=` slash-prefix uses `"/" + q` under
-    // Result-mode parse_url and hits a known compiler SEGV; use an explicit `/`.
     let u = match parse_url("http://example.com/?q=1") {
         Result::Ok(v) => v,
         Result::Err(_) => panic "parse failed",

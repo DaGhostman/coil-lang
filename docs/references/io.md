@@ -46,18 +46,19 @@ an explicit IP (e.g. `127.0.0.1`) when family order matters.
 OS `TimedOut` maps to `IoError::TimedOut` (not `WouldBlock`).
 
 TLS client enable takes
-`enable(s, host, { verify: bool, ca_pem: Option<string>, ca_path: Option<string>, timeout_ms: int })`.
+`enable(s, host, { verify: bool, ca_pem: Option<string>, ca_path: Option<string>, timeout_ms: int, alpn: string })`.
+`alpn: ""` leaves default negotiation; `"h2"` or `"http/1.1"` sets ALPN (comma-separated list allowed).
 When `verify` is true, trust always starts from **webpki-roots**.
 `ca_pem: Option::Some(pem)` and/or `ca_path: Option::Some(path)` **append**
 extra PEM trust anchors (they do not replace the defaults).
 `Option::None` for both leaves webpki alone. `verify: false` skips cert
 **trust** only. `timeout_ms <= 0` means no handshake deadline.
 
-TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string })`
+TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string, alpn: string })`
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
-non-empty PEM enables mTLS. `timeout_ms <= 0` means no handshake deadline.
+non-empty PEM enables mTLS. `alpn: ""` leaves default; `"h2"` advertises HTTP/2.
 
-Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland: [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md).
+Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland: [coil-http](https://github.com/ardax-corp/coil-http/blob/main/docs/README.md).
 
 See [Tutorial 10 — IO streams](../manual/tutorial/10-io-streams.md) and `examples/io_*.hy`.
 

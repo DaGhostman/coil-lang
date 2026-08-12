@@ -1,15 +1,16 @@
-// 04-http — stdlib HTTP/1.1 client against a local cleartext server.
+// 04-http — coil-http Client against local Server.
 //
 // Expected output: ok
-use http::client::{get};
+use http::client::{Client};
 
 use io::{stdout};
 use io::sync::{write_all};
-use string::{format, to_bytes};
+use string::{to_bytes};
 
 fn main() {
     let label = "err";
-    match get("http://127.0.0.1:41250/") {
+    let client = Client::new();
+    match client.get("http://127.0.0.1:41250/") {
         Result::Ok(_) => {
             label = "ok";
         },
