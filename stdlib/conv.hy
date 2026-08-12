@@ -90,17 +90,19 @@ fn parse_float(string s) -> Result<float, string> {
         i = i + 1;
     }
 
+    let frac_places: int = 0;
     if i < len(b) {
         if b[i] == "." {
             i = i + 1;
-            let place = 0.1;
+            // Fold fraction digits into the mantissa, then divide by 10^places once
+            // so values like 12.5 stay exact (repeated *0.1 is not).
             while i < len(b) {
                 if is_digit(b[i]) == false {
                     break;
                 }
                 let fraction_digit = digit_val(b[i]);
-                value = value + (fraction_digit as float) * place;
-                place = place / 10.0;
+                value = value * 10.0 + (fraction_digit as float);
+                frac_places = frac_places + 1;
                 saw_digit = true;
                 i = i + 1;
             }
@@ -108,6 +110,12 @@ fn parse_float(string s) -> Result<float, string> {
     }
     if !saw_digit {
         raise "invalid float";
+    }
+
+    let p: int = 0;
+    while p < frac_places {
+        value = value / 10.0;
+        p = p + 1;
     }
 
     let exponent: int = 0;
