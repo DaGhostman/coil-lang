@@ -108,10 +108,11 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 
 | Word | Notes |
 |------|-------|
-| `case` | Planned alias for `match`; not registered |
 | `struct` | FFI `extern struct` only; otherwise use `class` or record dicts |
 
 `import` is not a keyword and will not be added. Module binding is `use` only ([limitations.md](../internals/limitations.md) COI-73).
+
+`case` is not a keyword and will not be added. Pattern matching is `match` only ([limitations.md](../internals/limitations.md) COI-74).
 
 ---
 
