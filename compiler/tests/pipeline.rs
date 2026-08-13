@@ -146,6 +146,77 @@ fn run_on_example_stack(name: String, work: impl FnOnce() -> String + Send + 'st
     }
 }
 
+#[test]
+fn example_pool_resumes_panic_to_caller() {
+    // Without resume_unwind, catch_unwind around run_example would miss
+    // harness panics (FFI soft-skip probes, assertion failures).
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-probe".into(), || panic!("pool-panic-probe"));
+    }));
+    assert!(
+        panicked.is_err(),
+        "example pool must re-raise job panics to the caller"
+    );
+}
+
+#[test]
+fn example_pool_worker_survives_panic_for_next_job() {
+    // catch_unwind in the worker is load-bearing: a killed worker leaves
+    // later run_example calls blocked forever on reply_rx.recv().
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-then-ok".into(), || panic!("transient pool panic"));
+    }));
+    let out = run_on_example_stack("after-panic".into(), || "ok".to_string());
+    assert_eq!(out, "ok");
+}
+
+#[test]
+fn example_pool_caps_concurrent_jobs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar};
+    use std::time::{Duration, Instant};
+
+    // Encode COI-88: peak concurrent example runners must stay ≤ pool size
+    // even when many cargo-test threads submit jobs at once.
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let n_jobs = EXAMPLE_POOL_SIZE + 4;
+    let start = Arc::new(Barrier::new(n_jobs));
+    let mut handles = Vec::with_capacity(n_jobs);
+    for i in 0..n_jobs {
+        let gate = Arc::clone(&gate);
+        let max_seen = Arc::clone(&max_seen);
+        let start = Arc::clone(&start);
+        handles.push(std::thread::spawn(move || {
+            start.wait();
+            run_on_example_stack(format!("cap-{i}"), move || {
+                let (lock, cvar) = &*gate;
+                let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *count += 1;
+                max_seen.fetch_max(*count, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_millis(40);
+                while Instant::now() < deadline {
+                    let (guard, _) = cvar
+                        .wait_timeout(count, Duration::from_millis(5))
+                        .unwrap_or_else(|e| e.into_inner());
+                    count = guard;
+                }
+                *count -= 1;
+                cvar.notify_all();
+                "done".into()
+            })
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.join().expect("submitter join"), "done");
+    }
+    let peak = max_seen.load(Ordering::SeqCst);
+    assert!(
+        peak >= 1 && peak <= EXAMPLE_POOL_SIZE,
+        "peak concurrent example jobs was {peak}, want 1..={EXAMPLE_POOL_SIZE}"
+    );
+}
+
 fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
@@ -3614,9 +3685,8 @@ fn main() {
 fn attr_on_async_fn_rejected_at_compile_time() {
     // Attr-body-crosses-yield desugaring for a coroutine target used to
     // recurse deep enough (~1.5-2 MiB) to risk the default per-test thread
-    // stack before infer_inner/do_compile were split up; run on a dedicated
-    // thread with the same headroom as `run_example` regardless (see
-    // docs/internals/limitations.md).
+    // stack before infer_inner/do_compile were split up; reuse the example
+    // pool's 8 MiB workers instead of spawn/join (COI-88).
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -3634,14 +3704,15 @@ fn main() {
 }
 "#
     .to_string();
-    let is_err = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || Pipeline::new().compile_src(&src).is_err())
-        .expect("diagnostic thread")
-        .join()
-        .expect("diagnostic thread join");
+    let is_err = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&is_err);
+    run_on_example_stack("attr-async-diag".into(), move || {
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) =
+            Pipeline::new().compile_src(&src).is_err();
+        String::new()
+    });
     assert!(
-        is_err,
+        *is_err.lock().unwrap_or_else(|e| e.into_inner()),
         "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }
