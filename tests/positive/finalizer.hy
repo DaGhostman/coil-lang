@@ -4,9 +4,15 @@ class Handle {
     fd: int,
 }
 
+class Resurrect {
+    fd: int,
+}
+
 static let drops: int = 0;
 static let during: int = 0;
 static let held: Option<Weak<Handle>> = Option::None;
+static let resurrect_drops: int = 0;
+static let kept: Option<Resurrect> = Option::None;
 
 impl Handle {
     fn drop() {
@@ -20,6 +26,13 @@ impl Handle {
         during = live;
         collect();
         drops = drops + 1;
+    }
+}
+
+impl Resurrect {
+    fn drop() {
+        resurrect_drops = resurrect_drops + 1;
+        kept = Option::Some(self);
     }
 }
 
@@ -70,4 +83,47 @@ test("weak stays live during drop and is None after sweep") {
         Option::None => -1,
     };
     assert(after == 0)?;
+}
+
+fn stash_self() {
+    let h = new Resurrect(42);
+}
+
+fn resurrected_fd() -> int {
+    return match kept {
+        Option::Some(h) => h.fd,
+        Option::None => -1,
+    };
+}
+
+fn clear_kept() {
+    kept = Option::None;
+}
+
+test("storing self from drop resurrects once") {
+    resurrect_drops = 0;
+    kept = Option::None;
+    stash_self();
+    collect();
+    assert(resurrect_drops == 1)?;
+    assert(resurrected_fd() == 42)?;
+    clear_kept();
+    collect();
+    assert(resurrect_drops == 1)?;
+}
+
+fn explicit_stash() {
+    let h = new Resurrect(7);
+    h.drop();
+}
+
+test("explicit drop storing self stays once") {
+    resurrect_drops = 0;
+    kept = Option::None;
+    explicit_stash();
+    collect();
+    assert(resurrect_drops == 1)?;
+    clear_kept();
+    collect();
+    assert(resurrect_drops == 1)?;
 }

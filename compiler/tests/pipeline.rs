@@ -5823,6 +5823,85 @@ fn main() {
 }
 
 #[test]
+fn gc_finalizer_storing_self_resurrects_once() {
+    // COI-79/COI-95: storing `self` from drop keeps the cell; drop stays once.
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn make() {
+    let h = new Handle(42);
+}
+fn resurrected_fd() -> int {
+    return match kept {
+        Option::Some(h) => h.fd,
+        Option::None => -1,
+    };
+}
+fn clear_kept() {
+    kept = Option::None;
+}
+fn main() {
+    make();
+    collect();
+    let fd = resurrected_fd();
+    let after_first = drops;
+    clear_kept();
+    collect();
+    write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
+}
+"#,
+    );
+    assert_eq!(output, "1142");
+}
+
+#[test]
+fn gc_explicit_drop_store_self_stays_once() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn explicit() {
+    let h = new Handle(7);
+    h.drop();
+}
+fn clear_kept() {
+    kept = Option::None;
+}
+fn main() {
+    explicit();
+    collect();
+    let d1 = drops;
+    clear_kept();
+    collect();
+    write(stdout(), to_bytes(format("%i%i", d1, drops)));
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+#[test]
 fn gc_heap_bytes_is_nonnegative() {
     let output = run_example_src(
         r#"

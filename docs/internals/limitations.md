@@ -24,6 +24,7 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 |-------|--------|--------|
 | `Option` field moves | **Decided (copy-on-match):** `match` copies the scrutinee / field pointer; nested `match` on the same `Option` field is valid. Outer pattern bindings stay in scope (codegen merges `match_bindings`). Was a nested-match lookup hole, not a true move. | [COI-77](https://linear.app/ardax/issue/COI-77) |
 | User trait calls | **Decided (keep dictionaries):** ground instance methods with a static entry already emit `CALL` (user and builtin). Generic functions with user-trait / `Show` / `Length` bounds stay on dictionary passing; only ground `Num`/`Ord`/`Eq` (and operator supertraits) monomorphize to opcodes. Spec: [types.md](../references/types.md#call-site-dispatch). | [COI-78](https://linear.app/ardax/issue/COI-78) |
+| GC drop storing `self` | **Decided (allow-once):** storing `self` from `fn drop()` can keep the cell alive after the sweep (post-drop re-mark). Drop still runs at most once (`finalized`, including explicit `obj.drop()`). Defined footgun, not a pin API — use `gc::root` / `Weak`. Spec: [gc.md](../references/gc.md). | [COI-79](https://linear.app/ardax/issue/COI-79) |
 
 ## IL optimizations (low)
 
@@ -42,7 +43,7 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 | `multi_op_join_convoy` JMPF mis-sink | [COI-91](https://linear.app/ardax/issue/COI-91) |
 | Loop `LEQ` headers / float identity refusals | [COI-93](https://linear.app/ardax/issue/COI-93) |
 | Enum escape elimination vs heap | [COI-94](https://linear.app/ardax/issue/COI-94) |
-| GC drop storing `self` / resurrection | [COI-79](https://linear.app/ardax/issue/COI-79) |
+| GC drop storing `self` / resurrection — **decided: allow-once** (see Userland footguns) | [COI-79](https://linear.app/ardax/issue/COI-79) |
 | Option/Result niche vs boxed ABI | [COI-92](https://linear.app/ardax/issue/COI-92) |
 | Enums / generics / derive Drop (existing) | [COI-26](https://linear.app/ardax/issue/COI-26) |
 
@@ -74,7 +75,7 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 **Class temporary scalar replacement.** Direct `new Class(args).field` expressions now evaluate constructor arguments in order and return the selected argument without allocating an intermediate instance, **except** when the class declares `fn drop()` (the instance must exist so the finalizer can run). Named local instances remain heap-backed until a broader escape/alias analysis can prove that methods, calls, mutation, and object identity are unobservable.
 
-**GC finalizers (v1).** Inherent `impl Foo { fn drop() { … } }` runs at mark-sweep time (and VM teardown), not at last use. Order is unspecified. Storing `self` during drop can keep the cell alive (a footgun, not an API). Enums, generic derive-Drop, and resurrection are out of scope (Linear COI-26).
+**GC finalizers (v1).** Inherent `impl Foo { fn drop() { … } }` runs at mark-sweep time (and VM teardown), not at last use. Order is unspecified. **Resurrection (COI-79, decided allow-once):** storing `self` during drop can keep the cell alive after the sweep; drop still runs at most once. That is defined, not a pin API (`gc::root` / `Weak`). Enums and generic derive-Drop stay out of scope (Linear COI-26).
 
 **IL cursor split (COI-81, decided: keep).** Locals and operands share one `Stack<Value>`. Two analyses answer different questions; they are not the same number after `STORE` or nested `CALL`.
 
