@@ -4912,6 +4912,153 @@ fn main() { let _ = some_of(7); }",
         );
     }
 
+    /// COI-78: a user-trait method at a concrete type uses static `CALL`
+    /// (B4). The same method under an open generic bound stays on
+    /// `Index` + `CallIndirect`, and a ground call to that generic still
+    /// passes a dictionary rather than monomorphizing.
+    #[test]
+    fn user_trait_ground_method_call_vs_generic_dictionary() {
+        use common::Instruction;
+
+        let (ground, _) = compile_src(
+            "trait Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
+             fn main() { return 41.size(); }",
+        );
+        assert!(
+            ground
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "ground user-trait method must CALL; ops={:?}",
+            ground.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !ground
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "ground user-trait method must not CallIndirect; ops={:?}",
+            ground.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        let (generic, _) = compile_src(
+            "trait Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
+             fn size_of<T: Measurable>(T x) -> int { return x.size(); } \
+             fn main() { return size_of(41); }",
+        );
+        assert!(
+            generic
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "open user-trait bound must CallIndirect; ops={:?}",
+            generic.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            generic
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "ground call to a user-trait generic must pass a dict; ops={:?}",
+            generic.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = generic
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "size_of(41) CALL arity = 1 value + 1 dict; got {max_call_arity}"
+        );
+    }
+
+    /// COI-78: builtin `Show` is not a monomorphization candidate even at
+    /// a ground type (unlike `Num` / `Ord` / `Eq`).
+    #[test]
+    fn show_bound_ground_call_uses_dictionary_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn show_it<T: Show>(T x) -> T { return x; } \
+             fn main() { let y = show_it(7); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Show ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 Show dict); got {max_call_arity}"
+        );
+    }
+
+    /// COI-78: `Length` matches `Show` — ground calls keep dictionary ABI.
+    #[test]
+    fn length_bound_ground_call_uses_dictionary_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn n<T: Length>(T x) -> int { return len(x); } \
+             fn main() { return n(\"ab\"); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Length ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 Length dict); got {max_call_arity}"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "open Length::len body must CallIndirect; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// COI-78: mixing `Num` with a dictionary bound must not monomorphize —
+    /// the call site still emits a dict tuple (and bumped arity).
+    #[test]
+    fn num_plus_show_ground_call_keeps_dictionary() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn mix<T: Num + Show>(T a, T b) -> T { return a + b; } \
+             fn main() { let y = mix(1, 2); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Num+Show must emit dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        // 2 values + Num dict + Show dict
+        assert_eq!(
+            max_call_arity, 4,
+            "expected CALL arity = 4 (2 values + 2 dicts); got {max_call_arity}"
+        );
+    }
+
     #[test]
     fn omitted_default_method_dict_slot_has_real_target() {
         use common::Instruction;

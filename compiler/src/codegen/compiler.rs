@@ -14409,8 +14409,8 @@ impl Compiler {
                 // MakeTuple of method code offsets (CodePtr per method in
                 // declaration order). Builtin and user instances share this
                 // ABI; ground Num/Ord/Eq calls may still monomorphize away
-                // from the shared body, but Show-bound calls always take
-                // this path.
+                // from the shared body. User-trait / Show / Length bounds
+                // always take this path (COI-78).
                 let dict_count = if is_generic {
                     let (fixed, rest, pack_rest) =
                         self.split_call_args_for_rest(&lookup_name, arg_slice);
