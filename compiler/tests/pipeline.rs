@@ -2153,7 +2153,7 @@ fn main() {
     assert_eq!(output, "0123|0123|7|1.02.03.0|1.02.03.0|0");
 }
 
-/// Int `to_vec` thunks use ADD/LE(Q); float sibling thunks use ADDF/LE(Q)F.
+/// Int `to_vec` thunks fuse ADD/LE(Q); float sibling thunks keep ADDF and fuse LE(Q)F.
 #[test]
 fn range_to_vec_thunks_use_int_vs_float_opcodes() {
     let src = r#"
@@ -2171,7 +2171,12 @@ fn main() {
         let idx = syms
             .iter()
             .position(|s| s.name == name)
-            .unwrap_or_else(|| panic!("missing `{name}`; have {:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing `{name}`; have {:?}",
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
         let start = syms[idx].entry_pc as usize;
         let end = syms
             .get(idx + 1)
@@ -2179,30 +2184,74 @@ fn main() {
             .unwrap_or(bytecode.len());
         &bytecode[start..end]
     };
+    let jmpf_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotSlotJmpf)
+            .map(|b| b.bin_slot_slot_jmpf_parts().0)
+            .collect()
+    };
+    let imm_store_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotImmStore)
+            .map(|b| b.bin_slot_imm_store_parts().0)
+            .collect()
+    };
     let has = |slice: &[common::Byte], op: common::Instruction| {
         slice.iter().any(|b| *b.bytecode() == op)
     };
+
     let int_half = body("Range::to_vec");
-    assert!(has(int_half, common::Instruction::ADD), "int half-open needs ADD");
-    assert!(has(int_half, common::Instruction::LE), "int half-open needs LE");
-    assert!(!has(int_half, common::Instruction::ADDF), "int half-open must not use ADDF");
-    assert!(!has(int_half, common::Instruction::LEF), "int half-open must not use LEF");
+    assert_eq!(
+        jmpf_ops(int_half),
+        vec![common::Instruction::LE as u8],
+        "int half-open compare must be LE"
+    );
+    assert_eq!(
+        imm_store_ops(int_half),
+        vec![common::Instruction::ADD as u8],
+        "int half-open step must be ADD"
+    );
+    assert!(!has(int_half, common::Instruction::ADDF));
 
     let int_inc = body("RangeInclusive::to_vec");
-    assert!(has(int_inc, common::Instruction::ADD), "int inclusive needs ADD");
-    assert!(has(int_inc, common::Instruction::LEQ), "int inclusive needs LEQ");
-    assert!(!has(int_inc, common::Instruction::ADDF));
+    assert_eq!(
+        jmpf_ops(int_inc),
+        vec![common::Instruction::LEQ as u8],
+        "int inclusive compare must be LEQ"
+    );
+    assert_eq!(
+        imm_store_ops(int_inc),
+        vec![common::Instruction::ADD as u8],
+        "int inclusive step must be ADD"
+    );
 
     let float_half = body("Range::__float_to_vec");
-    assert!(has(float_half, common::Instruction::ADDF), "float half-open needs ADDF");
-    assert!(has(float_half, common::Instruction::LEF), "float half-open needs LEF");
-    assert!(!has(float_half, common::Instruction::ADD), "float half-open must not use int ADD");
-    assert!(!has(float_half, common::Instruction::LE), "float half-open must not use int LE");
+    assert_eq!(
+        jmpf_ops(float_half),
+        vec![common::Instruction::LEF as u8],
+        "float half-open compare must be LEF"
+    );
+    assert!(
+        has(float_half, common::Instruction::ADDF),
+        "float half-open step must use ADDF"
+    );
+    assert!(
+        imm_store_ops(float_half).is_empty(),
+        "float half-open must not fuse int BinSlotImmStore"
+    );
 
     let float_inc = body("RangeInclusive::__float_to_vec");
-    assert!(has(float_inc, common::Instruction::ADDF), "float inclusive needs ADDF");
-    assert!(has(float_inc, common::Instruction::LEQF), "float inclusive needs LEQF");
-    assert!(!has(float_inc, common::Instruction::LEQ), "float inclusive must not use int LEQ");
+    assert_eq!(
+        jmpf_ops(float_inc),
+        vec![common::Instruction::LEQF as u8],
+        "float inclusive compare must be LEQF"
+    );
+    assert!(
+        has(float_inc, common::Instruction::ADDF),
+        "float inclusive step must use ADDF"
+    );
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument
