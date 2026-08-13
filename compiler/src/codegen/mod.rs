@@ -691,7 +691,8 @@ struct Context {
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
 
-    /// Per-arm pattern bindings (slot 1..N). Overrides global `variables` in arm bodies.
+    /// Nested match arm bindings (payload slots). Inner maps merge over outer
+    /// ones so nested `match` can still load the enclosing arm's names.
     match_bindings: Option<HashMap<String, u32>>,
 
     /// Block-local binding overlays. When `Some`, shadowed names allocate a

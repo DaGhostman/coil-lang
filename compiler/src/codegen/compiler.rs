@@ -2475,11 +2475,8 @@ impl Compiler {
     }
 
     /// Look up the slot for a name used in an arm body. First
-    /// checks the per-arm `match_bindings` map (where match-bound
-    /// names live at slots 1, 2, 3, ... matching the VM's
-    /// payload-push positions). Falls back to the global
-    /// `variables` Interner for function params and other
-    /// non-pattern bindings.
+    /// checks the nested `match_bindings` map (inner names shadow
+    /// outer ones). Falls back to block overlays, then `variables`.
     ///
     /// Returns the slot ID (u32) if the name is found, `None`
     /// otherwise.
@@ -2503,6 +2500,19 @@ impl Compiler {
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
+    }
+
+    /// Install `inner` on top of any enclosing arm's bindings (inner names
+    /// shadow). Returns the previous map so the caller can restore it.
+    fn push_match_bindings(
+        &mut self,
+        inner: HashMap<String, u32>,
+    ) -> Option<HashMap<String, u32>> {
+        let saved = self.context.match_bindings.take();
+        let mut merged = saved.clone().unwrap_or_default();
+        merged.extend(inner);
+        self.context.match_bindings = Some(merged);
+        saved
     }
 
     /// Allocate a locals slot for a `let` / destructure binder.
@@ -12622,12 +12632,11 @@ impl Compiler {
         binding: Option<&str>,
         slot: Option<u32>,
     ) {
-        let saved_bindings = self.context.match_bindings.take();
-        let mut bindings = HashMap::new();
+        let mut inner = HashMap::new();
         if let (Some(name), Some(slot)) = (binding, slot) {
-            bindings.insert(name.to_string(), slot);
+            inner.insert(name.to_string(), slot);
         }
-        self.context.match_bindings = Some(bindings);
+        let saved_bindings = self.push_match_bindings(inner);
         let body_bc = self.do_compile(&arm.body);
         self.bytecode.extend(body_bc);
         self.context.match_bindings = saved_bindings;
@@ -12753,12 +12762,11 @@ impl Compiler {
         binding: Option<&str>,
         slot: Option<u32>,
     ) {
-        let saved_bindings = self.context.match_bindings.take();
-        let mut bindings = HashMap::new();
+        let mut inner = HashMap::new();
         if let (Some(name), Some(slot)) = (binding, slot) {
-            bindings.insert(name.to_string(), slot);
+            inner.insert(name.to_string(), slot);
         }
-        self.context.match_bindings = Some(bindings);
+        let saved_bindings = self.push_match_bindings(inner);
         if let Some(slot) = slot {
             self.record_debug_local(binding.unwrap_or(""), slot);
         }
@@ -13272,14 +13280,10 @@ impl Compiler {
                     }
                 } // close `else` for test chain arms
 
-                // Install the per-arm bindings map so the
-                // body's `Identifier` / `Assignment` lookups
-                // resolve pattern bindings to
-                // `payload_base`, `payload_base+1`, …
-                // — matching the VM's payload-push
-                // positions. Cleared after the body emits.
-                let saved_bindings = self.context.match_bindings.take();
-                self.context.match_bindings = Some(arm_bindings);
+                // Install this arm's bindings on top of any enclosing
+                // match so nested `match` bodies can still load outer
+                // pattern names. Inner names shadow.
+                let saved_bindings = self.push_match_bindings(arm_bindings);
                 let binding_slots: Vec<(String, u32)> = self
                     .context
                     .match_bindings
@@ -13336,12 +13340,6 @@ impl Compiler {
 
                 self.mono_codegen_var_types.pop();
 
-                // Restore the prior `match_bindings`
-                // (usually `None` — we only save/restore
-                // to be safe if a match is nested inside
-                // an arm body, which doesn't happen in
-                // practice but the typechecker doesn't
-                // prevent it).
                 self.context.match_bindings = saved_bindings;
 
                 // For non-first arms, emit a
