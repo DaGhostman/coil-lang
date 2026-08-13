@@ -2234,4 +2234,32 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    /// COI-80 retain path: only `capture_ops` fills `pre_fuse_ops` for the gate.
+    #[test]
+    fn lower_module_inner_captures_pre_fuse_ops_only_when_requested() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let plain = lower_module_inner(&mut module, &mut pool, false);
+        assert!(plain.pre_fuse_ops.is_none());
+
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let captured = lower_module_inner(&mut module, &mut pool, true);
+        let snap = captured
+            .pre_fuse_ops
+            .as_ref()
+            .expect("capture_ops must retain post-opt flat");
+        assert!(!snap.is_empty());
+        let emitting = snap.iter().filter(|op| op.emits_code()).count();
+        assert_eq!(
+            captured.pre_to_post.len(),
+            emitting,
+            "pre_to_post keys cover every emitting pre-fuse op"
+        );
+    }
 }
