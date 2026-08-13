@@ -311,6 +311,12 @@ pub enum Instruction {
 
     /// Float unary negate (IEEE sign-bit flip). Replaces `CONST -1; MULF`.
     NEGF,
+
+    /// Allocate a class instance stamped with a compile-time type id.
+    ///
+    /// Operand is `type_id` (`0` is unused — prefer [`Self::INIT`] for untyped
+    /// bags such as dicts). Existing [`Self::INIT`] stays for old archives.
+    InitTyped,
 }
 
 impl From<u8> for Instruction {
@@ -456,6 +462,7 @@ impl Instruction {
             Self::FloatChainStore => "FloatChainStore",
             Self::BinSlotSlotConstJmpf => "BinSlotSlotConstJmpf",
             Self::NEGF => "NEGF",
+            Self::InitTyped => "InitTyped",
         }
     }
 }
@@ -1256,7 +1263,7 @@ mod tests {
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable (keep in sync
         // with machine release `promise!` ceiling).
-        let last = Instruction::NEGF as u8;
+        let last = Instruction::InitTyped as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }
@@ -1273,6 +1280,7 @@ mod tests {
             "BinSlotSlotConstJmpf"
         );
         assert_eq!(Instruction::NEGF.mnemonic(), "NEGF");
+        assert_eq!(Instruction::InitTyped.mnemonic(), "InitTyped");
         assert_eq!(Instruction::BinSlotSlotStore.mnemonic(), "BinSlotSlotStore");
         assert_eq!(Instruction::BinSlotImmStore.mnemonic(), "BinSlotImmStore");
         assert_eq!(Instruction::TailCall.mnemonic(), "TailCall");
