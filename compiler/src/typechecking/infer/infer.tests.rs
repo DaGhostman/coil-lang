@@ -3,6 +3,11 @@
     use crate::typechecking::env::{instantiate, TyVarCounter};
     use crate::typechecking::subst::apply_ty_prune;
     use crate::typechecking::ty::EnumVariantPayloadTy;
+    use parser::SimpleSpan;
+    use parser::ast::{
+        EnumConstructPayload, EnumVariantPayload, LetFieldPattern, LetPattern, PatternField,
+        PatternPayload, RecordFieldDecl, RecordFieldValue,
+    };
     use parser::Pratt;
 
     fn is_bare_expr_source(trimmed: &str) -> bool {
@@ -2747,10 +2752,188 @@ fn main() { size_of("hi"); }
 
     #[test]
     fn dict_duplicate_field_emits_diagnostic() {
-        // `{ foo: 1, foo: 2 }` — duplicate field name.
-        let src = "fn main() { let _ = { foo: 1, foo: 2 }; }";
-        let (_c, msgs) = check_warn(src);
-        let found = msgs.iter().any(|m| m.message().contains("Duplicate field"));
+        // Parser rejects `{ foo: 1, foo: 2 }`; typecheck still reports if
+        // parse is bypassed.
+        let span = SimpleSpan::from(0..1);
+        let node = |e: Expression<'static>| (span, Box::new(e));
+        let int = |n: i64| node(Expression::Integer(n));
+        let ast = node(Expression::Dict(vec![
+            RecordFieldValue {
+                name: "foo",
+                value: int(1),
+            },
+            RecordFieldValue {
+                name: "foo",
+                value: int(2),
+            },
+        ]));
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        let found = msgs.iter().any(|m| {
+            m.code() == Some(ErrorCode::DuplicateField)
+                && m.message().contains("Duplicate field")
+        });
+        assert!(
+            found,
+            "expected duplicate-field diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn let_record_duplicate_field_emits_diagnostic_if_parse_bypassed() {
+        let span = SimpleSpan::from(0..1);
+        let node = |e: Expression<'static>| (span, Box::new(e));
+        let int = |n: i64| node(Expression::Integer(n));
+        let ast = node(Expression::LetDestructure {
+            pattern: LetPattern::Record(vec![
+                LetFieldPattern {
+                    name: "x",
+                    pattern: LetPattern::Binding { name: "a" },
+                },
+                LetFieldPattern {
+                    name: "x",
+                    pattern: LetPattern::Binding { name: "b" },
+                },
+            ]),
+            rhs: node(Expression::Dict(vec![
+                RecordFieldValue {
+                    name: "x",
+                    value: int(1),
+                },
+                RecordFieldValue {
+                    name: "y",
+                    value: int(2),
+                },
+            ])),
+        });
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        let found = msgs.iter().any(|m| {
+            m.code() == Some(ErrorCode::DuplicateField)
+                && m.message().contains("Duplicate field `x` in record pattern")
+        });
+        assert!(
+            found,
+            "expected duplicate-field diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn record_construct_duplicate_field_emits_diagnostic_if_parse_bypassed() {
+        let span = SimpleSpan::from(0..1);
+        let node = |e: Expression<'static>| (span, Box::new(e));
+        let int = |n: i64| node(Expression::Integer(n));
+        let ty_int = node(Expression::Type("int"));
+        let enum_decl = node(Expression::EnumDecl {
+            docs: vec![],
+            attrs: vec![],
+            name: "E",
+            type_params: vec![],
+            variants: vec![node(Expression::EnumVariant {
+                docs: vec![],
+                name: "Foo",
+                payload: EnumVariantPayload::Record(vec![
+                    RecordFieldDecl {
+                        name: "x",
+                        value: ty_int.clone(),
+                    },
+                    RecordFieldDecl {
+                        name: "y",
+                        value: ty_int,
+                    },
+                ]),
+            })],
+        });
+        let construct = node(Expression::Construct {
+            enum_name: "E",
+            variant_name: "Foo",
+            fields: EnumConstructPayload::Record(vec![
+                RecordFieldValue {
+                    name: "x",
+                    value: int(1),
+                },
+                RecordFieldValue {
+                    name: "x",
+                    value: int(2),
+                },
+            ]),
+        });
+        let ast = node(Expression::Program(vec![enum_decl, construct]));
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        let found = msgs.iter().any(|m| {
+            m.code() == Some(ErrorCode::DuplicateField)
+                && m.message().contains("Duplicate field `x` in record constructor")
+        });
+        assert!(
+            found,
+            "expected duplicate-field diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn record_pattern_duplicate_field_emits_diagnostic_if_parse_bypassed() {
+        let span = SimpleSpan::from(0..1);
+        let node = |e: Expression<'static>| (span, Box::new(e));
+        let ty_int = node(Expression::Type("int"));
+        let enum_decl = node(Expression::EnumDecl {
+            docs: vec![],
+            attrs: vec![],
+            name: "P",
+            type_params: vec![],
+            variants: vec![node(Expression::EnumVariant {
+                docs: vec![],
+                name: "P",
+                payload: EnumVariantPayload::Record(vec![
+                    RecordFieldDecl {
+                        name: "x",
+                        value: ty_int.clone(),
+                    },
+                    RecordFieldDecl {
+                        name: "y",
+                        value: ty_int,
+                    },
+                ]),
+            })],
+        });
+        let binding = |name| (span, Pattern::Binding { name });
+        let match_expr = node(Expression::Match {
+            scrutinee: node(Expression::Identifier("p")),
+            arms: vec![MatchArm {
+                pattern: (
+                    span,
+                    Pattern::Constructor {
+                        enum_name: "P",
+                        variant_name: "P",
+                        payload: PatternPayload::Record(vec![
+                            PatternField {
+                                name: "x",
+                                pattern: binding("x"),
+                            },
+                            PatternField {
+                                name: "x",
+                                pattern: binding("x"),
+                            },
+                        ]),
+                    },
+                ),
+                body: node(Expression::Identifier("x")),
+            }],
+        });
+        let ast = node(Expression::Program(vec![enum_decl, match_expr]));
+        let mut c = Checker::new();
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        let found = msgs.iter().any(|m| {
+            m.code() == Some(ErrorCode::DuplicateField)
+                && m.message().contains("Duplicate field")
+        });
         assert!(
             found,
             "expected duplicate-field diagnostic, got: {:?}",

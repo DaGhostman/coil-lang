@@ -483,7 +483,7 @@ Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `fl
 | Group | `(expr)` | Single expr — **not** a 1-tuple |
 | Tuple | `(e1, e2)` or `(e,)` | Comma required for tuple |
 | Array | `[e1, e2, ...]` or `[]` | Homogeneous; literal → `[T; N]`; empty `[]` needs `Vec<T>` / `[T; 0]` |
-| Dict | `{ name: expr, ... }` | Anonymous record |
+| Dict | `{ name: expr, ... }` | Anonymous record; field names must be unique (`E0208`) |
 | Construct | `Enum::Variant(...)` | Qualified constructor |
 | Call | `f(args)` | Args are positional `expr` and/or named `name: expr` (positional prefix, then named; no positional after named). Includes user functions and FFI-wrapped extern fns |
 | Instantiate | `new Class(args)` | Class construction |
@@ -549,6 +549,8 @@ tuple_pattern   ::= '(' pattern (',' pattern)* ')'
 record_pattern  ::= '{' field_pattern (',' field_pattern)* '}'
 field_pattern   ::= IDENT (':' pattern)?   /* shorthand: x => x: x */
 ```
+
+Field names in a record literal, constructor, pattern, or enum variant field list must be unique (`E0208`).
 
 Examples:
 

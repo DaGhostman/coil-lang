@@ -470,18 +470,20 @@ fn main() {
 #[test]
 fn let_record_duplicate_field_is_rejected() {
     // Distinct binders so this stays a *field* diagnostic (not binder).
-    let (_ty, msgs) = check(
-        r#"
+    let err = Pratt::default()
+        .parse(
+            r#"
 fn main() {
     let { x: a, x: b } = { x: 1, y: 2 };
 }
 "#,
-    );
+        )
+        .expect_err("duplicate let record fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field `x` in record pattern")),
-        "expected duplicate field in let record pattern, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field `x`"),
+        "expected duplicate field in let record pattern, got: {}",
+        err.message()
     );
 }
 
@@ -918,16 +920,18 @@ fn record_construct_shape_mismatch_diagnostic() {
 #[test]
 fn record_construct_duplicate_field_diagnostic() {
     // The user supplies the same field twice in a record
-    // constructor. The typechecker should reject this.
-    let (_ty, msgs) = check(
-        "enum E { Foo { x: int, y: int } } \
-         fn main() { E::Foo { x: 1, x: 2 }; }",
-    );
+    // constructor. The parser rejects this (E0208).
+    let err = Pratt::default()
+        .parse(
+            "enum E { Foo { x: int, y: int } } \
+             fn main() { E::Foo { x: 1, x: 2 }; }",
+        )
+        .expect_err("duplicate construct fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field `x`") || m.contains("duplicate")),
-        "expected 'Duplicate field `x`' diagnostic, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field `x`") || err.message().contains("duplicate"),
+        "expected 'Duplicate field `x`' diagnostic, got: {}",
+        err.message()
     );
 }
 
@@ -1763,8 +1767,9 @@ fn record_pattern_missing_field_errors() {
 
 #[test]
 fn record_pattern_duplicate_field_errors() {
-    let (_ty, msgs) = check(
-        r#"
+    let err = Pratt::default()
+        .parse(
+            r#"
         enum P { P { x: int, y: int } }
         fn f(P p) -> int {
             return match p {
@@ -1772,12 +1777,13 @@ fn record_pattern_duplicate_field_errors() {
             };
         }
         "#,
-    );
+        )
+        .expect_err("duplicate match record fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field") || m.contains("duplicate field")),
-        "expected duplicate field in record pattern, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field") || err.message().contains("duplicate field"),
+        "expected duplicate field in record pattern, got: {}",
+        err.message()
     );
 }
 
