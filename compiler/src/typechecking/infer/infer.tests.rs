@@ -3862,6 +3862,26 @@ fn dump<T: Ord>(T a, T b) {
     }
 
     #[test]
+    fn range_to_vec_help_mentions_shared_numeric_step_policy() {
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        let help = c
+            .messages()
+            .iter()
+            .find(|m| m.message().contains("cannot iterate"))
+            .and_then(|m| m.help().as_ref())
+            .expect("expected help on Range.to_vec reject");
+        assert!(
+            help.contains(".to_vec()") && help.contains("no successor protocol"),
+            "expected shared for/.to_vec help, got {help:?}"
+        );
+    }
+
+    #[test]
     fn for_in_hetero_tuple_is_diagnostic() {
         let (c, _) = check("fn main() { for x in (1, \"a\") { } }");
         assert!(

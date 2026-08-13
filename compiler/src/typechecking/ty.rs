@@ -1075,4 +1075,29 @@ mod tests {
             vec![("x".into(), int()), ("y".into(), int())]
         );
     }
+
+    #[test]
+    fn range_app_distinguishes_half_open_and_inclusive() {
+        let half = range_ty(int());
+        assert_eq!(range_app(&half).map(|(e, inc)| (e, inc)), Some((&int(), false)));
+        let closed = range_inclusive_ty(float());
+        assert_eq!(
+            range_app(&closed).map(|(e, inc)| (format!("{e}"), inc)),
+            Some(("float".into(), true))
+        );
+    }
+
+    #[test]
+    fn range_app_peels_readonly() {
+        let ty = readonly_ty(range_ty(byte()));
+        let (elem, inclusive) = range_app(&ty).expect("readonly Range");
+        assert!(!inclusive);
+        assert_eq!(elem, &byte());
+    }
+
+    #[test]
+    fn range_app_rejects_non_range() {
+        assert!(range_app(&int()).is_none());
+        assert!(range_app(&vec_app_ty(int())).is_none());
+    }
 }
