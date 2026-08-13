@@ -1782,6 +1782,24 @@
         );
     }
 
+    /// COI-74: `case` is a non-goal, not a synonym of `match`.
+    #[test]
+    fn case_scrutinee_is_parse_error_not_match() {
+        let src = "case x { Option::None => 0, Option::Some(v) => v }";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Match { .. } => {
+                    panic!("case x {{ … }} must not parse as Match")
+                }
+                other => panic!(
+                    "case x {{ … }} must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";

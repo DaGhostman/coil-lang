@@ -161,6 +161,14 @@ fn import_synonym_shapes_are_e0001() {
     }
 }
 
+/// COI-74: `case x { … }` is a parse error, not a `match` synonym.
+#[test]
+fn case_scrutinee_is_parse_error() {
+    let err = parse_err("case x { Option::None => 0, Option::Some(v) => v }");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+    assert_eq!(err.code().map(ErrorCode::as_str), Some("E0001"));
+}
+
 #[test]
 fn typed_fn_param_still_parses() {
     Pratt::default()

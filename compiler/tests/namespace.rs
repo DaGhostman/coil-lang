@@ -251,6 +251,29 @@ fn import_synonym_shapes_fail_with_parse_error() {
     }
 }
 
+/// COI-74: `case` is a non-goal, not a synonym of `match`.
+#[test]
+fn case_keyword_is_not_a_match_synonym() {
+    let mut pipeline = Pipeline::new();
+    let src = "fn main() { case x { Option::None => 0, Option::Some(v) => v }; }\n";
+    assert!(
+        pipeline.compile_src(src).is_err(),
+        "case x {{ … }} must not compile as match"
+    );
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::ParseError)),
+        "expected a parse error, not a match diagnostic, got: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn use_single_segment_resolves_in_src_root() {
     let manifest = manifest_src_and_stdlib();
