@@ -15,7 +15,7 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 | `coil.toml` `preludes` / `strict` | **Dropped:** unknown-key parse errors. Extra search paths use `[module].roots`; virtual prelude is compiler-owned; undefined names already fail typecheck (`E0100`). — [project-config.md](../references/project-config.md) | [COI-72](https://linear.app/ardax/issue/COI-72) |
 | `import` keyword | **Non-goal:** not a synonym of `use` and not a distinct construct. Module binding is `use` only. | [COI-73](https://linear.app/ardax/issue/COI-73) |
 | `case` as `match` alias | **Non-goal:** not a synonym of `match`. Pattern matching is `match` only. | [COI-74](https://linear.app/ardax/issue/COI-74) |
-| Range `collect` | `collect(0..5)` deferred; non-numeric `Ord` ranges not iterable | [COI-75](https://linear.app/ardax/issue/COI-75) |
+| Range `collect` | **Implemented:** numeric `Range` / `RangeInclusive` (`int` / `byte` / `float`) expose inherent `.to_vec() -> Vec<T>`. Decreasing ranges collect empty (same as `for`). Non-numeric `Ord` may construct a range; `for` and `.to_vec()` are type errors (no `succ` protocol). Step syntax still deferred. | [COI-75](https://linear.app/ardax/issue/COI-75) |
 | Duplicate record fields | Not rejected at parse time (typechecker reports) | [COI-76](https://linear.app/ardax/issue/COI-76) |
 
 ## Userland footguns

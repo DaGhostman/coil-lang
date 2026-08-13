@@ -635,9 +635,10 @@ time and does **not** allocate an array of length `n`. Decreasing
 ranges (`10..0`) are empty (Rust-like). First-class values work
 (`let r = 0..n; for x in r`).
 
-Construction needs only `Ord`. **`for` iteration** steps with `+1` /
-`+1.0` for `int`, `byte`, and `float` (other `Ord` types may form a
-range value but are not iterable yet).
+Construction needs only `Ord`. **`for` iteration** and **`.to_vec()`** step with
+`+1` / `+1.0` for `int`, `byte`, and `float`. Other `Ord` types may form a
+range value but `for` and `.to_vec()` are type errors (no successor protocol).
+Decreasing ranges collect as an empty `Vec`, matching `for`.
 
 ```coil
 use io::{stdout};
@@ -647,13 +648,14 @@ for x in 0..5 { write_all(stdout(), to_bytes(format("%i", x))); }   // 01234
 let r = 0..=3;
 for x in r { write_all(stdout(), to_bytes(format("%i", x))); }      // 0123
 for x in 1.0..4.0 { write_all(stdout(), to_bytes(format("%f", x))); } // 1.02.03.0
+let xs: Vec<int> = (0..5).to_vec();   // [0, 1, 2, 3, 4]
+let ys = r.to_vec();                  // Vec<int> [0, 1, 2, 3]
 ```
 
-See `examples/range.hy`.
+See `examples/range.hy` and `tests/positive/range_to_vec.hy`.
 
-**Deferred:** turning a range into a concrete array (e.g. a future
-`collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric
-`Ord` types.
+**Deferred:** step syntax (`0..10 step 2`). Non-numeric `Ord` iteration is
+intentionally unsupported.
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

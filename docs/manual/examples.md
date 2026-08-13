@@ -1975,7 +1975,8 @@ Native threads via `use thread::{spawn, join, …};` — each worker runs on its
 ### `examples/range.hy`
 
 **Demonstrates:** lazy `Range<T: Ord>` (`0..n`, `0..=n`, float bounds),
-first-class range values, empty decreasing ranges.
+first-class range values, empty decreasing ranges. Numeric ranges collect
+with `.to_vec()` (`tests/positive/range_to_vec.hy`).
 
 | | |
 |---|---|
