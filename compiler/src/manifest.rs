@@ -934,9 +934,11 @@ mod tests {
 
     #[test]
     fn parse_unknown_module_preludes_key_errors() {
+        // COI-72: dropped advertised key — must stay a hard unknown-key error.
         let src = "[module]\nroots = [\"./src\"]\npreludes = [\"./stdlib/src\"]\n";
         match Manifest::parse(src).unwrap_err() {
-            ManifestError::Parse { message, .. } => {
+            ManifestError::Parse { line, message } => {
+                assert_eq!(line, 3);
                 assert!(
                     message.contains("unknown key `module.preludes`"),
                     "got {message}"
@@ -948,9 +950,11 @@ mod tests {
 
     #[test]
     fn parse_unknown_module_strict_key_errors() {
+        // COI-72: dropped advertised key — must stay a hard unknown-key error.
         let src = "[module]\nroots = [\"./src\"]\nstrict = true\n";
         match Manifest::parse(src).unwrap_err() {
-            ManifestError::Parse { message, .. } => {
+            ManifestError::Parse { line, message } => {
+                assert_eq!(line, 3);
                 assert!(
                     message.contains("unknown key `module.strict`"),
                     "got {message}"
@@ -958,6 +962,54 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_unknown_module_prelude_singular_key_errors() {
+        // Singular spelling must not become a backdoor for dropped `preludes`.
+        let src = "[module]\nroots = [\"./src\"]\nprelude = [\"./stdlib/src\"]\n";
+        match Manifest::parse(src).unwrap_err() {
+            ManifestError::Parse { line, message } => {
+                assert_eq!(line, 3);
+                assert!(
+                    message.contains("unknown key `module.prelude`"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coil_toml_example_parses_without_live_dropped_module_keys() {
+        // Keep the shipped example aligned with COI-72: it must parse, and
+        // dropped `preludes` / `strict` must not reappear as live assignments.
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../coil.toml.example"
+        ));
+        for (i, raw) in src.lines().enumerate() {
+            let code = raw.split('#').next().unwrap_or("").trim();
+            if code.is_empty() {
+                continue;
+            }
+            let key = code.split('=').next().unwrap_or("").trim();
+            assert!(
+                key != "preludes" && key != "strict",
+                "line {}: dropped module key must not be live TOML: {raw}",
+                i + 1
+            );
+        }
+        let m = Manifest::parse(src).expect("coil.toml.example must parse");
+        assert_eq!(
+            m.roots,
+            vec![
+                PathBuf::from("./src"),
+                PathBuf::from("./vendor"),
+                PathBuf::from("../coil-stdlib/src"),
+            ]
+        );
+        assert!(m.entry.is_none());
     }
 
     #[test]
