@@ -136,6 +136,31 @@ fn let_missing_initializer_expr_is_parse_error() {
     assert_eq!(err.code(), Some(ErrorCode::ParseError));
 }
 
+/// COI-73: `import foo::bar;` is a parse error, not a `use` synonym.
+#[test]
+fn import_path_is_parse_error() {
+    let err = parse_err("import foo::bar;");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+    assert_eq!(err.code().map(ErrorCode::as_str), Some("E0001"));
+}
+
+/// COI-73: `import … as` / brace / glob shapes are E0001, not module diagnostics.
+#[test]
+fn import_synonym_shapes_are_e0001() {
+    for src in [
+        "import foo::bar as x;",
+        "import foo::{bar};",
+        "import foo::*;",
+    ] {
+        let err = parse_err(src);
+        assert_eq!(
+            err.code(),
+            Some(ErrorCode::ParseError),
+            "expected E0001 for {src}"
+        );
+    }
+}
+
 #[test]
 fn typed_fn_param_still_parses() {
     Pratt::default()

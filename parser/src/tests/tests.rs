@@ -1723,6 +1723,65 @@
         );
     }
 
+    /// COI-73: `import` is a non-goal, not a synonym of `use`.
+    #[test]
+    fn import_path_is_parse_error_not_use() {
+        let src = "import foo::bar;";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Use { .. } => {
+                    panic!("import foo::bar; must not parse as Use")
+                }
+                other => panic!(
+                    "import foo::bar; must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
+    /// COI-73: alias / brace / glob shapes must also fail, not become `Use`.
+    #[test]
+    fn import_alias_brace_and_glob_are_parse_errors_not_use() {
+        for src in [
+            "import foo::bar as x;",
+            "import foo::{bar};",
+            "import foo::*;",
+        ] {
+            match Pratt::default().parse(src) {
+                Ok((_, expr)) => match expr.as_ref() {
+                    Expression::Use { .. } => {
+                        panic!("{src} must not parse as Use")
+                    }
+                    other => panic!(
+                        "{src} must be a parse error, not silently accepted, got {:?}",
+                        other
+                    ),
+                },
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// COI-73 / keywords.md: `import` is not reserved; users may name bindings with it.
+    #[test]
+    fn import_is_not_a_keyword_and_can_name_a_user_function() {
+        let src = "fn import(int x) -> int { return x; } fn main() { let y = import(1); }";
+        let result = Pratt::default().parse(src);
+        assert!(
+            result.is_ok(),
+            "expected user fn named import to parse, got {:?}",
+            result.err()
+        );
+        let ast = result.unwrap();
+        let src_str = format!("{}", ast.1);
+        assert!(
+            src_str.contains("import"),
+            "display should retain import name: {src_str}"
+        );
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";

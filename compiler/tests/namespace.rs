@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use compiler::Pipeline;
+use compiler::{ErrorCode, Pipeline};
 use machine::Machine;
 
 // Tests change cwd; serialize with CWD_LOCK when running in parallel.
@@ -198,6 +198,57 @@ fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String
             .map(|m| m.message().to_string())
             .collect()
     })
+}
+
+/// COI-73: `import` is a non-goal, not a synonym of `use`.
+#[test]
+fn import_keyword_is_not_a_use_synonym() {
+    let mut pipeline = Pipeline::new();
+    let src = "import foo::bar;\nfn main() {}\n";
+    assert!(
+        pipeline.compile_src(src).is_err(),
+        "import foo::bar; must not compile as use"
+    );
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::ParseError)),
+        "expected a parse error, not a use/module diagnostic, got: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// COI-73: alias / brace / glob `import` shapes also fail at compile with E0001.
+#[test]
+fn import_synonym_shapes_fail_with_parse_error() {
+    for src in [
+        "import foo::bar as x;\nfn main() {}\n",
+        "import foo::{bar};\nfn main() {}\n",
+        "import foo::*;\nfn main() {}\n",
+    ] {
+        let mut pipeline = Pipeline::new();
+        assert!(
+            pipeline.compile_src(src).is_err(),
+            "{src:?} must not compile as use"
+        );
+        assert!(
+            pipeline
+                .messages()
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ParseError)),
+            "expected E0001 for {src:?}, got: {:?}",
+            pipeline
+                .messages()
+                .iter()
+                .map(|m| m.message().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
