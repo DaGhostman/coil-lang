@@ -4999,6 +4999,90 @@ fn main() { let _ = some_of(7); }",
         );
     }
 
+    /// COI-78: `Length` matches `Show` — ground calls keep dictionary ABI.
+    #[test]
+    fn length_bound_ground_call_uses_dictionary_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn n<T: Length>(T x) -> int { return len(x); } \
+             fn main() { return n(\"ab\"); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Length ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 Length dict); got {max_call_arity}"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "open Length::len body must CallIndirect; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// COI-78: mixing `Num` with a dictionary bound must not monomorphize —
+    /// the call site still emits a dict tuple (and bumped arity).
+    #[test]
+    fn num_plus_show_ground_call_keeps_dictionary() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn mix<T: Num + Show>(T a, T b) -> T { return a + b; } \
+             fn main() { let y = mix(1, 2); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Num+Show must emit dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        // 2 values + Num dict + Show dict
+        assert_eq!(
+            max_call_arity, 4,
+            "expected CALL arity = 4 (2 values + 2 dicts); got {max_call_arity}"
+        );
+    }
+
+    /// COI-78: ground UFCS (`size(41)`) shares the static-entry `CALL` path
+    /// with method form (`41.size()`).
+    #[test]
+    fn user_trait_ground_ufcs_uses_call() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "trait Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
+             fn main() { return size(41); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "ground UFCS user-trait method must CALL; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "ground UFCS user-trait method must not CallIndirect; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn omitted_default_method_dict_slot_has_real_target() {
         use common::Instruction;

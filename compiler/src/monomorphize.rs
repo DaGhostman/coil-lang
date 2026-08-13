@@ -930,6 +930,51 @@ mod tests {
         );
     }
 
+    /// COI-78: a dictionary bound anywhere on the signature blocks mono, even
+    /// when a sibling `Num` bound would otherwise specialize.
+    #[test]
+    fn does_not_plan_when_num_mixed_with_show_or_user_trait() {
+        let with_show = plan(
+            "fn mix<T: Num + Show>(T a, T b) -> T { return a + b; } \
+             fn main() { mix(1, 2); }",
+        );
+        assert!(
+            with_show.specializations.is_empty(),
+            "Num+Show must stay on dictionaries: {with_show:?}"
+        );
+
+        let with_user = plan(
+            "trait Tagged<T> { fn tag(T x) -> int; } \
+             impl Tagged<int> { fn tag(int x) -> int { return x; } } \
+             fn mix<T: Num + Tagged>(T a, T b) -> T { return a + b; } \
+             fn main() { mix(1, 2); }",
+        );
+        assert!(
+            with_user.specializations.is_empty(),
+            "Num+user-trait must stay on dictionaries: {with_user:?}"
+        );
+    }
+
+    /// COI-78 positive side: Ord / Eq remain opcode monomorphization candidates.
+    #[test]
+    fn plans_ground_ord_and_eq_calls() {
+        let ord = plan(
+            "fn less<T: Ord>(T a, T b) -> bool { return a < b; } \
+             fn main() { less(1, 2); }",
+        );
+        assert_eq!(ord.specializations.len(), 1);
+        assert_eq!(ord.specializations[0].key.fn_name, "less");
+        assert_eq!(ord.specializations[0].key.subst, vec!["int"]);
+
+        let eq = plan(
+            "fn same<T: Eq>(T a, T b) -> bool { return a == b; } \
+             fn main() { same(1, 1); }",
+        );
+        assert_eq!(eq.specializations.len(), 1);
+        assert_eq!(eq.specializations[0].key.fn_name, "same");
+        assert_eq!(eq.specializations[0].key.subst, vec!["int"]);
+    }
+
     #[test]
     fn rejects_conflicting_type_param_instantiation() {
         let plan = plan(

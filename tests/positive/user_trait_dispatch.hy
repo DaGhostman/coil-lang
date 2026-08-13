@@ -20,11 +20,43 @@ fn size_of_ufcs<T: Measurable>(T x) -> int {
     return size(x);
 }
 
+// Second method exercises Index slot selection under an open bound.
+trait PairOps<T> {
+    fn left(T x) -> int;
+    fn right(T x) -> int;
+}
+
+impl PairOps<(int, int)> {
+    fn left((int, int) x) -> int {
+        return x.0;
+    }
+    fn right((int, int) x) -> int {
+        return x.1;
+    }
+}
+
+fn pair_right_of<T: PairOps>(T x) -> int {
+    return x.right();
+}
+
+fn len_of<T: Length>(T x) -> int {
+    return len(x);
+}
+
 test("user trait at a ground type") {
     assert(41.size() == 42)?;
+    assert(size(41) == 42)?;
 }
 
 test("user trait under a generic bound") {
     assert(size_of(41) == 42)?;
     assert(size_of_ufcs(41) == 42)?;
+}
+
+test("multi-method user trait via dictionary") {
+    assert(pair_right_of((3, 9)) == 9)?;
+}
+
+test("Length bound stays on dictionary ABI") {
+    assert(len_of("ab") == 2)?;
 }
