@@ -39,7 +39,7 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 | Named-local class scalar replacement — **decided: named locals stay heap-backed** (temps elide; `fn drop()` always boxes) | [COI-84](https://linear.app/ardax/issue/COI-84) |
 | Bounds analysis vs `IndexUnchecked` | [COI-85](https://linear.app/ardax/issue/COI-85) |
 | Caller-side predicate peel vs self-recursion | [COI-86](https://linear.app/ardax/issue/COI-86) |
-| `*Jmpt` / fused invert | [COI-87](https://linear.app/ardax/issue/COI-87) |
+| `*Jmpt` / fused invert — **implemented** (`*Jmpt` twins; invert fused `*Jmpf; JMP`) | [COI-87](https://linear.app/ardax/issue/COI-87) |
 | `multi_op_join_convoy` JMPF mis-sink | [COI-91](https://linear.app/ardax/issue/COI-91) |
 | Loop `LEQ` headers / float identity refusals — **decided: keep numeric contract** (`i < bound` only; no `x - 0.0` / `x * 0.0`) | [COI-93](https://linear.app/ardax/issue/COI-93) |
 | Enum escape elimination vs heap | [COI-94](https://linear.app/ardax/issue/COI-94) |
@@ -128,7 +128,7 @@ That byte budget is the whole profitability margin, and it is what rules out pee
 | Instance methods, rest params, coroutines, un-monomorphized generics | The peel replicates the callee ABI, and `CallIndirect` receivers are not covered |
 | A call site that is not saturated | Partial application lowers to `MakeFn`, not `CALL` |
 
-**`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `BinSlotSlotConstJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`. **Near-miss (Phase 4):** fused `*Jmpf; JMP` (mandelbrot escape break) is tallied as `would_be_jmpt_after_invert` in `perf_metrics`. Scored go/no-go for this and other residual families: [optimization-roadmap.md — Opcode candidate ledger](optimization-roadmap.md#opcode-candidate-ledger-register-win-harvest-phase-5) (Phase 5; no opcodes implemented from the ledger yet).
+**`*Jmpt` twins of `*Jmpf` (COI-87, implemented).** `CmpJmpt` / `BinSlotImmJmpt` / `BinSlotSlotJmpt` / `BinSlotSlotConstJmpt` / `LogNotJmpt` share packing with the false forms. `opt::cfg::invert_branch_over_jump` inverts `JMPF A; JMP B; A:` to `JMPT B` even when the condition fuses; fuse-select then emits the `*Jmpt` twin. Loop headers stay `*Jmpf`. Archive minor 10.
 
 ## Test / CI reliability (high–medium)
 
