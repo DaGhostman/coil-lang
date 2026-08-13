@@ -1,4 +1,4 @@
-use gc::{collect, root, weak, upgrade, Weak};
+use gc::{collect, get, root, weak, upgrade, Root, Weak};
 
 class Handle {
     fd: int,
@@ -8,11 +8,34 @@ class Resurrect {
     fd: int,
 }
 
+class Rooted {
+    fd: int,
+}
+
+class Fielded {
+    fd: int,
+}
+
+class Bag {
+    slot: Option<Fielded>,
+}
+
+class WeakResurrect {
+    fd: int,
+}
+
 static let drops: int = 0;
 static let during: int = 0;
 static let held: Option<Weak<Handle>> = Option::None;
 static let resurrect_drops: int = 0;
 static let kept: Option<Resurrect> = Option::None;
+static let root_drops: int = 0;
+static let kept_root: Option<Root<Rooted>> = Option::None;
+static let field_drops: int = 0;
+static let bag: Option<Bag> = Option::None;
+static let weak_drops: int = 0;
+static let kept_weak: Option<WeakResurrect> = Option::None;
+static let held_weak: Option<Weak<WeakResurrect>> = Option::None;
 
 impl Handle {
     fn drop() {
@@ -33,6 +56,32 @@ impl Resurrect {
     fn drop() {
         resurrect_drops = resurrect_drops + 1;
         kept = Option::Some(self);
+    }
+}
+
+impl Rooted {
+    fn drop() {
+        root_drops = root_drops + 1;
+        kept_root = Option::Some(root(self));
+    }
+}
+
+impl Fielded {
+    fn drop() {
+        field_drops = field_drops + 1;
+        match bag {
+            Option::Some(b) => {
+                b.slot = Option::Some(self);
+            },
+            Option::None => {},
+        }
+    }
+}
+
+impl WeakResurrect {
+    fn drop() {
+        weak_drops = weak_drops + 1;
+        kept_weak = Option::Some(self);
     }
 }
 
@@ -126,4 +175,80 @@ test("explicit drop storing self stays once") {
     clear_kept();
     collect();
     assert(resurrect_drops == 1)?;
+}
+
+fn stash_into_root() {
+    let h = new Rooted(42);
+}
+
+test("storing self into Root from drop resurrects") {
+    root_drops = 0;
+    kept_root = Option::None;
+    stash_into_root();
+    collect();
+    assert(root_drops == 1)?;
+    let fd = match kept_root {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    assert(fd == 42)?;
+    collect();
+    assert(root_drops == 1)?;
+    let fd2 = match kept_root {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    assert(fd2 == 42)?;
+}
+
+fn setup_bag() {
+    bag = Option::Some(new Bag(Option::None));
+}
+
+fn stash_into_field() {
+    let h = new Fielded(9);
+}
+
+fn field_slot_fd() -> int {
+    return match bag {
+        Option::Some(b) => match b.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        },
+        Option::None => -2,
+    };
+}
+
+test("storing self into reachable field resurrects") {
+    field_drops = 0;
+    bag = Option::None;
+    setup_bag();
+    stash_into_field();
+    collect();
+    assert(field_drops == 1)?;
+    assert(field_slot_fd() == 9)?;
+    collect();
+    assert(field_drops == 1)?;
+}
+
+fn stash_with_weak() {
+    let h = new WeakResurrect(3);
+    held_weak = Option::Some(weak(h));
+}
+
+test("resurrection keeps weak upgradable") {
+    weak_drops = 0;
+    kept_weak = Option::None;
+    held_weak = Option::None;
+    stash_with_weak();
+    collect();
+    assert(weak_drops == 1)?;
+    let after = match held_weak {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        },
+        Option::None => -2,
+    };
+    assert(after == 3)?;
 }
