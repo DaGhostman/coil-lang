@@ -17,10 +17,10 @@ use crate::typechecking::ty::{AssocProjection, Constraint, Scheme};
 use crate::typechecking::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use crate::typechecking::ty::{
     EnumVariantPayloadTy, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
-    result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
+    list, never, option_app_ty, option_inner, option_ty, range_app, range_inclusive_ty, range_ty,
+    readonly_ty, result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
     strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty, vec_app_ty,
-    vec_element_ty,
+    vec_element_ty, RANGE, RANGE_INCLUSIVE,
 };
 use crate::typechecking::unify::{UnifyError, unify_with};
 use crate::typechecking::virtual_modules::{
@@ -154,6 +154,7 @@ impl Checker {
         };
         checker.register_builtin_enums();
         checker.register_builtin_vec();
+        checker.register_builtin_range();
         checker.register_builtin_call_sigs();
         checker
     }
@@ -289,6 +290,54 @@ impl Checker {
                 .entry(BUILTIN_VEC_TYPE.to_string())
                 .or_default()
                 .insert(name.to_string(), (Visibility::Public, scheme));
+        }
+    }
+
+    /// Synthetic `Range<T>` / `RangeInclusive<T>` inherent `to_vec`.
+    ///
+    /// Idempotent: same re-entry contract as [`Self::register_builtin_vec`].
+    /// Construction stays `T: Ord`; `.to_vec()` is rejected for non-numeric
+    /// elements at the call site (see [`Self::constrain_range_to_vec`]).
+    fn register_builtin_range(&mut self) {
+        self.overload_sets
+            .retain(|k, _| !k.starts_with("Range::") && !k.starts_with("RangeInclusive::"));
+
+        let fun = |params: &[Ty], ret: Ty| {
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
+        };
+        let dummy = 0..0;
+
+        for owner in [RANGE, RANGE_INCLUSIVE] {
+            self.classes
+                .entry(owner.to_string())
+                .or_insert_with(Vec::new);
+            let t = self.counter.fresh();
+            let recv = if owner == RANGE {
+                range_ty(Ty::Var(t))
+            } else {
+                range_inclusive_ty(Ty::Var(t))
+            };
+            let scheme = Scheme::poly(vec![t], vec![], fun(&[recv], vec_app_ty(Ty::Var(t))));
+            let fqn = format!("{owner}::to_vec");
+            self.fn_param_names.insert(fqn.clone(), Vec::new());
+            self.register_overload_candidate(
+                &fqn,
+                OverloadCandidate {
+                    id: 0,
+                    fixed_arity: 0,
+                    is_rest: false,
+                    scheme: scheme.clone(),
+                    param_names: Vec::new(),
+                },
+                &dummy,
+            );
+            self.methods
+                .entry(owner.to_string())
+                .or_default()
+                .insert("to_vec".to_string(), (Visibility::Public, scheme));
         }
     }
 
@@ -1517,8 +1566,9 @@ impl Checker {
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
-        // `fn_param_names` was cleared above — reinstall Vec method ABI.
+        // `fn_param_names` was cleared above — reinstall Vec / Range method ABI.
         self.register_builtin_vec();
+        self.register_builtin_range();
         self.register_builtin_call_sigs();
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
@@ -4777,6 +4827,9 @@ impl Checker {
                         .and_then(|m| m.get(*method))
                         .is_some()
                 {
+                    if *method == "to_vec" {
+                        self.constrain_range_to_vec(owner, &resolved, &range);
+                    }
                     let fqn = format!("{}::{}", owner, method);
                     let user_argc = method_args.len();
                     let scheme = if self.is_overloaded(&fqn) {
@@ -4969,6 +5022,9 @@ impl Checker {
                     .and_then(|m| m.get(*method))
                     .is_some()
             {
+                if *method == "to_vec" {
+                    self.constrain_range_to_vec(owner, &resolved, &range);
+                }
                 if self.is_static_method(owner, method) {
                     let fqn = format!("{}::{}", owner, method);
                     return self.error_with_help(
@@ -15586,10 +15642,10 @@ impl Checker {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") && args.len() == 2 {
                     return Some((args[0].clone(), ForInKind::Coroutine));
                 }
-                if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
+                if matches!(head.as_ref(), Ty::Con(n) if n == RANGE) && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], false, range);
                 }
-                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1 {
+                if matches!(head.as_ref(), Ty::Con(n) if n == RANGE_INCLUSIVE) && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], true, range);
                 }
                 None
@@ -15607,32 +15663,56 @@ impl Checker {
         inclusive: bool,
         range: &Range<usize>,
     ) -> Option<(Ty, ForInKind)> {
+        let type_name = if inclusive {
+            RANGE_INCLUSIVE
+        } else {
+            RANGE
+        };
+        let float = self.require_range_numeric_step(elem, type_name, range);
         let elem = apply_ty_prune(&self.subst, elem);
-        let float = match &elem {
+        Some((elem, ForInKind::Range { inclusive, float }))
+    }
+
+    /// Shared numeric-step gate for `for` and `.to_vec()`.
+    ///
+    /// Returns `true` when the element is `float` (ADDF path), `false` for
+    /// `int`/`byte` or after diagnosing a non-steppable type (int-style
+    /// recovery so codegen still emits).
+    fn require_range_numeric_step(
+        &mut self,
+        elem: &Ty,
+        type_name: &str,
+        range: &Range<usize>,
+    ) -> bool {
+        let elem = apply_ty_prune(&self.subst, elem);
+        match &elem {
             Ty::Con(n) if n == "float" => true,
             Ty::Con(n) if n == "int" || n == "byte" => false,
             other => {
                 let _ = self.error_with_help(
                     ErrorCode::GenericTypeError,
-                    format!("cannot iterate over `Range<{}>`", other),
+                    format!("cannot iterate over `{type_name}<{other}>`"),
                     range.clone(),
                     Some(
-                        "`for` over a range requires element type `int`, `byte`, or `float` \
-                         (construction only needs `Ord`; stepping needs a numeric successor)"
+                        "`for` and `.to_vec()` require element type `int`, `byte`, or `float` \
+                         (construction only needs `Ord`; there is no successor protocol)"
                             .to_string(),
                     ),
                 );
-                // Recovery: int-style opcodes so codegen still emits.
-                return Some((
-                    elem,
-                    ForInKind::Range {
-                        inclusive,
-                        float: false,
-                    },
-                ));
+                false
             }
+        }
+    }
+
+    /// Reject `.to_vec()` on a non-numeric `Range` / `RangeInclusive`.
+    fn constrain_range_to_vec(&mut self, owner: &str, recv_ty: &Ty, range: &Range<usize>) {
+        if owner != RANGE && owner != RANGE_INCLUSIVE {
+            return;
+        }
+        let Some((elem, _)) = range_app(recv_ty) else {
+            return;
         };
-        Some((elem, ForInKind::Range { inclusive, float }))
+        let _ = self.require_range_numeric_step(elem, owner, range);
     }
 
     /// All types unify to one element type, or diagnose heterogeneity.

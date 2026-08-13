@@ -55,7 +55,7 @@ Parse → typecheck (HM) → stack IL codegen + lower/fuse-select → versioned 
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
-| Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` steps `int`/`byte`/`float`; no auto array materialize ([syntax](references/syntax.md#ranges-lazy)) |
+| Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` / `.to_vec()` step `int`/`byte`/`float`; non-numeric `Ord` is a type error ([syntax](references/syntax.md#ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `string::format(...)` | Supported compiler intrinsic (returns `string`; literal specifiers are checked) |
 

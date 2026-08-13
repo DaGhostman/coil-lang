@@ -75,7 +75,8 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 
 Named call-site args: positional prefix then `f(name: v)`. Rest: trailing `T... xs`. Spread: `f(...pack)`.
 
-Ranges `a..b` / `a..=b` are **lazy** `Range<T: Ord>` — no auto array materialize.
+Ranges `a..b` / `a..=b` are **lazy** `Range<T: Ord>` / `RangeInclusive<T: Ord>`.
+`for` and `.to_vec()` step `int`/`byte`/`float` only; other `Ord` is a type error.
 
 Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
 

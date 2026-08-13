@@ -6187,6 +6187,90 @@ impl Compiler {
             "vec_remove",
             &[0, 1],
         );
+        self.emit_range_method_thunks();
+    }
+
+    /// Inherent `Range::to_vec` / `RangeInclusive::to_vec` bodies.
+    ///
+    /// Unpacks the runtime dict `{start,end,inclusive}` and fills a `Vec`
+    /// with the same step as `for` (`+1` / `+1.0`). Float uses a sibling
+    /// `__float_to_vec` thunk selected at the call site.
+    fn emit_range_method_thunks(&mut self) {
+        for owner in ["Range", "RangeInclusive"] {
+            let methods = self.context.methods.entry(owner.to_string()).or_default();
+            methods.insert("to_vec".to_string(), format!("{owner}::to_vec"));
+        }
+        self.emit_range_to_vec_thunk("Range::to_vec".into(), false, false);
+        self.emit_range_to_vec_thunk("Range::__float_to_vec".into(), false, true);
+        self.emit_range_to_vec_thunk("RangeInclusive::to_vec".into(), true, false);
+        self.emit_range_to_vec_thunk("RangeInclusive::__float_to_vec".into(), true, true);
+    }
+
+    fn emit_range_to_vec_thunk(&mut self, fqn: String, inclusive: bool, float: bool) {
+        if self.functions.contains_key(&fqn) {
+            return;
+        }
+        self.bind_function_entry(fqn);
+        // slot 0 = self (range dict); 1 = cur; 2 = end; 3 = out vec
+        let start_idx = self.intern_string("start");
+        self.bytecode.push_load(0);
+        self.bytecode.push_string(start_idx);
+        self.bytecode.push_get_field();
+        self.bytecode.push_store_pop(1);
+
+        let end_idx = self.intern_string("end");
+        self.bytecode.push_load(0);
+        self.bytecode.push_string(end_idx);
+        self.bytecode.push_get_field();
+        self.bytecode.push_store_pop(2);
+
+        self.bytecode.push_make_array(0);
+        self.bytecode.push_store_pop(3);
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label(self.bytecode.il_mut());
+        let exit_label = bb.fresh_label(self.bytecode.il_mut());
+        bb.bind_label(top_label, self.bytecode.il_mut());
+
+        self.bytecode.push_load(1);
+        self.bytecode.push_load(2);
+        self.bytecode.push(Byte::new(if float {
+            if inclusive {
+                Instruction::LEQF
+            } else {
+                Instruction::LEF
+            }
+        } else if inclusive {
+            Instruction::LEQ
+        } else {
+            Instruction::LE
+        }));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+
+        self.bytecode.push_load(3);
+        self.bytecode.push_load(1);
+        self.bytecode.push(Byte::new(Instruction::ArrayPush));
+        self.bytecode.push_store_pop(3);
+
+        self.bytecode.push_load(1);
+        if float {
+            let bits = Value::from(1.0_f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode.push_const_pool(idx);
+            self.bytecode.push(Byte::new(Instruction::ADDF));
+        } else {
+            self.bytecode.push_const(1);
+            self.bytecode.push(Byte::new(Instruction::ADD));
+        }
+        self.bytecode.push_store_pop(1);
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(exit_label, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: range to_vec labels bound");
+
+        self.bytecode.push_load(3);
+        self.bytecode.push_return();
     }
 
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
@@ -6212,6 +6296,7 @@ impl Compiler {
             Ty::Array { .. } => Some(ValueTag::Array),
             Ty::App(head, _) => match head.as_ref() {
                 Ty::Con(n) if n == common::BUILTIN_VEC_TYPE => Some(ValueTag::Array),
+                Ty::Con(n) if n == "Range" || n == "RangeInclusive" => Some(ValueTag::Record),
                 // Option / Result / user ADT apps share the Instance box tag.
                 Ty::Con(_) => Some(ValueTag::Instance),
                 _ => None,
@@ -6221,6 +6306,14 @@ impl Compiler {
             Ty::Var(_) => None,
             _ => None,
         }
+    }
+
+    fn range_to_vec_elem_is_float(&self, recv_ty: Option<&Ty>) -> bool {
+        recv_ty
+            .map(|ty| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty))
+            .as_ref()
+            .and_then(crate::typechecking::ty::range_app)
+            .is_some_and(|(elem, _)| matches!(elem, Ty::Con(n) if n == "float"))
     }
 
     /// Peel `forall` / function arrows to the final return type.
@@ -13744,6 +13837,13 @@ impl Compiler {
                     }
                 } else {
                     fqn_base
+                };
+                let fqn = if self.range_to_vec_elem_is_float(recv_ty.as_ref())
+                    && (fqn == "Range::to_vec" || fqn == "RangeInclusive::to_vec")
+                {
+                    fqn.replace("::to_vec", "::__float_to_vec")
+                } else {
+                    fqn
                 };
                 if let Some(offset) = self.functions.get(&fqn).copied() {
                     let niche_vec_method = (self.expr_is_niche_option(ast)

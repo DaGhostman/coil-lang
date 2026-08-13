@@ -69,9 +69,13 @@ match v.pop() {
 | `v.reserve(n)` | Ensure capacity for `len + n` |
 | `v.capacity()` / `v.len()` | Ints |
 | `v[i]` / `v[i] = x` | Index get/set |
+| `(0..n).to_vec()` | Collect a numeric `Range` / `RangeInclusive` into `Vec<T>` |
 
 Rest parameters `T... xs` pack into `Vec<T>`. Spread accepts both `[T; N]` and
 `Vec<T>`.
+
+Numeric ranges (`int` / `byte` / `float`) expose inherent `.to_vec()` — same
+step and empty-decreasing rule as `for`. See [Ranges](syntax.md#ranges-lazy).
 
 IO buffers (`to_bytes`, `read`/`write`) use `Vec<byte>`.
 

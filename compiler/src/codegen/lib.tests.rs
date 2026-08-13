@@ -265,10 +265,11 @@ test("two") { assert(true)?; }
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::YieldCoro))
             .expect("expected YieldCoro");
-        let store_pos = bc
+        let store_pos = bc[yield_pos..]
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::STORE))
-            .expect("expected STORE");
+            .map(|i| yield_pos + i)
+            .expect("expected STORE after YieldCoro");
         assert!(
             yield_pos < store_pos,
             "YieldCoro (at {}) must precede STORE (at {}) for binding yield",
@@ -607,10 +608,18 @@ use string::{format, to_bytes};
             "#,
         );
         // Key cached once in Point::twice_x; ignore STRING ops in later
-        // default Show/String / builtin thunks.
+        // default Show/String / builtin thunks (Range::to_vec uses GetField).
         let first_get = bc
             .iter()
-            .position(|b| matches!(b.bytecode(), Instruction::GetField))
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::GetField))
+            .find(|(i, _)| {
+                let end = (*i + 24).min(bc.len());
+                !bc[*i..end]
+                    .iter()
+                    .any(|b| matches!(b.bytecode(), Instruction::ArrayPush))
+            })
+            .map(|(i, _)| i)
             .expect("expected GetField in twice_x");
         let region_start = bc[..first_get]
             .iter()

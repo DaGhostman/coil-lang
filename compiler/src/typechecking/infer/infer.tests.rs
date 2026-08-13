@@ -3771,6 +3771,117 @@ fn dump<T: Ord>(T a, T b) {
     }
 
     #[test]
+    fn range_to_vec_infers_vec_int() {
+        let src = r#"
+fn main() {
+    let v = (0..5).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let v_ty = c.codegen_var_type("v").expect("v");
+        assert_eq!(
+            apply_ty_prune(c.subst(), v_ty),
+            crate::typechecking::ty::vec_app_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_inclusive_to_vec_infers_vec_int() {
+        let src = r#"
+fn main() {
+    let r = 0..=3;
+    let v = r.to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let v_ty = c.codegen_var_type("v").expect("v");
+        assert_eq!(
+            apply_ty_prune(c.subst(), v_ty),
+            crate::typechecking::ty::vec_app_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_to_vec_byte_and_float() {
+        let src = r#"
+fn main() {
+    let lo: byte = 1;
+    let hi: byte = 4;
+    let b = (lo..hi).to_vec();
+    let f = (1.0..=3.0).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let b_ty = c.codegen_var_type("b").expect("b");
+        assert_eq!(
+            apply_ty_prune(c.subst(), b_ty),
+            crate::typechecking::ty::vec_app_ty(crate::typechecking::ty::byte())
+        );
+        let f_ty = c.codegen_var_type("f").expect("f");
+        assert_eq!(
+            apply_ty_prune(c.subst(), f_ty),
+            crate::typechecking::ty::vec_app_ty(float())
+        );
+    }
+
+    #[test]
+    fn range_to_vec_rejects_non_numeric_ord_element() {
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("cannot iterate")),
+            "expected non-steppable range to_vec diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn range_inclusive_to_vec_rejects_non_numeric_ord_element() {
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..=b).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("cannot iterate over `RangeInclusive")),
+            "expected RangeInclusive to_vec diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn range_to_vec_help_mentions_shared_numeric_step_policy() {
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#;
+        let (c, _) = check(src);
+        let help = c
+            .messages()
+            .iter()
+            .find(|m| m.message().contains("cannot iterate"))
+            .and_then(|m| m.help().as_ref())
+            .expect("expected help on Range.to_vec reject");
+        assert!(
+            help.contains(".to_vec()") && help.contains("no successor protocol"),
+            "expected shared for/.to_vec help, got {help:?}"
+        );
+    }
+
+    #[test]
     fn for_in_hetero_tuple_is_diagnostic() {
         let (c, _) = check("fn main() { for x in (1, \"a\") { } }");
         assert!(

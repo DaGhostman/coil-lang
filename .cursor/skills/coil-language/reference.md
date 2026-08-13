@@ -118,7 +118,7 @@ let f = declare(lib, "strlen", (String,), Int)?;
 
 ## Iterator / for-in
 
-`for x in expr` uses `IntoIterator` / `Iterator` from prelude. Works on arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s.
+`for x in expr` uses `IntoIterator` / `Iterator` from prelude. Works on arrays, homogeneous tuples/dicts, numeric ranges (`int`/`byte`/`float`), coroutines, user `impl`s. Numeric ranges also have inherent `.to_vec() -> Vec<T>`.
 
 ## What does NOT exist
 

@@ -329,7 +329,8 @@ fn main() { let a = show(true); }
             .collect::<Vec<_>>()
     );
     assert!(
-        msgs.iter().any(|m| m.message().contains("No overload of `show`")),
+        msgs.iter()
+            .any(|m| m.message().contains("No overload of `show`")),
         "expected 'No overload of show' message, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
@@ -358,8 +359,7 @@ fn userland_wildcard_import_has_stable_error_code() {
 fn virtual_wildcard_import_is_rejected() {
     let msgs = check_messages("use io::*;\nfn main() {}\n");
     assert!(
-        msgs
-            .iter()
+        msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
         "virtual `use io::*` must emit WildcardImport, got: {:?}",
         msgs.iter()
@@ -2690,5 +2690,61 @@ fn main() {}
             .iter()
             .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
         "expected InvalidDrop for non-unit drop return"
+    );
+}
+
+#[test]
+fn range_to_vec_non_numeric_ord_is_cannot_iterate() {
+    let (_ty, msgs) = check(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot iterate over `Range")),
+        "expected cannot-iterate diagnostic for Range.to_vec, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn range_for_in_non_numeric_ord_is_cannot_iterate() {
+    let (_ty, msgs) = check(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    for x in a..=b { }
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot iterate over `RangeInclusive")),
+        "expected cannot-iterate diagnostic for RangeInclusive for-in, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn range_numeric_step_help_mentions_to_vec_and_successor() {
+    let msgs = check_messages(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#,
+    );
+    let help = msgs.iter().find_map(|m| {
+        m.message()
+            .contains("cannot iterate")
+            .then(|| m.help().clone())
+            .flatten()
+    });
+    let help = help.expect("expected help on cannot-iterate for Range.to_vec");
+    assert!(
+        help.contains(".to_vec()") && help.contains("successor"),
+        "help should pin shared for/.to_vec numeric-step policy, got: {help:?}"
     );
 }

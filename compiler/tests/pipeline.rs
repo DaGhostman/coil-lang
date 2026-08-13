@@ -1,7 +1,7 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1723,8 +1723,7 @@ fn example_strlen_prints_5_compile_src_from_file() {
         }
     };
     assert_eq!(
-        output,
-        "5",
+        output, "5",
         "strlen(\"hello\") via compile_src_from_file should print 5"
     );
 }
@@ -2086,6 +2085,173 @@ fn main() {
 "#,
     );
     assert_eq!(output, "0,01");
+}
+
+#[test]
+fn range_to_vec_collects_int_byte_float() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = (0..5).to_vec();
+    write(stdout(), to_bytes(format("%i", a.len())));
+    write(stdout(), to_bytes(","));
+    let r = 0..=3;
+    write(stdout(), to_bytes(format("%i", r.to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (10..0).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    let lo: byte = 5;
+    let hi: byte = 6;
+    write(stdout(), to_bytes(format("%i", (lo..=hi).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (1.0..4.0).to_vec().len())));
+}
+"#,
+    );
+    // 0..5 → 5; 0..=3 → 4; 10..0 → 0; byte 5..=6 → 2; float 1.0..4.0 → 3
+    assert_eq!(output, "5,4,0,2,3");
+}
+
+/// `.to_vec()` must yield the same sequence as `for` (shared LE/LEQ + step).
+#[test]
+fn range_to_vec_matches_for_in_elements() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    for x in 0..=3 {
+        write(stdout(), to_bytes(format("%i", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let v = (0..=3).to_vec();
+    let i = 0;
+    while i < v.len() {
+        write(stdout(), to_bytes(format("%i", v[i])));
+        i = i + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (7..=7).to_vec()[0])));
+    write(stdout(), to_bytes("|"));
+    for x in 1.0..=3.0 {
+        write(stdout(), to_bytes(format("%f", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let f = (1.0..=3.0).to_vec();
+    let j = 0;
+    while j < f.len() {
+        write(stdout(), to_bytes(format("%f", f[j])));
+        j = j + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (4.0..1.0).to_vec().len())));
+}
+"#,
+    );
+    assert_eq!(output, "0123|0123|7|1.02.03.0|1.02.03.0|0");
+}
+
+/// Int `to_vec` thunks fuse ADD/LE(Q); float sibling thunks keep ADDF and fuse LE(Q)F.
+#[test]
+fn range_to_vec_thunks_use_int_vs_float_opcodes() {
+    let src = r#"
+fn main() {
+    let _a = (0..3).to_vec();
+    let _b = (0..=2).to_vec();
+    let _c = (1.0..3.0).to_vec();
+    let _d = (1.0..=2.0).to_vec();
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("range to_vec compile");
+    let syms = pipeline.program_debug().fn_symbols;
+    let body = |name: &str| {
+        let idx = syms
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing `{name}`; have {:?}",
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        let start = syms[idx].entry_pc as usize;
+        let end = syms
+            .get(idx + 1)
+            .map(|s| s.entry_pc as usize)
+            .unwrap_or(bytecode.len());
+        &bytecode[start..end]
+    };
+    let jmpf_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotSlotJmpf)
+            .map(|b| b.bin_slot_slot_jmpf_parts().0)
+            .collect()
+    };
+    let imm_store_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotImmStore)
+            .map(|b| b.bin_slot_imm_store_parts().0)
+            .collect()
+    };
+    let has = |slice: &[common::Byte], op: common::Instruction| {
+        slice.iter().any(|b| *b.bytecode() == op)
+    };
+
+    let int_half = body("Range::to_vec");
+    assert_eq!(
+        jmpf_ops(int_half),
+        vec![common::Instruction::LE as u8],
+        "int half-open compare must be LE"
+    );
+    assert_eq!(
+        imm_store_ops(int_half),
+        vec![common::Instruction::ADD as u8],
+        "int half-open step must be ADD"
+    );
+    assert!(!has(int_half, common::Instruction::ADDF));
+
+    let int_inc = body("RangeInclusive::to_vec");
+    assert_eq!(
+        jmpf_ops(int_inc),
+        vec![common::Instruction::LEQ as u8],
+        "int inclusive compare must be LEQ"
+    );
+    assert_eq!(
+        imm_store_ops(int_inc),
+        vec![common::Instruction::ADD as u8],
+        "int inclusive step must be ADD"
+    );
+
+    let float_half = body("Range::__float_to_vec");
+    assert_eq!(
+        jmpf_ops(float_half),
+        vec![common::Instruction::LEF as u8],
+        "float half-open compare must be LEF"
+    );
+    assert!(
+        has(float_half, common::Instruction::ADDF),
+        "float half-open step must use ADDF"
+    );
+    assert!(
+        imm_store_ops(float_half).is_empty(),
+        "float half-open must not fuse int BinSlotImmStore"
+    );
+
+    let float_inc = body("RangeInclusive::__float_to_vec");
+    assert_eq!(
+        jmpf_ops(float_inc),
+        vec![common::Instruction::LEQF as u8],
+        "float inclusive compare must be LEQF"
+    );
+    assert!(
+        has(float_inc, common::Instruction::ADDF),
+        "float inclusive step must use ADDF"
+    );
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument
@@ -5907,7 +6073,10 @@ fn main() {
             .any(|b| matches!(b.bytecode(), Instruction::NEG)),
         "float aggregate negate must not emit int NEG"
     );
-    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "-1.5,-2.0");
+    assert_eq!(
+        run_bytecode(bytecode, constants, &pipeline, None),
+        "-1.5,-2.0"
+    );
 }
 
 #[test]
@@ -6460,7 +6629,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "enable must not resolve without tls client/server import");
+    assert!(
+        err.is_err(),
+        "enable must not resolve without tls client/server import"
+    );
 }
 
 /// Legacy `encrypt` / `decrypt` names under server must stay gone.
@@ -6734,7 +6906,12 @@ fn optional_virtual_modules_match_cargo_features() {
     fn check(src: &str, enabled: bool) {
         let mut pipeline = Pipeline::new();
         let ok = pipeline.compile_src(src).is_ok();
-        assert_eq!(ok, enabled, "src={src:?} messages={:?}", pipeline.messages());
+        assert_eq!(
+            ok,
+            enabled,
+            "src={src:?} messages={:?}",
+            pipeline.messages()
+        );
         if !enabled {
             assert!(
                 pipeline.messages().iter().any(|m| {
@@ -7227,10 +7404,7 @@ fn main() {
 }
 "#,
     );
-    assert!(
-        result.is_err(),
-        "unknown identifier must fail compile_src"
-    );
+    assert!(result.is_err(), "unknown identifier must fail compile_src");
     assert!(pipeline.had_errors());
     assert!(
         pipeline
@@ -8181,7 +8355,10 @@ fn main() {
 }
 "#,
     );
-    assert_eq!(output, "2", "push with Construct(format,…) must not drop the vec");
+    assert_eq!(
+        output, "2",
+        "push with Construct(format,…) must not drop the vec"
+    );
 }
 
 /// COI-19: heap value in a user static survives `gc::collect` (static roots).
