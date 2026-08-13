@@ -57,8 +57,8 @@ fn build_matching_coil_embed() -> PathBuf {
     embed
 }
 
-fn run_with_timeout(bin: &Path, secs: u64) -> std::process::Output {
-    let child = Command::new(bin)
+fn run_command_with_timeout(mut cmd: Command, secs: u64) -> std::process::Output {
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -76,6 +76,59 @@ fn run_with_timeout(bin: &Path, secs: u64) -> std::process::Output {
             panic!("packaged app hung for {secs}s (runner/compiler feature mismatch?)");
         }
     }
+}
+
+fn run_with_timeout(bin: &Path, secs: u64) -> std::process::Output {
+    run_command_with_timeout(Command::new(bin), secs)
+}
+
+#[test]
+fn coil_embed_build_args_mirrors_optional_features() {
+    let target_dir = Path::new("/tmp/coil-package-cli-embed-args");
+    let args = coil_embed_build_args(target_dir);
+    assert_eq!(
+        &args[..5],
+        ["build", "-q", "-p", "coil-embed", "--no-default-features"]
+    );
+    assert_eq!(args[5], "--target-dir");
+    assert_eq!(args[6], target_dir.display().to_string());
+
+    let mut expected = Vec::new();
+    if cfg!(feature = "crypto") {
+        expected.push("crypto");
+    }
+    if cfg!(feature = "time") {
+        expected.push("time");
+    }
+    if cfg!(feature = "regex") {
+        expected.push("regex");
+    }
+    if cfg!(feature = "tls") {
+        expected.push("tls");
+    }
+    if expected.is_empty() {
+        assert!(
+            !args.iter().any(|a| a == "--features"),
+            "bare stack must omit --features, got {args:?}"
+        );
+        assert_eq!(args.len(), 7);
+    } else {
+        assert_eq!(args[7], "--features");
+        assert_eq!(args[8], expected.join(","));
+        assert_eq!(args.len(), 9);
+    }
+}
+
+#[test]
+fn run_with_timeout_returns_fast_process_output() {
+    let out = run_command_with_timeout(Command::new("true"), 5);
+    assert!(out.status.success(), "true should exit 0");
+}
+
+#[test]
+#[should_panic(expected = "packaged app hung")]
+fn run_with_timeout_kills_hung_process() {
+    let _ = run_command_with_timeout(Command::new("sleep").arg("30"), 1);
 }
 
 #[test]

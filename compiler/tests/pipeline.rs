@@ -6726,28 +6726,38 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// Feature-off `use` of optional virtual modules is a compile error (E0900),
-/// not a hang. Stays ungated so `--no-default-features` still exercises it.
+/// Feature-off `use` of optional virtual modules is a compile error (E0900 /
+/// "Module not found"), not a hang. Stays ungated so `--no-default-features`
+/// still exercises it.
 #[test]
 fn optional_virtual_modules_match_cargo_features() {
-    fn compiles(src: &str) -> bool {
-        Pipeline::new().compile_src(src).is_ok()
+    fn check(src: &str, enabled: bool) {
+        let mut pipeline = Pipeline::new();
+        let ok = pipeline.compile_src(src).is_ok();
+        assert_eq!(ok, enabled, "src={src:?} messages={:?}", pipeline.messages());
+        if !enabled {
+            assert!(
+                pipeline.messages().iter().any(|m| {
+                    m.code() == Some(compiler::ErrorCode::IoError)
+                        || m.message().contains("Module not found")
+                }),
+                "feature-off use must surface Module not found / E0900, got {:?}",
+                pipeline.messages()
+            );
+        }
     }
-    assert_eq!(
-        compiles("use time::{epoch};\nfn main() {}\n"),
-        cfg!(feature = "time")
+    check("use time::{epoch};\nfn main() {}\n", cfg!(feature = "time"));
+    check(
+        "use crypto::{sha256};\nfn main() {}\n",
+        cfg!(feature = "crypto"),
     );
-    assert_eq!(
-        compiles("use crypto::{sha256};\nfn main() {}\n"),
-        cfg!(feature = "crypto")
+    check(
+        "use regex::{compile};\nfn main() {}\n",
+        cfg!(feature = "regex"),
     );
-    assert_eq!(
-        compiles("use regex::{compile};\nfn main() {}\n"),
-        cfg!(feature = "regex")
-    );
-    assert_eq!(
-        compiles("use io::net::tls::client::{enable};\nfn main() {}\n"),
-        cfg!(feature = "tls")
+    check(
+        "use io::net::tls::client::{enable};\nfn main() {}\n",
+        cfg!(feature = "tls"),
     );
 }
 
