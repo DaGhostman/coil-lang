@@ -345,14 +345,33 @@ pub fn byte() -> Ty {
     Ty::Con(BYTE.into())
 }
 
+/// Half-open lazy range constructor name (`Range<T>`).
+pub const RANGE: &str = "Range";
+
+/// Closed lazy range constructor name (`RangeInclusive<T>`).
+pub const RANGE_INCLUSIVE: &str = "RangeInclusive";
+
 /// Half-open lazy range type `Range<T>` (Phase P3).
 pub fn range_ty(elem: Ty) -> Ty {
-    Ty::App(Box::new(Ty::Con("Range".into())), vec![elem])
+    Ty::App(Box::new(Ty::Con(RANGE.into())), vec![elem])
 }
 
 /// Closed lazy range type `RangeInclusive<T>` (Phase P3).
 pub fn range_inclusive_ty(elem: Ty) -> Ty {
-    Ty::App(Box::new(Ty::Con("RangeInclusive".into())), vec![elem])
+    Ty::App(Box::new(Ty::Con(RANGE_INCLUSIVE.into())), vec![elem])
+}
+
+/// Element type and inclusivity of `Range<T>` / `RangeInclusive<T>`.
+pub fn range_app(ty: &Ty) -> Option<(&Ty, bool)> {
+    match ty {
+        Ty::App(head, args) if args.len() == 1 => match head.as_ref() {
+            Ty::Con(n) if n == RANGE => Some((&args[0], false)),
+            Ty::Con(n) if n == RANGE_INCLUSIVE => Some((&args[0], true)),
+            _ => None,
+        },
+        Ty::Readonly(inner) => range_app(inner),
+        _ => None,
+    }
 }
 
 /// Build the opaque `Stream` type.
