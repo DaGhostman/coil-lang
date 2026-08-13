@@ -12,7 +12,7 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 
 | Issue | Detail | Linear |
 |-------|--------|--------|
-| `coil.toml` `preludes` / `strict` | Not implemented — [project-config.md](../references/project-config.md) | [COI-72](https://linear.app/ardax/issue/COI-72) |
+| `coil.toml` `preludes` / `strict` | **Dropped:** unknown-key parse errors. Extra search paths use `[module].roots`; virtual prelude is compiler-owned; undefined names already fail typecheck (`E0100`). — [project-config.md](../references/project-config.md) | [COI-72](https://linear.app/ardax/issue/COI-72) |
 | `import` keyword | Not implemented (use `use`) | [COI-73](https://linear.app/ardax/issue/COI-73) |
 | `case` as `match` alias | Not in grammar | [COI-74](https://linear.app/ardax/issue/COI-74) |
 | Range `collect` | `collect(0..5)` deferred; non-numeric `Ord` ranges not iterable | [COI-75](https://linear.app/ardax/issue/COI-75) |
