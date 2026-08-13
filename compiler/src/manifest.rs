@@ -933,6 +933,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_unknown_module_preludes_key_errors() {
+        let src = "[module]\nroots = [\"./src\"]\npreludes = [\"./stdlib/src\"]\n";
+        match Manifest::parse(src).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(
+                    message.contains("unknown key `module.preludes`"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_module_strict_key_errors() {
+        let src = "[module]\nroots = [\"./src\"]\nstrict = true\n";
+        match Manifest::parse(src).unwrap_err() {
+            ManifestError::Parse { message, .. } => {
+                assert!(
+                    message.contains("unknown key `module.strict`"),
+                    "got {message}"
+                );
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_dependency_git_requires_version() {
         let src = r#"
             [dependencies]
