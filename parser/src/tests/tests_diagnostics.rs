@@ -198,3 +198,81 @@ fn typed_fn_param_still_parses() {
         .parse("fn fib(int n) { return n; }")
         .expect("typed parameter should parse");
 }
+
+fn assert_duplicate_field_parse(src: &str, field: &str) {
+    let err = parse_err(src);
+    assert_eq!(
+        err.code(),
+        Some(ErrorCode::DuplicateField),
+        "expected E0208 for `{src}`, got {:?}",
+        err.code()
+    );
+    assert_eq!(
+        err.code().map(ErrorCode::as_str),
+        Some("E0208"),
+        "expected E0208 string for `{src}`"
+    );
+    let needle = format!("Duplicate field `{field}`");
+    assert!(
+        err.message().contains(&needle),
+        "expected `{needle}` in `{}`",
+        err.message()
+    );
+    assert!(
+        err.help()
+            .as_ref()
+            .is_some_and(|h| h.contains("unique")),
+        "expected unique-names help for `{src}`, got {:?}",
+        err.help()
+    );
+}
+
+#[test]
+fn duplicate_dict_field_is_parse_error() {
+    assert_duplicate_field_parse("fn main() { let x = { foo: 1, foo: 2 }; }", "foo");
+}
+
+#[test]
+fn duplicate_construct_field_is_parse_error() {
+    assert_duplicate_field_parse(
+        "enum E { Foo { x: int, y: int } } fn main() { E::Foo { x: 1, x: 2 }; }",
+        "x",
+    );
+}
+
+#[test]
+fn duplicate_match_record_pattern_field_is_parse_error() {
+    assert_duplicate_field_parse(
+        "enum P { P { x: int, y: int } } fn f(P p) -> int { return match p { P::P { x, x } => x, }; }",
+        "x",
+    );
+}
+
+#[test]
+fn duplicate_let_record_pattern_field_is_parse_error() {
+    assert_duplicate_field_parse(
+        "fn main() { let { x: a, x: b } = { x: 1, y: 2 }; }",
+        "x",
+    );
+}
+
+#[test]
+fn duplicate_enum_variant_field_decl_is_parse_error() {
+    assert_duplicate_field_parse("enum E { Foo { x: int, x: int } }", "x");
+}
+
+#[test]
+fn unique_record_fields_still_parse() {
+    Pratt::default()
+        .parse("fn main() { let x = { foo: 1, bar: 2 }; }")
+        .expect("unique dict fields should parse");
+    Pratt::default()
+        .parse("enum E { Foo { x: int, y: int } } fn main() { E::Foo { x: 1, y: 2 }; }")
+        .expect("unique construct fields should parse");
+    Pratt::default()
+        .parse("enum P { P { x: int, y: int } } fn f(P p) -> int { return match p { P::P { x, y } => x, }; }")
+        .expect("unique match record pattern should parse");
+    Pratt::default()
+        .parse("fn main() { let { x: a, y: b } = { x: 1, y: 2 }; }")
+        .expect("unique let record pattern should parse");
+}

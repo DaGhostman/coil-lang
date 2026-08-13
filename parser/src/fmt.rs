@@ -2053,6 +2053,18 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_record_fields_are_not_formatted() {
+        let err = format_source("fn main() { let x = { foo: 1, foo: 2 }; }\n")
+            .expect_err("duplicate fields must not format");
+        assert_eq!(err.code(), Some(reporting::ErrorCode::DuplicateField));
+        assert!(
+            err.message().contains("Duplicate field `foo`"),
+            "got {}",
+            err.message()
+        );
+    }
+
+    #[test]
     fn item_docs_reads_attached_lines() {
         use crate::ast::item_docs;
         let src = "/// Hello\n/// World\nfn f() { return; }\n";
