@@ -1,8 +1,10 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Absolute path to coil-stdlib `src/` (sibling clone or `.deps/` checkout).
 fn workspace_stdlib() -> PathBuf {
@@ -64,27 +66,93 @@ impl Write for SharedBuf {
     }
 }
 
+/// Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
+/// thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
+/// actually runs with. infer_inner/do_compile no longer have oversized
+/// inline match arms (see docs/internals/limitations.md), so this is
+/// headroom rather than a load-bearing requirement.
+const EXAMPLE_STACK: usize = 8 * 1024 * 1024;
+
+/// Cap concurrent 8 MiB example-runner threads. Cargo's test threads plus
+/// per-VM reactor workers used to explode OS-thread churn (`make_handler`
+/// SIGSEGV / hang, COI-88). Reuse a tiny pool instead of spawn/join per test.
+const EXAMPLE_POOL_SIZE: usize = 2;
+
+struct ExampleJob {
+    name: String,
+    work: Box<dyn FnOnce() -> String + Send>,
+    reply: Sender<std::thread::Result<String>>,
+}
+
+fn example_job_tx() -> &'static Sender<ExampleJob> {
+    static TX: OnceLock<Sender<ExampleJob>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ExampleJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..EXAMPLE_POOL_SIZE {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("pipe-ex-{i}"))
+                .stack_size(EXAMPLE_STACK)
+                .spawn(move || example_pool_worker(rx))
+                .expect("pipeline example pool worker");
+        }
+        tx
+    })
+}
+
+fn example_pool_worker(rx: Arc<Mutex<Receiver<ExampleJob>>>) {
+    loop {
+        let job = {
+            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.recv()
+        };
+        let Ok(job) = job else { break };
+        set_worker_thread_name(&job.name);
+        let result = catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let _ = job.reply.send(result);
+        set_worker_thread_name("pipe-ex");
+    }
+}
+
+/// Linux/macOS pthread name is what `gdb` / core dumps show (15 bytes).
+fn set_worker_thread_name(name: &str) {
+    let mut buf = [0u8; 16];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = libc::pthread_setname_np(libc::pthread_self(), buf.as_ptr().cast());
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::pthread_setname_np(buf.as_ptr().cast());
+    }
+}
+
+fn run_on_example_stack(name: String, work: impl FnOnce() -> String + Send + 'static) -> String {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    example_job_tx()
+        .send(ExampleJob {
+            name,
+            work: Box::new(work),
+            reply: reply_tx,
+        })
+        .expect("pipeline example pool");
+    match reply_rx.recv().expect("pipeline example pool worker") {
+        Ok(output) => output,
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
 fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    // Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
-    // thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
-    // actually runs with. infer_inner/do_compile no longer have oversized
-    // inline match arms (see docs/internals/limitations.md), so this is
-    // headroom rather than a load-bearing requirement.
-    const STACK: usize = 8 * 1024 * 1024;
     let path = path.to_string();
-    // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
-    // triage point at the offending example after a crash.
-    let thread_name = path.clone();
-    std::thread::Builder::new()
-        .name(thread_name)
-        .stack_size(STACK)
-        .spawn(move || run_example_multifile(&path))
-        .expect("pipeline example thread")
-        .join()
-        .expect("pipeline example thread join")
+    let name = path.clone();
+    run_on_example_stack(name, move || run_example_multifile(&path))
 }
 
 /// Compile and run in-memory source.
