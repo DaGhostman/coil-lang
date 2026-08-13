@@ -41,7 +41,7 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 | Caller-side predicate peel vs self-recursion | [COI-86](https://linear.app/ardax/issue/COI-86) |
 | `*Jmpt` / fused invert | [COI-87](https://linear.app/ardax/issue/COI-87) |
 | `multi_op_join_convoy` JMPF mis-sink | [COI-91](https://linear.app/ardax/issue/COI-91) |
-| Loop `LEQ` headers / float identity refusals | [COI-93](https://linear.app/ardax/issue/COI-93) |
+| Loop `LEQ` headers / float identity refusals — **decided: keep numeric contract** (`i < bound` only; no `x - 0.0` / `x * 0.0`) | [COI-93](https://linear.app/ardax/issue/COI-93) |
 | Enum escape elimination vs heap | [COI-94](https://linear.app/ardax/issue/COI-94) |
 | GC drop storing `self` / resurrection — **decided: allow-once** (see Userland footguns) | [COI-79](https://linear.app/ardax/issue/COI-79) |
 | Option/Result niche vs boxed ABI — **decided: keep matrix** ([types.md](../references/types.md#option--result-runtime-abi)) | [COI-92](https://linear.app/ardax/issue/COI-92) |
