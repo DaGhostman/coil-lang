@@ -558,6 +558,44 @@ mod tests {
         assert_eq!(stack_delta(&tail), None);
     }
 
+    /// `1 - arity`, not JumpIfMatch's `arity - 1`. Arity 0 is the discriminator
+    /// (`+1` vs `-1`); arity 1 agrees under both formulas. Corpus gate: COI-80
+    /// `tell_symbolic_il_entry_call_delta_is_not_jump_if_match_arity_minus_one`.
+    #[test]
+    fn stack_delta_call_uses_one_minus_arity_not_arity_minus_one() {
+        let call0 = IlOp::Entry {
+            kind: EntryKind::Call,
+            arity: 0,
+            target: Label(0),
+            loc: loc(),
+        };
+        assert_eq!(stack_delta(&call0), Some(1));
+        assert_ne!(
+            stack_delta(&call0),
+            Some(-1),
+            "must not use JumpIfMatch's arity-1"
+        );
+    }
+
+    /// STORE pops; it does not raise operand height to `slot + 1`. After
+    /// `CONST; STORE 5` height is 0, not 6 — that floor is `il::tell`.
+    #[test]
+    fn store_does_not_raise_operand_height() {
+        let ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop {
+                slot: 5,
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(0), Sp::Known(0));
+        assert_eq!(info.sp_before(1), Sp::Known(1));
+        assert_eq!(info.sp_before(2), Sp::Known(0));
+        assert_eq!(stack_delta(&ops[1]), Some(-1));
+    }
+
     #[test]
     fn stack_delta_jump_if_match_consumes_scrutinee() {
         let jmp = IlOp::Jump {

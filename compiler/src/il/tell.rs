@@ -672,6 +672,49 @@ mod tests {
         assert_eq!(cursors(&code), vec![Some(0), Some(1), Some(6)]);
     }
 
+    /// COI-81: after `CONST; STORE 5` with height 1, tell is 6 and sp is 0.
+    /// Same ops, different quantities — do not unify.
+    #[test]
+    fn store_floor_is_not_operand_height() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Return { loc },
+        ];
+        let tell = analyze_il_at(&ops, 0);
+        let sp = crate::il::sp::analyze(&ops);
+        assert_eq!(tell.tell_before(1).known(), Some(1));
+        assert_eq!(tell.tell_before(2).known(), Some(6));
+        assert_eq!(sp.sp_before(1), crate::il::sp::Sp::Known(1));
+        assert_eq!(sp.sp_before(2), crate::il::sp::Sp::Known(0));
+    }
+
+    /// STORE floor persists across `CALL 0` (`tell` 6 then `+1` → 7). Nested
+    /// CALL still resets operand height to 1. Using either number for the
+    /// other pass is a hang or a silent clobber.
+    #[test]
+    fn store_floor_then_call_leaves_tell_above_sp() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let tell = analyze_il_at(&ops, 0);
+        let sp = crate::il::sp::analyze(&ops);
+        assert_eq!(tell.tell_before(2).known(), Some(6));
+        assert_eq!(tell.tell_before(3).known(), Some(7));
+        assert_eq!(sp.sp_before(2), crate::il::sp::Sp::Known(0));
+        assert_eq!(sp.sp_before(3), crate::il::sp::Sp::Known(1));
+    }
+
     #[test]
     fn store_to_a_low_slot_does_not_lower_the_cursor() {
         // Height returns to 3, but the floor of 1 must not pull the cursor down.
@@ -812,6 +855,8 @@ mod tests {
 
     /// Differential form of the Call-delta bug: IL after-cursor must match
     /// bytecode CALL, and must *not* match JumpIfMatch's `arity - 1`.
+    /// Corpus: `compiler/tests/cursor_model.rs`
+    /// `tell_symbolic_il_entry_call_delta_is_not_jump_if_match_arity_minus_one`.
     #[test]
     fn entry_call_tell_after_matches_bytecode_not_signed_arity_delta() {
         for arity in [0u32, 2, 3] {
