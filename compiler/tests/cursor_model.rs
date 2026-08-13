@@ -177,6 +177,14 @@ fn compile_src_retaining_il_keeps_pre_lower_ops() {
     assert!(n > 0, "retained IL should include prologue + main");
 }
 
+/// Plain `compile_src` must not populate the cursor-IL snap (retain is opt-in).
+#[test]
+fn compile_src_without_retain_leaves_no_cursor_il() {
+    let mut pipeline = Pipeline::new();
+    pipeline.compile_src("fn main() {}").expect("compile");
+    assert!(pipeline.retained_cursor_il_len().is_none());
+}
+
 const CORPUS: &[&str] = &[
     "examples/fib.hy",
     "examples/perf/nsieve.hy",

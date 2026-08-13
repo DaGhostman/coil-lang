@@ -1727,4 +1727,64 @@ fn main() {
         let _ = machine.restore_output();
         assert_eq!(shared.into_string(), "ok");
     }
+
+    /// Default compile path must not retain IL (dissect-free gate stays opt-in).
+    #[test]
+    fn compile_src_does_not_retain_cursor_il() {
+        let mut pipeline = Pipeline::new();
+        pipeline.compile_src("fn main() {}").expect("compile");
+        assert!(pipeline.retained_cursor_il_len().is_none());
+    }
+
+    /// Failed retaining compile still clears the pipeline retain flag.
+    #[test]
+    fn compile_src_retaining_il_clears_flag_on_failure() {
+        let mut pipeline = Pipeline::new();
+        assert!(pipeline.compile_src_retaining_il("fn main() { !!! }").is_err());
+        assert!(
+            !pipeline.retain_cursor_il,
+            "retain flag must clear even when compile fails"
+        );
+        pipeline.compile_src("fn main() {}").expect("recover");
+        assert!(pipeline.retained_cursor_il_len().is_none());
+    }
+
+    /// Retained snap is enough for an end-to-end IL↔bytecode tell diff.
+    #[test]
+    fn compile_src_retaining_il_supports_diff_against_bytecode() {
+        let mut pipeline = Pipeline::new();
+        let (bytecode, pool) = pipeline
+            .compile_src_retaining_il(
+                r#"
+fn add(a: int, b: int) -> int { a + b }
+fn main() { add(1, 2); }
+"#,
+            )
+            .expect("compile");
+        let n = pipeline
+            .retained_cursor_il_len()
+            .expect("cursor IL snapshot");
+        assert!(n > 0);
+        let mut syms = pipeline.program_debug().fn_symbols.clone();
+        syms.sort_by_key(|s| s.entry_pc);
+        let ranges: Vec<(String, usize, usize)> = syms
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let end = syms
+                    .get(i + 1)
+                    .map(|n| n.entry_pc as usize)
+                    .unwrap_or(bytecode.len());
+                (s.name.clone(), s.entry_pc as usize, end)
+            })
+            .collect();
+        // Same seed on both sides — agreement is what the gate checks.
+        let mut seeds = std::collections::HashMap::new();
+        for (_, start, _) in &ranges {
+            seeds.insert(*start, 0u32);
+        }
+        let report = pipeline.diff_il_tell_against_bytecode(&bytecode, &pool, &ranges, &seeds);
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert!(report.checked > 0);
+    }
 }
