@@ -1745,6 +1745,7 @@
                 multi_op_join_convoy: false,
                 invert_guard_branch: false,
                 slot_promote_tell: false,
+                seek_back_edge: false,
             },
             3,
             &mut Vec::new(),
