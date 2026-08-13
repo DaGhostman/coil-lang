@@ -67,7 +67,7 @@ cargo test --workspace --lib --tests --bins   # required; includes */tests/* (sk
 # Feature compile-gates / tooling (match CI matrix job titles):
 #   cargo check --workspace --lib --tests --bins --no-default-features --features tls
 #   cargo test --workspace --lib --tests --bins --features dissect
-ulimit -v 65536 && cargo run -- test   # leak smoke (64MB)
+cargo build --bin coil && (ulimit -v 65536; ./target/debug/coil test)  # leak smoke (64MB)
 cargo build --release --workspace
 ./scripts/poop_baseline.sh       # soft CPU check before/after perf work
 rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default run needs no out.hyc)

@@ -122,6 +122,12 @@ jobs:
         run: |
           ./target/debug/coil test
 
+      - name: Leak smoke (`coil test` under ulimit -v)
+        if: matrix.features.id == 'default' && runner.os == 'Linux'
+        run: |
+          ulimit -v 65536
+          ./target/debug/coil test
+
       - name: Showcase project tests
         if: matrix.features.id == 'default'
         run: |
