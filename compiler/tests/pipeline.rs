@@ -1,7 +1,7 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1723,8 +1723,7 @@ fn example_strlen_prints_5_compile_src_from_file() {
         }
     };
     assert_eq!(
-        output,
-        "5",
+        output, "5",
         "strlen(\"hello\") via compile_src_from_file should print 5"
     );
 }
@@ -2086,6 +2085,33 @@ fn main() {
 "#,
     );
     assert_eq!(output, "0,01");
+}
+
+#[test]
+fn range_to_vec_collects_int_byte_float() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = (0..5).to_vec();
+    write(stdout(), to_bytes(format("%i", a.len())));
+    write(stdout(), to_bytes(","));
+    let r = 0..=3;
+    write(stdout(), to_bytes(format("%i", r.to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (10..0).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    let lo: byte = 5;
+    let hi: byte = 6;
+    write(stdout(), to_bytes(format("%i", (lo..=hi).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (1.0..4.0).to_vec().len())));
+}
+"#,
+    );
+    // 0..5 → 5; 0..=3 → 4; 10..0 → 0; byte 5..=6 → 2; float 1.0..4.0 → 3
+    assert_eq!(output, "5,4,0,2,3");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument
@@ -5907,7 +5933,10 @@ fn main() {
             .any(|b| matches!(b.bytecode(), Instruction::NEG)),
         "float aggregate negate must not emit int NEG"
     );
-    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "-1.5,-2.0");
+    assert_eq!(
+        run_bytecode(bytecode, constants, &pipeline, None),
+        "-1.5,-2.0"
+    );
 }
 
 #[test]
@@ -6460,7 +6489,10 @@ fn main() {
 }
 "#,
     );
-    assert!(err.is_err(), "enable must not resolve without tls client/server import");
+    assert!(
+        err.is_err(),
+        "enable must not resolve without tls client/server import"
+    );
 }
 
 /// Legacy `encrypt` / `decrypt` names under server must stay gone.
@@ -6734,7 +6766,12 @@ fn optional_virtual_modules_match_cargo_features() {
     fn check(src: &str, enabled: bool) {
         let mut pipeline = Pipeline::new();
         let ok = pipeline.compile_src(src).is_ok();
-        assert_eq!(ok, enabled, "src={src:?} messages={:?}", pipeline.messages());
+        assert_eq!(
+            ok,
+            enabled,
+            "src={src:?} messages={:?}",
+            pipeline.messages()
+        );
         if !enabled {
             assert!(
                 pipeline.messages().iter().any(|m| {
@@ -7227,10 +7264,7 @@ fn main() {
 }
 "#,
     );
-    assert!(
-        result.is_err(),
-        "unknown identifier must fail compile_src"
-    );
+    assert!(result.is_err(), "unknown identifier must fail compile_src");
     assert!(pipeline.had_errors());
     assert!(
         pipeline
@@ -8181,7 +8215,10 @@ fn main() {
 }
 "#,
     );
-    assert_eq!(output, "2", "push with Construct(format,…) must not drop the vec");
+    assert_eq!(
+        output, "2",
+        "push with Construct(format,…) must not drop the vec"
+    );
 }
 
 /// COI-19: heap value in a user static survives `gc::collect` (static roots).
