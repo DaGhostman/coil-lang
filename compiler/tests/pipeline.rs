@@ -4185,6 +4185,28 @@ fn main() {
     assert_eq!(output, "0");
 }
 
+/// Fused `if i == k { continue/break }` inverts to `*Jmpt` (COI-87). Sum is
+/// 0+1+2+4+5+6 = 18 (skip 3, stop before 7).
+#[test]
+fn for_continue_and_break_guards_invert_to_jmpt() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let sum = 0;
+    for (let i = 0; i < 10; i = i + 1) {
+        if i == 3 { continue; }
+        if i == 7 { break; }
+        sum = sum + i;
+    }
+    write(stdout(), to_bytes(format("%i", sum)));
+}
+"#,
+    );
+    assert_eq!(output, "18");
+}
+
 /// Tiny direct-call inlining must preserve call semantics end-to-end.
 #[test]
 fn tiny_add_inlined_prints_7() {

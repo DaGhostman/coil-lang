@@ -3569,9 +3569,8 @@
     }
 
     #[test]
-    fn refuses_guard_inversion_when_condition_fuses_with_jmpf() {
-        // `BinSlotSlot LE; JMPF` fuses into BinSlotSlotJmpf; there is no
-        // BinSlotSlotJmpt, so inverting would cost a dispatch.
+    fn inverts_guard_when_condition_fuses_with_jmpf() {
+        // `BinSlotSlot LE; JMPF; JMP` inverts to JMPT so fuse can emit BinSlotSlotJmpt.
         let loc = common::DebugLoc::unknown();
         let mut ops = vec![
             IlOp::BinSlotSlot {
@@ -3594,13 +3593,12 @@
             IlOp::Label(Label(2)),
             IlOp::Return { loc },
         ];
-        let before = ops.len();
         invert_branch_over_jump(&mut ops);
-        assert_eq!(ops.len(), before, "fusable guard must be left alone");
+        assert_eq!(ops.len(), 5, "trailing JMP should drop");
         assert!(matches!(
             ops[1],
             IlOp::Jump {
-                kind: IlJumpKind::JumpIfFalse,
+                kind: IlJumpKind::JumpIfTrue,
                 ..
             }
         ));
