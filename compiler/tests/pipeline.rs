@@ -5261,6 +5261,102 @@ fn main() {
     );
 }
 
+/// Non-first field selection must index the staged ctor args (not always arg 0).
+#[test]
+fn direct_class_second_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", new Point(5, 6).y)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "6");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("second field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "second-field temp elision must not allocate; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `try_emit_direct_class_field_access` unwraps `Group`/`Expr` receivers.
+#[test]
+fn grouped_direct_class_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", (new Point(5, 6)).x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("grouped field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "grouped new Class(args).field must still elide; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Named locals keep a heap instance (COI-84). Temp `new C(args).field` elides;
 /// `let p = new C(args); p.field` does not — identity, methods, mutation, and
 /// `fn drop()` are observable without a whole-function escape scan.
@@ -5293,12 +5389,23 @@ fn main() {
         .get(main + 1)
         .map(|symbol| symbol.entry_pc as usize)
         .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
     assert!(
-        bytecode[start..end]
+        main_code
             .iter()
             .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
         "named local must stay InitTyped; opcodes: {:?}",
-        bytecode[start..end]
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "named local field read must use GetField; opcodes: {:?}",
+        main_code
             .iter()
             .map(|b| b.bytecode().mnemonic())
             .collect::<Vec<_>>()
@@ -5324,11 +5431,36 @@ fn main() {
 
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("drop temp field");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
     assert!(
-        bytecode
+        main_code
             .iter()
             .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
-        "drop class temp must allocate so the finalizer can run"
+        "drop class temp must allocate in main so the finalizer can run; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "drop class temp must GetField the heap instance; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
     );
 }
 
