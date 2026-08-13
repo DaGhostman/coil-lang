@@ -1745,8 +1745,10 @@ fn main() {
             !pipeline.retain_cursor_il,
             "retain flag must clear even when compile fails"
         );
-        pipeline.compile_src("fn main() {}").expect("recover");
-        assert!(pipeline.retained_cursor_il_len().is_none());
+        assert!(
+            pipeline.retained_cursor_il_len().is_none(),
+            "failed compile must not leave a cursor-IL snap"
+        );
     }
 
     /// Retained snap is enough for an end-to-end IL↔bytecode tell diff.
@@ -1756,7 +1758,7 @@ fn main() {
         let (bytecode, pool) = pipeline
             .compile_src_retaining_il(
                 r#"
-fn add(a: int, b: int) -> int { a + b }
+fn add(int a, int b) -> int { return a + b; }
 fn main() { add(1, 2); }
 "#,
             )

@@ -972,9 +972,14 @@ mod tests {
             !report.mismatches.is_empty(),
             "arity divergence must fail the IL↔BC gate"
         );
+        assert!(report.saw_call);
+        // tell_before at Call is the shared seed; the diverge shows on the next PC.
         assert!(
-            report.mismatches.iter().any(|m| m.contains("Entry{Call}")),
-            "{:?}",
+            report
+                .mismatches
+                .iter()
+                .any(|m| m.contains("il=2") && m.contains("bytecode=4")),
+            "expected post-Call cursor 2 vs 4 (seed 3, arity 2 vs 0); got {:?}",
             report.mismatches
         );
     }
