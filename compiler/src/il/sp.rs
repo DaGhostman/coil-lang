@@ -574,7 +574,14 @@ mod tests {
             target: Label(0),
             loc: loc(),
         };
+        let coro0 = IlOp::Entry {
+            kind: EntryKind::MakeCoro,
+            arity: 0,
+            target: Label(0),
+            loc: loc(),
+        };
         assert_eq!(stack_delta(&call0), Some(1));
+        assert_eq!(stack_delta(&coro0), Some(1));
         assert_ne!(
             stack_delta(&call0),
             Some(-1),
@@ -739,6 +746,31 @@ mod tests {
         let info = analyze(&ops);
         assert_eq!(info.sp_before(2), Sp::Known(2));
         assert_eq!(info.sp_before(3), Sp::Known(1));
+    }
+
+    /// COI-81: `MakeCoro` shares Call's absolute height reset (not relative delta).
+    #[test]
+    fn make_coro_resets_height_to_one_like_call() {
+        let ops = vec![
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::Const { imm: 2, loc: loc() },
+            IlOp::Const { imm: 3, loc: loc() },
+            IlOp::Entry {
+                kind: EntryKind::MakeCoro,
+                arity: 0,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Return { loc: loc() },
+        ];
+        let info = analyze(&ops);
+        assert_eq!(info.sp_before(3), Sp::Known(3));
+        assert_eq!(info.sp_before(4), Sp::Known(1));
+        assert_ne!(
+            info.sp_before(4).known(),
+            Some(4),
+            "relative 1-arity would leave height 4"
+        );
     }
 
     #[test]
