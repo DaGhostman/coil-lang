@@ -5777,6 +5777,7 @@ fn main() {
         use machine::{ENV_WIRING, FS_WIRING};
 
         let mut c = Checker::new();
+        #[allow(unused_mut)] // extended only when time/crypto/regex features are on
         let mut names: Vec<&str> = FS_WIRING
             .iter()
             .chain(ENV_WIRING.iter())

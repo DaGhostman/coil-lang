@@ -1471,10 +1471,14 @@ mod tests {
         let vm = VirtualModules::new();
         #[cfg(feature = "time")]
         assert!(vm.resolves_use(&["time".into()], "*"));
+        #[cfg(not(feature = "time"))]
+        assert!(!vm.resolves_use(&["time".into()], "*"));
         assert!(vm.resolves_use(&["io".into(), "fs".into()], "*"));
         assert!(vm.resolves_use(&["env".into()], "*"));
         #[cfg(feature = "crypto")]
         assert!(vm.resolves_use(&["crypto".into()], "*"));
+        #[cfg(not(feature = "crypto"))]
+        assert!(!vm.resolves_use(&["crypto".into()], "*"));
 
         #[cfg(feature = "time")]
         assert!(matches!(
@@ -1508,6 +1512,18 @@ mod tests {
         ));
         #[cfg(feature = "regex")]
         assert!(vm.resolves_use(&["regex".into()], "*"));
+        #[cfg(not(feature = "regex"))]
+        assert!(!vm.resolves_use(&["regex".into()], "*"));
+        #[cfg(feature = "tls")]
+        assert!(vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
+        ));
+        #[cfg(not(feature = "tls"))]
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
+        ));
         #[cfg(feature = "regex")]
         assert!(matches!(
             vm.resolve_item(&["regex".into()], "compile"),
