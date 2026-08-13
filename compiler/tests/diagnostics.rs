@@ -2647,3 +2647,48 @@ fn main() {}
         "expected InvalidDrop for duplicate drop"
     );
 }
+
+#[test]
+fn drop_rejects_trait_method() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+trait Closer {
+    fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for trait drop"
+    );
+}
+
+#[test]
+fn drop_rejects_non_unit_return() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() -> int { return 0; }
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for non-unit drop return"
+    );
+}

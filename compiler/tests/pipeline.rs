@@ -5340,6 +5340,49 @@ fn main() {
 }
 
 #[test]
+fn gc_finalizer_can_upgrade_weak_then_clears() {
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let during: int = 0;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        let live = match held {
+            Option::Some(w) => match upgrade(w) {
+                Option::Some(_) => 1,
+                Option::None => 2,
+            },
+            Option::None => 3,
+        };
+        during = live;
+    }
+}
+fn ephemeral() {
+    let h = new Handle(1);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(_) => 1,
+            Option::None => 0,
+        },
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i", during, after)));
+}
+"#,
+    );
+    assert_eq!(output, "10");
+}
+
+#[test]
 fn gc_heap_bytes_is_nonnegative() {
     let output = run_example_src(
         r#"
