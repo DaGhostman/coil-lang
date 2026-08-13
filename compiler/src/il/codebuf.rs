@@ -412,6 +412,31 @@ impl CodeBuf {
         self.il.splice_code_at(code_pos, other.il);
     }
 
+    /// Move IL ops `[raw_start..]` to logical code index `code_pos` without
+    /// remapping labels (same buffer namespace).
+    pub fn move_raw_suffix_to_code_pos(&mut self, raw_start: usize, code_pos: usize) {
+        self.invalidate_lowered();
+        let suffix: Vec<IlOp> = self.il.ops_mut().drain(raw_start..).collect();
+        if suffix.is_empty() {
+            return;
+        }
+        let mut emitting = 0usize;
+        let mut raw_idx = self.il.raw_len();
+        for (i, op) in self.il.ops().iter().enumerate() {
+            if emitting == code_pos {
+                raw_idx = i;
+                break;
+            }
+            if op.emits_code() {
+                emitting += 1;
+            }
+        }
+        if emitting < code_pos {
+            raw_idx = self.il.raw_len();
+        }
+        self.il.ops_mut().splice(raw_idx..raw_idx, suffix);
+    }
+
     pub fn insert_jump_at(&mut self, code_pos: usize, target: Label) {
         let mut emitting = 0usize;
         let mut raw_idx = self.il.raw_len();
