@@ -874,6 +874,166 @@ mod tests {
         assert!(report.known > 0);
     }
 
+    /// Leading/trailing labels around a fn body must stay in the IL slice so
+    /// intra-body jumps still resolve when diffing a single function range.
+    #[test]
+    fn il_fn_raw_range_includes_surrounding_labels() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Label(Label(9)),
+            IlOp::Const { imm: 1, loc },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(1),
+                loc,
+            },
+            IlOp::Label(Label(1)),
+            IlOp::Return { loc },
+            IlOp::Label(Label(8)),
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        let (start, end) = il_fn_raw_range(&ops, &lowered.pre_to_post, 0, lowered.bytecode.len())
+            .expect("range");
+        assert_eq!(start, 0, "leading Label must be included");
+        assert_eq!(end, ops.len(), "trailing Label must be included");
+        assert!(matches!(ops[start], IlOp::Label(_)));
+        assert!(matches!(ops[end - 1], IlOp::Label(_)));
+    }
+
+    /// Fused windows share one post-PC; only the window head is compared.
+    /// Dropping that skip would diff Return's post-Const cursor against the
+    /// fused ConstReturnImm *entry* cursor and false-fail the gate.
+    #[test]
+    fn diff_il_skips_fused_window_tails_sharing_post_pc() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 7, loc },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        assert_eq!(lowered.bytecode.len(), 1, "Const;Return must fuse");
+        assert_eq!(
+            lowered.pre_to_post.get(&0),
+            lowered.pre_to_post.get(&1),
+            "both pre indices must map to the fused PC"
+        );
+        let ranges = vec![("f".to_string(), 0, lowered.bytecode.len())];
+        let mut seeds = std::collections::HashMap::new();
+        seeds.insert(0, 0);
+        let report = diff_il_against_bytecode(
+            &ops,
+            &lowered.pre_to_post,
+            &lowered.bytecode,
+            &pool,
+            &ranges,
+            &seeds,
+        );
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert_eq!(report.checked, 1, "only the fused window head is checked");
+        assert_eq!(report.known, 1);
+    }
+
+    /// Fail-closed: IL Known that disagrees with bytecode Known is recorded.
+    #[test]
+    fn diff_il_records_known_mismatch_when_call_arity_diverges() {
+        let loc = common::DebugLoc::unknown();
+        let mut ops = vec![
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        // Same layout / map, but IL effect now uses arity 2 (`1-2`) while BC is arity 0 (`+1`).
+        ops[0] = IlOp::Entry {
+            kind: EntryKind::Call,
+            arity: 2,
+            target: Label(0),
+            loc,
+        };
+        let ranges = vec![("f".to_string(), 0, lowered.bytecode.len())];
+        let mut seeds = std::collections::HashMap::new();
+        seeds.insert(0, 3);
+        let report = diff_il_against_bytecode(
+            &ops,
+            &lowered.pre_to_post,
+            &lowered.bytecode,
+            &pool,
+            &ranges,
+            &seeds,
+        );
+        assert!(
+            !report.mismatches.is_empty(),
+            "arity divergence must fail the IL↔BC gate"
+        );
+        assert!(
+            report.mismatches.iter().any(|m| m.contains("Entry{Call}")),
+            "{:?}",
+            report.mismatches
+        );
+    }
+
+    /// Missing entry seeds skip the function rather than panicking or vacuous-checking.
+    #[test]
+    fn diff_il_skips_ranges_without_entry_seeds() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        let ranges = vec![("f".to_string(), 0, lowered.bytecode.len())];
+        let seeds = std::collections::HashMap::new();
+        let report = diff_il_against_bytecode(
+            &ops,
+            &lowered.pre_to_post,
+            &lowered.bytecode,
+            &pool,
+            &ranges,
+            &seeds,
+        );
+        assert_eq!(report.checked, 0);
+        assert!(report.mismatches.is_empty());
+    }
+
+    /// Bytecode JumpIfMatch taken edge is Unknown; IL may still be Known — not a mismatch.
+    #[test]
+    fn diff_il_allows_il_known_where_bytecode_taken_edge_is_unknown() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Jump {
+                kind: IlJumpKind::JumpIfMatch { tag: 0, arity: 2 },
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+            IlOp::Label(Label(0)),
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        let ranges = vec![("f".to_string(), 0, lowered.bytecode.len())];
+        let mut seeds = std::collections::HashMap::new();
+        seeds.insert(0, 3);
+        let report = diff_il_against_bytecode(
+            &ops,
+            &lowered.pre_to_post,
+            &lowered.bytecode,
+            &pool,
+            &ranges,
+            &seeds,
+        );
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert!(report.known > 0, "IL Known on fall-through / taken must still count");
+    }
+
     /// `MakeCoro` shares `call_arity_delta` with `Call` — keep them locked together.
     #[test]
     fn symbolic_il_make_coro_matches_call_delta() {
