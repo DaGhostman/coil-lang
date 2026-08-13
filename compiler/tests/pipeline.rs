@@ -5116,6 +5116,63 @@ fn main() {
 }
 
 #[test]
+fn nested_match_keeps_outer_option_field_bindings() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+class BoxInt {
+    opt: Option<int>,
+}
+
+class Node {
+    val: int,
+    left: Option<Node>,
+}
+
+fn nested_boxed(BoxInt b) -> int {
+    return match b.opt {
+        Option::Some(v) => match b.opt {
+            Option::Some(v2) => v + v2,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn nested_shadow(BoxInt b) -> int {
+    return match b.opt {
+        Option::Some(v) => match Option::Some(100) {
+            Option::Some(v) => v,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn nested_niche(Node n) -> int {
+    return match n.left {
+        Option::Some(child) => match n.left {
+            Option::Some(child2) => child.val + child2.val,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn main() {
+    let b = new BoxInt(Option::Some(21));
+    let leaf = new Node(3, Option::None);
+    let root = new Node(1, Option::Some(leaf));
+    write(stdout(), to_bytes(format("%i,%i,%i", nested_boxed(b), nested_shadow(b), nested_niche(root))));
+}
+"#,
+    );
+    assert_eq!(output, "42,100,6");
+}
+
+#[test]
 fn direct_result_pair_match_and_try() {
     let output = run_example_src(
         r#"
