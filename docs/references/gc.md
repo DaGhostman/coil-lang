@@ -24,6 +24,7 @@
 - **`heap_bytes`** reports VM-managed heap accounting only — not process RSS (native libs, stacks, Rust allocators sit outside it).
 - **`collect`** roots the operand stack and suspended coroutines the same way automatic GC does.
 - **Class `fn drop()`** runs after mark on unmarked instances with a registered finalizer, then a re-mark from VM roots, then weaks are cleared and sweep runs. Drop runs at most once (including explicit `obj.drop()`). Nested `collect` during drop is deferred. A panic in drop aborts that finalizer and continues the queue. After `main` returns, remaining finalizers run before the IO reactor shuts down (and again from `Machine` drop if anything is still pending).
+- **Resurrection is defined, not an API ([COI-79](https://linear.app/ardax/issue/COI-79)).** Storing `self` (or a field that aliases it) into a static, a still-reachable object, or a `Root` during `fn drop()` keeps the instance alive after the sweep — the post-drop re-mark sees that store. Drop still will not run again: the instance’s `finalized` bit stays set. Prefer `root` / `Weak` when you need an intentional lifetime pin; do not rely on drop-time stores.
 
 Typical FFI pattern: `root` a Coil buffer/callback before handing its address to C; hold `Weak` entries in Coil-side registries so maps do not extend lifetimes. Use `fn drop()` to close the native handle when the wrapper becomes unreachable.
 
