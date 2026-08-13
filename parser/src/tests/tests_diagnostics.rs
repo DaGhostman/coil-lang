@@ -169,6 +169,23 @@ fn case_scrutinee_is_parse_error() {
     assert_eq!(err.code().map(ErrorCode::as_str), Some("E0001"));
 }
 
+/// COI-74: wildcard / single-arm / statement `case` shapes are E0001, not match diagnostics.
+#[test]
+fn case_synonym_shapes_are_e0001() {
+    for src in [
+        "case x { _ => 0 }",
+        "case x { Option::None => 0 }",
+        "fn main() { case x { Option::None => 0 }; }",
+    ] {
+        let err = parse_err(src);
+        assert_eq!(
+            err.code(),
+            Some(ErrorCode::ParseError),
+            "expected E0001 for {src}"
+        );
+    }
+}
+
 #[test]
 fn typed_fn_param_still_parses() {
     Pratt::default()

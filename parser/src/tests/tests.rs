@@ -1800,6 +1800,47 @@
         }
     }
 
+    /// COI-74: wildcard / single-arm / statement shapes must also fail, not become `Match`.
+    #[test]
+    fn case_wildcard_and_stmt_shapes_are_parse_errors_not_match() {
+        for src in [
+            "case x { _ => 0 }",
+            "case x { Option::None => 0 }",
+            "fn main() { case x { Option::None => 0 }; }",
+        ] {
+            match Pratt::default().parse(src) {
+                Ok((_, expr)) => match expr.as_ref() {
+                    Expression::Match { .. } => {
+                        panic!("{src} must not parse as Match")
+                    }
+                    other => panic!(
+                        "{src} must be a parse error, not silently accepted, got {:?}",
+                        other
+                    ),
+                },
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// COI-74 / keywords.md: `case` is not reserved; users may name bindings with it.
+    #[test]
+    fn case_is_not_a_keyword_and_can_name_a_user_function() {
+        let src = "fn case(int x) -> int { return x; } fn main() { let y = case(1); }";
+        let result = Pratt::default().parse(src);
+        assert!(
+            result.is_ok(),
+            "expected user fn named case to parse, got {:?}",
+            result.err()
+        );
+        let ast = result.unwrap();
+        let src_str = format!("{}", ast.1);
+        assert!(
+            src_str.contains("case"),
+            "display should retain case name: {src_str}"
+        );
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";
