@@ -102,17 +102,17 @@ roots = ["./src", "./vendor", "../coil-stdlib/src"]
 # called `dload`).
 #
 # --------------------------------------------------------------------------
-# Reserved keys
+# Accepted keys
 # --------------------------------------------------------------------------
 #
-# The parser accepts these top-level keys under each section; any
-# other key is a parse error. Future versions may add:
+# Unknown sections and keys are parse errors. Accepted today
+# (see docs/references/project-config.md):
 #
 #   [module]
-#   preludes = ["./stdlib/src"]  # auto-imported in every file
-#   strict   = true          # reject undefined names at typecheck
+#   roots                    # search directories for `use` resolution
 #
-# Accepted today (see docs/references/project-config.md):
+#   [entry]
+#   file                     # optional entry-point path
 #
 #   [env]
 #   allow_exec = true        # opt-in: enable env::exec at runtime (default is false)
@@ -123,4 +123,5 @@ roots = ["./src", "./vendor", "../coil-stdlib/src"]
 #   [dependencies]
 #   name = { git = "…", version = "…" } | { path = "…" }
 #
-# Other keys under those sections are still parse errors until documented.
+# Compiler builtins (prelude, ffi, …) are virtual modules and are
+# not configured here. Extra disk search paths belong in `roots`.

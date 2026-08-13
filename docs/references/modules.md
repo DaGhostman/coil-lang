@@ -85,7 +85,7 @@ trait Eq<T> { /* your trait */ }   // now allowed
 
 Without the `as` rebind, `trait Eq` / `enum Option` is a conflict diagnostic.
 
-`coil.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops` + `prelude::test`.
+The implicit prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) is compiler-owned and not configurable via `coil.toml`. Extra disk search paths belong in `[module].roots`.
 
 ---
 
