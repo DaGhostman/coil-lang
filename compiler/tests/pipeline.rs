@@ -6048,6 +6048,7 @@ fn example_casts_primitive_as_operators() {
     assert_eq!(run_example("examples/casts.hy"), "13true");
 }
 
+#[cfg(feature = "time")]
 #[test]
 fn example_time_epoch_ok() {
     assert_eq!(run_example("examples/time_demo.hy"), "1");
@@ -6064,6 +6065,7 @@ fn example_ansi_color_prints_red() {
 }
 
 /// HostInvoke + virtual `crypto` wiring: empty SHA-256 digest length is 32.
+#[cfg(feature = "crypto")]
 #[test]
 fn crypto_sha256_empty_digest_len_via_host_invoke() {
     let output = run_example_src(
@@ -6686,6 +6688,7 @@ fn example_io_tls_prints_tls_ok() {
     assert_eq!(run_example("examples/io_tls.hy"), "tls-ok");
 }
 
+#[cfg(feature = "regex")]
 #[test]
 fn example_regex_demo_prints_expected() {
     assert_eq!(
@@ -6694,6 +6697,7 @@ fn example_regex_demo_prints_expected() {
     );
 }
 
+#[cfg(feature = "regex")]
 #[test]
 fn regex_compile_error_is_err_via_host_invoke() {
     let output = run_example_src(
@@ -6720,6 +6724,41 @@ fn main() {
 "#,
     );
     assert_eq!(output, "1");
+}
+
+/// Feature-off `use` of optional virtual modules is a compile error (E0900 /
+/// "Module not found"), not a hang. Stays ungated so `--no-default-features`
+/// still exercises it.
+#[test]
+fn optional_virtual_modules_match_cargo_features() {
+    fn check(src: &str, enabled: bool) {
+        let mut pipeline = Pipeline::new();
+        let ok = pipeline.compile_src(src).is_ok();
+        assert_eq!(ok, enabled, "src={src:?} messages={:?}", pipeline.messages());
+        if !enabled {
+            assert!(
+                pipeline.messages().iter().any(|m| {
+                    m.code() == Some(compiler::ErrorCode::IoError)
+                        || m.message().contains("Module not found")
+                }),
+                "feature-off use must surface Module not found / E0900, got {:?}",
+                pipeline.messages()
+            );
+        }
+    }
+    check("use time::{epoch};\nfn main() {}\n", cfg!(feature = "time"));
+    check(
+        "use crypto::{sha256};\nfn main() {}\n",
+        cfg!(feature = "crypto"),
+    );
+    check(
+        "use regex::{compile};\nfn main() {}\n",
+        cfg!(feature = "regex"),
+    );
+    check(
+        "use io::net::tls::client::{enable};\nfn main() {}\n",
+        cfg!(feature = "tls"),
+    );
 }
 
 /// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.

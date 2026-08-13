@@ -20,7 +20,7 @@ reporting = { path = "../reporting" }
 rkyv = "0.8.12"
 
 [dev-dependencies]
-machine = { path = "../machine", default-features = false, features = ["vm_profile", "crypto", "time", "regex", "tls"] }
+machine = { path = "../machine", default-features = false, features = ["vm_profile"] }
 proptest = "1"
 libc = "0.2"
 rcgen = "0.13"

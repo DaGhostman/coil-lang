@@ -1471,10 +1471,14 @@ mod tests {
         let vm = VirtualModules::new();
         #[cfg(feature = "time")]
         assert!(vm.resolves_use(&["time".into()], "*"));
+        #[cfg(not(feature = "time"))]
+        assert!(!vm.resolves_use(&["time".into()], "*"));
         assert!(vm.resolves_use(&["io".into(), "fs".into()], "*"));
         assert!(vm.resolves_use(&["env".into()], "*"));
         #[cfg(feature = "crypto")]
         assert!(vm.resolves_use(&["crypto".into()], "*"));
+        #[cfg(not(feature = "crypto"))]
+        assert!(!vm.resolves_use(&["crypto".into()], "*"));
 
         #[cfg(feature = "time")]
         assert!(matches!(
@@ -1484,6 +1488,8 @@ mod tests {
                 registry: "time_epoch"
             })
         ));
+        #[cfg(not(feature = "time"))]
+        assert!(vm.resolve_item(&["time".into()], "epoch").is_none());
         assert!(matches!(
             vm.resolve_item(&["io".into(), "fs".into()], "exists"),
             Some(BuiltinExport::HostFn {
@@ -1506,8 +1512,22 @@ mod tests {
                 registry: "crypto_sha256"
             })
         ));
+        #[cfg(not(feature = "crypto"))]
+        assert!(vm.resolve_item(&["crypto".into()], "sha256").is_none());
         #[cfg(feature = "regex")]
         assert!(vm.resolves_use(&["regex".into()], "*"));
+        #[cfg(not(feature = "regex"))]
+        assert!(!vm.resolves_use(&["regex".into()], "*"));
+        #[cfg(feature = "tls")]
+        assert!(vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
+        ));
+        #[cfg(not(feature = "tls"))]
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
+        ));
         #[cfg(feature = "regex")]
         assert!(matches!(
             vm.resolve_item(&["regex".into()], "compile"),
@@ -1516,6 +1536,16 @@ mod tests {
                 registry: "regex_compile"
             })
         ));
+        #[cfg(not(feature = "regex"))]
+        assert!(vm.resolve_item(&["regex".into()], "compile").is_none());
+        #[cfg(not(feature = "tls"))]
+        assert!(
+            vm.resolve_item(
+                &["io".into(), "net".into(), "tls".into(), "client".into()],
+                "enable"
+            )
+            .is_none()
+        );
         assert!(vm.resolves_use(&["gc".into()], "*"));
         assert!(matches!(
             vm.resolve_item(&["gc".into()], "root"),
