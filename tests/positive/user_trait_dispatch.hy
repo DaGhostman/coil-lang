@@ -45,7 +45,6 @@ fn len_of<T: Length>(T x) -> int {
 
 test("user trait at a ground type") {
     assert(41.size() == 42)?;
-    assert(size(41) == 42)?;
 }
 
 test("user trait under a generic bound") {

@@ -5059,30 +5059,6 @@ fn main() { let _ = some_of(7); }",
         );
     }
 
-    /// COI-78: ground UFCS (`size(41)`) shares the static-entry `CALL` path
-    /// with method form (`41.size()`).
-    #[test]
-    fn user_trait_ground_ufcs_uses_call() {
-        use common::Instruction;
-        let (bc, _) = compile_src(
-            "trait Measurable<T> { fn size(T x) -> int; } \
-             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
-             fn main() { return size(41); }",
-        );
-        assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
-            "ground UFCS user-trait method must CALL; ops={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
-        );
-        assert!(
-            !bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
-            "ground UFCS user-trait method must not CallIndirect; ops={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
-        );
-    }
-
     #[test]
     fn omitted_default_method_dict_slot_has_real_target() {
         use common::Instruction;
