@@ -109,6 +109,9 @@ uses `tell` as the whole safety proof — a `STORE t` reached with the cursor at
 take argument-materialization temps out of the frame (`tak`: 4 LOAD words / 9
 slots / 3 STOREs → 3 LOAD words / 6 slots / 0 STOREs). Joins are free: `tell`
 poisons a point whose predecessors disagree, so `Known` is agreement.
+Operand height (`il::sp`) is a different quantity — `STORE` floors tell without
+raising height — and stays split (COI-81); see
+[limitations](limitations.md#il-optimizations-low).
 
 What neither slice does yet (see
 [limitations](limitations.md#il-optimizations-low) for the full refusal table):

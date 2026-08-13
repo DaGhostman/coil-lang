@@ -4,7 +4,9 @@
 //! and the operand stack share one buffer, and `STORE` raises the cursor to
 //! `slot + 1` regardless of height. Passes that delete a store change the cursor
 //! and can therefore move a callee frame over slots that are still live — see
-//! `docs/internals/limitations.md`.
+//! `docs/internals/limitations.md`. COI-81 keeps this split: unifying would
+//! make `sp` lie about height (break fuse/canon) or make `tell` ignore STORE
+//! floors (break slot_promote / dead_store).
 //!
 //! Both halves are under the differential gate in `compiler/tests/cursor_model.rs`:
 //! `tell_cursor_model_matches_vm` diffs bytecode predictions against

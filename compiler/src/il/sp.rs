@@ -1,7 +1,12 @@
-//! Stack-height (SP) analysis over IL ops.
+//! Operand-height (SP) analysis over IL ops.
 //!
-//! Used by return-join convoys to refuse sinks when predecessor heights disagree
-//! or any op in the region has an unknown stack effect.
+//! This is **not** the shared buffer cursor: [`super::tell`] tracks `tell`,
+//! which `STORE` floors to `slot + 1` even when height is lower. `sp` only
+//! counts eval-stack values. Nested `CALL`/`MakeCoro` reset height to 1
+//! (return value only), not `before + (1 - arity)`.
+//!
+//! Used by return-join convoys, fuse/canon, and mem_fwd. Do not substitute
+//! tell here — a STORE floor is not height (COI-81).
 
 use common::Instruction;
 
