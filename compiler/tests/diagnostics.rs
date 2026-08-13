@@ -2543,3 +2543,107 @@ fn main() {
         msgs
     );
 }
+
+#[test]
+fn drop_method_typechecks() {
+    let (_ty, msgs) = check(
+        r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    let h = new Handle(1);
+    h.drop();
+}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "inherent drop should typecheck; got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn drop_rejects_free_function() {
+    let ast = parser::Pratt::default().parse("fn drop() {}").unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for free fn drop"
+    );
+}
+
+#[test]
+fn drop_rejects_static_and_arity() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    static fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for static drop"
+    );
+}
+
+#[test]
+fn drop_rejects_extra_arity() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop(int x) {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for extra drop parameters"
+    );
+}
+
+#[test]
+fn drop_rejects_duplicate() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+    fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for duplicate drop"
+    );
+}
