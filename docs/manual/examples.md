@@ -1950,6 +1950,17 @@ Native threads via `use thread::{spawn, join, …};` — each worker runs on its
 
 ---
 
+### `examples/finalizer.hy`
+
+**Demonstrates:** GC-time `fn drop()` on a class (fake handle close).
+
+| | |
+|---|---|
+| **Run** | `cargo run --bin coil -- examples/finalizer.hy` |
+| **Output** | `closed` |
+
+---
+
 ### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
@@ -2114,6 +2125,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
 | `gc_root_weak.hy` | GC | `pinned\npinned` |
 | `gc_collect.hy` | GC | `none` |
+| `finalizer.hy` | GC | `closed` |
 | `aliases.hy` | Types | `347` |
 | `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |

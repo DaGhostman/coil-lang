@@ -376,6 +376,8 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
+An inherent `fn drop()` is a GC-time finalizer (not RAII). The receiver is implicit `self` by value (same as other instance methods); it must return `unit` and appear at most once per class. Explicit `obj.drop()` is allowed and counts toward the once-limit. See [`gc`](gc.md).
+
 Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::{send, recv};` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
 
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
