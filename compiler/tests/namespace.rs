@@ -251,6 +251,73 @@ fn import_synonym_shapes_fail_with_parse_error() {
     }
 }
 
+/// COI-74: `case` is a non-goal, not a synonym of `match`.
+#[test]
+fn case_keyword_is_not_a_match_synonym() {
+    let mut pipeline = Pipeline::new();
+    let src = "fn main() { case x { Option::None => 0, Option::Some(v) => v }; }\n";
+    assert!(
+        pipeline.compile_src(src).is_err(),
+        "case x {{ … }} must not compile as match"
+    );
+    assert!(
+        pipeline
+            .messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::ParseError)),
+        "expected a parse error, not a match diagnostic, got: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// COI-74: wildcard / single-arm / nested `case` shapes also fail at compile with E0001.
+#[test]
+fn case_synonym_shapes_fail_with_parse_error() {
+    for src in [
+        "fn main() { case x { _ => 0 }; }\n",
+        "fn main() { case x { Option::None => 0 }; }\n",
+        "fn main() { match 1 { _ => case y { _ => 0 } }; }\n",
+    ] {
+        let mut pipeline = Pipeline::new();
+        assert!(
+            pipeline.compile_src(src).is_err(),
+            "{src:?} must not compile as match"
+        );
+        assert!(
+            pipeline
+                .messages()
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ParseError)),
+            "expected E0001 for {src:?}, got: {:?}",
+            pipeline
+                .messages()
+                .iter()
+                .map(|m| m.message().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// COI-74: `case` remains usable as a binding through the full compile pipeline.
+#[test]
+fn case_identifier_compiles_as_match_binding() {
+    let mut pipeline = Pipeline::new();
+    let src = "fn main() { let case = 1; let _ = match case { case => case }; }\n";
+    assert!(
+        pipeline.compile_src(src).is_ok(),
+        "case as identifier/match binding must compile, got: {:?}",
+        pipeline
+            .messages()
+            .iter()
+            .map(|m| m.message().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn use_single_segment_resolves_in_src_root() {
     let manifest = manifest_src_and_stdlib();

@@ -564,7 +564,7 @@ match p {
 }
 ```
 
-`match` copies the scrutinee (fields included). Nested `match` on the same value is allowed; outer pattern bindings stay in scope unless an inner pattern shadows them. See [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee).
+`match` copies the scrutinee (fields included). Nested `match` on the same value is allowed; outer pattern bindings stay in scope unless an inner pattern shadows them. See [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee). Pattern matching is spelled `match` only; `case` is not an alias ([limitations.md](../internals/limitations.md) COI-74).
 
 ---
 
@@ -626,15 +626,7 @@ With `coil.toml`, the pipeline discovers dependencies via `use` / `mod` and comp
 
 ---
 
-## Not yet in the grammar
-
-These appear in planning docs but are **not** parsed from source today:
-
-| Feature | Status |
-|---------|--------|
-| `case` as alias for `match` | Not registered |
-
-### Ranges (lazy)
+## Ranges (lazy)
 
 Half-open `start..end` and closed `start..=end` produce
 **`Range<T: Ord>`** / **`RangeInclusive<T: Ord>`** (both bounds unify).
