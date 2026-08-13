@@ -223,6 +223,34 @@ fn import_keyword_is_not_a_use_synonym() {
     );
 }
 
+/// COI-73: alias / brace / glob `import` shapes also fail at compile with E0001.
+#[test]
+fn import_synonym_shapes_fail_with_parse_error() {
+    for src in [
+        "import foo::bar as x;\nfn main() {}\n",
+        "import foo::{bar};\nfn main() {}\n",
+        "import foo::*;\nfn main() {}\n",
+    ] {
+        let mut pipeline = Pipeline::new();
+        assert!(
+            pipeline.compile_src(src).is_err(),
+            "{src:?} must not compile as use"
+        );
+        assert!(
+            pipeline
+                .messages()
+                .iter()
+                .any(|m| m.code() == Some(ErrorCode::ParseError)),
+            "expected E0001 for {src:?}, got: {:?}",
+            pipeline
+                .messages()
+                .iter()
+                .map(|m| m.message().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 #[test]
 fn use_single_segment_resolves_in_src_root() {
     let manifest = manifest_src_and_stdlib();
