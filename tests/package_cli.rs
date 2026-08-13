@@ -128,7 +128,9 @@ fn run_with_timeout_returns_fast_process_output() {
 #[test]
 #[should_panic(expected = "packaged app hung")]
 fn run_with_timeout_kills_hung_process() {
-    let _ = run_command_with_timeout(Command::new("sleep").arg("30"), 1);
+    let mut cmd = Command::new("sleep");
+    cmd.arg("30");
+    let _ = run_command_with_timeout(cmd, 1);
 }
 
 #[test]
