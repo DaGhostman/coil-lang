@@ -6217,3 +6217,150 @@ fn main() {
         );
     }
 
+    #[test]
+    fn ground_option_string_none_uses_pointer_niche() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<string> = Option::None;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "ground Option<string> None must not box; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn option_int_none_stays_boxed() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<int> = Option::None;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "Option<int> None must stay boxed; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unary_option_int_return_uses_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Option<int> {
+    return Option::None;
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "unary Option<int> return must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn niche_option_string_return_skips_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Option<string> {
+    return Option::None;
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "pointer-niche Option return stays off ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_option_boundary_inserts_niche_to_heap() {
+        let (bc, _) = compile_src(
+            r#"
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let x: Option<string> = Option::Some("ok");
+    let _ = id(x);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::OptionNicheToHeap)),
+            "generic Option<T> boundary must box a niche value; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vec_pop_heap_item_emits_host_invoke_niche() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from(["a"]);
+    let _ = v.pop();
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_pop", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::pop of string must emit HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vec_pop_int_stays_host_invoke() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from([1]);
+    let _ = v.pop();
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_pop", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::pop of int must not use HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "Vec::pop of int should still HostInvoke; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
