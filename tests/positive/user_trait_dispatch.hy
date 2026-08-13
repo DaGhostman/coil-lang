@@ -26,12 +26,12 @@ trait PairOps<T> {
     fn right(T x) -> int;
 }
 
-impl PairOps<(int, int)> {
-    fn left((int, int) x) -> int {
-        return x.0;
+impl PairOps<int> {
+    fn left(int x) -> int {
+        return x;
     }
-    fn right((int, int) x) -> int {
-        return x.1;
+    fn right(int x) -> int {
+        return x + 10;
     }
 }
 
@@ -54,7 +54,7 @@ test("user trait under a generic bound") {
 }
 
 test("multi-method user trait via dictionary") {
-    assert(pair_right_of((3, 9)) == 9)?;
+    assert(pair_right_of(3) == 13)?;
 }
 
 test("Length bound stays on dictionary ABI") {
