@@ -6,10 +6,11 @@
 //! and can therefore move a callee frame over slots that are still live — see
 //! `docs/internals/limitations.md`.
 //!
-//! The bytecode path is checked against the VM directly, while the symbolic-IL
-//! path feeds cursor-safe pre-lower optimizations. `tell_cursor_model_matches_vm`
-//! in `compiler/tests/cursor_model.rs` diffs every bytecode prediction against
-//! the real cursor recorded by `machine::cursor_trace`.
+//! Both halves are under the differential gate in `compiler/tests/cursor_model.rs`:
+//! `tell_cursor_model_matches_vm` diffs bytecode predictions against
+//! `machine::cursor_trace`, and `tell_symbolic_il_matches_bytecode` diffs
+//! post-opt IL tell against bytecode tell via lower's `pre_to_post` map. The
+//! symbolic-IL path still feeds cursor-safe pre-lower optimizations.
 //!
 //! **The cursor is not a per-PC constant.** A loop whose body stores to a higher
 //! slot each pass reaches its header with a different cursor on the back edge
@@ -21,9 +22,21 @@
 //! along a path even where the absolute value is unknown. This module supplies
 //! the validated per-op rules that such a relative analysis needs.
 
+use std::collections::HashMap;
+
 use common::{Byte, Instruction};
 
 use super::op::{EntryKind, IlJumpKind, IlOp};
+
+/// Post-opt, pre-fuse IL plus lower's emitting-index → PC map.
+///
+/// Retained by [`crate::Pipeline::compile_src_retaining_il`] so
+/// `compiler/tests/cursor_model.rs` can diff symbolic-IL tell against bytecode
+/// without the `dissect` feature.
+pub(crate) struct CursorIlSnap {
+    pub ops: Vec<IlOp>,
+    pub pre_to_post: HashMap<usize, usize>,
+}
 
 /// Frame-relative cursor before an instruction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -426,6 +439,211 @@ pub fn analyze_il_at(ops: &[IlOp], entry_tell: u32) -> TellInfo {
     )
 }
 
+/// Result of diffing symbolic-IL tell against bytecode tell.
+#[derive(Clone, Debug, Default)]
+pub struct IlTellDiff {
+    pub checked: usize,
+    pub known: usize,
+    pub mismatches: Vec<String>,
+    pub saw_call: bool,
+    pub saw_store: bool,
+}
+
+fn il_op_tag(op: &IlOp) -> &'static str {
+    match op {
+        IlOp::Entry {
+            kind: EntryKind::Call,
+            ..
+        } => "Entry{Call}",
+        IlOp::Entry {
+            kind: EntryKind::MakeCoro,
+            ..
+        } => "Entry{MakeCoro}",
+        IlOp::Entry {
+            kind: EntryKind::TailCall,
+            ..
+        } => "Entry{TailCall}",
+        IlOp::StorePop { .. } => "StorePop",
+        IlOp::Load { .. } => "Load",
+        IlOp::Const { .. } | IlOp::ConstPool { .. } => "Const",
+        IlOp::Jump { .. } => "Jump",
+        IlOp::Return { .. } => "Return",
+        IlOp::Byte { .. } => "Byte",
+        _ => "op",
+    }
+}
+
+/// Inclusive-exclusive raw-op range of one function in post-opt IL.
+///
+/// Leading/trailing labels around the emitting ops that lower into
+/// `[bc_start, bc_end)` are included so intra-body jumps still resolve.
+fn il_fn_raw_range(
+    ops: &[IlOp],
+    pre_to_post: &HashMap<usize, usize>,
+    bc_start: usize,
+    bc_end: usize,
+) -> Option<(usize, usize)> {
+    let mut emitting = 0usize;
+    let mut first_raw = None;
+    let mut last_raw = None;
+    for (raw, op) in ops.iter().enumerate() {
+        if !op.emits_code() {
+            continue;
+        }
+        if let Some(&pc) = pre_to_post.get(&emitting)
+            && pc >= bc_start
+            && pc < bc_end
+        {
+            if first_raw.is_none() {
+                let mut s = raw;
+                while s > 0 && !ops[s - 1].emits_code() {
+                    s -= 1;
+                }
+                first_raw = Some(s);
+            }
+            last_raw = Some(raw);
+        }
+        emitting += 1;
+    }
+    let start = first_raw?;
+    let mut end = last_raw? + 1;
+    while end < ops.len() && !ops[end].emits_code() {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Diff post-opt IL tell against bytecode tell using lower's `pre_to_post` map.
+///
+/// Fail-closed: wherever IL says [`Tell::Known`], bytecode at the corresponding
+/// PC must be that same value. IL [`Tell::Unknown`] is allowed. Bytecode
+/// `Unknown` (loop-header joins, `JumpIfMatch` taken edge) is skipped — IL may
+/// be more precise there. Fused intermediate ops share a post-PC with the
+/// window head and are not compared at their own index; tell-before of the next
+/// distinct PC still covers the composed effect.
+pub(crate) fn diff_il_against_bytecode(
+    ops: &[IlOp],
+    pre_to_post: &HashMap<usize, usize>,
+    bytecode: &[Byte],
+    pool: &[u64],
+    ranges: &[(String, usize, usize)],
+    seeds: &HashMap<usize, u32>,
+) -> IlTellDiff {
+    let mut emit_of_raw: Vec<Option<usize>> = vec![None; ops.len()];
+    let mut emitting = 0usize;
+    for (raw, op) in ops.iter().enumerate() {
+        if op.emits_code() {
+            emit_of_raw[raw] = Some(emitting);
+            emitting += 1;
+        }
+    }
+
+    let mut report = IlTellDiff::default();
+    for (name, bc_start, bc_end) in ranges {
+        let Some(&seed) = seeds.get(bc_start) else {
+            continue;
+        };
+        let Some((il_start, il_end)) = il_fn_raw_range(ops, pre_to_post, *bc_start, *bc_end) else {
+            continue;
+        };
+        let body = &ops[il_start..il_end];
+        let il_info = analyze_il_at(body, seed);
+        let bc_info = analyze_at(bytecode, pool, *bc_start, seed);
+
+        let mut prev_pc = None;
+        for local in 0..body.len() {
+            let op = &body[local];
+            if matches!(
+                op,
+                IlOp::Entry {
+                    kind: EntryKind::Call,
+                    ..
+                }
+            ) {
+                report.saw_call = true;
+            }
+            if matches!(op, IlOp::StorePop { .. }) {
+                report.saw_store = true;
+            }
+            let Some(e) = emit_of_raw[il_start + local] else {
+                continue;
+            };
+            let Some(&pc) = pre_to_post.get(&e) else {
+                continue;
+            };
+            if pc < *bc_start || pc >= *bc_end {
+                continue;
+            }
+            if prev_pc == Some(pc) {
+                continue;
+            }
+            prev_pc = Some(pc);
+
+            report.checked += 1;
+            let Tell::Known(predicted) = il_info.tell_before(local) else {
+                continue;
+            };
+            report.known += 1;
+            match bc_info.tell_before(pc) {
+                Tell::Known(actual) if actual == predicted => {}
+                Tell::Known(actual) => {
+                    if report.mismatches.len() < 12 {
+                        report.mismatches.push(format!(
+                            "{name} il={local} pc={pc} {}: il={predicted} bytecode={actual}",
+                            il_op_tag(op)
+                        ));
+                    }
+                }
+                Tell::Unknown => {}
+            }
+        }
+    }
+    report
+}
+
+/// Cursor immediately after `Entry{Call}` vs bytecode `CALL`, same seed.
+///
+/// COI-80: `effect_il` once used JumpIfMatch's `arity - 1` for Call instead of
+/// `1 - arity`. Arity 0 is the sharpest split (`+1` vs `-1`); arity 1 agrees
+/// under both formulas and is not a discriminator.
+pub fn entry_call_tell_after(arity: u32, seed: u32) -> (Tell, Tell) {
+    let loc = common::DebugLoc::unknown();
+    let ops = vec![
+        IlOp::Entry {
+            kind: EntryKind::Call,
+            arity,
+            target: super::op::Label(0),
+            loc,
+        },
+        IlOp::Return { loc },
+    ];
+    let il = analyze_il_at(&ops, seed).tell_before(1);
+    let code = vec![
+        Byte::new(Instruction::CALL).with_call_packed(arity, 0),
+        Byte::new(Instruction::RETURN),
+    ];
+    let bc = analyze_at(&code, &[], 0, seed).tell_before(1);
+    (il, bc)
+}
+
+/// Cursor after `Const; StorePop slot` vs `CONST; STORE slot`, same seed.
+pub fn store_pop_tell_after(slot: u32, seed: u32) -> (Tell, Tell) {
+    let loc = common::DebugLoc::unknown();
+    let ops = vec![
+        IlOp::Const { imm: 1, loc },
+        IlOp::StorePop { slot, loc },
+        IlOp::Return { loc },
+    ];
+    let il = analyze_il_at(&ops, seed).tell_before(2);
+    let code = vec![
+        Byte::new(Instruction::CONST).with_const_inline(1),
+        Byte::new(Instruction::STORE).with_load_store_slot(slot),
+        Byte::new(Instruction::RETURN),
+    ];
+    let bc = analyze_at(&code, &[], 0, seed).tell_before(2);
+    (il, bc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,9 +691,9 @@ mod tests {
         // Cursor is not monotone: POP moves it back below the store's floor.
         let code = vec![
             Byte::new(Instruction::CONST).with_const_inline(1),
-            store(4),                                        // cursor -> 5
+            store(4),                                           // cursor -> 5
             Byte::new(Instruction::CONST).with_const_inline(2), // -> 6
-            Byte::new(Instruction::POP),                     // -> 5
+            Byte::new(Instruction::POP),                        // -> 5
             Byte::new(Instruction::NOOP),
         ];
         assert_eq!(cursors(&code).last().copied().unwrap(), Some(5));
@@ -590,6 +808,70 @@ mod tests {
         let info = analyze_il_at(&ops, 2);
         assert_eq!(info.tell_before(0).known(), Some(2));
         assert_eq!(info.tell_before(1).known(), Some(3));
+    }
+
+    /// Differential form of the Call-delta bug: IL after-cursor must match
+    /// bytecode CALL, and must *not* match JumpIfMatch's `arity - 1`.
+    #[test]
+    fn entry_call_tell_after_matches_bytecode_not_signed_arity_delta() {
+        for arity in [0u32, 2, 3] {
+            let seed = arity + 2;
+            let (il, bc) = entry_call_tell_after(arity, seed);
+            let call = shift(seed, call_arity_delta(arity));
+            let jim = shift(seed, signed_arity_delta(arity));
+            assert_eq!(bc.known(), Some(call), "bytecode CALL arity {arity}");
+            assert_eq!(il, bc, "IL Entry{{Call}} arity {arity} must match CALL");
+            assert_ne!(
+                il.known(),
+                Some(jim),
+                "Entry{{Call}} arity {arity} must not use JumpIfMatch's arity-1"
+            );
+        }
+    }
+
+    #[test]
+    fn store_pop_tell_after_matches_bytecode_store() {
+        let (il, bc) = store_pop_tell_after(5, 0);
+        assert_eq!(bc.known(), Some(6));
+        assert_eq!(il, bc);
+        let (il, bc) = store_pop_tell_after(0, 3);
+        // pop then floor at 1, so cursor stays 3
+        assert_eq!(il, bc);
+        assert_eq!(il.known(), Some(3));
+    }
+
+    /// Corpus-shaped roundtrip: lower a Call/StorePop snippet and diff IL vs BC.
+    #[test]
+    fn diff_il_against_lowered_bytecode_agrees_on_call_and_store() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 0, loc },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let lowered = super::super::lower::lower_optimized(&ops, &mut pool);
+        let ranges = vec![("f".to_string(), 0, lowered.bytecode.len())];
+        let mut seeds = std::collections::HashMap::new();
+        seeds.insert(0, 1);
+        let report = diff_il_against_bytecode(
+            &ops,
+            &lowered.pre_to_post,
+            &lowered.bytecode,
+            &pool,
+            &ranges,
+            &seeds,
+        );
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert!(report.saw_call && report.saw_store);
+        assert!(report.known > 0);
     }
 
     /// `MakeCoro` shares `call_arity_delta` with `Call` — keep them locked together.

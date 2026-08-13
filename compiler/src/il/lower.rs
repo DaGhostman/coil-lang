@@ -18,6 +18,8 @@ pub struct Lowered {
     pub pre_to_post: HashMap<usize, usize>,
     /// Post-fusion bytecode length.
     pub code_len: usize,
+    /// Post-opt, pre-fuse ops when captured for the cursor_model gate.
+    pub pre_fuse_ops: Option<Vec<IlOp>>,
 }
 
 /// Intermediate slot before PC assignment. Jump targets stay symbolic.
@@ -119,10 +121,23 @@ pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> 
 ///
 /// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
 pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
+    lower_module_inner(module, pool, false)
+}
+
+/// Like [`lower_module`], optionally retaining the post-opt pre-fuse op stream.
+pub(crate) fn lower_module_inner(
+    module: &mut super::IlModule,
+    pool: &mut Vec<u64>,
+    capture_ops: bool,
+) -> Lowered {
     super::bounds::reset_bounds_stats();
     super::canon::reset_canon_stats();
     let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default(), pool);
-    lower_optimized(&flat, pool)
+    let mut lowered = lower_optimized(&flat, pool);
+    if capture_ops {
+        lowered.pre_fuse_ops = Some(flat);
+    }
+    lowered
 }
 
 /// Fuse-select + PC assign for an already-optimized op stream (no IL opts).
@@ -214,6 +229,7 @@ pub(crate) fn lower_optimized(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
         label_pcs,
         pre_to_post,
         code_len,
+        pre_fuse_ops: None,
     }
 }
 
