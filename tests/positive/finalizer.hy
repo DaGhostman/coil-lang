@@ -66,15 +66,25 @@ impl Rooted {
     }
 }
 
+impl Bag {
+    fn put(Fielded h) {
+        self.slot = Option::Some(h);
+    }
+    fn fd() -> int {
+        return match self.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        };
+    }
+}
+
 impl Fielded {
     fn drop() {
         field_drops = field_drops + 1;
         match bag {
-            Option::Some(b) => {
-                b.slot = Option::Some(self);
-            },
-            Option::None => {},
-        }
+            Option::Some(b) => b.put(self),
+            Option::None => (),
+        };
     }
 }
 
@@ -211,10 +221,7 @@ fn stash_into_field() {
 
 fn field_slot_fd() -> int {
     return match bag {
-        Option::Some(b) => match b.slot {
-            Option::Some(h) => h.fd,
-            Option::None => -1,
-        },
+        Option::Some(b) => b.fd(),
         Option::None => -2,
     };
 }

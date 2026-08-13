@@ -6020,19 +6020,32 @@ fn gc_finalizer_store_self_into_reachable_field() {
 use gc::{collect};
 use io::{stdout, write};
 use string::{format, to_bytes};
-class Handle { fd: int }
-class Bag { slot: Option<Handle> }
+class Handle {
+    fd: int,
+}
+class Bag {
+    slot: Option<Handle>,
+}
 static let drops: int = 0;
 static let bag: Option<Bag> = Option::None;
+impl Bag {
+    fn put(Handle h) {
+        self.slot = Option::Some(h);
+    }
+    fn fd() -> int {
+        return match self.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        };
+    }
+}
 impl Handle {
     fn drop() {
         drops = drops + 1;
         match bag {
-            Option::Some(b) => {
-                b.slot = Option::Some(self);
-            },
-            Option::None => {},
-        }
+            Option::Some(b) => b.put(self),
+            Option::None => (),
+        };
     }
 }
 fn setup() {
@@ -6041,20 +6054,14 @@ fn setup() {
 fn make() {
     let h = new Handle(9);
 }
-fn slot_fd() -> int {
-    return match bag {
-        Option::Some(b) => match b.slot {
-            Option::Some(h) => h.fd,
-            Option::None => -1,
-        },
-        Option::None => -2,
-    };
-}
 fn main() {
     setup();
     make();
     collect();
-    let fd = slot_fd();
+    let fd = match bag {
+        Option::Some(b) => b.fd(),
+        Option::None => -2,
+    };
     let after_first = drops;
     collect();
     write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
