@@ -309,7 +309,7 @@ Type pretty-print: `readonly T`. Arrays and dicts have no method exception — e
 
 ---
 
-Inherent `fn drop()` on a class is a GC-time finalizer (`unit` return, implicit `self` by value). See [`gc`](gc.md).
+Inherent `fn drop()` on a class is a GC-time finalizer (`unit` return, implicit `self` by value). See [`gc`](gc.md). Named locals are always heap-allocated (`InitTyped`); only a consumed `new Class(args).field` may skip the box, and never when the class has `fn drop()` ([COI-84](https://linear.app/ardax/issue/COI-84)).
 
 ## Class `const` fields
 

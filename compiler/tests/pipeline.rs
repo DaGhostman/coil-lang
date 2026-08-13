@@ -5261,6 +5261,77 @@ fn main() {
     );
 }
 
+/// Named locals keep a heap instance (COI-84). Temp `new C(args).field` elides;
+/// `let p = new C(args); p.field` does not — identity, methods, mutation, and
+/// `fn drop()` are observable without a whole-function escape scan.
+#[test]
+fn named_local_class_stays_heap_allocated() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    let p = new Point(5, 6);
+    write(stdout(), to_bytes(format("%i", p.x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("named local class");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    assert!(
+        bytecode[start..end]
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
+        "named local must stay InitTyped; opcodes: {:?}",
+        bytecode[start..end]
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `fn drop()` forces a real instance even for a consumed `new C(args).field`.
+#[test]
+fn drop_class_temp_field_access_still_allocates() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", new Handle(7).fd)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "7");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("drop temp field");
+    assert!(
+        bytecode
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
+        "drop class temp must allocate so the finalizer can run"
+    );
+}
+
 #[test]
 fn pointer_niche_option_match_and_coalesce() {
     let output = run_example_src(
