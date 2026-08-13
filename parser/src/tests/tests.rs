@@ -1723,6 +1723,24 @@
         );
     }
 
+    /// COI-73: `import` is a non-goal, not a synonym of `use`.
+    #[test]
+    fn import_path_is_parse_error_not_use() {
+        let src = "import foo::bar;";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Use { .. } => {
+                    panic!("import foo::bar; must not parse as Use")
+                }
+                other => panic!(
+                    "import foo::bar; must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";

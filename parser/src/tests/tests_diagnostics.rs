@@ -136,6 +136,13 @@ fn let_missing_initializer_expr_is_parse_error() {
     assert_eq!(err.code(), Some(ErrorCode::ParseError));
 }
 
+/// COI-73: `import foo::bar;` is a parse error, not a `use` synonym.
+#[test]
+fn import_path_is_parse_error() {
+    let err = parse_err("import foo::bar;");
+    assert_eq!(err.code(), Some(ErrorCode::ParseError));
+}
+
 #[test]
 fn typed_fn_param_still_parses() {
     Pratt::default()
