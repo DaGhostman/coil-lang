@@ -1,8 +1,10 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Absolute path to coil-stdlib `src/` (sibling clone or `.deps/` checkout).
 fn workspace_stdlib() -> PathBuf {
@@ -64,27 +66,164 @@ impl Write for SharedBuf {
     }
 }
 
+/// Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
+/// thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
+/// actually runs with. infer_inner/do_compile no longer have oversized
+/// inline match arms (see docs/internals/limitations.md), so this is
+/// headroom rather than a load-bearing requirement.
+const EXAMPLE_STACK: usize = 8 * 1024 * 1024;
+
+/// Cap concurrent 8 MiB example-runner threads. Cargo's test threads plus
+/// per-VM reactor workers used to explode OS-thread churn (`make_handler`
+/// SIGSEGV / hang, COI-88). Reuse a tiny pool instead of spawn/join per test.
+const EXAMPLE_POOL_SIZE: usize = 2;
+
+struct ExampleJob {
+    name: String,
+    work: Box<dyn FnOnce() -> String + Send>,
+    reply: Sender<std::thread::Result<String>>,
+}
+
+fn example_job_tx() -> &'static Sender<ExampleJob> {
+    static TX: OnceLock<Sender<ExampleJob>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ExampleJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..EXAMPLE_POOL_SIZE {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("pipe-ex-{i}"))
+                .stack_size(EXAMPLE_STACK)
+                .spawn(move || example_pool_worker(rx))
+                .expect("pipeline example pool worker");
+        }
+        tx
+    })
+}
+
+fn example_pool_worker(rx: Arc<Mutex<Receiver<ExampleJob>>>) {
+    loop {
+        let job = {
+            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.recv()
+        };
+        let Ok(job) = job else { break };
+        set_worker_thread_name(&job.name);
+        let result = catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let _ = job.reply.send(result);
+        set_worker_thread_name("pipe-ex");
+    }
+}
+
+/// Linux/macOS pthread name is what `gdb` / core dumps show (15 bytes).
+fn set_worker_thread_name(name: &str) {
+    let mut buf = [0u8; 16];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = libc::pthread_setname_np(libc::pthread_self(), buf.as_ptr().cast());
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::pthread_setname_np(buf.as_ptr().cast());
+    }
+}
+
+fn run_on_example_stack(name: String, work: impl FnOnce() -> String + Send + 'static) -> String {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    example_job_tx()
+        .send(ExampleJob {
+            name,
+            work: Box::new(work),
+            reply: reply_tx,
+        })
+        .expect("pipeline example pool");
+    match reply_rx.recv().expect("pipeline example pool worker") {
+        Ok(output) => output,
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+#[test]
+fn example_pool_resumes_panic_to_caller() {
+    // Without resume_unwind, catch_unwind around run_example would miss
+    // harness panics (FFI soft-skip probes, assertion failures).
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-probe".into(), || panic!("pool-panic-probe"));
+    }));
+    assert!(
+        panicked.is_err(),
+        "example pool must re-raise job panics to the caller"
+    );
+}
+
+#[test]
+fn example_pool_worker_survives_panic_for_next_job() {
+    // catch_unwind in the worker is load-bearing: a killed worker leaves
+    // later run_example calls blocked forever on reply_rx.recv().
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-then-ok".into(), || panic!("transient pool panic"));
+    }));
+    let out = run_on_example_stack("after-panic".into(), || "ok".to_string());
+    assert_eq!(out, "ok");
+}
+
+#[test]
+fn example_pool_caps_concurrent_jobs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar};
+    use std::time::{Duration, Instant};
+
+    // Encode COI-88: peak concurrent example runners must stay ≤ pool size
+    // even when many cargo-test threads submit jobs at once.
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let n_jobs = EXAMPLE_POOL_SIZE + 4;
+    let start = Arc::new(Barrier::new(n_jobs));
+    let mut handles = Vec::with_capacity(n_jobs);
+    for i in 0..n_jobs {
+        let gate = Arc::clone(&gate);
+        let max_seen = Arc::clone(&max_seen);
+        let start = Arc::clone(&start);
+        handles.push(std::thread::spawn(move || {
+            start.wait();
+            run_on_example_stack(format!("cap-{i}"), move || {
+                let (lock, cvar) = &*gate;
+                let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *count += 1;
+                max_seen.fetch_max(*count, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_millis(40);
+                while Instant::now() < deadline {
+                    let (guard, _) = cvar
+                        .wait_timeout(count, Duration::from_millis(5))
+                        .unwrap_or_else(|e| e.into_inner());
+                    count = guard;
+                }
+                *count -= 1;
+                cvar.notify_all();
+                "done".into()
+            })
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.join().expect("submitter join"), "done");
+    }
+    let peak = max_seen.load(Ordering::SeqCst);
+    assert!(
+        peak >= 1 && peak <= EXAMPLE_POOL_SIZE,
+        "peak concurrent example jobs was {peak}, want 1..={EXAMPLE_POOL_SIZE}"
+    );
+}
+
 fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    // Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
-    // thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
-    // actually runs with. infer_inner/do_compile no longer have oversized
-    // inline match arms (see docs/internals/limitations.md), so this is
-    // headroom rather than a load-bearing requirement.
-    const STACK: usize = 8 * 1024 * 1024;
     let path = path.to_string();
-    // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
-    // triage point at the offending example after a crash.
-    let thread_name = path.clone();
-    std::thread::Builder::new()
-        .name(thread_name)
-        .stack_size(STACK)
-        .spawn(move || run_example_multifile(&path))
-        .expect("pipeline example thread")
-        .join()
-        .expect("pipeline example thread join")
+    let name = path.clone();
+    run_on_example_stack(name, move || run_example_multifile(&path))
 }
 
 /// Compile and run in-memory source.
@@ -3546,9 +3685,8 @@ fn main() {
 fn attr_on_async_fn_rejected_at_compile_time() {
     // Attr-body-crosses-yield desugaring for a coroutine target used to
     // recurse deep enough (~1.5-2 MiB) to risk the default per-test thread
-    // stack before infer_inner/do_compile were split up; run on a dedicated
-    // thread with the same headroom as `run_example` regardless (see
-    // docs/internals/limitations.md).
+    // stack before infer_inner/do_compile were split up; reuse the example
+    // pool's 8 MiB workers instead of spawn/join (COI-88).
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -3566,14 +3704,15 @@ fn main() {
 }
 "#
     .to_string();
-    let is_err = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || Pipeline::new().compile_src(&src).is_err())
-        .expect("diagnostic thread")
-        .join()
-        .expect("diagnostic thread join");
+    let is_err = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&is_err);
+    run_on_example_stack("attr-async-diag".into(), move || {
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) =
+            Pipeline::new().compile_src(&src).is_err();
+        String::new()
+    });
     assert!(
-        is_err,
+        *is_err.lock().unwrap_or_else(|e| e.into_inner()),
         "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }
