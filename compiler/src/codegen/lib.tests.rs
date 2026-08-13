@@ -6354,13 +6354,119 @@ fn main() {
             !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
             "Vec::pop of int must not use HostInvokeNiche; opcodes={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
         );
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
             "Vec::pop of int should still HostInvoke; opcodes={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn unary_result_return_uses_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Result<int, string> {
+    return Result::Ok(1);
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "unary Result return must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn nested_option_string_none_stays_boxed() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<Option<string>> = Option::None;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "nested Option must stay boxed; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn generic_option_return_inserts_heap_to_niche() {
+        let (bc, _) = compile_src(
+            r#"
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let x: Option<string> = Option::Some("ok");
+    let y: Option<string> = id(x);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::OptionNicheToHeap)),
+            "generic Option arg must niche→heap; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HeapOptionToNiche)),
+            "generic Option return must heap→niche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vec_remove_heap_item_emits_host_invoke_niche() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from(["a"]);
+    let _ = v.remove(0);
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_remove", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::remove of string must emit HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ground_option_class_none_uses_pointer_niche() {
+        let (bc, _) = compile_src(
+            r#"
+class Box {
+    n: int,
+}
+fn main() {
+    let x: Option<Box> = Option::None;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "ground Option<class> None must not box; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
         );
     }
 
