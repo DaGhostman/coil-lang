@@ -64,6 +64,8 @@ Stack IL: symbolic labels until `finalize_bytecode` → single `il::lower` after
 ```bash
 cargo check --workspace          # lint gate (clippy has known Gc exception)
 cargo test --workspace --lib --tests --bins   # required; includes */tests/* (skip Criterion benches)
+# Bare optional stack (crypto/time/regex/tls tests cfg-skipped):
+#   cargo test --workspace --lib --tests --bins --no-default-features
 # Feature compile-gates / tooling (match CI matrix job titles):
 #   cargo check --workspace --lib --tests --bins --no-default-features --features tls
 #   cargo test --workspace --lib --tests --bins --features dissect
