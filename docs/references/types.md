@@ -52,6 +52,20 @@ Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`
 
 **Result mode:** a function that uses `raise` or Result-`?` has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. One `E` per function.
 
+### Option / Result runtime ABI
+
+User code always sees `Option<T>` / `Result<T, E>`. Codegen picks one of three representations; conversions happen at the boundary. **Decision ([COI-92](https://linear.app/ardax/issue/COI-92)):** keep this matrix — unifying would either box every ground `Option<string>` or invent a niche for `int` / nested / FFI payloads.
+
+| Shape | Representation | When |
+|-------|----------------|------|
+| Ground `Option<T>` whose `T` is a non-null heap pointer (`string`, class, heap aggregate) | Pointer niche: `0` = `None`, payload pointer = `Some` | Locals and direct values at a known ground type |
+| Statically known unary `Option` / `Result` **call return** | Two-slot `[payload, tag]` (`ReturnPair`) | Callee and caller both see a unary enum return; not a coroutine; not a pointer-niche `Option` |
+| Everything else | Boxed heap enum | Generic / nested-nullable / stack-shaped / coroutine / FFI / `CallIndirect` / unknown host |
+
+Cross a niche ↔ boxed boundary with `OptionNicheToHeap` / `HeapOptionToNiche`. `Vec::pop` / `Vec::remove` use allocation-free `HostInvokeNiche` when the item type is heap-only; other host results stay on `HostInvoke` and convert at the boundary.
+
+Do not match on raw `0` vs pointer in user code — `match` / `?` / `??` are the API. See [limitations](../internals/limitations.md).
+
 ---
 
 ## Function types (`Ty::Fun`)
@@ -911,6 +925,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | FFI | Broad scalar/Ptr/struct/callback tags via `ffi::types` / `extern struct` — see [FFI tutorial](../manual/tutorial/07-ffi.md) |
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
 | Trait runtime | **Decided ([COI-78](https://linear.app/ardax/issue/COI-78)):** ground instance methods use `CALL`; generic user-trait / `Show` / `Length` bounds keep dictionaries. Only ground `Num`/`Ord`/`Eq` (and operator supertraits) monomorphize to opcodes. See [Call-site dispatch](#call-site-dispatch). |
+| Option / Result ABI | **Decided ([COI-92](https://linear.app/ardax/issue/COI-92)):** pointer niche, two-slot call return, or boxed enum — see [Option / Result runtime ABI](#option--result-runtime-abi). |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |
