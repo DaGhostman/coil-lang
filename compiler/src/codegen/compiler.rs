@@ -14707,6 +14707,18 @@ impl Compiler {
         let _ = self.finalize_bytecode_inner(false);
     }
 
+    /// Retain post-opt pre-fuse IL on the next [`Self::finalize_bytecode`].
+    pub(crate) fn set_retain_cursor_il(&mut self, retain: bool) {
+        self.retain_cursor_il = retain;
+        if !retain {
+            self.cursor_il = None;
+        }
+    }
+
+    pub(crate) fn take_cursor_il(&mut self) -> Option<crate::il::tell::CursorIlSnap> {
+        self.cursor_il.take()
+    }
+
     /// Like [`finalize_bytecode`], but also returns a pre-opt IL snapshot for dissect.
     #[cfg(any(test, feature = "dissect"))]
     pub fn finalize_bytecode_capturing_il(&mut self) -> crate::dissect::IlSnapshot {
@@ -14846,7 +14858,12 @@ impl Compiler {
             None
         };
 
-        let lowered = self.bytecode.lower_in_place(&mut self.constants);
+        let mut lowered = if self.retain_cursor_il {
+            self.bytecode.lower_in_place_capturing(&mut self.constants)
+        } else {
+            self.bytecode.lower_in_place(&mut self.constants)
+        };
+        let cursor_ops = lowered.pre_fuse_ops.take();
         let map = |t: usize| -> usize {
             if let Some(&p) = lowered.pre_to_post.get(&t) {
                 return p;
@@ -14894,6 +14911,13 @@ impl Compiler {
             self.bytecode.len(),
             "debug_locs / bytecode length mismatch after finalize"
         );
+
+        if self.retain_cursor_il {
+            self.cursor_il = Some(crate::il::tell::CursorIlSnap {
+                ops: cursor_ops.unwrap_or_default(),
+                pre_to_post: lowered.pre_to_post.clone(),
+            });
+        }
 
         #[cfg(any(test, feature = "dissect"))]
         return il_snapshot;

@@ -18,6 +18,8 @@ pub struct Lowered {
     pub pre_to_post: HashMap<usize, usize>,
     /// Post-fusion bytecode length.
     pub code_len: usize,
+    /// Post-opt, pre-fuse ops when captured for the cursor_model gate.
+    pub pre_fuse_ops: Option<Vec<IlOp>>,
 }
 
 /// Intermediate slot before PC assignment. Jump targets stay symbolic.
@@ -119,10 +121,23 @@ pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> 
 ///
 /// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
 pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
+    lower_module_inner(module, pool, false)
+}
+
+/// Like [`lower_module`], optionally retaining the post-opt pre-fuse op stream.
+pub(crate) fn lower_module_inner(
+    module: &mut super::IlModule,
+    pool: &mut Vec<u64>,
+    capture_ops: bool,
+) -> Lowered {
     super::bounds::reset_bounds_stats();
     super::canon::reset_canon_stats();
     let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default(), pool);
-    lower_optimized(&flat, pool)
+    let mut lowered = lower_optimized(&flat, pool);
+    if capture_ops {
+        lowered.pre_fuse_ops = Some(flat);
+    }
+    lowered
 }
 
 /// Fuse-select + PC assign for an already-optimized op stream (no IL opts).
@@ -214,6 +229,7 @@ pub(crate) fn lower_optimized(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
         label_pcs,
         pre_to_post,
         code_len,
+        pre_fuse_ops: None,
     }
 }
 
@@ -2216,6 +2232,34 @@ mod tests {
                 .iter()
                 .map(|b| *b.bytecode())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// COI-80 retain path: only `capture_ops` fills `pre_fuse_ops` for the gate.
+    #[test]
+    fn lower_module_inner_captures_pre_fuse_ops_only_when_requested() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let plain = lower_module_inner(&mut module, &mut pool, false);
+        assert!(plain.pre_fuse_ops.is_none());
+
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let captured = lower_module_inner(&mut module, &mut pool, true);
+        let snap = captured
+            .pre_fuse_ops
+            .as_ref()
+            .expect("capture_ops must retain post-opt flat");
+        assert!(!snap.is_empty());
+        let emitting = snap.iter().filter(|op| op.emits_code()).count();
+        assert_eq!(
+            captured.pre_to_post.len(),
+            emitting,
+            "pre_to_post keys cover every emitting pre-fuse op"
         );
     }
 }
