@@ -23,7 +23,7 @@ Plan for `HashMap`, `HashSet`, `List`, and `TreeMap` in the standard library.
 | `HashMap<K,V>` | `collections::map` | Separate chaining: `heads: Vec<int>` + parallel `keys` / `vals` / `next` / `live` Vecs |
 | `HashSet<T>` | `collections::map` | `HashMap<T, bool>` wrapper (can move to `collections::set` in [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) now that class types import across modules) |
 | `List<T>` | `collections::list` | Mutable singly-linked `Node` class (`Option<Node<T>>`) |
-| `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel Vecs + child indices (avoids `Option` field moves) |
+| `TreeMap<K,V>` | `collections::tree` | Mutable BST via parallel Vecs + child indices |
 
 Constrained ops (`insert` / `get_or` / …) are **inherent methods** on
 `impl HashMap<K: Eq + Hash, V>` (and the Ord analogues for `TreeMap`). **Rule:**
@@ -32,7 +32,7 @@ applies `impl` type-param bounds to method schemes and emits dictionary
 arguments on inherent method `CALL` (same ABI as free generics). Free generic
 fns returning enums remain codegen-fragile; methods are the supported path.
 
-**`Option` field caveat:** matching a class field of type `Option<_>` moves the value out — write it back (`t.root = Option::Some(root)`) before returning, and copy child links to a `let` before nested `match` so the field is restored.
+**`Option` field match:** `match` copies the field (GC pointer / immediate). Nested `match` on the same `Option` field is valid and does not empty the field — no write-back. See [COI-77](https://linear.app/ardax/issue/COI-77) and [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee).
 
 ## Known language gaps (remaining)
 

@@ -22,7 +22,7 @@ Actionable gaps in the compiler, VM, and language surface. For opcode/archive ru
 
 | Issue | Detail | Linear |
 |-------|--------|--------|
-| `Option` field moves | `match` moves fields out — copy links before nested `match` on the same field | [COI-77](https://linear.app/ardax/issue/COI-77) |
+| `Option` field moves | **Decided (copy-on-match):** `match` copies the scrutinee / field pointer; nested `match` on the same `Option` field is valid. Outer pattern bindings stay in scope (codegen merges `match_bindings`). Was a nested-match lookup hole, not a true move. | [COI-77](https://linear.app/ardax/issue/COI-77) |
 | User trait calls | Dictionary passing; only ground builtin bounds get direct monomorphized opcodes | [COI-78](https://linear.app/ardax/issue/COI-78) |
 
 ## IL optimizations (low)
