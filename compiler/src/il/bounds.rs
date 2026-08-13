@@ -1,10 +1,11 @@
 //! Loop range / bounds analysis (proof-only + ArrayLen LICM).
 //!
-//! Identifies counted loops (`0..n` / `0..len`) with an invariant array, proves
-//! `0 <= i < len` for in-body `Index` / `StoreIndex` when the bound is the
+//! Identifies counted loops (`0..n` / `0..len`) with an invariant array, tallies
+//! `0 <= i < len` proofs for in-body `Index` / `StoreIndex` when the bound is the
 //! array's length (or a fill-loop-equal `n`), and hoists invariant
 //! `LOAD; ArrayLen; STORE` triples into the preheader. Fail-closed: unknown or
-//! mutation-sensitive paths keep checked ops. No new opcodes.
+//! mutation-sensitive paths stay checked. **`Index` is never rewritten**
+//! (COI-85: no `IndexUnchecked`). No new opcodes.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1778,6 +1779,10 @@ mod tests {
         BinSlotSlotGt,
         /// Residual `Byte(GT)` between loads (is_gt_cmp encode path).
         LoadLoadByteGt,
+        /// `Load p; Load n; LEQ` — `p <= n` is **not** a length proof (COI-93).
+        LoadLoadLeq,
+        /// `Load n; Load p; GEQ` — canon swap of LEQ; also not a length proof.
+        LoadLoadGeq,
     }
 
     /// flags = MakeArray 0; i=0; while i < n { push; i++ }; then while p < n { Index }.
@@ -1918,6 +1923,38 @@ mod tests {
                     },
                 ]);
             }
+            ScanHeader::LoadLoadLeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::LEQ,
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::LoadLoadGeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::GEQ,
+                        loc: loc(),
+                    },
+                ]);
+            }
         }
         ops.extend([
             IlOp::Jump {
@@ -2004,6 +2041,52 @@ mod tests {
         assert!(
             stats.proven_index >= 1,
             "Byte(GT) header must prove Index via is_gt_cmp; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn leq_scan_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "i <= n must not license Index; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "LEQ header Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn geq_scan_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadGeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "canon-swapped LEQ (GEQ) must not license Index; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "GEQ header Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn canon_then_bounds_still_refuses_leq_header() {
+        use super::super::canon::canonicalize_operand_order;
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLeq);
+        canonicalize_operand_order(&mut ops, &[]);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "canon must not turn LEQ into an Index proof; stats={stats:?}"
         );
     }
 
