@@ -43,7 +43,7 @@ Every runnable program needs `fn main()` **unless** the file only has `test("…
 
 Implicit imports (no `use` needed): prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) — injected by the compiler, not written in source.
 
-Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`.
+Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`, `gc`.
 
 ```coil
 use io::{stdout};
@@ -67,7 +67,7 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 | Types | Primitives `int` `float` `string` `bool` `byte`; arrays `[T]` / `[T; N]`; tuples; dicts as anonymous records |
 | Enums | `enum E { A, B(T) }`; `match e { … }` with record/nested patterns |
 | Errors | Built-in `Option`/`Result`; `raise`, `?`, `??`, `?.` |
-| Classes | `class C { … }`, `impl C { … }`, `new C(…)` — prefer methods for type-tied ops |
+| Classes | `class C { … }`, `impl C { … }`, `new C(…)` — prefer methods for type-tied ops; inherent `fn drop()` is a GC-time finalizer |
 | Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
 | FFI | `extern { … }` blocks or `use ffi::{dload, declare, invoke}` + `ffi::types::{Int, …}` |
 | Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
@@ -91,7 +91,7 @@ userland modules. Prelude is auto-injected.
 | `ffi` | `use ffi::{dload, declare, invoke};` + `use ffi::types::{Int, Ptr};` | Dynamic loading |
 | `thread` | `use thread::{spawn, join, channel, send, recv};` | OS threads, channels, mutex |
 | `time` / `env` / `crypto` / `regex` | `use time::{timestamp, sleep_ms};` etc. | Cargo-feature gated (default on) |
-| `gc` | `use gc::{root, weak, collect};` | `Root` / `Weak` GC pins |
+| `gc` | `use gc::{root, weak, collect};` | `Root` / `Weak` pins; class `fn drop()` runs at collect / teardown |
 
 `byte` is 0..=255; integer literals coerce under `byte` / `[byte]` expectations.
 
@@ -124,6 +124,7 @@ Or `#[test("desc")] fn … { … }`. Body is Result mode. `panic` aborts VM; `co
 | Modules | `examples/modules.hy` |
 | Coroutines | `examples/coro.hy` |
 | FFI | `examples/strlen.hy` |
+| GC `fn drop()` | `examples/finalizer.hy` |
 | Full catalog | [docs/manual/examples.md](docs/manual/examples.md) |
 
 Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) → chapters 01–11.

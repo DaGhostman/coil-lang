@@ -18,7 +18,7 @@
 
 - **`Root`** participates in mark-sweep: while a `Root` object is reachable from VM roots, its payload is marked.
 - **`unroot`** clears the pin so a still-reachable `Root` shell no longer keeps the payload alive.
-- **`Weak`** is not traced as a strong reference. After mark and before sweep, weaks whose heap referents are unmarked are cleared.
+- **`Weak`** is not traced as a strong reference. After mark, class finalizers run (and can still `upgrade` a weak to the instance being dropped); then a re-mark from VM roots; then weaks whose heap referents are still unmarked are cleared before sweep.
 - **Immediates** (`int`, `bool`, …) under `Weak` always upgrade successfully (they are not heap objects).
 - **`Root` / `Weak` are not thread-sendable.**
 - **`heap_bytes`** reports VM-managed heap accounting only — not process RSS (native libs, stacks, Rust allocators sit outside it).
