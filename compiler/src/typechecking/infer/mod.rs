@@ -169,6 +169,11 @@ pub struct Checker {
 
     /// Class declarations: name → list of (visibility, field name, type).
     classes: std::collections::HashMap<String, Vec<(Visibility, String, Ty)>>,
+    /// Compile-time type ids for class instances (`InitTyped`). Never 0.
+    class_type_ids: std::collections::HashMap<String, u32>,
+    next_class_type_id: u32,
+    /// Classes that declared inherent `fn drop(self)`.
+    classes_with_drop: std::collections::HashSet<String>,
 
     /// Method declarations: owner class → method name →
     /// (visibility, scheme). Methods are stored here so they can be

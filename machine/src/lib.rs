@@ -39,7 +39,7 @@ pub use debug::{DebugController, StepMode, StopReason};
 pub use env::ENV_WIRING;
 pub use ffi::*;
 pub use fs::FS_WIRING;
-pub use gc_handles::{GC_COLLECT_NATIVE, GC_WIRING};
+pub use gc_handles::{GC_COLLECT_NATIVE, GC_REGISTER_FINALIZER_NATIVE, GC_WIRING};
 pub use host_natives::{build_standard_host_natives, wire_standard_host_natives};
 pub use memory::*;
 pub use opcode::*;

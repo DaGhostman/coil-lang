@@ -4947,6 +4947,7 @@ fn main() {
             !matches!(
                 byte.bytecode(),
                 common::Instruction::INIT
+                    | common::Instruction::InitTyped
                     | common::Instruction::SetField
                     | common::Instruction::GetField
             )
@@ -5163,6 +5164,222 @@ fn main() {
 #[test]
 fn example_gc_collect_clears_weak() {
     assert_eq!(run_example("examples/gc_collect.hy"), "none");
+}
+
+#[test]
+fn example_finalizer_prints_closed() {
+    assert_eq!(run_example("examples/finalizer.hy"), "closed");
+}
+
+#[test]
+fn gc_finalizer_runs_on_collect() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_once_bit_and_explicit_drop() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn main() {
+    let h = new Handle(1);
+    h.drop();
+    h.drop();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_skips_live_root() {
+    let output = run_example_src(
+        r#"
+use gc::{collect, root};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn main() {
+    let h = new Handle(1);
+    let r = root(h);
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
+
+#[test]
+fn gc_finalizer_nested_collect_is_deferred() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        collect();
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_panic_continues_queue() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Boom { fd: int }
+impl Boom {
+    fn drop() {
+        panic "boom";
+    }
+}
+class Ok { fd: int }
+impl Ok {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let a = new Boom(1);
+    let b = new Ok(2);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert!(
+        output.ends_with('1'),
+        "Ok drop should still run after Boom panics; got {output:?}"
+    );
+}
+
+#[test]
+fn gc_finalizer_runs_on_teardown() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        write(stdout(), to_bytes("closed"));
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+}
+"#,
+    );
+    assert_eq!(output, "closed");
+}
+
+#[test]
+fn gc_finalizer_can_upgrade_weak_then_clears() {
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let during: int = 0;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        let live = match held {
+            Option::Some(w) => match upgrade(w) {
+                Option::Some(_) => 1,
+                Option::None => 2,
+            },
+            Option::None => 3,
+        };
+        during = live;
+    }
+}
+fn ephemeral() {
+    let h = new Handle(1);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(_) => 1,
+            Option::None => 0,
+        },
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i", during, after)));
+}
+"#,
+    );
+    assert_eq!(output, "10");
 }
 
 #[test]

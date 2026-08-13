@@ -26,6 +26,7 @@
         compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
         compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
         compiler.register_native_id(machine::PACKED_VEC_ARITH, 9005);
+        compiler.register_native_id(machine::GC_REGISTER_FINALIZER_NATIVE, 9100);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
@@ -6008,6 +6009,55 @@ fn main() {
         assert!(
             saw_while_exit,
             "expected while-exit BinSlotSlotJmpf targeting past back-edge JMP {back}"
+        );
+    }
+
+    #[test]
+    fn class_ctor_emits_init_typed() {
+        let (bc, _) = compile_src(
+            r#"
+class Box { n: int }
+fn main() {
+    let b = new Box(1);
+    return b.n;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::InitTyped)),
+            "expected InitTyped for class ctor; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode().mnemonic()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .all(|b| !matches!(b.bytecode(), Instruction::INIT)),
+            "new Class should not emit legacy INIT"
+        );
+    }
+
+    #[test]
+    fn drop_method_registers_finalizer_prologue() {
+        let (bc, _) = compile_src(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    let h = new Handle(1);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected registry HostInvoke in prologue"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CodePtr)),
+            "expected CodePtr for drop entry"
         );
     }
 

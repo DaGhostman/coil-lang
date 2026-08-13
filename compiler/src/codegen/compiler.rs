@@ -184,7 +184,10 @@ impl Compiler {
     /// Prologue `JMP` target: static initializers and/or `extern` setup
     /// run at `setup_entry_offset`; otherwise jump straight to `main`.
     pub fn prologue_jmp_target(&self) -> u32 {
-        if self.static_slot_count() > 0 || self.has_extern_block() {
+        if self.static_slot_count() > 0
+            || self.has_extern_block()
+            || self.checker.classes_with_drop().next().is_some()
+        {
             self.setup_entry_offset
         } else {
             self.functions
@@ -192,6 +195,11 @@ impl Compiler {
                 .copied()
                 .unwrap_or(self.program_start_offset as usize) as u32
         }
+    }
+
+    /// Bytecode offset of `main`, if bound.
+    pub fn main_offset(&self) -> Option<u32> {
+        self.functions.get("main").copied().map(|o| o as u32)
     }
 
     /// Harness test cases emitted this compile: `(description, fn offset)`.
@@ -7683,6 +7691,9 @@ impl Compiler {
         {
             return false;
         }
+        if self.checker.class_has_drop(class_name) {
+            return false;
+        }
         if args.iter().any(|arg| self.arg_emits_on_self_bytecode(arg)) {
             return false;
         }
@@ -10166,8 +10177,9 @@ impl Compiler {
                     }
                 } else {
                     let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
+                    let type_id = self.checker.class_type_id(&name);
                     bytecode
-                        .push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
+                        .push(Byte::new(Instruction::InitTyped).with_operand_u32(type_id));
                     // SetField stack order is value, target, name (same as
                     // Assignment to Access). Stash the instance, then for
                     // each ctor arg emit that sequence and discard the
@@ -14650,6 +14662,43 @@ impl Compiler {
         self.pad_debug_locs();
     }
 
+    /// Register `type_id → drop PC` via internal `gc_register_finalizer`.
+    ///
+    /// Emitted on the main buffer (so drop labels stay in-namespace) then
+    /// moved to the pre-`main` prologue.
+    fn emit_finalizer_registry(&mut self, insert_at: usize) -> Option<usize> {
+        let native_id = self.native_id("gc_register_finalizer")?;
+        let owners: Vec<String> = self.checker.classes_with_drop().cloned().collect();
+        if owners.is_empty() {
+            return None;
+        }
+        let raw_start = self.bytecode.il().raw_len();
+        let code_start = self.bytecode.len();
+        for owner in owners {
+            let fqn = format!("{owner}::drop");
+            let Some(label) = self.fn_entry_labels.get(&fqn).copied() else {
+                continue;
+            };
+            let type_id = self.checker.class_type_id(&owner);
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(type_id));
+            self.bytecode
+                .emit_entry(crate::il::EntryKind::CodePtr, 0, label);
+            self.bytecode.push_make_tuple(2);
+            self.bytecode.push_host_invoke(2);
+            self.bytecode.push_pop();
+        }
+        let n = self.bytecode.len().saturating_sub(code_start);
+        if n == 0 {
+            return None;
+        }
+        self.bytecode
+            .move_raw_suffix_to_code_pos(raw_start, insert_at);
+        Some(n)
+    }
+
     /// Lower stack IL to VM bytecode (fusion select + label resolution).
     ///
     /// Called once after multi-file linking by the pipeline, or at the end
@@ -14687,6 +14736,14 @@ impl Compiler {
             let ffi = std::mem::take(&mut self.ffi_init);
             let n = ffi.len();
             self.bytecode.splice_buf_at(setup_pos + init_len, ffi);
+            self.bytecode
+                .bump_absolute_entry_targets(setup_pos + init_len, n);
+            self.bytecode.bump_func_spans(setup_pos + init_len, n);
+            init_len += n;
+        }
+
+        if let Some(n) = self.emit_finalizer_registry(setup_pos + init_len) {
+            self.setup_entry_offset = setup_pos as u32;
             self.bytecode
                 .bump_absolute_entry_targets(setup_pos + init_len, n);
             self.bytecode.bump_func_spans(setup_pos + init_len, n);

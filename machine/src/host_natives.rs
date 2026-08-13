@@ -714,7 +714,12 @@ mod tests {
             .iter()
             .position(|(name, _)| name == crate::GC_COLLECT_NATIVE)
             .expect("gc_collect registration");
-        assert_eq!(math_start, gc_collect + 1);
+        let gc_register = registrations
+            .iter()
+            .position(|(name, _)| name == crate::GC_REGISTER_FINALIZER_NATIVE)
+            .expect("gc_register_finalizer registration");
+        assert_eq!(gc_register, gc_collect + 1);
+        assert_eq!(math_start, gc_register + 1);
 
         let expected = [
             "math_sin",

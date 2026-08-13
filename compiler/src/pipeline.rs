@@ -1279,6 +1279,14 @@ impl Pipeline {
         self.compiler_lazy().static_slot_count()
     }
 
+    pub fn prologue_jmp_target(&self) -> u32 {
+        self.compiler_lazy().prologue_jmp_target()
+    }
+
+    pub fn main_offset(&self) -> Option<u32> {
+        self.compiler_lazy().main_offset()
+    }
+
     pub fn program_debug(&self) -> ProgramDebug {
         ProgramDebug {
             source_files: self.compiler_lazy().source_files_list(),

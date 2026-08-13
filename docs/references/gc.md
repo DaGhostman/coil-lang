@@ -18,13 +18,14 @@
 
 - **`Root`** participates in mark-sweep: while a `Root` object is reachable from VM roots, its payload is marked.
 - **`unroot`** clears the pin so a still-reachable `Root` shell no longer keeps the payload alive.
-- **`Weak`** is not traced as a strong reference. After mark and before sweep, weaks whose heap referents are unmarked are cleared.
+- **`Weak`** is not traced as a strong reference. After mark, class finalizers run (and can still `upgrade` a weak to the instance being dropped); then a re-mark from VM roots; then weaks whose heap referents are still unmarked are cleared before sweep.
 - **Immediates** (`int`, `bool`, …) under `Weak` always upgrade successfully (they are not heap objects).
 - **`Root` / `Weak` are not thread-sendable.**
 - **`heap_bytes`** reports VM-managed heap accounting only — not process RSS (native libs, stacks, Rust allocators sit outside it).
 - **`collect`** roots the operand stack and suspended coroutines the same way automatic GC does.
+- **Class `fn drop()`** runs after mark on unmarked instances with a registered finalizer, then a re-mark from VM roots, then weaks are cleared and sweep runs. Drop runs at most once (including explicit `obj.drop()`). Nested `collect` during drop is deferred. A panic in drop aborts that finalizer and continues the queue. After `main` returns, remaining finalizers run before the IO reactor shuts down (and again from `Machine` drop if anything is still pending).
 
-Typical FFI pattern: `root` a Coil buffer/callback before handing its address to C; hold `Weak` entries in Coil-side registries so maps do not extend lifetimes.
+Typical FFI pattern: `root` a Coil buffer/callback before handing its address to C; hold `Weak` entries in Coil-side registries so maps do not extend lifetimes. Use `fn drop()` to close the native handle when the wrapper becomes unreachable.
 
 ```coil
 use gc::{collect, get, root, unroot, upgrade, weak};

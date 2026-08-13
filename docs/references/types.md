@@ -295,6 +295,8 @@ Type pretty-print: `readonly T`. Arrays and dicts have no method exception — e
 
 ---
 
+Inherent `fn drop()` on a class is a GC-time finalizer (`unit` return, implicit `self` by value). See [`gc`](gc.md).
+
 ## Class `const` fields
 
 ```coil

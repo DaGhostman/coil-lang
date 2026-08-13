@@ -910,6 +910,10 @@ pub enum Member {
 
 pub struct ObjInstance {
     fields: Table<Member>,
+    /// Compile-time class identity (`0` = none / dict / legacy `INIT`).
+    pub type_id: u32,
+    /// Set when `drop` has run (GC or explicit); drop must not run twice.
+    pub finalized: bool,
 }
 
 impl ObjInstance {
@@ -917,6 +921,17 @@ impl ObjInstance {
     pub fn default() -> Self {
         Self {
             fields: Table::default(),
+            type_id: 0,
+            finalized: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_type_id(type_id: u32) -> Self {
+        Self {
+            fields: Table::default(),
+            type_id,
+            finalized: false,
         }
     }
 

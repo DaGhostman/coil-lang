@@ -60,6 +60,9 @@ impl Checker {
             disk_imports: HashSet::new(),
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
+            class_type_ids: std::collections::HashMap::new(),
+            next_class_type_id: 1,
+            classes_with_drop: std::collections::HashSet::new(),
             methods: std::collections::HashMap::new(),
             static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
@@ -2902,12 +2905,13 @@ impl Checker {
             // ---- `test("…") { … }` harness cases ----
             Expression::TestCase { name, body } => self.infer_test_case(name, body, &range),
             Expression::Implementation {
+                what,
                 owner,
                 methods,
                 type_params,
                 ..
             } => {
-                self.infer_impl(owner, type_params, methods, &range);
+                self.infer_impl(what, owner, type_params, methods, &range);
                 unit_ty()
             }
             Expression::Class {
@@ -4192,6 +4196,14 @@ impl Checker {
                 ..
             } = method.1.as_ref()
             {
+                if *method_name == "drop" {
+                    self.messages.push(Message::error(
+                        ErrorCode::InvalidDrop,
+                        "fn drop(self) is only allowed on inherent class impls, not traits"
+                            .to_string(),
+                        method.0.into_range(),
+                    ));
+                }
                 // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
                 let mut method_frame = HashMap::new();
                 let mut method_vars = Vec::new();
@@ -10797,6 +10809,14 @@ impl Checker {
         // Bind the FQN before parsing fields so recursive types
         // (`next: Option<Node<T>>`) resolve to `module::Node`, not a dummy Con.
         self.classes.entry(key.clone()).or_insert_with(Vec::new);
+        if !self.class_type_ids.contains_key(&key) {
+            let id = self.next_class_type_id;
+            self.next_class_type_id = self.next_class_type_id.saturating_add(1);
+            if self.next_class_type_id == 0 {
+                self.next_class_type_id = 1;
+            }
+            self.class_type_ids.insert(key.clone(), id);
+        }
         self.generics
             .register_nominal_type(&key, &self.current_module);
         self.env
@@ -10889,6 +10909,7 @@ impl Checker {
     ///    scheme (poly when the impl is generic) under the owner's name.
     fn infer_impl(
         &mut self,
+        what: &str,
         owner: &str,
         type_params: &[parser::ast::TypeParam<'_>],
         methods: &[Output],
@@ -10924,7 +10945,8 @@ impl Checker {
             Vec::new()
         };
 
-        if !self.classes.contains_key(&owner_key) {
+        let owner_is_class = self.classes.contains_key(&owner_key);
+        if !owner_is_class {
             self.classes.insert(owner_key.clone(), Vec::new());
             self.env
                 .insert_top(owner_key.clone(), Scheme::mono(Ty::Con(owner_key.clone())));
@@ -10984,6 +11006,16 @@ impl Checker {
                     ..
                 } = body.1.as_ref()
                 {
+                    if *name == "drop" {
+                        self.check_drop_decl(
+                            what,
+                            &owner_key,
+                            owner_is_class,
+                            *is_static,
+                            args,
+                            &method.0.into_range(),
+                        );
+                    }
                     let self_ty = if *is_static { None } else { Some(&owner_ty) };
                     // Type params stay in the outer impl frame so `self`
                     // and method annotations share the same variables.
@@ -11000,6 +11032,30 @@ impl Checker {
                         Some(&owner_key),
                         *is_static,
                     );
+                    if *name == "drop" {
+                        let mut ret = apply_ty(&self.subst, &fun_ty);
+                        while let Ty::Fun(_, r) = ret {
+                            ret = *r;
+                        }
+                        match &ret {
+                            Ty::Con(n) if n == "unit" => {}
+                            Ty::Var(_) => {
+                                self.unify(
+                                    &ret,
+                                    &unit_ty(),
+                                    &method.0.into_range(),
+                                    "drop return type",
+                                );
+                            }
+                            _ => {
+                                self.messages.push(Message::error(
+                                    ErrorCode::InvalidDrop,
+                                    "fn drop(self) must return unit".to_string(),
+                                    method.0.into_range(),
+                                ));
+                            }
+                        }
+                    }
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
                     let fqn = format!("{}::{}", owner_key, name);
@@ -11078,6 +11134,44 @@ impl Checker {
         self.active_constraints.truncate(prev_constraints_len);
         self.pop_type_params_for_type_parsing(pushed);
         let _ = range;
+    }
+
+    fn check_drop_decl(
+        &mut self,
+        what: &str,
+        owner_key: &str,
+        owner_is_class: bool,
+        is_static: bool,
+        args: &Output,
+        range: &Range<usize>,
+    ) {
+        let arity = match args.1.as_ref() {
+            Expression::Fragment(items) => items
+                .iter()
+                .filter(|a| matches!(a.1.as_ref(), Expression::Argument { .. }))
+                .count(),
+            _ => 0,
+        };
+        let msg = if !what.is_empty() {
+            Some("fn drop(self) is only allowed on inherent class impls, not trait instances")
+        } else if !owner_is_class {
+            Some("fn drop(self) is only allowed on nominal classes")
+        } else if is_static {
+            Some("fn drop must take self by value; static drop is not allowed")
+        } else if arity != 0 {
+            Some("fn drop(self) must have no extra parameters")
+        } else if !self.classes_with_drop.insert(owner_key.to_string()) {
+            Some("duplicate fn drop(self) for this class")
+        } else {
+            None
+        };
+        if let Some(msg) = msg {
+            self.messages.push(Message::error(
+                ErrorCode::InvalidDrop,
+                msg.to_string(),
+                range.clone(),
+            ));
+        }
     }
 
     /// Look up a class field, substituting type-param placeholders when
@@ -11194,6 +11288,13 @@ impl Checker {
         method_owner: Option<&str>,
         is_static_method: bool,
     ) -> Ty {
+        if name == "drop" && method_owner.is_none() {
+            self.messages.push(Message::error(
+                ErrorCode::InvalidDrop,
+                "fn drop(self) is only allowed as an inherent class method".to_string(),
+                range.clone(),
+            ));
+        }
         let Some(body) = body else {
             return self.error_with_help(
                 ErrorCode::GenericTypeError,
@@ -15176,6 +15277,21 @@ impl Checker {
         } else {
             format!("{}::{}", self.current_module, name)
         }
+    }
+
+    /// Compile-time type id for `InitTyped` (`0` if the name is not a class).
+    pub fn class_type_id(&self, name: &str) -> u32 {
+        let key = self.resolve_class_key(name).unwrap_or_else(|| name.to_string());
+        self.class_type_ids.get(&key).copied().unwrap_or(0)
+    }
+
+    pub fn class_has_drop(&self, name: &str) -> bool {
+        let key = self.resolve_class_key(name).unwrap_or_else(|| name.to_string());
+        self.classes_with_drop.contains(&key)
+    }
+
+    pub fn classes_with_drop(&self) -> impl Iterator<Item = &String> {
+        self.classes_with_drop.iter()
     }
 
     /// Resolve a source identifier or `use` alias to the class table key.
