@@ -31,7 +31,7 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 
 | Topic | Linear |
 |-------|--------|
-| Symbolic-IL `cursor_model` gate | [COI-80](https://linear.app/ardax/issue/COI-80) |
+| Symbolic-IL `cursor_model` gate (done — IL tell vs bytecode in `cursor_model.rs`) | [COI-80](https://linear.app/ardax/issue/COI-80) |
 | Unified cursor (`sp` vs `tell` vs `STORE` floor) | [COI-81](https://linear.app/ardax/issue/COI-81) |
 | Copy-prop / GVN beyond straight-line | [COI-82](https://linear.app/ardax/issue/COI-82) |
 | Slot promotion across loop back-edges | [COI-83](https://linear.app/ardax/issue/COI-83) |
@@ -76,9 +76,7 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 **GC finalizers (v1).** Inherent `impl Foo { fn drop() { … } }` runs at mark-sweep time (and VM teardown), not at last use. Order is unspecified. Storing `self` during drop can keep the cell alive (a footgun, not an API). Enums, generic derive-Drop, and resurrection are out of scope (Linear COI-26).
 
-Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially against the VM; any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test.
-
-Only the *bytecode* half of that model is under the differential gate, and the gap has already cost one bug: `effect_il` gave `Entry{Call}` a delta of `arity - 1` (the correct rule for `JumpIfMatch`) instead of `1 - arity`, so every symbolic-IL cursor past a call was wrong. Extending `cursor_model.rs` to diff the symbolic-IL path as well would close it.
+Cursor rules established from the VM handlers: pushes/pops move it by ±n; `STORE` (packed `n`) pops `n` then raises it to `max(tell, max_written_slot + 1)`; `Seek s` sets it to `s`; `CALL` sets the callee frame base to `tell - arity`, and the matching return seeks back to that base and pushes the result, so the caller-relative effect is `-arity + 1`. The shared bytecode/symbolic-IL model is validated differentially: `tell_cursor_model_matches_vm` diffs bytecode `il::tell` against `machine::cursor_trace`, and `tell_symbolic_il_matches_bytecode` diffs post-opt IL tell against bytecode tell via lower's `pre_to_post` map (COI-80). The old `effect_il` `Entry{Call}` bug (`arity - 1` instead of `1 - arity`) is pinned by `tell_symbolic_il_entry_call_delta_is_not_jump_if_match_arity_minus_one`. Any future widening of copy propagation should preserve that gate because a cursor mistake is silent memory corruption, not a failing test. Fused intermediate IL ops are not compared at their own index (tell-before of the next distinct PC still covers the composed effect); bytecode `Unknown` (loop-header joins, `JumpIfMatch` taken edge) is not required to match a more precise IL `Known`.
 
 **Slot promotion only moves what the cursor proves.** `opt::slot_promote` drops a `STORE t` reached with the cursor at `t + 1` (TOS already *is* slot `t`, so the write and the store's own floor are both no-ops) together with the reload run in front of a `TailCall` whose arguments are already the top `arity` stack positions. It fires only when every surviving reference to the slot is dropped with it, because eliding the store leaves the slot defined by a bare push that no slot-tracking pass can see — hence it also runs *after* per-body GVN. Deliberately refused:
 
