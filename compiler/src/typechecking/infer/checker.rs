@@ -4196,6 +4196,14 @@ impl Checker {
                 ..
             } = method.1.as_ref()
             {
+                if *method_name == "drop" {
+                    self.messages.push(Message::error(
+                        ErrorCode::InvalidDrop,
+                        "fn drop(self) is only allowed on inherent class impls, not traits"
+                            .to_string(),
+                        method.0.into_range(),
+                    ));
+                }
                 // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
                 let mut method_frame = HashMap::new();
                 let mut method_vars = Vec::new();
@@ -11025,16 +11033,28 @@ impl Checker {
                         *is_static,
                     );
                     if *name == "drop" {
-                        let mut ret = fun_ty.clone();
+                        let mut ret = apply_ty(&self.subst, &fun_ty);
                         while let Ty::Fun(_, r) = ret {
                             ret = *r;
                         }
-                        self.unify(
-                            &ret,
-                            &unit_ty(),
-                            &method.0.into_range(),
-                            "drop return type",
-                        );
+                        match &ret {
+                            Ty::Con(n) if n == "unit" => {}
+                            Ty::Var(_) => {
+                                self.unify(
+                                    &ret,
+                                    &unit_ty(),
+                                    &method.0.into_range(),
+                                    "drop return type",
+                                );
+                            }
+                            _ => {
+                                self.messages.push(Message::error(
+                                    ErrorCode::InvalidDrop,
+                                    "fn drop(self) must return unit".to_string(),
+                                    method.0.into_range(),
+                                ));
+                            }
+                        }
                     }
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
