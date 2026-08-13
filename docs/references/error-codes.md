@@ -18,6 +18,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | Code | Name | Meaning |
 |------|------|---------|
 | `E0001` | `ParseError` | Syntax / parse error |
+| `E0208` | `DuplicateField` | Duplicate record field (parse-time for literals, constructors, patterns, and enum variant field decls; typecheck keeps the same code if parse is bypassed). Also duplicate named arguments. |
 | `E0100` | `UnknownValue` | Cannot find value in this scope |
 | `E0101` | `UnknownFunction` | Cannot find function |
 | `E0102` | `TypeMismatch` | Type mismatch |

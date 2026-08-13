@@ -239,7 +239,7 @@ The compiler catches common record mistakes at compile time.
 
 ### Duplicate fields
 
-Supplying the same field twice in a constructor or pattern:
+Supplying the same field twice in a constructor or pattern is a parse error (`E0208`):
 
 ```
 Duplicate field `x` in record constructor `Point`

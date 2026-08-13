@@ -211,7 +211,7 @@ let d = { foo: 42 };
 write_all(stdout(), to_bytes(format("%i", d.bar)));   // error: Cannot find field `bar` on record `{ foo: int }`
 ```
 
-Duplicate field names in one literal are also rejected:
+Duplicate field names in one literal are rejected at parse time (`E0208`):
 
 ```coil
 let bad = { foo: 1, foo: 2 };   // error: Duplicate field `foo`
