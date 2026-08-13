@@ -717,6 +717,81 @@ mod tests {
         assert_eq!(sp.sp_before(3), crate::il::sp::Sp::Known(1));
     }
 
+    /// Discriminator: leftover height + STORE floor. Relative `sp` would be
+    /// `3 + 1 = 4` after `CALL 0`; absolute reset is 1. Tell stays relative
+    /// (`9 + 1 = 10`). Same Call, two different arithmetic models.
+    #[test]
+    fn store_floor_then_call_with_leftover_height_splits_relative_vs_absolute() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::Const { imm: 3, loc },
+            IlOp::Const { imm: 4, loc },
+            IlOp::Entry {
+                kind: EntryKind::Call,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let tell = analyze_il_at(&ops, 0);
+        let sp = crate::il::sp::analyze(&ops);
+        assert_eq!(tell.tell_before(5).known(), Some(9));
+        assert_eq!(tell.tell_before(6).known(), Some(10));
+        assert_eq!(sp.sp_before(5), crate::il::sp::Sp::Known(3));
+        assert_eq!(sp.sp_before(6), crate::il::sp::Sp::Known(1));
+        assert_ne!(
+            sp.sp_before(6).known(),
+            Some(4),
+            "must not apply tell's relative 1-arity to operand height"
+        );
+    }
+
+    /// `MakeCoro` shares Call's tell delta and SP absolute reset after a STORE floor.
+    #[test]
+    fn store_floor_then_make_coro_leaves_tell_above_sp() {
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::StorePop { slot: 5, loc },
+            IlOp::Entry {
+                kind: EntryKind::MakeCoro,
+                arity: 0,
+                target: Label(0),
+                loc,
+            },
+            IlOp::Return { loc },
+        ];
+        let tell = analyze_il_at(&ops, 0);
+        let sp = crate::il::sp::analyze(&ops);
+        assert_eq!(tell.tell_before(2).known(), Some(6));
+        assert_eq!(tell.tell_before(3).known(), Some(7));
+        assert_eq!(sp.sp_before(2), crate::il::sp::Sp::Known(0));
+        assert_eq!(sp.sp_before(3), crate::il::sp::Sp::Known(1));
+    }
+
+    /// `Seek` re-anchors tell but fails closed for `sp` — another non-unifiable pair.
+    #[test]
+    fn seek_sets_tell_but_poisons_operand_height() {
+        use common::{Byte, Instruction};
+        let loc = common::DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Const { imm: 2, loc },
+            IlOp::byte(Byte::new(Instruction::Seek).with_operand_u32(4)),
+            IlOp::Return { loc },
+        ];
+        let tell = analyze_il_at(&ops, 0);
+        let sp = crate::il::sp::analyze(&ops);
+        assert_eq!(tell.tell_before(2).known(), Some(2));
+        assert_eq!(tell.tell_before(3).known(), Some(4));
+        assert_eq!(sp.sp_before(2), crate::il::sp::Sp::Known(2));
+        assert_eq!(sp.sp_before(3), crate::il::sp::Sp::Unknown);
+    }
+
     #[test]
     fn store_to_a_low_slot_does_not_lower_the_cursor() {
         // Height returns to 3, but the floor of 1 must not pull the cursor down.
