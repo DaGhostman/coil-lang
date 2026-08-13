@@ -65,6 +65,8 @@ If the `[module]` section is omitted entirely, roots default to `["src"]`.
 
 If `[module]` is present but `roots` is omitted, roots also default to `["src"]`.
 
+Compiler builtins (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `coil.toml`. Every file always gets the implicit prelude; FFI still requires an explicit `use`. Extra disk search directories belong in `roots`.
+
 ### `[entry]`
 
 | Key | Type | Required | Description |
@@ -314,22 +316,6 @@ project/
 ├── .spool/deps/       # managed symlinks into the shared spool cache
 └── .deps/coil-stdlib/ # optional local checkout (use .deps/coil-stdlib/src as a root)
 ```
-
----
-
-## Reserved / future keys
-
-The parser currently accepts only the keys documented above. Future versions may add keys such as:
-
-```toml
-[module]
-preludes = ["./stdlib/src"]   # customize auto-imports (not yet implemented)
-strict   = true           # reject undefined names at typecheck (not yet implemented)
-```
-
-These are recognized in planning documents but **ignored or rejected** by the current parser. Do not rely on them.
-
-Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `coil.toml` today. Every file always gets the implicit prelude; FFI still requires an explicit `use`.
 
 ---
 
