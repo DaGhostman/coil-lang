@@ -2726,3 +2726,25 @@ fn dump<T: Ord>(T a, T b) {
         msgs
     );
 }
+
+#[test]
+fn range_numeric_step_help_mentions_to_vec_and_successor() {
+    let msgs = check_messages(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#,
+    );
+    let help = msgs.iter().find_map(|m| {
+        m.message()
+            .contains("cannot iterate")
+            .then(|| m.help().clone())
+            .flatten()
+    });
+    let help = help.expect("expected help on cannot-iterate for Range.to_vec");
+    assert!(
+        help.contains(".to_vec()") && help.contains("successor"),
+        "help should pin shared for/.to_vec numeric-step policy, got: {help:?}"
+    );
+}

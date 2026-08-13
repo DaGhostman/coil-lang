@@ -2114,6 +2114,97 @@ fn main() {
     assert_eq!(output, "5,4,0,2,3");
 }
 
+/// `.to_vec()` must yield the same sequence as `for` (shared LE/LEQ + step).
+#[test]
+fn range_to_vec_matches_for_in_elements() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    for x in 0..=3 {
+        write(stdout(), to_bytes(format("%i", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let v = (0..=3).to_vec();
+    let i = 0;
+    while i < v.len() {
+        write(stdout(), to_bytes(format("%i", v[i])));
+        i = i + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (7..=7).to_vec()[0])));
+    write(stdout(), to_bytes("|"));
+    for x in 1.0..=3.0 {
+        write(stdout(), to_bytes(format("%f", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let f = (1.0..=3.0).to_vec();
+    let j = 0;
+    while j < f.len() {
+        write(stdout(), to_bytes(format("%f", f[j])));
+        j = j + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (4.0..1.0).to_vec().len())));
+}
+"#,
+    );
+    assert_eq!(output, "0123|0123|7|1.02.03.0|1.02.03.0|0");
+}
+
+/// Int `to_vec` thunks use ADD/LE(Q); float sibling thunks use ADDF/LE(Q)F.
+#[test]
+fn range_to_vec_thunks_use_int_vs_float_opcodes() {
+    let src = r#"
+fn main() {
+    let _a = (0..3).to_vec();
+    let _b = (0..=2).to_vec();
+    let _c = (1.0..3.0).to_vec();
+    let _d = (1.0..=2.0).to_vec();
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("range to_vec compile");
+    let syms = pipeline.program_debug().fn_symbols;
+    let body = |name: &str| {
+        let idx = syms
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| panic!("missing `{name}`; have {:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>()));
+        let start = syms[idx].entry_pc as usize;
+        let end = syms
+            .get(idx + 1)
+            .map(|s| s.entry_pc as usize)
+            .unwrap_or(bytecode.len());
+        &bytecode[start..end]
+    };
+    let has = |slice: &[common::Byte], op: common::Instruction| {
+        slice.iter().any(|b| *b.bytecode() == op)
+    };
+    let int_half = body("Range::to_vec");
+    assert!(has(int_half, common::Instruction::ADD), "int half-open needs ADD");
+    assert!(has(int_half, common::Instruction::LE), "int half-open needs LE");
+    assert!(!has(int_half, common::Instruction::ADDF), "int half-open must not use ADDF");
+    assert!(!has(int_half, common::Instruction::LEF), "int half-open must not use LEF");
+
+    let int_inc = body("RangeInclusive::to_vec");
+    assert!(has(int_inc, common::Instruction::ADD), "int inclusive needs ADD");
+    assert!(has(int_inc, common::Instruction::LEQ), "int inclusive needs LEQ");
+    assert!(!has(int_inc, common::Instruction::ADDF));
+
+    let float_half = body("Range::__float_to_vec");
+    assert!(has(float_half, common::Instruction::ADDF), "float half-open needs ADDF");
+    assert!(has(float_half, common::Instruction::LEF), "float half-open needs LEF");
+    assert!(!has(float_half, common::Instruction::ADD), "float half-open must not use int ADD");
+    assert!(!has(float_half, common::Instruction::LE), "float half-open must not use int LE");
+
+    let float_inc = body("RangeInclusive::__float_to_vec");
+    assert!(has(float_inc, common::Instruction::ADDF), "float inclusive needs ADDF");
+    assert!(has(float_inc, common::Instruction::LEQF), "float inclusive needs LEQF");
+    assert!(!has(float_inc, common::Instruction::LEQ), "float inclusive must not use int LEQ");
+}
+
 /// Regression guard: `resume h` used INLINE as a `print` argument
 /// (no intermediate `let` binding) must not corrupt the operand
 /// stack. Pre-fix, the bare `yield expr;` statement's spurious
