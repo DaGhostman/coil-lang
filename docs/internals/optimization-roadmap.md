@@ -119,11 +119,11 @@ What neither slice does yet (see
 - **Real slot liveness.** Without it, promotion must leave every slot with a
   visible def, which rules out `CALL` operand runs (the callee frame base is
   `tell - arity`) and any store whose slot is still read.
-- **Cursor normalization at loop back edges.** `mandelbrot`'s inner loop enters
-  with cursor 10 and re-enters with 13, so its header is `Unknown` and none of
-  its 3 body stores are provably redundant. A `Seek` on the back edge would make
-  the header `Known` and turn all three into self-stores — one dispatch per
-  iteration against three stores, worth measuring.
+- **Cursor normalization at loop back edges (COI-97, won't-do in production).**
+  Innermost mandelbrot has no tell-proven self-stores. A `Seek` on an *outer*
+  latch drops `cr`'s store and splits `FloatChainStore`. Prototype lives behind
+  `seek_back_edge` (default off); tests use a synthetic raising loop because
+  mandelbrot does not hit the profitable shape.
 - **Scheduling.** `mandelbrot`'s `tr → zr` copy cannot coalesce because `zr` is
   read between the def and the copy; sinking the def past that read is the fix.
 - **`Bin(slot, TOS)` operand shapes.** `mandelbrot`'s remaining `LOAD 5` / `LOAD

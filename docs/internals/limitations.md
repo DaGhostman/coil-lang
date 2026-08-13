@@ -34,8 +34,8 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 |-------|--------|
 | Symbolic-IL `cursor_model` gate (done — IL tell vs bytecode in `cursor_model.rs`) | [COI-80](https://linear.app/ardax/issue/COI-80) |
 | Cursor split (`sp` vs `tell`) — **decided: keep** (operand height ≠ STORE floor) | [COI-81](https://linear.app/ardax/issue/COI-81) |
-| Copy-prop / GVN beyond straight-line | [COI-82](https://linear.app/ardax/issue/COI-82) |
-| Slot promotion across loop back-edges | [COI-83](https://linear.app/ardax/issue/COI-83) |
+| Copy-prop / GVN beyond straight-line — **decided: keep ceiling** (intra-block GVN + join-sink; copy-prop straight-line; no SSA rename / Dup-CSE) | [COI-82](https://linear.app/ardax/issue/COI-82) |
+| Slot promotion across loop back-edges — **decided: keep Unknown headers** ([COI-97](https://linear.app/ardax/issue/COI-97) measured: innermost mandelbrot has no self-stores; outer Seek splits FloatChain) | [COI-83](https://linear.app/ardax/issue/COI-83) |
 | Named-local class scalar replacement | [COI-84](https://linear.app/ardax/issue/COI-84) |
 | Bounds analysis vs `IndexUnchecked` | [COI-85](https://linear.app/ardax/issue/COI-85) |
 | Caller-side predicate peel vs self-recursion | [COI-86](https://linear.app/ardax/issue/COI-86) |
@@ -96,7 +96,7 @@ The shared bytecode/symbolic-IL tell model is validated differentially: `tell_cu
 | Reload run in front of `CALL` | The callee frame base is `tell - arity`; a lower `tell` moves it down over caller slots, which needs slot liveness |
 | `LOAD t; RETURN` (cursor-provable) | Measured net loss: it is the suffix the whole-buffer return convoys sink into a join, and eliding it in one predecessor kills the sink |
 | Coalescing a copy whose destination is read in between | `mandelbrot`'s `tr → zr` needs the def sunk past the `zi` read — scheduling, not promotion |
-| Anything inside a loop whose body raises the cursor | The header cursor is genuinely `Unknown` (see `il::tell`), so no store in the body is provably redundant. This is what still holds `mandelbrot`'s 13 STOREs: normalizing the back edge with a `Seek` would make the header `Known` and turn all three inner temps into self-stores, at one dispatch per iteration |
+| Anything inside a loop whose body raises the cursor | The header cursor is genuinely `Unknown` (see `il::tell`). **COI-97 measured:** a `Seek` on the latch makes the header `Known` and drops in-loop self-stores (synthetic IL). Mandelbrot's innermost body has none — residual STOREs are real moves / `tr→zr` latch copies, not `tell == slot+1`. Applying the same Seek to an *outer* loop (x/y) drops `cr`'s store and splits `FloatChainStore` (4→3). Pass stays off (`seek_back_edge`). |
 | Pool-packed fused slot operands (`BinSlot*Store` / `BinSlot*Jmpf`), `Seek`, `UnpackAt` | Destination slot is not readable from symbolic IL — the whole body is refused |
 
 **Counted-loop bounds analysis proves length invariance, not in-bounds indices.** `il::bounds` answers one question per natural loop: can the length of the arrays this loop addresses change while it runs? Element writes cannot — `StoreIndex` overwrites a slot in place — so `while i < len(a) { a[i] = 0; }` has an invariant `len(a)` even though the array is mutated. On that proof two invariant materializations move to the preheader: the `LOAD a; ArrayLen; STORE t` triple codegen leaves in the loop header, and the `CONST imm; STORE t` pair that materializes a constant addressing operand (`vec_scan` 6.58M → 5.01M dispatches, `nsieve` 545.6k → 469.9k). **No bounds check is removed**: `Index` / `StoreIndex` keep the in-VM range test, so an out-of-range read still yields `-1` and an out-of-range write is still a no-op.
