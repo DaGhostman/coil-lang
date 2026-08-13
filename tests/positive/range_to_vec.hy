@@ -42,3 +42,31 @@ test("float exclusive and inclusive") {
     assert(closed.len() == 3)?;
     assert(closed[2] == 3.0)?;
 }
+
+test("singleton inclusive and decreasing float") {
+    let one = (7..=7).to_vec();
+    assert(one.len() == 1)?;
+    assert(one[0] == 7)?;
+    let empty_f = (3.0..1.0).to_vec();
+    assert(empty_f.len() == 0)?;
+    let empty_fi = (2.0..=0.0).to_vec();
+    assert(empty_fi.len() == 0)?;
+}
+
+test("to_vec matches for-in elements") {
+    let v = (0..=3).to_vec();
+    let i = 0;
+    for x in 0..=3 {
+        assert(v[i] == x)?;
+        i = i + 1;
+    }
+    assert(i == v.len())?;
+
+    let f = (1.0..4.0).to_vec();
+    let j = 0;
+    for x in 1.0..4.0 {
+        assert(f[j] == x)?;
+        j = j + 1;
+    }
+    assert(j == f.len())?;
+}
