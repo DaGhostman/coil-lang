@@ -1841,6 +1841,70 @@
         );
     }
 
+    /// COI-74: `case` stays a legal binding even inside real `match` patterns.
+    #[test]
+    fn case_can_be_a_match_pattern_binding() {
+        let ast = expr_ast!("match x { case => case, Option::Some(case) => case }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                match &arms[0].pattern.1 {
+                    Pattern::Binding { name } => assert_eq!(*name, "case"),
+                    other => panic!("expected Binding(case), got {:?}", other),
+                }
+                match &arms[1].pattern.1 {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload,
+                    } => {
+                        assert_eq!(*enum_name, "Option");
+                        assert_eq!(*variant_name, "Some");
+                        match payload {
+                            PatternPayload::Tuple(parts) => {
+                                assert_eq!(parts.len(), 1);
+                                match &parts[0].1 {
+                                    Pattern::Binding { name } => assert_eq!(*name, "case"),
+                                    other => panic!("expected Binding(case), got {:?}", other),
+                                }
+                            }
+                            other => panic!("expected Tuple payload, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Constructor(Option::Some(case)), got {:?}", other),
+                }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    /// COI-74: a real `match` must not enable `case` as a nested synonym.
+    #[test]
+    fn nested_case_inside_match_arm_is_parse_error_not_match() {
+        let src = "match x { _ => case y { _ => 0 } }";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Match { arms, .. } => {
+                    for arm in arms {
+                        if matches!(arm.body.1.as_ref(), Expression::Match { .. }) {
+                            panic!("{src} must not nest Match via case synonym");
+                        }
+                    }
+                    panic!("{src} must be a parse error, not a Match with non-Match arm body");
+                }
+                other => panic!(
+                    "{src} must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";
