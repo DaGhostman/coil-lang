@@ -9,6 +9,7 @@
 //! Limitations: no SSA rename of slots; effectful ops (`StorePop`, calls,
 //! HostInvoke, SetField, …) are barriers; does not replace Ord-sensitive convoy
 //! refuse rules — GVN feeds cleaner identical tails into those passes.
+//! COI-82: this intra-block + join-sink ceiling is the contract; no CFG copy-prop.
 
 use std::collections::{HashMap, HashSet};
 
