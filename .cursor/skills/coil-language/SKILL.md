@@ -25,7 +25,7 @@ cargo build --workspace
 cargo run -- examples/fib.hy          # in-memory compile + run (no out.hyc)
 cargo run -- compile examples/fib.hy    # writes out.hyc (or -o path)
 cargo run -- test                     # discover **/*.hy under ./tests
-ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
+cargo build --bin coil && (ulimit -v 65536; ./target/debug/coil test)  # 64MB leak check
 ```
 
 | Goal | Command |
