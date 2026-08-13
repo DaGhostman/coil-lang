@@ -564,6 +564,8 @@ match p {
 }
 ```
 
+`match` copies the scrutinee (fields included). Nested `match` on the same value is allowed; outer pattern bindings stay in scope unless an inner pattern shadows them. See [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee).
+
 ---
 
 ## Type annotations

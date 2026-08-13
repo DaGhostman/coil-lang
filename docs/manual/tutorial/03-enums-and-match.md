@@ -238,6 +238,33 @@ The two `Result::Ok` arms share the outer tag but differ on the inner `Option` t
 
 ---
 
+## `match` does not consume the scrutinee
+
+Matching copies the scrutinee. A class field is read, not taken: the original local or field is still there afterward, so you can match the same `Option` field twice — including nested `match` on `node.left` — without copying it to a `let` first.
+
+Pattern bindings from an outer arm stay in scope in a nested `match`. An inner pattern that reuses the same name shadows the outer one:
+
+```coil
+class Node {
+    val: int,
+    left: Option<Node>,
+}
+
+fn left_twice(Node n) -> int {
+    return match n.left {
+        Option::Some(child) => match n.left {
+            Option::Some(child2) => child.val + child2.val,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+```
+
+`child` is still the outer payload; `n.left` is still `Some`. Coil has no use-after-move on `match`.
+
+---
+
 ## Recursive enums
 
 Variants can reference their own enum type, enabling tree-like structures. From `examples/tree.hy`:
