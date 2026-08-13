@@ -4136,3 +4136,46 @@
         let sized = Machine::<16>::with_operand_capacity(512);
         assert_eq!(sized.operand_stack_capacity(), 512);
     }
+
+    #[test]
+    fn init_typed_stamps_type_id() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            Byte::new(Instruction::InitTyped).with_operand_u32(7),
+            Byte::new(Instruction::HALT),
+        ]);
+        vm.collect_garbage();
+        let v = vm.pop();
+        assert_eq!(vm.instance_meta(v), Some((7, false)));
+    }
+
+    #[test]
+    fn finalizer_registry_round_trip() {
+        let mut vm = Machine::<8>::default();
+        vm.register_finalizer_for_test(3, 99);
+        assert_eq!(vm.finalizer_pc(3), Some(99));
+        assert_eq!(vm.finalizer_pc(1), None);
+    }
+
+    #[test]
+    fn teardown_runs_remaining_finalizers() {
+        // JMP over drop; drop PRINT "closed"; main allocates a typed instance.
+        let strings = vec!["closed".to_string()];
+        let bytecode = vec![
+            Byte::new(Instruction::JMP).with_operand_u32(5),
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::PRINT),
+            const_int(0),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::InitTyped).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<8>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+        vm.register_finalizer_for_test(1, 1);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, "closed");
+    }

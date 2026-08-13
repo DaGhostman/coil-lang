@@ -110,6 +110,15 @@ pub fn host_gc_collect_stub(_heap: &mut Heap, _args: &[Value]) -> Value {
     Value::from(0i64)
 }
 
+/// Registry name for [`host_gc_register_finalizer_stub`]; the VM HostInvoke
+/// path records `type_id → drop PC` when it sees this name.
+pub const GC_REGISTER_FINALIZER_NATIVE: &str = "gc_register_finalizer";
+
+/// Stub for compiler prologue registration — the VM replaces this.
+pub fn host_gc_register_finalizer_stub(_heap: &mut Heap, _args: &[Value]) -> Value {
+    Value::from(0i64)
+}
+
 /// Registry names / arities for [`crate::host_natives::build_standard_host_natives`].
 ///
 /// Append-only: keep prior ids stable.
@@ -121,6 +130,7 @@ pub const GC_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] = &[
     ("gc_upgrade", 1, host_gc_upgrade),
     ("gc_heap_bytes", 0, host_gc_heap_bytes),
     (GC_COLLECT_NATIVE, 0, host_gc_collect_stub),
+    (GC_REGISTER_FINALIZER_NATIVE, 2, host_gc_register_finalizer_stub),
 ];
 
 #[cfg(test)]
@@ -334,7 +344,7 @@ mod tests {
 
     #[test]
     fn gc_wiring_names_and_arities_are_stable() {
-        assert_eq!(GC_WIRING.len(), 7);
+        assert_eq!(GC_WIRING.len(), 8);
         let expected = [
             ("gc_root", 1),
             ("gc_unroot", 1),
@@ -343,6 +353,7 @@ mod tests {
             ("gc_upgrade", 1),
             ("gc_heap_bytes", 0),
             (GC_COLLECT_NATIVE, 0),
+            (GC_REGISTER_FINALIZER_NATIVE, 2),
         ];
         for (i, (name, arity)) in expected.iter().enumerate() {
             assert_eq!(GC_WIRING[i].0, *name);
