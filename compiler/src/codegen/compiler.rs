@@ -9531,9 +9531,26 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
-                children.iter().for_each(|child| {
-                    bytecode.append(&mut self.do_compile(child));
-                });
+                // Emit phases (COI-109):
+                // 0 = decls / trait impls, 1 = free fns (not main),
+                // 2 = inherent `impl`, 3 = `main` + `test`.
+                // Free helpers must precede inherent methods; methods must
+                // precede `main`/`test` call sites. Function bodies are only
+                // entered via CALL.
+                let phase = |c: &Output| -> u8 {
+                    match c.1.as_ref() {
+                        Expression::Function { name, .. } if *name == "main" => 3,
+                        Expression::Function { .. } => 1,
+                        Expression::Implementation { .. } => 2,
+                        Expression::TestCase { .. } => 3,
+                        _ => 0,
+                    }
+                };
+                for p in 0..=3u8 {
+                    for child in children.iter().filter(|c| phase(c) == p) {
+                        bytecode.append(&mut self.do_compile(child));
+                    }
+                }
                 if !self.test_cases.is_empty() && !self.user_main_defined {
                     self.emit_virtual_test_main();
                 }
@@ -9798,14 +9815,6 @@ impl Compiler {
                 let prev_fn_table_key = self.current_function_table_key.take();
                 self.current_function_qualified = Some(qualified.clone());
                 self.current_function_table_key = Some(table_key.clone());
-                // Sync checker so `is_ffi_declare_variadic_for_fn_id` can see
-                // param call-site `declare` metadata for bare fn-id params.
-                let prev_checker_fn = if !self.compiling_method {
-                    self.checker
-                        .set_current_function(Some(name.to_string()))
-                } else {
-                    None
-                };
                 self.push_const_env();
                 self.context.variables = Interner::default();
                 self.context.stack_array_locals.clear();
@@ -9883,9 +9892,6 @@ impl Compiler {
                 self.compiling_pair_mode = prev_pair_mode;
                 self.compiling_pair_is_option = prev_pair_is_option;
                 self.pop_const_env();
-                if !self.compiling_method {
-                    self.checker.set_current_function(prev_checker_fn);
-                }
                 self.current_function_qualified = prev_fn_qualified;
                 self.current_function_table_key = prev_fn_table_key;
                 self.field_key_slots = prev_field_keys;
