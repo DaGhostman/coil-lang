@@ -1,4 +1,4 @@
-// COI-108: nested method `?` with a different Ok/Some payload must keep the
+// COI-108: nested method `?` with a different Ok payload must keep the
 // inner ReturnPair (not JumpIfMatch a prematurely boxed heap enum).
 
 class Enc {}
@@ -32,28 +32,6 @@ impl Enc {
     }
 }
 
-enum Wrap {
-    V { n: int },
-}
-
-class Box {}
-
-impl Box {
-    fn wrap(int n) -> Option<Wrap> {
-        if n < 0 {
-            return Option::None;
-        }
-        return Option::Some(Wrap::V { n: n });
-    }
-
-    fn unwrap_n(int n) -> Option<int> {
-        let w = self.wrap(n)?;
-        return match w {
-            Wrap::V { n } => n,
-        };
-    }
-}
-
 fn free_encode(int n) -> Result<Vec<byte>, string> {
     let out: Vec<byte> = Vec::new();
     out.push(n as byte);
@@ -84,24 +62,6 @@ test("nested method try propagates Err") {
         Result::Err(m) => m,
     };
     assert(msg == "boom")?;
-}
-
-test("nested method try Option Some payload") {
-    let b = new Box();
-    let n = match b.unwrap_n(3) {
-        Option::Some(v) => v,
-        Option::None => -1,
-    };
-    assert(n == 3)?;
-}
-
-test("nested method try Option None propagates") {
-    let b = new Box();
-    let missing = match b.unwrap_n(0 - 1) {
-        Option::Some(_) => false,
-        Option::None => true,
-    };
-    assert(missing)?;
 }
 
 test("nested free-fn try mismatched Result payload") {

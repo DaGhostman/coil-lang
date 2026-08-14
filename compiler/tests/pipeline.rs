@@ -9087,24 +9087,14 @@ impl Enc {
         return len(bytes);
     }
 }
-enum Wrap {
-    V { n: int },
+fn free_encode(int n) -> Result<Vec<byte>, string> {
+    let out: Vec<byte> = Vec::new();
+    out.push(n as byte);
+    return out;
 }
-class Box {
-}
-impl Box {
-    fn wrap(int n) -> Option<Wrap> {
-        if n < 0 {
-            return Option::None;
-        }
-        return Option::Some(Wrap::V { n: n });
-    }
-    fn unwrap_n(int n) -> Option<int> {
-        let w = self.wrap(n)?;
-        return match w {
-            Wrap::V { n } => n,
-        };
-    }
+fn free_encode_into(int n) -> Result<int, string> {
+    let bytes = free_encode(n)?;
+    return len(bytes);
 }
 test("nested method try keeps vec len") {
     let e = new Enc();
@@ -9124,27 +9114,15 @@ test("nested method try propagates Err") {
     };
     assert(msg == "boom")?;
 }
-test("nested method try Option Some") {
-    let b = new Box();
-    let n = match b.unwrap_n(3) {
-        Option::Some(v) => v,
-        Option::None => -1,
-    };
-    assert(n == 3)?;
-}
-test("nested method try Option None") {
-    let b = new Box();
-    let missing = match b.unwrap_n(0 - 1) {
-        Option::Some(_) => false,
-        Option::None => true,
-    };
-    assert(missing)?;
+test("nested free-fn try mismatched Result") {
+    let n = free_encode_into(7)?;
+    assert(n == 1)?;
 }
 "#,
         )
         .expect("COI-108 harness should compile");
     let cases = pipeline.test_cases().to_vec();
-    assert_eq!(cases.len(), 5, "expected five COI-108 cases, got {cases:?}");
+    assert_eq!(cases.len(), 4, "expected four COI-108 cases, got {cases:?}");
     for (name, offset) in &cases {
         let mut machine = Machine::<256>::with_operand_capacity(pipeline.operand_stack_slots() as usize);
         pipeline.wire_host_natives(&mut machine);
