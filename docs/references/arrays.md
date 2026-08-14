@@ -68,7 +68,7 @@ match v.pop() {
 | `v.clear()` | Drop all elements |
 | `v.reserve(n)` | Ensure capacity for `len + n` |
 | `v.capacity()` / `v.len()` | Ints |
-| `v[i]` / `v[i] = x` | Index get/set |
+| `v[i]` / `v[i] = x` | Index get/set (see [Out-of-range index](#out-of-range-index)) |
 | `(0..n).to_vec()` | Collect a numeric `Range` / `RangeInclusive` into `Vec<T>` |
 
 Rest parameters `T... xs` pack into `Vec<T>`. Spread accepts both `[T; N]` and
@@ -78,6 +78,17 @@ Numeric ranges (`int` / `byte` / `float`) expose inherent `.to_vec()` — same
 step and empty-decreasing rule as `for`. See [Ranges](syntax.md#ranges-lazy).
 
 IO buffers (`to_bytes`, `read`/`write`) use `Vec<byte>`.
+
+## Out-of-range index
+
+Runtime `a[i]` / `v[i]` does not panic. A negative or too-large index, or a
+non-array target, yields the integer `-1`. A write `v[i] = x` with a bad index
+is a no-op; the expression still produces `x`. Literal OOB on `[T; N]` and
+tuples is a compile error.
+
+`Index` / `StoreIndex` keep that in-VM check even when `il::bounds` has proved
+length invariance ([COI-85](https://linear.app/ardax/issue/COI-85)). Prefer
+`i < len(a)` in loops.
 
 ---
 

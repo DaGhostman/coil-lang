@@ -538,6 +538,124 @@
         assert_eq!(vm.pop().as_int(), 6);
     }
 
+    /// Docs contract: `Index` never panics — too-large / negative / non-array
+    /// targets yield the integer `-1` (COI-85 keeps the check in-VM).
+    #[test]
+    fn index_oob_and_non_array_yield_minus_one() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(2),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "too-large array Index");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            const_int(5),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "too-large tuple Index");
+
+        let neg1 = Value::from(-1_i64).raw() as u64;
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(
+            &[
+                const_int(10),
+                const_int(20),
+                Byte::new(Instruction::MakeArray).with_operand_u32(2),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::Index),
+                Byte::new(Instruction::HALT),
+            ],
+            &[neg1],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), -1, "negative array Index");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "non-array Index");
+    }
+
+    /// Docs contract: `StoreIndex` with a bad index is a no-op and still
+    /// leaves `x` on the stack.
+    #[test]
+    fn store_index_oob_is_noop_and_pushes_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(99),
+            const_int(7),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 7, "OOB StoreIndex still pushes value");
+
+        // Array still [10, 20] — re-index both slots.
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(5),
+            const_int(99),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::POP),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 10, "slot 0 unchanged after OOB store");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(5),
+            const_int(99),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::POP),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 20, "slot 1 unchanged after OOB store");
+
+        // Non-array target: still a no-op that pushes the value.
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            const_int(9),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 9, "non-array StoreIndex pushes value");
+    }
+
     /// Empty MakeTuple / MakeArray still allocate a rooted aggregate.
     #[test]
     fn make_tuple_and_array_arity0() {
