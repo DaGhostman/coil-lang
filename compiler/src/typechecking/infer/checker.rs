@@ -12908,6 +12908,11 @@ impl Checker {
             return;
         }
 
+        // Discard diagnostics from this stub: aliases/traits/classes used in
+        // signatures may not be registered yet. Real inference rebinds the
+        // scheme; forward call sites only need a best-effort shape.
+        let msg_len = self.messages.len();
+
         // Mirror `infer_function`'s binder setup so forward calls from
         // earlier `impl` bodies see a real poly scheme + constraints.
         let is_generic = !type_params.is_empty();
@@ -12993,6 +12998,7 @@ impl Checker {
         } else {
             self.env.insert_top(key, Scheme::mono(fun_ty));
         }
+        self.messages.truncate(msg_len);
     }
 
     /// Pre-pass: register enum shapes before main inference (forward refs).
