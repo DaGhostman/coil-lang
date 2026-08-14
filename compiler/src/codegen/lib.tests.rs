@@ -6550,10 +6550,9 @@ fn main() {
         let (bc, _) = compile_src(
             r#"
 class Svc {}
-enum Node { Obj { v: int } }
 impl Svc {
-    fn maybe() -> Option<Node> {
-        return Node::Obj { v: 7 };
+    fn maybe() -> Option<int> {
+        return Option::Some(7);
     }
 }
 fn main() {

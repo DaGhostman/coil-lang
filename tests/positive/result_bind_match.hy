@@ -12,14 +12,14 @@ impl Svc {
     }
 
     fn fail() -> Result<Node, string> {
-        return "boom";
+        raise "boom";
     }
 
-    fn maybe(int flag) -> Option<Node> {
+    fn maybe(int flag) -> Option<int> {
         if flag == 0 {
             return Option::None;
         }
-        return Node::Obj { v: flag };
+        return Option::Some(flag);
     }
 }
 
@@ -59,9 +59,7 @@ test("method option Some bind then match") {
     let s = new Svc();
     let o = s.maybe(7);
     let v = match o {
-        Option::Some(n) => match n {
-            Node::Obj { v } => v,
-        },
+        Option::Some(v) => v,
         Option::None => -1,
     };
     assert(v == 7)?;

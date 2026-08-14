@@ -8933,13 +8933,13 @@ impl Svc {
         return Node::Obj { v: 42 };
     }
     fn fail() -> Result<Node, string> {
-        return "boom";
+        raise "boom";
     }
-    fn maybe(int flag) -> Option<Node> {
+    fn maybe(int flag) -> Option<int> {
         if flag == 0 {
             return Option::None;
         }
-        return Node::Obj { v: flag };
+        return Option::Some(flag);
     }
 }
 test("bind method result Ok payload") {
@@ -8967,9 +8967,7 @@ test("bind method option Some/None") {
     let some = s.maybe(7);
     let none = s.maybe(0);
     let v = match some {
-        Option::Some(n) => match n {
-            Node::Obj { v } => v,
-        },
+        Option::Some(v) => v,
         Option::None => -1,
     };
     let is_none = match none {
