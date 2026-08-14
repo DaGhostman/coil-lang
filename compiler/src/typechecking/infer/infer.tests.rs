@@ -4375,6 +4375,34 @@ fn main() {
         );
     }
 
+    /// Inherent methods must not bind their short name in env (COI-115).
+    /// `impl Path { fn join }` would otherwise shadow `fn join` / `use path::{join}`.
+    #[test]
+    fn inherent_method_does_not_bind_bare_name() {
+        let src = r#"
+class P { x: int }
+impl P {
+    fn join(P other) -> P {
+        return other;
+    }
+}
+fn join(string a, string b) -> string {
+    return a;
+}
+fn main() {
+    let s = join("ok", "");
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let s_ty = c.codegen_var_type("s").expect("s");
+        assert_eq!(apply_ty_prune(c.subst(), s_ty).to_string(), "string");
+    }
+
     #[test]
     fn yield_outside_async_is_diagnostic() {
         let (c, _) = check("fn main() { yield 1; }");

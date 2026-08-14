@@ -11878,8 +11878,13 @@ impl Checker {
 
         if !is_generic {
             let resolved = apply_ty_prune(&self.subst, &fun_ty);
-            self.env
-                .insert_top(name.to_string(), Scheme::mono(resolved));
+            if let Some(owner) = method_owner {
+                self.env
+                    .insert_top(format!("{owner}::{name}"), Scheme::mono(resolved));
+            } else {
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(resolved));
+            }
         }
 
         let abstract_bindings = self.abstract_constraint_bindings.pop().unwrap_or_default();
