@@ -696,24 +696,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prelude_char_ord_follow_crypto_without_regex_gap() {
+    fn host_native_table_has_no_regex_entries() {
         let mut registrations = Vec::new();
         build_standard_host_natives(|name, id| {
             registrations.push((name.to_string(), id));
         });
+        let regex: Vec<_> = registrations
+            .iter()
+            .filter(|(name, _)| name.starts_with("regex_"))
+            .collect();
+        assert!(
+            regex.is_empty(),
+            "regex HostInvoke slots must not be registered: {:?}",
+            regex
+        );
         let ord = registrations
             .iter()
             .position(|(name, _)| name == "ord")
             .expect("ord registration");
         assert_eq!(registrations[ord - 1].0, "char");
-        assert!(
-            !registrations.iter().any(|(name, _)| name.starts_with("regex_")),
-            "regex HostInvoke slots must not be registered: {:?}",
-            registrations
-                .iter()
-                .filter(|(name, _)| name.starts_with("regex_"))
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
