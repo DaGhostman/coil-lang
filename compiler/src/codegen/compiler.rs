@@ -12029,8 +12029,9 @@ impl Compiler {
                         return bytecode;
                     }
                     // `Class::static_method(...)` — same surface as enum
-                    // Construct; lower to a direct CALL when registered.
-                    if let Some(offset) = self.functions.get(&fqn).copied() {
+                    // Construct; lower to a direct CALL or Entry{Call} when
+                    // the method is compiled or reserved (COI-108 forward).
+                    if self.functions.contains_key(&fqn) || self.fn_entry_labels.contains_key(&fqn) {
                         let arg_slice: &[Output] = match fields {
                             EnumConstructPayload::Unit => &[],
                             EnumConstructPayload::Tuple(args) => args.as_slice(),
@@ -12040,18 +12041,17 @@ impl Compiler {
                                 }
                                 // Record form is a type error for static
                                 // methods; still emit a CALL for recovery.
-                                bytecode.push(
-                                    Byte::new(Instruction::CALL)
-                                        .with_call_packed(parts.len() as u32, offset as u32),
+                                let _ = self.emit_direct_fn_call(
+                                    &mut bytecode,
+                                    &fqn,
+                                    parts.len() as u32,
                                 );
                                 return bytecode;
                             }
                         };
                         let arity =
                             self.emit_call_args_with_rest(&fqn, arg_slice, &mut bytecode, false);
-                        bytecode.push(
-                            Byte::new(Instruction::CALL).with_call_packed(arity, offset as u32),
-                        );
+                        let _ = self.emit_direct_fn_call(&mut bytecode, &fqn, arity);
                         return bytecode;
                     }
                     match fields {
