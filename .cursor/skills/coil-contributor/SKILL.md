@@ -64,7 +64,7 @@ Stack IL: symbolic labels until `finalize_bytecode` → single `il::lower` after
 ```bash
 cargo check --workspace          # lint gate (clippy has known Gc exception)
 cargo test --workspace --lib --tests --bins   # required; includes */tests/* (skip Criterion benches)
-# Bare optional stack (crypto/time/regex/tls tests cfg-skipped):
+# Bare optional stack (crypto/time/tls tests cfg-skipped):
 #   cargo test --workspace --lib --tests --bins --no-default-features
 # Feature compile-gates / tooling (match CI matrix job titles):
 #   cargo check --workspace --lib --tests --bins --no-default-features --features tls
@@ -98,9 +98,9 @@ rm -f out.hyc && cargo run --release -- examples/fib.hy   # expect 55 (default r
 
 Auto: `prelude`, `prelude::ops`, `prelude::test`, `prelude::math`.
 
-Explicit `use`: `ffi`, `io`, `thread`, `regex`, `crypto`, `time`, `env`, `string`, `gc`.
+Explicit `use`: `ffi`, `io`, `thread`, `crypto`, `time`, `env`, `string`, `gc`. Regex: [coil-regex](https://github.com/ardax-corp/coil-regex).
 
-Cargo features `crypto`, `time`, `regex`, `tls` gate modules (default on).
+Cargo features `crypto`, `time`, `tls` gate modules (default on).
 
 Prefer compiler builtins over userland for core type machinery.
 

@@ -7363,44 +7363,6 @@ fn example_io_tls_prints_tls_ok() {
     assert_eq!(run_example("examples/io_tls.hy"), "tls-ok");
 }
 
-#[cfg(feature = "regex")]
-#[test]
-fn example_regex_demo_prints_expected() {
-    assert_eq!(
-        run_example("examples/regex_demo.hy"),
-        "true,2,a->1 b->2,a|b|c"
-    );
-}
-
-#[cfg(feature = "regex")]
-#[test]
-fn regex_compile_error_is_err_via_host_invoke() {
-    let output = run_example_src(
-        r#"
-use regex::{compile};
-use io::{stdout, write};
-use string::{format, to_bytes};
-
-fn bad() -> int {
-    return match compile("(", "") {
-        Result::Ok(_) => 0,
-        Result::Err(e) => match e {
-            RegexError::Compile => 1,
-            RegexError::Runtime => 2,
-            RegexError::NoMatch => 3,
-            RegexError::Utf8 => 4,
-        },
-    };
-}
-
-fn main() {
-    write(stdout(), to_bytes(format("%i", bad())));
-}
-"#,
-    );
-    assert_eq!(output, "1");
-}
-
 /// Feature-off `use` of optional virtual modules is a compile error (E0900 /
 /// "Module not found"), not a hang. Stays ungated so `--no-default-features`
 /// still exercises it.
@@ -7433,7 +7395,7 @@ fn optional_virtual_modules_match_cargo_features() {
     );
     check(
         "use regex::{compile};\nfn main() {}\n",
-        cfg!(feature = "regex"),
+        false,
     );
     check(
         "use io::net::tls::client::{enable};\nfn main() {}\n",

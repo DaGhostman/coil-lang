@@ -436,15 +436,6 @@ impl Checker {
             self.register_builtin_crypto_error();
         }
 
-        let needs_regex_error = matches!(
-            &export,
-            BuiltinExport::Enum {
-                name: common::BUILTIN_REGEX_ERROR_ENUM
-            }
-        ) || host_registry.is_some_and(|r| r.starts_with("regex_"));
-        if needs_regex_error && !self.enums.contains_key(common::BUILTIN_REGEX_ERROR_ENUM) {
-            self.register_builtin_regex_error();
-        }
 
         // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
         // module is brought into scope (enum or any FFI builtin).
@@ -708,12 +699,6 @@ impl Checker {
         );
     }
 
-    fn register_builtin_regex_error(&mut self) {
-        self.register_builtin_unit_enum(
-            common::BUILTIN_REGEX_ERROR_ENUM,
-            common::BUILTIN_REGEX_ERROR_VARIANTS,
-        );
-    }
 
     /// Pre-register `ThreadError` unit variants for the virtual `thread` module.
     fn register_builtin_thread_error(&mut self) {
@@ -1067,19 +1052,15 @@ impl Checker {
         }
     }
 
-    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
+    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` pipeline host natives.
     pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
         #[cfg(feature = "crypto")]
         use crate::typechecking::ty::byte;
-        #[cfg(feature = "regex")]
-        use crate::typechecking::ty::regex_ty;
-        #[cfg(any(feature = "crypto", feature = "regex"))]
+        #[cfg(feature = "crypto")]
         use crate::typechecking::ty::tuple;
         use crate::typechecking::ty::{boolean, record};
         #[cfg(feature = "crypto")]
         use common::BUILTIN_CRYPTO_ERROR_ENUM;
-        #[cfg(feature = "regex")]
-        use common::BUILTIN_REGEX_ERROR_ENUM;
         #[cfg(feature = "time")]
         use common::BUILTIN_TIME_ERROR_ENUM;
         use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
@@ -1096,10 +1077,6 @@ impl Checker {
         let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
         #[cfg(feature = "crypto")]
         let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
-        #[cfg(feature = "regex")]
-        let regex_err = Ty::Con(BUILTIN_REGEX_ERROR_ENUM.into());
-        #[cfg(feature = "regex")]
-        let regex = regex_ty();
 
         let res_bool_io = result_app_ty(boolean(), io_err.clone());
         let res_unit_io = result_app_ty(unit_ty(), io_err.clone());
@@ -1140,26 +1117,6 @@ impl Checker {
         let res_unit_crypto = result_app_ty(unit_ty(), crypto_err.clone());
         #[cfg(feature = "crypto")]
         let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
-
-        #[cfg(feature = "regex")]
-        let span = tuple(vec![int(), int()]);
-        #[cfg(feature = "regex")]
-        let res_regex = result_app_ty(regex.clone(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_bool_regex = result_app_ty(boolean(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_span_regex = result_app_ty(span.clone(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_spans_regex = result_app_ty(vec_app_ty(span), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_caps_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_caps_all_regex =
-            result_app_ty(vec_app_ty(vec_app_ty(string())), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_strs_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_string_regex = result_app_ty(string(), regex_err.clone());
 
         let ty = match registry {
             "fs_exists" | "fs_is_file" | "fs_is_dir" | "fs_is_symlink" => {
@@ -1258,24 +1215,6 @@ impl Checker {
             #[cfg(feature = "crypto")]
             "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
 
-            #[cfg(feature = "regex")]
-            "regex_compile" => fun(&[string(), string()], res_regex),
-            #[cfg(feature = "regex")]
-            "regex_is_match" => fun(&[regex.clone(), string()], res_bool_regex),
-            #[cfg(feature = "regex")]
-            "regex_find" => fun(&[regex.clone(), string()], res_span_regex),
-            #[cfg(feature = "regex")]
-            "regex_find_all" => fun(&[regex.clone(), string()], res_spans_regex),
-            #[cfg(feature = "regex")]
-            "regex_captures" => fun(&[regex.clone(), string()], res_caps_regex),
-            #[cfg(feature = "regex")]
-            "regex_captures_all" => fun(&[regex.clone(), string()], res_caps_all_regex),
-            #[cfg(feature = "regex")]
-            "regex_split" => fun(&[regex.clone(), string()], res_strs_regex),
-            #[cfg(feature = "regex")]
-            "regex_replace" | "regex_replace_all" => {
-                fun(&[regex, string(), string()], res_string_regex)
-            }
 
             _ => {
                 let mut msg = Message::error(
@@ -1384,7 +1323,7 @@ impl Checker {
                 let n = name.to_ascii_lowercase();
                 if matches!(
                     n.as_str(),
-                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn" | "regex"
+                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn"
                         | "root" | "weak"
                 ) {
                     return false;
@@ -10145,7 +10084,6 @@ impl Checker {
             "string" => string(),
             "void" => unit_ty(),
             "stream" => crate::typechecking::ty::stream_ty(),
-            "regex" => crate::typechecking::ty::regex_ty(),
             "thread" => crate::typechecking::ty::thread_ty(),
             "sender" => crate::typechecking::ty::sender_ty(),
             "receiver" => crate::typechecking::ty::receiver_ty(),
@@ -10154,7 +10092,6 @@ impl Checker {
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
-            "regexerror" => Ty::Con(common::BUILTIN_REGEX_ERROR_ENUM.into()),
             "threaderror" => Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into()),
             "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),

@@ -43,11 +43,6 @@ jobs:
               mode: check
           - os: ubuntu-latest
             features:
-              id: regex
-              flags: "--no-default-features --features regex"
-              mode: check
-          - os: ubuntu-latest
-            features:
               id: tls
               flags: "--no-default-features --features tls"
               mode: check
@@ -73,13 +68,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libffi-dev libpcre2-dev build-essential
+          sudo apt-get install -y libffi-dev build-essential
 
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi pcre2
-          pkg-config --exists libpcre2-8
+          brew install libffi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -134,7 +128,7 @@ jobs:
           BIN=./target/debug/coil ./examples/projects/run-tests.sh
 
   # MinGW host matches release-binaries (COI-100/102): MSVC cannot link the
-  # MSYS2 libffi/pcre2 packages. Keep this on PRs so Unix-only host APIs fail
+  # MSYS2 libffi package. Keep this on PRs so Unix-only host APIs fail
   # here instead of only on the main-only zip cell.
   test-windows-gnu:
     name: test (windows-gnu, default)
@@ -156,7 +150,6 @@ jobs:
             base-devel
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-libffi
-            mingw-w64-x86_64-pcre2
             mingw-w64-x86_64-pkgconf
 
       - name: Configure pkg-config (Windows)
@@ -165,7 +158,6 @@ jobs:
           echo "PKG_CONFIG=$MINGW_PREFIX/bin/pkgconf.exe" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=$MINGW_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "$MINGW_PREFIX/bin" >> "$GITHUB_PATH"
-          pkgconf --exists libpcre2-8
           pkgconf --exists libffi
 
       - name: Install Rust toolchain

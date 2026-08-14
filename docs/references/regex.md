@@ -1,24 +1,51 @@
-# `regex` module
+# Regular expressions
 
-`use regex::{compile, is_match, find, replace};` — PCRE2 patterns via HostInvoke (system **libpcre2** / `pcre2-sys`). Opaque `Regex` handle from `compile(pattern, flags)`.
+PCRE2 regex is **userland** in [coil-regex](https://github.com/ardax-corp/coil-regex), not a compiler builtin.
 
-| Surface | Types |
-|---------|--------|
-| `compile` | `(string, string) -> Result<Regex, RegexError>` |
-| `is_match` | `(Regex, string) -> Result<bool, RegexError>` |
-| `find` | `(Regex, string) -> Result<(int, int), RegexError>` — first match byte span; no match → `NoMatch` |
-| `find_all` | `(Regex, string) -> Result<[(int, int)], RegexError>` — all non-overlapping spans (empty if none) |
-| `captures` | `(Regex, string) -> Result<[string], RegexError>` — `[0]` full match; empty string for non-participating groups |
-| `captures_all` | `(Regex, string) -> Result<[[string]], RegexError>` |
-| `split` | `(Regex, string) -> Result<[string], RegexError>` |
-| `replace` / `replace_all` | `(Regex, string, string) -> Result<string, RegexError>` — `$n` / `${name}` / `$$` |
+## Install via spool (future)
 
-**Flags** (second `compile` arg; case-sensitive; unknown letter → `Compile`): `i` caseless, `m` multiline, `s` dotall, `x` extended, `u` Unicode properties (`ucp`). UTF-8 matching is always on for coil strings. Other PCRE letters (`A`/`D`/`U`/`J`/…) are not exposed — use in-pattern verbs where PCRE2 allows.
+```toml
+[dependencies]
+regex = { git = "https://github.com/ardax-corp/coil-regex.git", version = "^0.1" }
 
-`RegexError` variants: `Compile`, `Runtime`, `NoMatch`, `Utf8`.
+[module]
+roots = ["./src", "./.spool/deps/regex/src"]
+
+[ffi]
+search_paths = ["./.spool/deps/regex/native"]
+```
+
+Run `spool install`, then:
+
+```coil
+use regex::{compile, find_all, Regex};
+```
+
+**Docs:** [coil-regex](https://github.com/ardax-corp/coil-regex/blob/main/docs/README.md)
+
+## Sibling checkout
+
+Clone [coil-regex](https://github.com/ardax-corp/coil-regex) beside your project and point `coil.toml` at it:
+
+```toml
+[module]
+roots = ["./src", "../coil-regex/src"]
+
+[ffi]
+search_paths = ["../coil-regex/native"]
+```
+
+Build the native library: `make -C ../coil-regex/native`.
+
+See [consume.md](https://github.com/ardax-corp/coil-regex/blob/main/docs/consume.md) for flags, `RegexError`, and `fn drop()` lifecycle.
+
+## Migrating from virtual `regex`
+
+Add coil-regex to `[module].roots` — `use regex::{compile}` without roots is a module-not-found error. Recompile any stale `.hyc` archives (archive **2.11** drops the old `regex_*` HostInvoke table).
 
 ---
 
 ## Related
 
 - [Getting Started](../manual/getting-started.md)
+- [Modules](modules.md)

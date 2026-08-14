@@ -14,9 +14,6 @@ fn coil_embed_build_args(target_dir: &Path) -> Vec<String> {
     if cfg!(feature = "time") {
         enabled.push("time");
     }
-    if cfg!(feature = "regex") {
-        enabled.push("regex");
-    }
     if cfg!(feature = "tls") {
         enabled.push("tls");
     }
@@ -107,9 +104,6 @@ fn coil_embed_build_args_mirrors_optional_features() {
     }
     if cfg!(feature = "time") {
         expected.push("time");
-    }
-    if cfg!(feature = "regex") {
-        expected.push("regex");
     }
     if cfg!(feature = "tls") {
         expected.push("tls");

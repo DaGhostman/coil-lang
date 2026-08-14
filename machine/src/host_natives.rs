@@ -16,8 +16,6 @@ use crate::math_libm::MATH_LIBM_WIRING;
 
 #[cfg(feature = "crypto")]
 use crate::CRYPTO_WIRING;
-#[cfg(feature = "regex")]
-use crate::REGEX_WIRING;
 #[cfg(feature = "time")]
 use crate::TIME_WIRING;
 use crate::GC_WIRING;
@@ -39,8 +37,6 @@ pub fn build_standard_host_natives(
     push_wiring(&mut out, &mut register_id, ENV_WIRING, "env");
     #[cfg(feature = "crypto")]
     push_wiring(&mut out, &mut register_id, CRYPTO_WIRING, "crypto");
-    #[cfg(feature = "regex")]
-    push_wiring(&mut out, &mut register_id, REGEX_WIRING, "regex");
     push_prelude_char_ord(&mut out, &mut register_id);
     push_thread_natives(&mut out, &mut register_id);
     push_packed_la(&mut out, &mut register_id);
@@ -698,6 +694,23 @@ fn push_thread_natives(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_native_table_has_no_regex_entries() {
+        let mut registrations = Vec::new();
+        build_standard_host_natives(|name, id| {
+            registrations.push((name.to_string(), id));
+        });
+        let regex: Vec<_> = registrations
+            .iter()
+            .filter(|(name, _)| name.starts_with("regex_"))
+            .collect();
+        assert!(
+            regex.is_empty(),
+            "regex HostInvoke slots must not be registered: {:?}",
+            regex
+        );
+    }
 
     #[test]
     fn math_libm_natives_are_float_typed_and_appended_after_gc() {

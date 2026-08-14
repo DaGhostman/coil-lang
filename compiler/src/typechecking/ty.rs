@@ -302,8 +302,6 @@ pub const BYTE: &str = "byte";
 pub const UNIT: &str = "unit";
 /// Name of the opaque `Stream` IO handle type.
 pub const STREAM: &str = "Stream";
-/// Opaque compiled regex handle (`regex` module).
-pub const REGEX: &str = "Regex";
 /// Opaque `thread` module handle types.
 pub const THREAD: &str = "Thread";
 pub const SENDER: &str = "Sender";
@@ -377,11 +375,6 @@ pub fn range_app(ty: &Ty) -> Option<(&Ty, bool)> {
 /// Build the opaque `Stream` type.
 pub fn stream_ty() -> Ty {
     Ty::Con(STREAM.into())
-}
-
-/// Build the opaque `Regex` type.
-pub fn regex_ty() -> Ty {
-    Ty::Con(REGEX.into())
 }
 
 /// Build the opaque `Thread` join-handle type.
