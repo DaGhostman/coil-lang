@@ -74,16 +74,25 @@ pub fn is_packaged_executable(data: &[u8]) -> bool {
     read_package_trailer(data).is_some()
 }
 
+/// rkyv `access` requires the blob pointer to meet `ArchivedArchivedProgram`
+/// alignment. PE/ELF runner sizes are often only 4- or 8-byte aligned.
+const PACKAGE_ARCHIVE_ALIGN: usize = 16;
+
 /// Append `archive` and trailer to `runner_bytes`, producing a packaged executable.
+///
+/// Zero-pads so the overlay starts at a 16-byte offset (rkyv alignment).
 pub fn append_package_payload(
     runner_bytes: &[u8],
     archive: &[u8],
     flags: u32,
     archive_version: u32,
 ) -> Vec<u8> {
-    let offset = u64::try_from(runner_bytes.len()).expect("runner too large");
+    let pad = (PACKAGE_ARCHIVE_ALIGN - (runner_bytes.len() % PACKAGE_ARCHIVE_ALIGN))
+        % PACKAGE_ARCHIVE_ALIGN;
+    let offset = u64::try_from(runner_bytes.len() + pad).expect("runner too large");
     let len = u64::try_from(archive.len()).expect("archive too large");
     let mut out = runner_bytes.to_vec();
+    out.resize(out.len() + pad, 0);
     out.extend_from_slice(archive);
     let trailer = PackageTrailer {
         archive_offset: offset,
@@ -169,8 +178,22 @@ mod tests {
         let archive = b"rkyv-bytes-here";
         let out = append_package_payload(runner, archive, 0, 26);
         let trailer = read_package_trailer(&out).expect("trailer");
-        assert_eq!(trailer.archive_offset, runner.len() as u64);
+        assert_eq!(trailer.archive_offset % PACKAGE_ARCHIVE_ALIGN as u64, 0);
+        assert!(trailer.archive_offset as usize >= runner.len());
         assert_eq!(trailer.archive_len, archive.len() as u64);
+        assert_eq!(
+            embedded_archive_slice(&out, trailer),
+            Some(archive.as_slice())
+        );
+    }
+
+    #[test]
+    fn append_pads_unaligned_runner_to_16() {
+        let runner = [0u8; 1];
+        let archive = b"blob";
+        let out = append_package_payload(&runner, archive, 0, 26);
+        let trailer = read_package_trailer(&out).expect("trailer");
+        assert_eq!(trailer.archive_offset, PACKAGE_ARCHIVE_ALIGN as u64);
         assert_eq!(
             embedded_archive_slice(&out, trailer),
             Some(archive.as_slice())

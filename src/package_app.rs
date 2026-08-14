@@ -227,4 +227,22 @@ mod tests {
             Err(LoadErr::Version(_))
         ));
     }
+
+    #[test]
+    fn load_archive_bytes_accepts_unaligned_prefix() {
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            static_slot_count: 0,
+            constants: vec![],
+            strings: vec![],
+            bytecode: vec![Byte::new(Instruction::HALT)],
+            source_files: vec![],
+            debug_locs: vec![],
+            fn_symbols: Vec::new(),
+        };
+        let bytes = rkyv::to_bytes::<Error>(&program).unwrap();
+        let mut prefixed = vec![0u8; 1];
+        prefixed.extend_from_slice(bytes.as_slice());
+        load_archive_bytes(&prefixed[1..]).expect("unaligned overlay slice");
+    }
 }

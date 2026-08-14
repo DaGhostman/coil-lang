@@ -9,7 +9,7 @@ fn coil_bin() -> String {
 
 fn ensure_helper(name: &str) {
     let coil = PathBuf::from(coil_bin());
-    let helper = coil.with_file_name(name);
+    let helper = coil_cli::sibling_bin(&coil, name);
     if helper.is_file() {
         return;
     }

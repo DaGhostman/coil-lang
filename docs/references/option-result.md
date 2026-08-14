@@ -13,6 +13,8 @@ Use constructors / `match` as usual, plus `raise`, `?`, `??`, and `?.` — see [
 
 `match` **copies** the scrutinee. It does not move a local or a class field. Nested `match` on the same `Option` field is valid, and outer pattern bindings remain visible in the inner arm (an inner name shadows). See [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee).
 
+Runtime layout is an implementation detail (pointer niche, two-slot call return, or boxed enum). User code always uses constructors and `match` / `?` — do not match on raw `0` vs pointer. See [Option / Result runtime ABI](types.md#option--result-runtime-abi).
+
 ---
 
 ## Related

@@ -1080,7 +1080,7 @@ pub struct ObjFn {
 
 /// Host-backed non-blocking IO stream (file / stdio / TCP / UDP / TLS).
 pub struct ObjStream {
-    pub fd: Option<std::os::fd::OwnedFd>,
+    pub handle: Option<crate::io_handle::NativeHandle>,
     pub kind: StreamKind,
     pub closed: bool,
     /// Soft deadline for sync read adapters / TLS handshake reads (`None` = wait forever).
@@ -1098,14 +1098,13 @@ impl Drop for ObjStream {
         if self.kind == StreamKind::Tls {
             // Best-effort close_notify so GC without explicit `close()` is not
             // always an abrupt TCP reset. Errors are ignored in Drop.
-            if let (Some(fd), Some(tls)) = (self.fd.as_ref(), self.tls.as_mut()) {
-                use std::os::fd::AsRawFd;
-                let _ = crate::tls::send_close_notify(fd.as_raw_fd(), tls);
+            if let (Some(handle), Some(tls)) = (self.handle.as_mut(), self.tls.as_mut()) {
+                let _ = crate::tls::send_close_notify(handle, tls);
             }
             self.tls.take();
         }
-        // OwnedFd closes on drop; clear explicitly for clarity.
-        self.fd.take();
+        // NativeHandle closes on drop; clear explicitly for clarity.
+        self.handle.take();
         #[cfg(feature = "tls")]
         {
             self.tls.take();

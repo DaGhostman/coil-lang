@@ -7,20 +7,20 @@
 use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use common::{BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value};
 
+use crate::io_handle::{NativeHandle, WaitHandle};
 use crate::io_reactor::Interest;
 use crate::memory::{Heap, Member, ObjArray, ObjStream, ObjTuple, Object, StreamKind};
 
 type OutputRedirect = *mut (dyn Write + Send);
 
-/// Request to park the VM until an fd is ready (set by `await_*` natives).
+/// Request to park the VM until a handle is ready (set by `await_*` natives).
 #[derive(Debug, Clone)]
 pub struct IoParkRequest {
-    pub fd: RawFd,
+    pub handle: WaitHandle,
     pub interest: Interest,
     pub timeout: Option<Duration>,
 }
@@ -152,18 +152,6 @@ fn member_from_value(heap: &Heap, value: Value) -> Member {
     }
 }
 
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Convert coil millisecond timeout: `<= 0` clears / means wait forever.
 pub fn duration_from_timeout_ms(ms: i64) -> Option<Duration> {
     if ms <= 0 {
@@ -185,7 +173,7 @@ fn stream_write_timeout(heap: &mut Heap, stream: Value) -> Result<Option<Duratio
 pub fn stream_set_read_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Result<(), IoErrorTag> {
     let d = duration_from_timeout_ms(ms);
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         s.read_timeout = d;
@@ -197,7 +185,7 @@ pub fn stream_set_read_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Resul
 pub fn stream_set_write_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Result<(), IoErrorTag> {
     let d = duration_from_timeout_ms(ms);
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         s.write_timeout = d;
@@ -205,30 +193,34 @@ pub fn stream_set_write_timeout(heap: &mut Heap, stream: Value, ms: i64) -> Resu
     })?
 }
 
-/// Wait for fd readiness via the VM's [`IoReactor`] (help-steals CPU work when available).
+/// Wait for handle readiness via the VM's [`IoReactor`] (help-steals CPU work when available).
 pub fn reactor_wait_fd(
-    fd: RawFd,
+    handle: WaitHandle,
     interest: Interest,
     timeout: Option<Duration>,
 ) -> Result<(), IoErrorTag> {
-    crate::thread::host_io_wait(fd, interest, timeout)
+    crate::thread::host_io_wait(handle, interest, timeout)
 }
 
-fn poll_ready(fd: RawFd, for_read: bool, timeout: Option<Duration>) -> Result<(), IoErrorTag> {
+fn poll_ready(
+    handle: WaitHandle,
+    for_read: bool,
+    timeout: Option<Duration>,
+) -> Result<(), IoErrorTag> {
     let interest = if for_read {
         Interest::Readable
     } else {
         Interest::Writable
     };
-    reactor_wait_fd(fd, interest, timeout)
+    reactor_wait_fd(handle, interest, timeout)
 }
 
-/// Wrap an owned fd as a heap `Stream` (always non-blocking).
-pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Result<Value> {
-    set_nonblocking(fd.as_raw_fd())?;
+/// Wrap an owned handle as a heap `Stream` (always non-blocking).
+pub fn alloc_stream(heap: &mut Heap, handle: NativeHandle, kind: StreamKind) -> io::Result<Value> {
+    handle.set_nonblocking(true)?;
     let (obj, _) = heap.alloc(
         ObjStream {
-            fd: Some(fd),
+            handle: Some(handle),
             kind,
             closed: false,
             read_timeout: None,
@@ -243,51 +235,24 @@ pub fn alloc_stream(heap: &mut Heap, fd: OwnedFd, kind: StreamKind) -> io::Resul
 
 pub fn stream_stdin(heap: &mut Heap) -> Result<Value, IoErrorTag> {
     // Dup so closing the Stream does not close process stdin.
-    let raw = unsafe { libc::dup(libc::STDIN_FILENO) };
-    if raw < 0 {
-        return Err(IoErrorTag::from_kind(io::Error::last_os_error().kind()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    alloc_stream(heap, fd, StreamKind::Stdin).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    let handle = NativeHandle::dup_stdin().map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    alloc_stream(heap, handle, StreamKind::Stdin).map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 pub fn stream_stdout(heap: &mut Heap) -> Result<Value, IoErrorTag> {
-    let raw = unsafe { libc::dup(libc::STDOUT_FILENO) };
-    if raw < 0 {
-        return Err(IoErrorTag::from_kind(io::Error::last_os_error().kind()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    alloc_stream(heap, fd, StreamKind::Stdout).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    let handle = NativeHandle::dup_stdout().map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    alloc_stream(heap, handle, StreamKind::Stdout).map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 pub fn stream_stderr(heap: &mut Heap) -> Result<Value, IoErrorTag> {
-    let raw = unsafe { libc::dup(libc::STDERR_FILENO) };
-    if raw < 0 {
-        return Err(IoErrorTag::from_kind(io::Error::last_os_error().kind()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    alloc_stream(heap, fd, StreamKind::Stderr).map_err(|e| IoErrorTag::from_kind(e.kind()))
-}
-
-fn open_flags(mode: &str) -> Result<i32, IoErrorTag> {
-    match mode {
-        "r" => Ok(libc::O_RDONLY),
-        "w" => Ok(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
-        "a" => Ok(libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND),
-        "rw" => Ok(libc::O_RDWR | libc::O_CREAT),
-        _ => Err(IoErrorTag::InvalidInput),
-    }
+    let handle = NativeHandle::dup_stderr().map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    alloc_stream(heap, handle, StreamKind::Stderr).map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 pub fn stream_open(heap: &mut Heap, path: &str, mode: &str) -> Result<Value, IoErrorTag> {
-    let flags = open_flags(mode)? | libc::O_NONBLOCK;
-    let c_path = std::ffi::CString::new(path).map_err(|_| IoErrorTag::InvalidInput)?;
-    let raw = unsafe { libc::open(c_path.as_ptr(), flags, 0o666) };
-    if raw < 0 {
-        return Err(IoErrorTag::from_kind(io::Error::last_os_error().kind()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    alloc_stream(heap, fd, StreamKind::File).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    let handle =
+        NativeHandle::open_file(path, mode).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    alloc_stream(heap, handle, StreamKind::File).map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 pub(crate) fn with_stream_mut<R>(
@@ -309,12 +274,12 @@ pub fn stream_close(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
         }
         #[cfg(feature = "tls")]
         if s.kind == StreamKind::Tls {
-            if let (Some(fd), Some(tls)) = (s.fd.as_ref(), s.tls.as_mut()) {
-                let _ = crate::tls::send_close_notify(fd.as_raw_fd(), tls);
+            if let (Some(handle), Some(tls)) = (s.handle.as_mut(), s.tls.as_mut()) {
+                let _ = crate::tls::send_close_notify(handle, tls);
             }
             s.tls.take();
         }
-        s.fd.take();
+        s.handle.take();
         s.closed = true;
         Ok(())
     })?
@@ -354,27 +319,23 @@ fn stream_read_into(
     let mut tmp = vec![0u8; capacity];
 
     let n = with_stream_mut(heap, stream, |s| -> Result<Option<usize>, IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
-        let fd = s.fd.as_ref().unwrap().as_raw_fd();
+        let handle = s.handle.as_mut().unwrap();
         #[cfg(feature = "tls")]
         if s.kind == StreamKind::Tls {
             let tls = s.tls.as_mut().ok_or(IoErrorTag::Other)?;
-            return crate::tls::tls_read(fd, tls, &mut tmp);
+            return crate::tls::tls_read(handle, tls, &mut tmp);
         }
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let result = match file.read(&mut tmp) {
+        match handle.read(&mut tmp) {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some(n)),
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                 Err(IoErrorTag::WouldBlock)
             }
             Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-        };
-        // Don't close the fd when `file` drops.
-        let _ = file.into_raw_fd();
-        result
+        }
     })??;
 
     if let Some(n) = n {
@@ -418,11 +379,7 @@ pub fn stream_write_from(
                 .iter()
                 .map(|v| {
                     let n = v.as_int();
-                    if !(0..=255).contains(&n) {
-                        0
-                    } else {
-                        n as u8
-                    }
+                    if !(0..=255).contains(&n) { 0 } else { n as u8 }
                 })
                 .collect()
         }
@@ -431,13 +388,9 @@ pub fn stream_write_from(
     stream_write_bytes(heap, stream, &bytes)
 }
 
-fn stream_write_bytes(
-    heap: &mut Heap,
-    stream: Value,
-    bytes: &[u8],
-) -> Result<usize, IoErrorTag> {
+fn stream_write_bytes(heap: &mut Heap, stream: Value, bytes: &[u8]) -> Result<usize, IoErrorTag> {
     with_stream_mut(heap, stream, |s| -> Result<usize, IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if matches!(s.kind, StreamKind::Stdout | StreamKind::Stderr)
@@ -445,22 +398,19 @@ fn stream_write_bytes(
         {
             return result;
         }
-        let fd = s.fd.as_ref().unwrap().as_raw_fd();
+        let handle = s.handle.as_mut().unwrap();
         #[cfg(feature = "tls")]
         if s.kind == StreamKind::Tls {
             let tls = s.tls.as_mut().ok_or(IoErrorTag::Other)?;
-            return crate::tls::tls_write(fd, tls, bytes);
+            return crate::tls::tls_write(handle, tls, bytes);
         }
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let result = match file.write(bytes) {
+        match handle.write(bytes) {
             Ok(n) => Ok(n),
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                 Err(IoErrorTag::WouldBlock)
             }
             Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-        };
-        let _ = file.into_raw_fd();
-        result
+        }
     })?
 }
 
@@ -601,13 +551,13 @@ fn wait_readable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
             s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.wants_write())
         })?;
         if wants_write {
-            let fd = stream_raw_fd(heap, stream)?;
+            let handle = stream_wait_handle(heap, stream)?;
             let write_timeout = stream_write_timeout(heap, stream)?;
-            return poll_ready(fd, false, write_timeout);
+            return poll_ready(handle, false, write_timeout);
         }
     }
-    let fd = stream_raw_fd(heap, stream)?;
-    poll_ready(fd, true, timeout)
+    let handle = stream_wait_handle(heap, stream)?;
+    poll_ready(handle, true, timeout)
 }
 
 fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
@@ -619,30 +569,24 @@ fn wait_writable(heap: &mut Heap, stream: Value) -> Result<(), IoErrorTag> {
             s.kind == StreamKind::Tls && s.tls.as_ref().is_some_and(|t| t.wants_write())
         })?;
         if wants {
-            let fd = stream_raw_fd(heap, stream)?;
-            return poll_ready(fd, false, timeout);
+            let handle = stream_wait_handle(heap, stream)?;
+            return poll_ready(handle, false, timeout);
         }
     }
-    let fd = stream_raw_fd(heap, stream)?;
-    poll_ready(fd, false, timeout)
+    let handle = stream_wait_handle(heap, stream)?;
+    poll_ready(handle, false, timeout)
 }
 
 /// Non-blocking readiness probe; parks the VM via [`IoParkRequest`] when not ready.
 ///
 /// Returns `Ok(None)` when a park was requested (caller must not push a value).
 /// Returns `Ok(Some(Result::Ok(())))` when already ready.
-pub fn stream_await_readable(
-    heap: &mut Heap,
-    stream: Value,
-) -> Result<Option<Value>, IoErrorTag> {
+pub fn stream_await_readable(heap: &mut Heap, stream: Value) -> Result<Option<Value>, IoErrorTag> {
     stream_await_interest(heap, stream, Interest::Readable)
 }
 
 /// Like [`stream_await_readable`] for writability.
-pub fn stream_await_writable(
-    heap: &mut Heap,
-    stream: Value,
-) -> Result<Option<Value>, IoErrorTag> {
+pub fn stream_await_writable(heap: &mut Heap, stream: Value) -> Result<Option<Value>, IoErrorTag> {
     stream_await_interest(heap, stream, Interest::Writable)
 }
 
@@ -664,13 +608,13 @@ fn stream_await_interest(
             return Ok(Some(as_result_unit(heap, Ok(()))));
         }
     }
-    let fd = stream_raw_fd(heap, stream)?;
+    let handle = stream_wait_handle(heap, stream)?;
     // Already ready?
-    match reactor_wait_fd(fd, interest, Some(Duration::ZERO)) {
+    match reactor_wait_fd(handle, interest, Some(Duration::ZERO)) {
         Ok(()) => Ok(Some(as_result_unit(heap, Ok(())))),
         Err(IoErrorTag::TimedOut) => {
             request_io_park(IoParkRequest {
-                fd,
+                handle,
                 interest,
                 timeout,
             });
@@ -692,12 +636,12 @@ pub fn io_wait_ready(_heap: &mut Heap) -> Value {
     Value::from(n as i64)
 }
 
-fn stream_raw_fd(heap: &mut Heap, stream: Value) -> Result<RawFd, IoErrorTag> {
+fn stream_wait_handle(heap: &mut Heap, stream: Value) -> Result<WaitHandle, IoErrorTag> {
     with_stream_mut(heap, stream, |s| {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             Err(IoErrorTag::AlreadyClosed)
         } else {
-            Ok(s.fd.as_ref().unwrap().as_raw_fd())
+            Ok(s.handle.as_ref().unwrap().wait_handle())
         }
     })?
 }
@@ -776,9 +720,8 @@ pub fn tcp_connect_timeout(
     stream
         .set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let fd = stream.into_raw_fd();
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    alloc_stream(heap, owned, StreamKind::Tcp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    alloc_stream(heap, NativeHandle::Tcp(stream), StreamKind::Tcp)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 pub fn tcp_listen(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
@@ -787,40 +730,39 @@ pub fn tcp_listen(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErr
     listener
         .set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let fd = listener.into_raw_fd();
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    alloc_stream(heap, owned, StreamKind::TcpListener).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    alloc_stream(
+        heap,
+        NativeHandle::Listener(listener),
+        StreamKind::TcpListener,
+    )
+    .map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 /// Non-blocking accept. `WouldBlock` if nothing pending.
 pub fn tcp_accept(heap: &mut Heap, listener: Value) -> Result<Value, IoErrorTag> {
-    with_stream_mut(heap, listener, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+    let stream = with_stream_mut(heap, listener, |s| -> Result<TcpStream, IoErrorTag> {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if s.kind != StreamKind::TcpListener {
             return Err(IoErrorTag::InvalidInput);
         }
-        Ok(())
-    })??;
-    let fd = stream_raw_fd(heap, listener)?;
-    // Reconstruct listener without taking ownership permanently.
-    let listener_sock = unsafe { TcpListener::from_raw_fd(fd) };
-    let result = match listener_sock.accept() {
-        Ok((stream, _)) => {
-            stream
-                .set_nonblocking(true)
-                .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-            let raw = stream.into_raw_fd();
-            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-            alloc_stream(heap, owned, StreamKind::Tcp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+        let listener_sock = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_listener_mut)
+            .ok_or(IoErrorTag::InvalidInput)?;
+        match listener_sock.accept() {
+            Ok((stream, _)) => Ok(stream),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Err(IoErrorTag::WouldBlock),
+            Err(e) => Err(IoErrorTag::from_kind(e.kind())),
         }
-        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(IoErrorTag::WouldBlock),
-        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-    };
-    // Don't close the listener fd.
-    let _ = listener_sock.into_raw_fd();
-    result
+    })??;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    alloc_stream(heap, NativeHandle::Tcp(stream), StreamKind::Tcp)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 /// Block until a connection is accepted.
@@ -849,8 +791,8 @@ pub fn tcp_accept_wait_timeout(
                         Some(end - now)
                     }
                 };
-                let fd = stream_raw_fd(heap, listener)?;
-                poll_ready(fd, true, remaining)?;
+                let handle = stream_wait_handle(heap, listener)?;
+                poll_ready(handle, true, remaining)?;
             }
             Err(e) => return Err(e),
         }
@@ -870,7 +812,7 @@ fn tcp_stream_addr(
     peer: bool,
 ) -> Result<(String, i64), IoErrorTag> {
     let kind = with_stream_mut(heap, stream, |s| -> Result<StreamKind, IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         match s.kind {
@@ -883,28 +825,24 @@ fn tcp_stream_addr(
     if peer && kind == StreamKind::TcpListener {
         return Err(IoErrorTag::InvalidInput);
     }
-    let fd = stream_raw_fd(heap, stream)?;
-    let result = if kind == StreamKind::TcpListener {
-        let sock = unsafe { TcpListener::from_raw_fd(fd) };
-        let result = sock
-            .local_addr()
-            .map(format_socket_addr)
-            .map_err(|e| IoErrorTag::from_kind(e.kind()));
-        let _ = sock.into_raw_fd();
-        result
-    } else {
-        let sock = unsafe { TcpStream::from_raw_fd(fd) };
-        let result = if peer {
-            sock.peer_addr()
-        } else {
+    with_stream_mut(heap, stream, |s| -> Result<(String, i64), IoErrorTag> {
+        let handle = s.handle.as_mut().ok_or(IoErrorTag::AlreadyClosed)?;
+        if kind == StreamKind::TcpListener {
+            let sock = handle.as_listener_mut().ok_or(IoErrorTag::InvalidInput)?;
             sock.local_addr()
+                .map(format_socket_addr)
+                .map_err(|e| IoErrorTag::from_kind(e.kind()))
+        } else {
+            let sock = handle.as_tcp_mut().ok_or(IoErrorTag::InvalidInput)?;
+            let addr = if peer {
+                sock.peer_addr()
+            } else {
+                sock.local_addr()
+            };
+            addr.map(format_socket_addr)
+                .map_err(|e| IoErrorTag::from_kind(e.kind()))
         }
-        .map(format_socket_addr)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()));
-        let _ = sock.into_raw_fd();
-        result
-    };
-    result
+    })?
 }
 
 /// Peer `(host, port)` for a connected TCP/TLS stream.
@@ -930,23 +868,23 @@ pub fn tcp_local_addr(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTa
 /// Enable / disable `TCP_NODELAY` on a TCP or TLS stream.
 pub fn tcp_set_nodelay(heap: &mut Heap, stream: Value, enabled: bool) -> Result<(), IoErrorTag> {
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         match s.kind {
-            StreamKind::Tcp => Ok(()),
+            StreamKind::Tcp => {}
             #[cfg(feature = "tls")]
-            StreamKind::Tls => Ok(()),
-            _ => Err(IoErrorTag::InvalidInput),
+            StreamKind::Tls => {}
+            _ => return Err(IoErrorTag::InvalidInput),
         }
-    })??;
-    let fd = stream_raw_fd(heap, stream)?;
-    let sock = unsafe { TcpStream::from_raw_fd(fd) };
-    let result = sock
-        .set_nodelay(enabled)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()));
-    let _ = sock.into_raw_fd();
-    result
+        let sock = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_tcp_mut)
+            .ok_or(IoErrorTag::InvalidInput)?;
+        sock.set_nodelay(enabled)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))
+    })?
 }
 
 /// Half-close a TCP/TLS stream. `how`: `0` read, `1` write, `2` both.
@@ -959,23 +897,23 @@ pub fn tcp_shutdown(heap: &mut Heap, stream: Value, how: i64) -> Result<(), IoEr
         _ => return Err(IoErrorTag::InvalidInput),
     };
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         match s.kind {
-            StreamKind::Tcp => Ok(()),
+            StreamKind::Tcp => {}
             #[cfg(feature = "tls")]
-            StreamKind::Tls => Ok(()),
-            _ => Err(IoErrorTag::InvalidInput),
+            StreamKind::Tls => {}
+            _ => return Err(IoErrorTag::InvalidInput),
         }
-    })??;
-    let fd = stream_raw_fd(heap, stream)?;
-    let sock = unsafe { TcpStream::from_raw_fd(fd) };
-    let result = sock
-        .shutdown(mode)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()));
-    let _ = sock.into_raw_fd();
-    result
+        let sock = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_tcp_mut)
+            .ok_or(IoErrorTag::InvalidInput)?;
+        sock.shutdown(mode)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))
+    })?
 }
 
 // ---- UDP ----
@@ -1031,9 +969,8 @@ pub fn udp_bind(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoError
     let sock = UdpSocket::bind(addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     sock.set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let fd = sock.into_raw_fd();
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    alloc_stream(heap, owned, StreamKind::Udp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    alloc_stream(heap, NativeHandle::Udp(sock), StreamKind::Udp)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 /// Create a connected non-blocking UDP socket toward `(host, port)`.
@@ -1049,21 +986,22 @@ pub fn udp_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoEr
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
     sock.set_nonblocking(true)
         .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
-    let fd = sock.into_raw_fd();
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    alloc_stream(heap, owned, StreamKind::Udp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+    alloc_stream(heap, NativeHandle::Udp(sock), StreamKind::Udp)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))
 }
 
 /// Local UDP port (after bind / connect).
 pub fn udp_local_port(heap: &mut Heap, stream: Value) -> Result<i64, IoErrorTag> {
-    let fd = stream_raw_fd(heap, stream)?;
-    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
-    let result = sock
-        .local_addr()
-        .map(|a| a.port() as i64)
-        .map_err(|e| IoErrorTag::from_kind(e.kind()));
-    let _ = sock.into_raw_fd();
-    result
+    with_stream_mut(heap, stream, |s| -> Result<i64, IoErrorTag> {
+        let sock = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_udp_mut)
+            .ok_or(IoErrorTag::AlreadyClosed)?;
+        sock.local_addr()
+            .map(|a| a.port() as i64)
+            .map_err(|e| IoErrorTag::from_kind(e.kind()))
+    })?
 }
 
 /// Non-blocking `sendto`. Returns bytes sent.
@@ -1076,17 +1014,20 @@ pub fn udp_send_to(
 ) -> Result<usize, IoErrorTag> {
     let peer = parse_socket_addr(host, port)?;
     let bytes = value_as_bytes(heap, buf)?;
-    let fd = stream_raw_fd(heap, stream)?;
-    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
-    let result = match sock.send_to(&bytes, peer) {
-        Ok(n) => Ok(n),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-            Err(IoErrorTag::WouldBlock)
+    with_stream_mut(heap, stream, |s| -> Result<usize, IoErrorTag> {
+        let sock = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_udp_mut)
+            .ok_or(IoErrorTag::AlreadyClosed)?;
+        match sock.send_to(&bytes, peer) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                Err(IoErrorTag::WouldBlock)
+            }
+            Err(e) => Err(IoErrorTag::from_kind(e.kind())),
         }
-        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-    };
-    let _ = sock.into_raw_fd();
-    result
+    })?
 }
 
 /// Non-blocking `recvfrom` into `buf`.
@@ -1113,19 +1054,26 @@ pub fn udp_recv_from(heap: &mut Heap, stream: Value, buf: Value) -> Result<Value
     }
     let mut tmp = vec![0u8; capacity];
 
-    let (n, peer) = {
-        let fd = stream_raw_fd(heap, stream)?;
-        let sock = unsafe { UdpSocket::from_raw_fd(fd) };
-        let result = match sock.recv_from(&mut tmp) {
-            Ok((n, peer)) => Ok((n, peer)),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                Err(IoErrorTag::WouldBlock)
+    let (n, peer) = with_stream_mut(
+        heap,
+        stream,
+        |s| -> Result<(usize, SocketAddr), IoErrorTag> {
+            let sock = s
+                .handle
+                .as_mut()
+                .and_then(NativeHandle::as_udp_mut)
+                .ok_or(IoErrorTag::AlreadyClosed)?;
+            match sock.recv_from(&mut tmp) {
+                Ok((n, peer)) => Ok((n, peer)),
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    Err(IoErrorTag::WouldBlock)
+                }
+                Err(e) => Err(IoErrorTag::from_kind(e.kind())),
             }
-            Err(e) => Err(IoErrorTag::from_kind(e.kind())),
-        };
-        let _ = sock.into_raw_fd();
-        result?
-    };
+        },
+    )??;
 
     {
         let Some(Object::Array(mut arr_gc)) = heap.find_object_by_addr(buf_addr) else {
@@ -1274,7 +1222,6 @@ mod tests {
     use crate::memory::Heap;
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::net::{TcpListener, TcpStream};
-    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::thread;
     use std::time::Duration;
 
@@ -1316,6 +1263,34 @@ mod tests {
         let buf = stream_read_to_end(&mut heap, r).expect("read_to_end");
         stream_close(&mut heap, r).expect("close r");
         assert_eq!(array_bytes(&heap, buf), b"Hi");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stream_open_rejects_invalid_mode() {
+        let mut heap = Heap::default();
+        let path = std::env::temp_dir().join("coil_io_bad_mode.bin");
+        let err = stream_open(&mut heap, path.to_str().unwrap(), "xx").unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn stream_open_append_preserves_bytes() {
+        let path = std::env::temp_dir().join("coil_io_append_mode.bin");
+        let _ = std::fs::remove_file(&path);
+        let mut heap = Heap::default();
+        let first = make_byte_array(&mut heap, b"ab");
+        let second = make_byte_array(&mut heap, b"cd");
+        let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open w");
+        stream_write_all(&mut heap, w, first).expect("write");
+        stream_close(&mut heap, w).expect("close w");
+        let a = stream_open(&mut heap, path.to_str().unwrap(), "a").expect("open a");
+        stream_write_all(&mut heap, a, second).expect("append");
+        stream_close(&mut heap, a).expect("close a");
+        let r = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open r");
+        let buf = stream_read_to_end(&mut heap, r).expect("read");
+        stream_close(&mut heap, r).expect("close r");
+        assert_eq!(array_bytes(&heap, buf), b"abcd");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1377,7 +1352,10 @@ mod tests {
         let mut heap = Heap::default();
         let s = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open");
         let buf = make_byte_array(&mut heap, &[]);
-        assert_eq!(stream_read_exact(&mut heap, s, buf).expect("read_exact"), Some(0));
+        assert_eq!(
+            stream_read_exact(&mut heap, s, buf).expect("read_exact"),
+            Some(0)
+        );
         stream_close(&mut heap, s).unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -1523,9 +1501,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port() as u16;
         listener.set_nonblocking(true).unwrap();
-        let fd = listener.into_raw_fd();
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let listen_stream = alloc_stream(&mut heap, owned, StreamKind::TcpListener).unwrap();
+        let listen_stream = alloc_stream(
+            &mut heap,
+            NativeHandle::Listener(listener),
+            StreamKind::TcpListener,
+        )
+        .unwrap();
 
         let client = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
@@ -1554,9 +1535,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
-        let fd = listener.into_raw_fd();
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let listen_stream = alloc_stream(&mut heap, owned, StreamKind::TcpListener).unwrap();
+        let listen_stream = alloc_stream(
+            &mut heap,
+            NativeHandle::Listener(listener),
+            StreamKind::TcpListener,
+        )
+        .unwrap();
         let reply = make_byte_array(&mut heap, b"ok");
 
         for round in 0..2 {
@@ -1636,7 +1620,7 @@ mod tests {
     #[test]
     fn stream_timeouts_round_trip_setters() {
         let mut heap = Heap::default();
-        let path = "/tmp/coil_io_timeout_setters.bin";
+        let path = "coil_io_timeout_setters.bin";
         let _ = std::fs::remove_file(path);
         let s = stream_open(&mut heap, path, "w").expect("open");
         stream_set_read_timeout(&mut heap, s, 100).expect("read to");
@@ -1680,7 +1664,7 @@ mod tests {
     #[test]
     fn stream_timeouts_on_closed_are_already_closed() {
         let mut heap = Heap::default();
-        let path = "/tmp/coil_io_timeout_closed.bin";
+        let path = "coil_io_timeout_closed.bin";
         let _ = std::fs::remove_file(path);
         let s = stream_open(&mut heap, path, "w").expect("open");
         stream_close(&mut heap, s).unwrap();
@@ -1777,21 +1761,26 @@ mod tests {
         assert_eq!(BUILTIN_IO_ERROR_VARIANTS[11], "Handshake");
     }
 
-    fn pipe_stream_pair(heap: &mut Heap) -> (Value, OwnedFd) {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let stream = alloc_stream(heap, read, StreamKind::File).expect("alloc read end");
-        (stream, write)
+    fn tcp_connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let writer = TcpStream::connect(addr).expect("connect");
+        let (reader, _) = listener.accept().expect("accept");
+        (reader, writer)
+    }
+
+    fn tcp_stream_pair(heap: &mut Heap) -> (Value, TcpStream) {
+        let (reader, writer) = tcp_connected_pair();
+        let stream =
+            alloc_stream(heap, NativeHandle::Tcp(reader), StreamKind::Tcp).expect("alloc read end");
+        (stream, writer)
     }
 
     #[test]
     fn await_readable_returns_ok_when_already_ready() {
         let mut heap = Heap::default();
-        let (stream, write) = pipe_stream_pair(&mut heap);
-        let n = unsafe { libc::write(write.as_raw_fd(), b"a".as_ptr().cast(), 1) };
-        assert_eq!(n, 1);
+        let (stream, mut write) = tcp_stream_pair(&mut heap);
+        write.write_all(b"a").expect("write");
         let _ = take_pending_io_park();
         let v = stream_await_readable(&mut heap, stream)
             .expect("await")
@@ -1805,15 +1794,15 @@ mod tests {
     #[test]
     fn await_readable_parks_when_not_ready() {
         let mut heap = Heap::default();
-        let (stream, write) = pipe_stream_pair(&mut heap);
+        let (stream, write) = tcp_stream_pair(&mut heap);
         stream_set_read_timeout(&mut heap, stream, 123).unwrap();
         let _ = take_pending_io_park();
         let parked = stream_await_readable(&mut heap, stream).expect("await");
-        assert!(parked.is_none(), "empty pipe must park the VM");
+        assert!(parked.is_none(), "empty socket must park the VM");
         let req = take_pending_io_park().expect("park request");
         assert_eq!(req.interest, Interest::Readable);
         assert_eq!(req.timeout, Some(Duration::from_millis(123)));
-        assert_eq!(req.fd, stream_raw_fd(&mut heap, stream).unwrap());
+        assert_eq!(req.handle, stream_wait_handle(&mut heap, stream).unwrap());
         stream_close(&mut heap, stream).unwrap();
         drop(write);
     }
@@ -1821,25 +1810,23 @@ mod tests {
     #[test]
     fn await_writable_returns_ok_for_empty_pipe_write_end() {
         let mut heap = Heap::default();
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        let stream = alloc_stream(&mut heap, write, StreamKind::File).expect("alloc write end");
+        let (reader, writer) = tcp_connected_pair();
+        let stream = alloc_stream(&mut heap, NativeHandle::Tcp(writer), StreamKind::Tcp)
+            .expect("alloc write end");
         let _ = take_pending_io_park();
         let v = stream_await_writable(&mut heap, stream)
             .expect("await")
-            .expect("empty pipe write end is writable");
+            .expect("connected TCP write end is writable");
         assert_eq!(enum_tag(&heap, v), Some(0));
         assert!(take_pending_io_park().is_none());
         stream_close(&mut heap, stream).unwrap();
-        drop(read);
+        drop(reader);
     }
 
     #[test]
     fn await_readable_on_closed_stream_errors() {
         let mut heap = Heap::default();
-        let (stream, write) = pipe_stream_pair(&mut heap);
+        let (stream, write) = tcp_stream_pair(&mut heap);
         stream_close(&mut heap, stream).unwrap();
         let err = stream_await_readable(&mut heap, stream).unwrap_err();
         assert_eq!(err, IoErrorTag::AlreadyClosed);
@@ -1856,21 +1843,16 @@ mod tests {
     fn io_drive_with_host_state_counts_ready_waiters() {
         let mut vm = crate::Machine::<64>::default();
         let io = std::sync::Arc::clone(vm.io_reactor());
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (r, w) = (fds[0], fds[1]);
-        let tok = io.register_wait(r, Interest::Readable);
+        let (r, mut w) = tcp_connected_pair();
+        let tok = io.register_wait(WaitHandle::from_tcp(&r), Interest::Readable);
         let _guard = crate::thread::HostStateGuard::enter(&mut vm);
         let mut heap = Heap::default();
         assert_eq!(io_drive(&mut heap).as_int(), 0);
-        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
-        assert_eq!(n, 1);
+        w.write_all(b"q").expect("write");
         assert_eq!(io_drive(&mut heap).as_int(), 1);
         io.cancel_wait(tok);
-        unsafe {
-            let _ = libc::close(r);
-            let _ = libc::close(w);
-        }
+        drop(r);
+        drop(w);
     }
 
     #[test]
@@ -1883,20 +1865,15 @@ mod tests {
     fn io_wait_ready_blocks_until_waiter_ready() {
         let mut vm = crate::Machine::<64>::default();
         let io = std::sync::Arc::clone(vm.io_reactor());
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (r, w) = (fds[0], fds[1]);
-        let tok = io.register_wait(r, Interest::Readable);
+        let (r, mut w) = tcp_connected_pair();
+        let tok = io.register_wait(WaitHandle::from_tcp(&r), Interest::Readable);
         let _guard = crate::thread::HostStateGuard::enter(&mut vm);
         let mut heap = Heap::default();
         // Make readable before wait so we don't hang the unit test.
-        let n = unsafe { libc::write(w, b"q".as_ptr().cast(), 1) };
-        assert_eq!(n, 1);
+        w.write_all(b"q").expect("write");
         assert!(io_wait_ready(&mut heap).as_int() >= 1);
         io.cancel_wait(tok);
-        unsafe {
-            let _ = libc::close(r);
-            let _ = libc::close(w);
-        }
+        drop(r);
+        drop(w);
     }
 }

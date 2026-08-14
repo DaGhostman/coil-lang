@@ -167,12 +167,15 @@ pub(super) fn byte_stack_delta(insn: Instruction, byte: &common::Byte) -> Option
         Instruction::INIT | Instruction::InitTyped => Some(1),
         Instruction::BinSlotImm | Instruction::BinSlotSlot => Some(1),
         Instruction::BinSlotImmJmpf
+        | Instruction::BinSlotImmJmpt
         | Instruction::BinSlotSlotJmpf
+        | Instruction::BinSlotSlotJmpt
         | Instruction::BinSlotSlotConstJmpf
+        | Instruction::BinSlotSlotConstJmpt
         | Instruction::BinSlotImmStore
         | Instruction::BinSlotSlotStore => Some(0),
-        Instruction::CmpJmpf => Some(-2),
-        Instruction::LogNotJmpf => Some(-1),
+        Instruction::CmpJmpf | Instruction::CmpJmpt => Some(-2),
+        Instruction::LogNotJmpf | Instruction::LogNotJmpt => Some(-1),
         Instruction::RETURN
         | Instruction::LoadReturnSlot
         | Instruction::ConstReturnImm => Some(-1),

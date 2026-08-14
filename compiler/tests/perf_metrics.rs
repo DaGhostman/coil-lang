@@ -113,8 +113,11 @@ fn count_bin_slot_family_in(bytecode: &[Byte], start: usize, end: usize) -> usiz
                 Instruction::BinSlotImm
                     | Instruction::BinSlotSlot
                     | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotImmJmpt
                     | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotSlotJmpt
                     | Instruction::BinSlotSlotConstJmpf
+                    | Instruction::BinSlotSlotConstJmpt
                     | Instruction::BinSlotImmStore
                     | Instruction::BinSlotSlotStore
                     | Instruction::FloatChainStore
@@ -400,25 +403,25 @@ fn perf_bool_guard_inverts_into_jmpt() {
 }
 
 #[test]
-fn perf_mandelbrot_keeps_fused_jmpf_guards() {
-    // Guard inversion must refuse fusable conditions: there is no *Jmpt
-    // superinstruction, so inverting `CmpJmpf` would add a dispatch.
+fn perf_mandelbrot_inverts_escape_into_const_jmpt() {
+    // Escape `if mag > 4 { break }` inverts fused *Jmpf; JMP into *Jmpt (COI-87).
     let (bc, _, _, _, pipeline) = compile("examples/perf/mandelbrot.hy");
     let syms = pipeline.program_debug().fn_symbols;
     let (start, end) = fn_pc_range(&syms, "mandelbrot", bc.len());
     assert_eq!(
         count_opcodes_in(&bc, start, end, Instruction::JMPT),
         0,
-        "mandelbrot's compare guards must stay fused as *Jmpf"
+        "escape should fuse to *Jmpt, not bare JMPT"
     );
     assert!(
-        count_opcodes_in(&bc, start, end, Instruction::BinSlotSlotConstJmpf) >= 1,
-        "escape test should fuse to BinSlotSlotConstJmpf"
+        count_opcodes_in(&bc, start, end, Instruction::BinSlotSlotConstJmpt) >= 1,
+        "escape test should invert+fuse to BinSlotSlotConstJmpt"
     );
     assert_eq!(
-        count_opcodes_in(&bc, start, end, Instruction::CmpJmpf),
+        count_opcodes_in(&bc, start, end, Instruction::CmpJmpf)
+            + count_opcodes_in(&bc, start, end, Instruction::CmpJmpt),
         0,
-        "escape CmpJmpf should be absorbed into BinSlotSlotConstJmpf"
+        "escape CmpJmp* should be absorbed into BinSlotSlotConstJmp*"
     );
 }
 
@@ -655,10 +658,15 @@ struct OpcodeHealth {
     bin_slot_imm_store: usize,
     bin_slot_slot_store: usize,
     bin_slot_imm_jmpf: usize,
+    bin_slot_imm_jmpt: usize,
     bin_slot_slot_jmpf: usize,
+    bin_slot_slot_jmpt: usize,
     bin_slot_slot_const_jmpf: usize,
+    bin_slot_slot_const_jmpt: usize,
     cmp_jmpf: usize,
+    cmp_jmpt: usize,
     log_not_jmpf: usize,
+    log_not_jmpt: usize,
     float_chain_store: usize,
     jmpf: usize,
     jmpt: usize,
@@ -685,6 +693,14 @@ impl OpcodeHealth {
             + self.cmp_jmpf
             + self.log_not_jmpf
     }
+
+    fn fused_jmpt_total(&self) -> usize {
+        self.bin_slot_imm_jmpt
+            + self.bin_slot_slot_jmpt
+            + self.bin_slot_slot_const_jmpt
+            + self.cmp_jmpt
+            + self.log_not_jmpt
+    }
 }
 
 /// Near-miss / residual shapes that existing opcodes do not absorb.
@@ -695,10 +711,9 @@ impl OpcodeHealth {
 struct OpcodeGaps {
     /// Bare JMPF remaining in the body (fusion miss or non-fusable guard).
     bare_jmpf: usize,
-    /// JMPT usage (invert of non-fusable bool guards only today).
+    /// JMPT usage (invert of non-fusable bool guards, plus fused `*Jmpt`).
     jmpt: usize,
-    /// Fused `*Jmpf` immediately followed by unconditional `JMP` — invert refused
-    /// because there is no `*Jmpt` counterpart (`if cond { break }` shape).
+    /// Fused `*Jmpf` immediately followed by unconditional `JMP` — invert miss.
     would_be_jmpt_after_invert: usize,
     /// `LOAD; CONST(pool); float-arith` — int/bool `BinSlotImm` only.
     bin_slot_imm_float_miss: usize,
@@ -809,10 +824,15 @@ fn inventory_health(body: &[Byte]) -> OpcodeHealth {
             Instruction::BinSlotImmStore => h.bin_slot_imm_store += 1,
             Instruction::BinSlotSlotStore => h.bin_slot_slot_store += 1,
             Instruction::BinSlotImmJmpf => h.bin_slot_imm_jmpf += 1,
+            Instruction::BinSlotImmJmpt => h.bin_slot_imm_jmpt += 1,
             Instruction::BinSlotSlotJmpf => h.bin_slot_slot_jmpf += 1,
+            Instruction::BinSlotSlotJmpt => h.bin_slot_slot_jmpt += 1,
             Instruction::BinSlotSlotConstJmpf => h.bin_slot_slot_const_jmpf += 1,
+            Instruction::BinSlotSlotConstJmpt => h.bin_slot_slot_const_jmpt += 1,
             Instruction::CmpJmpf => h.cmp_jmpf += 1,
+            Instruction::CmpJmpt => h.cmp_jmpt += 1,
             Instruction::LogNotJmpf => h.log_not_jmpf += 1,
+            Instruction::LogNotJmpt => h.log_not_jmpt += 1,
             Instruction::FloatChainStore => h.float_chain_store += 1,
             Instruction::JMPF => h.jmpf += 1,
             Instruction::JMPT => h.jmpt += 1,
@@ -840,7 +860,7 @@ fn inventory_gaps(body: &[Byte], body_abs_start: usize) -> OpcodeGaps {
     let n = body.len();
     let mut cast_blocked_float_ops = 0usize;
     for i in 0..n {
-        // Fused *Jmpf; JMP — invert refused (no *Jmpt).
+        // Fused *Jmpf; JMP — invert should have collapsed this when *Jmpt exists.
         if i + 1 < n && is_fused_jmpf(*body[i].bytecode()) && *body[i + 1].bytecode() == Instruction::JMP
         {
             g.would_be_jmpt_after_invert += 1;
@@ -1003,7 +1023,7 @@ fn perf_phase0_mandelbrot_shape_inventory() {
     //   latch dispatches/run — Phase 5 MoveSlot / rename candidate.
     // Phase 4 fuse-feed / near-miss audit:
     //   FCS≥2 / ConstJmpf≥1 / expand_dup squares intact; no promotion split.
-    //   would_be_jmpt_after_invert=1 (escape `*Jmpf; JMP` break).
+    //   would_be_jmpt_after_invert=0 (escape inverted to BinSlotSlotConstJmpt).
     // Phase cast_spill: cr/ci casts hoist to temps; FloatChainStore=4,
     //   residual float_arith=0, float_chain_cast_blocked=0; STORE budget +1.
     //   float_chain_stage_cap_leftover=0 (no 4-stage truncation).
@@ -1018,25 +1038,25 @@ fn perf_phase0_mandelbrot_shape_inventory() {
         "mandelbrot should fuse cr via cast_spill + FloatChainStore: {h:?}"
     );
     assert!(
-        h.bin_slot_slot_const_jmpf >= 1,
-        "escape test should stay BinSlotSlotConstJmpf: {h:?}"
+        h.bin_slot_slot_const_jmpt >= 1,
+        "escape break should invert+fuse to BinSlotSlotConstJmpt: {h:?}"
     );
     assert!(
-        h.fused_jmpf_total() >= 4,
+        h.fused_jmpf_total() + h.fused_jmpt_total() >= 4,
         "y/x/iter headers + escape: {h:?}"
     );
-    assert_eq!(h.jmpt, 0, "no *Jmpt path; guards stay *Jmpf: {h:?}");
+    assert_eq!(h.jmpt, 0, "no bare JMPT in mandelbrot: {h:?}");
     assert_eq!(h.jmpf, 0, "no bare JMPF in mandelbrot: {h:?}");
 
     // Opcode-candidate gaps (ledger rows).
     assert_eq!(
-        g.would_be_jmpt_after_invert, 1,
-        "escape break is fused *Jmpf; JMP (would-be *Jmpt): {g:?}"
+        g.would_be_jmpt_after_invert, 0,
+        "escape break should invert to *Jmpt (COI-87): {g:?}"
     );
     assert_eq!(
         g.jmpt_counterpart_proxy(),
-        1,
-        "*Jmpt ledger proxy = would_be_jmpt (bare JMPF/JMPT=0): {g:?}"
+        0,
+        "*Jmpt ledger proxy should be 0 after invert: {g:?}"
     );
     assert_eq!(
         g.bin_slot_imm_float_miss, 0,

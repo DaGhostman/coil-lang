@@ -154,7 +154,7 @@ fn main() {
     print_look(p);
     write_all(stdout(), to_bytes(" "));
 
-    let save_path = "/tmp/coil_adventure_save.dat";
+    let save_path = "coil_adventure_save.dat";
     let z: byte = 0;
     let nl: byte = 10;
     let cr: byte = 13;

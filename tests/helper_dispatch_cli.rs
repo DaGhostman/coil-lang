@@ -22,7 +22,7 @@ fn scratch_dir(suffix: &str) -> PathBuf {
 #[test]
 fn missing_helper_reports_required_binary() {
     let cwd = scratch_dir("missing");
-    let isolated = cwd.join("coil");
+    let isolated = cwd.join(format!("coil{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(coil_bin(), &isolated).expect("copy coil without helpers");
 
     let out = Command::new(&isolated)

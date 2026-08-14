@@ -13,6 +13,7 @@ pub mod fs;
 pub mod gc_handles;
 pub mod host_natives;
 pub mod io;
+mod io_handle;
 pub mod io_reactor;
 pub mod math_libm;
 mod memory;
