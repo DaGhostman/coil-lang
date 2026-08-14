@@ -6276,6 +6276,76 @@ fn main() {
     }
 
     #[test]
+    fn string_literal_cast_to_vec_byte_ok() {
+        let (mut c, _) = check(r#"fn main() { let b = "hi" as Vec<byte>; }"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("b")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("b");
+        assert_eq!(
+            ty,
+            crate::typechecking::ty::vec_app_ty(crate::typechecking::ty::byte())
+        );
+    }
+
+    #[test]
+    fn string_var_cast_to_byte_slice_ok() {
+        let (mut c, _) = check(r#"fn main() { let s = "hi"; let b = s as [byte]; }"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("b")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("b");
+        match ty {
+            Ty::Array {
+                element,
+                length: crate::typechecking::ty::ArrayLength::Dynamic,
+            } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn string_var_cast_to_fixed_byte_array_rejects() {
+        let msgs = assert_messages(r#"fn main() { let s = "hi"; let _ = s as [byte; 2]; }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.message()
+                    .contains("cannot cast `string` to fixed-length `[byte; N]`")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("to_bytes"))
+            }),
+            "got: {:?}",
+            msgs.iter().map(|m| (m.message(), m.help())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_var_annotated_vec_byte_rejects() {
+        let msgs = assert_messages(r#"fn main() { let s = "hi"; let _: Vec<byte> = s; }"#);
+        assert!(
+            !msgs.is_empty(),
+            "non-literal string must not coerce to Vec<byte> via annotation"
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                let msg = m.message();
+                msg.contains("Type mismatch")
+                    || msg.contains("expected")
+                    || msg.contains("Vec<byte>")
+            }),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn byte_cast_rejects_negative_literal() {
         for src in [
             "fn main() { let x = -1 as byte; }",
