@@ -5201,6 +5201,38 @@ fn main() -> Result<(), Error> {
     // ---- Error handling: raise / ? / ?? / ?. ----
 
     #[test]
+    fn explicit_result_ok_return_accepted_in_result_mode() {
+        let src = r#"
+fn f() -> Result<int, string> {
+    return Result::Ok(99);
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_is_result_mode("f"));
+    }
+
+    #[test]
+    fn explicit_result_err_return_accepted_in_result_mode() {
+        let src = r#"
+fn f() -> Result<int, string> {
+    return Result::Err("boom");
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_is_result_mode("f"));
+    }
+
+    #[test]
     fn raise_infers_result_mode_and_wraps_success() {
         let src = r#"
 fn f(int n) {

@@ -428,6 +428,9 @@ pub struct Checker {
 
     /// Functions whose success returns must be Ok-wrapped at codegen.
     result_mode_fns: HashSet<String>,
+    /// Result-mode functions whose Ok payload is itself a `Result` (nested).
+    /// Explicit `return Result::Ok(…)` is still Ok-wrapped for these.
+    result_mode_ok_is_result: HashSet<String>,
     /// Function names whose return type is (or was inferred as) `Option<_>`.
     option_mode_fns: HashSet<String>,
 
