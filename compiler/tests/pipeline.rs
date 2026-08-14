@@ -9203,11 +9203,29 @@ test("nested free-fn try mismatched Result") {
     let n = free_encode_into(7)?;
     assert(n == 1)?;
 }
+class Client {
+}
+impl Client {
+    fn get() -> Result<int, string> {
+        return self.send()?;
+    }
+    fn send() -> Result<int, string> {
+        return self.request_send()?;
+    }
+    fn request_send() -> Result<int, string> {
+        return 42;
+    }
+}
+test("nested same-Result methods declared later") {
+    let c = new Client();
+    let n = c.get()?;
+    assert(n == 42)?;
+}
 "#,
         )
         .expect("COI-108 harness should compile");
     let cases = pipeline.test_cases().to_vec();
-    assert_eq!(cases.len(), 4, "expected four COI-108 cases, got {cases:?}");
+    assert_eq!(cases.len(), 5, "expected five COI-108 cases, got {cases:?}");
     for (name, offset) in &cases {
         let mut machine = Machine::<256>::with_operand_capacity(pipeline.operand_stack_slots() as usize);
         pipeline.wire_host_natives(&mut machine);

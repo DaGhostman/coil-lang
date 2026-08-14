@@ -69,3 +69,25 @@ test("nested free-fn try mismatched Result payload") {
     let n = free_encode_into(7)?;
     assert(n == 1)?;
 }
+
+class Client {}
+
+impl Client {
+    fn get() -> Result<int, string> {
+        return self.send()?;
+    }
+
+    fn send() -> Result<int, string> {
+        return self.request_send()?;
+    }
+
+    fn request_send() -> Result<int, string> {
+        return 42;
+    }
+}
+
+test("nested same-Result methods declared later") {
+    let c = new Client();
+    let n = c.get()?;
+    assert(n == 42)?;
+}
