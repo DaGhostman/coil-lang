@@ -7298,6 +7298,44 @@ fn main() {
     }
 
     #[test]
+    fn imported_enum_variant_match_works_in_test_body() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("json::value");
+        let ast = parser
+            .parse("enum JsonValue { Null, Str(string), }")
+            .expect("parse value module");
+        let _ = c.check_program(&ast);
+        assert!(
+            c.take_messages().is_empty(),
+            "value module: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        c.set_current_module("");
+        c.env_mut().insert_top(
+            "JsonValue".to_string(),
+            Scheme::mono(Ty::Con("json::value::JsonValue".into())),
+        );
+        let ast = parser
+            .parse(
+                r#"test("match imported enum") {
+    let v = JsonValue::Null;
+    match v { JsonValue::Null => assert(true)?, _ => assert(false)? };
+}"#,
+            )
+            .expect("parse test file");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn two_modules_can_export_same_class_short_name() {
         let mut c = Checker::new();
         let parser = Pratt::default();
