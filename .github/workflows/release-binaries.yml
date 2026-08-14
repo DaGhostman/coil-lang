@@ -75,7 +75,9 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          # base-devel: GNU make + cmp for vendored libffi-sys ./configure
           install: >-
+            base-devel
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-libffi
             mingw-w64-x86_64-pcre2
@@ -156,8 +158,13 @@ jobs:
         shell: msys2 {0}
         run: |
           cargo_bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
-          export PATH="$MINGW_PREFIX/bin:$cargo_bin:$PATH"
+          # /usr/bin must be on PATH so vendored libffi-sys configure finds
+          # GNU make and cmp (base-devel). Keep MinGW + cargo ahead of it.
+          export PATH="$MINGW_PREFIX/bin:$cargo_bin:/usr/bin:$PATH"
           rustc -vV
+          command -v make
+          command -v cmp
+          make --version | head -n 1
           cargo build --release
 
       - name: Stage embed binary and toolkit archive
