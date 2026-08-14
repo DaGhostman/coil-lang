@@ -186,7 +186,7 @@ idle workers steal. `thread::spawn` / auto-par share this pool — no per-call
 
 | Env | Effect |
 |-----|--------|
-| `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2). |
+| `COIL_MAX_WORKER_THREADS` | Pool size (1..=512). Default `available_parallelism` (min 2), or **1** when `CI` is set. `.cargo/config.toml` also sets this to `1` (`force = false`) for local cargo test runs. Export a higher value to profile parallelism. |
 | `COIL_AUTO_PAR` | `0` / `false` / `off` / `no` disables auto fork-join codegen. |
 | `COIL_PAR_THRESHOLD` | Compile-time profitability cutoff — fork-site work score and loop trip count (default 20). |
 

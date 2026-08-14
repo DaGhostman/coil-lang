@@ -12,3 +12,8 @@
 # See docs/internals/limitations.md ("Test / CI reliability").
 [env]
 RUST_MIN_STACK = "8388608"
+# Cap the work-stealing reactor to one OS worker under cargo (tests especially).
+# Parallel Machines × default available_parallelism pools exhaust macOS process
+# limits and surface as cargo "io error when listing tests" EAGAIN. Override
+# with COIL_MAX_WORKER_THREADS=N when profiling auto-par / spawn throughput.
+COIL_MAX_WORKER_THREADS = { value = "1", force = false }

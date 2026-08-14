@@ -18,7 +18,8 @@ pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
 ///
 /// Caps host threads used for `spawn` / auto-par. Override with
 /// `COIL_MAX_WORKER_THREADS` (clamped to 1..=512). Default is
-/// `available_parallelism` (minimum 2).
+/// `available_parallelism` (minimum 2), or **1** when `CI` is set (and the
+/// env override is absent) so test runs do not multiply reactor OS threads.
 #[derive(Debug)]
 pub struct WorkerCap {
     max: usize,
@@ -50,6 +51,12 @@ fn max_worker_threads() -> usize {
             if let Ok(n) = raw.parse::<usize>() {
                 return n.clamp(1, 512);
             }
+        }
+        // GitHub Actions (and most CI) set `CI=true`. One worker per root
+        // Machine keeps parallel cargo tests from exploding OS-thread counts
+        // that amplify macOS cargo `--list` EAGAIN flakes.
+        if std::env::var_os("CI").is_some() {
+            return 1;
         }
         thread::available_parallelism()
             .map(|n| n.get().max(2))
