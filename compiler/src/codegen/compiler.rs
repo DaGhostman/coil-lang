@@ -4502,10 +4502,7 @@ impl Compiler {
         let fn_id = &args[1];
         let args_tuple = &args[2];
 
-        let variadic = match fn_id.1.as_ref() {
-            Expression::Identifier(name) => self.checker.is_ffi_declare_variadic(name),
-            _ => false,
-        };
+        let variadic = self.checker.is_ffi_declare_variadic_for_fn_id(fn_id);
 
         let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
             Expression::Tuple(items) => items.to_vec(),

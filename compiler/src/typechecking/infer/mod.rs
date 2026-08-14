@@ -390,6 +390,21 @@ pub struct Checker {
     /// Fixed-prefix arity (`nfixed`) for variadic `declare` bindings.
     ffi_fn_nfixed: HashMap<String, usize>,
 
+    /// `declare` return metadata keyed by `Class::field` (stored fn ids).
+    ffi_fn_ret_by_field: HashMap<String, Ty>,
+
+    /// Variadic flag for [`Self::ffi_fn_ret_by_field`] entries.
+    ffi_fn_variadic_by_field: HashMap<String, bool>,
+
+    /// Fixed-prefix arity for [`Self::ffi_fn_ret_by_field`] entries.
+    ffi_fn_nfixed_by_field: HashMap<String, usize>,
+
+    /// `invoke` return metadata keyed by `fn_name::param_name` from call sites.
+    ffi_fn_param_invoke_ret: HashMap<String, (Ty, bool, usize)>,
+
+    /// Enclosing function during body inference (`invoke` param refinement).
+    current_function: Option<String>,
+
     /// Extern functions declared with bare `...` (C varargs).
     extern_variadic: HashSet<String>,
 

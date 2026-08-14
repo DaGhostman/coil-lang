@@ -4259,6 +4259,95 @@ fn main() -> Result<(), Error> {
         }
     }
 
+    #[test]
+    fn invoke_refines_return_type_from_class_field_declare_id() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.id = declare(lib, "f", (), Float)?;
+    let f: float = invoke(lib, api.id, ())?;
+    let _ = f;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invoke_refines_return_type_from_local_copied_from_field() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.id = declare(lib, "f", (), Float)?;
+    let fn_id = api.id;
+    let f: float = invoke(lib, fn_id, ())?;
+    let _ = f;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invoke_refines_return_type_from_impl_self_field() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+impl Api {
+    fn load(int lib) -> Result<(), Error> {
+        self.id = declare(lib, "f", (), Float)?;
+    }
+}
+
+fn read(Api api) -> Result<float, Error> {
+    let f: float = invoke(0, api.id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.load(lib)?;
+    let _ = read(api)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     // ---- Error handling: raise / ? / ?? / ?. ----
 
     #[test]
