@@ -7,7 +7,6 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, OnceLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -20,6 +19,7 @@ use rustls::{
 use common::Value;
 
 use crate::io::{IoErrorTag, value_as_string, with_stream_mut};
+use crate::io_handle::{NativeHandle, WaitHandle};
 use crate::memory::{Heap, Member, Object, StreamKind};
 
 /// rustls session state owned by a TLS [`crate::memory::ObjStream`] (client or server).
@@ -241,18 +241,17 @@ fn handshake_with_deadline(
     conn: &mut Connection,
     deadline: Option<std::time::Instant>,
 ) -> Result<(), IoErrorTag> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
+    let wait = WaitHandle::from_tcp(stream);
     while conn.is_handshaking() {
         while conn.wants_write() {
             match conn.write_tls(stream) {
                 // rustls may return Ok(0) when the socket is not ready.
-                Ok(0) => wait_fd_deadline(fd, false, deadline)?,
+                Ok(0) => wait_handle_deadline(wait, false, deadline)?,
                 Ok(_) => {}
                 Err(e)
                     if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
                 {
-                    wait_fd_deadline(fd, false, deadline)?;
+                    wait_handle_deadline(wait, false, deadline)?;
                 }
                 Err(e) => return Err(map_io(e)),
             }
@@ -269,7 +268,7 @@ fn handshake_with_deadline(
                 Err(e)
                     if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
                 {
-                    wait_fd_deadline(fd, true, deadline)?;
+                    wait_handle_deadline(wait, true, deadline)?;
                 }
                 Err(e) => return Err(map_io(e)),
             }
@@ -277,10 +276,10 @@ fn handshake_with_deadline(
     }
     while conn.wants_write() {
         match conn.write_tls(stream) {
-            Ok(0) => wait_fd_deadline(fd, false, deadline)?,
+            Ok(0) => wait_handle_deadline(wait, false, deadline)?,
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                wait_fd_deadline(fd, false, deadline)?;
+                wait_handle_deadline(wait, false, deadline)?;
             }
             Err(e) => return Err(map_io(e)),
         }
@@ -288,8 +287,8 @@ fn handshake_with_deadline(
     Ok(())
 }
 
-fn wait_fd_deadline(
-    fd: RawFd,
+fn wait_handle_deadline(
+    handle: WaitHandle,
     for_read: bool,
     deadline: Option<std::time::Instant>,
 ) -> Result<(), IoErrorTag> {
@@ -308,7 +307,7 @@ fn wait_fd_deadline(
     } else {
         crate::io_reactor::Interest::Writable
     };
-    crate::io::reactor_wait_fd(fd, interest, timeout)
+    crate::io::reactor_wait_fd(handle, interest, timeout)
 }
 
 /// Run handshake while keeping the socket non-blocking; honor optional deadline.
@@ -482,24 +481,25 @@ pub fn tls_client_enable(
     };
     let deadline = deadline_from_ms(opts.timeout_ms);
 
-    let fd = with_stream_mut(heap, stream, |s| -> Result<RawFd, IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+    let hs = with_stream_mut(heap, stream, |s| -> Result<Connection, IoErrorTag> {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if s.kind != StreamKind::Tcp || s.tls.is_some() {
             return Err(IoErrorTag::InvalidInput);
         }
-        Ok(s.fd.as_ref().unwrap().as_raw_fd())
+        let tcp = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_tcp_mut)
+            .ok_or(IoErrorTag::InvalidInput)?;
+        with_handshake(tcp, deadline, |_tcp| {
+            let client = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
+            Ok(Connection::Client(client))
+        })
     })??;
 
-    let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = with_handshake(&mut tcp, deadline, |_tcp| {
-        let client = ClientConnection::new(config, server_name).map_err(map_tls_err)?;
-        Ok(Connection::Client(client))
-    });
-    let _ = tcp.into_raw_fd();
-
-    let session = match hs? {
+    let session = match hs {
         Connection::Client(c) => TlsSession::from_client(c),
         Connection::Server(s) => TlsSession::from_server(s),
     };
@@ -637,14 +637,14 @@ fn server_config_from_opts(opts: ServerEnableOpts) -> Result<Arc<ServerConfig>, 
 pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<Value, IoErrorTag> {
     // Validate the stream before PEM work so kind/closed errors do not depend
     // on whether cert/key parse.
-    let fd = with_stream_mut(heap, stream, |s| -> Result<RawFd, IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+    with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if s.kind != StreamKind::Tcp || s.tls.is_some() {
             return Err(IoErrorTag::InvalidInput);
         }
-        Ok(s.fd.as_ref().unwrap().as_raw_fd())
+        Ok(())
     })??;
 
     let opts = parse_server_enable_options(heap, opts)?;
@@ -657,14 +657,22 @@ pub fn tls_server_enable(heap: &mut Heap, stream: Value, opts: Value) -> Result<
         server_config_with_alpn((*base).clone(), &alpn)
     };
 
-    let mut tcp = unsafe { TcpStream::from_raw_fd(fd) };
-    let hs = with_handshake(&mut tcp, deadline, |_tcp| {
-        let server = ServerConnection::new(config).map_err(map_tls_err)?;
-        Ok(Connection::Server(server))
-    });
-    let _ = tcp.into_raw_fd();
+    let hs = with_stream_mut(heap, stream, |s| -> Result<Connection, IoErrorTag> {
+        if s.closed || s.handle.is_none() {
+            return Err(IoErrorTag::AlreadyClosed);
+        }
+        let tcp = s
+            .handle
+            .as_mut()
+            .and_then(NativeHandle::as_tcp_mut)
+            .ok_or(IoErrorTag::InvalidInput)?;
+        with_handshake(tcp, deadline, |_tcp| {
+            let server = ServerConnection::new(config).map_err(map_tls_err)?;
+            Ok(Connection::Server(server))
+        })
+    })??;
 
-    let session = match hs? {
+    let session = match hs {
         Connection::Client(c) => TlsSession::from_client(c),
         Connection::Server(s) => TlsSession::from_server(s),
     };
@@ -692,15 +700,14 @@ pub fn tls_server_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErr
 
 fn tls_teardown(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
-        if s.closed || s.fd.is_none() {
+        if s.closed || s.handle.is_none() {
             return Err(IoErrorTag::AlreadyClosed);
         }
         if s.kind != StreamKind::Tls {
             return Err(IoErrorTag::InvalidInput);
         }
-        let fd = s.fd.as_ref().unwrap().as_raw_fd();
-        if let Some(tls) = s.tls.as_mut() {
-            let _ = send_close_notify(fd, tls);
+        if let (Some(handle), Some(tls)) = (s.handle.as_mut(), s.tls.as_mut()) {
+            let _ = send_close_notify(handle, tls);
         }
         s.tls.take();
         s.kind = StreamKind::Tcp;
@@ -709,16 +716,9 @@ fn tls_teardown(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     Ok(stream)
 }
 
-fn with_socket_mut<R>(fd: RawFd, f: impl FnOnce(&mut std::fs::File) -> R) -> R {
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let result = f(&mut file);
-    let _ = file.into_raw_fd();
-    result
-}
-
-fn flush_tls(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorTag> {
+fn flush_tls<S: Read + Write>(sock: &mut S, tls: &mut TlsSession) -> Result<(), IoErrorTag> {
     while tls.conn.wants_write() {
-        let n = with_socket_mut(fd, |sock| tls.conn.write_tls(sock)).map_err(map_io)?;
+        let n = tls.conn.write_tls(sock).map_err(map_io)?;
         if n == 0 {
             return Err(IoErrorTag::WouldBlock);
         }
@@ -726,8 +726,11 @@ fn flush_tls(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorTag> {
     Ok(())
 }
 
-fn read_tls_records(fd: RawFd, tls: &mut TlsSession) -> Result<usize, IoErrorTag> {
-    match with_socket_mut(fd, |sock| tls.conn.read_tls(sock)) {
+fn read_tls_records<S: Read + Write>(
+    sock: &mut S,
+    tls: &mut TlsSession,
+) -> Result<usize, IoErrorTag> {
+    match tls.conn.read_tls(sock) {
         Ok(0) => Ok(0),
         Ok(n) => {
             let _ = tls.conn.process_new_packets().map_err(map_tls_err)?;
@@ -744,8 +747,8 @@ fn read_tls_records(fd: RawFd, tls: &mut TlsSession) -> Result<usize, IoErrorTag
 /// Non-blocking TLS application read into `buf`.
 ///
 /// `Ok(None)` = clean EOF; `Err(WouldBlock)` when more socket data is needed.
-pub fn tls_read(
-    fd: RawFd,
+pub fn tls_read<S: Read + Write>(
+    sock: &mut S,
     tls: &mut TlsSession,
     buf: &mut [u8],
 ) -> Result<Option<usize>, IoErrorTag> {
@@ -754,7 +757,7 @@ pub fn tls_read(
     }
     // Drain pending ciphertext first so a prior write that returned Ok(n) with
     // a WouldBlock flush cannot leave the peer waiting while we poll for read.
-    flush_tls(fd, tls)?;
+    flush_tls(sock, tls)?;
     // Prefer already-buffered plaintext.
     let n = tls.drain_plaintext_into(buf);
     if n > 0 {
@@ -767,7 +770,7 @@ pub fn tls_read(
         return Ok(Some(n));
     }
     // Need more TLS records from the socket.
-    match read_tls_records(fd, tls) {
+    match read_tls_records(sock, tls) {
         Ok(0) => {
             // Peer closed; drain any final plaintext.
             tls.pull_plaintext_from_conn()?;
@@ -788,32 +791,39 @@ pub fn tls_read(
 }
 
 /// Non-blocking TLS application write of `bytes`.
-pub fn tls_write(fd: RawFd, tls: &mut TlsSession, bytes: &[u8]) -> Result<usize, IoErrorTag> {
+pub fn tls_write<S: Read + Write>(
+    sock: &mut S,
+    tls: &mut TlsSession,
+    bytes: &[u8],
+) -> Result<usize, IoErrorTag> {
     // Always try to flush pending ciphertext first.
-    flush_tls(fd, tls)?;
+    flush_tls(sock, tls)?;
     if bytes.is_empty() {
         return Ok(0);
     }
     let n = match tls.conn.writer().write(bytes) {
         Ok(n) => n,
         Err(e) if e.kind() == ErrorKind::WouldBlock => {
-            flush_tls(fd, tls)?;
+            flush_tls(sock, tls)?;
             return Err(IoErrorTag::WouldBlock);
         }
         Err(_) => return Err(IoErrorTag::Other),
     };
     // Best-effort flush; WouldBlock after accepting app bytes is OK — next
     // write/read will resume flushing via wants_write.
-    match flush_tls(fd, tls) {
+    match flush_tls(sock, tls) {
         Ok(()) | Err(IoErrorTag::WouldBlock) => Ok(n),
         Err(e) => Err(e),
     }
 }
 
-/// Send TLS `close_notify` (best-effort) before the fd is closed.
-pub fn send_close_notify(fd: RawFd, tls: &mut TlsSession) -> Result<(), IoErrorTag> {
+/// Send TLS `close_notify` (best-effort) before the handle is closed.
+pub fn send_close_notify<S: Read + Write>(
+    sock: &mut S,
+    tls: &mut TlsSession,
+) -> Result<(), IoErrorTag> {
     tls.conn.send_close_notify();
-    match flush_tls(fd, tls) {
+    match flush_tls(sock, tls) {
         Ok(()) | Err(IoErrorTag::WouldBlock) => Ok(()),
         Err(e) => Err(e),
     }
@@ -1135,9 +1145,18 @@ mod tests {
     }
 
     fn stream_is_nonblocking(heap: &mut Heap, stream: Value) -> bool {
-        let fd = with_stream_mut(heap, stream, |s| s.fd.as_ref().unwrap().as_raw_fd()).unwrap();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        flags >= 0 && (flags as libc::c_int & libc::O_NONBLOCK) != 0
+        #[cfg(unix)]
+        {
+            let fd =
+                with_stream_mut(heap, stream, |s| s.handle.as_ref().unwrap().as_raw_fd()).unwrap();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            flags >= 0 && (flags as libc::c_int & libc::O_NONBLOCK) != 0
+        }
+        #[cfg(windows)]
+        {
+            let _ = (heap, stream);
+            true
+        }
     }
 
     #[test]
@@ -1367,9 +1386,8 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let mut buf = make_byte_array(&mut heap, &[0u8; 64]);
@@ -1470,10 +1488,9 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let mut heap = Heap::default();
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let s = tls_server_disable(&mut heap, s).expect("server disable");
@@ -1502,10 +1519,9 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let mut heap = Heap::default();
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let opts2 = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
@@ -1792,10 +1808,9 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let mut heap = Heap::default();
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let s = tls_client_disable(&mut heap, s).expect("client disable");
@@ -1826,9 +1841,8 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &server_cert, &server_key);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let buf = make_byte_array(&mut heap, &[0u8; 64]);
@@ -1880,9 +1894,8 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts = make_server_enable_opts(&mut heap, &server_cert, &server_key);
             let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
             let buf = make_byte_array(&mut heap, &[0u8; 64]);
@@ -2042,10 +2055,9 @@ mod tests {
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
-            let fd = sock.into_raw_fd();
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
             let mut heap = Heap::default();
-            let s = crate::io::alloc_stream(&mut heap, owned, StreamKind::Tcp).expect("stream");
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
             let opts =
                 make_server_enable_opts_full(&mut heap, &cert_pem, &key_pem, 2000, &client_ca_pem);
             let result = tls_server_enable(&mut heap, s, opts);
