@@ -5317,6 +5317,49 @@ fn main() -> Result<(), Error> { \
         );
     }
 
+    /// Param call-site flow must still set the FfiInvoke variadic bit when
+    /// `invoke` uses a bare parameter whose `declare(..., true)` metadata was
+    /// recorded from callers (codegen must restore checker `current_function`).
+    #[test]
+    fn invoke_param_fn_id_variadic_sets_ffi_operand_flag() {
+        use common::Instruction;
+        let src = "\
+use ffi::{dload, declare, invoke, Error}; \
+use ffi::types::{Int, Float}; \
+fn helper(int id) -> Result<float, Error> { \
+  let f: float = invoke(0, id, (1, 2, 3))?; \
+  return f; \
+} \
+fn main() -> Result<(), Error> { \
+  let lib = dload(\"noop\")?; \
+  let fn_id = declare(lib, \"f\", (Int,), Float, true)?; \
+  let _ = helper(fn_id)?; \
+}";
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            compiler.get_messages().is_empty(),
+            "unexpected compile diagnostics: {:?}",
+            compiler
+                .get_messages()
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+        let ffi = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::FfiInvoke))
+            .expect("expected FfiInvoke");
+        let operand = ffi.operand_u32();
+        assert_eq!(operand & 0xFFFF, 3, "arity low bits should be 3");
+        assert_ne!(
+            operand & (1 << 16),
+            0,
+            "variadic bit must be set for param fn-id declare(..., true)"
+        );
+    }
+
     /// `invoke(..., (fn, …))` callback args must use relocatable `CodePtr`,
     /// not `CONST`. Peephole fusion adjusts `CodePtr` in `finalize_bytecode`
     /// but never rewrites `CONST`, so a stale offset would make the FFI
