@@ -23,7 +23,7 @@ use io::sync::{write_all};
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_tls_smoke.bin";
+    let path = "coil_tls_smoke.bin";
     let s = open(path, "w")?;
     let msg = match enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" }) {
         Result::Ok(_) => "unexpected-ok",
