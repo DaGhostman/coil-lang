@@ -15367,9 +15367,14 @@ impl Checker {
                 payload,
                 ..
             } => {
+                // Imported short names resolve via env/FQN — same as
+                // `infer_pattern` / `infer_construct`.
+                let enum_key = self
+                    .resolve_enum_key(enum_name)
+                    .unwrap_or_else(|| enum_name.to_string());
                 let tag = self
                     .enum_tags
-                    .get(enum_name.to_string().as_str())
+                    .get(enum_key.as_str())
                     .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
                 let inner = Self::inner_coverage(payload, &self.enum_tags);
                 ArmCoverage {
