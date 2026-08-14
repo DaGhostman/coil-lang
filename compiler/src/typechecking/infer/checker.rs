@@ -15975,7 +15975,7 @@ impl Checker {
         if common::is_builtin_ffi_enum(enum_name) {
             common::BUILTIN_FFI_TYPE_ENUM.to_string()
         } else {
-            self.resolve_enum_key(enum_name)
+            self.resolve_enum_key_for_codegen(enum_name)
                 .unwrap_or_else(|| enum_name.to_string())
         }
     }
@@ -16357,21 +16357,31 @@ impl Checker {
                 return Some(n.clone());
             }
         }
-        // Codegen may look up short names after `current_module` moved on;
-        // accept a unique `…::Name` registry hit.
-        if !name.contains("::") {
-            let suffix = format!("::{name}");
-            let mut hits: Vec<String> = self
-                .enum_tags
-                .keys()
-                .filter(|k| *k == name || k.ends_with(&suffix))
-                .cloned()
-                .collect();
-            if hits.len() == 1 {
-                return hits.pop();
-            }
-        }
         None
+    }
+
+    /// Codegen-only: resolve a Construct enum head when `current_module` may
+    /// no longer match the defining module. Prefer normal resolution; if that
+    /// misses, accept a unique `…::Name` registry key.
+    fn resolve_enum_key_for_codegen(&self, name: &str) -> Option<String> {
+        if let Some(key) = self.resolve_enum_key(name) {
+            return Some(key);
+        }
+        if name.contains("::") {
+            return None;
+        }
+        let suffix = format!("::{name}");
+        let mut hits: Vec<String> = self
+            .enum_tags
+            .keys()
+            .filter(|k| k.ends_with(&suffix))
+            .cloned()
+            .collect();
+        if hits.len() == 1 {
+            hits.pop()
+        } else {
+            None
+        }
     }
 
     fn qualify_module_name(&self, name: &str) -> String {
