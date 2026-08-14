@@ -353,6 +353,14 @@ impl CodeBuf {
         label
     }
 
+    /// Bind a label previously allocated by [`Self::fresh_label`] at the current
+    /// PC so earlier `Entry` ops can target a method that is compiled later.
+    pub fn bind_reserved_entry(&mut self, label: Label) {
+        let pc = self.len();
+        self.bind_label(label);
+        self.entry_at_offset.insert(pc, label);
+    }
+
     /// Look up the entry label bound at logical code index `pc`, if any.
     pub fn entry_label_for_offset(&self, pc: usize) -> Option<Label> {
         self.entry_at_offset.get(&pc).copied()
