@@ -240,7 +240,7 @@ a || b ?? c       // (a || b) ?? c
 a = b ?? c        // a = (b ?? c)
 ```
 
-`raise expr` is a keyword expression (not a Pratt operator); it produces `Err(expr)` and requires result mode.
+`raise expr` is a keyword expression (not a Pratt operator); it produces `Err(expr)` and requires result mode. Do **not** write `raise err?` — postfix `?` binds to the operand (`raise (err?)`), not to `raise`. Use bare `raise err;` (or put `?` on a `Result`-producing call: `parse()?`).
 
 ---
 

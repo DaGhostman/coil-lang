@@ -5232,6 +5232,42 @@ fn f(int n) {
     }
 
     #[test]
+    fn raise_followed_by_try_names_invalid_form() {
+        let msgs = assert_messages(r#"fn f() { raise "err"?; }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::InvalidTry)
+                    && m.message().contains("`?` after `raise`")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("raise err;"))
+            }),
+            "expected raise…? guidance, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.code(), m.message(), m.help().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn try_on_raise_names_invalid_form() {
+        let msgs = assert_messages(r#"fn f() { (raise "err")?; }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::InvalidTry)
+                    && m.message().contains("`?` cannot follow `raise`")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("raise err;"))
+            }),
+            "expected (raise)? guidance, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.code(), m.message(), m.help().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn try_on_non_option_result_is_hard_error() {
         let msgs = assert_messages(r#"fn f() -> int { let x = 1; return x?; }"#);
         assert!(

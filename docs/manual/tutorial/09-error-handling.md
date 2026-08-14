@@ -36,6 +36,8 @@ Annotations may use type applications: `Option<int>`, `Result<int, string>`.
 
 A function enters **result mode** when it uses `raise`, uses `?` on a `Result`, or is annotated `-> Result<...>`. In result mode, ordinary `return v` (and success paths) are wrapped as `Result::Ok(v)` by codegen.
 
+Do **not** chain postfix `?` after `raise` (`raise err?` parses as `raise (err?)`). Write `raise err;` — `raise` already early-returns `Err`.
+
 ```coil
 fn parse_pos(int n, int is_neg) {
     if is_neg == 1 {

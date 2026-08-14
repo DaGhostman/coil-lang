@@ -2598,6 +2598,24 @@ impl Checker {
 
             // ---- raise / ? / ?? / ?. ----
             Expression::Raise(e) => {
+                // `raise err?` parses as `raise (err?)` (postfix `?` binds
+                // tighter than the `raise` keyword). Point users at the
+                // bare-`raise` early-return idiom instead of a bare InvalidTry.
+                if matches!(
+                    unwrap_expr_wrappers(e).1.as_ref(),
+                    Expression::Try(_)
+                ) {
+                    return self.error_with_help(
+                        ErrorCode::InvalidTry,
+                        "`?` after `raise` applies to the error expression, not to `raise`"
+                            .to_string(),
+                        range,
+                        Some(
+                            "write `raise err;` — `raise` already early-returns `Err`; do not write `raise err?`"
+                                .to_string(),
+                        ),
+                    );
+                }
                 let err_ty = self.infer(e);
                 let _ok_ty = self.ensure_result_mode(&err_ty, &e.0.into_range());
                 never()
@@ -2610,6 +2628,19 @@ impl Checker {
             }
 
             Expression::Try(inner) => {
+                // `(raise err)?` — `raise` already diverges as Err.
+                // Parens often wrap as `Group(Fragment([Raise]))`.
+                if Self::expr_is_raise(inner) {
+                    return self.error_with_help(
+                        ErrorCode::InvalidTry,
+                        "`?` cannot follow `raise`".to_string(),
+                        range,
+                        Some(
+                            "use `raise err;` — `raise` already early-returns `Err`"
+                                .to_string(),
+                        ),
+                    );
+                }
                 let inner_ty = self.infer(inner);
                 let resolved = apply_ty_prune(&self.subst, &inner_ty);
                 if let Some((ok, err)) = result_ok_err(&resolved) {
@@ -8497,6 +8528,22 @@ impl Checker {
 
     fn is_string_ty(ty: &Ty) -> bool {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::STRING)
+    }
+
+    /// True when `node` is `raise …`, including a parenthesized
+    /// `Group(Fragment([Raise]))` form from `(raise err)`.
+    fn expr_is_raise(node: &Output) -> bool {
+        let node = unwrap_expr_wrappers(node);
+        match node.1.as_ref() {
+            Expression::Raise(_) => true,
+            Expression::Fragment(items) if items.len() == 1 => {
+                matches!(
+                    unwrap_expr_wrappers(&items[0]).1.as_ref(),
+                    Expression::Raise(_)
+                )
+            }
+            _ => false,
+        }
     }
 
     fn is_int_ty(ty: &Ty) -> bool {
