@@ -1476,10 +1476,10 @@ impl Checker {
         self.const_scopes.clear();
         self.const_scopes.push(HashSet::new());
         self.abstract_constraint_bindings.clear();
-        self.enums.clear();
-        self.enum_tags.clear();
-        self.enum_payloads.clear();
-        self.enum_arities.clear();
+        self.enums.retain(|k, _| k.contains("::"));
+        self.enum_tags.retain(|k, _| k.contains("::"));
+        self.enum_payloads.retain(|k, _| k.contains("::"));
+        self.enum_arities.retain(|k, _| k.contains("::"));
         self.c_structs.clear();
         self.callback_sigs.clear();
         self.ffi_fn_ret_tys.clear();
@@ -13646,7 +13646,7 @@ impl Checker {
                 variants,
                 ..
             } => {
-                let name_str = name.to_string();
+                let name_str = self.qualify_module_name(name);
                 let previous_generic_ctor = self.register_generic_type_ctor(name, type_params);
                 let pushed = self.push_type_params_for_type_parsing(type_params);
                 let mut variant_names = Vec::new();
@@ -14108,7 +14108,7 @@ impl Checker {
 
     fn infer_enum_decl(&mut self, name: &str, variants: &[Output], _range: &Range<usize>) {
         use parser::ast::EnumVariantPayload;
-        let name_str = name.to_string();
+        let name_str = self.qualify_module_name(name);
         // Look up the pre-reserved shape. If missing, the
         // pre-pass rejected this enum (duplicate / collision);
         // the caller has already pushed a diagnostic. Just walk
@@ -14263,6 +14263,8 @@ impl Checker {
                 );
             }
             common::BUILTIN_FFI_TYPE_ENUM.to_string()
+        } else if let Some(key) = self.resolve_enum_key(enum_name) {
+            key
         } else {
             enum_name.to_string()
         };
@@ -14918,7 +14920,9 @@ impl Checker {
                 payload,
             } => {
                 // 1. Look up the variant's tag in the registry.
-                let enum_str = enum_name.to_string();
+                let enum_str = self
+                    .resolve_enum_key(enum_name)
+                    .unwrap_or_else(|| enum_name.to_string());
                 let variant_str = variant_name.to_string();
                 let tag_opt = self
                     .enum_tags
@@ -15363,9 +15367,14 @@ impl Checker {
                 payload,
                 ..
             } => {
+                // Imported short names resolve via env/FQN — same as
+                // `infer_pattern` / `infer_construct`.
+                let enum_key = self
+                    .resolve_enum_key(enum_name)
+                    .unwrap_or_else(|| enum_name.to_string());
                 let tag = self
                     .enum_tags
-                    .get(enum_name.to_string().as_str())
+                    .get(enum_key.as_str())
                     .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
                 let inner = Self::inner_coverage(payload, &self.enum_tags);
                 ArmCoverage {
@@ -16182,6 +16191,25 @@ impl Checker {
         self.const_class_fields
             .get(class)
             .is_some_and(|fields| fields.contains(field))
+    }
+
+    fn resolve_enum_key(&self, name: &str) -> Option<String> {
+        if self.enum_tags.contains_key(name) {
+            return Some(name.to_string());
+        }
+        let qualified = self.qualify_module_name(name);
+        if self.enum_tags.contains_key(&qualified) {
+            return Some(qualified);
+        }
+        if let Some(scheme) = self.env.lookup(name) {
+            let ty = apply_ty_prune(&self.subst, &scheme.ty);
+            if let Ty::Con(n) = &ty
+                && self.enum_tags.contains_key(n)
+            {
+                return Some(n.clone());
+            }
+        }
+        None
     }
 
     fn qualify_module_name(&self, name: &str) -> String {
