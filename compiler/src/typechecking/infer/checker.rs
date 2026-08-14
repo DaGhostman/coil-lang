@@ -128,6 +128,11 @@ impl Checker {
             ffi_fn_ret_tys: HashMap::new(),
             ffi_fn_variadic: HashMap::new(),
             ffi_fn_nfixed: HashMap::new(),
+            ffi_fn_ret_by_field: HashMap::new(),
+            ffi_fn_variadic_by_field: HashMap::new(),
+            ffi_fn_nfixed_by_field: HashMap::new(),
+            ffi_fn_param_invoke_ret: HashMap::new(),
+            current_function: None,
             extern_variadic: HashSet::new(),
             extern_variadic_nfixed: HashMap::new(),
             variadic_call_arg_tags: HashMap::new(),
@@ -1471,6 +1476,11 @@ impl Checker {
         self.ffi_fn_ret_tys.clear();
         self.ffi_fn_variadic.clear();
         self.ffi_fn_nfixed.clear();
+        self.ffi_fn_ret_by_field.clear();
+        self.ffi_fn_variadic_by_field.clear();
+        self.ffi_fn_nfixed_by_field.clear();
+        self.ffi_fn_param_invoke_ret.clear();
+        self.current_function = None;
         self.extern_variadic.clear();
         self.extern_variadic_nfixed.clear();
         self.variadic_call_arg_tags.clear();
@@ -2386,6 +2396,7 @@ impl Checker {
                 let val_ty = self.infer(value);
                 let target_ty = self.infer_mutable_lvalue(name, range.clone());
                 self.coerce_or_unify(&target_ty, &val_ty, Some(value), &range, "assignment");
+                self.maybe_record_ffi_declare_for_field_assignment(name, value);
                 apply_ty_prune(&self.subst, &val_ty)
             }
 
@@ -6002,35 +6013,7 @@ impl Checker {
                                 Expression::Try(inner) => unwrap_expr_wrappers(inner),
                                 _ => init,
                             };
-                            let declare_args = match init.1.as_ref() {
-                                Expression::Declare(dargs) => Some(dargs.as_slice()),
-                                Expression::Call { name: callee, args }
-                                    if matches!(
-                                        callee.1.as_ref(),
-                                        Expression::Identifier("declare")
-                                    ) =>
-                                {
-                                    args.as_deref()
-                                }
-                                _ => None,
-                            };
-                            if let Some(dargs) = declare_args
-                                && (dargs.len() == 4 || dargs.len() == 5)
-                            {
-                                let ret = self.ty_from_ffi_type_expr(&dargs[3]);
-                                self.ffi_fn_ret_tys.insert(name.to_string(), ret);
-                                let nfixed = match dargs[2].1.as_ref() {
-                                    Expression::Tuple(items) => items.len(),
-                                    _ => 0,
-                                };
-                                let variadic = if dargs.len() == 5 {
-                                    matches!(dargs[4].1.as_ref(), Expression::Bool(true))
-                                } else {
-                                    false
-                                };
-                                self.ffi_fn_variadic.insert(name.to_string(), variadic);
-                                self.ffi_fn_nfixed.insert(name.to_string(), nfixed);
-                            }
+                            self.maybe_record_ffi_declare_for_let_init(name, init);
                             i += 1;
                         }
                     }
@@ -8283,6 +8266,13 @@ impl Checker {
     /// Whether a `declare` binding was marked variadic.
     pub fn is_ffi_declare_variadic(&self, binding: &str) -> bool {
         self.ffi_fn_variadic.get(binding).copied().unwrap_or(false)
+    }
+
+    /// Whether the fn-id expression passed to `invoke` came from a variadic `declare`.
+    pub fn is_ffi_declare_variadic_for_fn_id(&self, expr: &Output) -> bool {
+        self.ffi_invoke_fn_id_metadata(expr)
+            .map(|(_, variadic, _)| variadic)
+            .unwrap_or(false)
     }
 
     /// Per-arg FFI tags recorded for a variadic call/invoke at `span`.
@@ -10545,6 +10535,159 @@ impl Checker {
         result_app_ty(int(), Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()))
     }
 
+    fn qualified_class_field_key(class: &str, field: &str) -> String {
+        format!("{class}::{field}")
+    }
+
+    fn ffi_param_invoke_key(fn_name: &str, param: &str) -> String {
+        format!("{fn_name}::{param}")
+    }
+
+    fn declare_args_from_expr<'a>(expr: &'a Output<'a>) -> Option<&'a [Output<'a>]> {
+        let init = unwrap_expr_wrappers(expr);
+        let init = match init.1.as_ref() {
+            Expression::Try(inner) => unwrap_expr_wrappers(inner),
+            _ => init,
+        };
+        match init.1.as_ref() {
+            Expression::Declare(dargs) => Some(dargs.as_slice()),
+            Expression::Call { name: callee, args }
+                if matches!(callee.1.as_ref(), Expression::Identifier("declare")) =>
+            {
+                args.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    fn record_ffi_declare_metadata(
+        &mut self,
+        key: String,
+        dargs: &[Output],
+        store_field: bool,
+    ) {
+        if dargs.len() != 4 && dargs.len() != 5 {
+            return;
+        }
+        let ret = self.ty_from_ffi_type_expr(&dargs[3]);
+        let nfixed = match dargs[2].1.as_ref() {
+            Expression::Tuple(items) => items.len(),
+            _ => 0,
+        };
+        let variadic = if dargs.len() == 5 {
+            matches!(dargs[4].1.as_ref(), Expression::Bool(true))
+        } else {
+            false
+        };
+        if store_field {
+            self.ffi_fn_ret_by_field.insert(key.clone(), ret);
+            self.ffi_fn_variadic_by_field.insert(key.clone(), variadic);
+            self.ffi_fn_nfixed_by_field.insert(key, nfixed);
+        } else {
+            self.ffi_fn_ret_tys.insert(key.clone(), ret);
+            self.ffi_fn_variadic.insert(key.clone(), variadic);
+            self.ffi_fn_nfixed.insert(key, nfixed);
+        }
+    }
+
+    fn class_name_for_field_receiver(&self, receiver: &Output) -> Option<String> {
+        match receiver.1.as_ref() {
+            Expression::Identifier(name) if *name == "self" => self.impl_owner.clone(),
+            Expression::Identifier(name) => self
+                .codegen_var_type(name)
+                .cloned()
+                .or_else(|| self.env.lookup(name).map(|s| s.ty.clone()))
+                .and_then(|ty| self.class_owner_from_ty(&apply_ty_prune(&self.subst, &ty))),
+            _ => None,
+        }
+    }
+
+    fn ffi_invoke_fn_id_metadata(&self, expr: &Output) -> Option<(Ty, bool, usize)> {
+        match expr.1.as_ref() {
+            Expression::Identifier(name) => {
+                if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                    let variadic = self.ffi_fn_variadic.get(*name).copied().unwrap_or(false);
+                    let nfixed = self.ffi_fn_nfixed.get(*name).copied().unwrap_or(0);
+                    return Some((ty.clone(), variadic, nfixed));
+                }
+                if let Some(fn_name) = &self.current_function {
+                    let key = Self::ffi_param_invoke_key(fn_name, name);
+                    if let Some(&(ref ty, variadic, nfixed)) = self.ffi_fn_param_invoke_ret.get(&key)
+                    {
+                        return Some((ty.clone(), variadic, nfixed));
+                    }
+                }
+                None
+            }
+            Expression::Access(receiver, field) => {
+                let class = self.class_name_for_field_receiver(receiver)?;
+                let key = Self::qualified_class_field_key(&class, field);
+                let ret = self.ffi_fn_ret_by_field.get(&key)?.clone();
+                let variadic = self
+                    .ffi_fn_variadic_by_field
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(false);
+                let nfixed = self.ffi_fn_nfixed_by_field.get(&key).copied().unwrap_or(0);
+                Some((ret, variadic, nfixed))
+            }
+            _ => None,
+        }
+    }
+
+    fn maybe_record_ffi_declare_for_field_assignment(&mut self, target: &Output, value: &Output) {
+        let Expression::Access(receiver, field) = target.1.as_ref() else {
+            return;
+        };
+        let Some(class) = self.class_name_for_field_receiver(receiver) else {
+            return;
+        };
+        let Some(dargs) = Self::declare_args_from_expr(value) else {
+            return;
+        };
+        let key = Self::qualified_class_field_key(&class, field);
+        self.record_ffi_declare_metadata(key, dargs, true);
+    }
+
+    fn maybe_record_ffi_declare_for_let_init(&mut self, name: &str, init: &Output) {
+        if let Some(dargs) = Self::declare_args_from_expr(init) {
+            self.record_ffi_declare_metadata(name.to_string(), dargs, false);
+            return;
+        }
+        if let Expression::Access(receiver, field) = init.1.as_ref() {
+            if let Some(class) = self.class_name_for_field_receiver(receiver) {
+                let key = Self::qualified_class_field_key(&class, field);
+                if let Some(ret) = self.ffi_fn_ret_by_field.get(&key).cloned() {
+                    let variadic = self
+                        .ffi_fn_variadic_by_field
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(false);
+                    let nfixed = self.ffi_fn_nfixed_by_field.get(&key).copied().unwrap_or(0);
+                    self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                    self.ffi_fn_variadic.insert(name.to_string(), variadic);
+                    self.ffi_fn_nfixed.insert(name.to_string(), nfixed);
+                }
+            }
+        }
+    }
+
+    fn record_ffi_param_invoke_flow(
+        &mut self,
+        fn_name: &str,
+        param_names: &[String],
+        arg_exprs: &[Output],
+    ) {
+        for (param, arg) in param_names.iter().zip(arg_exprs.iter()) {
+            let Some((ret, variadic, nfixed)) = self.ffi_invoke_fn_id_metadata(arg) else {
+                continue;
+            };
+            let key = Self::ffi_param_invoke_key(fn_name, param);
+            self.ffi_fn_param_invoke_ret
+                .insert(key, (ret, variadic, nfixed));
+        }
+    }
+
     fn infer_ffi_invoke(&mut self, args: &[Output], range: Range<usize>) -> Ty {
         if self.ffi_fn_in_scope("invoke").is_none() {
             let _ = self.error_with_help(
@@ -10560,12 +10703,10 @@ impl Checker {
         if args.len() == 3 {
             self.infer(&args[0]);
             self.infer(&args[1]);
-            if let Expression::Identifier(name) = args[1].1.as_ref() {
-                if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
-                    ret_ty = ty.clone();
-                }
-                variadic = self.ffi_fn_variadic.get(*name).copied().unwrap_or(false);
-                nfixed = self.ffi_fn_nfixed.get(*name).copied().unwrap_or(0);
+            if let Some((ty, var, fixed)) = self.ffi_invoke_fn_id_metadata(&args[1]) {
+                ret_ty = ty;
+                variadic = var;
+                nfixed = fixed;
             }
             match args[2].1.as_ref() {
                 Expression::Tuple(items) => {
@@ -11491,7 +11632,15 @@ impl Checker {
         self.fn_codegen_baselines.push(baseline);
         // Free-fn arg NodeId assign deferred (Hash / constraint-kind). Lambdas
         // call `assign_fn_arg_node_ids` at their infer site.
+        let prev_function = if method_owner.is_none() {
+            self.current_function.replace(name.to_string())
+        } else {
+            None
+        };
         let _ = self.infer(body);
+        if method_owner.is_none() {
+            self.current_function = prev_function;
+        }
         let body_is_stub = self.current_typeclass.is_some()
             && (matches!(
                 body.1.as_ref(),
@@ -12351,6 +12500,9 @@ impl Checker {
             for arg in args {
                 tys.push(self.infer_call_arg(arg));
                 exprs.push(arg.clone());
+            }
+            if let Some(param_names) = self.fn_param_names.get(fn_name).cloned() {
+                self.record_ffi_param_invoke_flow(fn_name, &param_names, &exprs);
             }
             return (tys, exprs);
         }

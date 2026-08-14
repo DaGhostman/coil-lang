@@ -99,7 +99,13 @@ invoke(lib, fn_id, (args...))
 | `fn_id` | `int` | Id from a successful `declare` |
 | `(args...)` | Tuple of values | Must match declared arity (or `>=` fixed prefix when `declare` was variadic) |
 
-Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = declare(...)?` (or match) so the side table can refine later `invoke` calls.
+        Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). The compiler refines `T` when the fn-id expression is:
+
+- a `let id = declare(...)?` binding (or a local copied from one, e.g. `let id = api.fn_id`);
+- a class field that was assigned `self.fn_id = declare(...)?` in an `impl` initializer;
+- a function parameter when every call site passes a value with known `declare` metadata (e.g. `helper(api.fn_id)`).
+
+Direct `invoke(lib, api.fn_id, …)` uses the field table; a bare parameter `id` uses call-site flow when the callee is typechecked after its callers.
 
 ```coil
 use io::{stdout};

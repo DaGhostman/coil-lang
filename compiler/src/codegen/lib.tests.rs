@@ -5277,6 +5277,46 @@ fn main() { \
         );
     }
 
+    /// Field-stored variadic `declare` ids must set the FfiInvoke variadic
+    /// bit (codegen uses `is_ffi_declare_variadic_for_fn_id`, not bare lets).
+    #[test]
+    fn invoke_field_fn_id_variadic_sets_ffi_operand_flag() {
+        use common::Instruction;
+        let src = "\
+use ffi::{dload, declare, invoke, Error}; \
+use ffi::types::{Int, Float}; \
+class Api { id: int, } \
+fn main() -> Result<(), Error> { \
+  let lib = dload(\"noop\")?; \
+  let api = new Api(0); \
+  api.id = declare(lib, \"f\", (Int,), Float, true)?; \
+  let _ = invoke(lib, api.id, (1, 2, 3))?; \
+}";
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            compiler.get_messages().is_empty(),
+            "unexpected compile diagnostics: {:?}",
+            compiler
+                .get_messages()
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+        let ffi = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::FfiInvoke))
+            .expect("expected FfiInvoke");
+        let operand = ffi.operand_u32();
+        assert_eq!(operand & 0xFFFF, 3, "arity low bits should be 3");
+        assert_ne!(
+            operand & (1 << 16),
+            0,
+            "variadic bit must be set for field fn-id declare(..., true)"
+        );
+    }
+
     /// `invoke(..., (fn, …))` callback args must use relocatable `CodePtr`,
     /// not `CONST`. Peephole fusion adjusts `CodePtr` in `finalize_bytecode`
     /// but never rewrites `CONST`, so a stale offset would make the FFI
