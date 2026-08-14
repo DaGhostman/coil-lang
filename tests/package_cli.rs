@@ -44,7 +44,10 @@ fn build_matching_coil_embed() -> PathBuf {
         .args(&args)
         .status()
         .expect("spawn cargo build -p coil-embed");
-    let embed = target_dir.join("debug/coil-embed");
+    let embed = target_dir.join(format!(
+        "debug/coil-embed{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     assert!(
         status.success() && embed.is_file(),
         "coil-embed missing at {} (build it with `cargo {}`)",
@@ -69,7 +72,12 @@ fn run_command_with_timeout(mut cmd: Command, secs: u64) -> std::process::Output
         Ok(Ok(output)) => output,
         Ok(Err(e)) => panic!("run packaged binary: {e}"),
         Err(_) => {
+            #[cfg(unix)]
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            #[cfg(windows)]
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status();
             panic!("packaged app hung for {secs}s (runner/compiler feature mismatch?)");
         }
     }
@@ -113,12 +121,14 @@ fn coil_embed_build_args_mirrors_optional_features() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn run_with_timeout_returns_fast_process_output() {
     let out = run_command_with_timeout(Command::new("true"), 5);
     assert!(out.status.success(), "true should exit 0");
 }
 
+#[cfg(unix)]
 #[test]
 #[should_panic(expected = "packaged app hung")]
 fn run_with_timeout_kills_hung_process() {
@@ -134,7 +144,11 @@ fn package_fib_embedded_run_prints_55() {
     let embed = build_matching_coil_embed();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let entry = manifest.join("examples/fib.hy");
-    let out = std::env::temp_dir().join(format!("coil_fib_pack_{}", std::process::id()));
+    let out = std::env::temp_dir().join(format!(
+        "coil_fib_pack_{}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
     let _ = std::fs::remove_file(&out);
 
     let status = Command::new(&bin)

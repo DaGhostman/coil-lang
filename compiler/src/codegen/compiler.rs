@@ -7781,10 +7781,16 @@ impl Compiler {
         receiver: &Output<'_>,
         field: &str,
     ) -> bool {
-        let receiver = match receiver.1.as_ref() {
-            Expression::Group(inner) | Expression::Expr(inner) => inner,
-            _ => receiver,
-        };
+        // Pratt wraps nodes in `Expr`; `(…)` is `Group(Fragment([…]))`. Peel
+        // wrappers so `(new C(args)).field` matches bare `new C(args).field`.
+        let mut receiver = receiver;
+        loop {
+            match receiver.1.as_ref() {
+                Expression::Group(inner) | Expression::Expr(inner) => receiver = inner,
+                Expression::Fragment(items) if items.len() == 1 => receiver = &items[0],
+                _ => break,
+            }
+        }
         let Expression::Instantiate(class, Some(args)) = receiver.1.as_ref() else {
             return false;
         };

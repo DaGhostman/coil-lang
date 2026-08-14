@@ -6,6 +6,9 @@ callgrind.out*
 out.hyc
 *.so
 *.o
+# Cwd-relative IO fixtures (Windows has no /tmp).
+coil_*.bin
+coil_adventure_save.dat
 THREADS_PLAN.md
 # Per-machine hook state (session ids / mtimes) — regenerated, never source.
 .cursor/hooks/state/

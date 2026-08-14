@@ -1647,6 +1647,7 @@ fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     libsum
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_sum_via_dlopen_prints_42() {
     let libsum = ensure_ffi_libsum_built();
@@ -1815,6 +1816,7 @@ fn clean_captured_os_stdout(output: &str) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_printf_prints_hello_42() {
     if machine::resolve_library("c", None, &[]).is_err() {
@@ -2517,6 +2519,7 @@ fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
     run_example_src_with_entry(&src, Some(full.as_path()))
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_array_sum_prints_15() {
     let libsum = ensure_ffi_libsum_built();
@@ -2528,6 +2531,7 @@ fn example_ffi_array_sum_prints_15() {
     assert_eq!(output, "15");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_callback_prints_42() {
     let libsum = ensure_ffi_libsum_built();
@@ -2539,6 +2543,7 @@ fn example_ffi_callback_prints_42() {
     assert_eq!(output, "42");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_struct_return_prints_34() {
     let libsum = ensure_ffi_libsum_built();
@@ -2550,6 +2555,7 @@ fn example_ffi_struct_return_prints_34() {
     assert_eq!(output, "34");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_callback_return_prints_1() {
     let libsum = ensure_ffi_libsum_built();
@@ -2918,7 +2924,7 @@ use io::net::tcp::{accept, connect_timeout, listen, local_addr, set_nodelay, shu
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_io_timeout_tcp_helpers.bin";
+    let path = "coil_io_timeout_tcp_helpers.bin";
     let file = open(path, "w")?;
 
     let local_on_file = match local_addr(file) {
@@ -4207,6 +4213,61 @@ fn main() {
     assert_eq!(output, "18");
 }
 
+/// `if !done { break }` must take LogNotJmpt polarity (COI-87).
+#[test]
+fn not_flag_break_log_not_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let done = false;
+    let n = 0;
+    while (n < 10) {
+        if !done { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::LogNotJmpt)),
+        "expected LogNotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
+}
+
+/// Two-local `if a < b { break }` fuses to BinSlotSlotJmpt and takes the break.
+#[test]
+fn two_local_compare_break_bin_slot_slot_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = 1;
+    let b = 2;
+    let n = 0;
+    while (n < 10) {
+        if a < b { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpt)),
+        "expected BinSlotSlotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
+}
+
 /// Tiny direct-call inlining must preserve call semantics end-to-end.
 #[test]
 fn tiny_add_inlined_prints_7() {
@@ -5283,6 +5344,102 @@ fn main() {
     );
 }
 
+/// Non-first field selection must index the staged ctor args (not always arg 0).
+#[test]
+fn direct_class_second_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", new Point(5, 6).y)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "6");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("second field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "second-field temp elision must not allocate; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `try_emit_direct_class_field_access` unwraps `Group`/`Expr` receivers.
+#[test]
+fn grouped_direct_class_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", (new Point(5, 6)).x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("grouped field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "grouped new Class(args).field must still elide; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Named locals keep a heap instance (COI-84). Temp `new C(args).field` elides;
 /// `let p = new C(args); p.field` does not — identity, methods, mutation, and
 /// `fn drop()` are observable without a whole-function escape scan.
@@ -5315,12 +5472,23 @@ fn main() {
         .get(main + 1)
         .map(|symbol| symbol.entry_pc as usize)
         .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
     assert!(
-        bytecode[start..end]
+        main_code
             .iter()
             .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
         "named local must stay InitTyped; opcodes: {:?}",
-        bytecode[start..end]
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "named local field read must use GetField; opcodes: {:?}",
+        main_code
             .iter()
             .map(|b| b.bytecode().mnemonic())
             .collect::<Vec<_>>()
@@ -5346,11 +5514,36 @@ fn main() {
 
     let mut pipeline = Pipeline::new();
     let (bytecode, _) = pipeline.compile_src(src).expect("drop temp field");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
     assert!(
-        bytecode
+        main_code
             .iter()
             .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
-        "drop class temp must allocate so the finalizer can run"
+        "drop class temp must allocate in main so the finalizer can run; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "drop class temp must GetField the heap instance; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -5995,6 +6188,144 @@ fn main() {
 }
 
 #[test]
+fn gc_finalizer_store_self_into_root_resurrects() {
+    // COI-79: root(self) during drop is a documented resurrection edge.
+    let output = run_example_src(
+        r#"
+use gc::{collect, get, root, Root};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Root<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(root(self));
+    }
+}
+fn make() {
+    let h = new Handle(42);
+}
+fn main() {
+    make();
+    collect();
+    let fd = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    let after_first = drops;
+    collect();
+    let fd2 = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i%i%i", after_first, drops, fd, fd2)));
+}
+"#,
+    );
+    assert_eq!(output, "114242");
+}
+
+#[test]
+fn gc_finalizer_store_self_into_reachable_field() {
+    // COI-79: store into a still-reachable object's field (not only a static).
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle {
+    fd: int,
+}
+class Bag {
+    slot: Option<Handle>,
+}
+static let drops: int = 0;
+static let bag: Option<Bag> = Option::None;
+impl Bag {
+    fn put(Handle h) {
+        self.slot = Option::Some(h);
+    }
+    fn fd() -> int {
+        return match self.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        };
+    }
+}
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        match bag {
+            Option::Some(b) => b.put(self),
+            Option::None => (),
+        };
+    }
+}
+fn setup() {
+    bag = Option::Some(new Bag(Option::None));
+}
+fn make() {
+    let h = new Handle(9);
+}
+fn main() {
+    setup();
+    make();
+    collect();
+    let fd = match bag {
+        Option::Some(b) => b.fd(),
+        Option::None => -2,
+    };
+    let after_first = drops;
+    collect();
+    write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
+}
+"#,
+    );
+    assert_eq!(output, "119");
+}
+
+#[test]
+fn gc_finalizer_resurrection_keeps_weak_upgradable() {
+    // Re-mark after drop must keep weaks to a resurrected cell live.
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn ephemeral() {
+    let h = new Handle(3);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        },
+        Option::None => -2,
+    };
+    write(stdout(), to_bytes(format("%i%i", drops, after)));
+}
+"#,
+    );
+    assert_eq!(output, "13");
+}
+
+#[test]
 fn gc_heap_bytes_is_nonnegative() {
     let output = run_example_src(
         r#"
@@ -6564,7 +6895,7 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_enable_kind.bin";
+    let path = "coil_tls_enable_kind.bin";
     let s = open(path, "w")?;
     let r = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" });
     let code = match r {
@@ -6589,7 +6920,7 @@ use io::net::tls::client::{disable};
 use string::{format, to_bytes};
 
 fn disable_file_is_err() -> int {
-    let path = "/tmp/coil_tls_disable_kind.bin";
+    let path = "coil_tls_disable_kind.bin";
     return match open(path, "w") {
         Result::Ok(s) => match disable(s) {
             Result::Ok(_) => 0,
@@ -6618,7 +6949,7 @@ use io::{open, IoError, Stream, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_arity.bin";
+    let path = "coil_tls_arity.bin";
     let s = open(path, "w")?;
     let r: Result<Stream, IoError> = enable(s, "127.0.0.1");
 }
@@ -6641,7 +6972,7 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_opts.bin";
+    let path = "coil_tls_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", 1)?;
 }
@@ -6661,7 +6992,7 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_empty_opts.bin";
+    let path = "coil_tls_empty_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", {})?;
 }
@@ -6704,7 +7035,7 @@ fn classify(IoError e) -> int {{
 }}
 
 fn main() {{
-    let path = "/tmp/coil_tls_server_enable_kind.bin";
+    let path = "coil_tls_server_enable_kind.bin";
     let s = open(path, "w")?;
     let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}", timeout_ms: 0, client_ca_pem: "", alpn: "" }});
     let code = match r {{
@@ -6730,7 +7061,7 @@ use io::net::tls::server::{disable};
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_disable_kind.bin";
+    let path = "coil_tls_server_disable_kind.bin";
     let code = match open(path, "w") {
         Result::Ok(s) => match disable(s) {
             Result::Ok(_) => 0,
@@ -6756,7 +7087,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_opts.bin";
+    let path = "coil_tls_server_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, 1)?;
 }
@@ -6776,7 +7107,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_empty.bin";
+    let path = "coil_tls_server_empty.bin";
     let s = open(path, "w")?;
     let _ = enable(s, {})?;
 }
@@ -6795,7 +7126,7 @@ fn tls_flat_parent_enable_does_not_compile() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_flat.bin";
+    let path = "coil_tls_flat.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" })?;
 }
@@ -6817,7 +7148,7 @@ fn tls_legacy_server_encrypt_decrypt_do_not_compile() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_legacy_encrypt.bin";
+    let path = "coil_tls_legacy_encrypt.bin";
     let s = open(path, "w")?;
     let _ = encrypt(s, { cert_pem: "x", key_pem: "y", timeout_ms: 0, client_ca_pem: "", alpn: "" })?;
 }
@@ -6833,7 +7164,7 @@ fn main() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_legacy_decrypt.bin";
+    let path = "coil_tls_legacy_decrypt.bin";
     let s = open(path, "w")?;
     let _ = decrypt(s)?;
 }
@@ -6856,7 +7187,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_cross_opts.bin";
+    let path = "coil_tls_cross_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" })?;
 }
@@ -6897,7 +7228,7 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_both_ns.bin";
+    let path = "coil_tls_both_ns.bin";
     let s = open(path, "w")?;
     let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" }) {
         Result::Ok(_) => 0,
@@ -6944,7 +7275,7 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_server_empty_pem.bin";
+    let path = "coil_tls_server_empty_pem.bin";
     let s = open(path, "w")?;
     let r = enable(s, { cert_pem: "", key_pem: "", timeout_ms: 0, client_ca_pem: "", alpn: "" });
     let code = match r {
@@ -6969,7 +7300,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_pem_ty.bin";
+    let path = "coil_tls_server_pem_ty.bin";
     let s = open(path, "w")?;
     let _ = enable(s, { cert_pem: 1, key_pem: 2, timeout_ms: 0, client_ca_pem: "", alpn: "" })?;
 }
@@ -6991,7 +7322,7 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_client_unknown_opts.bin";
+    let path = "coil_tls_client_unknown_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "", bogus: "x" })?;
 }
@@ -7013,7 +7344,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_unknown_opts.bin";
+    let path = "coil_tls_server_unknown_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, { cert_pem: "c", key_pem: "k", timeout_ms: 0, client_ca_pem: "", alpn: "", bogus: "x" })?;
 }

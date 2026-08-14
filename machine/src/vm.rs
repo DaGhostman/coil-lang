@@ -1503,7 +1503,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Register fd interest and yield so other coros / `wait_ready` can batch.
+    /// Register handle interest and yield so other coros / `wait_ready` can batch.
     ///
     /// Pushes `Ok(())` onto the coroutine stack before yielding so resume
     /// continues after `HostInvoke` as if the await completed. Callers must
@@ -1516,7 +1516,7 @@ impl<const S: usize> Machine<S> {
     ) {
         let token = self
             .io_reactor
-            .register_wait(req.fd, req.interest);
+            .register_wait(req.handle, req.interest);
         let coro_ptr = self
             .resume_stack
             .last()
@@ -1860,7 +1860,7 @@ impl<const S: usize> Machine<S> {
     fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
         self.frames.get_mut().set(pending.resume_sp);
         let req = pending.request;
-        let wait = crate::thread::host_io_wait(req.fd, req.interest, req.timeout);
+        let wait = crate::thread::host_io_wait(req.handle, req.interest, req.timeout);
         let v = crate::io::as_result_unit(&mut self.heap, wait);
         self.stack.push(v);
     }

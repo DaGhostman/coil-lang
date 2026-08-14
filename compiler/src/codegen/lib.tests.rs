@@ -1749,6 +1749,88 @@ sum = sum + i; \
             .map(|b| b.operand_u32())
             .filter(|t| *t != u32::MAX)
             .collect();
+        let imm_jmpt = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpt))
+            .count();
+        let imm_jmpf = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf))
+            .count();
+
+        assert!(
+            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
+            "loop back-edge JMP should be patched: {:?}",
+            back_edges
+        );
+        assert!(
+            imm_jmpt >= 2,
+            "continue/break `i == k` should invert+fuse to BinSlotImmJmpt; got {imm_jmpt}"
+        );
+        assert!(
+            imm_jmpf >= 1,
+            "loop header `i < 10` must stay BinSlotImmJmpf; got {imm_jmpf}"
+        );
+    }
+
+    /// `if !flag { break }` inverts fused LogNot;JMPF into LogNotJmpt (COI-87).
+    #[test]
+    fn not_flag_break_emits_log_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let flag = false; \
+let i = 0; \
+while (i < 5) { \
+if !flag { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::LogNotJmpt)),
+            "expected LogNotJmpt for inverted `if !flag {{ break }}`"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "while header should remain *Jmpf"
+        );
+    }
+
+    /// Two-local compare break fuses to BinSlotSlotJmpt after invert (COI-87).
+    #[test]
+    fn two_local_compare_break_emits_bin_slot_slot_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let a = 1; \
+let b = 2; \
+let i = 0; \
+while (i < 5) { \
+if a < b { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpt)),
+            "expected BinSlotSlotJmpt for inverted `if a < b {{ break }}`"
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpf)),
+            "break guard should not remain BinSlotSlotJmpf after invert"
+        );
+    }
+
+    /// Plain while headers must not invert to *Jmpt (COI-87 latch stays *Jmpf).
+    #[test]
+    fn while_header_stays_fused_jmpf_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src("fn main() { let i = 0; while (i < 3) { i = i + 1; } }");
         let jmpt = bc
             .iter()
             .filter(|b| {
@@ -1763,15 +1845,11 @@ sum = sum + i; \
                 )
             })
             .count();
-
+        assert_eq!(jmpt, 0, "header-only while must not emit *Jmpt");
         assert!(
-            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
-            "loop back-edge JMP should be patched: {:?}",
-            back_edges
-        );
-        assert!(
-            jmpt >= 2,
-            "continue/break should invert to *Jmpt; got {jmpt}"
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "header should stay BinSlotImmJmpf"
         );
     }
 
@@ -6368,13 +6446,119 @@ fn main() {
             !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
             "Vec::pop of int must not use HostInvokeNiche; opcodes={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
         );
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
             "Vec::pop of int should still HostInvoke; opcodes={:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn unary_result_return_uses_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Result<int, string> {
+    return Result::Ok(1);
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "unary Result return must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn nested_option_string_none_stays_boxed() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<Option<string>> = Option::None;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "nested Option must stay boxed; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn generic_option_return_inserts_heap_to_niche() {
+        let (bc, _) = compile_src(
+            r#"
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let x: Option<string> = Option::Some("ok");
+    let y: Option<string> = id(x);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::OptionNicheToHeap)),
+            "generic Option arg must niche→heap; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HeapOptionToNiche)),
+            "generic Option return must heap→niche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vec_remove_heap_item_emits_host_invoke_niche() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from(["a"]);
+    let _ = v.remove(0);
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_remove", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::remove of string must emit HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ground_option_class_none_uses_pointer_niche() {
+        let (bc, _) = compile_src(
+            r#"
+class Box {
+    n: int,
+}
+fn main() {
+    let x: Option<Box> = Option::None;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "ground Option<class> None must not box; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
         );
     }
 
