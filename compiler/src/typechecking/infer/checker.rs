@@ -1546,6 +1546,7 @@ impl Checker {
             self.messages.extend(msgs);
         }
         self.pre_register_free_functions(ast);
+        self.pre_register_inherent_methods(ast);
         self.pre_process_top_level_uses(ast);
         self.pre_pass_ffi_invoke_param_flow(ast);
 
@@ -11877,8 +11878,13 @@ impl Checker {
 
         if !is_generic {
             let resolved = apply_ty_prune(&self.subst, &fun_ty);
-            self.env
-                .insert_top(name.to_string(), Scheme::mono(resolved));
+            if let Some(owner) = method_owner {
+                self.env
+                    .insert_top(format!("{owner}::{name}"), Scheme::mono(resolved));
+            } else {
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(resolved));
+            }
         }
 
         let abstract_bindings = self.abstract_constraint_bindings.pop().unwrap_or_default();
@@ -12995,6 +13001,160 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// Stub inherent `impl Type { fn … }` signatures so trait-instance
+    /// bodies that appear earlier in the file can call those methods (COI-115).
+    fn pre_register_inherent_methods(&mut self, ast: &Output) {
+        let children = match ast.1.as_ref() {
+            Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
+            _ => return,
+        };
+        for child in children {
+            let stmt = Self::pre_pass_unwrap_stmt(child);
+            if let Expression::Implementation {
+                what,
+                owner,
+                type_params,
+                methods,
+            } = stmt.1.as_ref()
+            {
+                if !what.is_empty() {
+                    continue;
+                }
+                self.stub_inherent_impl_methods(
+                    owner,
+                    type_params,
+                    methods,
+                    &stmt.0.into_range(),
+                );
+            }
+        }
+    }
+
+    fn stub_inherent_impl_methods(
+        &mut self,
+        owner: &str,
+        type_params: &[parser::ast::TypeParam],
+        methods: &[Output],
+        _range: &Range<usize>,
+    ) {
+        let msg_len = self.messages.len();
+        let saved_idx = self.next_id_idx;
+        let pushed = self.push_type_params_for_type_parsing(type_params);
+        let owner_key = self.qualify_module_name(owner);
+        let owner_ty = if type_params.is_empty() {
+            Ty::Con(owner_key.clone())
+        } else {
+            let frame = self
+                .type_params_in_scope
+                .last()
+                .expect("type-param frame just pushed");
+            let args: Vec<Ty> = type_params
+                .iter()
+                .map(|tp| Ty::Var(*frame.get(tp.name).expect("type param registered in frame")))
+                .collect();
+            Ty::App(Box::new(Ty::Con(owner_key.clone())), args)
+        };
+        let param_vars: Vec<TyVarId> = if pushed {
+            let frame = self
+                .type_params_in_scope
+                .last()
+                .expect("type-param frame just pushed");
+            type_params
+                .iter()
+                .map(|tp| *frame.get(tp.name).expect("type param registered in frame"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut impl_constraints: Vec<Constraint> = Vec::new();
+        if pushed {
+            for (tp, var) in type_params.iter().zip(param_vars.iter()) {
+                for bound in &tp.bounds {
+                    impl_constraints.push(Constraint {
+                        class: bound.to_string(),
+                        args: vec![Ty::Var(*var)],
+                    });
+                }
+            }
+        }
+
+        for method in methods {
+            let (vis, body) = match method.1.as_ref() {
+                Expression::Method(vis, body) => (*vis, body),
+                _ => continue,
+            };
+            let Expression::Function {
+                name,
+                is_static,
+                args,
+                returns,
+                where_constraints,
+                ..
+            } = body.1.as_ref()
+            else {
+                continue;
+            };
+            self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
+            let arg_tys = self.parse_arg_list(args);
+            self.current_tuple_pack = None;
+            let param_names: Vec<String> = arg_tys.iter().map(|(n, _)| n.clone()).collect();
+            let fqn = format!("{}::{}", owner_key, name);
+            // FQN only — a bare `join` / `iter` key would shadow
+            // `use path::{join}` and other free-function imports.
+            self.fn_param_names.insert(fqn.clone(), param_names);
+            let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
+                if children.last().is_some_and(|c| {
+                    matches!(c.1.as_ref(), Expression::Argument { is_rest: true, .. })
+                }));
+            self.fn_has_rest.insert(fqn.clone(), has_rest);
+
+            let mut fun_ty = match returns {
+                Some(r) => self.parse_return_type_name(r),
+                None => Ty::Var(self.counter.fresh()),
+            };
+            for (_, arg_ty) in arg_tys.iter().rev() {
+                fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+            }
+            if !*is_static {
+                fun_ty = Ty::Fun(Box::new(owner_ty.clone()), Box::new(fun_ty));
+            }
+            let mut constraints = impl_constraints.clone();
+            for wc in where_constraints {
+                let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+                constraints.push(Constraint {
+                    class: wc.class.to_string(),
+                    args,
+                });
+            }
+            let scheme = if param_vars.is_empty() {
+                Scheme::mono(fun_ty)
+            } else {
+                Scheme::poly(param_vars.clone(), constraints.clone(), fun_ty)
+            };
+            self.env.insert_top(fqn.clone(), scheme.clone());
+            self.methods
+                .entry(owner_key.clone())
+                .or_default()
+                .insert(name.to_string(), (vis, scheme));
+            if *is_static {
+                self.static_methods
+                    .entry(owner_key.clone())
+                    .or_default()
+                    .insert(name.to_string());
+            }
+            if !constraints.is_empty() {
+                let dict_n = constraints.len();
+                self.fn_dict_arity.insert(fqn.clone(), dict_n);
+                self.generic_fns.insert(fqn.clone());
+                self.generics.generic_fns.insert(fqn);
+            }
+        }
+
+        self.pop_type_params_for_type_parsing(pushed);
+        self.next_id_idx = saved_idx;
+        self.messages.truncate(msg_len);
     }
 
     fn syntactic_param_names(args: &Output) -> Vec<String> {

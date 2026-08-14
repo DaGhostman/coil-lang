@@ -4129,6 +4129,280 @@ fn main() {
         assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
     }
 
+    /// COI-115: `impl Trait<T>` bodies must see inherent `impl T` methods.
+    #[test]
+    fn trait_impl_can_call_inherent_method() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl Box {
+    fn iter() -> BoxIter {
+        return new BoxIter(self.v);
+    }
+}
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter();
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+    let it = b.into_iter();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trait_impl_can_call_generic_inherent_method() {
+        let src = r#"
+class Map<K, V> { n: int }
+class MapIter<K, V> { n: int }
+
+impl Map<K, V> {
+    fn iter() -> MapIter<K, V> {
+        return new MapIter(self.n);
+    }
+}
+
+impl IntoIterator<Map<K, V>> {
+    type Item = int;
+    type IntoIter = MapIter<K, V>;
+    fn into_iter(Map<K, V> m) -> MapIter<K, V> {
+        return m.iter();
+    }
+}
+
+impl Iterator<MapIter<K, V>> {
+    type Item = int;
+    fn next(MapIter<K, V> it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let m = new Map(0);
+    let it = m.into_iter();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trait_impl_can_call_inherent_method_declared_later() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter();
+    }
+}
+
+impl Box {
+    fn iter() -> BoxIter {
+        return new BoxIter(self.v);
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+    let it = b.into_iter();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Stubbing must not invent methods — missing inherent stays an error.
+    #[test]
+    fn trait_impl_missing_inherent_method_still_errors() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter();
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                let t = m.message();
+                t.contains("Cannot find method `iter`") || t.contains("Unknown method")
+            }),
+            "expected missing-method diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Forward stubs must carry real arity — extra args still reject.
+    #[test]
+    fn trait_impl_inherent_method_arity_mismatch_still_errors() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter(1);
+    }
+}
+
+impl Box {
+    fn iter() -> BoxIter {
+        return new BoxIter(self.v);
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                let t = m.message();
+                t.contains("too many arguments") || t.contains("Unknown method")
+            }),
+            "expected arity diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Static inherent methods declared after a trait instance must resolve.
+    #[test]
+    fn trait_impl_can_call_static_inherent_method_declared_later() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return Box::make_iter(m);
+    }
+}
+
+impl Box {
+    static fn make_iter(Box m) -> BoxIter {
+        return new BoxIter(m.v);
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+    let it = b.into_iter();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_static_method("Box", "make_iter"),
+            "stub must record static method"
+        );
+    }
+
+    /// Inherent methods must not bind their short name in env (COI-115).
+    /// `impl Path { fn join }` would otherwise shadow `fn join` / `use path::{join}`.
+    #[test]
+    fn inherent_method_does_not_bind_bare_name() {
+        let src = r#"
+class P { x: int }
+impl P {
+    fn join(P other) -> P {
+        return other;
+    }
+}
+fn join(string a, string b) -> string {
+    return a;
+}
+fn main() {
+    let s = join("ok", "");
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let s_ty = c.codegen_var_type("s").expect("s");
+        assert_eq!(apply_ty_prune(c.subst(), s_ty).to_string(), "string");
+    }
+
     #[test]
     fn yield_outside_async_is_diagnostic() {
         let (c, _) = check("fn main() { yield 1; }");
