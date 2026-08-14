@@ -105,7 +105,7 @@ jobs:
           # Raise nofile and serialize package test runs so listing is sequential.
           jobs=""
           if [ "${{ runner.os }}" = "macOS" ]; then
-            ulimit -n 10240 || true
+            ulimit -n 65536 || true
             jobs="--jobs 1"
           fi
           n=0
