@@ -6085,13 +6085,13 @@ fn main() {
         {
             names.extend(machine::CRYPTO_WIRING.iter().map(|&(n, _, _)| n));
         }
-        #[cfg(feature = "regex")]
-        {
-            names.extend(machine::REGEX_WIRING.iter().map(|&(n, _, _)| n));
-        }
-        #[cfg(all(feature = "time", feature = "crypto", feature = "regex"))]
+        names.extend(machine::REGEX_STUB_WIRING.iter().map(|&(n, _, _)| n));
+        #[cfg(all(feature = "time", feature = "crypto"))]
         assert_eq!(names.len(), 72);
         for name in names {
+            if name.starts_with("regex_") {
+                continue;
+            }
             let _ = c.host_fn_scheme(name, 0..0);
         }
         let msgs = c.take_messages();

@@ -16,8 +16,7 @@ use crate::math_libm::MATH_LIBM_WIRING;
 
 #[cfg(feature = "crypto")]
 use crate::CRYPTO_WIRING;
-#[cfg(feature = "regex")]
-use crate::REGEX_WIRING;
+use crate::regex_stubs::REGEX_STUB_WIRING;
 #[cfg(feature = "time")]
 use crate::TIME_WIRING;
 use crate::GC_WIRING;
@@ -39,8 +38,7 @@ pub fn build_standard_host_natives(
     push_wiring(&mut out, &mut register_id, ENV_WIRING, "env");
     #[cfg(feature = "crypto")]
     push_wiring(&mut out, &mut register_id, CRYPTO_WIRING, "crypto");
-    #[cfg(feature = "regex")]
-    push_wiring(&mut out, &mut register_id, REGEX_WIRING, "regex");
+    push_wiring(&mut out, &mut register_id, REGEX_STUB_WIRING, "regex");
     push_prelude_char_ord(&mut out, &mut register_id);
     push_thread_natives(&mut out, &mut register_id);
     push_packed_la(&mut out, &mut register_id);
