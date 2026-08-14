@@ -8902,3 +8902,44 @@ fn extern_in_imported_module_runs() {
     };
     assert_eq!(output, "0\n");
 }
+
+/// COI-106: binding a unary Result call before match must preserve Ok heap payloads.
+#[test]
+fn result_bind_then_match_preserves_ok_payload() {
+    let bind_fn = run_harness_src(
+        r#"
+enum Node { Obj { v: int } }
+fn make_ok() -> Result<Node, string> { return Node::Obj { v: 42 }; }
+test("bind free fn") {
+    let r = make_ok();
+    assert(match r { Result::Ok(_) => true, Result::Err(_) => false })?;
+}
+"#,
+    );
+    assert!(!bind_fn.contains("failed"), "free fn bind failed: {bind_fn:?}");
+
+    let bind_method = run_harness_src(
+        r#"
+class Svc {}
+enum Node { Obj { v: int } }
+impl Svc {
+    fn decode() -> Result<Node, string> {
+        return Node::Obj { v: 42 };
+    }
+}
+test("bind method result") {
+    let s = new Svc();
+    let r = s.decode();
+    let ok = match r {
+        Result::Ok(_) => true,
+        Result::Err(_) => false,
+    };
+    assert(ok)?;
+}
+"#,
+    );
+    assert!(
+        !bind_method.contains("failed"),
+        "method call bind+match failed: {bind_method:?}"
+    );
+}
