@@ -1397,7 +1397,6 @@ impl Checker {
         }
     }
 
-    /// Set the module path used for ownership checks while typechecking.
     /// Set the free-function name used when resolving bare param `invoke`
     /// fn-ids (call-site `declare` flow). Codegen must restore this while
     /// emitting a function body; returns the previous value.
@@ -1405,6 +1404,7 @@ impl Checker {
         std::mem::replace(&mut self.current_function, name)
     }
 
+    /// Set the module path used for ownership checks while typechecking.
     pub fn set_current_module(&mut self, module: impl Into<String>) {
         self.current_module = module.into();
     }
