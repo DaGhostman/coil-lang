@@ -6071,7 +6071,7 @@ fn main() {
         use machine::{ENV_WIRING, FS_WIRING};
 
         let mut c = Checker::new();
-        #[allow(unused_mut)] // extended only when time/crypto/regex features are on
+        #[allow(unused_mut)] // extended only when time/crypto features are on
         let mut names: Vec<&str> = FS_WIRING
             .iter()
             .chain(ENV_WIRING.iter())
@@ -6085,13 +6085,9 @@ fn main() {
         {
             names.extend(machine::CRYPTO_WIRING.iter().map(|&(n, _, _)| n));
         }
-        names.extend(machine::REGEX_STUB_WIRING.iter().map(|&(n, _, _)| n));
         #[cfg(all(feature = "time", feature = "crypto"))]
-        assert_eq!(names.len(), 72);
+        assert_eq!(names.len(), 63);
         for name in names {
-            if name.starts_with("regex_") {
-                continue;
-            }
             let _ = c.host_fn_scheme(name, 0..0);
         }
         let msgs = c.take_messages();

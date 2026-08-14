@@ -28,7 +28,8 @@ pub const ARCHIVE_MAJOR: u16 = 2;
 /// 9 — `InitTyped`: class instances carry a compile-time type id.
 /// 10 — `*Jmpt` twins of fused `*Jmpf` (Cmp / BinSlotImm / LogNot /
 ///     BinSlotSlot / BinSlotSlotConst).
-pub const ARCHIVE_MINOR: u16 = 10;
+/// 11 — drop removed-regex HostInvoke slots (nine fewer standard natives).
+pub const ARCHIVE_MINOR: u16 = 11;
 
 /// Packed `ARCHIVE_MAJOR.ARCHIVE_MINOR` stamped into new archives.
 pub const ARCHIVE_VERSION: u32 = pack_archive_version(ARCHIVE_MAJOR, ARCHIVE_MINOR);
@@ -187,9 +188,9 @@ mod tests {
     #[test]
     fn archive_version_matches_current_abi() {
         assert_eq!(ARCHIVE_MAJOR, 2);
-        assert_eq!(ARCHIVE_MINOR, 10);
-        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 10));
-        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.10");
+        assert_eq!(ARCHIVE_MINOR, 11);
+        assert_eq!(ARCHIVE_VERSION, pack_archive_version(2, 11));
+        assert_eq!(format_archive_version(ARCHIVE_VERSION), "2.11");
     }
 
     #[test]

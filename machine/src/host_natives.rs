@@ -16,7 +16,6 @@ use crate::math_libm::MATH_LIBM_WIRING;
 
 #[cfg(feature = "crypto")]
 use crate::CRYPTO_WIRING;
-use crate::regex_stubs::REGEX_STUB_WIRING;
 #[cfg(feature = "time")]
 use crate::TIME_WIRING;
 use crate::GC_WIRING;
@@ -38,7 +37,6 @@ pub fn build_standard_host_natives(
     push_wiring(&mut out, &mut register_id, ENV_WIRING, "env");
     #[cfg(feature = "crypto")]
     push_wiring(&mut out, &mut register_id, CRYPTO_WIRING, "crypto");
-    push_wiring(&mut out, &mut register_id, REGEX_STUB_WIRING, "regex");
     push_prelude_char_ord(&mut out, &mut register_id);
     push_thread_natives(&mut out, &mut register_id);
     push_packed_la(&mut out, &mut register_id);
@@ -697,49 +695,25 @@ fn push_thread_natives(
 mod tests {
     use super::*;
 
-    /// Regex slots stay reserved (even without an in-tree PCRE2 module) so
-    /// `ord` / `thread_*` / packed-LA HostInvoke ids do not shift under stale bytecode.
     #[test]
-    fn regex_stub_slots_are_contiguous_immediately_before_ord() {
+    fn prelude_char_ord_follow_crypto_without_regex_gap() {
         let mut registrations = Vec::new();
-        let natives = build_standard_host_natives(|name, id| {
+        build_standard_host_natives(|name, id| {
             registrations.push((name.to_string(), id));
         });
-
-        let expected: Vec<&str> = crate::regex_stubs::REGEX_STUB_WIRING
+        let ord = registrations
             .iter()
-            .map(|(n, _, _)| *n)
-            .collect();
-        let start = registrations
-            .iter()
-            .position(|(name, _)| name == expected[0])
-            .expect("regex_compile registration");
-        let end = start + expected.len();
-        assert_eq!(
-            registrations[start..end]
+            .position(|(name, _)| name == "ord")
+            .expect("ord registration");
+        assert_eq!(registrations[ord - 1].0, "char");
+        assert!(
+            !registrations.iter().any(|(name, _)| name.starts_with("regex_")),
+            "regex HostInvoke slots must not be registered: {:?}",
+            registrations
                 .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>(),
-            expected
+                .filter(|(name, _)| name.starts_with("regex_"))
+                .collect::<Vec<_>>()
         );
-        for (offset, _) in expected.iter().enumerate() {
-            assert_eq!(registrations[start + offset].1, start + offset);
-        }
-        assert_eq!(registrations[end].0, "ord");
-        assert_eq!(natives[start].name(), "regex_compile");
-        assert_eq!(natives[end - 1].name(), "regex_replace_all");
-    }
-
-    #[test]
-    #[should_panic(expected = "regex HostInvoke removed")]
-    fn invoking_registered_regex_stub_panics() {
-        let natives = build_standard_host_natives(|_, _| {});
-        let stub = natives
-            .iter()
-            .find(|n| n.name() == "regex_compile")
-            .expect("regex_compile stub");
-        let mut heap = crate::Heap::default();
-        let _ = stub.invoke(&mut heap, &[Value::from(0i64), Value::from(0i64)]);
     }
 
     #[test]

@@ -19,7 +19,6 @@ mod memory;
 mod opcode;
 pub mod packed_la;
 pub mod reactor;
-pub mod regex_stubs;
 pub mod value_eq;
 pub mod vec_ops;
 pub mod thread;
@@ -44,7 +43,6 @@ pub use packed_la::{
     PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, PACKED_VEC_ARITH, packed_dot,
     packed_matmul, packed_matrix_neg, packed_matrix_zip, packed_vec_arith,
 };
-pub use regex_stubs::REGEX_STUB_WIRING;
 pub use thread::{
     LiveThreadRegistry, ThreadErrorTag, ThreadProgram, join_undetached_threads,
     new_live_thread_registry,

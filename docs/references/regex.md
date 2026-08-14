@@ -41,7 +41,7 @@ See [consume.md](https://github.com/ardax-corp/coil-regex/blob/main/docs/consume
 
 ## Migrating from virtual `regex`
 
-The interpreter keeps nine **reserved** `regex_*` HostInvoke slots that panic if called (stale `.hyc`). New code must add coil-regex to `[module].roots` — `use regex::{compile}` without roots is a module-not-found error.
+Add coil-regex to `[module].roots` — `use regex::{compile}` without roots is a module-not-found error. Recompile any stale `.hyc` archives (archive **2.11** drops the old `regex_*` HostInvoke table).
 
 ---
 
