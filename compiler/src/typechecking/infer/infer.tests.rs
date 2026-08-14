@@ -4348,6 +4348,160 @@ fn main() -> Result<(), Error> {
         );
     }
 
+    /// `self.id` as the invoke fn-id inside the owning method (not only via
+    /// free-fn field access after `impl` assignment).
+    #[test]
+    fn invoke_refines_return_type_from_self_field_inside_method() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+impl Api {
+    fn load(int lib) -> Result<(), Error> {
+        self.id = declare(lib, "f", (), Float)?;
+    }
+
+    fn call(int lib) -> Result<float, Error> {
+        let f: float = invoke(lib, self.id, ())?;
+        return f;
+    }
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.load(lib)?;
+    let _ = api.call(lib)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Variadic `declare` metadata stored on a class field must refine arity
+    /// (extra args ok) — same path codegen uses for `is_ffi_declare_variadic_for_fn_id`.
+    #[test]
+    fn invoke_variadic_from_class_field_allows_extra_args() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int, Float};
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.id = declare(lib, "f", (Int,), Float, true)?;
+    let f: float = invoke(lib, api.id, (1, 2, 3))?;
+    let _ = f;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Field → local copy must also carry variadic `nfixed` (let-init Access path).
+    #[test]
+    fn invoke_variadic_from_local_copied_from_field() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int, Float};
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.id = declare(lib, "f", (Int,), Float, true)?;
+    let fn_id = api.id;
+    let f: float = invoke(lib, fn_id, (1, 2))?;
+    let _ = f;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invoke_variadic_from_class_field_rejects_too_few_args() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int, Float};
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.id = declare(lib, "f", (Int, Int), Float, true)?;
+    let f: float = invoke(lib, api.id, (1,))?;
+    let _ = f;
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("variadic invoke expects at least")
+                    || m.code() == Some(ErrorCode::InvokeArity)
+            }),
+            "expected variadic arity error, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Field without a recorded `declare` must not refine `invoke` to float.
+    #[test]
+    fn invoke_untracked_field_id_does_not_refine_return_type() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    let _ = declare(lib, "f", (), Float)?;
+    let f: float = invoke(lib, api.id, ())?;
+    let _ = f;
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::TypeMismatch)
+                    || m.message().contains("Type mismatch")
+                    || m.message().contains("float")
+            }),
+            "expected float refine failure for untracked field id, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     // ---- Error handling: raise / ? / ?? / ?. ----
 
     #[test]
