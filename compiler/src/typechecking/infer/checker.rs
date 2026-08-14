@@ -3685,10 +3685,21 @@ impl Checker {
                 return dst_ty;
             }
             if Self::is_string_ty(&src_ty) {
+                if Self::is_vec_byte_ty(&dst_ty) {
+                    return self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        "cannot cast `string` to `Vec<byte>`".to_string(),
+                        range,
+                        Some(
+                            "use `to_bytes(s)` to encode a string as UTF-8 bytes (a cast does not UTF-8-encode)"
+                                .to_string(),
+                        ),
+                    );
+                }
                 // Non-literal `s as [byte]` → `to_bytes(s)`. Fixed
                 // `[byte; N]` still requires a literal (length known).
                 if matches!(
-                    Self::is_byte_array_ty(&dst_ty),
+                    Self::is_byte_slice_ty(&dst_ty),
                     Some(crate::typechecking::ty::ArrayLength::Dynamic)
                 ) {
                     return dst_ty;
@@ -8506,16 +8517,24 @@ impl Checker {
     /// `[byte]`, `[byte; N]`, or `Vec<byte>` — returns the length constraint when so.
     /// `Vec<byte>` is treated as dynamic length.
     fn is_byte_array_ty(ty: &Ty) -> Option<ArrayLength> {
+        Self::is_byte_slice_ty(ty).or_else(|| {
+            if Self::is_vec_byte_ty(ty) {
+                Some(ArrayLength::Dynamic)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn is_byte_slice_ty(ty: &Ty) -> Option<ArrayLength> {
         match ty {
             Ty::Array { element, length } if Self::is_byte_ty(element) => Some(*length),
-            _ => {
-                if vec_element_ty(ty).is_some_and(|e| Self::is_byte_ty(e)) {
-                    Some(ArrayLength::Dynamic)
-                } else {
-                    None
-                }
-            }
+            _ => None,
         }
+    }
+
+    fn is_vec_byte_ty(ty: &Ty) -> bool {
+        vec_element_ty(ty).is_some_and(|e| Self::is_byte_ty(e))
     }
 
     fn byte_array_tys_compatible(src: &Ty, dst: &Ty) -> bool {

@@ -6263,6 +6263,19 @@ fn main() {
         );
     }
     #[test]
+    fn string_var_cast_to_vec_byte_rejects_with_to_bytes_hint() {
+        let msgs = assert_messages(r#"fn main() { let s = "hi"; let _ = s as Vec<byte>; }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("cannot cast `string` to `Vec<byte>`")
+                    && m.help().as_ref().is_some_and(|h| h.contains("to_bytes"))
+            }),
+            "got: {:?}",
+            msgs.iter().map(|m| (m.message(), m.help())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn byte_cast_rejects_negative_literal() {
         for src in [
             "fn main() { let x = -1 as byte; }",
