@@ -69,3 +69,106 @@ test("nested free-fn try mismatched Result payload") {
     let n = free_encode_into(7)?;
     assert(n == 1)?;
 }
+
+class Client {}
+
+impl Client {
+    fn get() -> Result<int, string> {
+        return self.send()?;
+    }
+
+    fn send() -> Result<int, string> {
+        return self.request_send()?;
+    }
+
+    fn request_send() -> Result<int, string> {
+        return 42;
+    }
+}
+
+test("nested same-Result methods declared later") {
+    let c = new Client();
+    let n = c.get()?;
+    assert(n == 42)?;
+}
+
+class ClientFail {}
+
+impl ClientFail {
+    fn get() -> Result<int, string> {
+        return self.send()?;
+    }
+
+    fn send() -> Result<int, string> {
+        return self.boom()?;
+    }
+
+    fn boom() -> Result<int, string> {
+        raise "nope";
+    }
+}
+
+test("forward same-Result methods propagate Err") {
+    let c = new ClientFail();
+    let r = c.get();
+    let msg = match r {
+        Result::Ok(_) => "ok",
+        Result::Err(m) => m,
+    };
+    assert(msg == "nope")?;
+}
+
+class Counter {}
+
+impl Counter {
+    fn early() -> int {
+        return self.late();
+    }
+
+    fn late() -> int {
+        return 7;
+    }
+}
+
+test("forward non-Result instance method call") {
+    let c = new Counter();
+    assert(c.early() == 7)?;
+}
+
+class EncFwd {}
+
+impl EncFwd {
+    fn encode_into(int n) -> Result<int, string> {
+        let bytes = self.encode(n)?;
+        return len(bytes);
+    }
+
+    fn encode(int n) -> Result<Vec<byte>, string> {
+        let out: Vec<byte> = Vec::new();
+        out.push(n as byte);
+        return out;
+    }
+}
+
+test("forward mismatched-Result method try") {
+    let e = new EncFwd();
+    let n = e.encode_into(9)?;
+    assert(n == 1)?;
+}
+
+class Factory {}
+
+impl Factory {
+    fn make() -> int {
+        return Factory::value();
+    }
+
+    static fn value() -> int {
+        return 9;
+    }
+}
+
+test("forward static method call from instance") {
+    let f = new Factory();
+    assert(f.make() == 9)?;
+}

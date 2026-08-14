@@ -2425,10 +2425,40 @@ impl Compiler {
     /// Bind a fresh entry label at the current PC and register `name`.
     fn bind_function_entry(&mut self, name: String) -> (usize, IlLabel) {
         let offset = self.bytecode.len();
-        let label = self.bytecode.bind_fresh_entry();
+        let label = if let Some(existing) = self.fn_entry_labels.get(&name).copied() {
+            self.bytecode.bind_reserved_entry(existing);
+            existing
+        } else {
+            self.bytecode.bind_fresh_entry()
+        };
         self.functions.insert(name.clone(), offset);
         self.fn_entry_labels.insert(name, label);
         (offset, label)
+    }
+
+    /// Allocate an unbound entry label so later methods in the same `impl` can
+    /// be called before their bodies are emitted.
+    fn reserve_function_entry(&mut self, name: String) {
+        if self.fn_entry_labels.contains_key(&name) {
+            return;
+        }
+        let label = self.bytecode.fresh_label();
+        self.fn_entry_labels.insert(name, label);
+    }
+
+    /// Direct `CALL`, or `Entry{Call}` when the callee body is still ahead.
+    fn emit_direct_fn_call(&mut self, dest: &mut Vec<Byte>, name: &str, arity: u32) -> bool {
+        if let Some(&offset) = self.functions.get(name) {
+            dest.push(Byte::new(Instruction::CALL).with_call_packed(arity, offset as u32));
+            true
+        } else if let Some(label) = self.fn_entry_labels.get(name).copied() {
+            self.bytecode.append(dest);
+            self.bytecode
+                .emit_entry(crate::il::EntryKind::Call, arity, label);
+            true
+        } else {
+            false
+        }
     }
 
     /// Entry label for a registered function, if bound.
@@ -6472,11 +6502,16 @@ impl Compiler {
                     .as_ref()
                     .and_then(Checker::class_name_of_ty)
                     .map(str::to_string)?;
-                self.context.methods.get(&owner)?.get(*method)?.clone()
+                self.context
+                    .methods
+                    .get(&owner)
+                    .and_then(|m| m.get(*method))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}::{}", owner, method))
             }
             _ => return None,
         };
-        if !self.functions.contains_key(&name) {
+        if !self.functions.contains_key(&name) && !self.fn_entry_labels.contains_key(&name) {
             return None;
         }
         self.pair_return_kind(&name)
@@ -10237,6 +10272,20 @@ impl Compiler {
                 self.namespace = owner_key.clone();
 
                 for method_node in methods {
+                    if let Expression::Method(_, body) = method_node.1.borrow()
+                        && let Expression::Function { name, .. } = body.1.borrow()
+                    {
+                        let fqn = format!("{}::{}", owner_key, name);
+                        self.context
+                            .methods
+                            .entry(owner_key.clone())
+                            .or_default()
+                            .insert(name.to_string(), fqn.clone());
+                        self.reserve_function_entry(fqn);
+                    }
+                }
+
+                for method_node in methods {
                     match method_node.1.borrow() {
                         Expression::Method(_, body) => {
                             if let Expression::Function {
@@ -11980,8 +12029,9 @@ impl Compiler {
                         return bytecode;
                     }
                     // `Class::static_method(...)` — same surface as enum
-                    // Construct; lower to a direct CALL when registered.
-                    if let Some(offset) = self.functions.get(&fqn).copied() {
+                    // Construct; lower to a direct CALL or Entry{Call} when
+                    // the method is compiled or reserved (COI-108 forward).
+                    if self.functions.contains_key(&fqn) || self.fn_entry_labels.contains_key(&fqn) {
                         let arg_slice: &[Output] = match fields {
                             EnumConstructPayload::Unit => &[],
                             EnumConstructPayload::Tuple(args) => args.as_slice(),
@@ -11991,18 +12041,17 @@ impl Compiler {
                                 }
                                 // Record form is a type error for static
                                 // methods; still emit a CALL for recovery.
-                                bytecode.push(
-                                    Byte::new(Instruction::CALL)
-                                        .with_call_packed(parts.len() as u32, offset as u32),
+                                let _ = self.emit_direct_fn_call(
+                                    &mut bytecode,
+                                    &fqn,
+                                    parts.len() as u32,
                                 );
                                 return bytecode;
                             }
                         };
                         let arity =
                             self.emit_call_args_with_rest(&fqn, arg_slice, &mut bytecode, false);
-                        bytecode.push(
-                            Byte::new(Instruction::CALL).with_call_packed(arity, offset as u32),
-                        );
+                        let _ = self.emit_direct_fn_call(&mut bytecode, &fqn, arity);
                         return bytecode;
                     }
                     match fields {
@@ -13882,7 +13931,8 @@ impl Compiler {
                 } else {
                     fqn
                 };
-                if let Some(offset) = self.functions.get(&fqn).copied() {
+                if self.functions.contains_key(&fqn) || self.fn_entry_labels.contains_key(&fqn) {
+                    let offset = self.functions.get(&fqn).copied().unwrap_or(0);
                     let niche_vec_method = (self.expr_is_niche_option(ast)
                         || self.force_niche_option)
                         && (fqn == format!("{}::pop", common::BUILTIN_VEC_TYPE)
@@ -14043,12 +14093,24 @@ impl Compiler {
                     } else {
                         0
                     };
-                    bytecode.push(
-                        Byte::new(Instruction::CALL).with_call_packed(
-                            1 + nargs + dict_count as u32,
-                            call_offset as u32,
-                        ),
-                    );
+                    let call_arity = 1 + nargs + dict_count as u32;
+                    if niche_vec_method {
+                        bytecode.push(
+                            Byte::new(Instruction::CALL)
+                                .with_call_packed(call_arity, call_offset as u32),
+                        );
+                    } else if !self.emit_direct_fn_call(&mut bytecode, &fqn, call_arity) {
+                        let mut message = Message::error(
+                            ErrorCode::UnknownFunction,
+                            "Unknown method".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("Unable to call unknown method '{}'", fqn),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
                     if !niche_vec_method
                         && (self.expr_is_niche_option(ast) || self.force_niche_option)
                         && (lookup_name == format!("{}::pop", common::BUILTIN_VEC_TYPE)
