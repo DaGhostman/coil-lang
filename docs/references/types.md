@@ -21,7 +21,7 @@ Integer literals coerce to `byte` when the expected type is `byte` (returns, ann
 
 **Single-byte string literals** also coerce to `byte` in those same expected-type positions (and in `b == "/"`-style comparisons): the literal’s UTF-8 encoding must be exactly one byte after escapes (`"/"`, `"\n"`, `"\""`). Multi-byte characters (e.g. `"é"`) and non-literal `string` values do not coerce to `byte`.
 
-**String literals** also coerce to `Vec<byte>` / `[byte; N]` (UTF-8 bytes) under an expected byte-buffer type, via `"…" as Vec<byte>`, and as `Vec<byte>` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal strings may use `s as Vec<byte>` (lowers to `to_bytes`); fixed `[byte; N]` still needs a literal.
+**String literals** also coerce to `Vec<byte>` / `[byte; N]` (UTF-8 bytes) under an expected byte-buffer type, via `"…" as Vec<byte>`, and as `Vec<byte>` call arguments (e.g. `write_all(stdout(), "hi")`). For `[byte; N]` the decoded length must be exactly `N`. Non-literal strings may use `s as [byte]` (lowers to `to_bytes`); use `to_bytes(s)` for `Vec<byte>` (`s as Vec<byte>` is a compile-time error). Fixed `[byte; N]` still needs a literal.
 
 `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
