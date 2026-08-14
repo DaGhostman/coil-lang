@@ -542,6 +542,36 @@ impl Compiler {
         !arms.is_empty() && arms.iter().all(|arm| self.expr_is_tail_self_call(&arm.body))
     }
 
+    /// Whether an explicit `return Result::Ok/Err(…)` should skip the
+    /// result-mode Ok-wrap (COI-113). Nested `Result<Result<…>, …>` still
+    /// wraps `return Result::Ok(payload)`.
+    fn skip_result_ok_wrap_for_return(&self, expr: &Output<'_>) -> bool {
+        let node = unwrap_expr_output(expr);
+        let Expression::Construct {
+            enum_name,
+            variant_name,
+            ..
+        } = node.1.as_ref()
+        else {
+            if let Expression::Fragment(items) = node.1.as_ref()
+                && items.len() == 1
+            {
+                return self.skip_result_ok_wrap_for_return(&items[0]);
+            }
+            return false;
+        };
+        let is_result =
+            *enum_name == common::BUILTIN_RESULT_ENUM || enum_name.ends_with("::Result");
+        if !is_result {
+            return false;
+        }
+        match *variant_name {
+            "Err" => true,
+            "Ok" => !self.compiling_result_ok_is_result,
+            _ => false,
+        }
+    }
+
     /// `return self(...)` tail-call when eligible.
     fn try_emit_tail_call_expr(&mut self, expr: &Output<'_>, bytecode: &mut Vec<Byte>) -> bool {
         if !self.fn_defers.is_empty() {
@@ -6909,7 +6939,9 @@ impl Compiler {
         }
 
         let prev_result_mode = self.compiling_result_mode;
+        let prev_result_ok_is_result = self.compiling_result_ok_is_result;
         self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+        self.compiling_result_ok_is_result = self.checker.fn_result_ok_is_result(name);
         let prev_pair_mode = self.compiling_pair_mode;
         let prev_pair_is_option = self.compiling_pair_is_option;
         let pair_kind = if *is_coro {
@@ -6944,6 +6976,7 @@ impl Compiler {
 
         self.fn_defers = prev_fn_defers;
         self.compiling_result_mode = prev_result_mode;
+        self.compiling_result_ok_is_result = prev_result_ok_is_result;
         self.compiling_pair_mode = prev_pair_mode;
         self.compiling_pair_is_option = prev_pair_is_option;
         self.context.variables = prev_vars;
@@ -7218,8 +7251,11 @@ impl Compiler {
             let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
             let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
             let prev_result_mode = self.compiling_result_mode;
+            let prev_result_ok_is_result = self.compiling_result_ok_is_result;
             self.context.variables = Interner::default();
             self.compiling_result_mode = self.checker.fn_is_result_mode(source_name);
+            self.compiling_result_ok_is_result =
+                self.checker.fn_result_ok_is_result(source_name);
             self.mono_codegen_var_types.push(overrides);
 
             let prev_fn_defers = std::mem::take(&mut self.fn_defers);
@@ -7238,6 +7274,7 @@ impl Compiler {
             self.fn_defers = prev_fn_defers;
             self.mono_codegen_var_types.pop();
             self.compiling_result_mode = prev_result_mode;
+            self.compiling_result_ok_is_result = prev_result_ok_is_result;
             self.field_key_slots = prev_field_keys;
             self.context.variables = prev_fn_vars;
             self.polyfn_vars = prev_fn_polyfn_vars;
@@ -10057,7 +10094,9 @@ impl Compiler {
                 }
 
                 let prev_result_mode = self.compiling_result_mode;
+                let prev_result_ok_is_result = self.compiling_result_ok_is_result;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+                self.compiling_result_ok_is_result = self.checker.fn_result_ok_is_result(name);
                 let prev_pair_mode = self.compiling_pair_mode;
                 let prev_pair_is_option = self.compiling_pair_is_option;
                 let pair_kind = if *is_coro {
@@ -10121,6 +10160,7 @@ impl Compiler {
 
                 self.fn_defers = prev_fn_defers;
                 self.compiling_result_mode = prev_result_mode;
+                self.compiling_result_ok_is_result = prev_result_ok_is_result;
                 self.compiling_pair_mode = prev_pair_mode;
                 self.compiling_pair_is_option = prev_pair_is_option;
                 self.pop_const_env();
@@ -10372,7 +10412,9 @@ impl Compiler {
                     && self.try_emit_tail_call_expr(expr, &mut bytecode)
                 {
                     if self.compiling_result_mode {
-                        Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                        if !self.skip_result_ok_wrap_for_return(expr) {
+                            Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                        }
                     }
                     return bytecode;
                 }
@@ -10404,7 +10446,12 @@ impl Compiler {
                         }
                     }
                 } else if self.compiling_result_mode {
-                    Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                    // Explicit flat `return Result::Ok/Err` already builds the
+                    // enum — do not Ok-wrap again (COI-113). Nested Result Ok
+                    // payloads still wrap.
+                    if !self.skip_result_ok_wrap_for_return(expr) {
+                        Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                    }
                 }
                 self.bytecode.append(&mut bytecode);
                 self.emit_run_defers();
@@ -12159,7 +12206,10 @@ impl Compiler {
                 self.context.variables = Interner::default();
 
                 let prev_result_mode = self.compiling_result_mode;
+                let prev_result_ok_is_result = self.compiling_result_ok_is_result;
                 self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
+                self.compiling_result_ok_is_result =
+                    self.checker.fn_result_ok_is_result(&fn_name);
                 let prev_pair_mode = self.compiling_pair_mode;
                 let prev_pair_is_option = self.compiling_pair_is_option;
                 let pair_kind = self.pair_return_kind(&fn_name);
@@ -12178,6 +12228,7 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.compiling_result_ok_is_result = prev_result_ok_is_result;
                 self.compiling_pair_mode = prev_pair_mode;
                 self.compiling_pair_is_option = prev_pair_is_option;
                 self.field_key_slots = prev_field_keys;

@@ -34,7 +34,7 @@ Annotations may use type applications: `Option<int>`, `Result<int, string>`.
 
 `raise e` early-returns `Result::Err(e)` from the enclosing function.
 
-A function enters **result mode** when it uses `raise`, uses `?` on a `Result`, or is annotated `-> Result<...>`. In result mode, ordinary `return v` (and success paths) are wrapped as `Result::Ok(v)` by codegen.
+A function enters **result mode** when it uses `raise`, uses `?` on a `Result`, or is annotated `-> Result<...>`. In result mode, ordinary `return v` (and success paths) are wrapped as `Result::Ok(v)` by codegen. Explicit `return Result::Ok(v)` / `return Result::Err(e)` are also accepted (no double-wrap).
 
 Do **not** chain postfix `?` after `raise` (`raise err?` parses as `raise (err?)`). Write `raise err;` — `raise` already early-returns `Err`.
 
@@ -44,6 +44,10 @@ fn parse_pos(int n, int is_neg) {
         raise "neg";
     }
     return n; // becomes Ok(n)
+}
+
+fn explicit_ok() -> Result<int, string> {
+    return Result::Ok(1);
 }
 ```
 

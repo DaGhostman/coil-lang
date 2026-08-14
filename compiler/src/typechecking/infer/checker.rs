@@ -140,6 +140,7 @@ impl Checker {
             fn_result_mode: None,
             fn_option_mode: None,
             result_mode_fns: HashSet::new(),
+            result_mode_ok_is_result: HashSet::new(),
             option_mode_fns: HashSet::new(),
             test_case_names: Vec::new(),
             main_decl_span: None,
@@ -1502,6 +1503,7 @@ impl Checker {
         self.fn_result_mode = None;
         self.fn_option_mode = None;
         self.result_mode_fns.clear();
+        self.result_mode_ok_is_result.clear();
         self.option_mode_fns.clear();
         self.test_case_names.clear();
         self.main_decl_span = None;
@@ -2584,13 +2586,35 @@ impl Checker {
                 // Push the declared return type as expected so ground trait
                 // calls like `return c.into();` can pin `Into`'s target `T`
                 // before constraint discharge (same as annotated `let`).
+                // In result mode, bare `return v` expects the Ok payload. An
+                // explicit `return Result::Ok(v)` / `Result::Err(e)` expects
+                // the full Result when the Ok payload is not itself a Result
+                // (nested `Result<Result<…>, …>` still uses Ok as payload + wrap).
                 let prev_expected = self.current_expected.take();
-                if let Some(ret) = self.current_return_ty.clone() {
+                let flat_explicit_result = self.fn_result_mode.as_ref().is_some_and(|(ok, _)| {
+                    result_ok_err(ok).is_none() && Self::expr_is_explicit_result_construct(e)
+                });
+                if flat_explicit_result {
+                    if let Some((ok, err)) = self.fn_result_mode.clone() {
+                        self.current_expected = Some(result_ty(ok, err));
+                    }
+                } else if let Some(ret) = self.current_return_ty.clone() {
                     self.current_expected = Some(ret);
                 }
                 let ty = self.infer(e);
                 self.current_expected = prev_expected;
-                if let Some(ret) = self.current_return_ty.clone() {
+                if flat_explicit_result {
+                    if let Some((ok, err)) = self.fn_result_mode.clone() {
+                        let full = result_ty(ok, err);
+                        self.coerce_or_unify(
+                            &full,
+                            &ty,
+                            Some(e),
+                            &e.0.into_range(),
+                            "return value",
+                        );
+                    }
+                } else if let Some(ret) = self.current_return_ty.clone() {
                     self.coerce_or_unify(&ret, &ty, Some(e), &e.0.into_range(), "return value");
                 }
                 never()
@@ -8546,6 +8570,26 @@ impl Checker {
         }
     }
 
+    /// `Result::Ok(...)` / `Result::Err(...)` (also `Ok`/`Err` if prelude-bound).
+    fn expr_is_explicit_result_construct(node: &Output) -> bool {
+        let node = unwrap_expr_wrappers(node);
+        match node.1.as_ref() {
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                ..
+            } => {
+                let is_result = *enum_name == common::BUILTIN_RESULT_ENUM
+                    || enum_name.ends_with("::Result");
+                is_result && (*variant_name == "Ok" || *variant_name == "Err")
+            }
+            Expression::Fragment(items) if items.len() == 1 => {
+                Self::expr_is_explicit_result_construct(&items[0])
+            }
+            _ => false,
+        }
+    }
+
     fn is_int_ty(ty: &Ty) -> bool {
         matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::INT)
     }
@@ -10469,6 +10513,19 @@ impl Checker {
         self.result_mode_fns.contains(fn_name)
     }
 
+    /// Whether `fn_name`'s Result Ok payload is itself a Result (nested).
+    pub fn fn_result_ok_is_result(&self, fn_name: &str) -> bool {
+        self.result_mode_ok_is_result.contains(fn_name)
+    }
+
+    fn note_result_mode_fn(&mut self, name: &str, ok: &Ty) {
+        self.result_mode_fns.insert(name.to_string());
+        let ok = apply_ty_prune(&self.subst, ok);
+        if result_ok_err(&ok).is_some() {
+            self.result_mode_ok_is_result.insert(name.to_string());
+        }
+    }
+
     /// Literal names of top-level `test("…") { … }` cases (source order).
     pub fn test_case_names(&self) -> &[String] {
         &self.test_case_names
@@ -11902,7 +11959,7 @@ impl Checker {
             // Body used raise/? — rebuild fun_ty with Result return.
             let ok = apply_ty_prune(&self.subst, &ok);
             let err = apply_ty_prune(&self.subst, &err);
-            let result_ret = result_ty(ok, err);
+            let result_ret = result_ty(ok.clone(), err);
             fun_ty = result_ret.clone();
             for (_, arg_ty) in arg_tys.iter().rev() {
                 fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
@@ -11910,7 +11967,7 @@ impl Checker {
             if let Some(self_ty) = self_ty {
                 fun_ty = Ty::Fun(Box::new(self_ty.clone()), Box::new(fun_ty));
             }
-            self.result_mode_fns.insert(name.to_string());
+            self.note_result_mode_fn(name, &ok);
             let _ = result_ret;
         } else if let Some(inner) = self.fn_option_mode.clone() {
             let inner = apply_ty_prune(&self.subst, &inner);

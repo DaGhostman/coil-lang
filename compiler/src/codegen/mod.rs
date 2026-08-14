@@ -861,6 +861,9 @@ pub struct Compiler {
     /// True while compiling a function whose return type is inferred
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
+    /// When result-mode Ok payload is itself `Result`, keep Ok-wrapping
+    /// explicit `return Result::Ok(…)` (nested Result payload case).
+    compiling_result_ok_is_result: bool,
 
     /// Force ground pointer-niche `Option` expressions back to heap enums
     /// while using legacy pattern lowering or an unknown boundary.
@@ -1003,6 +1006,7 @@ impl Default for Compiler {
             active_fn_name: None,
             compiling_method: false,
             compiling_result_mode: false,
+            compiling_result_ok_is_result: false,
             force_heap_option: false,
             force_niche_option: false,
             compiling_pair_mode: false,

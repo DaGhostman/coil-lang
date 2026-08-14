@@ -50,7 +50,7 @@ The compiler pre-registers polymorphic sum types under the virtual `prelude` mod
 
 Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`). Error-handling operators (`raise`, `?`, `??`, `?.`) are documented in [Operators](operators.md) and [Tutorial 09](../manual/tutorial/09-error-handling.md).
 
-**Result mode:** a function that uses `raise` or Result-`?` has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. One `E` per function.
+**Result mode:** a function that uses `raise` or Result-`?` (or is annotated `-> Result<…>`) has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. Explicit `return Result::Ok(v)` / `return Result::Err(e)` are also accepted. One `E` per function.
 
 ### Option / Result runtime ABI
 
