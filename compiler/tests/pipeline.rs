@@ -9047,3 +9047,37 @@ test("bind method option Some/None") {
         "method call bind+match failed: {bind_method:?}"
     );
 }
+
+/// COI-108: `self.inner(x)?` must preserve inner method's Ok payload when the
+/// outer function returns a different `Result` payload type.
+#[test]
+fn nested_method_try_preserves_inner_result_payload() {
+    let output = run_harness_src(
+        r#"
+class Enc {
+}
+impl Enc {
+    fn encode(int n) -> Result<Vec<byte>, string> {
+        let out: Vec<byte> = Vec::new();
+        out.push(n as byte);
+        let m = n + 1;
+        out.push(m as byte);
+        return out;
+    }
+    fn encode_into(int n) -> Result<int, string> {
+        let bytes = self.encode(n)?;
+        return len(bytes);
+    }
+}
+test("nested method try keeps vec bytes") {
+    let e = new Enc();
+    let n = e.encode_into(10)?;
+    assert(n == 2)?;
+}
+"#,
+    );
+    assert!(
+        !output.contains("failed"),
+        "nested method try failed: {output:?}"
+    );
+}
