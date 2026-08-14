@@ -6056,6 +6056,144 @@ fn main() {
 }
 
 #[test]
+fn gc_finalizer_store_self_into_root_resurrects() {
+    // COI-79: root(self) during drop is a documented resurrection edge.
+    let output = run_example_src(
+        r#"
+use gc::{collect, get, root, Root};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Root<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(root(self));
+    }
+}
+fn make() {
+    let h = new Handle(42);
+}
+fn main() {
+    make();
+    collect();
+    let fd = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    let after_first = drops;
+    collect();
+    let fd2 = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i%i%i", after_first, drops, fd, fd2)));
+}
+"#,
+    );
+    assert_eq!(output, "114242");
+}
+
+#[test]
+fn gc_finalizer_store_self_into_reachable_field() {
+    // COI-79: store into a still-reachable object's field (not only a static).
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle {
+    fd: int,
+}
+class Bag {
+    slot: Option<Handle>,
+}
+static let drops: int = 0;
+static let bag: Option<Bag> = Option::None;
+impl Bag {
+    fn put(Handle h) {
+        self.slot = Option::Some(h);
+    }
+    fn fd() -> int {
+        return match self.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        };
+    }
+}
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        match bag {
+            Option::Some(b) => b.put(self),
+            Option::None => (),
+        };
+    }
+}
+fn setup() {
+    bag = Option::Some(new Bag(Option::None));
+}
+fn make() {
+    let h = new Handle(9);
+}
+fn main() {
+    setup();
+    make();
+    collect();
+    let fd = match bag {
+        Option::Some(b) => b.fd(),
+        Option::None => -2,
+    };
+    let after_first = drops;
+    collect();
+    write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
+}
+"#,
+    );
+    assert_eq!(output, "119");
+}
+
+#[test]
+fn gc_finalizer_resurrection_keeps_weak_upgradable() {
+    // Re-mark after drop must keep weaks to a resurrected cell live.
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn ephemeral() {
+    let h = new Handle(3);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        },
+        Option::None => -2,
+    };
+    write(stdout(), to_bytes(format("%i%i", drops, after)));
+}
+"#,
+    );
+    assert_eq!(output, "13");
+}
+
+#[test]
 fn gc_heap_bytes_is_nonnegative() {
     let output = run_example_src(
         r#"
