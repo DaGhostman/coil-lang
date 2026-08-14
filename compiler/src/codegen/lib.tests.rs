@@ -6648,6 +6648,54 @@ fn main() {
         );
     }
 
+    /// COI-108: `self.inner()?` with a different Ok payload must keep the
+    /// ReturnPair and use the tag EQ/JMPF path — not PairToHeap + JumpIfMatch.
+    #[test]
+    fn nested_method_try_mismatched_result_keeps_pair_path() {
+        let (bc, _) = compile_src(
+            r#"
+class Enc {}
+impl Enc {
+    fn encode(int n) -> Result<Vec<byte>, string> {
+        let out: Vec<byte> = Vec::new();
+        out.push(n as byte);
+        return out;
+    }
+    fn encode_into(int n) -> Result<int, string> {
+        let bytes = self.encode(n)?;
+        return len(bytes);
+    }
+}
+fn main() {
+    let e = new Enc();
+    let _ = e.encode_into(10);
+}
+"#,
+        );
+        let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
+        assert!(
+            !bc.windows(3).any(|w| {
+                matches!(w[0].bytecode(), Instruction::CALL)
+                    && matches!(w[1].bytecode(), Instruction::PairToHeap)
+                    && matches!(w[2].bytecode(), Instruction::DUPLICATE)
+            }),
+            "mismatched-Result method Try must not box before pair tag check; opcodes={ops:?}",
+        );
+        assert!(
+            bc.windows(4).any(|w| {
+                matches!(w[0].bytecode(), Instruction::CALL)
+                    && matches!(w[1].bytecode(), Instruction::DUPLICATE)
+                    && matches!(w[2].bytecode(), Instruction::CONST)
+                    && matches!(w[3].bytecode(), Instruction::EQ)
+            }),
+            "mismatched-Result method Try must use pair EQ tag check; opcodes={ops:?}",
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, Instruction::JumpIfMatch)),
+            "mismatched-Result method Try must not JumpIfMatch a heap enum; opcodes={ops:?}",
+        );
+    }
+
     #[test]
     fn nested_option_string_none_stays_boxed() {
         let (bc, _) = compile_src(
