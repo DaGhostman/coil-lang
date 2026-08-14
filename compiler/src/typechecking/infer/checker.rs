@@ -1541,6 +1541,11 @@ impl Checker {
 
         // Top frame for natives/globals; left on stack after check_program.
         self.push_scope();
+
+        // Forward-declare module-level function signatures so `impl`
+        // methods that appear earlier in the file can call them.
+        self.pre_register_free_functions(ast);
+
         let ty = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.infer(ast))) {
             Ok(ty) => ty,
             Err(payload) => {
@@ -12855,6 +12860,87 @@ impl Checker {
     // ============================================================
     //  Enums and pattern matching
     // ============================================================
+
+    /// Pre-pass: register top-level `fn` signatures before main inference so
+    /// `impl` methods can call module helpers defined later in the file.
+    fn pre_register_free_functions(&mut self, ast: &Output) {
+        let children = match ast.1.as_ref() {
+            Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
+            _ => return,
+        };
+        for child in children {
+            if let Expression::Function {
+                name,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                ..
+            } = child.1.as_ref()
+            {
+                self.stub_free_function_signature(
+                    name,
+                    type_params,
+                    args,
+                    returns.as_ref(),
+                    where_constraints,
+                    &child.0.into_range(),
+                );
+            }
+        }
+    }
+
+    fn stub_free_function_signature(
+        &mut self,
+        name: &str,
+        type_params: &[parser::ast::TypeParam],
+        args: &Output,
+        returns: Option<&Output>,
+        where_constraints: &[parser::ast::WhereConstraint],
+        range: &Range<usize>,
+    ) {
+        let key = if self.current_module.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.current_module, name)
+        };
+        if self.env.lookup(&key).is_some() || self.env.lookup(name).is_some() {
+            return;
+        }
+
+        let pushed = self.push_type_params_for_type_parsing(type_params);
+        let prev_constraints_len = self.active_constraints.len();
+        for wc in where_constraints {
+            let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+            self.active_constraints.push(Constraint {
+                class: wc.class.to_string(),
+                args,
+            });
+        }
+
+        self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
+        let arg_tys = self.parse_arg_list(args);
+        self.current_tuple_pack = None;
+        self.fn_param_names.insert(
+            key.clone(),
+            arg_tys.iter().map(|(n, _)| n.clone()).collect(),
+        );
+
+        let ret_ty = match returns {
+            Some(r) => self.parse_return_type_name(r),
+            None => Ty::Var(self.counter.fresh()),
+        };
+        let mut fun_ty = ret_ty;
+        for (_, arg_ty) in arg_tys.iter().rev() {
+            fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+        }
+        fun_ty = Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false);
+        self.env.insert_top(key, Scheme::mono(fun_ty));
+
+        self.active_constraints.truncate(prev_constraints_len);
+        self.pop_type_params_for_type_parsing(pushed);
+        let _ = range;
+    }
 
     /// Pre-pass: register enum shapes before main inference (forward refs).
     fn pre_register_enums(&mut self, ast: &Output) -> Result<(), Vec<Message>> {
