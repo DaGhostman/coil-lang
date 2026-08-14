@@ -12242,10 +12242,13 @@ impl Compiler {
                 let success_tag: u32 = if is_option { 1 } else { 0 }; // Some=1, Ok=0
 
                 let pair_inner = self.expr_pairs_with_return(inner);
+                // Mismatched Ok/Some payloads still leave a ReturnPair on the
+                // stack (`pair_producer`); keep pair context so the call is not
+                // boxed before the tag check below.
                 let pair_producer =
                     self.compiling_pair_mode && self.expr_is_pair_producer(inner);
                 let previous_pair_context = self.pair_value_context;
-                self.pair_value_context = pair_inner;
+                self.pair_value_context = pair_inner || pair_producer;
                 let inner_bc = self.do_compile(inner);
                 self.pair_value_context = previous_pair_context;
                 self.bytecode.extend(inner_bc);
