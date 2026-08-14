@@ -1267,6 +1267,32 @@ mod tests {
     }
 
     #[test]
+    fn stream_open_rejects_invalid_mode() {
+        let mut heap = Heap::default();
+        let path = std::env::temp_dir().join("coil_io_bad_mode.bin");
+        let err = stream_open(&mut heap, path.to_str().unwrap(), "xx").unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn stream_open_append_preserves_bytes() {
+        let path = std::env::temp_dir().join("coil_io_append_mode.bin");
+        let _ = std::fs::remove_file(&path);
+        let mut heap = Heap::default();
+        let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open w");
+        stream_write_all(&mut heap, w, make_byte_array(&mut heap, b"ab")).expect("write");
+        stream_close(&mut heap, w).expect("close w");
+        let a = stream_open(&mut heap, path.to_str().unwrap(), "a").expect("open a");
+        stream_write_all(&mut heap, a, make_byte_array(&mut heap, b"cd")).expect("append");
+        stream_close(&mut heap, a).expect("close a");
+        let r = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open r");
+        let buf = stream_read_to_end(&mut heap, r).expect("read");
+        stream_close(&mut heap, r).expect("close r");
+        assert_eq!(array_bytes(&heap, buf), b"abcd");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn write_from_rejects_negative_and_past_end_offset() {
         let path = std::env::temp_dir().join("coil_io_write_from_bad.bin");
         let mut heap = Heap::default();

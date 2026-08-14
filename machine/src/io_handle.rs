@@ -296,3 +296,135 @@ fn dup_stdio_file(kind: StdioKind) -> io::Result<File> {
         Ok(File::from(owned))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn open_file_rejects_invalid_mode() {
+        let path = temp_path("coil_native_handle_bad_mode.bin");
+        let err = NativeHandle::open_file(path.to_str().unwrap(), "x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn open_file_append_preserves_prior_bytes() {
+        let path = temp_path("coil_native_handle_append.bin");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = NativeHandle::open_file(path.to_str().unwrap(), "w").expect("open w");
+            w.write_all(b"ab").expect("write");
+        }
+        {
+            let mut a = NativeHandle::open_file(path.to_str().unwrap(), "a").expect("open a");
+            a.write_all(b"cd").expect("append");
+        }
+        let mut r = NativeHandle::open_file(path.to_str().unwrap(), "r").expect("open r");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).expect("read");
+        assert_eq!(buf, b"abcd");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_file_rw_round_trip() {
+        let path = temp_path("coil_native_handle_rw.bin");
+        let _ = std::fs::remove_file(&path);
+        let mut h = NativeHandle::open_file(path.to_str().unwrap(), "rw").expect("open rw");
+        h.write_all(b"xy").expect("write");
+        h.flush().expect("flush");
+        // Re-open for a clean read cursor (platform seek behavior varies).
+        drop(h);
+        let mut r = NativeHandle::open_file(path.to_str().unwrap(), "r").expect("reopen");
+        let mut buf = [0u8; 2];
+        r.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"xy");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listener_read_write_are_invalid_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let mut h = NativeHandle::Listener(listener);
+        assert_eq!(
+            h.read(&mut [0u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            h.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        h.flush().expect("listener flush is a no-op");
+    }
+
+    #[test]
+    fn accessors_match_variants() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("udp");
+
+        let mut tcp = NativeHandle::Tcp(server);
+        assert!(tcp.as_tcp_mut().is_some());
+        assert!(tcp.as_listener_mut().is_none());
+        assert!(tcp.as_udp_mut().is_none());
+
+        let mut listen = NativeHandle::Listener(TcpListener::bind("127.0.0.1:0").expect("bind2"));
+        assert!(listen.as_listener_mut().is_some());
+        assert!(listen.as_tcp_mut().is_none());
+
+        let mut u = NativeHandle::Udp(udp);
+        assert!(u.as_udp_mut().is_some());
+        assert!(u.as_tcp_mut().is_none());
+
+        drop(client);
+        drop(tcp);
+    }
+
+    #[test]
+    fn wait_handle_stable_for_same_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let from_tcp = WaitHandle::from_tcp(&server);
+        let h = NativeHandle::Tcp(server);
+        let a = h.wait_handle();
+        let b = h.wait_handle();
+        assert_eq!(a, b);
+        assert_eq!(a, from_tcp);
+        drop(client);
+    }
+
+    #[test]
+    fn set_nonblocking_on_tcp_ok() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let h = NativeHandle::Tcp(server);
+        h.set_nonblocking(true).expect("nb");
+        h.set_nonblocking(false).expect("blocking");
+        drop(client);
+    }
+
+    #[test]
+    fn file_wait_handle_is_copy_eq() {
+        let path = temp_path("coil_native_handle_wait.bin");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"z").expect("write");
+        let h = NativeHandle::open_file(path.to_str().unwrap(), "r").expect("open");
+        let a = h.wait_handle();
+        let b = h.wait_handle();
+        assert_eq!(a, b);
+        let _ = std::fs::remove_file(&path);
+    }
+}

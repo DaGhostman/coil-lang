@@ -689,4 +689,55 @@ mod tests {
         assert_eq!(io.poll_once(Some(Duration::ZERO)), 0);
         assert_eq!(io.poll_once(None), 0);
     }
+
+    #[test]
+    fn wait_fd_writable_succeeds_for_connected_tcp() {
+        let (r, w) = tcp_pair();
+        let io = IoReactor::new();
+        io.wait_fd(
+            wait_of(&w),
+            Interest::Writable,
+            Some(Duration::from_millis(50)),
+        )
+        .expect("connected TCP write end should be writable");
+        drop(r);
+        drop(w);
+    }
+
+    #[test]
+    fn wait_fd_file_handle_reports_readable() {
+        // Regular files use WaitHandle::File on Windows (WaitForSingleObject) and
+        // a pollable fd on Unix — exercise NativeHandle::File → reactor, not only TCP.
+        let path = std::env::temp_dir().join("coil_io_reactor_file_wait.bin");
+        std::fs::write(&path, b"ready").expect("write");
+        let handle = crate::io_handle::NativeHandle::open_file(path.to_str().unwrap(), "r")
+            .expect("open file");
+        let io = IoReactor::new();
+        io.wait_fd(
+            handle.wait_handle(),
+            Interest::Readable,
+            Some(Duration::from_millis(100)),
+        )
+        .expect("open regular file should be readable");
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn poll_once_marks_file_waiter_ready() {
+        let path = std::env::temp_dir().join("coil_io_reactor_file_poll.bin");
+        std::fs::write(&path, b"x").expect("write");
+        let handle = crate::io_handle::NativeHandle::open_file(path.to_str().unwrap(), "r")
+            .expect("open file");
+        let io = IoReactor::new();
+        let tok = io.register_wait(handle.wait_handle(), Interest::Readable);
+        assert!(
+            io.poll_once(Some(Duration::from_millis(20))) >= 1,
+            "file waiter should become ready"
+        );
+        io.wait_token(tok, Some(Duration::from_millis(10)))
+            .expect("token already ready");
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
 }
