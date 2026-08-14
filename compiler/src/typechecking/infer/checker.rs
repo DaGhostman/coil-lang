@@ -13095,14 +13095,14 @@ impl Checker {
             let arg_tys = self.parse_arg_list(args);
             self.current_tuple_pack = None;
             let param_names: Vec<String> = arg_tys.iter().map(|(n, _)| n.clone()).collect();
-            self.fn_param_names.insert((*name).to_string(), param_names.clone());
             let fqn = format!("{}::{}", owner_key, name);
+            // FQN only — a bare `join` / `iter` key would shadow
+            // `use path::{join}` and other free-function imports.
             self.fn_param_names.insert(fqn.clone(), param_names);
             let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
                 if children.last().is_some_and(|c| {
                     matches!(c.1.as_ref(), Expression::Argument { is_rest: true, .. })
                 }));
-            self.fn_has_rest.insert((*name).to_string(), has_rest);
             self.fn_has_rest.insert(fqn.clone(), has_rest);
 
             let mut fun_ty = match returns {
@@ -13141,11 +13141,8 @@ impl Checker {
             }
             if !constraints.is_empty() {
                 let dict_n = constraints.len();
-                self.fn_dict_arity.insert((*name).to_string(), dict_n);
                 self.fn_dict_arity.insert(fqn.clone(), dict_n);
-                self.generic_fns.insert((*name).to_string());
                 self.generic_fns.insert(fqn.clone());
-                self.generics.generic_fns.insert((*name).to_string());
                 self.generics.generic_fns.insert(fqn);
             }
         }
