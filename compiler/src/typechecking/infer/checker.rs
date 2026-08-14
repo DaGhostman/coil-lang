@@ -75,6 +75,7 @@ impl Checker {
             codegen_var_types_scopes: Vec::new(),
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
+            forward_free_fn_schemes: HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
             fn_tuple_rest: std::collections::HashMap::new(),
             current_tuple_pack: None,
@@ -1431,6 +1432,7 @@ impl Checker {
         self.codegen_var_types_scopes.clear();
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
+        self.forward_free_fn_schemes.clear();
         self.fn_has_rest.clear();
         self.fn_tuple_rest.clear();
         self.current_tuple_pack = None;
@@ -1545,13 +1547,18 @@ impl Checker {
         if let Err(msgs) = self.pre_register_enums(ast) {
             self.messages.extend(msgs);
         }
-        self.pre_register_free_functions(ast);
+        self.pre_collect_free_function_param_names(ast);
         self.pre_register_inherent_methods(ast);
         self.pre_process_top_level_uses(ast);
         self.pre_pass_ffi_invoke_param_flow(ast);
 
         // Top frame for natives/globals; left on stack after check_program.
         self.push_scope();
+
+        // Forward-declare module-level function signatures so `impl`
+        // methods that appear earlier in the file can call them.
+        self.pre_register_free_functions(ast);
+
         let ty = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.infer(ast))) {
             Ok(ty) => ty,
             Err(payload) => {
@@ -4747,6 +4754,13 @@ impl Checker {
     }
 
     #[inline(never)]
+    fn lookup_fn_scheme(&self, ident: &str) -> Option<Scheme> {
+        self.env
+            .lookup(ident)
+            .cloned()
+            .or_else(|| self.forward_free_fn_schemes.get(ident).cloned())
+    }
+
     fn infer_call_expr(
         &mut self,
         name: &Output,
@@ -5493,7 +5507,7 @@ impl Checker {
         // Named call-site args: skip trait UFCS and resolve an ordinary
         // function (partial application is allowed — residual Fun is OK).
         if has_named {
-            let scheme = self.env.lookup(&ident).cloned();
+            let scheme = self.lookup_fn_scheme(&ident);
             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
                 Some(s) => {
                     let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -5571,7 +5585,7 @@ impl Checker {
         // Rest-parameter calls pack trailing args; skip UFCS trait
         // resolution so we don't double-infer (NodeId alignment).
         if self.fn_has_rest(&ident) {
-            let scheme = self.env.lookup(&ident).cloned();
+            let scheme = self.lookup_fn_scheme(&ident);
             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
                 Some(s) => {
                     let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -5703,7 +5717,7 @@ impl Checker {
             }
         }
 
-        let scheme = self.env.lookup(&ident).cloned();
+        let scheme = self.lookup_fn_scheme(&ident);
         let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
             Some(s) => {
                 let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -11729,6 +11743,7 @@ impl Checker {
                     .insert(name.to_string());
             }
         } else {
+            self.forward_free_fn_schemes.remove(name);
             self.env
                 .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
         }
@@ -12983,9 +12998,9 @@ impl Checker {
     //  Enums and pattern matching
     // ============================================================
 
-    /// Pre-pass: register top-level `fn` parameter names before main inference
-    /// so call-site `declare` metadata can flow into callee `invoke` params.
-    fn pre_register_free_functions(&mut self, ast: &Output) {
+    /// Pre-pass: collect top-level `fn` parameter names (syntactic) for FFI
+    /// call-site flow before main inference.
+    fn pre_collect_free_function_param_names(&mut self, ast: &Output) {
         let children = match ast.1.as_ref() {
             Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
             _ => return,
@@ -13468,6 +13483,143 @@ impl Checker {
             };
         }
         current
+    }
+
+    fn stub_free_function_signature(
+        &mut self,
+        name: &str,
+        type_params: &[parser::ast::TypeParam],
+        args: &Output,
+        returns: Option<&Output>,
+        where_constraints: &[parser::ast::WhereConstraint],
+        range: &Range<usize>,
+    ) {
+        let key = if self.current_module.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.current_module, name)
+        };
+        if self.env.lookup(&key).is_some()
+            || self.env.lookup(name).is_some()
+            || self.forward_free_fn_schemes.contains_key(&key)
+            || self.forward_free_fn_schemes.contains_key(name)
+        {
+            return;
+        }
+
+        let msg_len = self.messages.len();
+        let is_generic = !type_params.is_empty();
+        let mut param_vars: Vec<TyVarId> = Vec::new();
+        let mut param_kinds: Vec<Kind> = Vec::new();
+        let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
+        for tp in type_params {
+            let var = self.counter.fresh();
+            let kind = self.resolve_type_param_kind(tp);
+            self.set_var_kind(var, kind.clone());
+            param_frame.insert(tp.name.to_string(), var);
+            param_vars.push(var);
+            param_kinds.push(kind);
+        }
+        if is_generic {
+            self.type_params_in_scope.push(param_frame);
+        }
+
+        let mut param_constraints: Vec<Constraint> = Vec::new();
+        for (tp, var) in type_params.iter().zip(param_vars.iter()) {
+            for bound in &tp.bounds {
+                param_constraints.push(Constraint {
+                    class: bound.to_string(),
+                    args: vec![Ty::Var(*var)],
+                });
+            }
+        }
+        for wc in where_constraints {
+            let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+            param_constraints.push(Constraint {
+                class: wc.class.to_string(),
+                args,
+            });
+        }
+
+        let arg_tys: Vec<Ty> = if let Expression::Fragment(children) = args.1.as_ref() {
+            children
+                .iter()
+                .filter_map(|c| {
+                    if let Expression::Argument { ty: Some(ty), .. } = c.1.as_ref() {
+                        Some(self.parse_type_name(ty))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let param_names = Self::syntactic_param_names(args);
+        self.fn_param_names.insert(key.clone(), param_names.clone());
+        if key != name {
+            self.fn_param_names.insert(name.to_string(), param_names);
+        }
+
+        let ret_ty = match returns {
+            Some(r) => self.parse_return_type_name(r),
+            None => Ty::Var(self.counter.fresh()),
+        };
+        let mut fun_ty = ret_ty;
+        for arg_ty in arg_tys.iter().rev() {
+            fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+        }
+        fun_ty = Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false);
+
+        if is_generic {
+            self.type_params_in_scope.pop();
+            let scheme = Scheme::poly_with_kinds(
+                param_vars,
+                param_kinds,
+                param_constraints,
+                fun_ty,
+            );
+            self.forward_free_fn_schemes
+                .insert(name.to_string(), scheme.clone());
+            if key != name {
+                self.forward_free_fn_schemes.insert(key, scheme);
+            }
+        } else {
+            self.forward_free_fn_schemes
+                .insert(key, Scheme::mono(fun_ty));
+        }
+        self.messages.truncate(msg_len);
+        let _ = range;
+    }
+
+
+    /// Forward-declare module-level `fn` signatures after `push_scope` so
+    /// `impl` methods can call helpers defined later in the file.
+    fn pre_register_free_functions(&mut self, ast: &Output) {
+        let children = match ast.1.as_ref() {
+            Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
+            _ => return,
+        };
+        for child in children {
+            if let Expression::Function {
+                name,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                ..
+            } = child.1.as_ref()
+            {
+                self.stub_free_function_signature(
+                    name,
+                    type_params,
+                    args,
+                    returns.as_ref(),
+                    where_constraints,
+                    &child.0.into_range(),
+                );
+            }
+        }
     }
 
     /// Pre-pass: register enum shapes before main inference (forward refs).

@@ -4623,6 +4623,181 @@ impl Compiler {
         )
     }
 
+    /// True when a free `fn` body calls a method declared in a user `impl`
+    /// block in the same file (must emit after those `impl`s). Builtin
+    /// methods such as `Vec::push` do not count.
+    fn function_body_calls_user_impl_method(
+        body: &Output<'_>,
+        user_impl_methods: &std::collections::HashSet<String>,
+    ) -> bool {
+        if user_impl_methods.is_empty() {
+            return false;
+        }
+        fn walk(node: &Output<'_>, user_impl_methods: &std::collections::HashSet<String>) -> bool {
+            if let Expression::Call { name, args } = node.1.as_ref() {
+                if let Expression::Access(recv, method) = name.1.as_ref() {
+                    if user_impl_methods.contains(*method)
+                        && matches!(
+                            recv.1.as_ref(),
+                            Expression::Identifier(_) | Expression::Variable(_, _)
+                        )
+                    {
+                        return true;
+                    }
+                }
+                if walk(name, user_impl_methods) {
+                    return true;
+                }
+                if let Some(args) = args {
+                    return args.iter().any(|a| walk(a, user_impl_methods));
+                }
+            }
+            match node.1.as_ref() {
+                Expression::Block(children) | Expression::Fragment(children) => {
+                    children.iter().any(|c| walk(c, user_impl_methods))
+                }
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Return(inner)
+                | Expression::Raise(inner)
+                | Expression::Yield(inner) => walk(inner, user_impl_methods),
+                Expression::Match { scrutinee, arms } => {
+                    walk(scrutinee, user_impl_methods)
+                        || arms.iter().any(|arm| walk(&arm.body, user_impl_methods))
+                }
+                Expression::Access(recv, _) => walk(recv, user_impl_methods),
+                _ => false,
+            }
+        }
+        walk(body, user_impl_methods)
+    }
+
+    fn collect_user_impl_method_names(children: &[Output<'_>]) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+        let mut names = HashSet::new();
+        for child in children {
+            let methods = match child.1.as_ref() {
+                Expression::Implementation { methods, .. } => methods.as_slice(),
+                _ => continue,
+            };
+            for method in methods {
+                let inner = match method.1.as_ref() {
+                    Expression::Method(_, inner) => inner,
+                    _ => method,
+                };
+                if let Expression::Function { name, .. } = inner.1.as_ref() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    fn top_level_free_fn_positions(children: &[Output<'_>]) -> std::collections::HashMap<String, usize> {
+        use std::collections::HashMap;
+        let mut pos = HashMap::new();
+        for (idx, child) in children.iter().enumerate() {
+            if let Expression::Function { name, .. } = child.1.as_ref() {
+                pos.insert(name.to_string(), idx);
+            }
+        }
+        pos
+    }
+
+    /// True when an `impl` method calls a module-level `fn` defined later in
+    /// the same file (COI-109 codegen ordering).
+    fn impl_calls_later_free_fn(
+        children: &[Output<'_>],
+        free_fn_pos: &std::collections::HashMap<String, usize>,
+    ) -> bool {
+        fn body_calls_later_fn(
+            node: &Output<'_>,
+            impl_idx: usize,
+            free_fn_pos: &std::collections::HashMap<String, usize>,
+        ) -> bool {
+            if let Expression::Call { name, args } = node.1.as_ref() {
+                if let Expression::Identifier(callee) = name.1.as_ref() {
+                    if free_fn_pos
+                        .get(*callee)
+                        .is_some_and(|fn_idx| *fn_idx > impl_idx)
+                    {
+                        return true;
+                    }
+                }
+                if body_calls_later_fn(name, impl_idx, free_fn_pos) {
+                    return true;
+                }
+                if let Some(args) = args {
+                    return args
+                        .iter()
+                        .any(|a| body_calls_later_fn(a, impl_idx, free_fn_pos));
+                }
+            }
+            match node.1.as_ref() {
+                Expression::Block(children) | Expression::Fragment(children) => children
+                    .iter()
+                    .any(|c| body_calls_later_fn(c, impl_idx, free_fn_pos)),
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Return(inner)
+                | Expression::Raise(inner)
+                | Expression::Yield(inner) => {
+                    body_calls_later_fn(inner, impl_idx, free_fn_pos)
+                }
+                Expression::Match { scrutinee, arms } => {
+                    body_calls_later_fn(scrutinee, impl_idx, free_fn_pos)
+                        || arms.iter().any(|arm| {
+                            body_calls_later_fn(&arm.body, impl_idx, free_fn_pos)
+                        })
+                }
+                Expression::Access(recv, _) => body_calls_later_fn(recv, impl_idx, free_fn_pos),
+                _ => false,
+            }
+        }
+
+        for (impl_idx, child) in children.iter().enumerate() {
+            let methods = match child.1.as_ref() {
+                Expression::Implementation { what, methods, .. } if what.is_empty() => {
+                    methods.as_slice()
+                }
+                _ => continue,
+            };
+            for method in methods {
+                let body = match method.1.as_ref() {
+                    Expression::Method(_, inner) => match inner.1.as_ref() {
+                        Expression::Function { body, .. } => body.as_ref(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(body) = body
+                    && body_calls_later_fn(body, impl_idx, free_fn_pos)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn program_needs_phased_emit(children: &[Output<'_>]) -> bool {
+        let user_impl_methods = Self::collect_user_impl_method_names(children);
+        let free_fn_pos = Self::top_level_free_fn_positions(children);
+        children.iter().any(|c| {
+            if let Expression::Function { body, .. } = c.1.as_ref() {
+                body.as_ref().is_some_and(|b| {
+                    Self::function_body_calls_user_impl_method(b, &user_impl_methods)
+                })
+            } else {
+                false
+            }
+        }) || Self::impl_calls_later_free_fn(children, &free_fn_pos)
+    }
+
     /// True when `body` is just the sole pattern binding (e.g. `Ok(x) => x`).
     fn match_arm_body_is_identity_binding<'a>(
         pattern: &parser::ast::Pattern<'a>,
@@ -9566,9 +9741,40 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
-                children.iter().for_each(|child| {
-                    bytecode.append(&mut self.do_compile(child));
-                });
+                if Self::program_needs_phased_emit(children) {
+                    // Emit phases (COI-109): helpers before `impl`, but free fns
+                    // that call user `impl` methods must follow their `impl` blocks.
+                    let user_impl_methods = Self::collect_user_impl_method_names(children);
+                    let phase = |c: &Output| -> u8 {
+                        match c.1.as_ref() {
+                            Expression::Function { name, body, .. } if *name == "main" => 3,
+                            Expression::Function { body, .. } => {
+                                if body.as_ref().is_some_and(|b| {
+                                    Self::function_body_calls_user_impl_method(
+                                        b,
+                                        &user_impl_methods,
+                                    )
+                                }) {
+                                    25
+                                } else {
+                                    1
+                                }
+                            }
+                            Expression::Implementation { .. } => 2,
+                            Expression::TestCase { .. } => 3,
+                            _ => 0,
+                        }
+                    };
+                    for p in [0u8, 1, 2, 25, 3] {
+                        for child in children.iter().filter(|c| phase(c) == p) {
+                            bytecode.append(&mut self.do_compile(child));
+                        }
+                    }
+                } else {
+                    for child in children {
+                        bytecode.append(&mut self.do_compile(child));
+                    }
+                }
                 if !self.test_cases.is_empty() && !self.user_main_defined {
                     self.emit_virtual_test_main();
                 }

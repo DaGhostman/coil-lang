@@ -230,6 +230,10 @@ pub struct Checker {
     /// `Owner::method` for inherent methods). Used to reorder named
     /// call-site arguments (Phase P2).
     fn_param_names: std::collections::HashMap<String, Vec<String>>,
+    /// Forward-declared module `fn` schemes for calls from earlier `impl`
+    /// bodies (COI-109). Kept out of `env` so stubbing cannot perturb
+    /// unrelated programs' codegen.
+    forward_free_fn_schemes: std::collections::HashMap<String, Scheme>,
 
     /// Whether the last parameter of `fn_name` is a rest pack (`T... name`).
     /// When true, call sites pack trailing args into a single `Vec<T>` (P4).
