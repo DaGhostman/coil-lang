@@ -17,7 +17,9 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 - Language features: draft plans; full HM; update `docs/`; minimal runnable example.
 - **Method-based APIs** — prefer inherent/`impl` methods over free functions for type-tied operations (stdlib, new language surface, codegen fixes). Free generic fns returning enums are fragile today; see `docs/internals/limitations.md`.
 - Granular conventional commits; stage only related files.
-- Prefer compiler virtual modules over userland for core machinery.
+- Prefer compiler virtual modules over userland for core interpreter machinery; extracted features (regex, HTTP, collections) live in separate repos (`ardax-corp/coil-regex`, `coil-http`, `coil-stdlib`).
+- **Userland package tests** — demos, native builds, and integration tests for extracted packages stay in their repos, not coil-lang `compiler/tests` or CI.
+- **VM vs `.hy` tests** — prefer `.hy` language tests (`tests/positive/`, `coil test`) over Rust VM bytecode tests when coverage overlaps; remove duplicates.
 - `cargo build` builds `coil` + `coil-debug` / `coil-dissect` / `coil-fmt` / `coil-lsp` / `coil-embed` (`coil package` defaults to embed).
 - IL inspection: `coil dissect` — no verbose debug-build dumps.
 - `coil fmt`: preserve `//` and `///`; wrap long lines; trailing commas on multi-line lists.
@@ -25,7 +27,7 @@ coil: statically typed `.hy` → stack IL → `.hyc` archive → custom VM.
 ## Invariants (do not break)
 
 - **Append-only opcodes** (`common/src/opcode.rs`). New variants at end → bump archive **minor**, `promise!` in `machine/src/vm.rs`, `instruction_from_u8_covers_last_appended_variant`. ABI break → **major** (reset minor).
-- **Virtual-module natives** via `HostInvoke` — host wiring in `machine/`.
+- **Virtual-module natives** via `HostInvoke` — host wiring in `machine/`. Removing natives drops their slots entirely and bumps archive minor (no reserved panic stubs).
 - **Feature gates**: debugger `feature = "debugger"`; dissect `feature = "dissect"` on helper binaries, not default `coil`.
 - **Lint gate**: `cargo check --workspace` (not clippy — `Gc::payload_mut` deny).
 
