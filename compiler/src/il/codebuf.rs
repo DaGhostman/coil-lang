@@ -840,7 +840,7 @@ mod tests {
             .expect("CALL present");
         assert_eq!(
             call.call_parts(),
-            (0, start as u32),
+            (0, start),
             "CALL must target the reserved body PC"
         );
     }
