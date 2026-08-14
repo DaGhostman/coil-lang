@@ -150,6 +150,11 @@ jobs:
           repository: ardax-corp/coil-stdlib
           path: .deps/coil-stdlib
 
+      - uses: actions/checkout@v4
+        with:
+          repository: ardax-corp/coil-regex
+          path: coil-regex
+
       - name: Install system deps (Windows)
         uses: msys2/setup-msys2@v2
         with:
