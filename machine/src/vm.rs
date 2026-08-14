@@ -1503,7 +1503,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Register fd interest and yield so other coros / `wait_ready` can batch.
+    /// Register handle interest and yield so other coros / `wait_ready` can batch.
     ///
     /// Pushes `Ok(())` onto the coroutine stack before yielding so resume
     /// continues after `HostInvoke` as if the await completed. Callers must
@@ -1516,7 +1516,7 @@ impl<const S: usize> Machine<S> {
     ) {
         let token = self
             .io_reactor
-            .register_wait(req.fd, req.interest);
+            .register_wait(req.handle, req.interest);
         let coro_ptr = self
             .resume_stack
             .last()
@@ -1860,7 +1860,7 @@ impl<const S: usize> Machine<S> {
     fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
         self.frames.get_mut().set(pending.resume_sp);
         let req = pending.request;
-        let wait = crate::thread::host_io_wait(req.fd, req.interest, req.timeout);
+        let wait = crate::thread::host_io_wait(req.handle, req.interest, req.timeout);
         let v = crate::io::as_result_unit(&mut self.heap, wait);
         self.stack.push(v);
     }
@@ -2115,7 +2115,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::InitTyped as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlotConstJmpt as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2621,8 +2621,8 @@ impl<const S: usize> Machine<S> {
                     };
                     self.stack.push(result);
                 }
-                // Fused `<cmp|cond>; JMPF target`.
-                Instruction::CmpJmpf => {
+                // Fused `<cmp|cond>; JMPF/JMPT target`.
+                Instruction::CmpJmpf | Instruction::CmpJmpt => {
                     let (op, t) = opcode.cmp_jmpf_parts();
                     let target = if opcode.cmp_jmpf_is_pool() {
                         promise!(t < constants.len());
@@ -2653,12 +2653,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(lhs.as_int() ^ rhs.as_int()).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::CmpJmpt) {
                         ip = target;
                     }
                 }
-                // Fused `LOAD slot; CONST imm; <cond>; JMPF` without stack traffic.
-                Instruction::BinSlotImmJmpf => {
+                // Fused `LOAD slot; CONST imm; <cond>; JMPF/JMPT` without stack traffic.
+                Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
                     let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
                     promise!(pool_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
@@ -2685,11 +2685,11 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(lhs.as_int() ^ imm).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotImmJmpt) {
                         ip = target;
                     }
                 }
-                Instruction::LogNotJmpf => {
+                Instruction::LogNotJmpf | Instruction::LogNotJmpt => {
                     let t = opcode.log_not_jmpf_target();
                     let target = if opcode.log_not_jmpf_is_pool() {
                         promise!(t < constants.len());
@@ -2698,12 +2698,12 @@ impl<const S: usize> Machine<S> {
                         t
                     };
                     let val = self.stack.pop();
-                    if val.as_int() != 0 {
+                    if (val.as_int() == 0) == matches!(*bc, Instruction::LogNotJmpt) {
                         ip = target;
                     }
                 }
-                // Fused `BinSlotSlot; JMPF` — pool packs (target<<32)|b.
-                Instruction::BinSlotSlotJmpf => {
+                // Fused `BinSlotSlot; JMPF/JMPT` — pool packs (target<<32)|b.
+                Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
                     let (op, a, pool_idx) = opcode.bin_slot_slot_jmpf_parts();
                     promise!(pool_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
@@ -2731,7 +2731,7 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(va.as_int() ^ vb.as_int()).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotSlotJmpt) {
                         ip = target;
                     }
                 }
@@ -3281,8 +3281,8 @@ impl<const S: usize> Machine<S> {
                         self.stack.seek(sp + dest + 1);
                     }
                 }
-                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf` — no stack traffic.
-                Instruction::BinSlotSlotConstJmpf => {
+                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf/CmpJmpt` — no stack traffic.
+                Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
                     let (bin_op, a, desc_idx) = opcode.bin_slot_slot_const_jmpf_parts();
                     promise!(desc_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(desc_idx) };
@@ -3310,7 +3310,7 @@ impl<const S: usize> Machine<S> {
                         Instruction::GEQF => mag >= rhs,
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotSlotConstJmpt) {
                         ip = target;
                     }
                 }

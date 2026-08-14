@@ -1743,21 +1743,35 @@ sum = sum + i; \
 }",
         );
 
-        let jmp_targets: Vec<u32> = bc
+        let back_edges: Vec<u32> = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JMP))
             .map(|b| b.operand_u32())
+            .filter(|t| *t != u32::MAX)
             .collect();
+        let jmpt = bc
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPT
+                        | Instruction::CmpJmpt
+                        | Instruction::BinSlotImmJmpt
+                        | Instruction::BinSlotSlotJmpt
+                        | Instruction::BinSlotSlotConstJmpt
+                        | Instruction::LogNotJmpt
+                )
+            })
+            .count();
 
         assert!(
-            jmp_targets.len() >= 3,
-            "expected continue, break, and back-edge JMPs; got {:?}",
-            jmp_targets
+            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
+            "loop back-edge JMP should be patched: {:?}",
+            back_edges
         );
         assert!(
-            jmp_targets.iter().all(|target| *target != 0),
-            "loop jump placeholders should be patched: {:?}",
-            jmp_targets
+            jmpt >= 2,
+            "continue/break should invert to *Jmpt; got {jmpt}"
         );
     }
 

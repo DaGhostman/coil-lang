@@ -36,18 +36,18 @@ Tracked in Linear project Known limitations (milestone **IL / codegen model**). 
 | Cursor split (`sp` vs `tell`) — **decided: keep** (operand height ≠ STORE floor) | [COI-81](https://linear.app/ardax/issue/COI-81) |
 | Copy-prop / GVN beyond straight-line — **decided: keep ceiling** (intra-block GVN + join-sink; copy-prop straight-line; no SSA rename / Dup-CSE) | [COI-82](https://linear.app/ardax/issue/COI-82) |
 | Slot promotion across loop back-edges — **decided: keep Unknown headers** ([COI-97](https://linear.app/ardax/issue/COI-97) measured: innermost mandelbrot has no self-stores; outer Seek splits FloatChain) | [COI-83](https://linear.app/ardax/issue/COI-83) |
-| Named-local class scalar replacement | [COI-84](https://linear.app/ardax/issue/COI-84) |
-| Bounds analysis vs `IndexUnchecked` | [COI-85](https://linear.app/ardax/issue/COI-85) |
-| Caller-side predicate peel vs self-recursion | [COI-86](https://linear.app/ardax/issue/COI-86) |
-| `*Jmpt` / fused invert | [COI-87](https://linear.app/ardax/issue/COI-87) |
-| `multi_op_join_convoy` JMPF mis-sink | [COI-91](https://linear.app/ardax/issue/COI-91) |
+| Named-local class scalar replacement — **decided: named locals stay heap-backed** (temps elide; `fn drop()` always boxes) | [COI-84](https://linear.app/ardax/issue/COI-84) |
+| Bounds analysis vs `IndexUnchecked` — **decided: Index stays checked** (length hoists only; no unchecked opcode) | [COI-85](https://linear.app/ardax/issue/COI-85) |
+| Caller-side predicate peel vs self-recursion — **decided: keep refusals** (self-recursive peel loses to the frame) | [COI-86](https://linear.app/ardax/issue/COI-86) |
+| `*Jmpt` / fused invert — **implemented** (`*Jmpt` twins; invert fused `*Jmpf; JMP`) | [COI-87](https://linear.app/ardax/issue/COI-87) |
+| `multi_op_join_convoy` JMPF mis-sink — **decided: whole-buffer only** | [COI-91](https://linear.app/ardax/issue/COI-91) |
 | Loop `LEQ` headers / float identity refusals — **decided: keep numeric contract** (`i < bound` only; no `x - 0.0` / `x * 0.0`) | [COI-93](https://linear.app/ardax/issue/COI-93) |
-| Enum escape elimination vs heap | [COI-94](https://linear.app/ardax/issue/COI-94) |
+| Enum escape elimination vs heap — **decided: unary/discarded-only** (not a second enum ABI) | [COI-94](https://linear.app/ardax/issue/COI-94) |
 | GC drop storing `self` / resurrection — **decided: allow-once** (see Userland footguns) | [COI-79](https://linear.app/ardax/issue/COI-79) |
 | Option/Result niche vs boxed ABI — **decided: keep matrix** ([types.md](../references/types.md#option--result-runtime-abi)) | [COI-92](https://linear.app/ardax/issue/COI-92) |
 | Enums / generics / derive Drop (existing) | [COI-26](https://linear.app/ardax/issue/COI-26) |
 
-GVN has no SSA slot rename; effectful ops are barriers. Its Dup-CSE is re-expanded to a second `LOAD` before lower (`expand_dup_after_load`) because `Dup` hides a binop's operands from fuse-select — keep that in mind before adding new Dup rewrites. Phase 4 confirmed this feed stays intact after slot promotion (mandelbrot self-`MULF` → `BinSlotSlot*`). Per-function `multi_op_join_convoy` can mis-sink on JMPF diamonds — whole-buffer pass required. Fuse-select intentionally conservative during JMP migration.
+GVN has no SSA slot rename; effectful ops are barriers. Its Dup-CSE is re-expanded to a second `LOAD` before lower (`expand_dup_after_load`) because `Dup` hides a binop's operands from fuse-select — keep that in mind before adding new Dup rewrites. Phase 4 confirmed this feed stays intact after slot promotion (mandelbrot self-`MULF` → `BinSlotSlot*`). Per-function `multi_op_join_convoy` can mis-sink on JMPF diamonds — whole-buffer pass required (COI-91). Fuse-select emits `*Jmpt` twins after fused invert (COI-87).
 
 **Operand-order canon.** `il::canon` rewrites Known-SP `Const; Load; op` and high-then-low `Load; Load; op` windows into preferred forms before algebraic/fuse. Int `ConstPool; Load; int-op` demotes the pool entry to inline `Const` when the value is a non-negative `i32` without `POOL_FLAG` bit 31 (float pool operands and non-commutative ops refused). Ordered cmps flip polarity on swap (`LE`↔`GT`, `LEQ`↔`GEQ`). No float reassociation. Loop bounds' `i < bound` header match accepts `Load i; Load b; LE` and the post-canon `Load b; Load i; GT` (and matching `BinSlotSlot` forms); **`LEQ`/`GEQ` headers are not treated as length proofs** (`i <= len` would allow an OOB index). See `CanonStats` / `last_canon_stats()`.
 
@@ -73,7 +73,7 @@ This is not general CFG copy propagation: joins, loops, unknown cursor states, c
 
 **Algebraic float identities / const-fold.** Known-SP algebraic peeps fold `x + 0.0` / `0.0 + x` → `x` and `x * 1.0` / `1.0 * x` → `x` only when the constant is a **known exact finite** const-pool literal with the `+0.0` or `+1.0` bit pattern. Missing/unknown pool entries, non-const operands, NaN, and −0.0 are refused for those identities. `x - 0.0` → `x` and `x * 0.0` → `0.0` are intentionally not rewritten (signed zero / NaN). Adjacent `ConstPool; ConstPool; ADDF|SUBF|MULF|DIVF|MODF` fold to a single `ConstPool` of the IEEE result (bits pushed onto the module pool, matching VM `as_float` ops); `DIVF`/`MODF` by ±0.0 are refused. Float compares (`LEF`/`LEQF`/`GTF`/`GEQF`) fold to an inline `Const` 0/1. No reassociation across non-const producers.
 
-**Class temporary scalar replacement.** Direct `new Class(args).field` expressions now evaluate constructor arguments in order and return the selected argument without allocating an intermediate instance, **except** when the class declares `fn drop()` (the instance must exist so the finalizer can run). Named local instances remain heap-backed until a broader escape/alias analysis can prove that methods, calls, mutation, and object identity are unobservable.
+**Class temporary scalar replacement (COI-84, decided: named locals stay boxed).** Direct `new Class(args).field` expressions evaluate constructor arguments in order and return the selected argument without allocating an intermediate instance, **except** when the class declares `fn drop()` (the instance must exist so the finalizer can run). Named local instances (`let p = new Class(args); p.field`) remain heap-backed: methods, calls, field writes, object identity, and `fn drop()` are observable without a whole-function escape/alias scan, which is a non-goal. Pinning tests: `direct_class_field_access_avoids_temporary_object`, `named_local_class_stays_heap_allocated`, `drop_class_temp_field_access_still_allocates`.
 
 **GC finalizers (v1).** Inherent `impl Foo { fn drop() { … } }` runs at mark-sweep time (and VM teardown), not at last use. Order is unspecified. **Resurrection (COI-79, decided allow-once):** storing `self` during drop can keep the cell alive after the sweep; drop still runs at most once. That is defined, not a pin API (`gc::root` / `Weak`). Enums and generic derive-Drop stay out of scope (Linear COI-26).
 
@@ -105,7 +105,7 @@ The safety argument is the cursor, not liveness: the preheader `STORE t` floors 
 
 | Refused | Why |
 |---------|-----|
-| Any call, host native, `GetField`/`SetField`, or unmodelled op in the body | The callee could hold another reference to the array and `push`/`pop` it. This is the single biggest coverage gap: most stdlib `while i < len(b)` loops call a helper on `b[i]` |
+| Any call, host native, `GetField`/`SetField`, or unmodelled op in the body | The callee could hold another reference to the array and `push`/`pop` it. This is the single biggest coverage gap: most stdlib `while i < len(b)` loops call a helper on `b[i]`. Follow-up: [COI-99](https://linear.app/ardax/issue/COI-99) (pure helpers only; still no `IndexUnchecked`) |
 | `ArrayPush` / `MakeArray` / `MakeDict` / `CodePtr` / `MakePolyFn` in the body | Length can change (`tests/positive/while_len_grow.hy`) or user code can run |
 | A rebound `Vec` local (`slots_stored_in_loop`) | A different array each pass, so its length is not invariant |
 | An `Index` / `StoreIndex` whose target is not a plain slot load | Nested `a[i][j]`, a `Dup`, a call result: the walk-back cannot name the array, so the whole loop is refused |
@@ -128,7 +128,7 @@ That byte budget is the whole profitability margin, and it is what rules out pee
 | Instance methods, rest params, coroutines, un-monomorphized generics | The peel replicates the callee ABI, and `CallIndirect` receivers are not covered |
 | A call site that is not saturated | Partial application lowers to `MakeFn`, not `CALL` |
 
-**`*Jmpf` has no `*Jmpt` counterpart.** `CmpJmpf` / `BinSlotImmJmpf` / `BinSlotSlotJmpf` / `BinSlotSlotConstJmpf` / `LogNotJmpf` exist but there are no jump-if-true forms, so `opt::cfg::invert_branch_over_jump` refuses to invert a guard whose condition would fuse — inverting would trade one fused dispatch for two. Only non-fusable guards (bool locals, call/field results) collapse to `JMPT`. **Near-miss (Phase 4):** fused `*Jmpf; JMP` (mandelbrot escape break) is tallied as `would_be_jmpt_after_invert` in `perf_metrics`. Scored go/no-go for this and other residual families: [optimization-roadmap.md — Opcode candidate ledger](optimization-roadmap.md#opcode-candidate-ledger-register-win-harvest-phase-5) (Phase 5; no opcodes implemented from the ledger yet).
+**`*Jmpt` twins of `*Jmpf` (COI-87, implemented).** `CmpJmpt` / `BinSlotImmJmpt` / `BinSlotSlotJmpt` / `BinSlotSlotConstJmpt` / `LogNotJmpt` share packing with the false forms. `opt::cfg::invert_branch_over_jump` inverts `JMPF A; JMP B; A:` to `JMPT B` even when the condition fuses; fuse-select then emits the `*Jmpt` twin. Loop headers stay `*Jmpf`. Archive minor 10.
 
 ## Test / CI reliability (high–medium)
 
@@ -143,6 +143,6 @@ That byte budget is the whole profitability margin, and it is what rules out pee
 
 ## Tracking
 
-Open items are Linear issues in the [Known limitations](https://linear.app/ardax/project/known-limitations-29053df372c3) project; investigation issues write the expected model first. Already tracked elsewhere: [COI-26](https://linear.app/ardax/issue/COI-26), [COI-70](https://linear.app/ardax/issue/COI-70), [COI-71](https://linear.app/ardax/issue/COI-71), [COI-35](https://linear.app/ardax/issue/COI-35).
+Open items are Linear issues in the [Known limitations](https://linear.app/ardax/project/known-limitations-29053df372c3) project; investigation issues write the expected model first. Already tracked elsewhere: [COI-26](https://linear.app/ardax/issue/COI-26), [COI-70](https://linear.app/ardax/issue/COI-70), [COI-71](https://linear.app/ardax/issue/COI-71), [COI-35](https://linear.app/ardax/issue/COI-35). Remaining follow-up from the investigation batch: [COI-99](https://linear.app/ardax/issue/COI-99) (length invariance across pure helper calls).
 
 Most items have no inline `TODO`/`FIXME` — knowledge lives here and in [.cursor/skills/coil-contributor/reference.md](../../.cursor/skills/coil-contributor/reference.md). Update this file when closing a limitation.
