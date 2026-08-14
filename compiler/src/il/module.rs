@@ -495,6 +495,13 @@ mod tests {
             }),
             "Seek must sit on the latch after GVN"
         );
+        let seek_to = flat.iter().find_map(|op| match op {
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::Seek => {
+                Some(byte.operand_u32())
+            }
+            _ => None,
+        });
+        assert_eq!(seek_to, Some(2), "Seek must re-anchor to the forward-edge tell");
         let stores = flat
             .iter()
             .filter(|op| matches!(op, IlOp::StorePop { .. }))
