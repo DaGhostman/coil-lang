@@ -8903,7 +8903,7 @@ fn extern_in_imported_module_runs() {
     assert_eq!(output, "0\n");
 }
 
-/// COI-106: binding a unary Result call before match must preserve Ok heap payloads.
+/// COI-106: binding a unary Result/Option call before match must preserve heap payloads.
 #[test]
 fn result_bind_then_match_preserves_ok_payload() {
     let bind_fn = run_harness_src(
@@ -8912,7 +8912,11 @@ enum Node { Obj { v: int } }
 fn make_ok() -> Result<Node, string> { return Node::Obj { v: 42 }; }
 test("bind free fn") {
     let r = make_ok();
-    assert(match r { Result::Ok(_) => true, Result::Err(_) => false })?;
+    let v = match r {
+        Result::Ok(Node::Obj { v }) => v,
+        Result::Err(_) => -1,
+    };
+    assert(v == 42)?;
 }
 "#,
     );
@@ -8926,15 +8930,48 @@ impl Svc {
     fn decode() -> Result<Node, string> {
         return Node::Obj { v: 42 };
     }
+    fn fail() -> Result<Node, string> {
+        return "boom";
+    }
+    fn maybe(int flag) -> Option<Node> {
+        if flag == 0 {
+            return Option::None;
+        }
+        return Node::Obj { v: flag };
+    }
 }
-test("bind method result") {
+test("bind method result Ok payload") {
     let s = new Svc();
     let r = s.decode();
-    let ok = match r {
-        Result::Ok(_) => true,
-        Result::Err(_) => false,
+    let v = match r {
+        Result::Ok(Node::Obj { v }) => v,
+        Result::Err(_) => -1,
     };
-    assert(ok)?;
+    assert(v == 42)?;
+}
+test("bind method result Err") {
+    let s = new Svc();
+    let r = s.fail();
+    let msg = match r {
+        Result::Ok(_) => "ok",
+        Result::Err(e) => e,
+    };
+    assert(msg == "boom")?;
+}
+test("bind method option Some/None") {
+    let s = new Svc();
+    let some = s.maybe(7);
+    let none = s.maybe(0);
+    let v = match some {
+        Option::Some(Node::Obj { v }) => v,
+        Option::None => -1,
+    };
+    let is_none = match none {
+        Option::Some(_) => false,
+        Option::None => true,
+    };
+    assert(v == 7)?;
+    assert(is_none)?;
 }
 "#,
     );
