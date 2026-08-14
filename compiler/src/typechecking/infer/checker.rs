@@ -12897,7 +12897,7 @@ impl Checker {
         args: &Output,
         returns: Option<&Output>,
         where_constraints: &[parser::ast::WhereConstraint],
-        range: &Range<usize>,
+        _range: &Range<usize>,
     ) {
         let key = if self.current_module.is_empty() {
             name.to_string()
@@ -12908,15 +12908,43 @@ impl Checker {
             return;
         }
 
-        let pushed = self.push_type_params_for_type_parsing(type_params);
-        let prev_constraints_len = self.active_constraints.len();
+        // Mirror `infer_function`'s binder setup so forward calls from
+        // earlier `impl` bodies see a real poly scheme + constraints.
+        let is_generic = !type_params.is_empty();
+        let mut param_vars: Vec<TyVarId> = Vec::new();
+        let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
+        let mut param_kinds: Vec<Kind> = Vec::new();
+        for tp in type_params {
+            let var = self.counter.fresh();
+            let kind = self.resolve_type_param_kind(tp);
+            self.set_var_kind(var, kind.clone());
+            param_frame.insert(tp.name.to_string(), var);
+            param_vars.push(var);
+            param_kinds.push(kind);
+        }
+        self.type_params_in_scope.push(param_frame);
+
+        let mut param_constraints: Vec<Constraint> = Vec::new();
+        for (tp, var) in type_params.iter().zip(param_vars.iter()) {
+            // Do not call `constraint_from_bound` here — user traits in the
+            // same file are registered during main inference, after this stub.
+            for bound in &tp.bounds {
+                param_constraints.push(Constraint {
+                    class: bound.to_string(),
+                    args: vec![Ty::Var(*var)],
+                });
+            }
+        }
         for wc in where_constraints {
             let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
-            self.active_constraints.push(Constraint {
+            param_constraints.push(Constraint {
                 class: wc.class.to_string(),
                 args,
             });
         }
+        let prev_constraints_len = self.active_constraints.len();
+        self.active_constraints
+            .extend(param_constraints.iter().cloned());
 
         self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
         let arg_tys = self.parse_arg_list(args);
@@ -12925,6 +12953,12 @@ impl Checker {
             key.clone(),
             arg_tys.iter().map(|(n, _)| n.clone()).collect(),
         );
+        if key != name {
+            self.fn_param_names.insert(
+                name.to_string(),
+                arg_tys.iter().map(|(n, _)| n.clone()).collect(),
+            );
+        }
 
         let ret_ty = match returns {
             Some(r) => self.parse_return_type_name(r),
@@ -12935,11 +12969,30 @@ impl Checker {
             fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
         }
         fun_ty = Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false);
-        self.env.insert_top(key, Scheme::mono(fun_ty));
 
         self.active_constraints.truncate(prev_constraints_len);
-        self.pop_type_params_for_type_parsing(pushed);
-        let _ = range;
+        self.type_params_in_scope.pop();
+
+        if is_generic {
+            let scheme =
+                Scheme::poly_with_kinds(param_vars, param_kinds, param_constraints.clone(), fun_ty);
+            self.generic_fns.insert(name.to_string());
+            self.generics.generic_fns.insert(name.to_string());
+            self.fn_dict_arity
+                .insert(name.to_string(), param_constraints.len());
+            if key != name {
+                self.generic_fns.insert(key.clone());
+                self.generics.generic_fns.insert(key.clone());
+                self.fn_dict_arity
+                    .insert(key.clone(), param_constraints.len());
+            }
+            self.env.insert_top(name.to_string(), scheme.clone());
+            if key != name {
+                self.env.insert_top(key, scheme);
+            }
+        } else {
+            self.env.insert_top(key, Scheme::mono(fun_ty));
+        }
     }
 
     /// Pre-pass: register enum shapes before main inference (forward refs).
