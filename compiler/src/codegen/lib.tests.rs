@@ -1749,6 +1749,88 @@ sum = sum + i; \
             .map(|b| b.operand_u32())
             .filter(|t| *t != u32::MAX)
             .collect();
+        let imm_jmpt = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpt))
+            .count();
+        let imm_jmpf = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf))
+            .count();
+
+        assert!(
+            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
+            "loop back-edge JMP should be patched: {:?}",
+            back_edges
+        );
+        assert!(
+            imm_jmpt >= 2,
+            "continue/break `i == k` should invert+fuse to BinSlotImmJmpt; got {imm_jmpt}"
+        );
+        assert!(
+            imm_jmpf >= 1,
+            "loop header `i < 10` must stay BinSlotImmJmpf; got {imm_jmpf}"
+        );
+    }
+
+    /// `if !flag { break }` inverts fused LogNot;JMPF into LogNotJmpt (COI-87).
+    #[test]
+    fn not_flag_break_emits_log_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let flag = false; \
+let i = 0; \
+while (i < 5) { \
+if !flag { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::LogNotJmpt)),
+            "expected LogNotJmpt for inverted `if !flag {{ break }}`"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "while header should remain *Jmpf"
+        );
+    }
+
+    /// Two-local compare break fuses to BinSlotSlotJmpt after invert (COI-87).
+    #[test]
+    fn two_local_compare_break_emits_bin_slot_slot_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let a = 1; \
+let b = 2; \
+let i = 0; \
+while (i < 5) { \
+if a < b { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpt)),
+            "expected BinSlotSlotJmpt for inverted `if a < b {{ break }}`"
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpf)),
+            "break guard should not remain BinSlotSlotJmpf after invert"
+        );
+    }
+
+    /// Plain while headers must not invert to *Jmpt (COI-87 latch stays *Jmpf).
+    #[test]
+    fn while_header_stays_fused_jmpf_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src("fn main() { let i = 0; while (i < 3) { i = i + 1; } }");
         let jmpt = bc
             .iter()
             .filter(|b| {
@@ -1763,15 +1845,11 @@ sum = sum + i; \
                 )
             })
             .count();
-
+        assert_eq!(jmpt, 0, "header-only while must not emit *Jmpt");
         assert!(
-            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
-            "loop back-edge JMP should be patched: {:?}",
-            back_edges
-        );
-        assert!(
-            jmpt >= 2,
-            "continue/break should invert to *Jmpt; got {jmpt}"
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "header should stay BinSlotImmJmpf"
         );
     }
 

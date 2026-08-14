@@ -3850,6 +3850,54 @@
         assert_eq!(vm.pop().as_int(), 0);
     }
 
+    /// BinSlotSlotJmpt: jump when the two-local compare is true (inverted break).
+    #[test]
+    fn bin_slot_slot_jmpt_jumps_when_compare_true() {
+        let le = Instruction::LE as u8;
+        let packed = (8u64 << 32) | 1u64;
+        // a=3, b=5 → 3<5 true → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(3),
+                const_int(5),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpt).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // a=5, b=3 → 5<3 false → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(5),
+                const_int(3),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpt).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
     /// BinSlotImmStore: compute slot⊕imm and write dest without stack traffic.
     #[test]
     fn bin_slot_imm_store_writes_dest() {
@@ -3931,6 +3979,34 @@
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// LogNotJmpt jumps when the popped value is falsy (fused `!x; JMPT`).
+    #[test]
+    fn log_not_jmpt_jumps_when_falsy_falls_through_when_truthy() {
+        // 0 → LogNot true → Jmpt jumps → push 0
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(0),
+            Byte::new(Instruction::LogNotJmpt).with_log_not_jmpf(4),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // nonzero → LogNot false → fall through → push 1
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::LogNotJmpt).with_log_not_jmpf(4),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
     }
 
     /// BinSlotImm covers bitwise and logical ops.

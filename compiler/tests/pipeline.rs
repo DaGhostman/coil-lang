@@ -4213,6 +4213,61 @@ fn main() {
     assert_eq!(output, "18");
 }
 
+/// `if !done { break }` must take LogNotJmpt polarity (COI-87).
+#[test]
+fn not_flag_break_log_not_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let done = false;
+    let n = 0;
+    while (n < 10) {
+        if !done { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::LogNotJmpt)),
+        "expected LogNotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
+}
+
+/// Two-local `if a < b { break }` fuses to BinSlotSlotJmpt and takes the break.
+#[test]
+fn two_local_compare_break_bin_slot_slot_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = 1;
+    let b = 2;
+    let n = 0;
+    while (n < 10) {
+        if a < b { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpt)),
+        "expected BinSlotSlotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
+}
+
 /// Tiny direct-call inlining must preserve call semantics end-to-end.
 #[test]
 fn tiny_add_inlined_prints_7() {
