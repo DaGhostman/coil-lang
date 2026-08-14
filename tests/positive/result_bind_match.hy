@@ -37,7 +37,9 @@ test("method result bind preserves nested Ok payload") {
     let s = new Svc();
     let r = s.decode();
     let v = match r {
-        Result::Ok(Node::Obj { v }) => v,
+        Result::Ok(n) => match n {
+            Node::Obj { v } => v,
+        },
         Result::Err(_) => -1,
     };
     assert(v == 42)?;
@@ -57,7 +59,9 @@ test("method option Some bind then match") {
     let s = new Svc();
     let o = s.maybe(7);
     let v = match o {
-        Option::Some(Node::Obj { v }) => v,
+        Option::Some(n) => match n {
+            Node::Obj { v } => v,
+        },
         Option::None => -1,
     };
     assert(v == 7)?;

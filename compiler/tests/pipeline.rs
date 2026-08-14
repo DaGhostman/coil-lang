@@ -8913,7 +8913,9 @@ fn make_ok() -> Result<Node, string> { return Node::Obj { v: 42 }; }
 test("bind free fn") {
     let r = make_ok();
     let v = match r {
-        Result::Ok(Node::Obj { v }) => v,
+        Result::Ok(n) => match n {
+            Node::Obj { v } => v,
+        },
         Result::Err(_) => -1,
     };
     assert(v == 42)?;
@@ -8944,7 +8946,9 @@ test("bind method result Ok payload") {
     let s = new Svc();
     let r = s.decode();
     let v = match r {
-        Result::Ok(Node::Obj { v }) => v,
+        Result::Ok(n) => match n {
+            Node::Obj { v } => v,
+        },
         Result::Err(_) => -1,
     };
     assert(v == 42)?;
@@ -8963,7 +8967,9 @@ test("bind method option Some/None") {
     let some = s.maybe(7);
     let none = s.maybe(0);
     let v = match some {
-        Option::Some(Node::Obj { v }) => v,
+        Option::Some(n) => match n {
+            Node::Obj { v } => v,
+        },
         Option::None => -1,
     };
     let is_none = match none {
