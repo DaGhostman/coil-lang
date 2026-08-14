@@ -148,6 +148,11 @@ pub fn try_run_embedded() -> Option<bool> {
     Some(panicked)
 }
 
+/// Path of `name` beside `exe`, including the host suffix (`.exe` on Windows).
+pub fn sibling_bin(exe: &Path, name: &str) -> PathBuf {
+    exe.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
 /// Resolve `coil-{name}` beside the current executable and re-exec with remaining args.
 ///
 /// Argv for the helper is `env::args().skip(2)` (drops program name + subcommand).
@@ -160,7 +165,7 @@ pub fn dispatch_helper(sub: &str) -> ! {
         }
     };
     let helper_name = format!("coil-{sub}");
-    let helper = exe.with_file_name(&helper_name);
+    let helper = sibling_bin(&exe, &helper_name);
     if !helper.is_file() {
         eprintln!(
             "`coil {sub}` requires `{helper_name}` next to this binary\n\
@@ -184,7 +189,7 @@ pub fn dispatch_helper(sub: &str) -> ! {
 pub fn resolve_default_runner() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))?;
-    let embed = exe.with_file_name("coil-embed");
+    let embed = sibling_bin(&exe, "coil-embed");
     if embed.is_file() {
         return Ok(embed);
     }
@@ -202,5 +207,21 @@ pub fn writer_for_format(pretty_on_stderr: bool) -> Box<dyn Write + Send> {
         Box::new(std::io::stderr())
     } else {
         Box::new(std::io::stdout())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_bin_uses_host_exe_suffix() {
+        let exe = Path::new("/opt/coil").join(format!("coil{}", std::env::consts::EXE_SUFFIX));
+        let helper = sibling_bin(&exe, "coil-debug");
+        let expected = format!("coil-debug{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            helper.file_name().and_then(|n| n.to_str()),
+            Some(expected.as_str())
+        );
     }
 }
