@@ -9531,30 +9531,25 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
-                // Emit order (COI-109): declare typeclass/class bodies and
-                // trait impls first, then free `fn`s, then inherent `impl` /
-                // `test` so methods can call helpers defined later in the
-                // file. Function bodies are only entered via CALL.
-                let is_free_fn = |c: &Output| {
-                    matches!(c.1.as_ref(), Expression::Function { .. })
+                // Emit phases (COI-109):
+                // 0 = decls / trait impls, 1 = free fns (not main),
+                // 2 = inherent `impl`, 3 = `main` + `test`.
+                // Free helpers must precede inherent methods; methods must
+                // precede `main`/`test` call sites. Function bodies are only
+                // entered via CALL.
+                let phase = |c: &Output| -> u8 {
+                    match c.1.as_ref() {
+                        Expression::Function { name, .. } if *name == "main" => 3,
+                        Expression::Function { .. } => 1,
+                        Expression::Implementation { .. } => 2,
+                        Expression::TestCase { .. } => 3,
+                        _ => 0,
+                    }
                 };
-                let is_late = |c: &Output| {
-                    matches!(
-                        c.1.as_ref(),
-                        Expression::Implementation { .. } | Expression::TestCase { .. }
-                    )
-                };
-                for child in children
-                    .iter()
-                    .filter(|c| !is_free_fn(c) && !is_late(c))
-                {
-                    bytecode.append(&mut self.do_compile(child));
-                }
-                for child in children.iter().filter(|c| is_free_fn(c)) {
-                    bytecode.append(&mut self.do_compile(child));
-                }
-                for child in children.iter().filter(|c| is_late(c)) {
-                    bytecode.append(&mut self.do_compile(child));
+                for p in 0..=3u8 {
+                    for child in children.iter().filter(|c| phase(c) == p) {
+                        bytecode.append(&mut self.do_compile(child));
+                    }
                 }
                 if !self.test_cases.is_empty() && !self.user_main_defined {
                     self.emit_virtual_test_main();
