@@ -836,6 +836,8 @@ impl Checker {
             }
             #[cfg(feature = "tls")]
             IoBuiltin::TlsServerDisable => fun(&[stream], res_stream),
+            #[cfg(feature = "tls")]
+            IoBuiltin::TlsAlpnProtocol => fun(&[stream], res_string),
             IoBuiltin::UdpBind | IoBuiltin::UdpConnect => fun(&[string(), int()], res_stream),
             IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
             IoBuiltin::UdpRecvFrom => {

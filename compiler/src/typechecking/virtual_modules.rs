@@ -36,7 +36,7 @@ pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
 /// UDP helpers under `io::net::udp` (`bind`, `send_to`, …).
 pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
 
-/// Parent TLS namespace (`io::net::tls`); children hold the APIs.
+/// Parent TLS namespace (`io::net::tls`); `alpn_protocol` lives here.
 #[cfg(feature = "tls")]
 pub const IO_NET_TLS_MODULE: &str = "io::net::tls";
 
@@ -240,6 +240,9 @@ pub enum IoBuiltin {
     /// Server TLS teardown (`io::net::tls::server::disable`).
     #[cfg(feature = "tls")]
     TlsServerDisable,
+    /// Negotiated ALPN protocol (`io::net::tls::alpn_protocol`).
+    #[cfg(feature = "tls")]
+    TlsAlpnProtocol,
 }
 
 impl IoBuiltin {
@@ -277,6 +280,8 @@ impl IoBuiltin {
             Self::TlsClientEnable | Self::TlsServerEnable => "enable",
             #[cfg(feature = "tls")]
             Self::TlsClientDisable | Self::TlsServerDisable => "disable",
+            #[cfg(feature = "tls")]
+            Self::TlsAlpnProtocol => "alpn_protocol",
         }
     }
 
@@ -318,6 +323,8 @@ impl IoBuiltin {
             Self::TlsServerEnable => "tls_server_enable",
             #[cfg(feature = "tls")]
             Self::TlsServerDisable => "tls_server_disable",
+            #[cfg(feature = "tls")]
+            Self::TlsAlpnProtocol => "tls_alpn_protocol",
         }
     }
 
@@ -386,6 +393,7 @@ impl IoBuiltin {
             Self::TlsClientDisable,
             Self::TlsServerEnable,
             Self::TlsServerDisable,
+            Self::TlsAlpnProtocol,
         ]
     }
 
@@ -431,6 +439,8 @@ impl IoBuiltin {
             // (append-only).
             Self::WaitReady,
             Self::WriteFrom,
+            #[cfg(feature = "tls")]
+            Self::TlsAlpnProtocol,
         ]
     }
 }
@@ -859,9 +869,13 @@ impl VirtualModules {
 
         #[cfg(feature = "tls")]
         {
-            // Parent path exists so nested `use io::net::tls::…` resolves cleanly;
-            // APIs live on `client` / `server` children.
-            modules.insert(IO_NET_TLS_MODULE, Vec::new());
+            // Parent holds shared post-handshake helpers; enable/disable live on children.
+            modules.insert(
+                IO_NET_TLS_MODULE,
+                vec![BuiltinExport::IoFn {
+                    kind: IoBuiltin::TlsAlpnProtocol,
+                }],
+            );
             let client_exports: Vec<BuiltinExport> = IoBuiltin::tls_client()
                 .iter()
                 .map(|kind| BuiltinExport::IoFn { kind: *kind })
@@ -1291,7 +1305,22 @@ mod tests {
         let parent = vm
             .resolve_glob(&["io".into(), "net".into(), "tls".into()])
             .expect("io::net::tls");
-        assert!(parent.is_empty(), "APIs live on client/server children");
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].short_name(), "alpn_protocol");
+
+        assert_eq!(
+            IoBuiltin::TlsAlpnProtocol.native_name(),
+            "tls_alpn_protocol"
+        );
+        let alpn = vm
+            .resolve_item(&["io".into(), "net".into(), "tls".into()], "alpn_protocol")
+            .expect("io::net::tls::alpn_protocol");
+        assert_eq!(
+            alpn,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::TlsAlpnProtocol
+            }
+        );
 
         let client = vm
             .resolve_glob(&["io".into(), "net".into(), "tls".into(), "client".into()])

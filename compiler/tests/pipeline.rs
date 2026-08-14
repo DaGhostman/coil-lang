@@ -7116,7 +7116,7 @@ fn main() {
     assert!(err.is_err(), "empty server enable opts should fail");
 }
 
-/// Parent `io::net::tls` exports nothing — flat `enable` must not resolve.
+/// Parent `io::net::tls` does not export `enable` — it must be imported from client/server.
 #[cfg(feature = "tls")]
 #[test]
 fn tls_flat_parent_enable_does_not_compile() {
@@ -7136,6 +7136,27 @@ fn main() {
         err.is_err(),
         "enable must not resolve without tls client/server import"
     );
+}
+
+/// `alpn_protocol` is on the parent `io::net::tls` module.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_alpn_protocol_compiles_on_parent() {
+    let mut pipeline = Pipeline::new();
+    pipeline
+        .compile_src(
+            r#"
+use io::{open};
+use io::net::tls::{alpn_protocol};
+
+fn main() {
+    let path = "coil_tls_alpn_parent.bin";
+    let s = open(path, "w")?;
+    let _ = alpn_protocol(s);
+}
+"#,
+        )
+        .expect("alpn_protocol should typecheck");
 }
 
 /// Legacy `encrypt` / `decrypt` names under server must stay gone.
