@@ -13,6 +13,7 @@ pub mod fs;
 pub mod gc_handles;
 pub mod host_natives;
 pub mod io;
+mod io_handle;
 pub mod io_reactor;
 pub mod math_libm;
 mod memory;
@@ -21,10 +22,6 @@ pub mod packed_la;
 pub mod reactor;
 pub mod value_eq;
 pub mod vec_ops;
-#[cfg(feature = "regex")]
-pub mod regex;
-#[cfg(feature = "regex")]
-mod regex_state;
 pub mod thread;
 #[cfg(feature = "time")]
 pub mod time;
@@ -39,7 +36,7 @@ pub use debug::{DebugController, StepMode, StopReason};
 pub use env::ENV_WIRING;
 pub use ffi::*;
 pub use fs::FS_WIRING;
-pub use gc_handles::{GC_COLLECT_NATIVE, GC_WIRING};
+pub use gc_handles::{GC_COLLECT_NATIVE, GC_REGISTER_FINALIZER_NATIVE, GC_WIRING};
 pub use host_natives::{build_standard_host_natives, wire_standard_host_natives};
 pub use memory::*;
 pub use opcode::*;
@@ -47,8 +44,6 @@ pub use packed_la::{
     PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, PACKED_VEC_ARITH, packed_dot,
     packed_matmul, packed_matrix_neg, packed_matrix_zip, packed_vec_arith,
 };
-#[cfg(feature = "regex")]
-pub use regex::{REGEX_WIRING, RegexErrorTag};
 pub use thread::{
     LiveThreadRegistry, ThreadErrorTag, ThreadProgram, join_undetached_threads,
     new_live_thread_registry,

@@ -308,6 +308,14 @@ pub struct Machine<const S: usize> {
     reactor: std::sync::Arc<crate::reactor::Reactor>,
     /// IO readiness reactor (sync adapters + async waiters).
     io_reactor: std::sync::Arc<crate::io_reactor::IoReactor>,
+    /// `type_id` → drop method entry PC (empty = no user finalizers).
+    finalizer_by_type: std::collections::HashMap<u32, u32>,
+    /// Drop entry PCs (for explicit `obj.drop()` once-bit intercept).
+    finalizer_pcs: std::collections::HashSet<u32>,
+    /// True while a mark/finalize/sweep cycle is running.
+    gc_in_progress: bool,
+    /// Nested `gc_collect` during a finalizer; run another cycle after.
+    gc_deferred: bool,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -359,6 +367,10 @@ impl<const S: usize> Machine<S> {
             worker_cap,
             reactor,
             io_reactor: crate::io_reactor::IoReactor::new(),
+            finalizer_by_type: std::collections::HashMap::new(),
+            finalizer_pcs: std::collections::HashSet::new(),
+            gc_in_progress: false,
+            gc_deferred: false,
         }
     }
 
@@ -847,51 +859,83 @@ impl<const S: usize> Machine<S> {
         Ok(Value::from(addr as *mut u8))
     }
 
-    /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
-    fn gc_collect(
-        heap: &mut Heap,
-        stack: &Stack<Value>,
-        resume_stack: &[ResumeCtx],
-        statics: &[Value],
-    ) {
-        #[cfg(any(test, feature = "vm_profile"))]
-        VM_GC_COUNT.with(|c| {
-            c.fetch_add(1, Ordering::Relaxed);
-        });
-        let mut roots = heap.take_gc_roots();
-        // Only live operand-stack slots (not the full capacity buffer).
-        for v in stack.as_slice() {
+    /// Mark-and-sweep GC, running registered class finalizers after mark.
+    fn gc_collect(&mut self) {
+        if self.gc_in_progress {
+            self.gc_deferred = true;
+            return;
+        }
+        self.gc_in_progress = true;
+        loop {
+            self.gc_deferred = false;
+            #[cfg(any(test, feature = "vm_profile"))]
+            VM_GC_COUNT.with(|c| {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+
+            self.mark_from_vm_roots();
+            let queue = self.queue_unmarked_finalizers();
+            if !queue.is_empty() {
+                let mut gray = Vec::new();
+                for (val, _) in &queue {
+                    if let Some(obj) = Self::find_object_by_addr(&self.heap, val.raw() as u64) {
+                        obj.mark(&mut gray);
+                        Self::mark_aggregate_elements(&self.heap, &obj, &mut gray);
+                        obj.mark_references(&mut gray);
+                    }
+                }
+                while let Some(obj) = gray.pop() {
+                    Self::mark_aggregate_elements(&self.heap, &obj, &mut gray);
+                    obj.mark_references(&mut gray);
+                }
+                for (val, pc) in queue {
+                    self.run_finalizer(val, pc);
+                }
+                self.unmark_heap();
+                self.mark_from_vm_roots();
+            }
+
+            self.heap.clear_dead_weaks();
+            // SAFETY: all reachable objects were marked above; dead weaks cleared.
+            unsafe { self.heap.sweep() };
+            if !self.gc_deferred {
+                break;
+            }
+        }
+        self.gc_in_progress = false;
+    }
+
+    fn collect_vm_root_addrs(&mut self) -> Vec<u64> {
+        let mut roots = self.heap.take_gc_roots();
+        for v in self.stack.as_slice() {
             let addr = v.raw() as u64;
-            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+            if addr != 0 && self.heap.find_object_by_addr(addr).is_some() {
                 roots.push(addr);
             }
         }
-
-        // Global static slots (`LoadStatic` / `StoreStatic`), including
-        // `extern` library handles.
-        for v in statics {
+        for v in &self.statics {
             let addr = v.raw() as u64;
-            if addr != 0 && heap.find_object_by_addr(addr).is_some() {
+            if addr != 0 && self.heap.find_object_by_addr(addr).is_some() {
                 roots.push(addr);
             }
         }
-
-        for ctx in resume_stack {
+        for ctx in &self.resume_stack {
             roots.push(ctx.coro.as_ptr() as u64);
         }
-
-        // Conservatively root values held in suspended coroutine stacks.
-        for obj in heap.into_iter() {
+        for obj in self.heap.into_iter() {
             if let Object::Coroutine(gc) = obj {
                 roots.push(gc.as_ptr() as u64);
-                Self::root_coroutine_saved_stack(heap, gc.as_ref(), &mut roots);
+                Self::root_coroutine_saved_stack(&self.heap, gc.as_ref(), &mut roots);
             }
         }
+        roots
+    }
 
-        heap.trace(&roots);
-
-        let (mut gray, mut root_objects) = heap.take_gc_worklists();
-        let mut current = heap.head_for_lookup();
+    fn mark_from_vm_roots(&mut self) {
+        let roots = self.collect_vm_root_addrs();
+        self.heap.trace(&roots);
+        let (mut gray, mut root_objects) = self.heap.take_gc_worklists();
+        let mut current = self.heap.head_for_lookup();
         while let Some(reference) = current {
             if reference.is_marked() {
                 root_objects.push(reference);
@@ -899,33 +943,109 @@ impl<const S: usize> Machine<S> {
             current = reference.get_next();
         }
         for root in &root_objects {
-            Self::mark_aggregate_elements(heap, root, &mut gray);
+            Self::mark_aggregate_elements(&self.heap, root, &mut gray);
             root.mark_references(&mut gray);
         }
         while let Some(obj) = gray.pop() {
-            Self::mark_aggregate_elements(heap, &obj, &mut gray);
+            Self::mark_aggregate_elements(&self.heap, &obj, &mut gray);
             obj.mark_references(&mut gray);
         }
+        self.heap.restore_gc_worklists(gray, root_objects);
+        self.heap.restore_gc_roots(roots);
+    }
 
-        heap.clear_dead_weaks();
+    fn unmark_heap(&self) {
+        let mut current = self.heap.head_for_lookup();
+        while let Some(obj) = current {
+            obj.unmark();
+            current = obj.get_next();
+        }
+    }
 
-        // SAFETY: all reachable objects were marked above; dead weaks cleared.
-        unsafe { heap.sweep() };
+    fn queue_unmarked_finalizers(&self) -> Vec<(Value, u32)> {
+        if self.finalizer_by_type.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut current = self.heap.head_for_lookup();
+        while let Some(obj) = current {
+            if !obj.is_marked()
+                && let Object::Instance(gc) = obj
+            {
+                let inst = gc.as_ref();
+                if inst.type_id != 0
+                    && !inst.finalized
+                    && let Some(&pc) = self.finalizer_by_type.get(&inst.type_id)
+                {
+                    out.push((Value::from(obj.addr()), pc));
+                }
+            }
+            current = obj.get_next();
+        }
+        out
+    }
 
-        heap.restore_gc_worklists(gray, root_objects);
-        heap.restore_gc_roots(roots);
+    fn claim_finalizer(&self, v: Value) -> bool {
+        match Self::find_object_by_addr(&self.heap, v.raw() as u64) {
+            Some(Object::Instance(gc)) => {
+                let inst = gc.payload_mut();
+                if inst.finalized {
+                    false
+                } else {
+                    inst.finalized = true;
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn run_finalizer(&mut self, self_val: Value, pc: u32) {
+        if !self.claim_finalizer(self_val) {
+            return;
+        }
+        let was_panicked = self.panicked;
+        self.panicked = false;
+        let _ = self.call_function(pc, &[self_val]);
+        self.panicked = was_panicked;
+    }
+
+    fn register_finalizer(&mut self, type_id: u32, pc: u32) {
+        if type_id == 0 {
+            return;
+        }
+        self.finalizer_by_type.insert(type_id, pc);
+        self.finalizer_pcs.insert(pc);
+    }
+
+    fn run_remaining_finalizers(&mut self) {
+        if self.program_code.is_empty() || self.finalizer_by_type.is_empty() {
+            return;
+        }
+        let mut queue = Vec::new();
+        let mut current = self.heap.head_for_lookup();
+        while let Some(obj) = current {
+            if let Object::Instance(gc) = obj {
+                let inst = gc.as_ref();
+                if inst.type_id != 0
+                    && !inst.finalized
+                    && let Some(&pc) = self.finalizer_by_type.get(&inst.type_id)
+                {
+                    queue.push((Value::from(obj.addr()), pc));
+                }
+            }
+            current = obj.get_next();
+        }
+        for (val, pc) in queue {
+            self.run_finalizer(val, pc);
+        }
     }
 
     /// Run GC when live heap bytes exceed the heap threshold.
     #[inline]
-    fn maybe_gc_after_alloc(
-        heap: &mut Heap,
-        stack: &Stack<Value>,
-        resume_stack: &[ResumeCtx],
-        statics: &[Value],
-    ) {
-        if unlikely(heap.should_collect()) {
-            Self::gc_collect(heap, stack, resume_stack, statics);
+    fn maybe_gc_after_alloc(&mut self) {
+        if unlikely(self.heap.should_collect()) {
+            self.gc_collect();
         }
     }
 
@@ -1060,7 +1180,7 @@ impl<const S: usize> Machine<S> {
         let gc_string = self.heap.intern(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
-        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+        self.maybe_gc_after_alloc();
     }
 
     fn push_program_string(&mut self, idx: usize) {
@@ -1068,7 +1188,7 @@ impl<const S: usize> Machine<S> {
         let gc_string = self.heap.intern_str(data);
         self.stack
             .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
-        Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+        self.maybe_gc_after_alloc();
     }
 }
 
@@ -1255,7 +1375,28 @@ impl<const S: usize> Machine<S> {
 
     /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
-        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+        self.gc_collect();
+    }
+
+    #[cfg(test)]
+    pub fn finalizer_pc(&self, type_id: u32) -> Option<u32> {
+        self.finalizer_by_type.get(&type_id).copied()
+    }
+
+    #[cfg(test)]
+    pub fn instance_meta(&self, v: Value) -> Option<(u32, bool)> {
+        match Self::find_object_by_addr(&self.heap, v.raw() as u64) {
+            Some(Object::Instance(gc)) => {
+                let inst = gc.as_ref();
+                Some((inst.type_id, inst.finalized))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn register_finalizer_for_test(&mut self, type_id: u32, pc: u32) {
+        self.register_finalizer(type_id, pc);
     }
 
     fn with_coroutine_mut(&self, addr: u64, f: impl FnOnce(&mut ObjCoroutine)) {
@@ -1362,7 +1503,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Register fd interest and yield so other coros / `wait_ready` can batch.
+    /// Register handle interest and yield so other coros / `wait_ready` can batch.
     ///
     /// Pushes `Ok(())` onto the coroutine stack before yielding so resume
     /// continues after `HostInvoke` as if the await completed. Callers must
@@ -1375,7 +1516,7 @@ impl<const S: usize> Machine<S> {
     ) {
         let token = self
             .io_reactor
-            .register_wait(req.fd, req.interest);
+            .register_wait(req.handle, req.interest);
         let coro_ptr = self
             .resume_stack
             .last()
@@ -1600,6 +1741,55 @@ impl<const S: usize> Machine<S> {
         self.panicked = false;
     }
 
+    /// Rewrite the first `JMP target` at or after `from` into `HALT` so setup
+    /// can run without falling through into `main`.
+    pub fn halt_first_jump_to(&mut self, from: usize, target: u32) {
+        let code: &mut [Byte] = unsafe {
+            std::slice::from_raw_parts_mut(self.program_code.as_mut_ptr().cast(), self.program_code.len())
+        };
+        for b in code.iter_mut().skip(from) {
+            if matches!(b.bytecode(), Instruction::JMP) && b.operand_u32() == target {
+                *b = Byte::new(Instruction::HALT);
+                return;
+            }
+        }
+    }
+
+    /// Execute loaded `program_code` starting at `start_ip` until halt/panic.
+    pub fn run_from(&mut self, start_ip: usize) {
+        if self.program_code.is_empty() {
+            return;
+        }
+        let code: &[Byte] = unsafe {
+            std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
+        };
+        let constants: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                self.program_constants.as_ptr(),
+                self.program_constants.len(),
+            )
+        };
+        let mut ip = start_ip;
+        loop {
+            let paused = self.execute(code, constants, ip);
+            if let Some(pending) = self.pending_ffi.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if let Some(pending) = self.pending_io.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_io_wait(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if !paused {
+                break;
+            }
+        }
+    }
+
     /// True when `value` is a heap `Result::Ok` (enum tag 0).
     pub fn result_is_ok(&self, value: Value) -> bool {
         match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
@@ -1654,6 +1844,9 @@ impl<const S: usize> Machine<S> {
         // which looks like "recv never blocks" and "nothing after recv runs".
         // Only joins *this* Machine's registry (not a process-global list).
         crate::thread::join_undetached_threads(&self.live_threads);
+        // Remaining class finalizers need host IO / FFI while the reactor is
+        // still up. `Drop` still runs this as a safety net for embedders.
+        self.run_remaining_finalizers();
         // Reactor pool threads hold their own `Arc<Reactor>` clone and poll
         // forever unless told to stop — otherwise every program that spawns
         // a coil thread leaks `worker_cap` OS threads for the rest of the
@@ -1667,7 +1860,7 @@ impl<const S: usize> Machine<S> {
     fn finish_pending_io_wait(&mut self, pending: PendingIoWait) {
         self.frames.get_mut().set(pending.resume_sp);
         let req = pending.request;
-        let wait = crate::thread::host_io_wait(req.fd, req.interest, req.timeout);
+        let wait = crate::thread::host_io_wait(req.handle, req.interest, req.timeout);
         let v = crate::io::as_result_unit(&mut self.heap, wait);
         self.stack.push(v);
     }
@@ -1922,7 +2115,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::NEGF as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlotConstJmpt as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1989,12 +2182,7 @@ impl<const S: usize> Machine<S> {
                             Object::Enum,
                         );
                         self.stack.push(Value::from(object.addr()));
-                        Self::maybe_gc_after_alloc(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &self.statics,
-                        );
+                        self.maybe_gc_after_alloc();
                     }
                 }
                 Instruction::HeapOptionToNiche => {
@@ -2038,12 +2226,7 @@ impl<const S: usize> Machine<S> {
                     let is_option = opcode.operand_u32() & 1 != 0;
                     let boxed = self.alloc_pair_enum(payload, tag, is_option);
                     self.stack.push(boxed);
-                    Self::maybe_gc_after_alloc(
-                        &mut self.heap,
-                        &self.stack,
-                        &self.resume_stack,
-                        &self.statics,
-                    );
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::HeapToPair => {
                     let value = self.stack.pop();
@@ -2308,6 +2491,16 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::CALL => {
                     let (arity, target) = opcode.call_parts();
+                    if arity == 1
+                        && self.finalizer_pcs.contains(&(target as u32))
+                    {
+                        let self_val = self.stack[self.stack.tell() - 1];
+                        if !self.claim_finalizer(self_val) {
+                            self.stack.pop();
+                            self.stack.push(Value::from(0i64));
+                            continue;
+                        }
+                    }
                     let callee_sp = self.stack.tell() - arity;
                     // Direct calls dominate; avoid the indirect `target == 0`
                     // return-ip adjustment on that path.
@@ -2369,7 +2562,16 @@ impl<const S: usize> Machine<S> {
                     let _ = r.as_mut();
                     // Root before GC — same rule as `push_interned_string`.
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
+                }
+                Instruction::InitTyped => {
+                    let type_id = opcode.operand_u32();
+                    let (_, mut r) = self
+                        .heap
+                        .alloc(ObjInstance::with_type_id(type_id), Object::Instance);
+                    let _ = r.as_mut();
+                    self.stack.push(Value::from(r.as_ptr().addr() as u64));
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
@@ -2419,8 +2621,8 @@ impl<const S: usize> Machine<S> {
                     };
                     self.stack.push(result);
                 }
-                // Fused `<cmp|cond>; JMPF target`.
-                Instruction::CmpJmpf => {
+                // Fused `<cmp|cond>; JMPF/JMPT target`.
+                Instruction::CmpJmpf | Instruction::CmpJmpt => {
                     let (op, t) = opcode.cmp_jmpf_parts();
                     let target = if opcode.cmp_jmpf_is_pool() {
                         promise!(t < constants.len());
@@ -2451,12 +2653,12 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(lhs.as_int() ^ rhs.as_int()).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::CmpJmpt) {
                         ip = target;
                     }
                 }
-                // Fused `LOAD slot; CONST imm; <cond>; JMPF` without stack traffic.
-                Instruction::BinSlotImmJmpf => {
+                // Fused `LOAD slot; CONST imm; <cond>; JMPF/JMPT` without stack traffic.
+                Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
                     let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
                     promise!(pool_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
@@ -2483,11 +2685,11 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(lhs.as_int() ^ imm).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotImmJmpt) {
                         ip = target;
                     }
                 }
-                Instruction::LogNotJmpf => {
+                Instruction::LogNotJmpf | Instruction::LogNotJmpt => {
                     let t = opcode.log_not_jmpf_target();
                     let target = if opcode.log_not_jmpf_is_pool() {
                         promise!(t < constants.len());
@@ -2496,12 +2698,12 @@ impl<const S: usize> Machine<S> {
                         t
                     };
                     let val = self.stack.pop();
-                    if val.as_int() != 0 {
+                    if (val.as_int() == 0) == matches!(*bc, Instruction::LogNotJmpt) {
                         ip = target;
                     }
                 }
-                // Fused `BinSlotSlot; JMPF` — pool packs (target<<32)|b.
-                Instruction::BinSlotSlotJmpf => {
+                // Fused `BinSlotSlot; JMPF/JMPT` — pool packs (target<<32)|b.
+                Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
                     let (op, a, pool_idx) = opcode.bin_slot_slot_jmpf_parts();
                     promise!(pool_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(pool_idx) };
@@ -2529,7 +2731,7 @@ impl<const S: usize> Machine<S> {
                         Instruction::XOR => Value::from(va.as_int() ^ vb.as_int()).as_bool(),
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotSlotJmpt) {
                         ip = target;
                     }
                 }
@@ -2920,16 +3122,17 @@ impl<const S: usize> Machine<S> {
                     // pressure still fires when HostInvoke is the only
                     // allocator on a hot path.
                     let live_before = self.heap.live_object_count();
-                    let is_gc_collect = self
-                        .natives
-                        .get_by_id(fn_id)
-                        .is_some_and(|n| n.name() == crate::GC_COLLECT_NATIVE);
-                    if is_gc_collect {
-                        // Full stack-rooted collect; stub native is not used.
+                    let native_name = self.natives.get_by_id(fn_id).map(|n| n.name().to_string());
+                    if native_name.as_deref() == Some(crate::GC_COLLECT_NATIVE) {
                         let before = self.heap.size();
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                        self.gc_collect();
                         let freed = before.saturating_sub(self.heap.size());
                         self.stack.push(Value::from(freed as i64));
+                    } else if native_name.as_deref() == Some(crate::GC_REGISTER_FINALIZER_NATIVE) {
+                        let type_id = args.first().map(|v| v.as_int() as u32).unwrap_or(0);
+                        let pc = args.get(1).map(|v| v.as_int() as u32).unwrap_or(0);
+                        self.register_finalizer(type_id, pc);
+                        self.stack.push(Value::from(0i64));
                     } else {
                         match self.natives.get_by_id(fn_id) {
                             Some(native) => match native.invoke(&mut self.heap, args) {
@@ -2967,7 +3170,7 @@ impl<const S: usize> Machine<S> {
                         }
                         let allocated = self.heap.live_object_count().saturating_sub(live_before);
                         if allocated > 0 {
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                            self.maybe_gc_after_alloc();
                         }
                     }
                 }
@@ -3078,8 +3281,8 @@ impl<const S: usize> Machine<S> {
                         self.stack.seek(sp + dest + 1);
                     }
                 }
-                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf` — no stack traffic.
-                Instruction::BinSlotSlotConstJmpf => {
+                // Fused `BinSlotSlot <arith>; CONST pool; CmpJmpf/CmpJmpt` — no stack traffic.
+                Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
                     let (bin_op, a, desc_idx) = opcode.bin_slot_slot_const_jmpf_parts();
                     promise!(desc_idx < constants.len());
                     let packed = unsafe { *constants.get_unchecked(desc_idx) };
@@ -3107,7 +3310,7 @@ impl<const S: usize> Machine<S> {
                         Instruction::GEQF => mag >= rhs,
                         _ => false,
                     };
-                    if !taken {
+                    if taken == matches!(*bc, Instruction::BinSlotSlotConstJmpt) {
                         ip = target;
                     }
                 }
@@ -3169,7 +3372,7 @@ impl<const S: usize> Machine<S> {
                     // Drop args, then root the fresh enum before maybe-GC.
                     self.stack.seek(sp - n);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
@@ -3197,7 +3400,7 @@ impl<const S: usize> Machine<S> {
                     };
                     self.stack.seek(base);
                     self.stack.push(Value::from(addr));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::Index => {
                     let index_val = self.stack.pop();
@@ -3256,7 +3459,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
@@ -3385,7 +3588,7 @@ impl<const S: usize> Machine<S> {
                         Object::Array,
                     );
                     self.stack.push(Value::from(array_obj.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; pool index in operands[15:0]
@@ -3570,7 +3773,7 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
@@ -3736,7 +3939,7 @@ impl<const S: usize> Machine<S> {
                             };
                             let (object, _) = self.heap.alloc(partial, Object::Fn);
                             self.stack.push(Value::from(object.addr()));
-                            Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                            self.maybe_gc_after_alloc();
                             continue;
                         }
 
@@ -3895,7 +4098,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::Fn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::LoadStatic => {
                     let slot = opcode.operand_u32() as usize;
@@ -3932,7 +4135,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let boxed = ObjBoxed { tag, payload };
                     let (object, _) = self.heap.alloc(boxed, Object::Boxed);
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::UnboxValue => {
@@ -3967,7 +4170,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::MakePolyFnCapture => {
                     let count = (opcode.operand_u32() & 0xFF) as usize;
@@ -3992,7 +4195,7 @@ impl<const S: usize> Machine<S> {
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.stack.push(Value::from(object.addr()));
-                    Self::maybe_gc_after_alloc(&mut self.heap, &self.stack, &self.resume_stack, &self.statics);
+                    self.maybe_gc_after_alloc();
                 }
                 Instruction::DynAdd
                 | Instruction::DynSub
@@ -4146,6 +4349,12 @@ impl<const S: usize> Machine<S> {
             }
         }
         false
+    }
+}
+
+impl<const S: usize> Drop for Machine<S> {
+    fn drop(&mut self) {
+        self.run_remaining_finalizers();
     }
 }
 

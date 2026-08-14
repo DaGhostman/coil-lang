@@ -9,6 +9,7 @@ use ast::{
     Visibility,
 };
 use std::{
+    collections::HashSet,
     marker::PhantomData,
     num::{ParseFloatError, ParseIntError},
 };
@@ -77,6 +78,34 @@ pub use fmt::{format_program, format_range, format_source};
 #[derive(Default)]
 pub struct Pratt<'pratt> {
     _data: PhantomData<&'pratt ()>,
+}
+
+fn first_duplicate_name<'a, I>(names: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn duplicate_field_error<'src>(
+    names: impl IntoIterator<Item = &'src str>,
+    span: SimpleSpan,
+) -> Option<Rich<'src, char>> {
+    first_duplicate_name(names)
+        .map(|name| Rich::custom(span, format!("Duplicate field `{name}`")))
+}
+
+fn is_duplicate_field_parse_error(err: &Rich<'_, char>) -> bool {
+    matches!(
+        err.reason(),
+        RichReason::Custom(msg) if msg.starts_with("Duplicate field `")
+    )
 }
 
 impl<'pratt> Pratt<'pratt> {
@@ -2624,7 +2653,12 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map(LetPattern::Record)
+            .validate(|fields, e, emitter| {
+                if let Some(err) = duplicate_field_error(fields.iter().map(|f| f.name), e.span()) {
+                    emitter.emit(err);
+                }
+                LetPattern::Record(fields)
+            })
     }
 
     /// Nested irrefutable `let` pattern: `_`, binding, `(p, …)`, `{ field, … }`.
@@ -2647,7 +2681,14 @@ impl<'pratt> Pratt<'pratt> {
                 .allow_trailing()
                 .collect::<Vec<_>>()
                 .delimited_by(op!("{"), op!("}"))
-                .map(LetPattern::Record);
+                .validate(|fields, e, emitter| {
+                    if let Some(err) =
+                        duplicate_field_error(fields.iter().map(|f| f.name), e.span())
+                    {
+                        emitter.emit(err);
+                    }
+                    LetPattern::Record(fields)
+                });
 
             let tuple_multi = pattern_parser
                 .clone()
@@ -2791,9 +2832,12 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map_with(|fields, e| {
+            .validate(|fields, e, emitter| {
                 let fs: Vec<RecordFieldValue<'pratt>> =
                     fields.into_iter().map(|(_, f)| f).collect();
+                if let Some(err) = duplicate_field_error(fs.iter().map(|f| f.name), e.span()) {
+                    emitter.emit(err);
+                }
                 (e.span(), Box::new(Expression::Dict(fs)))
             })
             .labelled("dict")
@@ -2846,8 +2890,8 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // Record field: `name : expr` — duplicate field names are
-        // rejected by the parser (emit a chumsky error).
+        // Record field: `name : expr`. Duplicate names emit a chumsky
+        // error so fmt/parser tooling never round-trips illegal records.
         let record_field = text::ident()
             .padded()
             .then_ignore(op!(":"))
@@ -2860,15 +2904,13 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map(|fields| {
-                // Duplicate field names pass through to the
-                // typechecker, which reports them with a
-                // source-anchored "Duplicate field `x`" message.
-                // The parser intentionally does NOT reject them
-                // — emitting a chumsky error here from inside
-                // `map_with` would require a borrowed emitter and
-                // duplicate the diagnostic machinery.
-                EnumConstructPayload::Record(fields.into_iter().map(|(_, f)| f).collect())
+            .validate(|fields, e, emitter| {
+                let fs: Vec<RecordFieldValue<'pratt>> =
+                    fields.into_iter().map(|(_, f)| f).collect();
+                if let Some(err) = duplicate_field_error(fs.iter().map(|f| f.name), e.span()) {
+                    emitter.emit(err);
+                }
+                EnumConstructPayload::Record(fs)
             })
             .labelled("record payload");
 
@@ -3059,7 +3101,14 @@ impl<'pratt> Pratt<'pratt> {
                 .allow_trailing()
                 .collect::<Vec<_>>()
                 .delimited_by(op!("{"), op!("}"))
-                .map(PatternPayload::Record)
+                .validate(|fields, e, emitter| {
+                    if let Some(err) =
+                        duplicate_field_error(fields.iter().map(|f| f.name), e.span())
+                    {
+                        emitter.emit(err);
+                    }
+                    PatternPayload::Record(fields)
+                })
                 .labelled("record pattern payload");
 
             // `Enum::Variant(p1, p2, ...)` — the first ident must be
@@ -3163,7 +3212,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         // Record field: `name : Type` — the type is parsed via
         // `type_annotation()` so it can be generic (`Inner<T>`), an array,
-        // or a tuple.  Duplicate names are rejected at parse time.
+        // or a tuple. Duplicate names are rejected at parse time.
         let record_field_decl = text::ident()
             .padded()
             .then_ignore(op!(":"))
@@ -3176,7 +3225,12 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map(EnumVariantPayload::Record)
+            .validate(|fields, e, emitter| {
+                if let Some(err) = duplicate_field_error(fields.iter().map(|f| f.name), e.span()) {
+                    emitter.emit(err);
+                }
+                EnumVariantPayload::Record(fields)
+            })
             .labelled("record variant payload");
 
         // Tuple payload: each element is a full type annotation so that
@@ -3221,15 +3275,22 @@ impl<'pratt> Pratt<'pratt> {
             .into_result()
         {
             Err(errs) => {
-                let primary = errs
-                    .first()
+                let primary_err = errs
+                    .iter()
+                    .find(|err| is_duplicate_field_parse_error(err))
+                    .or(errs.first());
+                let primary = primary_err
                     .map(|err| err.span().into_range())
                     .unwrap_or_default();
-                let title = errs
-                    .first()
+                let title = primary_err
                     .map(|err| format_parse_error_title(input, err))
                     .unwrap_or_else(|| "Parse error".to_string());
-                let mut message = Message::error(ErrorCode::ParseError, title, primary);
+                let code = if errs.iter().any(is_duplicate_field_parse_error) {
+                    ErrorCode::DuplicateField
+                } else {
+                    ErrorCode::ParseError
+                };
+                let mut message = Message::error(code, title, primary);
 
                 errs.iter().for_each(|err| {
                     message.push(Label::new(
@@ -3238,7 +3299,7 @@ impl<'pratt> Pratt<'pratt> {
                     ));
                 });
 
-                if let Some(help) = errs.first().and_then(|err| parse_error_help(input, err)) {
+                if let Some(help) = primary_err.and_then(|err| parse_error_help(input, err)) {
                     message.with_help(help);
                 }
 
@@ -3296,6 +3357,9 @@ fn parse_error_help(input: &str, err: &Rich<'_, char>) -> Option<String> {
         );
     }
     match err.reason() {
+        RichReason::Custom(msg) if msg.starts_with("Duplicate field `") => {
+            Some("record fields must have unique names".to_string())
+        }
         RichReason::Custom(msg)
             if msg.contains("missing a type") || msg.contains("name: Type") =>
         {

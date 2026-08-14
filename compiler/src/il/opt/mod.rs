@@ -42,6 +42,11 @@ pub struct OptimizeOptions {
     /// Drop `LOAD`/`STORE` the shared cursor proves redundant, promoting the
     /// slot out of the frame. Runs last, after every slot-tracking pass.
     pub slot_promote_tell: bool,
+    /// `Seek` the latch of a natural loop back to the forward-edge cursor when
+    /// that makes the header `Known` and exposes in-loop self-stores (COI-97).
+    /// Off: innermost mandelbrot has no such self-stores; outer-loop Seek
+    /// splits FloatChainStore fuse windows.
+    pub seek_back_edge: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -66,6 +71,7 @@ impl Default for OptimizeOptions {
             multi_op_join_convoy: true,
             invert_guard_branch: true,
             slot_promote_tell: true,
+            seek_back_edge: false,
         }
     }
 }
@@ -139,6 +145,10 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
     }
     // After every slot-tracking pass: promotion leaves a slot defined only by
     // the push that lands on it, which earlier passes would not see.
+    // Seek-normalize first so loop headers join at a Known cursor.
+    if opts.seek_back_edge {
+        seek_normalize_back_edges(ops, entry_tell);
+    }
     if opts.slot_promote_tell {
         slot_promote_at(ops, entry_tell);
     }
@@ -217,4 +227,4 @@ use convoy::{bin_join_convoy, clone_shared_return, return_convoy};
 use slot_promote::slot_promote;
 pub(crate) use cfg::invert_branch_over_jump as invert_guard_branch;
 pub(crate) use convoy::multi_op_join_convoy;
-pub(crate) use slot_promote::slot_promote_at;
+pub(crate) use slot_promote::{seek_normalize_back_edges, slot_promote_at};

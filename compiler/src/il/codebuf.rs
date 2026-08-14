@@ -4,9 +4,8 @@ use std::collections::HashMap;
 
 use common::{Byte, DebugLoc, Instruction};
 
-use super::{
-    EntryKind, IlBuilder, IlFunc, IlJumpKind, IlModule, IlOp, Label, Lowered, lower_module,
-};
+use super::lower::lower_module_inner;
+use super::{EntryKind, IlBuilder, IlFunc, IlJumpKind, IlModule, IlOp, Label, Lowered};
 
 /// Compile-time code buffer: IL during emit, `Vec<Byte>` after lower.
 #[derive(Clone, Default)]
@@ -412,6 +411,31 @@ impl CodeBuf {
         self.il.splice_code_at(code_pos, other.il);
     }
 
+    /// Move IL ops `[raw_start..]` to logical code index `code_pos` without
+    /// remapping labels (same buffer namespace).
+    pub fn move_raw_suffix_to_code_pos(&mut self, raw_start: usize, code_pos: usize) {
+        self.invalidate_lowered();
+        let suffix: Vec<IlOp> = self.il.ops_mut().drain(raw_start..).collect();
+        if suffix.is_empty() {
+            return;
+        }
+        let mut emitting = 0usize;
+        let mut raw_idx = self.il.raw_len();
+        for (i, op) in self.il.ops().iter().enumerate() {
+            if emitting == code_pos {
+                raw_idx = i;
+                break;
+            }
+            if op.emits_code() {
+                emitting += 1;
+            }
+        }
+        if emitting < code_pos {
+            raw_idx = self.il.raw_len();
+        }
+        self.il.ops_mut().splice(raw_idx..raw_idx, suffix);
+    }
+
     pub fn insert_jump_at(&mut self, code_pos: usize, target: Label) {
         let mut emitting = 0usize;
         let mut raw_idx = self.il.raw_len();
@@ -436,9 +460,18 @@ impl CodeBuf {
 
     /// Rebuild an owning [`IlModule`] from the flat emit stream and lower once.
     pub fn lower_in_place(&mut self, pool: &mut Vec<u64>) -> Lowered {
+        self.lower_in_place_inner(pool, false)
+    }
+
+    /// Like [`Self::lower_in_place`], keeping post-opt pre-fuse ops on [`Lowered`].
+    pub(crate) fn lower_in_place_capturing(&mut self, pool: &mut Vec<u64>) -> Lowered {
+        self.lower_in_place_inner(pool, true)
+    }
+
+    fn lower_in_place_inner(&mut self, pool: &mut Vec<u64>, capture_ops: bool) -> Lowered {
         let mut module = IlModule::from_flat(self.il.ops(), &self.funcs)
             .with_entries(self.entry_at_offset.clone());
-        let lowered = lower_module(&mut module, pool);
+        let lowered = lower_module_inner(&mut module, pool, capture_ops);
         self.lowered = Some(lowered.bytecode.clone());
         self.lowered_locs = Some(lowered.debug_locs.clone());
         lowered

@@ -329,7 +329,8 @@ fn main() { let a = show(true); }
             .collect::<Vec<_>>()
     );
     assert!(
-        msgs.iter().any(|m| m.message().contains("No overload of `show`")),
+        msgs.iter()
+            .any(|m| m.message().contains("No overload of `show`")),
         "expected 'No overload of show' message, got: {:?}",
         msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
@@ -358,8 +359,7 @@ fn userland_wildcard_import_has_stable_error_code() {
 fn virtual_wildcard_import_is_rejected() {
     let msgs = check_messages("use io::*;\nfn main() {}\n");
     assert!(
-        msgs
-            .iter()
+        msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::WildcardImport)),
         "virtual `use io::*` must emit WildcardImport, got: {:?}",
         msgs.iter()
@@ -470,18 +470,20 @@ fn main() {
 #[test]
 fn let_record_duplicate_field_is_rejected() {
     // Distinct binders so this stays a *field* diagnostic (not binder).
-    let (_ty, msgs) = check(
-        r#"
+    let err = Pratt::default()
+        .parse(
+            r#"
 fn main() {
     let { x: a, x: b } = { x: 1, y: 2 };
 }
 "#,
-    );
+        )
+        .expect_err("duplicate let record fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field `x` in record pattern")),
-        "expected duplicate field in let record pattern, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field `x`"),
+        "expected duplicate field in let record pattern, got: {}",
+        err.message()
     );
 }
 
@@ -918,16 +920,18 @@ fn record_construct_shape_mismatch_diagnostic() {
 #[test]
 fn record_construct_duplicate_field_diagnostic() {
     // The user supplies the same field twice in a record
-    // constructor. The typechecker should reject this.
-    let (_ty, msgs) = check(
-        "enum E { Foo { x: int, y: int } } \
-         fn main() { E::Foo { x: 1, x: 2 }; }",
-    );
+    // constructor. The parser rejects this (E0208).
+    let err = Pratt::default()
+        .parse(
+            "enum E { Foo { x: int, y: int } } \
+             fn main() { E::Foo { x: 1, x: 2 }; }",
+        )
+        .expect_err("duplicate construct fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field `x`") || m.contains("duplicate")),
-        "expected 'Duplicate field `x`' diagnostic, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field `x`") || err.message().contains("duplicate"),
+        "expected 'Duplicate field `x`' diagnostic, got: {}",
+        err.message()
     );
 }
 
@@ -1763,8 +1767,9 @@ fn record_pattern_missing_field_errors() {
 
 #[test]
 fn record_pattern_duplicate_field_errors() {
-    let (_ty, msgs) = check(
-        r#"
+    let err = Pratt::default()
+        .parse(
+            r#"
         enum P { P { x: int, y: int } }
         fn f(P p) -> int {
             return match p {
@@ -1772,12 +1777,13 @@ fn record_pattern_duplicate_field_errors() {
             };
         }
         "#,
-    );
+        )
+        .expect_err("duplicate match record fields must fail at parse");
+    assert_eq!(err.code(), Some(ErrorCode::DuplicateField));
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("Duplicate field") || m.contains("duplicate field")),
-        "expected duplicate field in record pattern, got: {:?}",
-        msgs
+        err.message().contains("Duplicate field") || err.message().contains("duplicate field"),
+        "expected duplicate field in record pattern, got: {}",
+        err.message()
     );
 }
 
@@ -2541,5 +2547,210 @@ fn main() {
         msgs.is_empty(),
         "root/get/weak/upgrade should typecheck; got: {:?}",
         msgs
+    );
+}
+
+#[test]
+fn drop_method_typechecks() {
+    let (_ty, msgs) = check(
+        r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    let h = new Handle(1);
+    h.drop();
+}
+"#,
+    );
+    assert!(
+        msgs.is_empty(),
+        "inherent drop should typecheck; got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn drop_rejects_free_function() {
+    let ast = parser::Pratt::default().parse("fn drop() {}").unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for free fn drop"
+    );
+}
+
+#[test]
+fn drop_rejects_static_and_arity() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    static fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for static drop"
+    );
+}
+
+#[test]
+fn drop_rejects_extra_arity() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop(int x) {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for extra drop parameters"
+    );
+}
+
+#[test]
+fn drop_rejects_duplicate() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+    fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for duplicate drop"
+    );
+}
+
+#[test]
+fn drop_rejects_trait_method() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+trait Closer {
+    fn drop() {}
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for trait drop"
+    );
+}
+
+#[test]
+fn drop_rejects_non_unit_return() {
+    let ast = parser::Pratt::default()
+        .parse(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() -> int { return 0; }
+}
+fn main() {}
+"#,
+        )
+        .unwrap();
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    assert!(
+        c.take_messages()
+            .iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidDrop)),
+        "expected InvalidDrop for non-unit drop return"
+    );
+}
+
+#[test]
+fn range_to_vec_non_numeric_ord_is_cannot_iterate() {
+    let (_ty, msgs) = check(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot iterate over `Range")),
+        "expected cannot-iterate diagnostic for Range.to_vec, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn range_for_in_non_numeric_ord_is_cannot_iterate() {
+    let (_ty, msgs) = check(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    for x in a..=b { }
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot iterate over `RangeInclusive")),
+        "expected cannot-iterate diagnostic for RangeInclusive for-in, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn range_numeric_step_help_mentions_to_vec_and_successor() {
+    let msgs = check_messages(
+        r#"
+fn dump<T: Ord>(T a, T b) {
+    let _ = (a..b).to_vec();
+}
+"#,
+    );
+    let help = msgs.iter().find_map(|m| {
+        m.message()
+            .contains("cannot iterate")
+            .then(|| m.help().clone())
+            .flatten()
+    });
+    let help = help.expect("expected help on cannot-iterate for Range.to_vec");
+    assert!(
+        help.contains(".to_vec()") && help.contains("successor"),
+        "help should pin shared for/.to_vec numeric-step policy, got: {help:?}"
     );
 }

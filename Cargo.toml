@@ -40,10 +40,9 @@ name = "fib"
 harness = false
 
 [features]
-default = ["crypto", "time", "regex", "tls"]
+default = ["crypto", "time", "tls"]
 crypto = ["machine/crypto", "compiler/crypto", "coil-cli/crypto"]
 time = ["machine/time", "compiler/time", "coil-cli/time"]
-regex = ["machine/regex", "compiler/regex", "coil-cli/regex"]
 tls = ["machine/tls", "compiler/tls", "coil-cli/tls"]
 
 [profile.release]

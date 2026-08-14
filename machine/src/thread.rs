@@ -409,7 +409,7 @@ fn host_spawn_context() -> Result<ThreadSpawnContext, ThreadErrorTag> {
 
 /// Block on IO readiness using the bound VM's reactors (CPU help-steal when present).
 pub(crate) fn host_io_wait(
-    fd: std::os::fd::RawFd,
+    handle: crate::io_handle::WaitHandle,
     interest: crate::io_reactor::Interest,
     timeout: Option<std::time::Duration>,
 ) -> Result<(), crate::io::IoErrorTag> {
@@ -423,9 +423,9 @@ pub(crate) fn host_io_wait(
         }
     });
     match (io, cpu) {
-        (Some(io), Some(cpu)) => io.wait_fd_helping(fd, interest, timeout, || cpu.help_once()),
-        (Some(io), None) => io.wait_fd(fd, interest, timeout),
-        (None, _) => IoReactor::new().wait_fd(fd, interest, timeout),
+        (Some(io), Some(cpu)) => io.wait_fd_helping(handle, interest, timeout, || cpu.help_once()),
+        (Some(io), None) => io.wait_fd(handle, interest, timeout),
+        (None, _) => IoReactor::new().wait_fd(handle, interest, timeout),
     }
 }
 
@@ -598,8 +598,6 @@ fn encode_value(
         | Object::Library(_)
         | Object::Root(_)
         | Object::Weak(_) => Err(ThreadErrorTag::NotSendable),
-        #[cfg(feature = "regex")]
-        Object::Regex(_) => Err(ThreadErrorTag::NotSendable),
         #[cfg(feature = "crypto")]
         Object::CryptoHasher(_) => Err(ThreadErrorTag::NotSendable),
         // Handled above; listed so the match stays exhaustive.

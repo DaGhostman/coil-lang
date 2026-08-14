@@ -3,8 +3,9 @@ mod block_builder;
 mod const_fold;
 #[cfg(any(test, feature = "dissect"))]
 mod dissect;
-// `il::tell` is exercised by `tests/cursor_model.rs`, which diffs it against the
-// real VM cursor; the rest of the IL stays crate-private.
+// `il::tell` is exercised by `tests/cursor_model.rs`, which diffs bytecode
+// against the VM cursor and symbolic-IL tell against bytecode; the rest of
+// the IL stays crate-private.
 pub(crate) mod il;
 pub use il::tell;
 pub use il::{BoundsStats, CanonStats, last_bounds_stats, last_canon_stats};

@@ -302,8 +302,6 @@ pub const BYTE: &str = "byte";
 pub const UNIT: &str = "unit";
 /// Name of the opaque `Stream` IO handle type.
 pub const STREAM: &str = "Stream";
-/// Opaque compiled regex handle (`regex` module).
-pub const REGEX: &str = "Regex";
 /// Opaque `thread` module handle types.
 pub const THREAD: &str = "Thread";
 pub const SENDER: &str = "Sender";
@@ -345,24 +343,38 @@ pub fn byte() -> Ty {
     Ty::Con(BYTE.into())
 }
 
+/// Half-open lazy range constructor name (`Range<T>`).
+pub const RANGE: &str = "Range";
+
+/// Closed lazy range constructor name (`RangeInclusive<T>`).
+pub const RANGE_INCLUSIVE: &str = "RangeInclusive";
+
 /// Half-open lazy range type `Range<T>` (Phase P3).
 pub fn range_ty(elem: Ty) -> Ty {
-    Ty::App(Box::new(Ty::Con("Range".into())), vec![elem])
+    Ty::App(Box::new(Ty::Con(RANGE.into())), vec![elem])
 }
 
 /// Closed lazy range type `RangeInclusive<T>` (Phase P3).
 pub fn range_inclusive_ty(elem: Ty) -> Ty {
-    Ty::App(Box::new(Ty::Con("RangeInclusive".into())), vec![elem])
+    Ty::App(Box::new(Ty::Con(RANGE_INCLUSIVE.into())), vec![elem])
+}
+
+/// Element type and inclusivity of `Range<T>` / `RangeInclusive<T>`.
+pub fn range_app(ty: &Ty) -> Option<(&Ty, bool)> {
+    match ty {
+        Ty::App(head, args) if args.len() == 1 => match head.as_ref() {
+            Ty::Con(n) if n == RANGE => Some((&args[0], false)),
+            Ty::Con(n) if n == RANGE_INCLUSIVE => Some((&args[0], true)),
+            _ => None,
+        },
+        Ty::Readonly(inner) => range_app(inner),
+        _ => None,
+    }
 }
 
 /// Build the opaque `Stream` type.
 pub fn stream_ty() -> Ty {
     Ty::Con(STREAM.into())
-}
-
-/// Build the opaque `Regex` type.
-pub fn regex_ty() -> Ty {
-    Ty::Con(REGEX.into())
 }
 
 /// Build the opaque `Thread` join-handle type.
@@ -1055,5 +1067,30 @@ mod tests {
             p.field_pairs(),
             vec![("x".into(), int()), ("y".into(), int())]
         );
+    }
+
+    #[test]
+    fn range_app_distinguishes_half_open_and_inclusive() {
+        let half = range_ty(int());
+        assert_eq!(range_app(&half).map(|(e, inc)| (e, inc)), Some((&int(), false)));
+        let closed = range_inclusive_ty(float());
+        assert_eq!(
+            range_app(&closed).map(|(e, inc)| (format!("{e}"), inc)),
+            Some(("float".into(), true))
+        );
+    }
+
+    #[test]
+    fn range_app_peels_readonly() {
+        let ty = readonly_ty(range_ty(byte()));
+        let (elem, inclusive) = range_app(&ty).expect("readonly Range");
+        assert!(!inclusive);
+        assert_eq!(elem, &byte());
+    }
+
+    #[test]
+    fn range_app_rejects_non_range() {
+        assert!(range_app(&int()).is_none());
+        assert!(range_app(&vec_app_ty(int())).is_none());
     }
 }

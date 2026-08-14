@@ -1,10 +1,11 @@
 //! Loop range / bounds analysis (proof-only + ArrayLen LICM).
 //!
-//! Identifies counted loops (`0..n` / `0..len`) with an invariant array, proves
-//! `0 <= i < len` for in-body `Index` / `StoreIndex` when the bound is the
+//! Identifies counted loops (`0..n` / `0..len`) with an invariant array, tallies
+//! `0 <= i < len` proofs for in-body `Index` / `StoreIndex` when the bound is the
 //! array's length (or a fill-loop-equal `n`), and hoists invariant
 //! `LOAD; ArrayLen; STORE` triples into the preheader. Fail-closed: unknown or
-//! mutation-sensitive paths keep checked ops. No new opcodes.
+//! mutation-sensitive paths stay checked. **`Index` is never rewritten**
+//! (COI-85: no `IndexUnchecked`). No new opcodes.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1768,7 +1769,7 @@ mod tests {
     }
 
     /// Scan-loop compare shape after fill-to-`n` (nsieve-like).
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ScanHeader {
         /// `Load p; Load n; LE` — pre-canon form when slot(p) ≤ slot(n) fails.
         LoadLoadLe,
@@ -1778,6 +1779,18 @@ mod tests {
         BinSlotSlotGt,
         /// Residual `Byte(GT)` between loads (is_gt_cmp encode path).
         LoadLoadByteGt,
+        /// `Load p; Load n; LEQ` — `p <= n` is **not** a length proof (COI-93).
+        LoadLoadLeq,
+        /// `Load n; Load p; GEQ` — canon swap of LEQ; also not a length proof.
+        LoadLoadGeq,
+        /// Fused `BinSlotSlot LEQ p,n` — inclusive; must not match LE header.
+        BinSlotSlotLeq,
+        /// Fused `BinSlotSlot GEQ n,p` — inclusive canon twin of LEQ.
+        BinSlotSlotGeq,
+        /// Residual `Byte(LEQ)` between loads — must not match `is_le_cmp`.
+        LoadLoadByteLeq,
+        /// Residual `Byte(GEQ)` between loads — must not match `is_gt_cmp`.
+        LoadLoadByteGeq,
     }
 
     /// flags = MakeArray 0; i=0; while i < n { push; i++ }; then while p < n { Index }.
@@ -1918,6 +1931,86 @@ mod tests {
                     },
                 ]);
             }
+            ScanHeader::LoadLoadLeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::LEQ,
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::LoadLoadGeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Bin {
+                        op: Instruction::GEQ,
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::BinSlotSlotLeq => {
+                ops.push(IlOp::BinSlotSlot {
+                    op: Instruction::LEQ as u8,
+                    a: 3,
+                    b: 0,
+                    loc: loc(),
+                });
+            }
+            ScanHeader::BinSlotSlotGeq => {
+                ops.push(IlOp::BinSlotSlot {
+                    op: Instruction::GEQ as u8,
+                    a: 0,
+                    b: 3,
+                    loc: loc(),
+                });
+            }
+            ScanHeader::LoadLoadByteLeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Byte {
+                        byte: Byte::new(Instruction::LEQ),
+                        loc: loc(),
+                    },
+                ]);
+            }
+            ScanHeader::LoadLoadByteGeq => {
+                ops.extend([
+                    IlOp::Load {
+                        slot: 0,
+                        loc: loc(),
+                    },
+                    IlOp::Load {
+                        slot: 3,
+                        loc: loc(),
+                    },
+                    IlOp::Byte {
+                        byte: Byte::new(Instruction::GEQ),
+                        loc: loc(),
+                    },
+                ]);
+            }
         }
         ops.extend([
             IlOp::Jump {
@@ -2005,6 +2098,188 @@ mod tests {
             stats.proven_index >= 1,
             "Byte(GT) header must prove Index via is_gt_cmp; stats={stats:?}"
         );
+    }
+
+    #[test]
+    fn leq_scan_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "i <= n must not license Index; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "LEQ header Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn geq_scan_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadGeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "canon-swapped LEQ (GEQ) must not license Index; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "GEQ header Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn canon_then_bounds_still_refuses_leq_header() {
+        use super::super::canon::canonicalize_operand_order;
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLeq);
+        canonicalize_operand_order(&mut ops, &[]);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "canon must not turn LEQ into an Index proof; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "canon→GEQ LEQ twin must keep Index checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn canon_then_bounds_still_refuses_geq_header() {
+        use super::super::canon::canonicalize_operand_order;
+        reset_bounds_stats();
+        // Start from Load p; Load n; LE, then rewrite the cmp to GEQ so the
+        // high-then-low window flips to LEQ under canon — still inclusive.
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadLe);
+        let le_pos = ops
+            .iter()
+            .rposition(|op| {
+                matches!(
+                    op,
+                    IlOp::Bin {
+                        op: Instruction::LE,
+                        ..
+                    }
+                )
+            })
+            .expect("scan LE header");
+        if let IlOp::Bin { op, .. } = &mut ops[le_pos] {
+            *op = Instruction::GEQ;
+        }
+        canonicalize_operand_order(&mut ops, &[]);
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                IlOp::Bin {
+                    op: Instruction::LEQ,
+                    ..
+                }
+            )),
+            "expected canon to flip high-then-low GEQ into LEQ"
+        );
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "canon GEQ→LEQ must not license Index; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "canon GEQ→LEQ Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn bin_slot_slot_leq_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::BinSlotSlotLeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "BinSlotSlot LEQ must not match LE header; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "BinSlotSlot LEQ Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn bin_slot_slot_geq_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::BinSlotSlotGeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "BinSlotSlot GEQ must not match GT header; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "BinSlotSlot GEQ Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn byte_leq_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadByteLeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "Byte(LEQ) must not match is_le_cmp; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "Byte(LEQ) Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn byte_geq_header_does_not_prove_index() {
+        reset_bounds_stats();
+        let mut ops = fill_then_scan_ops(ScanHeader::LoadLoadByteGeq);
+        loop_bounds(&mut ops);
+        let stats = last_bounds_stats();
+        assert_eq!(
+            stats.proven_index, 0,
+            "Byte(GEQ) must not match is_gt_cmp; stats={stats:?}"
+        );
+        assert!(
+            stats.checked_index >= 1,
+            "Byte(GEQ) Index must stay checked; stats={stats:?}"
+        );
+    }
+
+    #[test]
+    fn header_lt_bound_refuses_inclusive_scan_headers() {
+        for scan in [
+            ScanHeader::LoadLoadLeq,
+            ScanHeader::LoadLoadGeq,
+            ScanHeader::BinSlotSlotLeq,
+            ScanHeader::BinSlotSlotGeq,
+            ScanHeader::LoadLoadByteLeq,
+            ScanHeader::LoadLoadByteGeq,
+        ] {
+            let ops = fill_then_scan_ops(scan);
+            let loops = find_natural_loops(&ops);
+            // Fill loop may still resolve as (2, 0); the scan loop must not be
+            // counted as (index=3, bound=0) under an inclusive header.
+            assert!(
+                !loops
+                    .iter()
+                    .any(|lp| header_lt_bound_for_test(&ops, lp) == Some((3, 0))),
+                "inclusive header must not resolve as i < n; scan={scan:?} loops={loops:?}"
+            );
+        }
     }
 
     #[test]

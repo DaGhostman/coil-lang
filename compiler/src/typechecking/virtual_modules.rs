@@ -65,9 +65,7 @@ pub const ENV_MODULE: &str = "env";
 #[cfg(feature = "crypto")]
 pub const CRYPTO_MODULE: &str = "crypto";
 
-/// PCRE2 regex (`compile`, `is_match`, `find_all`, …).
-#[cfg(feature = "regex")]
-pub const REGEX_MODULE: &str = "regex";
+/// PCRE2 regex moved to [coil-regex](https://github.com/ardax-corp/coil-regex).
 
 /// Explicit GC pins and weak handles (`root`, `weak`, `Root`, `Weak`, …).
 pub const GC_MODULE: &str = "gc";
@@ -1013,28 +1011,6 @@ impl VirtualModules {
             modules.insert(CRYPTO_MODULE, crypto_exports);
         }
 
-        #[cfg(feature = "regex")]
-        {
-            let mut regex_exports = vec![
-                BuiltinExport::OpaqueType { name: "Regex" },
-                BuiltinExport::Enum {
-                    name: common::BUILTIN_REGEX_ERROR_ENUM,
-                },
-            ];
-            regex_exports.extend(host_exports(&[
-                ("compile", "regex_compile"),
-                ("is_match", "regex_is_match"),
-                ("find", "regex_find"),
-                ("find_all", "regex_find_all"),
-                ("captures", "regex_captures"),
-                ("captures_all", "regex_captures_all"),
-                ("split", "regex_split"),
-                ("replace", "regex_replace"),
-                ("replace_all", "regex_replace_all"),
-            ]));
-            modules.insert(REGEX_MODULE, regex_exports);
-        }
-
         Self { modules }
     }
 
@@ -1471,10 +1447,14 @@ mod tests {
         let vm = VirtualModules::new();
         #[cfg(feature = "time")]
         assert!(vm.resolves_use(&["time".into()], "*"));
+        #[cfg(not(feature = "time"))]
+        assert!(!vm.resolves_use(&["time".into()], "*"));
         assert!(vm.resolves_use(&["io".into(), "fs".into()], "*"));
         assert!(vm.resolves_use(&["env".into()], "*"));
         #[cfg(feature = "crypto")]
         assert!(vm.resolves_use(&["crypto".into()], "*"));
+        #[cfg(not(feature = "crypto"))]
+        assert!(!vm.resolves_use(&["crypto".into()], "*"));
 
         #[cfg(feature = "time")]
         assert!(matches!(
@@ -1484,6 +1464,8 @@ mod tests {
                 registry: "time_epoch"
             })
         ));
+        #[cfg(not(feature = "time"))]
+        assert!(vm.resolve_item(&["time".into()], "epoch").is_none());
         assert!(matches!(
             vm.resolve_item(&["io".into(), "fs".into()], "exists"),
             Some(BuiltinExport::HostFn {
@@ -1506,16 +1488,28 @@ mod tests {
                 registry: "crypto_sha256"
             })
         ));
-        #[cfg(feature = "regex")]
-        assert!(vm.resolves_use(&["regex".into()], "*"));
-        #[cfg(feature = "regex")]
-        assert!(matches!(
-            vm.resolve_item(&["regex".into()], "compile"),
-            Some(BuiltinExport::HostFn {
-                surface: "compile",
-                registry: "regex_compile"
-            })
+        #[cfg(not(feature = "crypto"))]
+        assert!(vm.resolve_item(&["crypto".into()], "sha256").is_none());
+        assert!(!vm.resolves_use(&["regex".into()], "*"));
+        assert!(vm.resolve_item(&["regex".into()], "compile").is_none());
+        #[cfg(feature = "tls")]
+        assert!(vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
         ));
+        #[cfg(not(feature = "tls"))]
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "enable"
+        ));
+        #[cfg(not(feature = "tls"))]
+        assert!(
+            vm.resolve_item(
+                &["io".into(), "net".into(), "tls".into(), "client".into()],
+                "enable"
+            )
+            .is_none()
+        );
         assert!(vm.resolves_use(&["gc".into()], "*"));
         assert!(matches!(
             vm.resolve_item(&["gc".into()], "root"),

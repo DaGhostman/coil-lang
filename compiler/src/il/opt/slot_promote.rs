@@ -24,6 +24,10 @@
 //!   `s`) and a unique in-loop reaching def of `t` can be redirected to `s`
 //!   without interfering with a live `s`. Opaque/`Byte` between refuse; true
 //!   φ merges (multi-pred) refuse. Mandelbrot `tr`/`zr` stays refused.
+//! - Seek-normalize (COI-97, flag off): `Seek` the latch of an innermost
+//!   raising loop to the forward-edge cursor, then drop in-loop self-stores.
+//!   Mandelbrot's inner body has none; outer-loop Seek splits FloatChainStore.
+//!   `Seek` is `tell::Set` and does not refuse the body.
 //! - Uses `il::tell` known-cursor as a gate on LOAD→producer replacement
 //!   (same proof surface as `copy_prop`); dead stores are left to
 //!   `dead_store_at` except for the alias-elide cleanup above.
@@ -437,7 +441,7 @@ fn rewrite_byte_slot_uses(byte: &mut common::Byte, from: u32, to: u32) -> bool {
             }
             true
         }
-        Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+        Instruction::BinSlotImm | Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
             let (op, slot, imm) = byte.bin_slot_imm_parts();
             if slot as u32 != from || to > 255 {
                 return false;
@@ -445,7 +449,7 @@ fn rewrite_byte_slot_uses(byte: &mut common::Byte, from: u32, to: u32) -> bool {
             *byte = common::Byte::new(insn).with_bin_slot_imm(op, to as u8, imm as i16);
             true
         }
-        Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+        Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
             let (op, a, b) = byte.bin_slot_slot_parts();
             if to > 255 {
                 return false;
@@ -744,7 +748,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                         defs.insert(byte.load_store_slot_at(k));
                     }
                 }
-                Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+                Instruction::BinSlotImm | Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
                     let (_, slot, _) = byte.bin_slot_imm_parts();
                     uses.insert(slot as u32);
                 }
@@ -754,7 +758,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                     // Dest lives in the const pool; treat as opaque def.
                     opaque = true;
                 }
-                Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+                Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
                     let (_, a, b) = byte.bin_slot_slot_parts();
                     uses.insert(a as u32);
                     uses.insert(b as u32);
@@ -765,7 +769,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                     uses.insert(b as u32);
                     defs.insert(dest as u32);
                 }
-                Instruction::BinSlotSlotConstJmpf => {
+                Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
                     let o = byte.operand_u32();
                     uses.insert(((o >> 16) & 0xff) as u32);
                     // Second slot is pool-backed — fail closed.
@@ -1257,8 +1261,11 @@ fn slot_used_anywhere(ops: &[IlOp], slot: u32) -> bool {
                             | Instruction::BinSlotImmStore
                             | Instruction::BinSlotSlotStore
                             | Instruction::BinSlotImmJmpf
+                            | Instruction::BinSlotImmJmpt
                             | Instruction::BinSlotSlotJmpf
+                            | Instruction::BinSlotSlotJmpt
                             | Instruction::BinSlotSlotConstJmpf
+                            | Instruction::BinSlotSlotConstJmpt
                             | Instruction::FloatChainStore
                     ) {
                         return true;
@@ -1573,14 +1580,18 @@ fn elide_unused_alias_stores(ops: &mut Vec<IlOp>, entry_tell: u32) {
 ///
 /// Dropping the store hides the fact that the *push* is what really defines the
 /// slot, so a store only goes when every surviving reference to its slot goes
-/// with it. Ops with a slot operand this pass cannot resolve before lowering
-/// (pool-packed `BinSlot*` fused forms, `Seek`, `UnpackAt`) refuse the body.
+/// with it — except in-loop self-stores after Seek-normalize, where the push
+/// already landed on the slot and named-slot readers keep working. Ops with a
+/// slot operand this pass cannot resolve before lowering (pool-packed
+/// `BinSlot*` fused forms, `UnpackAt`) refuse the body. `Seek` is modelled as
+/// `tell::Set` and does not refuse.
 mod tell {
     use std::collections::{HashMap, HashSet};
 
-    use common::Instruction;
+    use common::{Byte, Instruction};
 
-    use crate::il::op::{EntryKind, IlOp};
+    use crate::il::licm::find_natural_loops;
+    use crate::il::op::{EntryKind, IlJumpKind, IlOp, Label};
     use crate::il::tell::TellInfo;
 
     /// Frame-relative slots `op` names as an operand.
@@ -1612,13 +1623,15 @@ mod tell {
                 }
                 Instruction::INC | Instruction::DEC => visit(byte.inc_dec_parts().0 as u32),
                 Instruction::LoadReturnSlot => visit(byte.operand_u32()),
-                // Pool-packed destinations, absolute cursor moves and in-place
-                // unpacks name slots this pass cannot read from the IL alone.
+                Instruction::Seek => {}
+                // Pool-packed destinations and in-place unpacks name slots this
+                // pass cannot read from the IL alone.
                 Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotImmJmpt
                 | Instruction::BinSlotSlotJmpf
+                | Instruction::BinSlotSlotJmpt
                 | Instruction::BinSlotImmStore
                 | Instruction::BinSlotSlotStore
-                | Instruction::Seek
                 | Instruction::UnpackAt => return false,
                 _ => {}
             },
@@ -1736,6 +1749,89 @@ mod tell {
         retained
     }
 
+    fn is_seek(op: &IlOp) -> bool {
+        matches!(op, IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::Seek)
+    }
+
+    fn fresh_label(ops: &[IlOp]) -> Label {
+        let max = ops
+            .iter()
+            .filter_map(|op| match op {
+                IlOp::Label(Label(id)) => Some(*id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        Label(max.saturating_add(1))
+    }
+
+    /// Header/latch tell with the back-edge redirected so the join does not poison.
+    fn profitable_seek_target(
+        ops: &[IlOp],
+        header: usize,
+        latch: usize,
+        entry_tell: u32,
+    ) -> Option<u32> {
+        let mut clone = ops.to_vec();
+        match &mut clone[latch] {
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target,
+                ..
+            } => *target = fresh_label(ops),
+            _ => return None,
+        }
+        let info = crate::il::tell::analyze_il_at(&clone, entry_tell);
+        let fwd = info.tell_before(header).known()?;
+        let back = info.tell_before(latch).known()?;
+        if fwd == back {
+            return None;
+        }
+        let has_self = (header + 1..latch).any(|i| is_self_store(&clone[i], &info, i).is_some());
+        has_self.then_some(fwd)
+    }
+
+    fn is_innermost(lp: &crate::il::licm::NaturalLoop, loops: &[crate::il::licm::NaturalLoop]) -> bool {
+        !loops.iter().any(|inner| {
+            inner.header != lp.header && inner.header > lp.header && inner.latch < lp.latch
+        })
+    }
+
+    /// Insert `Seek` before a back-edge JMP when the forward-seeded body has
+    /// self-stores the header join currently hides (COI-97).
+    ///
+    /// Innermost loops only: an outer loop that wraps a raising inner body will
+    /// also look profitable, but dropping its self-stores splits FloatChainStore
+    /// fuse windows (mandelbrot `cr`).
+    pub(crate) fn seek_normalize_back_edges(ops: &mut Vec<IlOp>, entry_tell: u32) {
+        for _ in 0..find_natural_loops(ops).len().saturating_add(1) {
+            let loops = find_natural_loops(ops);
+            let mut inserts: Vec<(usize, u32)> = Vec::new();
+            for lp in &loops {
+                if !is_innermost(lp, &loops) {
+                    continue;
+                }
+                if lp.latch == 0 || is_seek(&ops[lp.latch - 1]) {
+                    continue;
+                }
+                let Some(fwd) = profitable_seek_target(ops, lp.header, lp.latch, entry_tell) else {
+                    continue;
+                };
+                inserts.push((lp.latch, fwd));
+            }
+            if inserts.is_empty() {
+                break;
+            }
+            inserts.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+            for (idx, seek_to) in inserts {
+                ops.insert(
+                    idx,
+                    IlOp::byte(Byte::new(Instruction::Seek).with_operand_u32(seek_to)),
+                );
+            }
+        }
+    }
+
     /// Drop `LOAD` / `STORE` words the shared cursor proves redundant.
     ///
     /// Runs on one function body, seeded at `entry_tell` (`arity` at a function
@@ -1776,6 +1872,25 @@ mod tell {
                     drop.insert(*idx);
                 }
             }
+            // After Seek-normalize the header is Known, so in-loop `STORE t` at
+            // tell `t+1` is a no-op write. Named-slot readers keep working
+            // because the push already landed on `t`. Straight-line surviving
+            // readers stay with TailCall promotion / `dead_store`.
+            let loops = find_natural_loops(ops);
+            for (idx, _) in &self_stores {
+                if drop.contains(idx) {
+                    continue;
+                }
+                let in_known_innermost = loops.iter().any(|lp| {
+                    is_innermost(lp, &loops)
+                        && *idx > lp.header
+                        && *idx < lp.latch
+                        && cursor.tell_before(lp.header).known().is_some()
+                });
+                if in_known_innermost {
+                    drop.insert(*idx);
+                }
+            }
         }
 
         if drop.is_empty() {
@@ -1793,7 +1908,8 @@ mod tell {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::il::op::Label;
+        use crate::il::op::{IlJumpKind, Label};
+        use crate::il::opt::{OptimizeOptions, optimize_at};
         use common::{Byte, DebugLoc};
 
         fn loc() -> DebugLoc {
@@ -1980,10 +2096,9 @@ mod tell {
             assert_eq!(counts(&ops), (1, 1));
         }
 
-        /// Absolute `Seek` names a cursor this pass cannot reason about from the
-        /// IL alone, so the whole body is refused.
+        /// `Seek` is `tell::Set`; it must not poison promotion for the rest of the body.
         #[test]
-        fn seek_in_body_refuses_slot_promotion() {
+        fn seek_in_body_still_promotes_tail_call() {
             let mut ops = vec![
                 IlOp::byte(Byte::new(common::Instruction::Seek).with_operand_u32(3)),
                 IlOp::Const { imm: 1, loc: loc() },
@@ -1992,12 +2107,368 @@ mod tell {
                 tail_call(1),
             ];
             slot_promote_at(&mut ops, 3);
+            assert_eq!(counts(&ops), (0, 0));
+        }
+
+        fn raising_loop() -> Vec<IlOp> {
+            vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+            ]
+        }
+
+        /// Without Seek-normalize the header is Unknown, so the self-store stays.
+        #[test]
+        fn loop_self_store_stays_when_header_is_unknown() {
+            let mut ops = raising_loop();
+            slot_promote_at(&mut ops, 2);
             assert_eq!(counts(&ops), (1, 1));
+            assert!(!ops.iter().any(is_seek));
+        }
+
+        /// Seek on the latch makes the header Known and drops the in-loop self-store
+        /// even though a `LOAD` of that slot survives.
+        #[test]
+        fn seek_on_back_edge_elides_loop_self_store() {
+            let mut ops = raising_loop();
+            seek_normalize_back_edges(&mut ops, 2);
+            assert!(
+                ops.iter().any(is_seek),
+                "expected a Seek on the latch"
+            );
+            slot_promote_at(&mut ops, 2);
+            assert_eq!(counts(&ops), (1, 0));
+        }
+
+        fn seek_promote_opts(on: bool) -> OptimizeOptions {
+            OptimizeOptions {
+                jump_thread: false,
+                dead_block: false,
+                stack_dce: false,
+                mem_fwd: false,
+                copy_prop: false,
+                slot_promote: false,
+                canon: false,
+                cast_spill: false,
+                algebraic: false,
+                licm: false,
+                loop_bounds: false,
+                return_convoy: false,
+                clone_shared_return: false,
+                bin_join_convoy: false,
+                multi_op_join_convoy: false,
+                invert_guard_branch: false,
+                slot_promote_tell: true,
+                seek_back_edge: on,
+            }
+        }
+
+        fn seek_before_latch(ops: &[IlOp]) -> bool {
+            ops.windows(2).any(|w| {
+                is_seek(&w[0])
+                    && matches!(
+                        w[1],
+                        IlOp::Jump {
+                            kind: IlJumpKind::Unconditional,
+                            ..
+                        }
+                    )
+            })
+        }
+
+        /// Default pipeline leaves Unknown headers: the flag is off, so a
+        /// raising loop keeps its self-store (mandelbrot's shape).
+        #[test]
+        fn optimize_at_default_does_not_seek_normalize() {
+            let mut ops = raising_loop();
+            optimize_at(&mut ops, &seek_promote_opts(false), 2, &mut Vec::new());
+            assert!(!ops.iter().any(is_seek));
+            assert_eq!(counts(&ops), (1, 1));
+        }
+
+        /// `optimize_at` with the flag on is the production wiring (empty-funcs
+        /// buffer). Mandelbrot does not take this path; this loop does.
+        #[test]
+        fn optimize_at_seek_back_edge_elides_raising_loop_store() {
+            let mut ops = raising_loop();
+            optimize_at(&mut ops, &seek_promote_opts(true), 2, &mut Vec::new());
+            assert!(seek_before_latch(&ops), "Seek must sit on the latch");
+            assert_eq!(counts(&ops), (1, 0));
+        }
+
+        /// After Seek-normalize the header join is Known at the forward-edge tell.
+        #[test]
+        fn seek_normalize_makes_raising_header_known() {
+            let mut ops = raising_loop();
+            assert_eq!(
+                crate::il::tell::analyze_il_at(&ops, 2)
+                    .tell_before(1)
+                    .known(),
+                None,
+                "disagreeing latch must poison the header"
+            );
+            seek_normalize_back_edges(&mut ops, 2);
+            assert_eq!(
+                crate::il::tell::analyze_il_at(&ops, 2)
+                    .tell_before(1)
+                    .known(),
+                Some(2)
+            );
+        }
+
+        /// Seek must re-anchor to the forward-edge tell — a wrong absolute
+        /// cursor would leave the latch still disagreeing with the header.
+        #[test]
+        fn seek_normalize_targets_forward_edge_tell() {
+            let mut ops = raising_loop();
+            seek_normalize_back_edges(&mut ops, 2);
+            let seek_to = ops.iter().find_map(|op| match op {
+                IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::Seek => {
+                    Some(byte.operand_u32())
+                }
+                _ => None,
+            });
+            assert_eq!(seek_to, Some(2));
+        }
+
+        /// A second pass must not insert another Seek in front of the latch.
+        #[test]
+        fn seek_normalize_is_idempotent() {
+            let mut ops = raising_loop();
+            seek_normalize_back_edges(&mut ops, 2);
+            let after_first = ops.clone();
+            seek_normalize_back_edges(&mut ops, 2);
+            assert!(ops == after_first, "second pass must not insert another Seek");
+            assert_eq!(ops.iter().filter(|op| is_seek(op)).count(), 1);
+        }
+
+        /// `STORE` floors tell to `slot+1`, so a bare self-store still raises the
+        /// latch — Seek is profitable even without a following LOAD/POP.
+        #[test]
+        fn seek_normalize_store_floor_raising_self_store() {
+            let mut ops = vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+            ];
+            assert_eq!(
+                crate::il::tell::analyze_il_at(&ops, 2)
+                    .tell_before(1)
+                    .known(),
+                None,
+                "STORE floor leaves latch tell above the forward edge"
+            );
+            seek_normalize_back_edges(&mut ops, 2);
+            assert!(seek_before_latch(&ops));
+            slot_promote_at(&mut ops, 2);
+            assert_eq!(counts(&ops), (0, 0));
+        }
+
+        /// A store that actually moves the value is not a self-store, so Seek
+        /// would add a dispatch for nothing.
+        #[test]
+        fn seek_normalize_skips_loop_without_self_store() {
+            let mut ops = vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 5, loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+            ];
+            seek_normalize_back_edges(&mut ops, 2);
+            assert!(!ops.iter().any(is_seek));
+            assert_eq!(counts(&ops), (0, 1));
+        }
+
+        fn nested_raising_loops() -> Vec<IlOp> {
+            vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(1),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(1)),
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(1),
+                    loc: loc(),
+                },
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+            ]
+        }
+
+        /// Outer loops that wrap a raising inner body also look profitable, but
+        /// Seek there splits FloatChainStore (mandelbrot `cr`). Only the
+        /// innermost latch is rewritten.
+        #[test]
+        fn seek_normalize_only_innermost_raising_loop() {
+            let mut ops = nested_raising_loops();
+            seek_normalize_back_edges(&mut ops, 2);
+            let seeks = ops.iter().filter(|op| is_seek(op)).count();
+            assert_eq!(seeks, 1, "outer latch must not get a Seek");
+            assert!(seek_before_latch(&ops));
+            slot_promote_at(&mut ops, 2);
+            // Inner self-store dropped; outer self-store kept.
+            assert_eq!(counts(&ops), (1, 1));
+        }
+
+        /// `JMPF` exit (while-shaped) still Seek-normalizes the back-edge.
+        #[test]
+        fn seek_normalize_while_shaped_raising_loop() {
+            let mut ops = vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Load { slot: 0, loc: loc() },
+                IlOp::Load { slot: 1, loc: loc() },
+                IlOp::Bin {
+                    op: common::Instruction::LE,
+                    loc: loc(),
+                },
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    target: Label(1),
+                    loc: loc(),
+                },
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(1)),
+                IlOp::Return { loc: loc() },
+            ];
+            optimize_at(&mut ops, &seek_promote_opts(true), 2, &mut Vec::new());
+            assert!(seek_before_latch(&ops));
+            assert_eq!(counts(&ops), (3, 0));
+        }
+
+        /// Two reachable while-shaped raising loops are both innermost; each
+        /// latch gets a Seek (inserts from the back must not skip the earlier).
+        #[test]
+        fn seek_normalize_sibling_raising_loops() {
+            let mut ops = vec![
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(0)),
+                IlOp::Load { slot: 0, loc: loc() },
+                IlOp::Load { slot: 1, loc: loc() },
+                IlOp::Bin {
+                    op: common::Instruction::LE,
+                    loc: loc(),
+                },
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    target: Label(2),
+                    loc: loc(),
+                },
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(0),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(2)),
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(1),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(1)),
+                IlOp::Load { slot: 0, loc: loc() },
+                IlOp::Load { slot: 1, loc: loc() },
+                IlOp::Bin {
+                    op: common::Instruction::LE,
+                    loc: loc(),
+                },
+                IlOp::Jump {
+                    kind: IlJumpKind::JumpIfFalse,
+                    target: Label(3),
+                    loc: loc(),
+                },
+                IlOp::Const { imm: 1, loc: loc() },
+                IlOp::StorePop { slot: 2, loc: loc() },
+                IlOp::Load { slot: 2, loc: loc() },
+                IlOp::Pop { loc: loc() },
+                IlOp::Jump {
+                    kind: IlJumpKind::Unconditional,
+                    target: Label(1),
+                    loc: loc(),
+                },
+                IlOp::Label(Label(3)),
+                IlOp::Return { loc: loc() },
+            ];
+            seek_normalize_back_edges(&mut ops, 2);
+            let seeks = ops.iter().filter(|op| is_seek(op)).count();
+            assert_eq!(seeks, 2, "each sibling latch needs its own Seek");
+            slot_promote_at(&mut ops, 2);
+            // Two loop LOADs of slot 2 dropped with their stores; four bound LOADs remain.
+            assert_eq!(counts(&ops), (6, 0));
         }
     }
 }
 
-pub(crate) use tell::slot_promote_at;
+pub(crate) use tell::{seek_normalize_back_edges, slot_promote_at};
 
 #[cfg(test)]
 mod tests {

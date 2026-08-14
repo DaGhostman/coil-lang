@@ -54,6 +54,8 @@ pub enum ErrorCode {
     /// be confused with [`Self::UnboundedRecursion`], which is about the
     /// *compiled program's* runtime call stack.
     ExpressionNestingTooDeep,
+    /// Invalid `fn drop(self)` (wrong owner, arity, static, duplicate, …).
+    InvalidDrop,
 
     // --- Enums / match / constructs (E02xx) ---
     DuplicateEnum,
@@ -127,6 +129,7 @@ impl ErrorCode {
             Self::UnreachableCode => "E0118",
             Self::DeferNeverRuns => "E0123",
             Self::ExpressionNestingTooDeep => "E0125",
+            Self::InvalidDrop => "E0126",
             Self::DuplicateEnum => "E0200",
             Self::DuplicateConstructor => "E0201",
             Self::UnknownEnum => "E0202",
@@ -194,6 +197,7 @@ impl ErrorCode {
             Self::UnreachableCode => "unreachable code",
             Self::DeferNeverRuns => "defer will never run on function exit",
             Self::ExpressionNestingTooDeep => "expression nested too deeply for the compiler",
+            Self::InvalidDrop => "invalid drop method",
             Self::DuplicateEnum => "duplicate enum",
             Self::DuplicateConstructor => "duplicate constructor",
             Self::UnknownEnum => "unknown enum",
@@ -269,6 +273,7 @@ mod tests {
             | UnreachableCode
             | DeferNeverRuns
             | ExpressionNestingTooDeep
+            | InvalidDrop
             | DuplicateEnum
             | DuplicateConstructor
             | UnknownEnum
@@ -326,6 +331,7 @@ mod tests {
             UnreachableCode,
             DeferNeverRuns,
             ExpressionNestingTooDeep,
+            InvalidDrop,
             DuplicateEnum,
             DuplicateConstructor,
             UnknownEnum,

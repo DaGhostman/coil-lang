@@ -376,6 +376,8 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
+An inherent `fn drop()` is a GC-time finalizer (not RAII). The receiver is implicit `self` by value (same as other instance methods); it must return `unit` and appear at most once per class. Explicit `obj.drop()` is allowed and counts toward the once-limit. Storing `self` from `drop` can keep the object alive after the sweep; drop still runs at most once. See [`gc`](gc.md).
+
 Inherent method names are **not** bound as bare identifiers inside the method body (so `use thread::{send, recv};` keeps `send` / `recv` visible even if you write `fn send(...)`). Call the method as `self.send(...)` (or `Class::method(...)` for `static fn`). Bare `send(...)` resolves to the imported function.
 
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
@@ -481,7 +483,7 @@ Primitive casts use postfix `expr as T` (`int` / `float` / `byte` / `bool`). `fl
 | Group | `(expr)` | Single expr — **not** a 1-tuple |
 | Tuple | `(e1, e2)` or `(e,)` | Comma required for tuple |
 | Array | `[e1, e2, ...]` or `[]` | Homogeneous; literal → `[T; N]`; empty `[]` needs `Vec<T>` / `[T; 0]` |
-| Dict | `{ name: expr, ... }` | Anonymous record |
+| Dict | `{ name: expr, ... }` | Anonymous record; field names must be unique (`E0208`) |
 | Construct | `Enum::Variant(...)` | Qualified constructor |
 | Call | `f(args)` | Args are positional `expr` and/or named `name: expr` (positional prefix, then named; no positional after named). Includes user functions and FFI-wrapped extern fns |
 | Instantiate | `new Class(args)` | Class construction |
@@ -548,6 +550,8 @@ record_pattern  ::= '{' field_pattern (',' field_pattern)* '}'
 field_pattern   ::= IDENT (':' pattern)?   /* shorthand: x => x: x */
 ```
 
+Field names in a record literal, constructor, pattern, or enum variant field list must be unique (`E0208`).
+
 Examples:
 
 ```coil
@@ -561,6 +565,8 @@ match p {
     Point::Point { x, y } => x + y,
 }
 ```
+
+`match` copies the scrutinee (fields included). Nested `match` on the same value is allowed; outer pattern bindings stay in scope unless an inner pattern shadows them. See [Enums and Match](../manual/tutorial/03-enums-and-match.md#match-does-not-consume-the-scrutinee). Pattern matching is spelled `match` only; `case` is not an alias ([limitations.md](../internals/limitations.md) COI-74).
 
 ---
 
@@ -622,15 +628,7 @@ With `coil.toml`, the pipeline discovers dependencies via `use` / `mod` and comp
 
 ---
 
-## Not yet in the grammar
-
-These appear in planning docs but are **not** parsed from source today:
-
-| Feature | Status |
-|---------|--------|
-| `case` as alias for `match` | Not registered |
-
-### Ranges (lazy)
+## Ranges (lazy)
 
 Half-open `start..end` and closed `start..=end` produce
 **`Range<T: Ord>`** / **`RangeInclusive<T: Ord>`** (both bounds unify).
@@ -639,9 +637,10 @@ time and does **not** allocate an array of length `n`. Decreasing
 ranges (`10..0`) are empty (Rust-like). First-class values work
 (`let r = 0..n; for x in r`).
 
-Construction needs only `Ord`. **`for` iteration** steps with `+1` /
-`+1.0` for `int`, `byte`, and `float` (other `Ord` types may form a
-range value but are not iterable yet).
+Construction needs only `Ord`. **`for` iteration** and **`.to_vec()`** step with
+`+1` / `+1.0` for `int`, `byte`, and `float`. Other `Ord` types may form a
+range value but `for` and `.to_vec()` are type errors (no successor protocol).
+Decreasing ranges collect as an empty `Vec`, matching `for`.
 
 ```coil
 use io::{stdout};
@@ -651,13 +650,14 @@ for x in 0..5 { write_all(stdout(), to_bytes(format("%i", x))); }   // 01234
 let r = 0..=3;
 for x in r { write_all(stdout(), to_bytes(format("%i", x))); }      // 0123
 for x in 1.0..4.0 { write_all(stdout(), to_bytes(format("%f", x))); } // 1.02.03.0
+let xs: Vec<int> = (0..5).to_vec();   // [0, 1, 2, 3, 4]
+let ys = r.to_vec();                  // Vec<int> [0, 1, 2, 3]
 ```
 
-See `examples/range.hy`.
+See `examples/range.hy` and `tests/positive/range_to_vec.hy`.
 
-**Deferred:** turning a range into a concrete array (e.g. a future
-`collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric
-`Ord` types.
+**Deferred:** step syntax (`0..10 step 2`). Non-numeric `Ord` iteration is
+intentionally unsupported.
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

@@ -9,8 +9,7 @@ machine = { path = "../machine", default-features = false }
 rkyv = "0.8.12"
 
 [features]
-default = ["crypto", "time", "regex", "tls"]
+default = ["crypto", "time", "tls"]
 crypto = ["machine/crypto"]
 time = ["machine/time"]
-regex = ["machine/regex"]
 tls = ["machine/tls"]

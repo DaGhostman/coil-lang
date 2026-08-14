@@ -18,6 +18,8 @@ pub struct Lowered {
     pub pre_to_post: HashMap<usize, usize>,
     /// Post-fusion bytecode length.
     pub code_len: usize,
+    /// Post-opt, pre-fuse ops when captured for the cursor_model gate.
+    pub pre_fuse_ops: Option<Vec<IlOp>>,
 }
 
 /// Intermediate slot before PC assignment. Jump targets stay symbolic.
@@ -27,14 +29,15 @@ enum Slot {
     Jump(IlJumpKind, Label, DebugLoc),
     Entry(EntryKind, u32, Label, DebugLoc),
     PrologueJmp(DebugLoc),
-    CmpJmpf(u8, Label, DebugLoc),
-    LogNotJmpf(Label, DebugLoc),
+    CmpJmpf(u8, Label, DebugLoc, bool),
+    LogNotJmpf(Label, DebugLoc, bool),
     BinSlotImmJmpf {
         op: u8,
         slot: u8,
         imm: i16,
         target: Label,
         loc: DebugLoc,
+        if_true: bool,
     },
     BinSlotSlotJmpf {
         op: u8,
@@ -42,8 +45,9 @@ enum Slot {
         b: u8,
         target: Label,
         loc: DebugLoc,
+        if_true: bool,
     },
-    /// `BinSlotSlot <float-arith>; CONST pool; <float-cmp>; JMPF`.
+    /// `BinSlotSlot <float-arith>; CONST pool; <float-cmp>; JMPF/JMPT`.
     BinSlotSlotConstJmpf {
         bin_op: u8,
         a: u8,
@@ -52,6 +56,7 @@ enum Slot {
         float_pool_idx: u16,
         target: Label,
         loc: DebugLoc,
+        if_true: bool,
     },
 }
 
@@ -62,8 +67,8 @@ impl Slot {
             | Slot::Jump(_, _, l)
             | Slot::Entry(_, _, _, l)
             | Slot::PrologueJmp(l)
-            | Slot::CmpJmpf(_, _, l)
-            | Slot::LogNotJmpf(_, l)
+            | Slot::CmpJmpf(_, _, l, _)
+            | Slot::LogNotJmpf(_, l, _)
             | Slot::BinSlotImmJmpf { loc: l, .. }
             | Slot::BinSlotSlotJmpf { loc: l, .. }
             | Slot::BinSlotSlotConstJmpf { loc: l, .. } => *l,
@@ -119,10 +124,23 @@ pub fn lower_with_funcs(ops: &[IlOp], funcs: &[IlFunc], pool: &mut Vec<u64>) -> 
 ///
 /// Pipeline: per-body opts/GVN → concat → whole-buffer multi_op → single lower.
 pub fn lower_module(module: &mut super::IlModule, pool: &mut Vec<u64>) -> Lowered {
+    lower_module_inner(module, pool, false)
+}
+
+/// Like [`lower_module`], optionally retaining the post-opt pre-fuse op stream.
+pub(crate) fn lower_module_inner(
+    module: &mut super::IlModule,
+    pool: &mut Vec<u64>,
+    capture_ops: bool,
+) -> Lowered {
     super::bounds::reset_bounds_stats();
     super::canon::reset_canon_stats();
     let flat = module.optimize_and_flatten(&opt::OptimizeOptions::default(), pool);
-    lower_optimized(&flat, pool)
+    let mut lowered = lower_optimized(&flat, pool);
+    if capture_ops {
+        lowered.pre_fuse_ops = Some(flat);
+    }
+    lowered
 }
 
 /// Fuse-select + PC assign for an already-optimized op stream (no IL opts).
@@ -214,6 +232,7 @@ pub(crate) fn lower_optimized(ops: &[IlOp], pool: &mut Vec<u64>) -> Lowered {
         label_pcs,
         pre_to_post,
         code_len,
+        pre_fuse_ops: None,
     }
 }
 
@@ -279,6 +298,14 @@ fn absolute_jump_targets(slots: &[Slot]) -> std::collections::HashSet<usize> {
     set
 }
 
+fn cond_jump(slot: &Slot) -> Option<(bool, Label)> {
+    match slot {
+        Slot::Jump(IlJumpKind::JumpIfFalse, t, _) => Some((false, *t)),
+        Slot::Jump(IlJumpKind::JumpIfTrue, t, _) => Some((true, *t)),
+        _ => None,
+    }
+}
+
 fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)> {
     // Fuse-select order mirrors historical peephole try_fuse; JMPF targets stay symbolic.
     if let Some((s, n)) = try_fuse_float_chain_store(window, pool) {
@@ -318,8 +345,8 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
         }
     }
     if window.len() >= 2
-        && let (Some(b0), Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _)) =
-            (slot_as_byte(&window[0]), &window[1])
+        && let (Some(b0), Some((if_true, tgt))) =
+            (slot_as_byte(&window[0]), cond_jump(&window[1]))
     {
         if *b0.bytecode() == Instruction::BinSlotImm {
             let (op, slot, imm) = b0.bin_slot_imm_parts();
@@ -329,8 +356,9 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
                         op,
                         slot: slot as u8,
                         imm: imm as i16,
-                        target: *tgt,
+                        target: tgt,
                         loc: window[0].loc(),
+                        if_true,
                     },
                     2,
                 ));
@@ -344,19 +372,20 @@ fn try_fuse_slots(window: &[Slot], pool: &mut Vec<u64>) -> Option<(Slot, usize)>
                         op,
                         a: a as u8,
                         b: b as u8,
-                        target: *tgt,
+                        target: tgt,
                         loc: window[0].loc(),
+                        if_true,
                     },
                     2,
                 ));
             }
         }
         if *b0.bytecode() == Instruction::LogNot {
-            return Some((Slot::LogNotJmpf(*tgt, window[0].loc()), 2));
+            return Some((Slot::LogNotJmpf(tgt, window[0].loc(), if_true), 2));
         }
         if is_jmpf_cond_op(*b0.bytecode()) {
             return Some((
-                Slot::CmpJmpf(*b0.bytecode() as u8, *tgt, window[0].loc()),
+                Slot::CmpJmpf(*b0.bytecode() as u8, tgt, window[0].loc(), if_true),
                 2,
             ));
         }
@@ -685,9 +714,7 @@ fn try_fuse_bin_slot_slot_const_jmpf_ready(window: &[Slot]) -> Option<Slot> {
     let b0 = slot_as_byte(&window[0])?;
     let b1 = slot_as_byte(&window[1])?;
     let b2 = slot_as_byte(&window[2])?;
-    let Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _) = &window[3] else {
-        return None;
-    };
+    let (if_true, tgt) = cond_jump(&window[3])?;
     if *b0.bytecode() != Instruction::BinSlotSlot {
         return None;
     }
@@ -705,8 +732,9 @@ fn try_fuse_bin_slot_slot_const_jmpf_ready(window: &[Slot]) -> Option<Slot> {
         b: b as u8,
         cmp_op: *b2.bytecode() as u8,
         float_pool_idx,
-        target: *tgt,
+        target: tgt,
         loc: window[0].loc(),
+        if_true,
     })
 }
 
@@ -719,9 +747,7 @@ fn try_fuse_load_load_arith_const_jmpf(window: &[Slot]) -> Option<Slot> {
     let b2 = slot_as_byte(&window[2])?;
     let b3 = slot_as_byte(&window[3])?;
     let b4 = slot_as_byte(&window[4])?;
-    let Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _) = &window[5] else {
-        return None;
-    };
+    let (if_true, tgt) = cond_jump(&window[5])?;
     let a = load_slot(&b0)?;
     let b = load_slot(&b1)?;
     if !is_float_arith_op(*b2.bytecode()) {
@@ -737,8 +763,9 @@ fn try_fuse_load_load_arith_const_jmpf(window: &[Slot]) -> Option<Slot> {
         b,
         cmp_op: *b4.bytecode() as u8,
         float_pool_idx,
-        target: *tgt,
+        target: tgt,
         loc: window[0].loc(),
+        if_true,
     })
 }
 
@@ -749,9 +776,7 @@ fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
     let b0 = slot_as_byte(&window[0])?;
     let b1 = slot_as_byte(&window[1])?;
     let b2 = slot_as_byte(&window[2])?;
-    let Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _) = &window[3] else {
-        return None;
-    };
+    let (if_true, tgt) = cond_jump(&window[3])?;
     let slot = load_slot(&b0)?;
     let imm = i16::try_from(const_inline_value(&b1)?).ok()?;
     if !is_jmpf_cond_op(*b2.bytecode()) {
@@ -761,8 +786,9 @@ fn try_fuse_load_const_cmp_jmpf_slot(window: &[Slot]) -> Option<Slot> {
         op: *b2.bytecode() as u8,
         slot,
         imm,
-        target: *tgt,
+        target: tgt,
         loc: window[0].loc(),
+        if_true,
     })
 }
 
@@ -773,9 +799,7 @@ fn try_fuse_load_load_op_jmpf_slot(window: &[Slot]) -> Option<Slot> {
     let b0 = slot_as_byte(&window[0])?;
     let b1 = slot_as_byte(&window[1])?;
     let b2 = slot_as_byte(&window[2])?;
-    let Slot::Jump(IlJumpKind::JumpIfFalse, tgt, _) = &window[3] else {
-        return None;
-    };
+    let (if_true, tgt) = cond_jump(&window[3])?;
     let a = load_slot(&b0)?;
     let b = load_slot(&b1)?;
     if !is_jmpf_cond_op(*b2.bytecode()) {
@@ -785,8 +809,9 @@ fn try_fuse_load_load_op_jmpf_slot(window: &[Slot]) -> Option<Slot> {
         op: *b2.bytecode() as u8,
         a,
         b,
-        target: *tgt,
+        target: tgt,
         loc: window[0].loc(),
+        if_true,
     })
 }
 
@@ -891,24 +916,34 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
                 EntryKind::MakePolyFn => Byte::new(Instruction::MakePolyFn).with_operand_u32(pc),
             }
         }
-        Slot::CmpJmpf(op, target, _) => {
+        Slot::CmpJmpf(op, target, _, if_true) => {
             let pc = resolve(labels, *target);
+            let insn = if *if_true {
+                Instruction::CmpJmpt
+            } else {
+                Instruction::CmpJmpf
+            };
             if pc <= u16::MAX as u32 {
-                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(*op, pc as u16)
+                Byte::new(insn).with_cmp_jmpf(*op, pc as u16)
             } else {
                 let idx = pool.len();
                 pool.push(pc as u64);
-                Byte::new(Instruction::CmpJmpf).with_cmp_jmpf_pool(*op, idx as u16)
+                Byte::new(insn).with_cmp_jmpf_pool(*op, idx as u16)
             }
         }
-        Slot::LogNotJmpf(target, _) => {
+        Slot::LogNotJmpf(target, _, if_true) => {
             let pc = resolve(labels, *target);
+            let insn = if *if_true {
+                Instruction::LogNotJmpt
+            } else {
+                Instruction::LogNotJmpf
+            };
             if pc <= u16::MAX as u32 {
-                Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(pc as u16)
+                Byte::new(insn).with_log_not_jmpf(pc as u16)
             } else {
                 let idx = pool.len();
                 pool.push(pc as u64);
-                Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf_pool(idx as u16)
+                Byte::new(insn).with_log_not_jmpf_pool(idx as u16)
             }
         }
         Slot::BinSlotImmJmpf {
@@ -916,20 +951,36 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             slot,
             imm,
             target,
+            if_true,
             ..
         } => {
             let pc = resolve(labels, *target);
             let idx = pool.len();
             pool.push(((pc as u64) << 32) | (*imm as u16 as u32 as u64));
-            Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(*op, *slot, idx as u16)
+            let insn = if *if_true {
+                Instruction::BinSlotImmJmpt
+            } else {
+                Instruction::BinSlotImmJmpf
+            };
+            Byte::new(insn).with_bin_slot_imm_jmpf(*op, *slot, idx as u16)
         }
         Slot::BinSlotSlotJmpf {
-            op, a, b, target, ..
+            op,
+            a,
+            b,
+            target,
+            if_true,
+            ..
         } => {
             let pc = resolve(labels, *target);
             let idx = pool.len();
             pool.push(((pc as u64) << 32) | (*b as u64));
-            Byte::new(Instruction::BinSlotSlotJmpf).with_bin_slot_slot_jmpf(*op, *a, idx as u16)
+            let insn = if *if_true {
+                Instruction::BinSlotSlotJmpt
+            } else {
+                Instruction::BinSlotSlotJmpf
+            };
+            Byte::new(insn).with_bin_slot_slot_jmpf(*op, *a, idx as u16)
         }
         Slot::BinSlotSlotConstJmpf {
             bin_op,
@@ -938,6 +989,7 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
             cmp_op,
             float_pool_idx,
             target,
+            if_true,
             ..
         } => {
             let pc = resolve(labels, *target);
@@ -948,11 +1000,12 @@ fn encode_slot(slot: &Slot, labels: &HashMap<u32, usize>, pool: &mut Vec<u64>) -
                 *float_pool_idx,
                 pc,
             ));
-            Byte::new(Instruction::BinSlotSlotConstJmpf).with_bin_slot_slot_const_jmpf(
-                *bin_op,
-                *a,
-                idx as u16,
-            )
+            let insn = if *if_true {
+                Instruction::BinSlotSlotConstJmpt
+            } else {
+                Instruction::BinSlotSlotConstJmpf
+            };
+            Byte::new(insn).with_bin_slot_slot_const_jmpf(*bin_op, *a, idx as u16)
         }
     }
 }
@@ -2216,6 +2269,34 @@ mod tests {
                 .iter()
                 .map(|b| *b.bytecode())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// COI-80 retain path: only `capture_ops` fills `pre_fuse_ops` for the gate.
+    #[test]
+    fn lower_module_inner_captures_pre_fuse_ops_only_when_requested() {
+        let loc = DebugLoc::unknown();
+        let ops = vec![
+            IlOp::Const { imm: 1, loc },
+            IlOp::Return { loc },
+        ];
+        let mut pool = Vec::new();
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let plain = lower_module_inner(&mut module, &mut pool, false);
+        assert!(plain.pre_fuse_ops.is_none());
+
+        let mut module = crate::il::IlModule::from_flat(&ops, &[]);
+        let captured = lower_module_inner(&mut module, &mut pool, true);
+        let snap = captured
+            .pre_fuse_ops
+            .as_ref()
+            .expect("capture_ops must retain post-opt flat");
+        assert!(!snap.is_empty());
+        let emitting = snap.iter().filter(|op| op.emits_code()).count();
+        assert_eq!(
+            captured.pre_to_post.len(),
+            emitting,
+            "pre_to_post keys cover every emitting pre-fuse op"
         );
     }
 }

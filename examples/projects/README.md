@@ -1,6 +1,6 @@
 # Showcase example projects
 
-Four escalating apps under `examples/projects/`. Each has its own `coil.toml`,
+Three escalating apps under `examples/projects/`. Each has its own `coil.toml`,
 `src/`, co-located `tests/`, and `NOTES.md`. **Do not** put these suites under
 repo-root `tests/` (that tree is for language/compiler harness cases).
 
@@ -9,15 +9,16 @@ repo-root `tests/` (that tree is for language/compiler harness cases).
 | `01-todo` | Core language (classes, arrays, modules) | prints a seeded board summary |
 | `02-adventure` | Interactive stdin REPL + modules + save/load | playable text adventure |
 | `03-echo` | TCP + coroutines + protocol module | single-process echo → `ok` |
-| `04-http` | Userland [coil-stdlib HTTP](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md) client + local HTTP/1.1 server | cleartext `get` → `ok` |
+
+HTTP client/server is **[coil-http](https://github.com/ardax-corp/coil-http)** — install via [spool](https://github.com/ardax-corp/spool), not vendored here.
 
 ## Run demos (scripts)
 
 From the repo root (builds a release binary if needed):
 
 ```bash
-./examples/projects/run-demos.sh     # todo + adventure transcript + echo + http
-./examples/projects/run-tests.sh     # co-located tests for all four
+./examples/projects/run-demos.sh     # todo + adventure transcript + echo
+./examples/projects/run-tests.sh     # co-located tests for all three
 ```
 
 Per project:
@@ -27,7 +28,6 @@ Per project:
 ./examples/projects/02-adventure/demo.sh          # interactive on a TTY
 ./examples/projects/02-adventure/demo.sh --ci     # pipe transcript.txt under timeout
 ./examples/projects/03-echo/demo.sh
-./examples/projects/04-http/demo.sh
 ```
 
 Adventure CI input lives in `02-adventure/transcript.txt`.
@@ -52,7 +52,6 @@ cargo run --release -- examples/projects/01-todo/src/main.hy
 timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.hy \
   < examples/projects/02-adventure/transcript.txt
 timeout 10s cargo run --release -- examples/projects/03-echo/src/main.hy
-./examples/projects/04-http/demo.sh
 ```
 
 ## Per-project unit tests
@@ -75,7 +74,6 @@ ergonomics (no `coil test --project …` yet).
 | `01-todo` | `board.hy` + `main.hy` |
 | `02-adventure` | `world.hy` + `commands.hy` + `save.hy` + `main.hy` |
 | `03-echo` | `protocol.hy` + `server.hy` + `client.hy` + `main.hy` |
-| `04-http` | `server.hy` + `main.hy` + coil-stdlib `http/*` |
 
 ## Rolled-up language / tooling gaps
 
@@ -91,5 +89,3 @@ See each project's `NOTES.md` for detail. Highlights:
    `multi_file_io_hostinvoke_try_in_dependency` in
    `compiler/tests/namespace.rs`); demos may still keep Stream IO in the
    entry for layout clarity.
-7. Import HTTP types from the module that defines them (`http::url`,
-   `http::request`, `http::response`). `use` does not re-export.

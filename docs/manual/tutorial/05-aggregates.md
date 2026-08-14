@@ -148,7 +148,9 @@ Indexing uses the same `arr[i]` syntax as tuples (also works on `Vec`).
   let _ = arr[i];        // OK
   ```
 
-**`Vec<T>`:** no compile-time out-of-bounds check on variable indices.
+**`Vec<T>`:** no compile-time out-of-bounds check on variable indices. At
+runtime an out-of-range read yields `-1` and an out-of-range write is a no-op
+(same as `[T; N]` with a variable index). See [Arrays and Vec](../../references/arrays.md#out-of-range-index).
 
 ### Growing collections with `Vec` and `len`
 
@@ -211,7 +213,7 @@ let d = { foo: 42 };
 write_all(stdout(), to_bytes(format("%i", d.bar)));   // error: Cannot find field `bar` on record `{ foo: int }`
 ```
 
-Duplicate field names in one literal are also rejected:
+Duplicate field names in one literal are rejected at parse time (`E0208`):
 
 ```coil
 let bad = { foo: 1, foo: 2 };   // error: Duplicate field `foo`

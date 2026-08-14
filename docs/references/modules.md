@@ -69,7 +69,6 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `time` | `timestamp`, `Period`, `format` / `parse`, monotonic `Instant` | No — `use time::{timestamp, sleep_ms, …};` |
 | `env` | `args`, `var`, `cwd`, `exit`, `exec` (argv-only) | No — `use env::{args, var, …};` |
 | `crypto` | Hashes, HMAC, AEAD, Ed25519, Argon2, `random_bytes`, … | No — `use crypto::{sha256, random_bytes, …};` |
-| `regex` | PCRE2 `compile` / `is_match` / `find` / `captures` / `split` / `replace` | No — `use regex::{compile, is_match, …};` |
 | `thread` | `spawn`, channels, mutexes | No — `use thread::{spawn, join, channel, …};` |
 | `gc` | `Root` / `Weak`, `root` / `unroot` / `get` / `weak` / `upgrade`, `heap_bytes` / `collect` | No — `use gc::{root, weak, collect, …};` |
 
@@ -85,7 +84,7 @@ trait Eq<T> { /* your trait */ }   // now allowed
 
 Without the `as` rebind, `trait Eq` / `enum Option` is a conflict diagnostic.
 
-`coil.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops` + `prelude::test`.
+The implicit prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) is compiler-owned and not configurable via `coil.toml`. Extra disk search paths belong in `[module].roots`.
 
 ---
 

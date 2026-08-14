@@ -2053,6 +2053,47 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_record_fields_are_not_formatted() {
+        let err = format_source("fn main() { let x = { foo: 1, foo: 2 }; }\n")
+            .expect_err("duplicate fields must not format");
+        assert_eq!(err.code(), Some(reporting::ErrorCode::DuplicateField));
+        assert!(
+            err.message().contains("Duplicate field `foo`"),
+            "got {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn duplicate_construct_and_enum_fields_are_not_formatted() {
+        let construct = format_source(
+            "enum E { Foo { x: int, y: int } }\nfn main() { E::Foo { x: 1, x: 2 }; }\n",
+        )
+        .expect_err("duplicate construct fields must not format");
+        assert_eq!(
+            construct.code(),
+            Some(reporting::ErrorCode::DuplicateField)
+        );
+        assert!(
+            construct.message().contains("Duplicate field `x`"),
+            "got {}",
+            construct.message()
+        );
+
+        let enum_decl = format_source("enum E { Foo { x: int, x: int } }\n")
+            .expect_err("duplicate enum field decls must not format");
+        assert_eq!(
+            enum_decl.code(),
+            Some(reporting::ErrorCode::DuplicateField)
+        );
+        assert!(
+            enum_decl.message().contains("Duplicate field `x`"),
+            "got {}",
+            enum_decl.message()
+        );
+    }
+
+    #[test]
     fn item_docs_reads_attached_lines() {
         use crate::ast::item_docs;
         let src = "/// Hello\n/// World\nfn f() { return; }\n";

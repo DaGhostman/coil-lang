@@ -52,6 +52,20 @@ Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`
 
 **Result mode:** a function that uses `raise` or Result-`?` has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. One `E` per function.
 
+### Option / Result runtime ABI
+
+User code always sees `Option<T>` / `Result<T, E>`. Codegen picks one of three representations; conversions happen at the boundary. **Decision ([COI-92](https://linear.app/ardax/issue/COI-92)):** keep this matrix — unifying would either box every ground `Option<string>` or invent a niche for `int` / nested / FFI payloads.
+
+| Shape | Representation | When |
+|-------|----------------|------|
+| Ground `Option<T>` whose `T` is a non-null heap pointer (`string`, class, heap aggregate) | Pointer niche: `0` = `None`, payload pointer = `Some` | Locals and direct values at a known ground type |
+| Statically known unary `Option` / `Result` **call return** | Two-slot `[payload, tag]` (`ReturnPair`) | Callee and caller both see a unary enum return; not a coroutine; not a pointer-niche `Option` |
+| Everything else | Boxed heap enum | Generic / nested-nullable / stack-shaped / coroutine / FFI / `CallIndirect` / unknown host |
+
+Cross a niche ↔ boxed boundary with `OptionNicheToHeap` / `HeapOptionToNiche`. `Vec::pop` / `Vec::remove` use allocation-free `HostInvokeNiche` when the item type is heap-only; other host results stay on `HostInvoke` and convert at the boundary.
+
+Do not match on raw `0` vs pointer in user code — `match` / `?` / `??` are the API. See [limitations](../internals/limitations.md).
+
 ---
 
 ## Function types (`Ty::Fun`)
@@ -87,6 +101,10 @@ Ty::Sum {
     ],
 }
 ```
+
+### Runtime representation
+
+User code always sees constructors and `match`. At runtime, enums are heap objects (`MakeEnum`). Codegen may skip that allocation only for a discarded constructor (`MakeEnum; POP`) or a unary variant immediately consumed by `Unpack` / `LoadField(0)`. Wider payloads, values that escape, and control-flow joins stay heap-backed — a DCE ceiling, not a second enum ABI ([COI-94](https://linear.app/ardax/issue/COI-94)). Named-local class unboxing is a different rule ([COI-84](https://linear.app/ardax/issue/COI-84)). Builtin `Option` / `Result` have their own niche / pair / boxed matrix ([Option / Result runtime ABI](#option--result-runtime-abi)).
 
 ### Generic enums (`Ty::App`)
 
@@ -193,10 +211,12 @@ Statics: `Vec::new`, `Vec::with_capacity`, `Vec::from`. Methods: `push`, `pop`,
 
 | Target | Compile-time index | Runtime index |
 |--------|-------------------|---------------|
-| Fixed array `[T; N]` | OOB literal → diagnostic | Allowed (no static check) |
-| `Vec<T>` | N/A | Allowed (no OOB diagnostic) |
+| Fixed array `[T; N]` | OOB literal → diagnostic | Allowed (no static check); OOB load yields `-1`, OOB store is a no-op |
+| `Vec<T>` | N/A | Allowed (no OOB diagnostic); same `-1` / no-op VM contract |
 | Tuple | OOB literal → diagnostic | — |
 | Non-aggregate | Error | — |
+
+`Index` is never rewritten to an unchecked form ([COI-85](https://linear.app/ardax/issue/COI-85)). Prefer `i < len(a)` in loops. Details: [Arrays and Vec](arrays.md#out-of-range-index).
 
 ---
 
@@ -211,7 +231,7 @@ let n = d.x;              // field access
 
 - Two record literals with the same field names and compatible field types unify structurally.
 - Field access on records uses string-keyed `GetField`; enum record variants use index-based `LoadField`.
-- Duplicate field names in one literal → compile error.
+- Duplicate field names in one literal → parse error (`E0208`); typecheck repeats the check if parse is bypassed.
 - Anonymous records have structural `Show` support for `%v` when every field is showable. Fields print in canonical name order as `{ a: 1, b: 2 }`.
 
 Structural `Show` covers tuples and anonymous records automatically. Non-generic
@@ -294,6 +314,8 @@ let p = new readonly Point(1, 2);
 Type pretty-print: `readonly T`. Arrays and dicts have no method exception — external `StoreIndex` / field writes are rejected.
 
 ---
+
+Inherent `fn drop()` on a class is a GC-time finalizer (`unit` return, implicit `self` by value). See [`gc`](gc.md). Named locals are always heap-allocated (`InitTyped`); only a consumed `new Class(args).field` may skip the box, and never when the class has `fn drop()` ([COI-84](https://linear.app/ardax/issue/COI-84)).
 
 ## Class `const` fields
 
@@ -527,15 +549,22 @@ class, `T: c` is rejected as an unsatisfied abstract constraint.
 | `fn f<F: * -> * -> *, Bifunctor, A, B>(F<A, B> x)` | Explicit kind plus a class bound on one parameter |
 | `fn f<c: * -> Constraint, T: c>(T x)` | Constraint-kind parameter and abstract bound |
 
-Call-site strategy:
+### Call-site dispatch
 
-| Situation | Runtime |
-|-----------|---------|
-| Ground call with only **builtin** bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
-| Ground call with named args and/or rest packs (`T...`) under the same builtin bounds | Same monomorphization path — args are reordered/packed to match formals before keying |
-| Shared body / open type params with any bound | **Dictionary passing** — see below |
-| Ground or shared call with user trait bounds | **Dictionary passing** — see below |
+One calling convention, two ways to name the callee. **`CALL`** packs arity and a static bytecode offset. **`CallIndirect`** pops the target from the stack (`CodePtr`, dictionary `Index`, or a `PolyFn` local). Dictionaries are the ABI for open bounds; they are not a second dispatch model.
+
+| Situation | Bytecode |
+|-----------|----------|
+| Direct call to a function or instance method with a known entry | `CALL` |
+| Ground trait method / UFCS (`x.m()` / `m(x)`) with a resolved instance | `CALL` to that instance method. A trailing dictionary is still passed (default / sibling ABI). Primitive `Num`/`Eq`/`Ord` operators further lower to opcodes (`ADD`, `EQ`, …); structural `len` may become `ArrayLen`. |
+| Ground call to a generic whose bounds are only `Num`/`Add`/…/`Ord`/`Lt`/…/`Eq` | **Monomorphize** into a specialized clone (unboxed `ADD`, etc.). No dictionary at the call site. |
+| Same, with named args and/or rest packs (`T...`) | Same monomorphization — args are reordered/packed to match formals before keying |
+| Ground or open call with **user** trait bounds, or builtin `Show` / `Length` | **Dictionary passing** — `CALL` the shared generic body with trailing dict tuples |
+| Open type params inside a generic body (any bound) | `LOAD __dictN`; `Index`; `CallIndirect` |
+| Existential (`Show x`) | Unpack the dict from the value; `CallIndirect` |
 | Escaped generic fn value (`let f = id;`) | `MakePolyFn` / `MakePolyFnCapture` + `CallIndirect` |
+
+**Decision ([COI-78](https://linear.app/ardax/issue/COI-78)):** keep this split. Ground user-trait methods already share the static-entry `CALL` path with ground builtin methods. Extending generic-function monomorphization to user traits would recompile bodies that still carry dictionary `bound_method_call` hints, can leave open `Ty::Var` at call sites (`Show` / `Length`), and would not remove the dictionary ABI that default and sibling methods need. Caps, escaped `PolyFn`, and nested open bounds would still use dictionaries. There is no opcode to fuse a user method into, unlike `Num` → `ADD`.
 
 ### Dictionary passing
 
@@ -901,7 +930,9 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `ffi::types` / `extern struct` — see [FFI tutorial](../manual/tutorial/07-ffi.md) |
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
-| Trait runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
+| Trait runtime | **Decided ([COI-78](https://linear.app/ardax/issue/COI-78)):** ground instance methods use `CALL`; generic user-trait / `Show` / `Length` bounds keep dictionaries. Only ground `Num`/`Ord`/`Eq` (and operator supertraits) monomorphize to opcodes. See [Call-site dispatch](#call-site-dispatch). |
+| Option / Result ABI | **Decided ([COI-92](https://linear.app/ardax/issue/COI-92)):** pointer niche, two-slot call return, or boxed enum — see [Option / Result runtime ABI](#option--result-runtime-abi). |
+| Enum runtime | **Decided ([COI-94](https://linear.app/ardax/issue/COI-94)):** heap objects; DCE may skip discarded or unary-unpack constructors only — see [Runtime representation](#runtime-representation). |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |

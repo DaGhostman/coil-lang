@@ -15,8 +15,7 @@ reporting = { path = "../reporting" }
 coil-cli = { path = "../coil-cli", default-features = false }
 
 [features]
-default = ["crypto", "time", "regex", "tls"]
+default = ["crypto", "time", "tls"]
 crypto = ["compiler/crypto", "coil-cli/crypto"]
 time = ["compiler/time", "coil-cli/time"]
-regex = ["compiler/regex", "coil-cli/regex"]
 tls = ["compiler/tls", "coil-cli/tls"]

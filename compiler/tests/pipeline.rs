@@ -1,8 +1,10 @@
 //! End-to-end golden tests for `.hy` example programs.
 
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Absolute path to coil-stdlib `src/` (sibling clone or `.deps/` checkout).
 fn workspace_stdlib() -> PathBuf {
@@ -64,27 +66,164 @@ impl Write for SharedBuf {
     }
 }
 
+/// Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
+/// thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
+/// actually runs with. infer_inner/do_compile no longer have oversized
+/// inline match arms (see docs/internals/limitations.md), so this is
+/// headroom rather than a load-bearing requirement.
+const EXAMPLE_STACK: usize = 8 * 1024 * 1024;
+
+/// Cap concurrent 8 MiB example-runner threads. Cargo's test threads plus
+/// per-VM reactor workers used to explode OS-thread churn (`make_handler`
+/// SIGSEGV / hang, COI-88). Reuse a tiny pool instead of spawn/join per test.
+const EXAMPLE_POOL_SIZE: usize = 2;
+
+struct ExampleJob {
+    name: String,
+    work: Box<dyn FnOnce() -> String + Send>,
+    reply: Sender<std::thread::Result<String>>,
+}
+
+fn example_job_tx() -> &'static Sender<ExampleJob> {
+    static TX: OnceLock<Sender<ExampleJob>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ExampleJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..EXAMPLE_POOL_SIZE {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("pipe-ex-{i}"))
+                .stack_size(EXAMPLE_STACK)
+                .spawn(move || example_pool_worker(rx))
+                .expect("pipeline example pool worker");
+        }
+        tx
+    })
+}
+
+fn example_pool_worker(rx: Arc<Mutex<Receiver<ExampleJob>>>) {
+    loop {
+        let job = {
+            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.recv()
+        };
+        let Ok(job) = job else { break };
+        set_worker_thread_name(&job.name);
+        let result = catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let _ = job.reply.send(result);
+        set_worker_thread_name("pipe-ex");
+    }
+}
+
+/// Linux/macOS pthread name is what `gdb` / core dumps show (15 bytes).
+fn set_worker_thread_name(name: &str) {
+    let mut buf = [0u8; 16];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = libc::pthread_setname_np(libc::pthread_self(), buf.as_ptr().cast());
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::pthread_setname_np(buf.as_ptr().cast());
+    }
+}
+
+fn run_on_example_stack(name: String, work: impl FnOnce() -> String + Send + 'static) -> String {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    example_job_tx()
+        .send(ExampleJob {
+            name,
+            work: Box::new(work),
+            reply: reply_tx,
+        })
+        .expect("pipeline example pool");
+    match reply_rx.recv().expect("pipeline example pool worker") {
+        Ok(output) => output,
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+#[test]
+fn example_pool_resumes_panic_to_caller() {
+    // Without resume_unwind, catch_unwind around run_example would miss
+    // harness panics (FFI soft-skip probes, assertion failures).
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-probe".into(), || panic!("pool-panic-probe"));
+    }));
+    assert!(
+        panicked.is_err(),
+        "example pool must re-raise job panics to the caller"
+    );
+}
+
+#[test]
+fn example_pool_worker_survives_panic_for_next_job() {
+    // catch_unwind in the worker is load-bearing: a killed worker leaves
+    // later run_example calls blocked forever on reply_rx.recv().
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        run_on_example_stack("panic-then-ok".into(), || panic!("transient pool panic"));
+    }));
+    let out = run_on_example_stack("after-panic".into(), || "ok".to_string());
+    assert_eq!(out, "ok");
+}
+
+#[test]
+fn example_pool_caps_concurrent_jobs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar};
+    use std::time::{Duration, Instant};
+
+    // Encode COI-88: peak concurrent example runners must stay ≤ pool size
+    // even when many cargo-test threads submit jobs at once.
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let n_jobs = EXAMPLE_POOL_SIZE + 4;
+    let start = Arc::new(Barrier::new(n_jobs));
+    let mut handles = Vec::with_capacity(n_jobs);
+    for i in 0..n_jobs {
+        let gate = Arc::clone(&gate);
+        let max_seen = Arc::clone(&max_seen);
+        let start = Arc::clone(&start);
+        handles.push(std::thread::spawn(move || {
+            start.wait();
+            run_on_example_stack(format!("cap-{i}"), move || {
+                let (lock, cvar) = &*gate;
+                let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *count += 1;
+                max_seen.fetch_max(*count, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_millis(40);
+                while Instant::now() < deadline {
+                    let (guard, _) = cvar
+                        .wait_timeout(count, Duration::from_millis(5))
+                        .unwrap_or_else(|e| e.into_inner());
+                    count = guard;
+                }
+                *count -= 1;
+                cvar.notify_all();
+                "done".into()
+            })
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.join().expect("submitter join"), "done");
+    }
+    let peak = max_seen.load(Ordering::SeqCst);
+    assert!(
+        peak >= 1 && peak <= EXAMPLE_POOL_SIZE,
+        "peak concurrent example jobs was {peak}, want 1..={EXAMPLE_POOL_SIZE}"
+    );
+}
+
 fn run_example(path: &str) -> String {
     // File-backed examples may `use` stdlib modules (`io::sync`, …); in-memory
     // compile of the text alone used to miss those until `compile_src` gained
     // discovery — prefer the multifile path so entry paths/debug stay accurate.
-    // Match `RUST_MIN_STACK` in `.cargo/config.toml` / the OS default main
-    // thread stack (`ulimit -s`, 8 MiB on Linux/macOS) that the `coil` CLI
-    // actually runs with. infer_inner/do_compile no longer have oversized
-    // inline match arms (see docs/internals/limitations.md), so this is
-    // headroom rather than a load-bearing requirement.
-    const STACK: usize = 8 * 1024 * 1024;
     let path = path.to_string();
-    // Thread name (truncated to 15 bytes on Linux) helps `gdb`/core-dump
-    // triage point at the offending example after a crash.
-    let thread_name = path.clone();
-    std::thread::Builder::new()
-        .name(thread_name)
-        .stack_size(STACK)
-        .spawn(move || run_example_multifile(&path))
-        .expect("pipeline example thread")
-        .join()
-        .expect("pipeline example thread join")
+    let name = path.clone();
+    run_on_example_stack(name, move || run_example_multifile(&path))
 }
 
 /// Compile and run in-memory source.
@@ -1508,6 +1647,7 @@ fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     libsum
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_sum_via_dlopen_prints_42() {
     let libsum = ensure_ffi_libsum_built();
@@ -1584,8 +1724,7 @@ fn example_strlen_prints_5_compile_src_from_file() {
         }
     };
     assert_eq!(
-        output,
-        "5",
+        output, "5",
         "strlen(\"hello\") via compile_src_from_file should print 5"
     );
 }
@@ -1677,6 +1816,7 @@ fn clean_captured_os_stdout(output: &str) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_printf_prints_hello_42() {
     if machine::resolve_library("c", None, &[]).is_err() {
@@ -1949,6 +2089,173 @@ fn main() {
     assert_eq!(output, "0,01");
 }
 
+#[test]
+fn range_to_vec_collects_int_byte_float() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = (0..5).to_vec();
+    write(stdout(), to_bytes(format("%i", a.len())));
+    write(stdout(), to_bytes(","));
+    let r = 0..=3;
+    write(stdout(), to_bytes(format("%i", r.to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (10..0).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    let lo: byte = 5;
+    let hi: byte = 6;
+    write(stdout(), to_bytes(format("%i", (lo..=hi).to_vec().len())));
+    write(stdout(), to_bytes(","));
+    write(stdout(), to_bytes(format("%i", (1.0..4.0).to_vec().len())));
+}
+"#,
+    );
+    // 0..5 → 5; 0..=3 → 4; 10..0 → 0; byte 5..=6 → 2; float 1.0..4.0 → 3
+    assert_eq!(output, "5,4,0,2,3");
+}
+
+/// `.to_vec()` must yield the same sequence as `for` (shared LE/LEQ + step).
+#[test]
+fn range_to_vec_matches_for_in_elements() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    for x in 0..=3 {
+        write(stdout(), to_bytes(format("%i", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let v = (0..=3).to_vec();
+    let i = 0;
+    while i < v.len() {
+        write(stdout(), to_bytes(format("%i", v[i])));
+        i = i + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (7..=7).to_vec()[0])));
+    write(stdout(), to_bytes("|"));
+    for x in 1.0..=3.0 {
+        write(stdout(), to_bytes(format("%f", x)));
+    }
+    write(stdout(), to_bytes("|"));
+    let f = (1.0..=3.0).to_vec();
+    let j = 0;
+    while j < f.len() {
+        write(stdout(), to_bytes(format("%f", f[j])));
+        j = j + 1;
+    }
+    write(stdout(), to_bytes("|"));
+    write(stdout(), to_bytes(format("%i", (4.0..1.0).to_vec().len())));
+}
+"#,
+    );
+    assert_eq!(output, "0123|0123|7|1.02.03.0|1.02.03.0|0");
+}
+
+/// Int `to_vec` thunks fuse ADD/LE(Q); float sibling thunks keep ADDF and fuse LE(Q)F.
+#[test]
+fn range_to_vec_thunks_use_int_vs_float_opcodes() {
+    let src = r#"
+fn main() {
+    let _a = (0..3).to_vec();
+    let _b = (0..=2).to_vec();
+    let _c = (1.0..3.0).to_vec();
+    let _d = (1.0..=2.0).to_vec();
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("range to_vec compile");
+    let syms = pipeline.program_debug().fn_symbols;
+    let body = |name: &str| {
+        let idx = syms
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing `{name}`; have {:?}",
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        let start = syms[idx].entry_pc as usize;
+        let end = syms
+            .get(idx + 1)
+            .map(|s| s.entry_pc as usize)
+            .unwrap_or(bytecode.len());
+        &bytecode[start..end]
+    };
+    let jmpf_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotSlotJmpf)
+            .map(|b| b.bin_slot_slot_jmpf_parts().0)
+            .collect()
+    };
+    let imm_store_ops = |slice: &[common::Byte]| -> Vec<u8> {
+        slice
+            .iter()
+            .filter(|b| *b.bytecode() == common::Instruction::BinSlotImmStore)
+            .map(|b| b.bin_slot_imm_store_parts().0)
+            .collect()
+    };
+    let has = |slice: &[common::Byte], op: common::Instruction| {
+        slice.iter().any(|b| *b.bytecode() == op)
+    };
+
+    let int_half = body("Range::to_vec");
+    assert_eq!(
+        jmpf_ops(int_half),
+        vec![common::Instruction::LE as u8],
+        "int half-open compare must be LE"
+    );
+    assert_eq!(
+        imm_store_ops(int_half),
+        vec![common::Instruction::ADD as u8],
+        "int half-open step must be ADD"
+    );
+    assert!(!has(int_half, common::Instruction::ADDF));
+
+    let int_inc = body("RangeInclusive::to_vec");
+    assert_eq!(
+        jmpf_ops(int_inc),
+        vec![common::Instruction::LEQ as u8],
+        "int inclusive compare must be LEQ"
+    );
+    assert_eq!(
+        imm_store_ops(int_inc),
+        vec![common::Instruction::ADD as u8],
+        "int inclusive step must be ADD"
+    );
+
+    let float_half = body("Range::__float_to_vec");
+    assert_eq!(
+        jmpf_ops(float_half),
+        vec![common::Instruction::LEF as u8],
+        "float half-open compare must be LEF"
+    );
+    assert!(
+        has(float_half, common::Instruction::ADDF),
+        "float half-open step must use ADDF"
+    );
+    assert!(
+        imm_store_ops(float_half).is_empty(),
+        "float half-open must not fuse int BinSlotImmStore"
+    );
+
+    let float_inc = body("RangeInclusive::__float_to_vec");
+    assert_eq!(
+        jmpf_ops(float_inc),
+        vec![common::Instruction::LEQF as u8],
+        "float inclusive compare must be LEQF"
+    );
+    assert!(
+        has(float_inc, common::Instruction::ADDF),
+        "float inclusive step must use ADDF"
+    );
+}
+
 /// Regression guard: `resume h` used INLINE as a `print` argument
 /// (no intermediate `let` binding) must not corrupt the operand
 /// stack. Pre-fix, the bare `yield expr;` statement's spurious
@@ -2212,6 +2519,7 @@ fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
     run_example_src_with_entry(&src, Some(full.as_path()))
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_array_sum_prints_15() {
     let libsum = ensure_ffi_libsum_built();
@@ -2223,6 +2531,7 @@ fn example_ffi_array_sum_prints_15() {
     assert_eq!(output, "15");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_callback_prints_42() {
     let libsum = ensure_ffi_libsum_built();
@@ -2234,6 +2543,7 @@ fn example_ffi_callback_prints_42() {
     assert_eq!(output, "42");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_struct_return_prints_34() {
     let libsum = ensure_ffi_libsum_built();
@@ -2245,6 +2555,7 @@ fn example_ffi_struct_return_prints_34() {
     assert_eq!(output, "34");
 }
 
+#[cfg(unix)]
 #[test]
 fn example_ffi_callback_return_prints_1() {
     let libsum = ensure_ffi_libsum_built();
@@ -2613,7 +2924,7 @@ use io::net::tcp::{accept, connect_timeout, listen, local_addr, set_nodelay, shu
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_io_timeout_tcp_helpers.bin";
+    let path = "coil_io_timeout_tcp_helpers.bin";
     let file = open(path, "w")?;
 
     let local_on_file = match local_addr(file) {
@@ -3546,9 +3857,8 @@ fn main() {
 fn attr_on_async_fn_rejected_at_compile_time() {
     // Attr-body-crosses-yield desugaring for a coroutine target used to
     // recurse deep enough (~1.5-2 MiB) to risk the default per-test thread
-    // stack before infer_inner/do_compile were split up; run on a dedicated
-    // thread with the same headroom as `run_example` regardless (see
-    // docs/internals/limitations.md).
+    // stack before infer_inner/do_compile were split up; reuse the example
+    // pool's 8 MiB workers instead of spawn/join (COI-88).
     let src = r#"
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -3566,14 +3876,15 @@ fn main() {
 }
 "#
     .to_string();
-    let is_err = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || Pipeline::new().compile_src(&src).is_err())
-        .expect("diagnostic thread")
-        .join()
-        .expect("diagnostic thread join");
+    let is_err = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&is_err);
+    run_on_example_stack("attr-async-diag".into(), move || {
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) =
+            Pipeline::new().compile_src(&src).is_err();
+        String::new()
+    });
     assert!(
-        is_err,
+        *is_err.lock().unwrap_or_else(|e| e.into_inner()),
         "attrs that yield outside target(...args) must be rejected on async fn"
     );
 }
@@ -3878,6 +4189,83 @@ fn main() {
 "#,
     );
     assert_eq!(output, "0");
+}
+
+/// Fused `if i == k { continue/break }` inverts to `*Jmpt` (COI-87). Sum is
+/// 0+1+2+4+5+6 = 18 (skip 3, stop before 7).
+#[test]
+fn for_continue_and_break_guards_invert_to_jmpt() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let sum = 0;
+    for (let i = 0; i < 10; i = i + 1) {
+        if i == 3 { continue; }
+        if i == 7 { break; }
+        sum = sum + i;
+    }
+    write(stdout(), to_bytes(format("%i", sum)));
+}
+"#,
+    );
+    assert_eq!(output, "18");
+}
+
+/// `if !done { break }` must take LogNotJmpt polarity (COI-87).
+#[test]
+fn not_flag_break_log_not_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let done = false;
+    let n = 0;
+    while (n < 10) {
+        if !done { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::LogNotJmpt)),
+        "expected LogNotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
+}
+
+/// Two-local `if a < b { break }` fuses to BinSlotSlotJmpt and takes the break.
+#[test]
+fn two_local_compare_break_bin_slot_slot_jmpt_runs() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let a = 1;
+    let b = 2;
+    let n = 0;
+    while (n < 10) {
+        if a < b { break; }
+        n = n + 1;
+    }
+    write(stdout(), to_bytes(format("%i", n)));
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::BinSlotSlotJmpt)),
+        "expected BinSlotSlotJmpt in bytecode"
+    );
+    assert_eq!(run_example_src(src), "0");
 }
 
 /// Tiny direct-call inlining must preserve call semantics end-to-end.
@@ -4947,11 +5335,215 @@ fn main() {
             !matches!(
                 byte.bytecode(),
                 common::Instruction::INIT
+                    | common::Instruction::InitTyped
                     | common::Instruction::SetField
                     | common::Instruction::GetField
             )
         }),
         "direct class field access should not allocate or touch fields"
+    );
+}
+
+/// Non-first field selection must index the staged ctor args (not always arg 0).
+#[test]
+fn direct_class_second_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", new Point(5, 6).y)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "6");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("second field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "second-field temp elision must not allocate; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `try_emit_direct_class_field_access` unwraps `Group`/`Expr` receivers.
+#[test]
+fn grouped_direct_class_field_access_avoids_temporary_object() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", (new Point(5, 6)).x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("grouped field temp");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code.iter().all(|byte| {
+            !matches!(
+                byte.bytecode(),
+                common::Instruction::INIT
+                    | common::Instruction::InitTyped
+                    | common::Instruction::SetField
+                    | common::Instruction::GetField
+            )
+        }),
+        "grouped new Class(args).field must still elide; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Named locals keep a heap instance (COI-84). Temp `new C(args).field` elides;
+/// `let p = new C(args); p.field` does not — identity, methods, mutation, and
+/// `fn drop()` are observable without a whole-function escape scan.
+#[test]
+fn named_local_class_stays_heap_allocated() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Point {
+    x: int,
+    y: int,
+}
+fn main() {
+    let p = new Point(5, 6);
+    write(stdout(), to_bytes(format("%i", p.x)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "5");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("named local class");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
+        "named local must stay InitTyped; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "named local field read must use GetField; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `fn drop()` forces a real instance even for a consumed `new C(args).field`.
+#[test]
+fn drop_class_temp_field_access_still_allocates() {
+    let src = r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    write(stdout(), to_bytes(format("%i", new Handle(7).fd)));
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "7");
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _) = pipeline.compile_src(src).expect("drop temp field");
+    let symbols = pipeline.program_debug().fn_symbols;
+    let main = symbols
+        .iter()
+        .position(|symbol| symbol.name == "main")
+        .expect("main symbol");
+    let start = symbols[main].entry_pc as usize;
+    let end = symbols
+        .get(main + 1)
+        .map(|symbol| symbol.entry_pc as usize)
+        .unwrap_or(bytecode.len());
+    let main_code = &bytecode[start..end];
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::InitTyped)),
+        "drop class temp must allocate in main so the finalizer can run; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        main_code
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), common::Instruction::GetField)),
+        "drop class temp must GetField the heap instance; opcodes: {:?}",
+        main_code
+            .iter()
+            .map(|b| b.bytecode().mnemonic())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -4973,6 +5565,141 @@ fn main() {
 "#,
     );
     assert_eq!(output, "ok,none");
+}
+
+#[test]
+fn nested_match_keeps_outer_option_field_bindings() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+class BoxInt {
+    opt: Option<int>,
+}
+
+class Node {
+    val: int,
+    left: Option<Node>,
+}
+
+fn nested_boxed(BoxInt b) -> int {
+    return match b.opt {
+        Option::Some(v) => match b.opt {
+            Option::Some(v2) => v + v2,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn nested_shadow(BoxInt b) -> int {
+    return match b.opt {
+        Option::Some(v) => match Option::Some(100) {
+            Option::Some(v) => v,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn nested_niche(Node n) -> int {
+    return match n.left {
+        Option::Some(child) => match n.left {
+            Option::Some(child2) => child.val + child2.val,
+            Option::None => -1,
+        },
+        Option::None => 0,
+    };
+}
+
+fn main() {
+    let b = new BoxInt(Option::Some(21));
+    let leaf = new Node(3, Option::None);
+    let root = new Node(1, Option::Some(leaf));
+    write(stdout(), to_bytes(format("%i,%i,%i", nested_boxed(b), nested_shadow(b), nested_niche(root))));
+}
+"#,
+    );
+    assert_eq!(output, "42,100,6");
+}
+
+#[test]
+fn nested_match_restores_and_chains_outer_bindings() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+
+class BoxInt {
+    opt: Option<int>,
+}
+
+enum Choice {
+    A(int),
+    B,
+}
+
+fn after_nested(BoxInt b) -> int {
+    return match b.opt {
+        Option::Some(v) => {
+            let inner = match Option::Some(1) {
+                Option::Some(x) => x,
+                Option::None => 0,
+            };
+            v + inner
+        },
+        Option::None => 0,
+    };
+}
+
+fn triple(BoxInt box) -> int {
+    return match box.opt {
+        Option::Some(a) => match box.opt {
+            Option::Some(b) => match box.opt {
+                Option::Some(c) => a + b + c,
+                Option::None => -1,
+            },
+            Option::None => -2,
+        },
+        Option::None => 0,
+    };
+}
+
+fn nested_result(Result<int, string> r) -> int {
+    return match r {
+        Result::Ok(v) => match r {
+            Result::Ok(v2) => v + v2,
+            Result::Err(_) => -1,
+        },
+        Result::Err(_) => 0,
+    };
+}
+
+fn nested_choice(Choice c) -> int {
+    return match c {
+        Choice::A(x) => match c {
+            Choice::A(y) => x + y,
+            Choice::B => -1,
+        },
+        Choice::B => 0,
+    };
+}
+
+fn main() {
+    let b = new BoxInt(Option::Some(21));
+    let t = new BoxInt(Option::Some(7));
+    write(stdout(), to_bytes(format(
+        "%i,%i,%i,%i",
+        after_nested(b),
+        triple(t),
+        nested_result(Result::Ok(21)),
+        nested_choice(Choice::A(21)),
+    )));
+}
+"#,
+    );
+    assert_eq!(output, "22,21,42,42");
 }
 
 #[test]
@@ -5163,6 +5890,439 @@ fn main() {
 #[test]
 fn example_gc_collect_clears_weak() {
     assert_eq!(run_example("examples/gc_collect.hy"), "none");
+}
+
+#[test]
+fn example_finalizer_prints_closed() {
+    assert_eq!(run_example("examples/finalizer.hy"), "closed");
+}
+
+#[test]
+fn gc_finalizer_runs_on_collect() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_once_bit_and_explicit_drop() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn main() {
+    let h = new Handle(1);
+    h.drop();
+    h.drop();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_skips_live_root() {
+    let output = run_example_src(
+        r#"
+use gc::{collect, root};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn main() {
+    let h = new Handle(1);
+    let r = root(h);
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
+
+#[test]
+fn gc_finalizer_nested_collect_is_deferred() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        collect();
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+#[test]
+fn gc_finalizer_panic_continues_queue() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+static let drops: int = 0;
+class Boom { fd: int }
+impl Boom {
+    fn drop() {
+        panic "boom";
+    }
+}
+class Ok { fd: int }
+impl Ok {
+    fn drop() {
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let a = new Boom(1);
+    let b = new Ok(2);
+}
+fn main() {
+    make();
+    collect();
+    write(stdout(), to_bytes(format("%i", drops)));
+}
+"#,
+    );
+    assert!(
+        output.ends_with('1'),
+        "Ok drop should still run after Boom panics; got {output:?}"
+    );
+}
+
+#[test]
+fn gc_finalizer_runs_on_teardown() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{to_bytes};
+static let drops: int = 0;
+class Handle { fd: int }
+impl Handle {
+    fn drop() {
+        write(stdout(), to_bytes("closed"));
+        drops = drops + 1;
+    }
+}
+fn make() {
+    let h = new Handle(1);
+}
+fn main() {
+    make();
+}
+"#,
+    );
+    assert_eq!(output, "closed");
+}
+
+#[test]
+fn gc_finalizer_can_upgrade_weak_then_clears() {
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let during: int = 0;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        let live = match held {
+            Option::Some(w) => match upgrade(w) {
+                Option::Some(_) => 1,
+                Option::None => 2,
+            },
+            Option::None => 3,
+        };
+        during = live;
+    }
+}
+fn ephemeral() {
+    let h = new Handle(1);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(_) => 1,
+            Option::None => 0,
+        },
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i", during, after)));
+}
+"#,
+    );
+    assert_eq!(output, "10");
+}
+
+#[test]
+fn gc_finalizer_storing_self_resurrects_once() {
+    // COI-79/COI-95: storing `self` from drop keeps the cell; drop stays once.
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn make() {
+    let h = new Handle(42);
+}
+fn resurrected_fd() -> int {
+    return match kept {
+        Option::Some(h) => h.fd,
+        Option::None => -1,
+    };
+}
+fn clear_kept() {
+    kept = Option::None;
+}
+fn main() {
+    make();
+    collect();
+    let fd = resurrected_fd();
+    let after_first = drops;
+    clear_kept();
+    collect();
+    write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
+}
+"#,
+    );
+    assert_eq!(output, "1142");
+}
+
+#[test]
+fn gc_explicit_drop_store_self_stays_once() {
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn explicit() {
+    let h = new Handle(7);
+    h.drop();
+}
+fn clear_kept() {
+    kept = Option::None;
+}
+fn main() {
+    explicit();
+    collect();
+    let d1 = drops;
+    clear_kept();
+    collect();
+    write(stdout(), to_bytes(format("%i%i", d1, drops)));
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+#[test]
+fn gc_finalizer_store_self_into_root_resurrects() {
+    // COI-79: root(self) during drop is a documented resurrection edge.
+    let output = run_example_src(
+        r#"
+use gc::{collect, get, root, Root};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Root<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(root(self));
+    }
+}
+fn make() {
+    let h = new Handle(42);
+}
+fn main() {
+    make();
+    collect();
+    let fd = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    let after_first = drops;
+    collect();
+    let fd2 = match kept {
+        Option::Some(r) => get(r).fd,
+        Option::None => -1,
+    };
+    write(stdout(), to_bytes(format("%i%i%i%i", after_first, drops, fd, fd2)));
+}
+"#,
+    );
+    assert_eq!(output, "114242");
+}
+
+#[test]
+fn gc_finalizer_store_self_into_reachable_field() {
+    // COI-79: store into a still-reachable object's field (not only a static).
+    let output = run_example_src(
+        r#"
+use gc::{collect};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle {
+    fd: int,
+}
+class Bag {
+    slot: Option<Handle>,
+}
+static let drops: int = 0;
+static let bag: Option<Bag> = Option::None;
+impl Bag {
+    fn put(Handle h) {
+        self.slot = Option::Some(h);
+    }
+    fn fd() -> int {
+        return match self.slot {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        };
+    }
+}
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        match bag {
+            Option::Some(b) => b.put(self),
+            Option::None => (),
+        };
+    }
+}
+fn setup() {
+    bag = Option::Some(new Bag(Option::None));
+}
+fn make() {
+    let h = new Handle(9);
+}
+fn main() {
+    setup();
+    make();
+    collect();
+    let fd = match bag {
+        Option::Some(b) => b.fd(),
+        Option::None => -2,
+    };
+    let after_first = drops;
+    collect();
+    write(stdout(), to_bytes(format("%i%i%i", after_first, drops, fd)));
+}
+"#,
+    );
+    assert_eq!(output, "119");
+}
+
+#[test]
+fn gc_finalizer_resurrection_keeps_weak_upgradable() {
+    // Re-mark after drop must keep weaks to a resurrected cell live.
+    let output = run_example_src(
+        r#"
+use gc::{collect, weak, upgrade, Weak};
+use io::{stdout, write};
+use string::{format, to_bytes};
+class Handle { fd: int }
+static let drops: int = 0;
+static let kept: Option<Handle> = Option::None;
+static let held: Option<Weak<Handle>> = Option::None;
+impl Handle {
+    fn drop() {
+        drops = drops + 1;
+        kept = Option::Some(self);
+    }
+}
+fn ephemeral() {
+    let h = new Handle(3);
+    held = Option::Some(weak(h));
+}
+fn main() {
+    ephemeral();
+    collect();
+    let after = match held {
+        Option::Some(w) => match upgrade(w) {
+            Option::Some(h) => h.fd,
+            Option::None => -1,
+        },
+        Option::None => -2,
+    };
+    write(stdout(), to_bytes(format("%i%i", drops, after)));
+}
+"#,
+    );
+    assert_eq!(output, "13");
 }
 
 #[test]
@@ -5416,7 +6576,10 @@ fn main() {
             .any(|b| matches!(b.bytecode(), Instruction::NEG)),
         "float aggregate negate must not emit int NEG"
     );
-    assert_eq!(run_bytecode(bytecode, constants, &pipeline, None), "-1.5,-2.0");
+    assert_eq!(
+        run_bytecode(bytecode, constants, &pipeline, None),
+        "-1.5,-2.0"
+    );
 }
 
 #[test]
@@ -5557,6 +6720,7 @@ fn example_casts_primitive_as_operators() {
     assert_eq!(run_example("examples/casts.hy"), "13true");
 }
 
+#[cfg(feature = "time")]
 #[test]
 fn example_time_epoch_ok() {
     assert_eq!(run_example("examples/time_demo.hy"), "1");
@@ -5573,6 +6737,7 @@ fn example_ansi_color_prints_red() {
 }
 
 /// HostInvoke + virtual `crypto` wiring: empty SHA-256 digest length is 32.
+#[cfg(feature = "crypto")]
 #[test]
 fn crypto_sha256_empty_digest_len_via_host_invoke() {
     let output = run_example_src(
@@ -5730,9 +6895,9 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_enable_kind.bin";
+    let path = "coil_tls_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 });
+    let r = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -5755,7 +6920,7 @@ use io::net::tls::client::{disable};
 use string::{format, to_bytes};
 
 fn disable_file_is_err() -> int {
-    let path = "/tmp/coil_tls_disable_kind.bin";
+    let path = "coil_tls_disable_kind.bin";
     return match open(path, "w") {
         Result::Ok(s) => match disable(s) {
             Result::Ok(_) => 0,
@@ -5784,7 +6949,7 @@ use io::{open, IoError, Stream, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_arity.bin";
+    let path = "coil_tls_arity.bin";
     let s = open(path, "w")?;
     let r: Result<Stream, IoError> = enable(s, "127.0.0.1");
 }
@@ -5807,7 +6972,7 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_opts.bin";
+    let path = "coil_tls_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", 1)?;
 }
@@ -5827,7 +6992,7 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_empty_opts.bin";
+    let path = "coil_tls_empty_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, "127.0.0.1", {})?;
 }
@@ -5870,9 +7035,9 @@ fn classify(IoError e) -> int {{
 }}
 
 fn main() {{
-    let path = "/tmp/coil_tls_server_enable_kind.bin";
+    let path = "coil_tls_server_enable_kind.bin";
     let s = open(path, "w")?;
-    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}", timeout_ms: 0, client_ca_pem: "" }});
+    let r = enable(s, {{ cert_pem: "{cert_pem}", key_pem: "{key_pem}", timeout_ms: 0, client_ca_pem: "", alpn: "" }});
     let code = match r {{
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -5896,7 +7061,7 @@ use io::net::tls::server::{disable};
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_disable_kind.bin";
+    let path = "coil_tls_server_disable_kind.bin";
     let code = match open(path, "w") {
         Result::Ok(s) => match disable(s) {
             Result::Ok(_) => 0,
@@ -5922,7 +7087,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_opts.bin";
+    let path = "coil_tls_server_opts.bin";
     let s = open(path, "w")?;
     let _ = enable(s, 1)?;
 }
@@ -5942,7 +7107,7 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_empty.bin";
+    let path = "coil_tls_server_empty.bin";
     let s = open(path, "w")?;
     let _ = enable(s, {})?;
 }
@@ -5961,13 +7126,16 @@ fn tls_flat_parent_enable_does_not_compile() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_flat.bin";
+    let path = "coil_tls_flat.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" })?;
 }
 "#,
     );
-    assert!(err.is_err(), "enable must not resolve without tls client/server import");
+    assert!(
+        err.is_err(),
+        "enable must not resolve without tls client/server import"
+    );
 }
 
 /// Legacy `encrypt` / `decrypt` names under server must stay gone.
@@ -5980,9 +7148,9 @@ fn tls_legacy_server_encrypt_decrypt_do_not_compile() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_legacy_encrypt.bin";
+    let path = "coil_tls_legacy_encrypt.bin";
     let s = open(path, "w")?;
-    let _ = encrypt(s, { cert_pem: "x", key_pem: "y", timeout_ms: 0, client_ca_pem: "" })?;
+    let _ = encrypt(s, { cert_pem: "x", key_pem: "y", timeout_ms: 0, client_ca_pem: "", alpn: "" })?;
 }
 "#,
     );
@@ -5996,7 +7164,7 @@ fn main() {
 use io::{open, write};
 
 fn main() {
-    let path = "/tmp/coil_tls_legacy_decrypt.bin";
+    let path = "coil_tls_legacy_decrypt.bin";
     let s = open(path, "w")?;
     let _ = decrypt(s)?;
 }
@@ -6019,9 +7187,9 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_cross_opts.bin";
+    let path = "coil_tls_cross_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 })?;
+    let _ = enable(s, { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" })?;
 }
 "#,
     );
@@ -6060,14 +7228,14 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_both_ns.bin";
+    let path = "coil_tls_both_ns.bin";
     let s = open(path, "w")?;
-    let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0 }) {
+    let c = match client_enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "" }) {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     };
     let s2 = open(path, "w")?;
-    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem", timeout_ms: 0, client_ca_pem: "" }) {
+    let sv = match server_enable(s2, { cert_pem: "not-pem", key_pem: "not-pem", timeout_ms: 0, client_ca_pem: "", alpn: "" }) {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
     };
@@ -6107,9 +7275,9 @@ fn classify(IoError e) -> int {
 }
 
 fn main() {
-    let path = "/tmp/coil_tls_server_empty_pem.bin";
+    let path = "coil_tls_server_empty_pem.bin";
     let s = open(path, "w")?;
-    let r = enable(s, { cert_pem: "", key_pem: "", timeout_ms: 0, client_ca_pem: "" });
+    let r = enable(s, { cert_pem: "", key_pem: "", timeout_ms: 0, client_ca_pem: "", alpn: "" });
     let code = match r {
         Result::Ok(_) => 0,
         Result::Err(e) => classify(e),
@@ -6132,9 +7300,9 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_pem_ty.bin";
+    let path = "coil_tls_server_pem_ty.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { cert_pem: 1, key_pem: 2, timeout_ms: 0, client_ca_pem: "" })?;
+    let _ = enable(s, { cert_pem: 1, key_pem: 2, timeout_ms: 0, client_ca_pem: "", alpn: "" })?;
 }
 "#,
     );
@@ -6154,9 +7322,9 @@ use io::{open, write};
 use io::net::tls::client::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_client_unknown_opts.bin";
+    let path = "coil_tls_client_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "h2" })?;
+    let _ = enable(s, "127.0.0.1", { verify: false, ca_pem: Option::None, ca_path: Option::None, timeout_ms: 0, alpn: "", bogus: "x" })?;
 }
 "#,
     );
@@ -6176,9 +7344,9 @@ use io::{open, write};
 use io::net::tls::server::{enable};
 
 fn main() {
-    let path = "/tmp/coil_tls_server_unknown_opts.bin";
+    let path = "coil_tls_server_unknown_opts.bin";
     let s = open(path, "w")?;
-    let _ = enable(s, { cert_pem: "c", key_pem: "k", timeout_ms: 0, client_ca_pem: "", alpn: "h2" })?;
+    let _ = enable(s, { cert_pem: "c", key_pem: "k", timeout_ms: 0, client_ca_pem: "", alpn: "", bogus: "x" })?;
 }
 "#,
     );
@@ -6195,40 +7363,44 @@ fn example_io_tls_prints_tls_ok() {
     assert_eq!(run_example("examples/io_tls.hy"), "tls-ok");
 }
 
+/// Feature-off `use` of optional virtual modules is a compile error (E0900 /
+/// "Module not found"), not a hang. Stays ungated so `--no-default-features`
+/// still exercises it.
 #[test]
-fn example_regex_demo_prints_expected() {
-    assert_eq!(
-        run_example("examples/regex_demo.hy"),
-        "true,2,a->1 b->2,a|b|c"
+fn optional_virtual_modules_match_cargo_features() {
+    fn check(src: &str, enabled: bool) {
+        let mut pipeline = Pipeline::new();
+        let ok = pipeline.compile_src(src).is_ok();
+        assert_eq!(
+            ok,
+            enabled,
+            "src={src:?} messages={:?}",
+            pipeline.messages()
+        );
+        if !enabled {
+            assert!(
+                pipeline.messages().iter().any(|m| {
+                    m.code() == Some(compiler::ErrorCode::IoError)
+                        || m.message().contains("Module not found")
+                }),
+                "feature-off use must surface Module not found / E0900, got {:?}",
+                pipeline.messages()
+            );
+        }
+    }
+    check("use time::{epoch};\nfn main() {}\n", cfg!(feature = "time"));
+    check(
+        "use crypto::{sha256};\nfn main() {}\n",
+        cfg!(feature = "crypto"),
     );
-}
-
-#[test]
-fn regex_compile_error_is_err_via_host_invoke() {
-    let output = run_example_src(
-        r#"
-use regex::{compile};
-use io::{stdout, write};
-use string::{format, to_bytes};
-
-fn bad() -> int {
-    return match compile("(", "") {
-        Result::Ok(_) => 0,
-        Result::Err(e) => match e {
-            RegexError::Compile => 1,
-            RegexError::Runtime => 2,
-            RegexError::NoMatch => 3,
-            RegexError::Utf8 => 4,
-        },
-    };
-}
-
-fn main() {
-    write(stdout(), to_bytes(format("%i", bad())));
-}
-"#,
+    check(
+        "use regex::{compile};\nfn main() {}\n",
+        false,
     );
-    assert_eq!(output, "1");
+    check(
+        "use io::net::tls::client::{enable};\nfn main() {}\n",
+        cfg!(feature = "tls"),
+    );
 }
 
 /// `#[derive(String)]` end-to-end: synthesized `to_string` is callable.
@@ -6697,10 +7869,7 @@ fn main() {
 }
 "#,
     );
-    assert!(
-        result.is_err(),
-        "unknown identifier must fail compile_src"
-    );
+    assert!(result.is_err(), "unknown identifier must fail compile_src");
     assert!(pipeline.had_errors());
     assert!(
         pipeline
@@ -7651,7 +8820,10 @@ fn main() {
 }
 "#,
     );
-    assert_eq!(output, "2", "push with Construct(format,…) must not drop the vec");
+    assert_eq!(
+        output, "2",
+        "push with Construct(format,…) must not drop the vec"
+    );
 }
 
 /// COI-19: heap value in a user static survives `gc::collect` (static roots).

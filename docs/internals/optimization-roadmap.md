@@ -109,6 +109,9 @@ uses `tell` as the whole safety proof — a `STORE t` reached with the cursor at
 take argument-materialization temps out of the frame (`tak`: 4 LOAD words / 9
 slots / 3 STOREs → 3 LOAD words / 6 slots / 0 STOREs). Joins are free: `tell`
 poisons a point whose predecessors disagree, so `Known` is agreement.
+Operand height (`il::sp`) is a different quantity — `STORE` floors tell without
+raising height — and stays split (COI-81); see
+[limitations](limitations.md#il-optimizations-low).
 
 What neither slice does yet (see
 [limitations](limitations.md#il-optimizations-low) for the full refusal table):
@@ -116,11 +119,11 @@ What neither slice does yet (see
 - **Real slot liveness.** Without it, promotion must leave every slot with a
   visible def, which rules out `CALL` operand runs (the callee frame base is
   `tell - arity`) and any store whose slot is still read.
-- **Cursor normalization at loop back edges.** `mandelbrot`'s inner loop enters
-  with cursor 10 and re-enters with 13, so its header is `Unknown` and none of
-  its 3 body stores are provably redundant. A `Seek` on the back edge would make
-  the header `Known` and turn all three into self-stores — one dispatch per
-  iteration against three stores, worth measuring.
+- **Cursor normalization at loop back edges (COI-97, won't-do in production).**
+  Innermost mandelbrot has no tell-proven self-stores. A `Seek` on an *outer*
+  latch drops `cr`'s store and splits `FloatChainStore`. Prototype lives behind
+  `seek_back_edge` (default off); tests use a synthetic raising loop because
+  mandelbrot does not hit the profitable shape.
 - **Scheduling.** `mandelbrot`'s `tr → zr` copy cannot coalesce because `zr` is
   read between the def and the copy; sinking the def past that read is the fix.
 - **`Bin(slot, TOS)` operand shapes.** `mandelbrot`'s remaining `LOAD 5` / `LOAD
@@ -248,7 +251,7 @@ existing opcode; fits append-only opcode ABI.
 
 | Family | Evidence (post Phases 1–4) | Est. dynamic weight | Recommendation | Rationale |
 |--------|----------------------------|---------------------|----------------|-----------|
-| `*Jmpt` counterparts (`CmpJmpt` / `BinSlot*Jmpt` / `BinSlotSlotConstJmpt` / …) | mandelbrot `would_be_jmpt_after_invert=1` (`BinSlotSlotConstJmpf`; `JMP`); bare `JMPT` only for non-fusable bools | ~1.28M/run (iter escape) | **needs more proof** | Invert intentionally refuses fused `*Jmpf` — would trade one fused dispatch for two. A true `*Jmpt` twin could collapse the escape `JMP`, but only if invert savings beat opcode + decode cost and the shape shows up beyond mandelbrot. Prefer measuring invert-with-`*Jmpt` prototype cost before appending. |
+| `*Jmpt` counterparts (`CmpJmpt` / `BinSlot*Jmpt` / `BinSlotSlotConstJmpt` / …) | mandelbrot escape `BinSlotSlotConstJmpt`; `would_be_jmpt_after_invert=0`; tak/nsieve/numeric stay 0 | ~1.28M/run (iter escape, one dispatch not two) | **done** ([COI-87](https://linear.app/ardax/issue/COI-87)) | Invert fused `*Jmpf; JMP` into `*Jmpt`. Same packing as the false twins. Loop headers remain `*Jmpf`. |
 | Cast spill → `FloatChainStore` | mandelbrot `cr`/`ci` casts | material in mandelbrot float body | **done** | Hoist `LOAD; Cast` to float temps (`il::cast_spill`, default on) + fuse stage0 `LOAD;CONST` / const-under (existing ext flags). |
 | Function tree-shake | eager `Hash__*`/`Show__*`/… thunks in archives | binary size / dissect noise | **done** | Reachability prune before lower (`il::treeshake`); roots = `main` (+ tests when included). |
 | Unused-slot DCE across jumps | assignment-only locals kept by jump-as-used | IL store noise | **done** | `dead_store` whole-body unread slots ignore Jump/Label; cursor proof unchanged. |

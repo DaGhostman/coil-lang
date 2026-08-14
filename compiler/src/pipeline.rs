@@ -84,6 +84,9 @@ pub struct Pipeline {
     sink: Box<dyn DiagnosticSink>,
     /// How many compiler messages have already been emitted to [`Self::sink`].
     messages_emitted: usize,
+    /// Retain post-opt IL across the next [`Self::compile_src`] (cursor_model).
+    retain_cursor_il: bool,
+    cursor_il: Option<crate::il::tell::CursorIlSnap>,
 }
 
 /// Native function declaration registered by the host.
@@ -406,6 +409,8 @@ impl Pipeline {
             pending_native_ids: Vec::new(),
             sink,
             messages_emitted: 0,
+            retain_cursor_il: false,
+            cursor_il: None,
         };
         match Manifest::load(&project_root) {
             Ok(m) => {
@@ -680,10 +685,7 @@ impl Pipeline {
             uniq.dedup();
             remaining.insert(item.file.clone(), uniq.len());
             for d in uniq {
-                dependents
-                    .entry(d)
-                    .or_default()
-                    .push(item.file.clone());
+                dependents.entry(d).or_default().push(item.file.clone());
             }
         }
         let entry = self.entry_file.clone();
@@ -970,7 +972,9 @@ impl Pipeline {
         // the prologue on the second call). See
         // `Compiler::compile_module` for the operand
         // adjustment details.
-        let bytecode = self.compiler_lazy_mut().compile_module(namespace.as_str(), &mut ast);
+        let bytecode = self
+            .compiler_lazy_mut()
+            .compile_module(namespace.as_str(), &mut ast);
 
         // Append this file's bytecode to the running
         // output. Each file's bytecode is independent;
@@ -1069,8 +1073,8 @@ impl Pipeline {
         // Patch the JMP at offset 1 (the second prologue
         // instruction).
         if let Some(byte) = bytecode.get_mut(1) {
-            *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler_lazy().prologue_jmp_target());
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler_lazy().prologue_jmp_target());
         }
 
         (bytecode, self.compiler_lazy_mut().constants().to_vec())
@@ -1113,12 +1117,19 @@ impl Pipeline {
             return Err(());
         }
 
+        if self.retain_cursor_il {
+            self.compiler_lazy_mut().set_retain_cursor_il(true);
+        }
         self.compiler_lazy_mut().finalize_bytecode();
+        if self.retain_cursor_il {
+            self.cursor_il = self.compiler_lazy_mut().take_cursor_il();
+            self.compiler_lazy_mut().set_retain_cursor_il(false);
+        }
         let mut bytecode = self.compiler_lazy_mut().bytecode_vec();
 
         if let Some(byte) = bytecode.get_mut(1) {
-            *byte =
-                Byte::new(Instruction::JMP).with_operand_u32(self.compiler_lazy().prologue_jmp_target());
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler_lazy().prologue_jmp_target());
         }
 
         // Warnings are kept for callers to inspect; only hard errors fail.
@@ -1127,6 +1138,46 @@ impl Pipeline {
         }
 
         Ok((bytecode, self.compiler_lazy_mut().constants().to_vec()))
+    }
+
+    /// Like [`Self::compile_src`], but keeps post-opt pre-fuse IL for the
+    /// cursor_model gate. Always available so `compiler/tests/cursor_model.rs`
+    /// does not need the `dissect` feature.
+    pub fn compile_src_retaining_il(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
+        self.retain_cursor_il = true;
+        let result = self.compile_src(src);
+        self.retain_cursor_il = false;
+        result
+    }
+
+    /// Number of retained post-opt IL ops after [`Self::compile_src_retaining_il`].
+    pub fn retained_cursor_il_len(&self) -> Option<usize> {
+        self.cursor_il.as_ref().map(|s| s.ops.len())
+    }
+
+    /// Diff retained symbolic-IL tell against lowered bytecode (COI-80).
+    ///
+    /// Requires a prior [`Self::compile_src_retaining_il`]. `ranges` and `seeds`
+    /// are the same function spans / entry cursors used by the VM gate.
+    pub fn diff_il_tell_against_bytecode(
+        &self,
+        bytecode: &[Byte],
+        pool: &[u64],
+        ranges: &[(String, usize, usize)],
+        seeds: &HashMap<usize, u32>,
+    ) -> crate::tell::IlTellDiff {
+        let snap = self
+            .cursor_il
+            .as_ref()
+            .expect("compile_src_retaining_il before diff_il_tell_against_bytecode");
+        crate::il::tell::diff_il_against_bytecode(
+            &snap.ops,
+            &snap.pre_to_post,
+            bytecode,
+            pool,
+            ranges,
+            seeds,
+        )
     }
 
     /// Compile a single source file in-memory and return the
@@ -1277,6 +1328,14 @@ impl Pipeline {
 
     pub fn static_slot_count(&self) -> u32 {
         self.compiler_lazy().static_slot_count()
+    }
+
+    pub fn prologue_jmp_target(&self) -> u32 {
+        self.compiler_lazy().prologue_jmp_target()
+    }
+
+    pub fn main_offset(&self) -> Option<u32> {
+        self.compiler_lazy().main_offset()
     }
 
     pub fn program_debug(&self) -> ProgramDebug {
@@ -1542,8 +1601,7 @@ fn main() {
     /// the whole point of the OnceCell (run-path startup).
     #[test]
     fn construction_defers_compiler_until_first_use() {
-        let pipeline =
-            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        let pipeline = Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
         assert!(
             pipeline.compiler.get().is_none(),
             "compiler must stay uninitialized after construction"
@@ -1563,8 +1621,7 @@ fn main() {
     /// compiler is first built — otherwise HostInvoke fn_ids drift from the VM.
     #[test]
     fn first_compiler_access_replays_pending_native_ids() {
-        let pipeline =
-            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        let pipeline = Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
         let pending = pipeline.pending_native_ids.clone();
         assert!(!pending.is_empty());
 
@@ -1578,11 +1635,17 @@ fn main() {
         }
         assert_eq!(
             compiler.native_id("stdout"),
-            pending.iter().find(|(n, _)| n == "stdout").map(|(_, id)| *id)
+            pending
+                .iter()
+                .find(|(n, _)| n == "stdout")
+                .map(|(_, id)| *id)
         );
         assert_eq!(
             compiler.native_id("write"),
-            pending.iter().find(|(n, _)| n == "write").map(|(_, id)| *id)
+            pending
+                .iter()
+                .find(|(n, _)| n == "write")
+                .map(|(_, id)| *id)
         );
     }
 
@@ -1590,8 +1653,7 @@ fn main() {
     /// typechecker. Touching the compiler here would undo the startup win.
     #[test]
     fn wire_host_natives_does_not_build_compiler() {
-        let pipeline =
-            Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
+        let pipeline = Pipeline::with_reporter(ReportConfig::default(), Box::new(std::io::sink()));
         assert!(pipeline.compiler.get().is_none());
 
         let mut machine = machine::Machine::<128>::default();
@@ -1618,12 +1680,8 @@ fn main() {
             .expect("stdout native buffered at construction");
 
         let custom_id = pipeline.register_host_native(
-            machine::FfiSignature::from_parts(
-                "coverage_probe",
-                vec![],
-                machine::FfiType::Int,
-            )
-            .expect("sig"),
+            machine::FfiSignature::from_parts("coverage_probe", vec![], machine::FfiType::Int)
+                .expect("sig"),
             |_heap, _args| Ok(Some(common::Value::from(7))),
         );
         assert!(pipeline.compiler.get().is_some());
@@ -1668,5 +1726,67 @@ fn main() {
         );
         let _ = machine.restore_output();
         assert_eq!(shared.into_string(), "ok");
+    }
+
+    /// Default compile path must not retain IL (dissect-free gate stays opt-in).
+    #[test]
+    fn compile_src_does_not_retain_cursor_il() {
+        let mut pipeline = Pipeline::new();
+        pipeline.compile_src("fn main() {}").expect("compile");
+        assert!(pipeline.retained_cursor_il_len().is_none());
+    }
+
+    /// Failed retaining compile still clears the pipeline retain flag.
+    #[test]
+    fn compile_src_retaining_il_clears_flag_on_failure() {
+        let mut pipeline = Pipeline::new();
+        assert!(pipeline.compile_src_retaining_il("fn main() { !!! }").is_err());
+        assert!(
+            !pipeline.retain_cursor_il,
+            "retain flag must clear even when compile fails"
+        );
+        assert!(
+            pipeline.retained_cursor_il_len().is_none(),
+            "failed compile must not leave a cursor-IL snap"
+        );
+    }
+
+    /// Retained snap is enough for an end-to-end IL↔bytecode tell diff.
+    #[test]
+    fn compile_src_retaining_il_supports_diff_against_bytecode() {
+        let mut pipeline = Pipeline::new();
+        let (bytecode, pool) = pipeline
+            .compile_src_retaining_il(
+                r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() { add(1, 2); }
+"#,
+            )
+            .expect("compile");
+        let n = pipeline
+            .retained_cursor_il_len()
+            .expect("cursor IL snapshot");
+        assert!(n > 0);
+        let mut syms = pipeline.program_debug().fn_symbols.clone();
+        syms.sort_by_key(|s| s.entry_pc);
+        let ranges: Vec<(String, usize, usize)> = syms
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let end = syms
+                    .get(i + 1)
+                    .map(|n| n.entry_pc as usize)
+                    .unwrap_or(bytecode.len());
+                (s.name.clone(), s.entry_pc as usize, end)
+            })
+            .collect();
+        // Same seed on both sides — agreement is what the gate checks.
+        let mut seeds = std::collections::HashMap::new();
+        for (_, start, _) in &ranges {
+            seeds.insert(*start, 0u32);
+        }
+        let report = pipeline.diff_il_tell_against_bytecode(&bytecode, &pool, &ranges, &seeds);
+        assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
+        assert!(report.checked > 0);
     }
 }

@@ -26,6 +26,11 @@ required) covers:
 | Homogeneous `(A, …, A)` | `A` | Materialised to a temp array; hetero → diagnostic |
 | Homogeneous `{ k: V, … }` | `(string, V)` | `DictEntries` then array path; hetero values → diagnostic |
 | `coroutine<Y, S>` | `Y` | Resume/Done; completion value excluded from the body |
+| `Range<T>` / `RangeInclusive<T>` | `T` | `int` / `byte` / `float` only (`+1` / `+1.0`); other `Ord` → diagnostic |
+
+Numeric ranges also collect with inherent `.to_vec() -> Vec<T>` (same step and
+empty-decreasing rule as `for`). There is no free `collect` and no successor
+protocol for non-numeric `Ord`.
 
 Users write ordinary `impl IntoIterator` / `impl Iterator` for custom types
 (see `examples/for_in_custom.hy`). Methods are callable as UFCS

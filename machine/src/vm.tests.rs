@@ -538,6 +538,124 @@
         assert_eq!(vm.pop().as_int(), 6);
     }
 
+    /// Docs contract: `Index` never panics — too-large / negative / non-array
+    /// targets yield the integer `-1` (COI-85 keeps the check in-VM).
+    #[test]
+    fn index_oob_and_non_array_yield_minus_one() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            const_int(2),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "too-large array Index");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(3),
+            const_int(5),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "too-large tuple Index");
+
+        let neg1 = Value::from(-1_i64).raw() as u64;
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(
+            &[
+                const_int(10),
+                const_int(20),
+                Byte::new(Instruction::MakeArray).with_operand_u32(2),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::Index),
+                Byte::new(Instruction::HALT),
+            ],
+            &[neg1],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), -1, "negative array Index");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), -1, "non-array Index");
+    }
+
+    /// Docs contract: `StoreIndex` with a bad index is a no-op and still
+    /// leaves `x` on the stack.
+    #[test]
+    fn store_index_oob_is_noop_and_pushes_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(99),
+            const_int(7),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 7, "OOB StoreIndex still pushes value");
+
+        // Array still [10, 20] — re-index both slots.
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(5),
+            const_int(99),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::POP),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 10, "slot 0 unchanged after OOB store");
+
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(5),
+            const_int(99),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::POP),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 20, "slot 1 unchanged after OOB store");
+
+        // Non-array target: still a no-op that pushes the value.
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(0),
+            const_int(9),
+            Byte::new(Instruction::StoreIndex),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 9, "non-array StoreIndex pushes value");
+    }
+
     /// Empty MakeTuple / MakeArray still allocate a rooted aggregate.
     #[test]
     fn make_tuple_and_array_arity0() {
@@ -3527,6 +3645,36 @@
         assert_eq!(vm.pop().as_int(), 0);
     }
 
+    /// Fused CmpJmpt: true comparison jumps; false comparison falls through.
+    #[test]
+    fn cmp_jmpt_jumps_when_true_falls_through_when_false() {
+        // 3 < 5 → taken=true → jump → push 0
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(3),
+            const_int(5),
+            Byte::new(Instruction::CmpJmpt).with_cmp_jmpf(Instruction::LE as u8, 5),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // 5 < 3 → taken=false → fall through → push 1
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(5),
+            const_int(3),
+            Byte::new(Instruction::CmpJmpt).with_cmp_jmpf(Instruction::LE as u8, 5),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
     /// Fused float CmpJmpf uses as_float paths (not raw bit compares).
     #[test]
     fn cmp_jmpf_float_leq_falls_through_on_equal() {
@@ -3603,6 +3751,54 @@
         assert_eq!(vm.pop().as_int(), 1);
     }
 
+    /// BinSlotImmJmpt jumps when the compare is true (inverted `if n <= 2 { … }`).
+    #[test]
+    fn bin_slot_imm_jmpt_jumps_when_compare_true() {
+        let leq = Instruction::LEQ as u8;
+        let packed = (8u64 << 32) | (2u32 as u64);
+        // n=2 → LEQ true → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(2),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotImmJmpt).with_bin_slot_imm_jmpf(leq, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // n=3 → LEQ false → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(3),
+                Byte::new(Instruction::CALL).with_call_packed(1, 3),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotImmJmpt).with_bin_slot_imm_jmpf(leq, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+    }
+
     /// BinSlotSlotJmpf: two-local compare + JMPF without stack traffic.
     #[test]
     fn bin_slot_slot_jmpf_jumps_when_compare_false() {
@@ -3652,6 +3848,54 @@
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// BinSlotSlotJmpt: jump when the two-local compare is true (inverted break).
+    #[test]
+    fn bin_slot_slot_jmpt_jumps_when_compare_true() {
+        let le = Instruction::LE as u8;
+        let packed = (8u64 << 32) | 1u64;
+        // a=3, b=5 → 3<5 true → jump → 0
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(3),
+                const_int(5),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpt).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // a=5, b=3 → 5<3 false → fall through → 1
+        let mut vm = Machine::<32>::default();
+        vm.run_with_pool(
+            &[
+                const_int(5),
+                const_int(3),
+                Byte::new(Instruction::CALL).with_call_packed(2, 4),
+                Byte::new(Instruction::HALT),
+                Byte::new(Instruction::BinSlotSlotJmpt).with_bin_slot_slot_jmpf(le, 0, 0),
+                const_int(1),
+                Byte::new(Instruction::RETURN),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::RETURN),
+            ],
+            &[packed],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
     }
 
     /// BinSlotImmStore: compute slot⊕imm and write dest without stack traffic.
@@ -3735,6 +3979,34 @@
             0,
         );
         assert_eq!(vm.pop().as_int(), 0);
+    }
+
+    /// LogNotJmpt jumps when the popped value is falsy (fused `!x; JMPT`).
+    #[test]
+    fn log_not_jmpt_jumps_when_falsy_falls_through_when_truthy() {
+        // 0 → LogNot true → Jmpt jumps → push 0
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(0),
+            Byte::new(Instruction::LogNotJmpt).with_log_not_jmpf(4),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+
+        // nonzero → LogNot false → fall through → push 1
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::LogNotJmpt).with_log_not_jmpf(4),
+            const_int(1),
+            Byte::new(Instruction::HALT),
+            const_int(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 1);
     }
 
     /// BinSlotImm covers bitwise and logical ops.
@@ -3980,6 +4252,66 @@
         assert_eq!(vm.pop().as_int(), 1);
     }
 
+    /// BinSlotSlotConstJmpt: ADDF(slots) > pool float — jump when true (escape break).
+    #[test]
+    fn bin_slot_slot_const_jmpt_addf_gtf() {
+        let four = 4.0f64.to_bits();
+        let three = 3.0f64.to_bits();
+        let one = 1.0f64.to_bits();
+        let two = 2.0f64.to_bits();
+        // 3.0+1.0=4.0; 4.0 > 4.0 is false → fall through → push 1
+        let desc_fall =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpt).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, one, four, desc_fall],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 1);
+
+        // 3.0+2.0=5.0; 5.0 > 4.0 → jump → push 0
+        let desc_jump =
+            common::Byte::pack_bin_slot_slot_const_jmpf_desc(1, Instruction::GTF as u8, 2, 7);
+        let mut vm = Machine::<16>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::STORE).with_operand_u32(0),
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG | 1),
+                Byte::new(Instruction::STORE).with_operand_u32(1),
+                Byte::new(Instruction::BinSlotSlotConstJmpt).with_bin_slot_slot_const_jmpf(
+                    Instruction::ADDF as u8,
+                    0,
+                    3,
+                ),
+                const_int(1),
+                Byte::new(Instruction::HALT),
+                const_int(0),
+                Byte::new(Instruction::HALT),
+            ],
+            &[three, two, four, desc_jump],
+            &[],
+            0,
+        );
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
     /// Packed LOAD/STORE n=2 preserves push/pop order (n=3 is covered separately).
     #[test]
     fn packed_load_store_n2_order() {
@@ -4135,4 +4467,47 @@
 
         let sized = Machine::<16>::with_operand_capacity(512);
         assert_eq!(sized.operand_stack_capacity(), 512);
+    }
+
+    #[test]
+    fn init_typed_stamps_type_id() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            Byte::new(Instruction::InitTyped).with_operand_u32(7),
+            Byte::new(Instruction::HALT),
+        ]);
+        vm.collect_garbage();
+        let v = vm.pop();
+        assert_eq!(vm.instance_meta(v), Some((7, false)));
+    }
+
+    #[test]
+    fn finalizer_registry_round_trip() {
+        let mut vm = Machine::<8>::default();
+        vm.register_finalizer_for_test(3, 99);
+        assert_eq!(vm.finalizer_pc(3), Some(99));
+        assert_eq!(vm.finalizer_pc(1), None);
+    }
+
+    #[test]
+    fn teardown_runs_remaining_finalizers() {
+        // JMP over drop; drop PRINT "closed"; main allocates a typed instance.
+        let strings = vec!["closed".to_string()];
+        let bytecode = vec![
+            Byte::new(Instruction::JMP).with_operand_u32(5),
+            Byte::new(Instruction::STRING).with_operand_u32(0),
+            Byte::new(Instruction::PRINT),
+            const_int(0),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::InitTyped).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<8>::default();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
+        vm.register_finalizer_for_test(1, 1);
+        vm.run_with_pool(&bytecode, &[], &strings, 0);
+        let _ = vm.restore_output();
+        let s = String::from_utf8(take_test_output(buf)).expect("utf-8");
+        assert_eq!(s, "closed");
     }

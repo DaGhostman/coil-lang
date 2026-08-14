@@ -84,9 +84,10 @@ struct MonoCandidate {
 
 /// Build a monomorphization plan for ground, bounded generic call sites.
 ///
-/// The current MVP specializes only generic functions whose type parameters
-/// carry at least one bound. That keeps unbounded `id<T>` on the existing
-/// shared `BoxValue`/`UnboxValue` path while enabling the target `Num` case.
+/// Only generic functions whose type parameters carry at least one **opcode**
+/// bound (`Num` / `Ord` / `Eq` and operator supertraits) are specialized.
+/// Unbounded `id<T>` stays on the shared `BoxValue`/`UnboxValue` path. User
+/// traits, `Show`, and `Length` stay on dictionary passing (COI-78).
 pub fn plan_monomorphization(module: &str, ast: &Output, checker: &Checker) -> MonoPlan {
     let mut sigs = HashMap::new();
     collect_generic_functions(module, ast, &mut sigs);
@@ -217,10 +218,10 @@ fn candidate_for_call(
         return None;
     }
 
-    // Skip monomorphization when the shared body needs dictionary dispatch:
+    // Dictionary bodies are not specialized (COI-78):
     // - user-defined typeclasses always use dict tuples
-    // - `Show` / `Length` always use dict / CallIndirect; they must not
-    //   be ground-specialized, or call sites keep an open `Ty::Var`
+    // - `Show` / `Length` always use dict / CallIndirect; specializing them
+    //   leaves call sites with an open `Ty::Var`
     // Num / Ord / Eq still monomorphize so arithmetic becomes direct opcodes.
     let requires_dictionary_body = sig.type_param_bounds.iter().any(|bounds| {
         bounds
@@ -899,6 +900,79 @@ mod tests {
     fn leaves_unbounded_id_on_shared_path_for_mvp() {
         let plan = plan("fn id<T>(T x) -> T { return x; } fn main() { id(1); }");
         assert!(plan.specializations.is_empty());
+    }
+
+    #[test]
+    fn does_not_plan_user_trait_ground_call() {
+        let plan = plan(
+            "trait Describable<T> { fn describe_val(T x) -> int; } \
+             impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
+             fn show<T: Describable>(T x) -> int { return x.describe_val(); } \
+             fn main() { show(42); }",
+        );
+        assert!(
+            plan.specializations.is_empty(),
+            "user-trait generics stay on dictionaries: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_plan_show_or_length_ground_call() {
+        let show = plan("fn show_it<T: Show>(T x) -> T { return x; } fn main() { show_it(1); }");
+        assert!(
+            show.specializations.is_empty(),
+            "Show stays on dictionaries: {show:?}"
+        );
+        let length = plan("fn n<T: Length>(T x) -> int { return 0; } fn main() { n(\"ab\"); }");
+        assert!(
+            length.specializations.is_empty(),
+            "Length stays on dictionaries: {length:?}"
+        );
+    }
+
+    /// COI-78: a dictionary bound anywhere on the signature blocks mono, even
+    /// when a sibling `Num` bound would otherwise specialize.
+    #[test]
+    fn does_not_plan_when_num_mixed_with_show_or_user_trait() {
+        let with_show = plan(
+            "fn mix<T: Num + Show>(T a, T b) -> T { return a + b; } \
+             fn main() { mix(1, 2); }",
+        );
+        assert!(
+            with_show.specializations.is_empty(),
+            "Num+Show must stay on dictionaries: {with_show:?}"
+        );
+
+        let with_user = plan(
+            "trait Tagged<T> { fn tag(T x) -> int; } \
+             impl Tagged<int> { fn tag(int x) -> int { return x; } } \
+             fn mix<T: Num + Tagged>(T a, T b) -> T { return a + b; } \
+             fn main() { mix(1, 2); }",
+        );
+        assert!(
+            with_user.specializations.is_empty(),
+            "Num+user-trait must stay on dictionaries: {with_user:?}"
+        );
+    }
+
+    /// COI-78 positive side: Ord / Eq remain opcode monomorphization candidates.
+    #[test]
+    fn plans_ground_ord_and_eq_calls() {
+        let ord = plan(
+            "fn less<T: Ord>(T a, T b) -> bool { return a < b; } \
+             fn main() { less(1, 2); }",
+        );
+        assert_eq!(ord.specializations.len(), 1);
+        assert_eq!(ord.specializations[0].key.fn_name, "less");
+        assert_eq!(ord.specializations[0].key.subst, vec!["int"]);
+
+        let eq = plan(
+            "fn same<T: Eq>(T a, T b) -> bool { return a == b; } \
+             fn main() { same(1, 1); }",
+        );
+        assert_eq!(eq.specializations.len(), 1);
+        assert_eq!(eq.specializations[0].key.fn_name, "same");
+        assert_eq!(eq.specializations[0].key.subst, vec!["int"]);
     }
 
     #[test]

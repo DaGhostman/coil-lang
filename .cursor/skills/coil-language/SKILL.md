@@ -25,7 +25,7 @@ cargo build --workspace
 cargo run -- examples/fib.hy          # in-memory compile + run (no out.hyc)
 cargo run -- compile examples/fib.hy    # writes out.hyc (or -o path)
 cargo run -- test                     # discover **/*.hy under ./tests
-ulimit -v 65536 && cargo run -- test  # 64MB leak check (preferred)
+cargo build --bin coil && (ulimit -v 65536; ./target/debug/coil test)  # 64MB leak check
 ```
 
 | Goal | Command |
@@ -43,7 +43,7 @@ Every runnable program needs `fn main()` **unless** the file only has `test("…
 
 Implicit imports (no `use` needed): prelude (`prelude`, `prelude::ops`, `prelude::test`, `prelude::math`) — injected by the compiler, not written in source.
 
-Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `regex`.
+Explicit `use` for: `io`, `string`, `ffi`, `thread`, `time`, `env`, `crypto`, `gc`. Regex: [coil-regex](https://github.com/ardax-corp/coil-regex) userland package.
 
 ```coil
 use io::{stdout};
@@ -67,7 +67,7 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 | Types | Primitives `int` `float` `string` `bool` `byte`; arrays `[T]` / `[T; N]`; tuples; dicts as anonymous records |
 | Enums | `enum E { A, B(T) }`; `match e { … }` with record/nested patterns |
 | Errors | Built-in `Option`/`Result`; `raise`, `?`, `??`, `?.` |
-| Classes | `class C { … }`, `impl C { … }`, `new C(…)` — prefer methods for type-tied ops |
+| Classes | `class C { … }`, `impl C { … }`, `new C(…)` — prefer methods for type-tied ops; inherent `fn drop()` is a GC-time finalizer |
 | Modules | `use path::{a, b};`, `mod foo;` (load without binding) |
 | FFI | `extern { … }` blocks or `use ffi::{dload, declare, invoke}` + `ffi::types::{Int, …}` |
 | Attributes | `#[derive(Show)]`, `#[test("desc")]`, user `attr` decorators |
@@ -75,7 +75,8 @@ There is **no `print` statement** — use `io` + `string::format` / `to_bytes`.
 
 Named call-site args: positional prefix then `f(name: v)`. Rest: trailing `T... xs`. Spread: `f(...pack)`.
 
-Ranges `a..b` / `a..=b` are **lazy** `Range<T: Ord>` — no auto array materialize.
+Ranges `a..b` / `a..=b` are **lazy** `Range<T: Ord>` / `RangeInclusive<T: Ord>`.
+`for` and `.to_vec()` step `int`/`byte`/`float` only; other `Ord` is a type error.
 
 Full grammar: [docs/references/syntax.md](docs/references/syntax.md).
 
@@ -90,8 +91,8 @@ userland modules. Prelude is auto-injected.
 | `string` | `use string::{format, to_bytes, from_bytes};` | Formatting / UTF-8 bytes |
 | `ffi` | `use ffi::{dload, declare, invoke};` + `use ffi::types::{Int, Ptr};` | Dynamic loading |
 | `thread` | `use thread::{spawn, join, channel, send, recv};` | OS threads, channels, mutex |
-| `time` / `env` / `crypto` / `regex` | `use time::{timestamp, sleep_ms};` etc. | Cargo-feature gated (default on) |
-| `gc` | `use gc::{root, weak, collect};` | `Root` / `Weak` GC pins |
+| `time` / `env` / `crypto` | `use time::{timestamp, sleep_ms};` etc. | Cargo-feature gated (default on) |
+| `gc` | `use gc::{root, weak, collect};` | `Root` / `Weak` pins; class `fn drop()` runs at collect / teardown |
 
 `byte` is 0..=255; integer literals coerce under `byte` / `[byte]` expectations.
 
@@ -124,6 +125,7 @@ Or `#[test("desc")] fn … { … }`. Body is Result mode. `panic` aborts VM; `co
 | Modules | `examples/modules.hy` |
 | Coroutines | `examples/coro.hy` |
 | FFI | `examples/strlen.hy` |
+| GC `fn drop()` | `examples/finalizer.hy` |
 | Full catalog | [docs/manual/examples.md](docs/manual/examples.md) |
 
 Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) → chapters 01–11.
@@ -131,7 +133,7 @@ Tutorial path: [docs/manual/getting-started.md](docs/manual/getting-started.md) 
 ## Common pitfalls
 
 1. **`main` + `test()`** — do not combine in one file.
-2. **Assuming stdlib** — no `sort` or HTTP in the VM; add [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) (or use `io` TCP / FFI). `sqrt` is prelude math.
+2. **Assuming stdlib** — no `sort` or HTTP in the VM; add [coil-stdlib](https://github.com/ardax-corp/coil-stdlib) for collections/IO adapters; HTTP is [coil-http](https://github.com/ardax-corp/coil-http) via spool. `sqrt` is prelude math.
 3. **Missing `use`** — `io`/`string` are not auto-imported.
 4. **FFI** — needs system libffi; `resolve_library` searches entry dir, `coil.toml` paths, system.
 5. **Stale `out.hyc`** — only from `coil compile`; delete before `coil run` if sources changed.

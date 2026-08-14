@@ -184,7 +184,10 @@ impl Compiler {
     /// Prologue `JMP` target: static initializers and/or `extern` setup
     /// run at `setup_entry_offset`; otherwise jump straight to `main`.
     pub fn prologue_jmp_target(&self) -> u32 {
-        if self.static_slot_count() > 0 || self.has_extern_block() {
+        if self.static_slot_count() > 0
+            || self.has_extern_block()
+            || self.checker.classes_with_drop().next().is_some()
+        {
             self.setup_entry_offset
         } else {
             self.functions
@@ -192,6 +195,11 @@ impl Compiler {
                 .copied()
                 .unwrap_or(self.program_start_offset as usize) as u32
         }
+    }
+
+    /// Bytecode offset of `main`, if bound.
+    pub fn main_offset(&self) -> Option<u32> {
+        self.functions.get("main").copied().map(|o| o as u32)
     }
 
     /// Harness test cases emitted this compile: `(description, fn offset)`.
@@ -962,10 +970,15 @@ impl Compiler {
                     | Instruction::JMPT
                     | Instruction::BinReturn
                     | Instruction::CmpJmpf
+                    | Instruction::CmpJmpt
                     | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotImmJmpt
                     | Instruction::BinSlotSlotJmpf
+                    | Instruction::BinSlotSlotJmpt
                     | Instruction::BinSlotSlotConstJmpf
+                    | Instruction::BinSlotSlotConstJmpt
                     | Instruction::LogNotJmpf
+                    | Instruction::LogNotJmpt
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
             ),
@@ -2467,11 +2480,8 @@ impl Compiler {
     }
 
     /// Look up the slot for a name used in an arm body. First
-    /// checks the per-arm `match_bindings` map (where match-bound
-    /// names live at slots 1, 2, 3, ... matching the VM's
-    /// payload-push positions). Falls back to the global
-    /// `variables` Interner for function params and other
-    /// non-pattern bindings.
+    /// checks the nested `match_bindings` map (inner names shadow
+    /// outer ones). Falls back to block overlays, then `variables`.
     ///
     /// Returns the slot ID (u32) if the name is found, `None`
     /// otherwise.
@@ -2495,6 +2505,19 @@ impl Compiler {
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
+    }
+
+    /// Install `inner` on top of any enclosing arm's bindings (inner names
+    /// shadow). Returns the previous map so the caller can restore it.
+    fn push_match_bindings(
+        &mut self,
+        inner: HashMap<String, u32>,
+    ) -> Option<HashMap<String, u32>> {
+        let saved = self.context.match_bindings.take();
+        let mut merged = saved.clone().unwrap_or_default();
+        merged.extend(inner);
+        self.context.match_bindings = Some(merged);
+        saved
     }
 
     /// Allocate a locals slot for a `let` / destructure binder.
@@ -6169,6 +6192,90 @@ impl Compiler {
             "vec_remove",
             &[0, 1],
         );
+        self.emit_range_method_thunks();
+    }
+
+    /// Inherent `Range::to_vec` / `RangeInclusive::to_vec` bodies.
+    ///
+    /// Unpacks the runtime dict `{start,end,inclusive}` and fills a `Vec`
+    /// with the same step as `for` (`+1` / `+1.0`). Float uses a sibling
+    /// `__float_to_vec` thunk selected at the call site.
+    fn emit_range_method_thunks(&mut self) {
+        for owner in ["Range", "RangeInclusive"] {
+            let methods = self.context.methods.entry(owner.to_string()).or_default();
+            methods.insert("to_vec".to_string(), format!("{owner}::to_vec"));
+        }
+        self.emit_range_to_vec_thunk("Range::to_vec".into(), false, false);
+        self.emit_range_to_vec_thunk("Range::__float_to_vec".into(), false, true);
+        self.emit_range_to_vec_thunk("RangeInclusive::to_vec".into(), true, false);
+        self.emit_range_to_vec_thunk("RangeInclusive::__float_to_vec".into(), true, true);
+    }
+
+    fn emit_range_to_vec_thunk(&mut self, fqn: String, inclusive: bool, float: bool) {
+        if self.functions.contains_key(&fqn) {
+            return;
+        }
+        self.bind_function_entry(fqn);
+        // slot 0 = self (range dict); 1 = cur; 2 = end; 3 = out vec
+        let start_idx = self.intern_string("start");
+        self.bytecode.push_load(0);
+        self.bytecode.push_string(start_idx);
+        self.bytecode.push_get_field();
+        self.bytecode.push_store_pop(1);
+
+        let end_idx = self.intern_string("end");
+        self.bytecode.push_load(0);
+        self.bytecode.push_string(end_idx);
+        self.bytecode.push_get_field();
+        self.bytecode.push_store_pop(2);
+
+        self.bytecode.push_make_array(0);
+        self.bytecode.push_store_pop(3);
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label(self.bytecode.il_mut());
+        let exit_label = bb.fresh_label(self.bytecode.il_mut());
+        bb.bind_label(top_label, self.bytecode.il_mut());
+
+        self.bytecode.push_load(1);
+        self.bytecode.push_load(2);
+        self.bytecode.push(Byte::new(if float {
+            if inclusive {
+                Instruction::LEQF
+            } else {
+                Instruction::LEF
+            }
+        } else if inclusive {
+            Instruction::LEQ
+        } else {
+            Instruction::LE
+        }));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, self.bytecode.il_mut());
+
+        self.bytecode.push_load(3);
+        self.bytecode.push_load(1);
+        self.bytecode.push(Byte::new(Instruction::ArrayPush));
+        self.bytecode.push_store_pop(3);
+
+        self.bytecode.push_load(1);
+        if float {
+            let bits = Value::from(1.0_f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode.push_const_pool(idx);
+            self.bytecode.push(Byte::new(Instruction::ADDF));
+        } else {
+            self.bytecode.push_const(1);
+            self.bytecode.push(Byte::new(Instruction::ADD));
+        }
+        self.bytecode.push_store_pop(1);
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, self.bytecode.il_mut());
+        bb.bind_label(exit_label, self.bytecode.il_mut());
+        bb.finalize()
+            .expect("BlockBuilder::finalize: range to_vec labels bound");
+
+        self.bytecode.push_load(3);
+        self.bytecode.push_return();
     }
 
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
@@ -6194,6 +6301,7 @@ impl Compiler {
             Ty::Array { .. } => Some(ValueTag::Array),
             Ty::App(head, _) => match head.as_ref() {
                 Ty::Con(n) if n == common::BUILTIN_VEC_TYPE => Some(ValueTag::Array),
+                Ty::Con(n) if n == "Range" || n == "RangeInclusive" => Some(ValueTag::Record),
                 // Option / Result / user ADT apps share the Instance box tag.
                 Ty::Con(_) => Some(ValueTag::Instance),
                 _ => None,
@@ -6203,6 +6311,14 @@ impl Compiler {
             Ty::Var(_) => None,
             _ => None,
         }
+    }
+
+    fn range_to_vec_elem_is_float(&self, recv_ty: Option<&Ty>) -> bool {
+        recv_ty
+            .map(|ty| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty))
+            .as_ref()
+            .and_then(crate::typechecking::ty::range_app)
+            .is_some_and(|(elem, _)| matches!(elem, Ty::Con(n) if n == "float"))
     }
 
     /// Peel `forall` / function arrows to the final return type.
@@ -7665,10 +7781,16 @@ impl Compiler {
         receiver: &Output<'_>,
         field: &str,
     ) -> bool {
-        let receiver = match receiver.1.as_ref() {
-            Expression::Group(inner) | Expression::Expr(inner) => inner,
-            _ => receiver,
-        };
+        // Pratt wraps nodes in `Expr`; `(…)` is `Group(Fragment([…]))`. Peel
+        // wrappers so `(new C(args)).field` matches bare `new C(args).field`.
+        let mut receiver = receiver;
+        loop {
+            match receiver.1.as_ref() {
+                Expression::Group(inner) | Expression::Expr(inner) => receiver = inner,
+                Expression::Fragment(items) if items.len() == 1 => receiver = &items[0],
+                _ => break,
+            }
+        }
         let Expression::Instantiate(class, Some(args)) = receiver.1.as_ref() else {
             return false;
         };
@@ -7681,6 +7803,9 @@ impl Compiler {
                 .resolve_class_key(class_name)
                 .is_some_and(|k| self.decorated_class_ctors.contains_key(&k))
         {
+            return false;
+        }
+        if self.checker.class_has_drop(class_name) {
             return false;
         }
         if args.iter().any(|arg| self.arg_emits_on_self_bytecode(arg)) {
@@ -10166,8 +10291,9 @@ impl Compiler {
                     }
                 } else {
                     let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
+                    let type_id = self.checker.class_type_id(&name);
                     bytecode
-                        .push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
+                        .push(Byte::new(Instruction::InitTyped).with_operand_u32(type_id));
                     // SetField stack order is value, target, name (same as
                     // Assignment to Access). Stash the instance, then for
                     // each ctor arg emit that sequence and discard the
@@ -12610,12 +12736,11 @@ impl Compiler {
         binding: Option<&str>,
         slot: Option<u32>,
     ) {
-        let saved_bindings = self.context.match_bindings.take();
-        let mut bindings = HashMap::new();
+        let mut inner = HashMap::new();
         if let (Some(name), Some(slot)) = (binding, slot) {
-            bindings.insert(name.to_string(), slot);
+            inner.insert(name.to_string(), slot);
         }
-        self.context.match_bindings = Some(bindings);
+        let saved_bindings = self.push_match_bindings(inner);
         let body_bc = self.do_compile(&arm.body);
         self.bytecode.extend(body_bc);
         self.context.match_bindings = saved_bindings;
@@ -12741,12 +12866,11 @@ impl Compiler {
         binding: Option<&str>,
         slot: Option<u32>,
     ) {
-        let saved_bindings = self.context.match_bindings.take();
-        let mut bindings = HashMap::new();
+        let mut inner = HashMap::new();
         if let (Some(name), Some(slot)) = (binding, slot) {
-            bindings.insert(name.to_string(), slot);
+            inner.insert(name.to_string(), slot);
         }
-        self.context.match_bindings = Some(bindings);
+        let saved_bindings = self.push_match_bindings(inner);
         if let Some(slot) = slot {
             self.record_debug_local(binding.unwrap_or(""), slot);
         }
@@ -13260,14 +13384,10 @@ impl Compiler {
                     }
                 } // close `else` for test chain arms
 
-                // Install the per-arm bindings map so the
-                // body's `Identifier` / `Assignment` lookups
-                // resolve pattern bindings to
-                // `payload_base`, `payload_base+1`, …
-                // — matching the VM's payload-push
-                // positions. Cleared after the body emits.
-                let saved_bindings = self.context.match_bindings.take();
-                self.context.match_bindings = Some(arm_bindings);
+                // Install this arm's bindings on top of any enclosing
+                // match so nested `match` bodies can still load outer
+                // pattern names. Inner names shadow.
+                let saved_bindings = self.push_match_bindings(arm_bindings);
                 let binding_slots: Vec<(String, u32)> = self
                     .context
                     .match_bindings
@@ -13324,12 +13444,6 @@ impl Compiler {
 
                 self.mono_codegen_var_types.pop();
 
-                // Restore the prior `match_bindings`
-                // (usually `None` — we only save/restore
-                // to be safe if a match is nested inside
-                // an arm body, which doesn't happen in
-                // practice but the typechecker doesn't
-                // prevent it).
                 self.context.match_bindings = saved_bindings;
 
                 // For non-first arms, emit a
@@ -13734,6 +13848,13 @@ impl Compiler {
                     }
                 } else {
                     fqn_base
+                };
+                let fqn = if self.range_to_vec_elem_is_float(recv_ty.as_ref())
+                    && (fqn == "Range::to_vec" || fqn == "RangeInclusive::to_vec")
+                {
+                    fqn.replace("::to_vec", "::__float_to_vec")
+                } else {
+                    fqn
                 };
                 if let Some(offset) = self.functions.get(&fqn).copied() {
                     let niche_vec_method = (self.expr_is_niche_option(ast)
@@ -14299,8 +14420,8 @@ impl Compiler {
                 // MakeTuple of method code offsets (CodePtr per method in
                 // declaration order). Builtin and user instances share this
                 // ABI; ground Num/Ord/Eq calls may still monomorphize away
-                // from the shared body, but Show-bound calls always take
-                // this path.
+                // from the shared body. User-trait / Show / Length bounds
+                // always take this path (COI-78).
                 let dict_count = if is_generic {
                     let (fixed, rest, pack_rest) =
                         self.split_call_args_for_rest(&lookup_name, arg_slice);
@@ -14650,12 +14771,61 @@ impl Compiler {
         self.pad_debug_locs();
     }
 
+    /// Register `type_id → drop PC` via internal `gc_register_finalizer`.
+    ///
+    /// Emitted on the main buffer (so drop labels stay in-namespace) then
+    /// moved to the pre-`main` prologue.
+    fn emit_finalizer_registry(&mut self, insert_at: usize) -> Option<usize> {
+        let native_id = self.native_id("gc_register_finalizer")?;
+        let owners: Vec<String> = self.checker.classes_with_drop().cloned().collect();
+        if owners.is_empty() {
+            return None;
+        }
+        let raw_start = self.bytecode.il().raw_len();
+        let code_start = self.bytecode.len();
+        for owner in owners {
+            let fqn = format!("{owner}::drop");
+            let Some(label) = self.fn_entry_labels.get(&fqn).copied() else {
+                continue;
+            };
+            let type_id = self.checker.class_type_id(&owner);
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(type_id));
+            self.bytecode
+                .emit_entry(crate::il::EntryKind::CodePtr, 0, label);
+            self.bytecode.push_make_tuple(2);
+            self.bytecode.push_host_invoke(2);
+            self.bytecode.push_pop();
+        }
+        let n = self.bytecode.len().saturating_sub(code_start);
+        if n == 0 {
+            return None;
+        }
+        self.bytecode
+            .move_raw_suffix_to_code_pos(raw_start, insert_at);
+        Some(n)
+    }
+
     /// Lower stack IL to VM bytecode (fusion select + label resolution).
     ///
     /// Called once after multi-file linking by the pipeline, or at the end
     /// of single-file [`compile`] so unit tests observe fused output.
     pub fn finalize_bytecode(&mut self) {
         let _ = self.finalize_bytecode_inner(false);
+    }
+
+    /// Retain post-opt pre-fuse IL on the next [`Self::finalize_bytecode`].
+    pub(crate) fn set_retain_cursor_il(&mut self, retain: bool) {
+        self.retain_cursor_il = retain;
+        if !retain {
+            self.cursor_il = None;
+        }
+    }
+
+    pub(crate) fn take_cursor_il(&mut self) -> Option<crate::il::tell::CursorIlSnap> {
+        self.cursor_il.take()
     }
 
     /// Like [`finalize_bytecode`], but also returns a pre-opt IL snapshot for dissect.
@@ -14687,6 +14857,14 @@ impl Compiler {
             let ffi = std::mem::take(&mut self.ffi_init);
             let n = ffi.len();
             self.bytecode.splice_buf_at(setup_pos + init_len, ffi);
+            self.bytecode
+                .bump_absolute_entry_targets(setup_pos + init_len, n);
+            self.bytecode.bump_func_spans(setup_pos + init_len, n);
+            init_len += n;
+        }
+
+        if let Some(n) = self.emit_finalizer_registry(setup_pos + init_len) {
+            self.setup_entry_offset = setup_pos as u32;
             self.bytecode
                 .bump_absolute_entry_targets(setup_pos + init_len, n);
             self.bytecode.bump_func_spans(setup_pos + init_len, n);
@@ -14789,7 +14967,12 @@ impl Compiler {
             None
         };
 
-        let lowered = self.bytecode.lower_in_place(&mut self.constants);
+        let mut lowered = if self.retain_cursor_il {
+            self.bytecode.lower_in_place_capturing(&mut self.constants)
+        } else {
+            self.bytecode.lower_in_place(&mut self.constants)
+        };
+        let cursor_ops = lowered.pre_fuse_ops.take();
         let map = |t: usize| -> usize {
             if let Some(&p) = lowered.pre_to_post.get(&t) {
                 return p;
@@ -14837,6 +15020,13 @@ impl Compiler {
             self.bytecode.len(),
             "debug_locs / bytecode length mismatch after finalize"
         );
+
+        if self.retain_cursor_il {
+            self.cursor_il = Some(crate::il::tell::CursorIlSnap {
+                ops: cursor_ops.unwrap_or_default(),
+                pre_to_post: lowered.pre_to_post.clone(),
+            });
+        }
 
         #[cfg(any(test, feature = "dissect"))]
         return il_snapshot;

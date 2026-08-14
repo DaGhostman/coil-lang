@@ -306,7 +306,12 @@ mod tests {
 
     #[test]
     fn absolute_path_is_sole_candidate() {
-        let c = library_candidates("/usr/lib/libfoo.so", None, &[]);
-        assert_eq!(c, vec![PathBuf::from("/usr/lib/libfoo.so")]);
+        let abs = if cfg!(windows) {
+            PathBuf::from(r"C:\lib\libfoo.dll")
+        } else {
+            PathBuf::from("/usr/lib/libfoo.so")
+        };
+        let c = library_candidates(abs.to_str().unwrap(), None, &[]);
+        assert_eq!(c, vec![abs]);
     }
 }

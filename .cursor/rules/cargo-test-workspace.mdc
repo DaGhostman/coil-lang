@@ -22,12 +22,13 @@ Prefer `--lib --tests --bins` over `--all-targets`: Criterion `[[bench]]` target
 | Feature | Command | Notes |
 |---------|---------|--------|
 | default stack | `cargo test --workspace --lib --tests --bins` | full suite |
-| `crypto` / `time` / `regex` / `tls` | `cargo check --workspace --lib --tests --bins --no-default-features --features <name>` | compile-gate only |
-| `no-default` | `cargo check --workspace --lib --tests --bins --no-default-features` | bare build |
+| `no-default` | `cargo test --workspace --lib --tests --bins --no-default-features` | real suite; crypto/time/tls tests are `cfg`-skipped |
+| `crypto` / `time` / `tls` | `cargo check --workspace --lib --tests --bins --no-default-features --features <name>` | CI compile-gate only; `cargo test … --no-default-features --features <name>` finishes locally |
 | `dissect` | `cargo test --workspace --lib --tests --bins --features dissect` | dissect integration |
 | `debugger` | `cargo test --workspace --lib --tests --bins --features debugger` | debugger paths |
 
 ```bash
+cargo test --workspace --lib --tests --bins --no-default-features
 cargo check --workspace --lib --tests --bins --no-default-features --features tls
 cargo test --workspace --lib --tests --bins --features dissect
 ```

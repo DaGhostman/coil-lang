@@ -17,10 +17,10 @@ use crate::typechecking::ty::{AssocProjection, Constraint, Scheme};
 use crate::typechecking::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use crate::typechecking::ty::{
     EnumVariantPayloadTy, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, never, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, readonly_ty,
-    result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
+    list, never, option_app_ty, option_inner, option_ty, range_app, range_inclusive_ty, range_ty,
+    readonly_ty, result_app_ty, result_ok_err, result_ty, schemaize_payload, schemaize_ty, string,
     strip_readonly, subst_payload_params, subst_ty_params, unit as unit_ty, vec_app_ty,
-    vec_element_ty,
+    vec_element_ty, RANGE, RANGE_INCLUSIVE,
 };
 use crate::typechecking::unify::{UnifyError, unify_with};
 use crate::typechecking::virtual_modules::{
@@ -60,6 +60,9 @@ impl Checker {
             disk_imports: HashSet::new(),
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
+            class_type_ids: std::collections::HashMap::new(),
+            next_class_type_id: 1,
+            classes_with_drop: std::collections::HashSet::new(),
             methods: std::collections::HashMap::new(),
             static_methods: std::collections::HashMap::new(),
             ids: IdTable::new(),
@@ -151,6 +154,7 @@ impl Checker {
         };
         checker.register_builtin_enums();
         checker.register_builtin_vec();
+        checker.register_builtin_range();
         checker.register_builtin_call_sigs();
         checker
     }
@@ -289,6 +293,54 @@ impl Checker {
         }
     }
 
+    /// Synthetic `Range<T>` / `RangeInclusive<T>` inherent `to_vec`.
+    ///
+    /// Idempotent: same re-entry contract as [`Self::register_builtin_vec`].
+    /// Construction stays `T: Ord`; `.to_vec()` is rejected for non-numeric
+    /// elements at the call site (see [`Self::constrain_range_to_vec`]).
+    fn register_builtin_range(&mut self) {
+        self.overload_sets
+            .retain(|k, _| !k.starts_with("Range::") && !k.starts_with("RangeInclusive::"));
+
+        let fun = |params: &[Ty], ret: Ty| {
+            params
+                .iter()
+                .rev()
+                .fold(ret, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)))
+        };
+        let dummy = 0..0;
+
+        for owner in [RANGE, RANGE_INCLUSIVE] {
+            self.classes
+                .entry(owner.to_string())
+                .or_insert_with(Vec::new);
+            let t = self.counter.fresh();
+            let recv = if owner == RANGE {
+                range_ty(Ty::Var(t))
+            } else {
+                range_inclusive_ty(Ty::Var(t))
+            };
+            let scheme = Scheme::poly(vec![t], vec![], fun(&[recv], vec_app_ty(Ty::Var(t))));
+            let fqn = format!("{owner}::to_vec");
+            self.fn_param_names.insert(fqn.clone(), Vec::new());
+            self.register_overload_candidate(
+                &fqn,
+                OverloadCandidate {
+                    id: 0,
+                    fixed_arity: 0,
+                    is_rest: false,
+                    scheme: scheme.clone(),
+                    param_names: Vec::new(),
+                },
+                &dummy,
+            );
+            self.methods
+                .entry(owner.to_string())
+                .or_default()
+                .insert("to_vec".to_string(), (Visibility::Public, scheme));
+        }
+    }
+
     /// Parameter names for builtins that support named arguments at call sites.
     fn register_builtin_call_sigs(&mut self) {
         self.fn_param_names
@@ -384,15 +436,6 @@ impl Checker {
             self.register_builtin_crypto_error();
         }
 
-        let needs_regex_error = matches!(
-            &export,
-            BuiltinExport::Enum {
-                name: common::BUILTIN_REGEX_ERROR_ENUM
-            }
-        ) || host_registry.is_some_and(|r| r.starts_with("regex_"));
-        if needs_regex_error && !self.enums.contains_key(common::BUILTIN_REGEX_ERROR_ENUM) {
-            self.register_builtin_regex_error();
-        }
 
         // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
         // module is brought into scope (enum or any FFI builtin).
@@ -656,12 +699,6 @@ impl Checker {
         );
     }
 
-    fn register_builtin_regex_error(&mut self) {
-        self.register_builtin_unit_enum(
-            common::BUILTIN_REGEX_ERROR_ENUM,
-            common::BUILTIN_REGEX_ERROR_VARIANTS,
-        );
-    }
 
     /// Pre-register `ThreadError` unit variants for the virtual `thread` module.
     fn register_builtin_thread_error(&mut self) {
@@ -780,6 +817,7 @@ impl Checker {
                     ("ca_pem".into(), opt_string.clone()),
                     ("ca_path".into(), opt_string),
                     ("timeout_ms".into(), int()),
+                    ("alpn".into(), string()),
                 ]);
                 fun(&[stream, string(), opts], res_stream)
             }
@@ -792,6 +830,7 @@ impl Checker {
                     ("key_pem".into(), string()),
                     ("timeout_ms".into(), int()),
                     ("client_ca_pem".into(), string()),
+                    ("alpn".into(), string()),
                 ]);
                 fun(&[stream, opts], res_stream)
             }
@@ -1013,19 +1052,15 @@ impl Checker {
         }
     }
 
-    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` / `regex_*` pipeline host natives.
+    /// Scheme for `fs_*` / `time_*` / `env_*` / `crypto_*` pipeline host natives.
     pub fn host_fn_scheme(&mut self, registry: &str, range: Range<usize>) -> Scheme {
         #[cfg(feature = "crypto")]
         use crate::typechecking::ty::byte;
-        #[cfg(feature = "regex")]
-        use crate::typechecking::ty::regex_ty;
-        #[cfg(any(feature = "crypto", feature = "regex"))]
+        #[cfg(feature = "crypto")]
         use crate::typechecking::ty::tuple;
         use crate::typechecking::ty::{boolean, record};
         #[cfg(feature = "crypto")]
         use common::BUILTIN_CRYPTO_ERROR_ENUM;
-        #[cfg(feature = "regex")]
-        use common::BUILTIN_REGEX_ERROR_ENUM;
         #[cfg(feature = "time")]
         use common::BUILTIN_TIME_ERROR_ENUM;
         use common::{BUILTIN_ENV_ERROR_ENUM, BUILTIN_IO_ERROR_ENUM};
@@ -1042,10 +1077,6 @@ impl Checker {
         let env_err = Ty::Con(BUILTIN_ENV_ERROR_ENUM.into());
         #[cfg(feature = "crypto")]
         let crypto_err = Ty::Con(BUILTIN_CRYPTO_ERROR_ENUM.into());
-        #[cfg(feature = "regex")]
-        let regex_err = Ty::Con(BUILTIN_REGEX_ERROR_ENUM.into());
-        #[cfg(feature = "regex")]
-        let regex = regex_ty();
 
         let res_bool_io = result_app_ty(boolean(), io_err.clone());
         let res_unit_io = result_app_ty(unit_ty(), io_err.clone());
@@ -1086,26 +1117,6 @@ impl Checker {
         let res_unit_crypto = result_app_ty(unit_ty(), crypto_err.clone());
         #[cfg(feature = "crypto")]
         let keypair = tuple(vec![bytes.clone(), bytes.clone()]);
-
-        #[cfg(feature = "regex")]
-        let span = tuple(vec![int(), int()]);
-        #[cfg(feature = "regex")]
-        let res_regex = result_app_ty(regex.clone(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_bool_regex = result_app_ty(boolean(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_span_regex = result_app_ty(span.clone(), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_spans_regex = result_app_ty(vec_app_ty(span), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_caps_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_caps_all_regex =
-            result_app_ty(vec_app_ty(vec_app_ty(string())), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_strs_regex = result_app_ty(vec_app_ty(string()), regex_err.clone());
-        #[cfg(feature = "regex")]
-        let res_string_regex = result_app_ty(string(), regex_err.clone());
 
         let ty = match registry {
             "fs_exists" | "fs_is_file" | "fs_is_dir" | "fs_is_symlink" => {
@@ -1204,24 +1215,6 @@ impl Checker {
             #[cfg(feature = "crypto")]
             "crypto_ct_eq" => fun(&[bytes.clone(), bytes.clone()], res_bool_crypto),
 
-            #[cfg(feature = "regex")]
-            "regex_compile" => fun(&[string(), string()], res_regex),
-            #[cfg(feature = "regex")]
-            "regex_is_match" => fun(&[regex.clone(), string()], res_bool_regex),
-            #[cfg(feature = "regex")]
-            "regex_find" => fun(&[regex.clone(), string()], res_span_regex),
-            #[cfg(feature = "regex")]
-            "regex_find_all" => fun(&[regex.clone(), string()], res_spans_regex),
-            #[cfg(feature = "regex")]
-            "regex_captures" => fun(&[regex.clone(), string()], res_caps_regex),
-            #[cfg(feature = "regex")]
-            "regex_captures_all" => fun(&[regex.clone(), string()], res_caps_all_regex),
-            #[cfg(feature = "regex")]
-            "regex_split" => fun(&[regex.clone(), string()], res_strs_regex),
-            #[cfg(feature = "regex")]
-            "regex_replace" | "regex_replace_all" => {
-                fun(&[regex, string(), string()], res_string_regex)
-            }
 
             _ => {
                 let mut msg = Message::error(
@@ -1330,7 +1323,7 @@ impl Checker {
                 let n = name.to_ascii_lowercase();
                 if matches!(
                     n.as_str(),
-                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn" | "regex"
+                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn"
                         | "root" | "weak"
                 ) {
                     return false;
@@ -1512,8 +1505,9 @@ impl Checker {
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
-        // `fn_param_names` was cleared above — reinstall Vec method ABI.
+        // `fn_param_names` was cleared above — reinstall Vec / Range method ABI.
         self.register_builtin_vec();
+        self.register_builtin_range();
         self.register_builtin_call_sigs();
 
         // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
@@ -2900,12 +2894,13 @@ impl Checker {
             // ---- `test("…") { … }` harness cases ----
             Expression::TestCase { name, body } => self.infer_test_case(name, body, &range),
             Expression::Implementation {
+                what,
                 owner,
                 methods,
                 type_params,
                 ..
             } => {
-                self.infer_impl(owner, type_params, methods, &range);
+                self.infer_impl(what, owner, type_params, methods, &range);
                 unit_ty()
             }
             Expression::Class {
@@ -4190,6 +4185,14 @@ impl Checker {
                 ..
             } = method.1.as_ref()
             {
+                if *method_name == "drop" {
+                    self.messages.push(Message::error(
+                        ErrorCode::InvalidDrop,
+                        "fn drop(self) is only allowed on inherent class impls, not traits"
+                            .to_string(),
+                        method.0.into_range(),
+                    ));
+                }
                 // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
                 let mut method_frame = HashMap::new();
                 let mut method_vars = Vec::new();
@@ -4763,6 +4766,9 @@ impl Checker {
                         .and_then(|m| m.get(*method))
                         .is_some()
                 {
+                    if *method == "to_vec" {
+                        self.constrain_range_to_vec(owner, &resolved, &range);
+                    }
                     let fqn = format!("{}::{}", owner, method);
                     let user_argc = method_args.len();
                     let scheme = if self.is_overloaded(&fqn) {
@@ -4955,6 +4961,9 @@ impl Checker {
                     .and_then(|m| m.get(*method))
                     .is_some()
             {
+                if *method == "to_vec" {
+                    self.constrain_range_to_vec(owner, &resolved, &range);
+                }
                 if self.is_static_method(owner, method) {
                     let fqn = format!("{}::{}", owner, method);
                     return self.error_with_help(
@@ -10075,7 +10084,6 @@ impl Checker {
             "string" => string(),
             "void" => unit_ty(),
             "stream" => crate::typechecking::ty::stream_ty(),
-            "regex" => crate::typechecking::ty::regex_ty(),
             "thread" => crate::typechecking::ty::thread_ty(),
             "sender" => crate::typechecking::ty::sender_ty(),
             "receiver" => crate::typechecking::ty::receiver_ty(),
@@ -10084,7 +10092,6 @@ impl Checker {
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
-            "regexerror" => Ty::Con(common::BUILTIN_REGEX_ERROR_ENUM.into()),
             "threaderror" => Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into()),
             "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
@@ -10795,6 +10802,14 @@ impl Checker {
         // Bind the FQN before parsing fields so recursive types
         // (`next: Option<Node<T>>`) resolve to `module::Node`, not a dummy Con.
         self.classes.entry(key.clone()).or_insert_with(Vec::new);
+        if !self.class_type_ids.contains_key(&key) {
+            let id = self.next_class_type_id;
+            self.next_class_type_id = self.next_class_type_id.saturating_add(1);
+            if self.next_class_type_id == 0 {
+                self.next_class_type_id = 1;
+            }
+            self.class_type_ids.insert(key.clone(), id);
+        }
         self.generics
             .register_nominal_type(&key, &self.current_module);
         self.env
@@ -10887,6 +10902,7 @@ impl Checker {
     ///    scheme (poly when the impl is generic) under the owner's name.
     fn infer_impl(
         &mut self,
+        what: &str,
         owner: &str,
         type_params: &[parser::ast::TypeParam<'_>],
         methods: &[Output],
@@ -10922,7 +10938,8 @@ impl Checker {
             Vec::new()
         };
 
-        if !self.classes.contains_key(&owner_key) {
+        let owner_is_class = self.classes.contains_key(&owner_key);
+        if !owner_is_class {
             self.classes.insert(owner_key.clone(), Vec::new());
             self.env
                 .insert_top(owner_key.clone(), Scheme::mono(Ty::Con(owner_key.clone())));
@@ -10982,6 +10999,16 @@ impl Checker {
                     ..
                 } = body.1.as_ref()
                 {
+                    if *name == "drop" {
+                        self.check_drop_decl(
+                            what,
+                            &owner_key,
+                            owner_is_class,
+                            *is_static,
+                            args,
+                            &method.0.into_range(),
+                        );
+                    }
                     let self_ty = if *is_static { None } else { Some(&owner_ty) };
                     // Type params stay in the outer impl frame so `self`
                     // and method annotations share the same variables.
@@ -10998,6 +11025,30 @@ impl Checker {
                         Some(&owner_key),
                         *is_static,
                     );
+                    if *name == "drop" {
+                        let mut ret = apply_ty(&self.subst, &fun_ty);
+                        while let Ty::Fun(_, r) = ret {
+                            ret = *r;
+                        }
+                        match &ret {
+                            Ty::Con(n) if n == "unit" => {}
+                            Ty::Var(_) => {
+                                self.unify(
+                                    &ret,
+                                    &unit_ty(),
+                                    &method.0.into_range(),
+                                    "drop return type",
+                                );
+                            }
+                            _ => {
+                                self.messages.push(Message::error(
+                                    ErrorCode::InvalidDrop,
+                                    "fn drop(self) must return unit".to_string(),
+                                    method.0.into_range(),
+                                ));
+                            }
+                        }
+                    }
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
                     let fqn = format!("{}::{}", owner_key, name);
@@ -11076,6 +11127,44 @@ impl Checker {
         self.active_constraints.truncate(prev_constraints_len);
         self.pop_type_params_for_type_parsing(pushed);
         let _ = range;
+    }
+
+    fn check_drop_decl(
+        &mut self,
+        what: &str,
+        owner_key: &str,
+        owner_is_class: bool,
+        is_static: bool,
+        args: &Output,
+        range: &Range<usize>,
+    ) {
+        let arity = match args.1.as_ref() {
+            Expression::Fragment(items) => items
+                .iter()
+                .filter(|a| matches!(a.1.as_ref(), Expression::Argument { .. }))
+                .count(),
+            _ => 0,
+        };
+        let msg = if !what.is_empty() {
+            Some("fn drop(self) is only allowed on inherent class impls, not trait instances")
+        } else if !owner_is_class {
+            Some("fn drop(self) is only allowed on nominal classes")
+        } else if is_static {
+            Some("fn drop must take self by value; static drop is not allowed")
+        } else if arity != 0 {
+            Some("fn drop(self) must have no extra parameters")
+        } else if !self.classes_with_drop.insert(owner_key.to_string()) {
+            Some("duplicate fn drop(self) for this class")
+        } else {
+            None
+        };
+        if let Some(msg) = msg {
+            self.messages.push(Message::error(
+                ErrorCode::InvalidDrop,
+                msg.to_string(),
+                range.clone(),
+            ));
+        }
     }
 
     /// Look up a class field, substituting type-param placeholders when
@@ -11192,6 +11281,13 @@ impl Checker {
         method_owner: Option<&str>,
         is_static_method: bool,
     ) -> Ty {
+        if name == "drop" && method_owner.is_none() {
+            self.messages.push(Message::error(
+                ErrorCode::InvalidDrop,
+                "fn drop(self) is only allowed as an inherent class method".to_string(),
+                range.clone(),
+            ));
+        }
         let Some(body) = body else {
             return self.error_with_help(
                 ErrorCode::GenericTypeError,
@@ -15176,6 +15272,21 @@ impl Checker {
         }
     }
 
+    /// Compile-time type id for `InitTyped` (`0` if the name is not a class).
+    pub fn class_type_id(&self, name: &str) -> u32 {
+        let key = self.resolve_class_key(name).unwrap_or_else(|| name.to_string());
+        self.class_type_ids.get(&key).copied().unwrap_or(0)
+    }
+
+    pub fn class_has_drop(&self, name: &str) -> bool {
+        let key = self.resolve_class_key(name).unwrap_or_else(|| name.to_string());
+        self.classes_with_drop.contains(&key)
+    }
+
+    pub fn classes_with_drop(&self) -> impl Iterator<Item = &String> {
+        self.classes_with_drop.iter()
+    }
+
     /// Resolve a source identifier or `use` alias to the class table key.
     pub fn resolve_class_key(&self, name: &str) -> Option<String> {
         if self.classes.contains_key(name) {
@@ -15468,10 +15579,10 @@ impl Checker {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") && args.len() == 2 {
                     return Some((args[0].clone(), ForInKind::Coroutine));
                 }
-                if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
+                if matches!(head.as_ref(), Ty::Con(n) if n == RANGE) && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], false, range);
                 }
-                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1 {
+                if matches!(head.as_ref(), Ty::Con(n) if n == RANGE_INCLUSIVE) && args.len() == 1 {
                     return self.range_for_in_kind(&args[0], true, range);
                 }
                 None
@@ -15489,32 +15600,56 @@ impl Checker {
         inclusive: bool,
         range: &Range<usize>,
     ) -> Option<(Ty, ForInKind)> {
+        let type_name = if inclusive {
+            RANGE_INCLUSIVE
+        } else {
+            RANGE
+        };
+        let float = self.require_range_numeric_step(elem, type_name, range);
         let elem = apply_ty_prune(&self.subst, elem);
-        let float = match &elem {
+        Some((elem, ForInKind::Range { inclusive, float }))
+    }
+
+    /// Shared numeric-step gate for `for` and `.to_vec()`.
+    ///
+    /// Returns `true` when the element is `float` (ADDF path), `false` for
+    /// `int`/`byte` or after diagnosing a non-steppable type (int-style
+    /// recovery so codegen still emits).
+    fn require_range_numeric_step(
+        &mut self,
+        elem: &Ty,
+        type_name: &str,
+        range: &Range<usize>,
+    ) -> bool {
+        let elem = apply_ty_prune(&self.subst, elem);
+        match &elem {
             Ty::Con(n) if n == "float" => true,
             Ty::Con(n) if n == "int" || n == "byte" => false,
             other => {
                 let _ = self.error_with_help(
                     ErrorCode::GenericTypeError,
-                    format!("cannot iterate over `Range<{}>`", other),
+                    format!("cannot iterate over `{type_name}<{other}>`"),
                     range.clone(),
                     Some(
-                        "`for` over a range requires element type `int`, `byte`, or `float` \
-                         (construction only needs `Ord`; stepping needs a numeric successor)"
+                        "`for` and `.to_vec()` require element type `int`, `byte`, or `float` \
+                         (construction only needs `Ord`; there is no successor protocol)"
                             .to_string(),
                     ),
                 );
-                // Recovery: int-style opcodes so codegen still emits.
-                return Some((
-                    elem,
-                    ForInKind::Range {
-                        inclusive,
-                        float: false,
-                    },
-                ));
+                false
             }
+        }
+    }
+
+    /// Reject `.to_vec()` on a non-numeric `Range` / `RangeInclusive`.
+    fn constrain_range_to_vec(&mut self, owner: &str, recv_ty: &Ty, range: &Range<usize>) {
+        if owner != RANGE && owner != RANGE_INCLUSIVE {
+            return;
+        }
+        let Some((elem, _)) = range_app(recv_ty) else {
+            return;
         };
-        Some((elem, ForInKind::Range { inclusive, float }))
+        let _ = self.require_range_numeric_step(elem, owner, range);
     }
 
     /// All types unify to one element type, or diagnose heterogeneity.

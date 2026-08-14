@@ -1020,15 +1020,23 @@ fn run_test_case(
     name: &str,
     offset: u32,
 ) -> bool {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut machine = Machine::<256>::default();
-        pipeline.wire_vm_ffi(&mut machine, entry);
-        pipeline.wire_host_natives(&mut machine);
-        machine.set_program_debug(pipeline.program_debug());
-        machine.load_program(bytecode, constants, strings);
-        let ret = machine.call_function(offset, &[]);
-        !machine.panicked() && machine.result_is_ok(ret)
-    }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut machine = Machine::<256>::default();
+            pipeline.wire_vm_ffi(&mut machine, entry);
+            pipeline.wire_host_natives(&mut machine);
+            machine.set_program_debug(pipeline.program_debug());
+            machine.init_static_slots(pipeline.static_slot_count());
+            machine.load_program(bytecode, constants, strings);
+            if let Some(main) = pipeline.main_offset() {
+                let setup = pipeline.prologue_jmp_target();
+                if setup != main {
+                    machine.halt_first_jump_to(setup as usize, main);
+                    machine.run_from(setup as usize);
+                }
+            }
+            let ret = machine.call_function(offset, &[]);
+            !machine.panicked() && machine.result_is_ok(ret)
+        }));
     match result {
         Ok(ok) => {
             if !ok {

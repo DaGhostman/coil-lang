@@ -26,6 +26,7 @@
         compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
         compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
         compiler.register_native_id(machine::PACKED_VEC_ARITH, 9005);
+        compiler.register_native_id(machine::GC_REGISTER_FINALIZER_NATIVE, 9100);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
@@ -264,10 +265,11 @@ test("two") { assert(true)?; }
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::YieldCoro))
             .expect("expected YieldCoro");
-        let store_pos = bc
+        let store_pos = bc[yield_pos..]
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::STORE))
-            .expect("expected STORE");
+            .map(|i| yield_pos + i)
+            .expect("expected STORE after YieldCoro");
         assert!(
             yield_pos < store_pos,
             "YieldCoro (at {}) must precede STORE (at {}) for binding yield",
@@ -606,10 +608,18 @@ use string::{format, to_bytes};
             "#,
         );
         // Key cached once in Point::twice_x; ignore STRING ops in later
-        // default Show/String / builtin thunks.
+        // default Show/String / builtin thunks (Range::to_vec uses GetField).
         let first_get = bc
             .iter()
-            .position(|b| matches!(b.bytecode(), Instruction::GetField))
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::GetField))
+            .find(|(i, _)| {
+                let end = (*i + 24).min(bc.len());
+                !bc[*i..end]
+                    .iter()
+                    .any(|b| matches!(b.bytecode(), Instruction::ArrayPush))
+            })
+            .map(|(i, _)| i)
             .expect("expected GetField in twice_x");
         let region_start = bc[..first_get]
             .iter()
@@ -1733,21 +1743,113 @@ sum = sum + i; \
 }",
         );
 
-        let jmp_targets: Vec<u32> = bc
+        let back_edges: Vec<u32> = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JMP))
             .map(|b| b.operand_u32())
+            .filter(|t| *t != u32::MAX)
             .collect();
+        let imm_jmpt = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpt))
+            .count();
+        let imm_jmpf = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf))
+            .count();
 
         assert!(
-            jmp_targets.len() >= 3,
-            "expected continue, break, and back-edge JMPs; got {:?}",
-            jmp_targets
+            !back_edges.is_empty() && back_edges.iter().all(|t| *t != 0),
+            "loop back-edge JMP should be patched: {:?}",
+            back_edges
         );
         assert!(
-            jmp_targets.iter().all(|target| *target != 0),
-            "loop jump placeholders should be patched: {:?}",
-            jmp_targets
+            imm_jmpt >= 2,
+            "continue/break `i == k` should invert+fuse to BinSlotImmJmpt; got {imm_jmpt}"
+        );
+        assert!(
+            imm_jmpf >= 1,
+            "loop header `i < 10` must stay BinSlotImmJmpf; got {imm_jmpf}"
+        );
+    }
+
+    /// `if !flag { break }` inverts fused LogNot;JMPF into LogNotJmpt (COI-87).
+    #[test]
+    fn not_flag_break_emits_log_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let flag = false; \
+let i = 0; \
+while (i < 5) { \
+if !flag { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::LogNotJmpt)),
+            "expected LogNotJmpt for inverted `if !flag {{ break }}`"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "while header should remain *Jmpf"
+        );
+    }
+
+    /// Two-local compare break fuses to BinSlotSlotJmpt after invert (COI-87).
+    #[test]
+    fn two_local_compare_break_emits_bin_slot_slot_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            "fn main() { \
+let a = 1; \
+let b = 2; \
+let i = 0; \
+while (i < 5) { \
+if a < b { break; } \
+i = i + 1; \
+} \
+}",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpt)),
+            "expected BinSlotSlotJmpt for inverted `if a < b {{ break }}`"
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotSlotJmpf)),
+            "break guard should not remain BinSlotSlotJmpf after invert"
+        );
+    }
+
+    /// Plain while headers must not invert to *Jmpt (COI-87 latch stays *Jmpf).
+    #[test]
+    fn while_header_stays_fused_jmpf_not_jmpt() {
+        use common::Instruction;
+        let (bc, _) = compile_src("fn main() { let i = 0; while (i < 3) { i = i + 1; } }");
+        let jmpt = bc
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPT
+                        | Instruction::CmpJmpt
+                        | Instruction::BinSlotImmJmpt
+                        | Instruction::BinSlotSlotJmpt
+                        | Instruction::BinSlotSlotConstJmpt
+                        | Instruction::LogNotJmpt
+                )
+            })
+            .count();
+        assert_eq!(jmpt, 0, "header-only while must not emit *Jmpt");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BinSlotImmJmpf)),
+            "header should stay BinSlotImmJmpf"
         );
     }
 
@@ -4902,6 +5004,153 @@ fn main() { let _ = some_of(7); }",
         );
     }
 
+    /// COI-78: a user-trait method at a concrete type uses static `CALL`
+    /// (B4). The same method under an open generic bound stays on
+    /// `Index` + `CallIndirect`, and a ground call to that generic still
+    /// passes a dictionary rather than monomorphizing.
+    #[test]
+    fn user_trait_ground_method_call_vs_generic_dictionary() {
+        use common::Instruction;
+
+        let (ground, _) = compile_src(
+            "trait Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
+             fn main() { return 41.size(); }",
+        );
+        assert!(
+            ground
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "ground user-trait method must CALL; ops={:?}",
+            ground.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !ground
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "ground user-trait method must not CallIndirect; ops={:?}",
+            ground.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        let (generic, _) = compile_src(
+            "trait Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x + 1; } } \
+             fn size_of<T: Measurable>(T x) -> int { return x.size(); } \
+             fn main() { return size_of(41); }",
+        );
+        assert!(
+            generic
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "open user-trait bound must CallIndirect; ops={:?}",
+            generic.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            generic
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "ground call to a user-trait generic must pass a dict; ops={:?}",
+            generic.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = generic
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "size_of(41) CALL arity = 1 value + 1 dict; got {max_call_arity}"
+        );
+    }
+
+    /// COI-78: builtin `Show` is not a monomorphization candidate even at
+    /// a ground type (unlike `Num` / `Ord` / `Eq`).
+    #[test]
+    fn show_bound_ground_call_uses_dictionary_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn show_it<T: Show>(T x) -> T { return x; } \
+             fn main() { let y = show_it(7); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Show ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 Show dict); got {max_call_arity}"
+        );
+    }
+
+    /// COI-78: `Length` matches `Show` — ground calls keep dictionary ABI.
+    #[test]
+    fn length_bound_ground_call_uses_dictionary_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn n<T: Length>(T x) -> int { return len(x); } \
+             fn main() { return n(\"ab\"); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Length ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 Length dict); got {max_call_arity}"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "open Length::len body must CallIndirect; ops={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// COI-78: mixing `Num` with a dictionary bound must not monomorphize —
+    /// the call site still emits a dict tuple (and bumped arity).
+    #[test]
+    fn num_plus_show_ground_call_keeps_dictionary() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn mix<T: Num + Show>(T a, T b) -> T { return a + b; } \
+             fn main() { let y = mix(1, 2); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "Num+Show must emit dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        // 2 values + Num dict + Show dict
+        assert_eq!(
+            max_call_arity, 4,
+            "expected CALL arity = 4 (2 values + 2 dicts); got {max_call_arity}"
+        );
+    }
+
     #[test]
     fn omitted_default_method_dict_slot_has_real_target() {
         use common::Instruction;
@@ -6008,6 +6257,308 @@ fn main() {
         assert!(
             saw_while_exit,
             "expected while-exit BinSlotSlotJmpf targeting past back-edge JMP {back}"
+        );
+    }
+
+    #[test]
+    fn class_ctor_emits_init_typed() {
+        let (bc, _) = compile_src(
+            r#"
+class Box { n: int }
+fn main() {
+    let b = new Box(1);
+    return b.n;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::InitTyped)),
+            "expected InitTyped for class ctor; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode().mnemonic()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .all(|b| !matches!(b.bytecode(), Instruction::INIT)),
+            "new Class should not emit legacy INIT"
+        );
+    }
+
+    #[test]
+    fn drop_method_registers_finalizer_prologue() {
+        let (bc, _) = compile_src(
+            r#"
+class Handle { fd: int }
+impl Handle {
+    fn drop() {}
+}
+fn main() {
+    let h = new Handle(1);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected registry HostInvoke in prologue"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CodePtr)),
+            "expected CodePtr for drop entry"
+        );
+    }
+
+    #[test]
+    fn ground_option_string_none_uses_pointer_niche() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<string> = Option::None;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "ground Option<string> None must not box; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn option_int_none_stays_boxed() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<int> = Option::None;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "Option<int> None must stay boxed; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unary_option_int_return_uses_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Option<int> {
+    return Option::None;
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "unary Option<int> return must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn niche_option_string_return_skips_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Option<string> {
+    return Option::None;
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "pointer-niche Option return stays off ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_option_boundary_inserts_niche_to_heap() {
+        let (bc, _) = compile_src(
+            r#"
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let x: Option<string> = Option::Some("ok");
+    let _ = id(x);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::OptionNicheToHeap)),
+            "generic Option<T> boundary must box a niche value; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vec_pop_heap_item_emits_host_invoke_niche() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from(["a"]);
+    let _ = v.pop();
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_pop", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::pop of string must emit HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vec_pop_int_stays_host_invoke() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from([1]);
+    let _ = v.pop();
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_pop", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::pop of int must not use HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "Vec::pop of int should still HostInvoke; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn unary_result_return_uses_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+fn give() -> Result<int, string> {
+    return Result::Ok(1);
+}
+fn main() {
+    let _ = give();
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "unary Result return must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn nested_option_string_none_stays_boxed() {
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let x: Option<Option<string>> = Option::None;
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "nested Option must stay boxed; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn generic_option_return_inserts_heap_to_niche() {
+        let (bc, _) = compile_src(
+            r#"
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let x: Option<string> = Option::Some("ok");
+    let y: Option<string> = id(x);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::OptionNicheToHeap)),
+            "generic Option arg must niche→heap; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HeapOptionToNiche)),
+            "generic Option return must heap→niche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn vec_remove_heap_item_emits_host_invoke_niche() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let v = Vec::from(["a"]);
+    let _ = v.remove(0);
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.register_native_id("vec_from_array", 1);
+        compiler.register_native_id("vec_remove", 2);
+        let bc = compiler.compile("", &mut ast);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvokeNiche)),
+            "Vec::remove of string must emit HostInvokeNiche; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn ground_option_class_none_uses_pointer_niche() {
+        let (bc, _) = compile_src(
+            r#"
+class Box {
+    n: int,
+}
+fn main() {
+    let x: Option<Box> = Option::None;
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeEnum)),
+            "ground Option<class> None must not box; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
         );
     }
 

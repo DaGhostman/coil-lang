@@ -127,9 +127,12 @@ impl IlModule {
         let run_invert = per.invert_guard_branch;
         per.invert_guard_branch = false;
         // GVN reasons about slot defs; promotion removes the store that makes one
-        // visible, so it runs after GVN has seen the body.
+        // visible, so it runs after GVN has seen the body. Seek-normalize poisons
+        // operand-height at the latch, so it also waits until after GVN.
         let run_slot_promote_tell = per.slot_promote_tell;
+        let run_seek_back_edge = per.seek_back_edge;
         per.slot_promote_tell = false;
+        per.seek_back_edge = false;
 
         if self.funcs.is_empty() {
             let mut ops = self.to_flat();
@@ -140,6 +143,9 @@ impl IlModule {
         for body in &mut self.funcs {
             opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32, pool);
             super::gvn::cfg_gvn(&mut body.ops);
+            if run_seek_back_edge {
+                opt::seek_normalize_back_edges(&mut body.ops, body.meta.entry_sp);
+            }
             if run_slot_promote_tell {
                 opt::slot_promote_at(&mut body.ops, body.meta.entry_sp);
             }
@@ -387,6 +393,7 @@ mod tests {
                 multi_op_join_convoy: true,
                 invert_guard_branch: false,
                 slot_promote_tell: false,
+                seek_back_edge: false,
             },
             &mut Vec::new(),
         );
@@ -398,5 +405,107 @@ mod tests {
             loads, 1,
             "clean body must still sink via whole-buffer multi_op"
         );
+    }
+
+    /// Raising loop used by Seek-normalize tests. Mandelbrot's innermost loop
+    /// is not this shape (no tell-proven self-store); this IL is.
+    fn raising_loop() -> Vec<IlOp> {
+        vec![
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+            IlOp::Label(Label(0)),
+            IlOp::Const { imm: 1, loc: loc() },
+            IlOp::StorePop { slot: 2, loc: loc() },
+            IlOp::Load { slot: 2, loc: loc() },
+            IlOp::Pop { loc: loc() },
+            IlOp::Jump {
+                kind: IlJumpKind::Unconditional,
+                target: Label(0),
+                loc: loc(),
+            },
+        ]
+    }
+
+    fn seek_promote_opts(on: bool) -> OptimizeOptions {
+        OptimizeOptions {
+            jump_thread: false,
+            dead_block: false,
+            stack_dce: false,
+            mem_fwd: false,
+            copy_prop: false,
+            slot_promote: false,
+            canon: false,
+            cast_spill: false,
+            algebraic: false,
+            licm: false,
+            loop_bounds: false,
+            return_convoy: false,
+            clone_shared_return: false,
+            bin_join_convoy: false,
+            multi_op_join_convoy: false,
+            invert_guard_branch: false,
+            slot_promote_tell: true,
+            seek_back_edge: on,
+        }
+    }
+
+    fn is_seek(op: &IlOp) -> bool {
+        matches!(op, IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::Seek)
+    }
+
+    /// Production `optimize_and_flatten` (GVN, then Seek, then promote). Default
+    /// flag is off, so Unknown headers keep the self-store.
+    #[test]
+    fn optimize_and_flatten_default_does_not_seek_normalize() {
+        let ops = raising_loop();
+        let emit_end = ops.iter().filter(|op| op.emits_code()).count();
+        let funcs = vec![IlFunc::with_entry_sp("f", None, 0, emit_end, 2)];
+        let mut m = IlModule::from_flat(&ops, &funcs);
+        let flat = m.optimize_and_flatten(&seek_promote_opts(false), &mut Vec::new());
+        assert!(!flat.iter().any(is_seek));
+        let stores = flat
+            .iter()
+            .filter(|op| matches!(op, IlOp::StorePop { .. }))
+            .count();
+        assert_eq!(stores, 1);
+    }
+
+    /// Flag on: Seek sits on the latch after GVN, then promotion drops the
+    /// self-store. Mandelbrot never takes this path (`seek_back_edge` stays off).
+    #[test]
+    fn optimize_and_flatten_seek_back_edge_elides_raising_loop_store() {
+        let ops = raising_loop();
+        let emit_end = ops.iter().filter(|op| op.emits_code()).count();
+        let funcs = vec![IlFunc::with_entry_sp("f", None, 0, emit_end, 2)];
+        let mut m = IlModule::from_flat(&ops, &funcs);
+        let flat = m.optimize_and_flatten(&seek_promote_opts(true), &mut Vec::new());
+        assert!(
+            flat.windows(2).any(|w| {
+                is_seek(&w[0])
+                    && matches!(
+                        w[1],
+                        IlOp::Jump {
+                            kind: IlJumpKind::Unconditional,
+                            ..
+                        }
+                    )
+            }),
+            "Seek must sit on the latch after GVN"
+        );
+        let seek_to = flat.iter().find_map(|op| match op {
+            IlOp::Byte { byte, .. } if *byte.bytecode() == Instruction::Seek => {
+                Some(byte.operand_u32())
+            }
+            _ => None,
+        });
+        assert_eq!(seek_to, Some(2), "Seek must re-anchor to the forward-edge tell");
+        let stores = flat
+            .iter()
+            .filter(|op| matches!(op, IlOp::StorePop { .. }))
+            .count();
+        assert_eq!(stores, 0);
     }
 }

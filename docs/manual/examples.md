@@ -1019,30 +1019,6 @@ fn main() {
 
 ---
 
-### `examples/regex_demo.hy`
-
-**Demonstrates:** Virtual `regex` (PCRE2) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
-
-```coil
-use regex::{compile, find_all, is_match, replace_all, split};
-
-fn main() {
-    let re = match compile("(\\w+)=(\\d+)", "i") {
-        Result::Ok(v) => v,
-        Result::Err(_) => panic "compile",
-    };
-    // …
-}
-```
-
-| | |
-|---|---|
-| **Run** | `cargo run -- examples/regex_demo.hy` |
-| **Output** | `true,2,a->1 b->2,a|b|c` |
-| **Needs** | system **libpcre2** (or `pcre2-sys` source build) |
-
----
-
 ### `examples/aliases.hy`
 
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
@@ -1950,6 +1926,17 @@ Native threads via `use thread::{spawn, join, …};` — each worker runs on its
 
 ---
 
+### `examples/finalizer.hy`
+
+**Demonstrates:** GC-time `fn drop()` on a class (fake handle close).
+
+| | |
+|---|---|
+| **Run** | `cargo run --bin coil -- examples/finalizer.hy` |
+| **Output** | `closed` |
+
+---
+
 ### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
@@ -1964,7 +1951,8 @@ Native threads via `use thread::{spawn, join, …};` — each worker runs on its
 ### `examples/range.hy`
 
 **Demonstrates:** lazy `Range<T: Ord>` (`0..n`, `0..=n`, float bounds),
-first-class range values, empty decreasing ranges.
+first-class range values, empty decreasing ranges. Numeric ranges collect
+with `.to_vec()` (`tests/positive/range_to_vec.hy`).
 
 | | |
 |---|---|
@@ -2027,17 +2015,15 @@ Each project has its own `coil.toml`, co-located `tests/`, and `NOTES.md`.
 | `01-todo` | Classes, arrays, modules | `./examples/projects/01-todo/demo.sh` |
 | `02-adventure` | Interactive stdin REPL + save/load | `./examples/projects/02-adventure/demo.sh` (or `--ci`) |
 | `03-echo` | TCP + coroutines + protocol module | `./examples/projects/03-echo/demo.sh` |
-| `04-http` | Userland HTTP/1.1 client ([coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md)) | `./examples/projects/04-http/demo.sh` |
+
+HTTP client/server: [coil-http](https://github.com/ardax-corp/coil-http) via [spool](https://github.com/ardax-corp/spool) — see [HTTP stub](http-client.md).
 
 Convenience from repo root:
 
 ```bash
 ./examples/projects/run-demos.sh    # all demos (adventure uses transcript.txt)
-./examples/projects/run-tests.sh    # co-located tests for all four
+./examples/projects/run-tests.sh    # co-located tests for all three
 ```
-
-See also [HTTP/1.1 client](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/http.md)
-([language-repo stub](http-client.md)).
 
 ### Playing `02-adventure`
 
@@ -2113,9 +2099,9 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `static_singleton.hy` | Statics | `121` |
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
-| `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
 | `gc_root_weak.hy` | GC | `pinned\npinned` |
 | `gc_collect.hy` | GC | `none` |
+| `finalizer.hy` | GC | `closed` |
 | `aliases.hy` | Types | `347` |
 | `nested_aggregates.hy` | Aggregates | `alice:30bob:25total:55` |
 | `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |

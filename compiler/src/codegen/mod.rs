@@ -691,7 +691,8 @@ struct Context {
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
 
-    /// Per-arm pattern bindings (slot 1..N). Overrides global `variables` in arm bodies.
+    /// Nested match arm bindings (payload slots). Inner maps merge over outer
+    /// ones so nested `match` can still load the enclosing arm's names.
     match_bindings: Option<HashMap<String, u32>>,
 
     /// Block-local binding overlays. When `Some`, shadowed names allocate a
@@ -949,6 +950,11 @@ pub struct Compiler {
 
     /// Operand-stack capacity for the VM (from recursion-depth analysis).
     operand_stack_slots: u32,
+
+    /// When true, [`Self::finalize_bytecode`] keeps post-opt pre-fuse IL.
+    retain_cursor_il: bool,
+    /// Snapshot filled by finalize when [`Self::retain_cursor_il`] is set.
+    cursor_il: Option<crate::il::tell::CursorIlSnap>,
 }
 
 impl Default for Compiler {
@@ -1030,6 +1036,8 @@ impl Default for Compiler {
             loop_par_sites: crate::typechecking::LoopParSites::new(),
             loop_par_helpers: 0,
             operand_stack_slots: crate::typechecking::DEFAULT_OPERAND_STACK_SLOTS,
+            retain_cursor_il: false,
+            cursor_il: None,
         }
     }
 }

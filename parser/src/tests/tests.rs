@@ -1723,6 +1723,188 @@
         );
     }
 
+    /// COI-73: `import` is a non-goal, not a synonym of `use`.
+    #[test]
+    fn import_path_is_parse_error_not_use() {
+        let src = "import foo::bar;";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Use { .. } => {
+                    panic!("import foo::bar; must not parse as Use")
+                }
+                other => panic!(
+                    "import foo::bar; must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
+    /// COI-73: alias / brace / glob shapes must also fail, not become `Use`.
+    #[test]
+    fn import_alias_brace_and_glob_are_parse_errors_not_use() {
+        for src in [
+            "import foo::bar as x;",
+            "import foo::{bar};",
+            "import foo::*;",
+        ] {
+            match Pratt::default().parse(src) {
+                Ok((_, expr)) => match expr.as_ref() {
+                    Expression::Use { .. } => {
+                        panic!("{src} must not parse as Use")
+                    }
+                    other => panic!(
+                        "{src} must be a parse error, not silently accepted, got {:?}",
+                        other
+                    ),
+                },
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// COI-73 / keywords.md: `import` is not reserved; users may name bindings with it.
+    #[test]
+    fn import_is_not_a_keyword_and_can_name_a_user_function() {
+        let src = "fn import(int x) -> int { return x; } fn main() { let y = import(1); }";
+        let result = Pratt::default().parse(src);
+        assert!(
+            result.is_ok(),
+            "expected user fn named import to parse, got {:?}",
+            result.err()
+        );
+        let ast = result.unwrap();
+        let src_str = format!("{}", ast.1);
+        assert!(
+            src_str.contains("import"),
+            "display should retain import name: {src_str}"
+        );
+    }
+
+    /// COI-74: `case` is a non-goal, not a synonym of `match`.
+    #[test]
+    fn case_scrutinee_is_parse_error_not_match() {
+        let src = "case x { Option::None => 0, Option::Some(v) => v }";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Match { .. } => {
+                    panic!("case x {{ … }} must not parse as Match")
+                }
+                other => panic!(
+                    "case x {{ … }} must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
+    /// COI-74: wildcard / single-arm / statement shapes must also fail, not become `Match`.
+    #[test]
+    fn case_wildcard_and_stmt_shapes_are_parse_errors_not_match() {
+        for src in [
+            "case x { _ => 0 }",
+            "case x { Option::None => 0 }",
+            "fn main() { case x { Option::None => 0 }; }",
+        ] {
+            match Pratt::default().parse(src) {
+                Ok((_, expr)) => match expr.as_ref() {
+                    Expression::Match { .. } => {
+                        panic!("{src} must not parse as Match")
+                    }
+                    other => panic!(
+                        "{src} must be a parse error, not silently accepted, got {:?}",
+                        other
+                    ),
+                },
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// COI-74 / keywords.md: `case` is not reserved; users may name bindings with it.
+    #[test]
+    fn case_is_not_a_keyword_and_can_name_a_user_function() {
+        let src = "fn case(int x) -> int { return x; } fn main() { let y = case(1); }";
+        let result = Pratt::default().parse(src);
+        assert!(
+            result.is_ok(),
+            "expected user fn named case to parse, got {:?}",
+            result.err()
+        );
+        let ast = result.unwrap();
+        let src_str = format!("{}", ast.1);
+        assert!(
+            src_str.contains("case"),
+            "display should retain case name: {src_str}"
+        );
+    }
+
+    /// COI-74: `case` stays a legal binding even inside real `match` patterns.
+    #[test]
+    fn case_can_be_a_match_pattern_binding() {
+        let ast = expr_ast!("match x { case => case, Option::Some(case) => case }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                match &arms[0].pattern.1 {
+                    Pattern::Binding { name } => assert_eq!(*name, "case"),
+                    other => panic!("expected Binding(case), got {:?}", other),
+                }
+                match &arms[1].pattern.1 {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload,
+                    } => {
+                        assert_eq!(*enum_name, "Option");
+                        assert_eq!(*variant_name, "Some");
+                        match payload {
+                            PatternPayload::Tuple(parts) => {
+                                assert_eq!(parts.len(), 1);
+                                match &parts[0].1 {
+                                    Pattern::Binding { name } => assert_eq!(*name, "case"),
+                                    other => panic!("expected Binding(case), got {:?}", other),
+                                }
+                            }
+                            other => panic!("expected Tuple payload, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Constructor(Option::Some(case)), got {:?}", other),
+                }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    /// COI-74: a real `match` must not enable `case` as a nested synonym.
+    #[test]
+    fn nested_case_inside_match_arm_is_parse_error_not_match() {
+        let src = "match x { _ => case y { _ => 0 } }";
+        match Pratt::default().parse(src) {
+            Ok((_, expr)) => match expr.as_ref() {
+                Expression::Match { arms, .. } => {
+                    for arm in arms {
+                        if matches!(arm.body.1.as_ref(), Expression::Match { .. }) {
+                            panic!("{src} must not nest Match via case synonym");
+                        }
+                    }
+                    panic!("{src} must be a parse error, not a Match with non-Match arm body");
+                }
+                other => panic!(
+                    "{src} must be a parse error, not silently accepted, got {:?}",
+                    other
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn parse_use_single_segment() {
         let src = "use foo::bar;";

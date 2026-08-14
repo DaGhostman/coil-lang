@@ -341,6 +341,8 @@ Using an outer name without listing it produces `cannot capture \`n\` without \`
 
 Use `defer` for resource teardown, logging, or paired setup/teardown logic without scattering cleanup across every `return` path.
 
+**GC finalizers** are different: an inherent `fn drop()` on a class runs when the instance is unmarked after a mark-sweep (`gc::collect()` or automatic GC), and again at VM exit for anything still allocated. Order is unspecified; `defer` stays the deterministic function-exit tool. Storing `self` from `drop` can resurrect the object for later collections, but drop still runs at most once — treat that as a footgun, not a pin API (`gc::root` / `Weak` are the pin API). See [`gc`](../../references/gc.md).
+
 ---
 
 ## Stdout and format specifiers
