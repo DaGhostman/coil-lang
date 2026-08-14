@@ -43,11 +43,6 @@ jobs:
               mode: check
           - os: ubuntu-latest
             features:
-              id: regex
-              flags: "--no-default-features --features regex"
-              mode: check
-          - os: ubuntu-latest
-            features:
               id: tls
               flags: "--no-default-features --features tls"
               mode: check
@@ -69,6 +64,11 @@ jobs:
           repository: ardax-corp/coil-stdlib
           path: .deps/coil-stdlib
 
+      - uses: actions/checkout@v4
+        with:
+          repository: ardax-corp/coil-regex
+          path: coil-regex
+
       - name: Install system deps (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -78,8 +78,7 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi pcre2
-          pkg-config --exists libpcre2-8
+          brew install libffi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -88,6 +87,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.features.id }}
+
+      - name: Build coil-regex native lib
+        if: matrix.features.id == 'default'
+        run: make -C coil-regex/native
 
       - name: Build all CLI binaries
         if: matrix.features.id == 'default'

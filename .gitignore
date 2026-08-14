@@ -11,3 +11,5 @@ THREADS_PLAN.md
 .cursor/hooks/state/
 # Local coil-stdlib checkout (CI clones here; sibling `../coil-stdlib` also works).
 .deps/
+# Local coil-regex checkout (CI clones here; sibling `../coil-regex` also works).
+/coil-regex/

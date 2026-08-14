@@ -36,7 +36,7 @@ jobs:
             triple: x86_64-unknown-linux-gnu
             rust_toolchain: stable
             libc: gnu
-          # Native musl build inside Alpine (libffi/pcre2 available as musl
+          # Native musl build inside Alpine (libffi available as musl
           # packages — avoids fragile glibc→musl cross-linking).
           - os: ubuntu-latest
             triple: x86_64-unknown-linux-musl
@@ -49,7 +49,7 @@ jobs:
           # x86_64-apple-darwin / macos-13: GitHub Intel runners stay queued
           # for hours and pin the whole matrix (COI-100). Restore in COI-101.
           - os: windows-latest
-            # MinGW host so we can link the MSYS2 libffi/pcre2 packages
+            # MinGW host so we can link the MSYS2 libffi packages
             # (MSVC + MinGW libs is an ABI mismatch).
             triple: x86_64-pc-windows-gnu
             rust_toolchain: stable-x86_64-pc-windows-gnu
@@ -61,13 +61,13 @@ jobs:
         if: runner.os == 'Linux' && matrix.libc == 'gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libffi-dev libpcre2-dev build-essential
+          sudo apt-get install -y libffi-dev build-essential
 
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi pcre2
-          pkg-config --exists libpcre2-8
+          brew install libffi
+          pkg-config --exists libffi
 
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
@@ -80,7 +80,6 @@ jobs:
             base-devel
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-libffi
-            mingw-w64-x86_64-pcre2
             mingw-w64-x86_64-pkgconf
 
       - name: Configure pkg-config (Windows)
@@ -90,7 +89,6 @@ jobs:
           echo "PKG_CONFIG=$MINGW_PREFIX/bin/pkgconf.exe" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=$MINGW_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "$MINGW_PREFIX/bin" >> "$GITHUB_PATH"
-          pkgconf --exists libpcre2-8
           pkgconf --exists libffi
 
       - name: Install Rust toolchain
@@ -132,7 +130,7 @@ jobs:
             rust:1-alpine \
             sh -c '
               set -eu
-              apk add --no-cache build-base libffi-dev pcre2-dev pkgconf
+              apk add --no-cache build-base libffi-dev pkgconf
               host="$(rustc -vV | sed -n "s/^host: //p")"
               echo "rustc host=$host (expected ${{ matrix.triple }})"
               case "$host" in
