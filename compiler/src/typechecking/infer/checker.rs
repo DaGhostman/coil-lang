@@ -12978,38 +12978,28 @@ impl Checker {
             _ => return,
         };
         for child in children {
-            if let Expression::Function {
-                name,
-                type_params,
-                args,
-                where_constraints,
-                ..
-            } = child.1.as_ref()
-            {
+            if let Expression::Function { name, args, .. } = child.1.as_ref() {
                 if self.fn_param_names.contains_key(*name) {
                     continue;
                 }
-                let pushed = self.push_type_params_for_type_parsing(type_params);
-                let prev_constraints_len = self.active_constraints.len();
-                for wc in where_constraints {
-                    let wc_args: Vec<Ty> =
-                        wc.args.iter().map(|a| self.parse_type_name(a)).collect();
-                    self.active_constraints.push(Constraint {
-                        class: wc.class.to_string(),
-                        args: wc_args,
-                    });
+                let names = Self::syntactic_param_names(args);
+                if !names.is_empty() {
+                    self.fn_param_names.insert(name.to_string(), names);
                 }
-                self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
-                let arg_tys = self.parse_arg_list(args);
-                self.current_tuple_pack = None;
-                self.fn_param_names.insert(
-                    name.to_string(),
-                    arg_tys.iter().map(|(n, _)| n.clone()).collect(),
-                );
-                self.active_constraints.truncate(prev_constraints_len);
-                self.pop_type_params_for_type_parsing(pushed);
             }
         }
+    }
+
+    fn syntactic_param_names(args: &Output) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Expression::Fragment(children) = args.1.as_ref() {
+            for child in children {
+                if let Expression::Argument { name, .. } = child.1.as_ref() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
     }
 
     /// Pre-pass: apply top-level `use` imports so FFI type tags resolve during
