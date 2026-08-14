@@ -62,7 +62,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files 
 | `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `write_from` / `close`, `from_bytes` / `to_bytes`, stream timeouts | No — `use io::{stdout, open, …};` (blocking helpers: `io::sync`) |
 | `io::net::tcp` | `connect` / `connect_timeout` / `listen` / `accept` / `accept_wait` / `accept_wait_timeout`, address helpers, `set_nodelay`, `shutdown` | No — `use io::net::tcp::{connect, listen, …};` |
 | `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — `use io::net::udp::{bind, send_to, …};` |
-| `io::net::tls` | *(none)* | Parent namespace only — import `client` / `server` (feature `tls`) |
+| `io::net::tls` | `alpn_protocol` | No — `use io::net::tls::{alpn_protocol};` (feature `tls`) |
 | `io::net::tls::client` | `enable` / `disable` | No — `use io::net::tls::client::{enable, disable};` (feature `tls`) |
 | `io::net::tls::server` | `enable` / `disable` | No — `use io::net::tls::server::{enable, disable};` (feature `tls`) |
 | `io::fs` | Path/metadata helpers (`exists`, `realpath`, `list_dir`, …) | No — `use io::fs::{exists, list_dir, …};` |

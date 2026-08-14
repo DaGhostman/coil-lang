@@ -7116,7 +7116,7 @@ fn main() {
     assert!(err.is_err(), "empty server enable opts should fail");
 }
 
-/// Parent `io::net::tls` exports nothing — flat `enable` must not resolve.
+/// Parent `io::net::tls` does not export `enable` — it must be imported from client/server.
 #[cfg(feature = "tls")]
 #[test]
 fn tls_flat_parent_enable_does_not_compile() {
@@ -7136,6 +7136,69 @@ fn main() {
         err.is_err(),
         "enable must not resolve without tls client/server import"
     );
+}
+
+/// `alpn_protocol` is on the parent `io::net::tls` module.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_alpn_protocol_compiles_on_parent() {
+    let mut pipeline = Pipeline::new();
+    pipeline
+        .compile_src(
+            r#"
+use io::{open};
+use io::net::tls::{alpn_protocol};
+
+fn main() {
+    let path = "coil_tls_alpn_parent.bin";
+    let s = open(path, "w")?;
+    let _ = alpn_protocol(s);
+}
+"#,
+        )
+        .expect("alpn_protocol should typecheck");
+}
+
+/// HostInvoke: `alpn_protocol` on a non-TLS stream → InvalidInput.
+#[cfg(feature = "tls")]
+#[test]
+fn tls_alpn_protocol_non_tls_is_err_via_host_invoke() {
+    let output = run_example_src(
+        r#"
+use io::{open, stdout, IoError, write};
+use io::net::tls::{alpn_protocol};
+use string::{format, to_bytes};
+
+fn classify(IoError e) -> int {
+    return match e {
+        IoError::WouldBlock => 10,
+        IoError::NotFound => 11,
+        IoError::PermissionDenied => 12,
+        IoError::AlreadyClosed => 13,
+        IoError::InvalidInput => 1,
+        IoError::Other => 15,
+        IoError::NotADirectory => 16,
+        IoError::AlreadyExists => 17,
+        IoError::TimedOut => 18,
+        IoError::Truncated => 19,
+        IoError::Certificate => 20,
+        IoError::Handshake => 21,
+    };
+}
+
+fn main() {
+    let path = "coil_tls_alpn_kind.bin";
+    let s = open(path, "w")?;
+    let r = alpn_protocol(s);
+    let code = match r {
+        Result::Ok(_) => 0,
+        Result::Err(e) => classify(e),
+    };
+    write(stdout(), to_bytes(format("%i", code)));
+}
+"#,
+    );
+    assert_eq!(output, "1");
 }
 
 /// Legacy `encrypt` / `decrypt` names under server must stay gone.

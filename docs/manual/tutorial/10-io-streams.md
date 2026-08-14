@@ -77,6 +77,7 @@ See `examples/io_text.hy`.
 | `io::sync::{write_all,read_exact,read_to_end}` | [coil-stdlib](https://github.com/ardax-corp/coil-stdlib/blob/main/docs/io.md) | Blocking adapters over L0 + `await_*` |
 | `io::net::tcp::{connect,listen,accept,…}` | TCP | `connect` / `connect_timeout` / `listen` / `accept`, plus address / shutdown helpers |
 | `io::net::udp::{bind,send_to,recv_from,…}` | UDP | Datagram sockets; see below |
+| `io::net::tls::{alpn_protocol}` | TLS ALPN | Negotiated protocol after handshake (feature `tls`) |
 | `io::net::tls::client::{enable,disable}` | TLS client | `enable` / `disable` (feature `tls`) |
 | `io::net::tls::server::{enable,disable}` | TLS server | `enable` / `disable` (feature `tls`) |
 
@@ -91,6 +92,7 @@ TCP, UDP, and TLS live in nested virtual modules — import them explicitly
 use io::{stdout};
 use io::net::tcp::{connect};
 use io::net::udp::{bind, local_port, send_to};
+use io::net::tls::{alpn_protocol};
 use io::net::tls::client::{enable, disable};
 use io::net::tls::server::{enable, disable};
 ```
@@ -157,6 +159,7 @@ Client and server share the names `enable` / `disable` under separate modules.
 
 | Module | Function | Behavior |
 |--------|----------|----------|
+| `tls` | `alpn_protocol(s)` | Selected ALPN or `""`; `InvalidInput` if not TLS |
 | `tls::client` | `enable(s, host, opts)` | TCP→TLS; `opts.verify`, `ca_pem`, `ca_path`, `timeout_ms` **required** |
 | `tls::client` | `disable(s)` | Tear TLS down; plaintext on same fd |
 | `tls::server` | `enable(s, opts)` | TCP→TLS; `opts.cert_pem`, `key_pem`, `timeout_ms`, `client_ca_pem` **required** |

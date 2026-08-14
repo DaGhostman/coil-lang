@@ -2,6 +2,7 @@
 //!
 //! Client: [`tls_client_enable`] / [`tls_client_disable`].
 //! Server: [`tls_server_enable`] / [`tls_server_disable`].
+//! After handshake, [`tls_alpn_protocol`] reports the negotiated ALPN (or `""`).
 //! Both upgrade a TCP [`crate::memory::ObjStream`] in place; after handshake,
 //! normal Stream read/write use the shared TLS session.
 
@@ -20,7 +21,7 @@ use common::Value;
 
 use crate::io::{IoErrorTag, value_as_string, with_stream_mut};
 use crate::io_handle::{NativeHandle, WaitHandle};
-use crate::memory::{Heap, Member, Object, StreamKind};
+use crate::memory::{Heap, Member, Object, ObjString, StreamKind};
 
 /// rustls session state owned by a TLS [`crate::memory::ObjStream`] (client or server).
 pub struct TlsSession {
@@ -55,6 +56,14 @@ impl TlsSession {
     /// Whether rustls still has ciphertext to flush to the socket.
     pub fn wants_write(&self) -> bool {
         self.conn.wants_write()
+    }
+
+    /// Negotiated ALPN after handshake, or empty if none was selected.
+    fn alpn_protocol(&self) -> String {
+        self.conn
+            .alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .unwrap_or_default()
     }
 
     fn drain_plaintext_into(&mut self, out: &mut [u8]) -> usize {
@@ -698,6 +707,24 @@ pub fn tls_server_disable(heap: &mut Heap, stream: Value) -> Result<Value, IoErr
     tls_teardown(heap, stream)
 }
 
+/// Negotiated ALPN protocol on a TLS stream, or `""` if none.
+///
+/// Returns [`IoErrorTag::InvalidInput`] if `stream` is not TLS.
+pub fn tls_alpn_protocol(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
+    let proto = with_stream_mut(heap, stream, |s| {
+        if s.kind != StreamKind::Tls {
+            return Err(IoErrorTag::InvalidInput);
+        }
+        Ok(s.tls
+            .as_ref()
+            .map(|t| t.alpn_protocol())
+            .unwrap_or_default())
+    })?;
+    let proto = proto?;
+    let (obj, _) = heap.alloc(ObjString::from(proto.as_str()), Object::String);
+    Ok(Value::from(obj.addr()))
+}
+
 fn tls_teardown(heap: &mut Heap, stream: Value) -> Result<Value, IoErrorTag> {
     with_stream_mut(heap, stream, |s| -> Result<(), IoErrorTag> {
         if s.closed || s.handle.is_none() {
@@ -876,13 +903,24 @@ mod tests {
         ca_path: Option<&str>,
         timeout_ms: i64,
     ) -> Value {
+        make_opts_alpn(heap, verify, ca_pem, ca_path, timeout_ms, "")
+    }
+
+    fn make_opts_alpn(
+        heap: &mut Heap,
+        verify: bool,
+        ca_pem: Option<&str>,
+        ca_path: Option<&str>,
+        timeout_ms: i64,
+        alpn: &str,
+    ) -> Value {
         let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
         let k_verify = heap.intern("verify".into());
         let k_ca = heap.intern("ca_pem".into());
         let k_path = heap.intern("ca_path".into());
         let k_to = heap.intern("timeout_ms".into());
         let k_alpn = heap.intern("alpn".into());
-        let (alpn_obj, _) = heap.alloc(ObjString::from(""), Object::String);
+        let (alpn_obj, _) = heap.alloc(ObjString::from(alpn), Object::String);
         let ca_pem_m = option_string_member(heap, ca_pem);
         let ca_path_m = option_string_member(heap, ca_path);
         gc.as_mut()
@@ -1001,6 +1039,17 @@ mod tests {
     /// client saw `read_to_end == []` (CI flake).
     fn spawn_tls_echo_server() -> (u16, thread::JoinHandle<()>) {
         let (cfg, _name) = test_server_config();
+        spawn_tls_echo_server_cfg(cfg)
+    }
+
+    fn spawn_tls_echo_server_with_alpn(alpn: &[&[u8]]) -> (u16, thread::JoinHandle<()>) {
+        let (cfg, _) = test_server_config();
+        let mut cfg = (*cfg).clone();
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        spawn_tls_echo_server_cfg(Arc::new(cfg))
+    }
+
+    fn spawn_tls_echo_server_cfg(cfg: Arc<ServerConfig>) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -1125,6 +1174,148 @@ mod tests {
         let echoed = stream_read_to_end(&mut heap, s).expect("read_to_end");
         assert_eq!(array_bytes(&heap, echoed), b"hello-tls");
         stream_close(&mut heap, s).expect("close");
+        handle.join().expect("server thread");
+    }
+
+    fn heap_string(heap: &Heap, v: Value) -> String {
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::String(gc)) => gc.as_ref().data.clone(),
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn alpn_protocol_empty_when_neither_side_offers() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn alpn_protocol_negotiates_h2() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"h2"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "h2");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn alpn_protocol_client_prefers_server_overlap() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"http/1.1"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2,http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "http/1.1");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn alpn_protocol_on_non_tls_is_invalid_input() {
+        let mut heap = Heap::default();
+        let path = "coil_alpn_not_tls.bin";
+        let s = stream_open(&mut heap, path, "w").expect("open");
+        let err = tls_alpn_protocol(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn alpn_protocols_from_opt_parses_comma_list() {
+        assert!(alpn_protocols_from_opt("").is_empty());
+        assert_eq!(alpn_protocols_from_opt("h2"), vec![b"h2".to_vec()]);
+        assert_eq!(
+            alpn_protocols_from_opt("h2,http/1.1"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            alpn_protocols_from_opt("h2, http/1.1"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            alpn_protocols_from_opt("h2,,http/1.1,"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn alpn_protocol_on_plain_tcp_is_invalid_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let err = tls_alpn_protocol(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn alpn_protocol_after_disable_is_invalid_input() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let s = tls_client_disable(&mut heap, s).expect("disable");
+        let err = tls_alpn_protocol(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Client advertises ALPN but the peer offers none → `""` (HTTP/1.1 fallback path).
+    #[test]
+    fn alpn_protocol_empty_when_only_client_offers() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2,http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Both sides offer `h2` and `http/1.1`; client preference selects `h2` (COI-69).
+    #[test]
+    fn alpn_protocol_client_preferred_when_both_overlap() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"h2", b"http/1.1"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2,http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "h2");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Whitespace after commas in the opts string must still negotiate.
+    #[test]
+    fn alpn_protocol_whitespace_list_negotiates() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"http/1.1"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2, http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "http/1.1");
+        stream_close(&mut heap, s).ok();
         handle.join().expect("server thread");
     }
 

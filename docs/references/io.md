@@ -22,6 +22,7 @@ use io::sync::{write_all, read_to_end};   // optional blocking adapters (coil-st
 | `io::net::tcp::{connect,connect_timeout,listen,accept}` | TCP | Nested module — `use io::net::tcp::{connect, listen, …};`; timeout `ms <= 0` waits forever |
 | `io::net::tcp::{peer_addr,local_addr,set_nodelay,shutdown}` | TCP helpers | Address tuples, `TCP_NODELAY`, and half-close (`0` read, `1` write, `2` both) |
 | `io::net::udp::{bind,connect,send_to,recv_from,local_port}` | UDP | Nested module; `recv_from` → `(nbytes, host, port)` |
+| `io::net::tls` | `alpn_protocol` | Parent module (feature `tls`); negotiated ALPN after handshake |
 | `io::net::tls::client::{enable,disable}` | TLS client | Nested module (feature `tls`); in-place TCP↔TLS with required opts |
 | `io::net::tls::server::{enable,disable}` | TLS server | Nested module (feature `tls`); PEM cert/key opts, optional mTLS |
 
@@ -57,6 +58,10 @@ extra PEM trust anchors (they do not replace the defaults).
 TLS server enable takes `enable(s, { cert_pem: string, key_pem: string, timeout_ms: int, client_ca_pem: string, alpn: string })`
 on an accepted TCP stream. Empty `client_ca_pem` disables client certificate auth;
 non-empty PEM enables mTLS. `alpn: ""` leaves default; `"h2"` advertises HTTP/2.
+
+After handshake, `io::net::tls::alpn_protocol(s)` returns `Result<string, IoError>`:
+the selected protocol (`"h2"`, `"http/1.1"`, …) or `""` if none. Non-TLS streams
+yield `InvalidInput`.
 
 Buffers are **`Vec<byte>`**. Use `string::{from_bytes, to_bytes}` for text; `io::{from_bytes, to_bytes}` remain aliases. Use `write_all(stdout(), to_bytes(...))` for stdout text. HTTP is userland [coil-http](https://github.com/ardax-corp/coil-http) — install via [spool](../manual/http-client.md).
 
