@@ -5,9 +5,11 @@ coil keeps two runtime facets on each root [`Machine`](../../machine/src/vm.rs):
 | Facet | Module | Role |
 |-------|--------|------|
 | CPU | [`reactor.rs`](../../machine/src/reactor.rs) | Work-stealing Coil `Job`s (`spawn` / auto-par) |
-| IO | [`io_reactor.rs`](../../machine/src/io_reactor.rs) | fd readiness for streams / TLS |
+| IO | [`io_reactor.rs`](../../machine/src/io_reactor.rs) | handle readiness for streams / TLS |
 
 They share a lifecycle (cloned onto pool workers) but **never** put blocking IO onto stealable CPU jobs.
+
+Host streams store a [`NativeHandle`](../../machine/src/io_handle.rs) (`File` / `TcpStream` / `TcpListener` / `UdpSocket`). The reactor waits on a copyable [`WaitHandle`](../../machine/src/io_handle.rs): Unix `poll(2)` on the fd, Windows `WSAPoll` for sockets and `WaitForSingleObject` for file/stdio handles.
 
 ## Async-first model
 
@@ -55,7 +57,7 @@ fn main() {
 ```
 
 Each `await_*` inside `serve` yields after registering interest; `wait_ready`
-runs one multiplexed `poll` over all outstanding fds.
+runs one multiplexed wait over all outstanding handles.
 
 ## Waiting on readiness
 
