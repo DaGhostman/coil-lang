@@ -57,6 +57,29 @@ Point::Point { x: 5, y: 12 }
 
 Field order at the call site does not have to match the declaration — `Point::Point { y: 12, x: 5 }` is valid. See [Records and Fields](04-records-and-fields.md) for details.
 
+### Wrapping a class in a tuple variant
+
+A tuple variant may hold a single class (or any other type). Construct with the class instance — do not use record-call syntax unless the variant itself was declared with `{ … }` fields:
+
+```coil
+class JsonObject {
+    keys: Vec<string>,
+    vals: Vec<JsonValue>,
+}
+
+enum JsonValue {
+    Null,
+    Obj(JsonObject),
+}
+
+fn wrap(JsonObject o) -> JsonValue {
+    return JsonValue::Obj(o);   // tuple construct
+}
+
+// Prefer a record variant if you want `JsonValue::Obj { keys, vals }` at call sites:
+// enum JsonValue { Obj { keys: Vec<string>, vals: Vec<JsonValue> }, … }
+```
+
 ---
 
 ## `match` expressions
