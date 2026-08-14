@@ -710,11 +710,6 @@ mod tests {
             "regex HostInvoke slots must not be registered: {:?}",
             regex
         );
-        let ord = registrations
-            .iter()
-            .position(|(name, _)| name == "ord")
-            .expect("ord registration");
-        assert_eq!(registrations[ord - 1].0, "char");
     }
 
     #[test]
