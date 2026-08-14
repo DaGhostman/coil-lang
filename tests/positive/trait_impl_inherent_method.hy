@@ -1,6 +1,6 @@
 // Expected output: 1
 //
-// Trait-instance methods may call inherent methods declared later (COI-115).
+// Trait-instance methods may call inherent methods on the same type (COI-115).
 
 use io::{stdout, write};
 use string::{format, to_bytes};
@@ -13,17 +13,17 @@ class ItemBoxIter {
     i: int,
 }
 
+impl ItemBox {
+    fn iter() -> ItemBoxIter {
+        return new ItemBoxIter(self.v);
+    }
+}
+
 impl IntoIterator<ItemBox> {
     type Item = int;
     type IntoIter = ItemBoxIter;
     fn into_iter(ItemBox m) -> ItemBoxIter {
         return m.iter();
-    }
-}
-
-impl ItemBox {
-    fn iter() -> ItemBoxIter {
-        return new ItemBoxIter(self.v);
     }
 }
 

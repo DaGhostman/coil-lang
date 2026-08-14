@@ -5780,7 +5780,7 @@ fn main() {
     assert_eq!(output, "xx");
 }
 
-/// COI-115: inherent `impl` after `impl IntoIterator` must still compile + run.
+/// COI-115: trait instance may call an inherent method on the same type.
 #[test]
 fn trait_impl_calls_inherent_method_declared_later() {
     let output = run_example_src(
@@ -5789,16 +5789,16 @@ use io::{stdout, write};
 use string::{format, to_bytes};
 class ItemBox { v: int }
 class ItemBoxIter { i: int }
+impl ItemBox {
+    fn iter() -> ItemBoxIter {
+        return new ItemBoxIter(self.v);
+    }
+}
 impl IntoIterator<ItemBox> {
     type Item = int;
     type IntoIter = ItemBoxIter;
     fn into_iter(ItemBox m) -> ItemBoxIter {
         return m.iter();
-    }
-}
-impl ItemBox {
-    fn iter() -> ItemBoxIter {
-        return new ItemBoxIter(self.v);
     }
 }
 impl Iterator<ItemBoxIter> {
@@ -5822,7 +5822,7 @@ fn main() {
     assert_eq!(output, "1");
 }
 
-/// COI-115: static inherent helper declared after the trait instance.
+/// COI-115: static inherent helper used from a trait instance.
 #[test]
 fn trait_impl_calls_static_inherent_method_declared_later() {
     let output = run_example_src(
@@ -5831,16 +5831,16 @@ use io::{stdout, write};
 use string::{format, to_bytes};
 class ItemBox { v: int }
 class ItemBoxIter { i: int }
+impl ItemBox {
+    static fn make_iter(ItemBox m) -> ItemBoxIter {
+        return new ItemBoxIter(m.v);
+    }
+}
 impl IntoIterator<ItemBox> {
     type Item = int;
     type IntoIter = ItemBoxIter;
     fn into_iter(ItemBox m) -> ItemBoxIter {
         return ItemBox::make_iter(m);
-    }
-}
-impl ItemBox {
-    static fn make_iter(ItemBox m) -> ItemBoxIter {
-        return new ItemBoxIter(m.v);
     }
 }
 impl Iterator<ItemBoxIter> {
