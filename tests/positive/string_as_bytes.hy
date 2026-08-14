@@ -11,7 +11,7 @@ test("non-literal string as [byte] lowers to to_bytes") {
     let s = "hi";
     let b = s as [byte];
     assert(len(b) == 2)?;
-    assert(b == to_bytes("hi"))?;
+    assert(b == ("hi" as [byte]))?;
 }
 
 test("literal cast to Vec<byte>") {
