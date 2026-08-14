@@ -9050,10 +9050,17 @@ test("bind method option Some/None") {
 
 /// COI-108: `self.inner(x)?` must preserve inner method's Ok payload when the
 /// outer function returns a different `Result` payload type.
+///
+/// Empty SharedBuf alone is not enough: a VM panic from a bad Try shape can
+/// leave no `"failed"` banner. Drive cases via `call_function` and require
+/// `!panicked && result_is_ok`.
 #[test]
 fn nested_method_try_preserves_inner_result_payload() {
-    let output = run_harness_src(
-        r#"
+    let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
 class Enc {
 }
 impl Enc {
@@ -9064,20 +9071,85 @@ impl Enc {
         out.push(m as byte);
         return out;
     }
+    fn encode_fail(int _n) -> Result<Vec<byte>, string> {
+        raise "boom";
+    }
     fn encode_into(int n) -> Result<int, string> {
         let bytes = self.encode(n)?;
         return len(bytes);
     }
+    fn encode_first(int n) -> Result<byte, string> {
+        let bytes = self.encode(n)?;
+        return bytes[0];
+    }
+    fn encode_into_fail(int n) -> Result<int, string> {
+        let bytes = self.encode_fail(n)?;
+        return len(bytes);
+    }
 }
-test("nested method try keeps vec bytes") {
+class Box {
+}
+impl Box {
+    fn label(int n) -> Option<string> {
+        if n == 0 {
+            return Option::None;
+        }
+        return Option::Some("ok");
+    }
+    fn label_len(int n) -> Option<int> {
+        let s = self.label(n)?;
+        return len(s);
+    }
+}
+test("nested method try keeps vec len") {
     let e = new Enc();
     let n = e.encode_into(10)?;
     assert(n == 2)?;
 }
+test("nested method try keeps first byte") {
+    let e = new Enc();
+    let b = e.encode_first(10)?;
+    assert(b == (10 as byte))?;
+}
+test("nested method try propagates Err") {
+    let e = new Enc();
+    let msg = match e.encode_into_fail(1) {
+        Result::Ok(_) => "ok",
+        Result::Err(m) => m,
+    };
+    assert(msg == "boom")?;
+}
+test("nested method try Option Some") {
+    let b = new Box();
+    let n = match b.label_len(1) {
+        Option::Some(v) => v,
+        Option::None => -1,
+    };
+    assert(n == 2)?;
+}
+test("nested method try Option None") {
+    let b = new Box();
+    let missing = match b.label_len(0) {
+        Option::Some(_) => false,
+        Option::None => true,
+    };
+    assert(missing)?;
+}
 "#,
-    );
-    assert!(
-        !output.contains("failed"),
-        "nested method try failed: {output:?}"
-    );
+        )
+        .expect("COI-108 harness should compile");
+    let cases = pipeline.test_cases().to_vec();
+    assert_eq!(cases.len(), 5, "expected five COI-108 cases, got {cases:?}");
+    for (name, offset) in &cases {
+        let mut machine = Machine::<256>::with_operand_capacity(pipeline.operand_stack_slots() as usize);
+        pipeline.wire_host_natives(&mut machine);
+        machine.load_program(&bytecode, &constants, pipeline.strings());
+        let ret = machine.call_function(*offset, &[]);
+        assert!(
+            !machine.panicked() && machine.result_is_ok(ret),
+            "COI-108 case {name:?} failed (panicked={} ret_ok={})",
+            machine.panicked(),
+            machine.result_is_ok(ret)
+        );
+    }
 }
