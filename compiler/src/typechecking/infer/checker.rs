@@ -13524,6 +13524,23 @@ impl Checker {
             self.type_params_in_scope.push(param_frame);
         }
 
+        let mut param_constraints: Vec<Constraint> = Vec::new();
+        for (tp, var) in type_params.iter().zip(param_vars.iter()) {
+            for bound in &tp.bounds {
+                param_constraints.push(Constraint {
+                    class: bound.to_string(),
+                    args: vec![Ty::Var(*var)],
+                });
+            }
+        }
+        for wc in where_constraints {
+            let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+            param_constraints.push(Constraint {
+                class: wc.class.to_string(),
+                args,
+            });
+        }
+
         let arg_tys: Vec<Ty> = if let Expression::Fragment(children) = args.1.as_ref() {
             children
                 .iter()
@@ -13556,7 +13573,12 @@ impl Checker {
 
         if is_generic {
             self.type_params_in_scope.pop();
-            let scheme = Scheme::poly_with_kinds(param_vars, param_kinds, Vec::new(), fun_ty);
+            let scheme = Scheme::poly_with_kinds(
+                param_vars,
+                param_kinds,
+                param_constraints,
+                fun_ty,
+            );
             self.forward_free_fn_schemes
                 .insert(name.to_string(), scheme.clone());
             if key != name {
@@ -13567,7 +13589,7 @@ impl Checker {
                 .insert(key, Scheme::mono(fun_ty));
         }
         self.messages.truncate(msg_len);
-        let _ = (where_constraints, range);
+        let _ = range;
     }
 
 
