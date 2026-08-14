@@ -4534,6 +4534,48 @@ fn main() -> Result<(), Error> {
     }
 
     #[test]
+    fn impl_method_can_call_module_helper_after_impl() {
+        let src = r#"
+fn helper(int n) -> int { return n + 1; }
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return helper(f.v); }
+}
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_can_call_module_helper_before_impl() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return helper(f.v); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn invoke_refines_return_type_from_class_field_declare_id() {
         let src = r#"
 use ffi::{declare, dload, invoke, Error};
