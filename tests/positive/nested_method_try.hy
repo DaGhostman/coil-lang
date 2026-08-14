@@ -35,16 +35,16 @@ impl Enc {
 class Box {}
 
 impl Box {
-    fn label(int n) -> Option<string> {
-        if n == 0 {
+    fn mid(int n) -> Option<int> {
+        if n < 0 {
             return Option::None;
         }
-        return Option::Some("ok");
+        return Option::Some(n);
     }
 
-    fn label_len(int n) -> Option<int> {
-        let s = self.label(n)?;
-        return len(s);
+    fn mid_as_float(int n) -> Option<float> {
+        let v = self.mid(n)?;
+        return v as float;
     }
 }
 
@@ -82,16 +82,16 @@ test("nested method try propagates Err") {
 
 test("nested method try Option Some payload") {
     let b = new Box();
-    let n = match b.label_len(1) {
+    let n = match b.mid_as_float(3) {
         Option::Some(v) => v,
-        Option::None => -1,
+        Option::None => 0.0 - 1.0,
     };
-    assert(n == 2)?;
+    assert(n == 3.0)?;
 }
 
 test("nested method try Option None propagates") {
     let b = new Box();
-    let missing = match b.label_len(0) {
+    let missing = match b.mid_as_float(0 - 1) {
         Option::Some(_) => false,
         Option::None => true,
     };

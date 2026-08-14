@@ -6696,27 +6696,28 @@ fn main() {
         );
     }
 
-    /// COI-108: same pair-context rule for Option methods with different payloads.
+    /// COI-108: same pair-context rule for non-niche Option methods with
+    /// different payloads (`Option<string>` is niche and takes another path).
     #[test]
     fn nested_method_try_mismatched_option_keeps_pair_path() {
         let (bc, _) = compile_src(
             r#"
 class Box {}
 impl Box {
-    fn label(int n) -> Option<string> {
-        if n == 0 {
+    fn mid(int n) -> Option<int> {
+        if n < 0 {
             return Option::None;
         }
-        return Option::Some("ok");
+        return Option::Some(n);
     }
-    fn label_len(int n) -> Option<int> {
-        let s = self.label(n)?;
-        return len(s);
+    fn mid_as_float(int n) -> Option<float> {
+        let v = self.mid(n)?;
+        return v as float;
     }
 }
 fn main() {
     let b = new Box();
-    let _ = b.label_len(1);
+    let _ = b.mid_as_float(3);
 }
 "#,
         );
