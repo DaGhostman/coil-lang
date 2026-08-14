@@ -253,6 +253,10 @@ a = b ?? c        // a = (b ?? c)
 Empty index `arr[]` (append assignment) is **removed** — use `vec.push(v)` on a
 `Vec<T>` (`E0107`). See [Arrays and Vec](arrays.md).
 
+Runtime out-of-range `arr[i]` yields `-1` (no panic); out-of-range `arr[i] = x`
+is a no-op. Literal OOB on `[T; N]` and tuples is a compile error. See
+[Out-of-range index](arrays.md#out-of-range-index).
+
 ---
 
 ## Unary operators
