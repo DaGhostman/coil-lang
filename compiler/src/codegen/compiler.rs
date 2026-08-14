@@ -4663,45 +4663,189 @@ impl Compiler {
         if user_impl_methods.is_empty() {
             return false;
         }
-        fn walk(node: &Output<'_>, user_impl_methods: &std::collections::HashSet<String>) -> bool {
-            if let Expression::Call { name, args } = node.1.as_ref() {
-                if let Expression::Access(recv, method) = name.1.as_ref() {
-                    if user_impl_methods.contains(*method)
-                        && matches!(
-                            recv.1.as_ref(),
-                            Expression::Identifier(_) | Expression::Variable(_, _)
-                        )
-                    {
+        Self::walk_expr_calls(body, &mut |name, recv_is_value_method| {
+            recv_is_value_method && user_impl_methods.contains(name)
+        })
+    }
+
+    /// True when `body` calls any free function whose short name is in `names`.
+    fn function_body_calls_free_fn(
+        body: &Output<'_>,
+        names: &std::collections::HashSet<String>,
+    ) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        Self::walk_expr_calls(body, &mut |name, recv_is_value_method| {
+            !recv_is_value_method && names.contains(name)
+        })
+    }
+
+    /// Walk call sites in `node`. `pred(callee_name, is_value_method)` —
+    /// `is_value_method` is true for `recv.method(...)` on an identifier/
+    /// variable receiver.
+    fn walk_expr_calls(
+        node: &Output<'_>,
+        pred: &mut dyn FnMut(&str, bool) -> bool,
+    ) -> bool {
+        if let Expression::Call { name, args } = node.1.as_ref() {
+            match name.1.as_ref() {
+                Expression::Access(recv, method)
+                    if matches!(
+                        recv.1.as_ref(),
+                        Expression::Identifier(_) | Expression::Variable(_, _)
+                    ) =>
+                {
+                    if pred(method, true) {
                         return true;
                     }
                 }
-                if walk(name, user_impl_methods) {
+                Expression::Identifier(callee) => {
+                    if pred(callee, false) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            if Self::walk_expr_calls(name, pred) {
+                return true;
+            }
+            if let Some(args) = args {
+                if args.iter().any(|a| Self::walk_expr_calls(a, pred)) {
                     return true;
                 }
-                if let Some(args) = args {
-                    return args.iter().any(|a| walk(a, user_impl_methods));
-                }
-            }
-            match node.1.as_ref() {
-                Expression::Block(children) | Expression::Fragment(children) => {
-                    children.iter().any(|c| walk(c, user_impl_methods))
-                }
-                Expression::Expr(inner)
-                | Expression::Group(inner)
-                | Expression::Statement(inner)
-                | Expression::ExprStatement(inner)
-                | Expression::Return(inner)
-                | Expression::Raise(inner)
-                | Expression::Yield(inner) => walk(inner, user_impl_methods),
-                Expression::Match { scrutinee, arms } => {
-                    walk(scrutinee, user_impl_methods)
-                        || arms.iter().any(|arm| walk(&arm.body, user_impl_methods))
-                }
-                Expression::Access(recv, _) => walk(recv, user_impl_methods),
-                _ => false,
             }
         }
-        walk(body, user_impl_methods)
+        match node.1.as_ref() {
+            Expression::Block(children)
+            | Expression::Fragment(children)
+            | Expression::If(children) => {
+                children.iter().any(|c| Self::walk_expr_calls(c, pred))
+            }
+            Expression::Branch(cond, body) => {
+                cond.as_ref()
+                    .is_some_and(|c| Self::walk_expr_calls(c, pred))
+                    || Self::walk_expr_calls(body, pred)
+            }
+            Expression::Loop {
+                iterable,
+                body,
+                identifier,
+            } => {
+                Self::walk_expr_calls(iterable, pred)
+                    || identifier
+                        .as_ref()
+                        .is_some_and(|id| Self::walk_expr_calls(id, pred))
+                    || Self::walk_expr_calls(body, pred)
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                init.as_ref()
+                    .is_some_and(|i| Self::walk_expr_calls(i, pred))
+                    || Self::walk_expr_calls(cond, pred)
+                    || step.as_ref().is_some_and(|s| Self::walk_expr_calls(s, pred))
+                    || Self::walk_expr_calls(body, pred)
+            }
+            Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Statement(inner)
+            | Expression::ExprStatement(inner)
+            | Expression::Return(inner)
+            | Expression::ImplicitReturn(inner)
+            | Expression::Raise(inner)
+            | Expression::Yield(inner)
+            | Expression::Try(inner)
+            | Expression::NamedArg(_, inner) => Self::walk_expr_calls(inner, pred),
+            Expression::Construct {
+                variant_name,
+                fields,
+                ..
+            } => {
+                // `Class::static_method(...)` shares Construct surface with enums.
+                if pred(variant_name, true) {
+                    return true;
+                }
+                match fields {
+                    parser::ast::EnumConstructPayload::Unit => false,
+                    parser::ast::EnumConstructPayload::Tuple(args) => {
+                        args.iter().any(|a| Self::walk_expr_calls(a, pred))
+                    }
+                    parser::ast::EnumConstructPayload::Record(parts) => parts
+                        .iter()
+                        .any(|p| Self::walk_expr_calls(&p.value, pred)),
+                }
+            },
+            Expression::List(items)
+            | Expression::Tuple(items)
+            | Expression::Array(items)
+            | Expression::Declare(items)
+            | Expression::Invoke(items) => {
+                items.iter().any(|i| Self::walk_expr_calls(i, pred))
+            }
+            Expression::Match { scrutinee, arms } => {
+                Self::walk_expr_calls(scrutinee, pred)
+                    || arms
+                        .iter()
+                        .any(|arm| Self::walk_expr_calls(&arm.body, pred))
+            }
+            Expression::Access(recv, _) | Expression::OptionalAccess(recv, _) => {
+                Self::walk_expr_calls(recv, pred)
+            }
+            Expression::Instantiate(class, args) => {
+                Self::walk_expr_calls(class, pred)
+                    || args.as_ref().is_some_and(|a| {
+                        a.iter().any(|arg| Self::walk_expr_calls(arg, pred))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Free fns that must emit after `impl`s: those that call user methods,
+    /// plus the transitive callers of that set (so phase-1 never forward-calls
+    /// a deferred callee via Entry into `self.bytecode`).
+    fn deferred_post_impl_free_fns(
+        children: &[Output<'_>],
+        user_impl_methods: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+        let mut deferred = HashSet::new();
+        for child in children {
+            if let Expression::Function { name, body, .. } = child.1.as_ref() {
+                if *name == "main" {
+                    continue;
+                }
+                if body.as_ref().is_some_and(|b| {
+                    Self::function_body_calls_user_impl_method(b, user_impl_methods)
+                }) {
+                    deferred.insert(name.to_string());
+                }
+            }
+        }
+        loop {
+            let mut grew = false;
+            for child in children {
+                if let Expression::Function { name, body, .. } = child.1.as_ref() {
+                    if *name == "main" || deferred.contains(*name) {
+                        continue;
+                    }
+                    if body.as_ref().is_some_and(|b| {
+                        Self::function_body_calls_free_fn(b, &deferred)
+                    }) {
+                        deferred.insert(name.to_string());
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        deferred
     }
 
     fn collect_user_impl_method_names(children: &[Output<'_>]) -> std::collections::HashSet<String> {
@@ -4766,16 +4910,49 @@ impl Compiler {
                 }
             }
             match node.1.as_ref() {
-                Expression::Block(children) | Expression::Fragment(children) => children
+                Expression::Block(children)
+                | Expression::Fragment(children)
+                | Expression::If(children) => children
                     .iter()
                     .any(|c| body_calls_later_fn(c, impl_idx, free_fn_pos)),
+                Expression::Branch(cond, body) => {
+                    cond.as_ref()
+                        .is_some_and(|c| body_calls_later_fn(c, impl_idx, free_fn_pos))
+                        || body_calls_later_fn(body, impl_idx, free_fn_pos)
+                }
+                Expression::Loop {
+                    iterable,
+                    body,
+                    identifier,
+                } => {
+                    body_calls_later_fn(iterable, impl_idx, free_fn_pos)
+                        || identifier.as_ref().is_some_and(|id| {
+                            body_calls_later_fn(id, impl_idx, free_fn_pos)
+                        })
+                        || body_calls_later_fn(body, impl_idx, free_fn_pos)
+                }
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    init.as_ref()
+                        .is_some_and(|i| body_calls_later_fn(i, impl_idx, free_fn_pos))
+                        || body_calls_later_fn(cond, impl_idx, free_fn_pos)
+                        || step
+                            .as_ref()
+                            .is_some_and(|s| body_calls_later_fn(s, impl_idx, free_fn_pos))
+                        || body_calls_later_fn(body, impl_idx, free_fn_pos)
+                }
                 Expression::Expr(inner)
                 | Expression::Group(inner)
                 | Expression::Statement(inner)
                 | Expression::ExprStatement(inner)
                 | Expression::Return(inner)
                 | Expression::Raise(inner)
-                | Expression::Yield(inner) => {
+                | Expression::Yield(inner)
+                | Expression::Try(inner) => {
                     body_calls_later_fn(inner, impl_idx, free_fn_pos)
                 }
                 Expression::Match { scrutinee, arms } => {
@@ -4814,18 +4991,24 @@ impl Compiler {
         false
     }
 
+    fn reserve_phased_free_fn_entries(&mut self, children: &[Output<'_>]) {
+        for child in children {
+            if let Expression::Function { name, .. } = child.1.as_ref() {
+                let qualified = if self.namespace.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}::{}", self.namespace, name)
+                };
+                self.reserve_function_entry(qualified);
+            }
+        }
+    }
+
     fn program_needs_phased_emit(children: &[Output<'_>]) -> bool {
         let user_impl_methods = Self::collect_user_impl_method_names(children);
         let free_fn_pos = Self::top_level_free_fn_positions(children);
-        children.iter().any(|c| {
-            if let Expression::Function { body, .. } = c.1.as_ref() {
-                body.as_ref().is_some_and(|b| {
-                    Self::function_body_calls_user_impl_method(b, &user_impl_methods)
-                })
-            } else {
-                false
-            }
-        }) || Self::impl_calls_later_free_fn(children, &free_fn_pos)
+        !Self::deferred_post_impl_free_fns(children, &user_impl_methods).is_empty()
+            || Self::impl_calls_later_free_fn(children, &free_fn_pos)
     }
 
     /// True when `body` is just the sole pattern binding (e.g. `Ok(x) => x`).
@@ -9780,23 +9963,16 @@ impl Compiler {
             Expression::Program(children) => {
                 if Self::program_needs_phased_emit(children) {
                     // Emit phases (COI-109): helpers before `impl`, but free fns
-                    // that call user `impl` methods must follow their `impl` blocks.
-                    let user_impl_methods = Self::collect_user_impl_method_names(children);
+                    // that call user `impl` methods (and their callers) must
+                    // follow their `impl` blocks, in source order within the
+                    // deferred set so callees bind before callers.
+                    // All free fns after inherent impls (source order). Reserve
+                    // entries so `impl` methods can Entry-call later helpers.
+                    self.reserve_phased_free_fn_entries(children);
                     let phase = |c: &Output| -> u8 {
                         match c.1.as_ref() {
-                            Expression::Function { name, body, .. } if *name == "main" => 3,
-                            Expression::Function { body, .. } => {
-                                if body.as_ref().is_some_and(|b| {
-                                    Self::function_body_calls_user_impl_method(
-                                        b,
-                                        &user_impl_methods,
-                                    )
-                                }) {
-                                    25
-                                } else {
-                                    1
-                                }
-                            }
+                            Expression::Function { name, .. } if *name == "main" => 3,
+                            Expression::Function { .. } => 25,
                             Expression::Implementation { .. } => 2,
                             Expression::TestCase { .. } => 3,
                             _ => 0,
@@ -14513,6 +14689,7 @@ impl Compiler {
             // names so TC can pass while codegen misses — retry
             // the current module FQN before reporting unknown.
             let n = if self.functions.contains_key(&n)
+                || self.fn_entry_labels.contains_key(&n)
                 || self.extern_runtime_functions.contains_key(&n)
                 || self.native.contains_key(&n)
             {
@@ -14520,6 +14697,7 @@ impl Compiler {
             } else if !self.namespace.is_empty() && !n.contains("::") {
                 let qualified = format!("{}::{}", self.namespace, n);
                 if self.functions.contains_key(&qualified)
+                    || self.fn_entry_labels.contains_key(&qualified)
                     || self
                         .checker
                         .selected_overload_at(span.start, span.end)
@@ -14862,13 +15040,40 @@ impl Compiler {
                 // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
                 // not boxed at construction, so unboxing would zero
                 // a valid immediate (Phase 5 HKT / Container::first).
-                if is_generic && self.generic_return_is_boxed(&lookup_name) {
+                    if is_generic && self.generic_return_is_boxed(&lookup_name) {
                     if let Some(call_ty) = self.codegen_expr_ty(ast) {
                         Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                         if self.niche_option_inner_ty(&call_ty).is_some() {
                             bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
                         }
                     }
+                }
+            } else if self.fn_entry_labels.contains_key(&n) {
+                // Reserved by phased emit (COI-109) but body not yet bound.
+                let lookup_name = strip_overload_key(&n).to_string();
+                let pair_kind = self.pair_return_kind(&lookup_name);
+                let arg_slice = args.as_deref().unwrap_or(&[]);
+                self.consume_spread_emit_ids(arg_slice);
+                let value_arity = self.emit_call_args_with_rest(
+                    &lookup_name,
+                    arg_slice,
+                    &mut bytecode,
+                    false,
+                );
+                if !self.emit_direct_fn_call(&mut bytecode, &n, value_arity) {
+                    let mut message = Message::error(
+                        ErrorCode::UnknownFunction,
+                        "Unknown function".to_string(),
+                        span.into_range(),
+                    );
+                    message.push(DiagLabel::new(
+                        format!("Unable to call unknown function '{}'", n),
+                        span.into_range(),
+                    ));
+                    self.messages.push(message);
+                }
+                if pair_kind.is_some() && !self.pair_value_context {
+                    self.emit_pair_to_heap_after_call(&mut bytecode, &lookup_name);
                 }
             } else if let Some(slot) = self.lookup_slot(&identifier) {
                 // Local holding a function value: escaped PolyFn

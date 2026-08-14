@@ -1010,6 +1010,94 @@ fn main() {
         );
     }
 
+    /// COI-109: free fns that only call user methods inside `while`/`if` must
+    /// still emit after the `impl` (walk must enter loop/branch bodies).
+    #[test]
+    fn free_fn_method_call_inside_while_after_sibling_runs() {
+        let src = r#"
+class Box { n: int, }
+impl Box {
+    fn get() -> int { return self.n; }
+    fn bump() { self.n = self.n + 1; }
+}
+fn peek(Box b) -> int { return b.get(); }
+fn thrash(Box b) {
+    let i = 0;
+    while i < 1 {
+        b.bump();
+        i = i + 1;
+    }
+}
+fn main() {
+    let b = new Box(0);
+    peek(b);
+    thrash(b);
+    if b.get() != 1 { raise "bump"; }
+}
+"#;
+        let mut pipeline = crate::Pipeline::new();
+        let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+        let mut machine = machine::Machine::<256>::default();
+        pipeline.wire_host_natives(&mut machine);
+        machine.set_program_debug(pipeline.program_debug());
+        machine.run_raw(
+            &bytecode,
+            &constants,
+            pipeline.strings(),
+            pipeline.static_slot_count(),
+        );
+        assert!(
+            !machine.panicked(),
+            "while-body user method calls must resolve after sibling free fn"
+        );
+    }
+
+    /// COI-109: free fn calling a deferred method-caller must also emit after
+    /// `impl` (or all free fns after impls) so the callee is bound for CALL.
+    #[test]
+    fn phase1_free_fn_can_call_deferred_method_caller() {
+        let src = r#"
+class Box { n: int, }
+impl Box {
+    fn get() -> int { return self.n; }
+}
+fn peek(Box b) -> int { return b.get(); }
+fn wrap(Box b) -> int { return peek(b); }
+fn main() {
+    let b = new Box(7);
+    let got = wrap(b);
+    if got != 7 {
+        let _x = 0 / 0;
+    }
+}
+"#;
+        let mut pipeline = crate::Pipeline::new();
+        let compiled = pipeline.compile_src(src);
+        assert!(
+            compiled.is_ok(),
+            "compile failed: {:?}",
+            pipeline
+                .messages()
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+        let (bytecode, constants) = compiled.unwrap();
+        let mut machine = machine::Machine::<256>::default();
+        pipeline.wire_host_natives(&mut machine);
+        machine.set_program_debug(pipeline.program_debug());
+        machine.run_raw(
+            &bytecode,
+            &constants,
+            pipeline.strings(),
+            pipeline.static_slot_count(),
+        );
+        assert!(
+            !machine.panicked(),
+            "phase-1 caller must Entry-call deferred free fn"
+        );
+    }
+
     /// COI-109: later free helpers must be callable from inherent methods under
     /// the default `main` treeshake path (not only `coil test` roots).
     #[test]
