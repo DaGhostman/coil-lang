@@ -8644,6 +8644,73 @@ impl Compiler {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Unwrap statement wrappers to the underlying expr (depth-capped).
+    fn unwrap_stmt_node<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
+        let mut current = node;
+        for _ in 0..8 {
+            current = match current.1.as_ref() {
+                Expression::Statement(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Expr(inner)
+                | Expression::Group(inner) => inner,
+                _ => break,
+            };
+        }
+        current
+    }
+
+    /// Inherent `impl Type { … }` (trait instances use [`Expression::TypeClassImpl`]).
+    fn is_inherent_impl(node: &Output<'_>) -> bool {
+        matches!(
+            Self::unwrap_stmt_node(node).1.as_ref(),
+            Expression::Implementation { what, .. } if what.is_empty()
+        )
+    }
+
+    /// User-written trait instance (`impl IntoIterator<T>`, …).
+    ///
+    /// Skips auto-injected `Show`/`String` display impls that the attr expander
+    /// inserts beside each class — those must stay glued to their type.
+    fn is_user_trait_instance(node: &Output<'_>) -> bool {
+        match Self::unwrap_stmt_node(node).1.as_ref() {
+            Expression::TypeClassImpl { class, .. } => *class != "Show" && *class != "String",
+            Expression::Implementation { what, .. } => !what.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// When a user trait instance appears before an inherent `impl Type`, hoist
+    /// that inherent block to just before the first such trait instance so
+    /// method CALL sites resolve (COI-115). Inherent blocks already before all
+    /// user trait instances are left in place (keeps class / derive adjacency).
+    fn program_children_inherent_before_trait<'a>(
+        children: &'a [Output<'a>],
+    ) -> Vec<&'a Output<'a>> {
+        let Some(first_user_trait) = children.iter().position(|c| Self::is_user_trait_instance(c))
+        else {
+            return children.iter().collect();
+        };
+        let mut hoist = Vec::new();
+        let mut rest = Vec::with_capacity(children.len());
+        for (idx, child) in children.iter().enumerate() {
+            if idx > first_user_trait && Self::is_inherent_impl(child) {
+                hoist.push(child);
+            } else {
+                rest.push(child);
+            }
+        }
+        if hoist.is_empty() {
+            return rest;
+        }
+        // `first_user_trait` still indexes into `rest` because we only removed
+        // nodes that were strictly after it.
+        let mut out = Vec::with_capacity(children.len());
+        out.extend(rest.iter().copied().take(first_user_trait));
+        out.extend(hoist);
+        out.extend(rest.iter().copied().skip(first_user_trait));
+        out
+    }
+
     fn class_member_fqn(&self, owner: &str, member: &str) -> String {
         format!("{}::{}", self.resolve_class_ident(owner), member)
     }
@@ -9531,9 +9598,14 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
-                children.iter().for_each(|child| {
+                // COI-115: trait-instance bodies may call inherent methods
+                // declared later in the file. Codegen resolves `recv.method`
+                // via `context.methods` / `functions`, which are filled when
+                // the inherent `impl` is emitted — so emit those inherent
+                // impls before user trait instances that precede them.
+                for child in Self::program_children_inherent_before_trait(children) {
                     bytecode.append(&mut self.do_compile(child));
-                });
+                }
                 if !self.test_cases.is_empty() && !self.user_main_defined {
                     self.emit_virtual_test_main();
                 }
