@@ -32,19 +32,25 @@ impl Enc {
     }
 }
 
+enum Wrap {
+    V { n: int },
+}
+
 class Box {}
 
 impl Box {
-    fn mid(int n) -> Option<int> {
+    fn wrap(int n) -> Option<Wrap> {
         if n < 0 {
             return Option::None;
         }
-        return Option::Some(n);
+        return Option::Some(Wrap::V { n: n });
     }
 
-    fn mid_as_float(int n) -> Option<float> {
-        let v = self.mid(n)?;
-        return v as float;
+    fn unwrap_n(int n) -> Option<int> {
+        let w = self.wrap(n)?;
+        return match w {
+            Wrap::V { n } => n,
+        };
     }
 }
 
@@ -82,16 +88,16 @@ test("nested method try propagates Err") {
 
 test("nested method try Option Some payload") {
     let b = new Box();
-    let n = match b.mid_as_float(3) {
+    let n = match b.unwrap_n(3) {
         Option::Some(v) => v,
-        Option::None => 0.0 - 1.0,
+        Option::None => -1,
     };
-    assert(n == 3.0)?;
+    assert(n == 3)?;
 }
 
 test("nested method try Option None propagates") {
     let b = new Box();
-    let missing = match b.mid_as_float(0 - 1) {
+    let missing = match b.unwrap_n(0 - 1) {
         Option::Some(_) => false,
         Option::None => true,
     };

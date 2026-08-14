@@ -6702,22 +6702,25 @@ fn main() {
     fn nested_method_try_mismatched_option_keeps_pair_path() {
         let (bc, _) = compile_src(
             r#"
+enum Wrap { V { n: int } }
 class Box {}
 impl Box {
-    fn mid(int n) -> Option<int> {
+    fn wrap(int n) -> Option<Wrap> {
         if n < 0 {
             return Option::None;
         }
-        return Option::Some(n);
+        return Option::Some(Wrap::V { n: n });
     }
-    fn mid_as_float(int n) -> Option<float> {
-        let v = self.mid(n)?;
-        return v as float;
+    fn unwrap_n(int n) -> Option<int> {
+        let w = self.wrap(n)?;
+        return match w {
+            Wrap::V { n } => n,
+        };
     }
 }
 fn main() {
     let b = new Box();
-    let _ = b.mid_as_float(3);
+    let _ = b.unwrap_n(3);
 }
 "#,
         );
