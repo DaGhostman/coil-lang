@@ -9108,7 +9108,8 @@ test("nested method try keeps first byte") {
 }
 test("nested method try propagates Err") {
     let e = new Enc();
-    let msg = match e.encode_into_fail(1) {
+    let r = e.encode_into_fail(1);
+    let msg = match r {
         Result::Ok(_) => "ok",
         Result::Err(m) => m,
     };

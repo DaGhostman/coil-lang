@@ -6652,7 +6652,7 @@ fn main() {
     /// ReturnPair and use the tag EQ/JMPF path — not PairToHeap + JumpIfMatch.
     #[test]
     fn nested_method_try_mismatched_result_keeps_pair_path() {
-        let mut owned = String::from(
+        let (bc, _) = compile_src(
             r#"
 class Enc {}
 impl Enc {
@@ -6671,16 +6671,6 @@ fn main() {
     let _ = e.encode_into(10);
 }
 "#,
-        );
-        let mut ast = Pratt::default()
-            .parse(owned.as_str())
-            .expect("parse failed");
-        let mut compiler = Compiler::default();
-        let bc = compiler.compile("", &mut ast);
-        assert!(
-            compiler.messages.is_empty(),
-            "COI-108 sample must typecheck; messages={:?}",
-            compiler.messages
         );
         let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
         assert!(
@@ -6704,7 +6694,6 @@ fn main() {
             !ops.iter().any(|op| matches!(op, Instruction::JumpIfMatch)),
             "mismatched-Result method Try must not JumpIfMatch a heap enum; opcodes={ops:?}",
         );
-        let _ = owned;
     }
 
     #[test]
