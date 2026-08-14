@@ -102,6 +102,10 @@ Ty::Sum {
 }
 ```
 
+### Runtime representation
+
+User code always sees constructors and `match`. At runtime, enums are heap objects (`MakeEnum`). Codegen may skip that allocation only for a discarded constructor (`MakeEnum; POP`) or a unary variant immediately consumed by `Unpack` / `LoadField(0)`. Wider payloads, values that escape, and control-flow joins stay heap-backed — a DCE ceiling, not a second enum ABI ([COI-94](https://linear.app/ardax/issue/COI-94)). Named-local class unboxing is a different rule ([COI-84](https://linear.app/ardax/issue/COI-84)). Builtin `Option` / `Result` have their own niche / pair / boxed matrix ([Option / Result runtime ABI](#option--result-runtime-abi)).
+
 ### Generic enums (`Ty::App`)
 
 User enums may take type parameters. Annotations and construct/match use the same `Ty::App` machinery as builtin `Option` / `Result`:
@@ -207,10 +211,12 @@ Statics: `Vec::new`, `Vec::with_capacity`, `Vec::from`. Methods: `push`, `pop`,
 
 | Target | Compile-time index | Runtime index |
 |--------|-------------------|---------------|
-| Fixed array `[T; N]` | OOB literal → diagnostic | Allowed (no static check) |
-| `Vec<T>` | N/A | Allowed (no OOB diagnostic) |
+| Fixed array `[T; N]` | OOB literal → diagnostic | Allowed (no static check); OOB load yields `-1`, OOB store is a no-op |
+| `Vec<T>` | N/A | Allowed (no OOB diagnostic); same `-1` / no-op VM contract |
 | Tuple | OOB literal → diagnostic | — |
 | Non-aggregate | Error | — |
+
+`Index` is never rewritten to an unchecked form ([COI-85](https://linear.app/ardax/issue/COI-85)). Prefer `i < len(a)` in loops. Details: [Arrays and Vec](arrays.md#out-of-range-index).
 
 ---
 
@@ -926,6 +932,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
 | Trait runtime | **Decided ([COI-78](https://linear.app/ardax/issue/COI-78)):** ground instance methods use `CALL`; generic user-trait / `Show` / `Length` bounds keep dictionaries. Only ground `Num`/`Ord`/`Eq` (and operator supertraits) monomorphize to opcodes. See [Call-site dispatch](#call-site-dispatch). |
 | Option / Result ABI | **Decided ([COI-92](https://linear.app/ardax/issue/COI-92)):** pointer niche, two-slot call return, or boxed enum — see [Option / Result runtime ABI](#option--result-runtime-abi). |
+| Enum runtime | **Decided ([COI-94](https://linear.app/ardax/issue/COI-94)):** heap objects; DCE may skip discarded or unary-unpack constructors only — see [Runtime representation](#runtime-representation). |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |

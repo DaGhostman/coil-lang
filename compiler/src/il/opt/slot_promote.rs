@@ -441,7 +441,7 @@ fn rewrite_byte_slot_uses(byte: &mut common::Byte, from: u32, to: u32) -> bool {
             }
             true
         }
-        Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+        Instruction::BinSlotImm | Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
             let (op, slot, imm) = byte.bin_slot_imm_parts();
             if slot as u32 != from || to > 255 {
                 return false;
@@ -449,7 +449,7 @@ fn rewrite_byte_slot_uses(byte: &mut common::Byte, from: u32, to: u32) -> bool {
             *byte = common::Byte::new(insn).with_bin_slot_imm(op, to as u8, imm as i16);
             true
         }
-        Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+        Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
             let (op, a, b) = byte.bin_slot_slot_parts();
             if to > 255 {
                 return false;
@@ -748,7 +748,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                         defs.insert(byte.load_store_slot_at(k));
                     }
                 }
-                Instruction::BinSlotImm | Instruction::BinSlotImmJmpf => {
+                Instruction::BinSlotImm | Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
                     let (_, slot, _) = byte.bin_slot_imm_parts();
                     uses.insert(slot as u32);
                 }
@@ -758,7 +758,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                     // Dest lives in the const pool; treat as opaque def.
                     opaque = true;
                 }
-                Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf => {
+                Instruction::BinSlotSlot | Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
                     let (_, a, b) = byte.bin_slot_slot_parts();
                     uses.insert(a as u32);
                     uses.insert(b as u32);
@@ -769,7 +769,7 @@ fn op_slot_use_def(op: &IlOp) -> (HashSet<u32>, HashSet<u32>, bool) {
                     uses.insert(b as u32);
                     defs.insert(dest as u32);
                 }
-                Instruction::BinSlotSlotConstJmpf => {
+                Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
                     let o = byte.operand_u32();
                     uses.insert(((o >> 16) & 0xff) as u32);
                     // Second slot is pool-backed — fail closed.
@@ -1261,8 +1261,11 @@ fn slot_used_anywhere(ops: &[IlOp], slot: u32) -> bool {
                             | Instruction::BinSlotImmStore
                             | Instruction::BinSlotSlotStore
                             | Instruction::BinSlotImmJmpf
+                            | Instruction::BinSlotImmJmpt
                             | Instruction::BinSlotSlotJmpf
+                            | Instruction::BinSlotSlotJmpt
                             | Instruction::BinSlotSlotConstJmpf
+                            | Instruction::BinSlotSlotConstJmpt
                             | Instruction::FloatChainStore
                     ) {
                         return true;
@@ -1624,7 +1627,9 @@ mod tell {
                 // Pool-packed destinations and in-place unpacks name slots this
                 // pass cannot read from the IL alone.
                 Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotImmJmpt
                 | Instruction::BinSlotSlotJmpf
+                | Instruction::BinSlotSlotJmpt
                 | Instruction::BinSlotImmStore
                 | Instruction::BinSlotSlotStore
                 | Instruction::UnpackAt => return false,

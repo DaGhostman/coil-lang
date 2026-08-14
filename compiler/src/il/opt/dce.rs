@@ -324,13 +324,14 @@ fn slot_used_by(op: &IlOp, slot: u32) -> bool {
                 let (_op, s, _) = byte.bin_slot_imm_parts();
                 s as u32 == slot
             }
-            Instruction::BinSlotImmStore | Instruction::BinSlotImmJmpf => {
+            Instruction::BinSlotImmStore | Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
                 let (_op, s, _) = byte.bin_slot_imm_store_parts();
                 s as u32 == slot
             }
             Instruction::BinSlotSlot
             | Instruction::BinSlotSlotStore
-            | Instruction::BinSlotSlotJmpf => {
+            | Instruction::BinSlotSlotJmpf
+            | Instruction::BinSlotSlotJmpt => {
                 let (_op, a, b) = byte.bin_slot_slot_parts();
                 a as u32 == slot || b as u32 == slot
             }
@@ -363,13 +364,15 @@ fn collect_used_slots(ops: &[IlOp]) -> std::collections::HashSet<u32> {
                 }
                 Instruction::BinSlotImm
                 | Instruction::BinSlotImmStore
-                | Instruction::BinSlotImmJmpf => {
+                | Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotImmJmpt => {
                     let (_op, s, _) = byte.bin_slot_imm_parts();
                     used.insert(s as u32);
                 }
                 Instruction::BinSlotSlot
                 | Instruction::BinSlotSlotStore
-                | Instruction::BinSlotSlotJmpf => {
+                | Instruction::BinSlotSlotJmpf
+                | Instruction::BinSlotSlotJmpt => {
                     let (_op, a, b) = byte.bin_slot_slot_parts();
                     used.insert(a as u32);
                     used.insert(b as u32);

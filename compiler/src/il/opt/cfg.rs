@@ -49,40 +49,10 @@ pub(super) fn jump_thread(ops: &mut Vec<IlOp>) {
     }
 }
 
-/// True when `op` would fuse into a `*Jmpf` superinstruction with a following
-/// `JumpIfFalse` (mirrors the `try_fuse_*_jmpf` arms in [`crate::il::lower`]).
-fn fuses_with_jmpf(op: Option<&IlOp>) -> bool {
-    let Some(op) = op else {
-        return false;
-    };
-    if matches!(op, IlOp::BinSlotImm { op: o, .. } | IlOp::BinSlotSlot { op: o, .. }
-        if crate::il::lower::is_jmpf_cond_op(Instruction::from(*o)))
-    {
-        return true;
-    }
-    if matches!(op, IlOp::Bin { op: o, .. } if crate::il::lower::is_jmpf_cond_op(*o)) {
-        return true;
-    }
-    match op.as_encode_byte() {
-        Some(b) => match *b.bytecode() {
-            Instruction::LogNot => true,
-            Instruction::BinSlotImm => {
-                crate::il::lower::is_jmpf_cond_op(Instruction::from(b.bin_slot_imm_parts().0))
-            }
-            Instruction::BinSlotSlot => {
-                crate::il::lower::is_jmpf_cond_op(Instruction::from(b.bin_slot_slot_parts().0))
-            }
-            other => crate::il::lower::is_jmpf_cond_op(other),
-        },
-        None => false,
-    }
-}
-
 /// `JMPF A; JMP B; A:` → `JMPT B`, dropping the trailing unconditional jump.
 ///
 /// This is the shape every `if cond { break / return / continue }` guard emits.
-/// Refused when the condition producer would fuse into a `*Jmpf` superinstruction
-/// — there is no `*Jmpt` counterpart, so inverting would cost more than it saves.
+/// Fusable producers invert too: fuse-select emits the `*Jmpt` twin (COI-87).
 pub(crate) fn invert_branch_over_jump(ops: &mut Vec<IlOp>) {
     let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut i = 0;
@@ -104,8 +74,7 @@ pub(crate) fn invert_branch_over_jump(ops: &mut Vec<IlOp>) {
             continue;
         };
         let (skip, far, loc) = (*skip, *far, *loc);
-        let prev = i.checked_sub(1).and_then(|p| ops.get(p));
-        if fuses_with_jmpf(prev) || !labels_bind_at(ops, i + 2, skip) {
+        if !labels_bind_at(ops, i + 2, skip) {
             i += 1;
             continue;
         }

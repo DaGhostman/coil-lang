@@ -105,7 +105,7 @@ jobs:
           # Raise nofile and serialize package test runs so listing is sequential.
           jobs=""
           if [ "${{ runner.os }}" = "macOS" ]; then
-            ulimit -n 10240 || true
+            ulimit -n 65536 || true
             jobs="--jobs 1"
           fi
           n=0
@@ -132,3 +132,90 @@ jobs:
         if: matrix.features.id == 'default'
         run: |
           BIN=./target/debug/coil ./examples/projects/run-tests.sh
+
+  # MinGW host matches release-binaries (COI-100/102): MSVC cannot link the
+  # MSYS2 libffi/pcre2 packages. Keep this on PRs so Unix-only host APIs fail
+  # here instead of only on the main-only zip cell.
+  test-windows-gnu:
+    name: test (windows-gnu, default)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ardax-corp/coil-stdlib
+          path: .deps/coil-stdlib
+
+      - name: Install system deps (Windows)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-libffi
+            mingw-w64-x86_64-pcre2
+            mingw-w64-x86_64-pkgconf
+
+      - name: Configure pkg-config (Windows)
+        shell: msys2 {0}
+        run: |
+          echo "PKG_CONFIG=$MINGW_PREFIX/bin/pkgconf.exe" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$MINGW_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$MINGW_PREFIX/bin" >> "$GITHUB_PATH"
+          pkgconf --exists libpcre2-8
+          pkgconf --exists libffi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Verify host triple
+        shell: bash
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host=$host"
+          if [[ "$host" != "x86_64-pc-windows-gnu" ]]; then
+            echo "::error::runner host triple '$host' is not x86_64-pc-windows-gnu"
+            exit 1
+          fi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows-gnu-default
+
+      - name: Build all CLI binaries
+        shell: msys2 {0}
+        run: |
+          cargo_bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
+          # /usr/bin: GNU make + cmp for vendored libffi-sys ./configure.
+          export PATH="$MINGW_PREFIX/bin:$cargo_bin:/usr/bin:$PATH"
+          rustc -vV
+          command -v make
+          command -v cmp
+          cargo build
+
+      - name: Workspace tests (default)
+        shell: msys2 {0}
+        run: |
+          cargo_bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
+          export PATH="$MINGW_PREFIX/bin:$cargo_bin:/usr/bin:$PATH"
+          cargo test --workspace --lib --tests --bins --jobs 1
+
+      - name: Language harness (`coil test`)
+        shell: msys2 {0}
+        run: |
+          cargo_bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
+          export PATH="$MINGW_PREFIX/bin:$cargo_bin:/usr/bin:$PATH"
+          ./target/debug/coil.exe test
+
+      - name: Showcase project tests
+        shell: msys2 {0}
+        run: |
+          cargo_bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
+          export PATH="$MINGW_PREFIX/bin:$cargo_bin:/usr/bin:$PATH"
+          BIN=./target/debug/coil.exe bash ./examples/projects/run-tests.sh
