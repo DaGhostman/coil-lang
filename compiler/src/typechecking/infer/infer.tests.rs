@@ -4301,6 +4301,154 @@ fn main() {
         );
     }
 
+
+    #[test]
+    fn impl_method_forward_helper_num_bound_rejects_string() {
+        let src = r#"
+class Foo { v: string, }
+impl Foo {
+    fn bump(Foo f) -> string { return add1(f.v); }
+}
+fn add1<T: Num>(T n) -> T { return n; }
+fn main() {
+    let f = new Foo("x");
+    let x = f.bump();
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("No instance for `Num")),
+            "expected Num<string> rejection via stub, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_helper_where_num_rejects_string() {
+        let src = r#"
+class Foo { v: string, }
+impl Foo {
+    fn bump(Foo f) -> string { return twice(f.v); }
+}
+fn twice<T>(T n) -> T where Num<T> { return n; }
+fn main() {
+    let f = new Foo("x");
+    let x = f.bump();
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("No instance for `Num")),
+            "expected where Num rejection via stub, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_helper_arity_mismatch() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return helper(f.v, 2); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("too many arguments")),
+            "expected arity error via stub, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_helper_type_mismatch() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return helper("x"); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected type mismatch via stub, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_unknown_helper_still_errors() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return missing(f.v); }
+}
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Cannot find function")),
+            "expected unknown helper error, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_nullary_and_inferred_return() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return one() + helper(f.v); }
+}
+fn one() { return 1; }
+fn helper(int n) { return n; }
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn impl_method_forward_generic_id_helper() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump(Foo f) -> int { return id(f.v); }
+}
+fn id<T>(T x) -> T { return x; }
+fn main() {
+    let f = new Foo(1);
+    let x = f.bump();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn invoke_refines_return_type_from_class_field_declare_id() {
         let src = r#"
