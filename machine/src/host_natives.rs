@@ -43,6 +43,8 @@ pub fn build_standard_host_natives(
     // Append-only: keep prior HostInvoke ids stable across ARCHIVE_MINOR bumps.
     push_io_wait_ready(&mut out, &mut register_id);
     push_io_write_from(&mut out, &mut register_id);
+    #[cfg(feature = "tls")]
+    push_tls_alpn_protocol(&mut out, &mut register_id);
     push_wiring(&mut out, &mut register_id, GC_WIRING, "gc");
     push_math_libm(&mut out, &mut register_id);
     // Append-only after math_libm: Vec helpers.
@@ -191,6 +193,28 @@ fn push_io_write_from(
     out.push(Arc::new(HostClosureFn::new(sig, |heap, args| {
         let r = stream_write_from(heap, args[0], args[1], args[2].as_int());
         Ok(Some(as_result_int(heap, r)))
+    })));
+}
+
+/// Read negotiated ALPN on a TLS stream (`io::net::tls::alpn_protocol`).
+#[cfg(feature = "tls")]
+fn push_tls_alpn_protocol(
+    out: &mut Vec<Arc<dyn NativeFn>>,
+    register_id: &mut impl FnMut(&str, usize),
+) {
+    use crate::io::as_result_value;
+    use crate::tls::tls_alpn_protocol;
+    let sig = FfiSignature::from_parts(
+        "tls_alpn_protocol".to_string(),
+        vec![FfiType::Int],
+        FfiType::Int,
+    )
+    .expect("tls_alpn_protocol signature");
+    let id = out.len();
+    register_id("tls_alpn_protocol", id);
+    out.push(Arc::new(HostClosureFn::new(sig, |heap, args| {
+        let r = tls_alpn_protocol(heap, args[0]);
+        Ok(Some(as_result_value(heap, r)))
     })));
 }
 
@@ -784,6 +808,14 @@ mod tests {
         let sig = natives[write_from].signature();
         assert_eq!(sig.args, vec![FfiType::Int, FfiType::Int, FfiType::Int]);
         assert_eq!(sig.ret, FfiType::Int);
+        #[cfg(feature = "tls")]
+        {
+            let alpn = registrations
+                .iter()
+                .position(|(name, _)| name == "tls_alpn_protocol")
+                .expect("tls_alpn_protocol");
+            assert_eq!(alpn, write_from + 1);
+        }
     }
 
     /// Auto-par specializations spawn N-ary recursive calls; the host native
