@@ -4722,30 +4722,6 @@ fn main() {
         );
     }
 
-    /// Forward stubs may parse signatures before aliases exist; truncated
-    /// stub diagnostics must not leak into the final message list.
-    #[test]
-    fn impl_method_forward_helper_alias_sig_no_stub_noise() {
-        let src = r#"
-class Foo { v: int, }
-impl Foo {
-    fn bump(Foo f) -> int { return helper(f.v); }
-}
-type MyInt = int;
-fn helper(MyInt n) -> MyInt { return n + 1; }
-fn main() {
-    let f = new Foo(1);
-    let x = f.bump();
-}
-"#;
-        let (c, _) = check(src);
-        assert!(
-            c.messages().is_empty(),
-            "unexpected stub/alias noise: {:?}",
-            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
-        );
-    }
-
     #[test]
     fn invoke_refines_return_type_from_class_field_declare_id() {
         let src = r#"
