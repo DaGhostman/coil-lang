@@ -75,6 +75,7 @@ impl Checker {
             codegen_var_types_scopes: Vec::new(),
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
+            forward_free_fn_schemes: HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
             fn_tuple_rest: std::collections::HashMap::new(),
             current_tuple_pack: None,
@@ -1431,6 +1432,7 @@ impl Checker {
         self.codegen_var_types_scopes.clear();
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
+        self.forward_free_fn_schemes.clear();
         self.fn_has_rest.clear();
         self.fn_tuple_rest.clear();
         self.current_tuple_pack = None;
@@ -4752,6 +4754,13 @@ impl Checker {
     }
 
     #[inline(never)]
+    fn lookup_fn_scheme(&self, ident: &str) -> Option<Scheme> {
+        self.env
+            .lookup(ident)
+            .cloned()
+            .or_else(|| self.forward_free_fn_schemes.get(ident).cloned())
+    }
+
     fn infer_call_expr(
         &mut self,
         name: &Output,
@@ -5498,7 +5507,7 @@ impl Checker {
         // Named call-site args: skip trait UFCS and resolve an ordinary
         // function (partial application is allowed — residual Fun is OK).
         if has_named {
-            let scheme = self.env.lookup(&ident).cloned();
+            let scheme = self.lookup_fn_scheme(&ident);
             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
                 Some(s) => {
                     let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -5576,7 +5585,7 @@ impl Checker {
         // Rest-parameter calls pack trailing args; skip UFCS trait
         // resolution so we don't double-infer (NodeId alignment).
         if self.fn_has_rest(&ident) {
-            let scheme = self.env.lookup(&ident).cloned();
+            let scheme = self.lookup_fn_scheme(&ident);
             let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
                 Some(s) => {
                     let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -5708,7 +5717,7 @@ impl Checker {
             }
         }
 
-        let scheme = self.env.lookup(&ident).cloned();
+        let scheme = self.lookup_fn_scheme(&ident);
         let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = match scheme {
             Some(s) => {
                 let (fun_ty, constraints, mapping) = self.instantiate_scheme_mapped(&s);
@@ -11734,6 +11743,7 @@ impl Checker {
                     .insert(name.to_string());
             }
         } else {
+            self.forward_free_fn_schemes.remove(name);
             self.env
                 .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
         }
@@ -13482,28 +13492,26 @@ impl Checker {
         args: &Output,
         returns: Option<&Output>,
         where_constraints: &[parser::ast::WhereConstraint],
-        _range: &Range<usize>,
+        range: &Range<usize>,
     ) {
         let key = if self.current_module.is_empty() {
             name.to_string()
         } else {
             format!("{}::{}", self.current_module, name)
         };
-        if self.env.lookup(&key).is_some() || self.env.lookup(name).is_some() {
+        if self.env.lookup(&key).is_some()
+            || self.env.lookup(name).is_some()
+            || self.forward_free_fn_schemes.contains_key(&key)
+            || self.forward_free_fn_schemes.contains_key(name)
+        {
             return;
         }
 
-        // Discard diagnostics from this stub: aliases/traits/classes used in
-        // signatures may not be registered yet. Real inference rebinds the
-        // scheme; forward call sites only need a best-effort shape.
         let msg_len = self.messages.len();
-
-        // Mirror `infer_function`'s binder setup so forward calls from
-        // earlier `impl` bodies see a real poly scheme + constraints.
         let is_generic = !type_params.is_empty();
         let mut param_vars: Vec<TyVarId> = Vec::new();
-        let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
         let mut param_kinds: Vec<Kind> = Vec::new();
+        let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
         for tp in type_params {
             let var = self.counter.fresh();
             let kind = self.resolve_type_param_kind(tp);
@@ -13512,42 +13520,28 @@ impl Checker {
             param_vars.push(var);
             param_kinds.push(kind);
         }
-        self.type_params_in_scope.push(param_frame);
-
-        let mut param_constraints: Vec<Constraint> = Vec::new();
-        for (tp, var) in type_params.iter().zip(param_vars.iter()) {
-            // Do not call `constraint_from_bound` here — user traits in the
-            // same file are registered during main inference, after this stub.
-            for bound in &tp.bounds {
-                param_constraints.push(Constraint {
-                    class: bound.to_string(),
-                    args: vec![Ty::Var(*var)],
-                });
-            }
+        if is_generic {
+            self.type_params_in_scope.push(param_frame);
         }
-        for wc in where_constraints {
-            let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
-            param_constraints.push(Constraint {
-                class: wc.class.to_string(),
-                args,
-            });
-        }
-        let prev_constraints_len = self.active_constraints.len();
-        self.active_constraints
-            .extend(param_constraints.iter().cloned());
 
-        self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
-        let arg_tys = self.parse_arg_list(args);
-        self.current_tuple_pack = None;
-        self.fn_param_names.insert(
-            key.clone(),
-            arg_tys.iter().map(|(n, _)| n.clone()).collect(),
-        );
+        let arg_tys: Vec<Ty> = if let Expression::Fragment(children) = args.1.as_ref() {
+            children
+                .iter()
+                .filter_map(|c| {
+                    if let Expression::Argument { ty: Some(ty), .. } = c.1.as_ref() {
+                        Some(self.parse_type_name(ty))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let param_names = Self::syntactic_param_names(args);
+        self.fn_param_names.insert(key.clone(), param_names.clone());
         if key != name {
-            self.fn_param_names.insert(
-                name.to_string(),
-                arg_tys.iter().map(|(n, _)| n.clone()).collect(),
-            );
+            self.fn_param_names.insert(name.to_string(), param_names);
         }
 
         let ret_ty = match returns {
@@ -13555,35 +13549,25 @@ impl Checker {
             None => Ty::Var(self.counter.fresh()),
         };
         let mut fun_ty = ret_ty;
-        for (_, arg_ty) in arg_tys.iter().rev() {
+        for arg_ty in arg_tys.iter().rev() {
             fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
         }
         fun_ty = Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false);
 
-        self.active_constraints.truncate(prev_constraints_len);
-        self.type_params_in_scope.pop();
-
         if is_generic {
-            let scheme =
-                Scheme::poly_with_kinds(param_vars, param_kinds, param_constraints.clone(), fun_ty);
-            self.generic_fns.insert(name.to_string());
-            self.generics.generic_fns.insert(name.to_string());
-            self.fn_dict_arity
-                .insert(name.to_string(), param_constraints.len());
+            self.type_params_in_scope.pop();
+            let scheme = Scheme::poly_with_kinds(param_vars, param_kinds, Vec::new(), fun_ty);
+            self.forward_free_fn_schemes
+                .insert(name.to_string(), scheme.clone());
             if key != name {
-                self.generic_fns.insert(key.clone());
-                self.generics.generic_fns.insert(key.clone());
-                self.fn_dict_arity
-                    .insert(key.clone(), param_constraints.len());
-            }
-            self.env.insert_top(name.to_string(), scheme.clone());
-            if key != name {
-                self.env.insert_top(key, scheme);
+                self.forward_free_fn_schemes.insert(key, scheme);
             }
         } else {
-            self.env.insert_top(key, Scheme::mono(fun_ty));
+            self.forward_free_fn_schemes
+                .insert(key, Scheme::mono(fun_ty));
         }
         self.messages.truncate(msg_len);
+        let _ = (where_constraints, range);
     }
 
 

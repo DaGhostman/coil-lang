@@ -955,6 +955,61 @@ use string::{format, to_bytes};
         );
     }
 
+    #[test]
+    fn check_program_impl_calls_later_helper_via_compiler_checker() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump() -> int { return helper(self.v); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(41);
+    if f.bump() != 42 { raise "bump"; }
+}
+"#;
+        let ast = Pratt::default().parse(src).expect("parse");
+        let mut compiler = Compiler::default();
+        let _ = compiler.checker.check_program(&ast);
+        assert!(
+            compiler.checker.messages().is_empty(),
+            "unexpected: {:?}",
+            compiler
+                .checker
+                .messages()
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compiler_compile_impl_calls_later_helper() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump() -> int { return helper(self.v); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(41);
+    if f.bump() != 42 { raise "bump"; }
+}
+"#;
+        let mut ast = Pratt::default().parse(src).expect("parse");
+        let mut compiler = Compiler::default();
+        let _ = compiler.compile("", &mut ast);
+        assert!(
+            compiler.get_messages().is_empty(),
+            "unexpected: {:?}",
+            compiler
+                .get_messages()
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// COI-109: later free helpers must be callable from inherent methods under
     /// the default `main` treeshake path (not only `coil test` roots).
     #[test]

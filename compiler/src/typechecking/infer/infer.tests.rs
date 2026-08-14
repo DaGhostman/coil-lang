@@ -4534,6 +4534,27 @@ fn main() -> Result<(), Error> {
     }
 
     #[test]
+    fn impl_method_self_calls_later_helper() {
+        let src = r#"
+class Foo { v: int, }
+impl Foo {
+    fn bump() -> int { return helper(self.v); }
+}
+fn helper(int n) -> int { return n + 1; }
+fn main() {
+    let f = new Foo(41);
+    let x = f.bump();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn impl_method_can_call_module_helper_after_impl() {
         let src = r#"
 fn helper(int n) -> int { return n + 1; }

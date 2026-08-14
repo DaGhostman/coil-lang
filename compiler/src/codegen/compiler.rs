@@ -9531,12 +9531,6 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
-                // Emit phases (COI-109):
-                // 0 = decls / trait impls, 1 = free fns (not main),
-                // 2 = inherent `impl`, 3 = `main` + `test`.
-                // Free helpers must precede inherent methods; methods must
-                // precede `main`/`test` call sites. Function bodies are only
-                // entered via CALL.
                 let phase = |c: &Output| -> u8 {
                     match c.1.as_ref() {
                         Expression::Function { name, .. } if *name == "main" => 3,
