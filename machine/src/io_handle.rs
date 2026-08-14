@@ -310,8 +310,10 @@ mod tests {
     #[test]
     fn open_file_rejects_invalid_mode() {
         let path = temp_path("coil_native_handle_bad_mode.bin");
-        let err = NativeHandle::open_file(path.to_str().unwrap(), "x").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        match NativeHandle::open_file(path.to_str().unwrap(), "x") {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("invalid mode must fail"),
+        }
     }
 
     #[test]

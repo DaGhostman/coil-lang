@@ -1279,11 +1279,13 @@ mod tests {
         let path = std::env::temp_dir().join("coil_io_append_mode.bin");
         let _ = std::fs::remove_file(&path);
         let mut heap = Heap::default();
+        let first = make_byte_array(&mut heap, b"ab");
+        let second = make_byte_array(&mut heap, b"cd");
         let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open w");
-        stream_write_all(&mut heap, w, make_byte_array(&mut heap, b"ab")).expect("write");
+        stream_write_all(&mut heap, w, first).expect("write");
         stream_close(&mut heap, w).expect("close w");
         let a = stream_open(&mut heap, path.to_str().unwrap(), "a").expect("open a");
-        stream_write_all(&mut heap, a, make_byte_array(&mut heap, b"cd")).expect("append");
+        stream_write_all(&mut heap, a, second).expect("append");
         stream_close(&mut heap, a).expect("close a");
         let r = stream_open(&mut heap, path.to_str().unwrap(), "r").expect("open r");
         let buf = stream_read_to_end(&mut heap, r).expect("read");
