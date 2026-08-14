@@ -14508,6 +14508,31 @@ impl Checker {
                     range,
                 );
             }
+            let call_shape = match fields {
+                EnumConstructPayload::Unit => "unit",
+                EnumConstructPayload::Tuple(_) => "tuple",
+                EnumConstructPayload::Record(_) => "record",
+            };
+            let help = match (&expected_payload, fields) {
+                (
+                    EnumVariantPayloadTy::Tuple(tys),
+                    EnumConstructPayload::Record(_),
+                ) if tys.len() == 1 => {
+                    let wrapped = crate::typechecking::pretty::format_ty_for_diag(
+                        &self.subst,
+                        &tys[0],
+                    );
+                    format!(
+                        "`{enum_str}::{variant_str}` is a tuple variant wrapping `{wrapped}`; \
+                         construct with `{enum_str}::{variant_str}(value)`, or declare a record \
+                         variant `{variant_str} {{ …fields… }}` if you want named fields at the call site"
+                    )
+                }
+                (EnumVariantPayloadTy::Record(_), _) => {
+                    format!("use record syntax for `{enum_str}::{variant_str}`")
+                }
+                _ => format!("use tuple / unit syntax for `{enum_str}::{variant_str}`"),
+            };
             return self.error_with_help(
                 ErrorCode::PayloadShapeMismatch,
                 format!(
@@ -14515,23 +14540,10 @@ impl Checker {
                     enum_str,
                     variant_str,
                     payload_kind_name(&expected_payload),
-                    match fields {
-                        EnumConstructPayload::Unit => "unit",
-                        EnumConstructPayload::Tuple(_) => "tuple",
-                        EnumConstructPayload::Record(_) => "record",
-                    },
+                    call_shape,
                 ),
                 range,
-                Some(format!(
-                    "use {} syntax for `{}::{}`",
-                    if matches!(expected_payload, EnumVariantPayloadTy::Record(_)) {
-                        "record"
-                    } else {
-                        "tuple / unit"
-                    },
-                    enum_str,
-                    variant_str,
-                )),
+                Some(help),
             );
         }
 

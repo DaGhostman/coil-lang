@@ -2333,6 +2333,50 @@ fn main() {
     }
 
     #[test]
+    fn record_construct_on_class_tuple_variant_steers_to_tuple_or_record_decl() {
+        let msgs = assert_messages(
+            r#"
+class JsonObject { x: int }
+enum JsonValue { Obj(JsonObject) }
+fn main() { let _ = JsonValue::Obj { x: 1 }; }
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("payload shape mismatch")
+                    && m.help().as_ref().is_some_and(|h| {
+                        h.contains("wrapping")
+                            && h.contains("JsonObject")
+                            && h.contains("Obj(value)")
+                    })
+            }),
+            "expected class-wrap tuple hint, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.message(), m.help().clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tuple_variant_wrapping_class_typechecks() {
+        let (c, _) = check(
+            r#"
+class JsonObject { x: int }
+enum JsonValue { Obj(JsonObject) }
+fn main() {
+    let o = new JsonObject(1);
+    let _ = JsonValue::Obj(o);
+}
+"#,
+        );
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn access_field_from_tuple_variant_produces_error() {
         // `p.x` where `p` is bound to `Tuple::Wrap(1, 2)` — a
         // Tuple-shaped variant. The variant isn't a record, so we
