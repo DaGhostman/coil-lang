@@ -1374,6 +1374,15 @@ mod tests {
         assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "encrypt"));
         assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "decrypt"));
         assert!(!vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "connect"));
+        assert!(vm.resolves_use(&["io".into(), "net".into(), "tls".into()], "alpn_protocol"));
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "client".into()],
+            "alpn_protocol"
+        ));
+        assert!(!vm.resolves_use(
+            &["io".into(), "net".into(), "tls".into(), "server".into()],
+            "alpn_protocol"
+        ));
         assert!(!vm.resolves_use(
             &["io".into(), "net".into(), "tls".into(), "server".into()],
             "encrypt"

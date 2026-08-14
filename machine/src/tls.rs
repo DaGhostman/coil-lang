@@ -1232,6 +1232,93 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn alpn_protocols_from_opt_parses_comma_list() {
+        assert!(alpn_protocols_from_opt("").is_empty());
+        assert_eq!(alpn_protocols_from_opt("h2"), vec![b"h2".to_vec()]);
+        assert_eq!(
+            alpn_protocols_from_opt("h2,http/1.1"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            alpn_protocols_from_opt("h2, http/1.1"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            alpn_protocols_from_opt("h2,,http/1.1,"),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn alpn_protocol_on_plain_tcp_is_invalid_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let err = tls_alpn_protocol(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        let _ = accept.join();
+    }
+
+    #[test]
+    fn alpn_protocol_after_disable_is_invalid_input() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_then_enable(&mut heap, "127.0.0.1", port as i64, false).expect("enable");
+        let s = tls_client_disable(&mut heap, s).expect("disable");
+        let err = tls_alpn_protocol(&mut heap, s).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Client advertises ALPN but the peer offers none → `""` (HTTP/1.1 fallback path).
+    #[test]
+    fn alpn_protocol_empty_when_only_client_offers() {
+        let (port, handle) = spawn_tls_echo_server();
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2,http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Both sides offer `h2` and `http/1.1`; client preference selects `h2` (COI-69).
+    #[test]
+    fn alpn_protocol_client_preferred_when_both_overlap() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"h2", b"http/1.1"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2,http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "h2");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
+    /// Whitespace after commas in the opts string must still negotiate.
+    #[test]
+    fn alpn_protocol_whitespace_list_negotiates() {
+        let (port, handle) = spawn_tls_echo_server_with_alpn(&[b"http/1.1"]);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_alpn(&mut heap, false, None, None, 0, "h2, http/1.1");
+        let s = tls_client_enable(&mut heap, s, "127.0.0.1", opts).expect("enable");
+        let proto = tls_alpn_protocol(&mut heap, s).expect("alpn");
+        assert_eq!(heap_string(&heap, proto), "http/1.1");
+        stream_close(&mut heap, s).ok();
+        handle.join().expect("server thread");
+    }
+
     /// Large payload so rustls may buffer ciphertext across write/flush; ensures
     /// read_to_end still drains pending writes instead of hanging on poll(read).
     #[test]
