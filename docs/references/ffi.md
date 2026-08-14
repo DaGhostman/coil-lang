@@ -105,7 +105,7 @@ invoke(lib, fn_id, (args...))
 - a class field that was assigned `self.fn_id = declare(...)?` in an `impl` initializer;
 - a function parameter when every call site passes a value with known `declare` metadata (e.g. `helper(api.fn_id)`).
 
-Direct `invoke(lib, api.fn_id, …)` uses the field table; a bare parameter `id` uses call-site flow when the callee is typechecked after its callers.
+Direct `invoke(lib, api.fn_id, …)` uses the field table; a bare parameter `id` uses call-site flow recorded from callers (including a module pre-pass before inference).
 
 ```coil
 use io::{stdout};

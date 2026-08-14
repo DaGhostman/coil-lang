@@ -4386,6 +4386,218 @@ fn main() -> Result<(), Error> {
         );
     }
 
+    /// Call-site `declare` metadata flows into a callee's bare `invoke` param.
+    #[test]
+    fn invoke_refines_return_type_from_param_call_site_flow() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+impl Api {
+    fn load(int lib) -> Result<(), Error> {
+        self.id = declare(lib, "f", (), Float)?;
+    }
+}
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.load(lib)?;
+    let _ = helper(api.id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pre-pass records param flow even when the helper is defined before callers.
+    #[test]
+    fn pre_pass_records_param_invoke_flow_before_main_infer() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (), Float)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let mut c = Checker::new();
+        let trimmed = normalize_adjacent_decls(src.trim());
+        let owned = format_check_src(trimmed.as_str());
+        let ast = Pratt::default().parse(owned.as_str()).unwrap();
+        crate::typechecking::id::pre_walk(&ast, &mut c.ids);
+        c.pre_register_enums(&ast).unwrap();
+        c.pre_register_free_functions(&ast);
+        c.pre_process_top_level_uses(&ast);
+        c.pre_pass_ffi_invoke_param_flow(&ast);
+        let meta = c
+            .test_ffi_param_invoke_ret("helper::id")
+            .expect("pre-pass must record helper::id flow");
+        assert_eq!(meta.0, float(), "declare ret Float must flow into param");
+        assert!(!meta.1, "non-variadic declare must not set variadic bit");
+        assert_eq!(meta.2, 0);
+    }
+
+    #[test]
+    fn invoke_refines_return_type_from_param_call_site_flow_forward_ref() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (), Float)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Named-arg call sites must record param flow (`infer_and_reorder` path).
+    #[test]
+    fn invoke_refines_return_type_from_named_param_call_site_flow() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (), Float)?;
+    let _ = helper(id: fn_id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Variadic `declare` metadata must flow through a callee param (extra args ok).
+    #[test]
+    fn invoke_variadic_from_param_call_site_allows_extra_args() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int, Float};
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, (1, 2, 3))?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (Int,), Float, true)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invoke_variadic_from_param_call_site_rejects_too_few_args() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::{Int, Float};
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, (1,))?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (Int, Int), Float, true)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("variadic invoke expects at least")
+                    || m.code() == Some(ErrorCode::InvokeArity)
+            }),
+            "expected variadic arity error via param flow, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            !msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "brace-imported Float must refine invoke ret via param flow, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Bare int param without call-site `declare` metadata must not refine to float.
+    #[test]
+    fn invoke_untracked_param_id_does_not_refine_return_type() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let _ = declare(lib, "f", (), Float)?;
+    let _ = helper(0)?;
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::TypeMismatch)
+                    || m.message().contains("Type mismatch")
+                    || m.message().contains("float")
+            }),
+            "expected float refine failure for untracked param id, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     /// Variadic `declare` metadata stored on a class field must refine arity
     /// (extra args ok) — same path codegen uses for `is_ffi_declare_variadic_for_fn_id`.
     #[test]
