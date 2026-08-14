@@ -7382,24 +7382,26 @@ test("match imported payload") {
 
         c.set_current_module("pkg");
         let ast = parser
-            .parse("enum Status { Ok, Err, }")
+            .parse("enum Traffic { Go, Stop, }")
             .expect("parse pkg");
         let _ = c.check_program(&ast);
-        assert!(c.take_messages().is_empty());
+        assert!(
+            c.take_messages().is_empty(),
+            "pkg: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
 
         c.set_current_module("");
         let ast = parser
             .parse(
                 r#"
-use pkg::{Status};
-fn tag_of(Status s) -> int {
-    return match s {
-        Status::Ok => 0,
-        Status::Err => 1,
-    };
-}
+use pkg::{Traffic};
 fn main() {
-    let n = tag_of(Status::Ok);
+    let s = Traffic::Go;
+    let n = match s {
+        Traffic::Go => 0,
+        Traffic::Stop => 1,
+    };
 }
 "#,
             )
@@ -7420,21 +7422,29 @@ fn main() {
 
         c.set_current_module("pkg");
         let ast = parser
-            .parse("enum Status { Ok, Err, }")
+            .parse("enum Traffic { Go, Stop, }")
             .expect("parse pkg");
         let _ = c.check_program(&ast);
-        assert!(c.take_messages().is_empty());
-        assert_eq!(c.tag_for("pkg::Status", "Ok"), Some(0));
-        assert_eq!(c.tag_for("pkg::Status", "Err"), Some(1));
+        assert!(
+            c.take_messages().is_empty(),
+            "pkg: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.tag_for("pkg::Traffic", "Go"), Some(0));
+        assert_eq!(c.tag_for("pkg::Traffic", "Stop"), Some(1));
 
         c.set_current_module("");
         let ast = parser
             .parse("enum Local { A, B, }")
             .expect("parse root enum");
         let _ = c.check_program(&ast);
-        assert!(c.take_messages().is_empty());
+        assert!(
+            c.take_messages().is_empty(),
+            "root: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
         assert_eq!(
-            c.tag_for("pkg::Status", "Ok"),
+            c.tag_for("pkg::Traffic", "Go"),
             Some(0),
             "module FQN tags must survive the next check_program"
         );
@@ -7444,7 +7454,7 @@ fn main() {
         let _ = c.check_program(&ast);
         assert!(c.take_messages().is_empty());
         assert_eq!(
-            c.tag_for("pkg::Status", "Ok"),
+            c.tag_for("pkg::Traffic", "Go"),
             Some(0),
             "module FQN tags must survive a third check_program"
         );
@@ -7461,16 +7471,20 @@ fn main() {
 
         c.set_current_module("pkg");
         let ast = parser
-            .parse("enum Status { Ok, Err, }")
+            .parse("enum Traffic { Go, Stop, }")
             .expect("parse pkg");
         let _ = c.check_program(&ast);
-        assert!(c.take_messages().is_empty());
+        assert!(
+            c.take_messages().is_empty(),
+            "pkg: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
 
         c.set_current_module("");
         let ast = parser
             .parse(
                 r#"test("no import") {
-    let v = Status::Ok;
+    let v = Traffic::Go;
 }"#,
             )
             .expect("parse test without use");
