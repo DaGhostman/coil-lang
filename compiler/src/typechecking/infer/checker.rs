@@ -1398,6 +1398,13 @@ impl Checker {
     }
 
     /// Set the module path used for ownership checks while typechecking.
+    /// Set the free-function name used when resolving bare param `invoke`
+    /// fn-ids (call-site `declare` flow). Codegen must restore this while
+    /// emitting a function body; returns the previous value.
+    pub fn set_current_function(&mut self, name: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.current_function, name)
+    }
+
     pub fn set_current_module(&mut self, module: impl Into<String>) {
         self.current_module = module.into();
     }
@@ -13010,11 +13017,29 @@ impl Checker {
             _ => return,
         };
         for child in children {
-            if let Expression::Use { path, name, alias } = child.1.as_ref() {
+            self.pre_process_top_level_use_node(child);
+        }
+    }
+
+    /// Walk statement wrappers and brace-`use` `Fragment`s so
+    /// `use ffi::types::{Int, Float}` applies each binding.
+    fn pre_process_top_level_use_node(&mut self, node: &Output) {
+        match node.1.as_ref() {
+            Expression::Statement(inner)
+            | Expression::ExprStatement(inner)
+            | Expression::Expr(inner)
+            | Expression::Group(inner) => self.pre_process_top_level_use_node(inner),
+            Expression::Fragment(children) | Expression::Block(children) => {
+                for child in children {
+                    self.pre_process_top_level_use_node(child);
+                }
+            }
+            Expression::Use { path, name, alias } => {
                 if name != "*" {
                     let _ = self.apply_virtual_use(path, name, alias.as_deref());
                 }
             }
+            _ => {}
         }
     }
 

@@ -4561,6 +4561,11 @@ fn main() -> Result<(), Error> {
             "expected variadic arity error via param flow, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+        assert!(
+            !msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "brace-imported Float must refine invoke ret via param flow, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     /// Bare int param without call-site `declare` metadata must not refine to float.
