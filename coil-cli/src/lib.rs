@@ -25,6 +25,19 @@ pub enum LoadErr {
 pub fn load_archive_bytes(
     buffer: &[u8],
 ) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
+    let align = std::mem::align_of::<ArchivedArchivedProgram>();
+    if (buffer.as_ptr() as usize) % align == 0 {
+        decode_archive(buffer)
+    } else {
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(buffer.len());
+        aligned.extend_from_slice(buffer);
+        decode_archive(&aligned)
+    }
+}
+
+fn decode_archive(
+    buffer: &[u8],
+) -> Result<(Vec<Byte>, Vec<u64>, Vec<String>, u32, ProgramDebug), LoadErr> {
     let archived =
         rkyv::access::<ArchivedArchivedProgram, Error>(buffer).map_err(|_| LoadErr::Corrupt)?;
     let version = u32::from(archived.version);
