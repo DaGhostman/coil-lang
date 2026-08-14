@@ -6739,6 +6739,86 @@ fn main() {
         );
     }
 
+    /// COI-108 forward refs: callee declared after the caller must still use
+    /// the pair Try path (reserved entry + `pair_call_kind`), not Unknown method
+    /// or PairToHeap-before-tag-check.
+    #[test]
+    fn forward_mismatched_result_method_try_keeps_pair_path() {
+        let (bc, _) = compile_src(
+            r#"
+class EncFwd {}
+impl EncFwd {
+    fn encode_into(int n) -> Result<int, string> {
+        let bytes = self.encode(n)?;
+        return len(bytes);
+    }
+    fn encode(int n) -> Result<Vec<byte>, string> {
+        let out: Vec<byte> = Vec::new();
+        out.push(n as byte);
+        return out;
+    }
+}
+fn main() {
+    let e = new EncFwd();
+    let _ = e.encode_into(10);
+}
+"#,
+        );
+        let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, Instruction::CALL)),
+            "forward method call must lower to CALL; opcodes={ops:?}",
+        );
+        assert!(
+            !bc.windows(3).any(|w| {
+                matches!(w[0].bytecode(), Instruction::CALL)
+                    && matches!(w[1].bytecode(), Instruction::PairToHeap)
+                    && matches!(w[2].bytecode(), Instruction::DUPLICATE)
+            }),
+            "forward mismatched-Result Try must not box before pair tag check; opcodes={ops:?}",
+        );
+        assert!(
+            bc.windows(4).any(|w| {
+                matches!(w[0].bytecode(), Instruction::CALL)
+                    && matches!(w[1].bytecode(), Instruction::DUPLICATE)
+                    && matches!(w[2].bytecode(), Instruction::CONST)
+                    && matches!(w[3].bytecode(), Instruction::EQ)
+            }),
+            "forward mismatched-Result Try must use pair EQ tag check; opcodes={ops:?}",
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, Instruction::JumpIfMatch)),
+            "forward mismatched-Result Try must not JumpIfMatch a heap enum; opcodes={ops:?}",
+        );
+    }
+
+    /// Plain (non-Result) forward instance call must resolve via reserved entry.
+    #[test]
+    fn forward_instance_method_call_emits_call() {
+        let (bc, _) = compile_src(
+            r#"
+class Counter {}
+impl Counter {
+    fn early() -> int {
+        return self.late();
+    }
+    fn late() -> int {
+        return 7;
+    }
+}
+fn main() {
+    let c = new Counter();
+    let _ = c.early();
+}
+"#,
+        );
+        let ops: Vec<_> = bc.iter().map(|b| *b.bytecode()).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, Instruction::CALL)),
+            "forward instance method must lower to CALL; opcodes={ops:?}",
+        );
+    }
+
     #[test]
     fn nested_option_string_none_stays_boxed() {
         let (bc, _) = compile_src(

@@ -802,4 +802,46 @@ mod tests {
         );
         assert_eq!(buf.as_slice().len(), lowered.bytecode.len());
     }
+
+    /// COI-108: reserve an entry label, emit `Entry{Call}` before the body, then
+    /// bind the reserved label — lower must resolve CALL to the body PC.
+    #[test]
+    fn bind_reserved_entry_resolves_earlier_entry_call() {
+        let mut buf = CodeBuf::new();
+        let reserved = buf.fresh_label();
+        // Call site ahead of the callee body (forward method reference).
+        buf.emit_entry(EntryKind::Call, 0, reserved);
+        buf.push(Byte::new(Instruction::HALT));
+
+        let start = buf.len();
+        buf.bind_reserved_entry(reserved);
+        buf.push_const(3);
+        buf.push_return();
+        let end = buf.len();
+        buf.record_func("later", Some(reserved), start, end);
+
+        assert_eq!(
+            buf.entry_label_for_offset(start),
+            Some(reserved),
+            "bind_reserved_entry must record entry_at_offset"
+        );
+
+        let mut pool = Vec::new();
+        let lowered = buf.lower_in_place(&mut pool);
+        let ops: Vec<_> = lowered.bytecode.iter().map(|b| *b.bytecode()).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, Instruction::CALL)),
+            "reserved Entry{{Call}} must lower to CALL; ops={ops:?}"
+        );
+        let call = lowered
+            .bytecode
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::CALL))
+            .expect("CALL present");
+        assert_eq!(
+            call.call_parts(),
+            (0, start as u32),
+            "CALL must target the reserved body PC"
+        );
+    }
 }
