@@ -8902,3 +8902,85 @@ fn extern_in_imported_module_runs() {
     };
     assert_eq!(output, "0\n");
 }
+
+/// COI-106: binding a unary Result/Option call before match must preserve heap payloads.
+#[test]
+fn result_bind_then_match_preserves_ok_payload() {
+    let bind_fn = run_harness_src(
+        r#"
+enum Node { Obj { v: int } }
+fn make_ok() -> Result<Node, string> { return Node::Obj { v: 42 }; }
+test("bind free fn") {
+    let r = make_ok();
+    let v = match r {
+        Result::Ok(n) => match n {
+            Node::Obj { v } => v,
+        },
+        Result::Err(_) => -1,
+    };
+    assert(v == 42)?;
+}
+"#,
+    );
+    assert!(!bind_fn.contains("failed"), "free fn bind failed: {bind_fn:?}");
+
+    let bind_method = run_harness_src(
+        r#"
+class Svc {}
+enum Node { Obj { v: int } }
+impl Svc {
+    fn decode() -> Result<Node, string> {
+        return Node::Obj { v: 42 };
+    }
+    fn fail() -> Result<Node, string> {
+        raise "boom";
+    }
+    fn maybe(int flag) -> Option<int> {
+        if flag == 0 {
+            return Option::None;
+        }
+        return Option::Some(flag);
+    }
+}
+test("bind method result Ok payload") {
+    let s = new Svc();
+    let r = s.decode();
+    let v = match r {
+        Result::Ok(n) => match n {
+            Node::Obj { v } => v,
+        },
+        Result::Err(_) => -1,
+    };
+    assert(v == 42)?;
+}
+test("bind method result Err") {
+    let s = new Svc();
+    let r = s.fail();
+    let msg = match r {
+        Result::Ok(_) => "ok",
+        Result::Err(e) => e,
+    };
+    assert(msg == "boom")?;
+}
+test("bind method option Some/None") {
+    let s = new Svc();
+    let some = s.maybe(7);
+    let none = s.maybe(0);
+    let v = match some {
+        Option::Some(v) => v,
+        Option::None => -1,
+    };
+    let is_none = match none {
+        Option::Some(_) => false,
+        Option::None => true,
+    };
+    assert(v == 7)?;
+    assert(is_none)?;
+}
+"#,
+    );
+    assert!(
+        !bind_method.contains("failed"),
+        "method call bind+match failed: {bind_method:?}"
+    );
+}

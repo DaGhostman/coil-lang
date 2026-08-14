@@ -6442,6 +6442,18 @@ impl Compiler {
         );
     }
 
+    /// Box a unary `Option`/`Result` call return before storing or re-matching.
+    fn emit_pair_to_heap_after_call(&self, bytecode: &mut Vec<Byte>, lookup_name: &str) {
+        if let Some(is_option) = self.pair_return_kind(lookup_name)
+            && !self.pair_value_context
+        {
+            bytecode.push(
+                Byte::new(Instruction::PairToHeap)
+                    .with_operand_u32(u32::from(is_option)),
+            );
+        }
+    }
+
     fn pair_call_candidate(&self, callee: &Output) -> bool {
         self.pair_call_kind(callee).is_some()
     }
@@ -13732,9 +13744,9 @@ impl Compiler {
                 .and_then(|instance| {
                     let fqn = instance.method_fqns.get(*method)?.clone();
                     let offset = *self.functions.get(&fqn)?;
-                    Some((instance.class.clone(), instance.args.clone(), offset))
+                    Some((instance.class.clone(), instance.args.clone(), offset, fqn))
                 });
-            if let Some((class, inst_args, offset)) = ground_trait {
+            if let Some((class, inst_args, offset, fqn)) = ground_trait {
                 bytecode.append(&mut self.do_compile(recv));
                 // Box the receiver when the instance method prologue
                 // expects an unbox (same contract as Eq/Ord direct calls).
@@ -13768,6 +13780,7 @@ impl Compiler {
                     nargs += 1; // trailing dictionary
                 }
                 Self::emit_known_target_call(&mut bytecode, offset as u32, nargs);
+                self.emit_pair_to_heap_after_call(&mut bytecode, &fqn);
                 return bytecode;
             }
 
@@ -14035,6 +14048,10 @@ impl Compiler {
                             Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                         }
                     }
+                    self.emit_pair_to_heap_after_call(
+                        &mut bytecode,
+                        strip_overload_key(&fqn),
+                    );
                 } else {
                     let mut message = Message::error(
                         ErrorCode::UnknownFunction,
@@ -14505,13 +14522,8 @@ impl Compiler {
                 {
                     bytecode.push(Byte::new(Instruction::HeapOptionToNiche));
                 }
-                if let Some(is_option) = pair_kind
-                    && !self.pair_value_context
-                {
-                    bytecode.push(
-                        Byte::new(Instruction::PairToHeap)
-                            .with_operand_u32(u32::from(is_option)),
-                    );
+                if pair_kind.is_some() && !self.pair_value_context {
+                    self.emit_pair_to_heap_after_call(&mut bytecode, &lookup_name);
                 }
                 // Generic→concrete unbox: only when the return type
                 // parameter was boxed as a top-level argument

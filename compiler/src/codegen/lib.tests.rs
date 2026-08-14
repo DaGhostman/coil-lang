@@ -6477,6 +6477,138 @@ fn main() {
     }
 
     #[test]
+    fn result_bind_to_local_boxes_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+enum Node {
+    Obj { v: int },
+}
+fn make_ok() -> Result<Node, string> {
+    return Node::Obj { v: 42 };
+}
+fn main() {
+    let r = make_ok();
+    let _ = match r {
+        Result::Ok(Node::Obj { v }) => v,
+        Result::Err(_) => -1,
+    };
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ReturnPair)),
+            "Result call must use ReturnPair; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PairToHeap)),
+            "binding a pair-return call must box before StorePop; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn method_result_bind_boxes_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+class Svc {}
+enum Node { Obj { v: int } }
+impl Svc {
+    fn decode() -> Result<Node, string> {
+        return Node::Obj { v: 42 };
+    }
+}
+fn main() {
+    let s = new Svc();
+    let r = s.decode();
+    let _ = match r {
+        Result::Ok(_) => 0,
+        Result::Err(_) => -1,
+    };
+}
+"#,
+        );
+        let pair_to_heap = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::PairToHeap));
+        assert!(
+            pair_to_heap.is_some(),
+            "instance method Result bind must PairToHeap; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            pair_to_heap.unwrap().operand_u32(),
+            0,
+            "Result PairToHeap operand must be 0 (is_option=false)",
+        );
+    }
+
+    #[test]
+    fn method_option_bind_boxes_return_pair() {
+        let (bc, _) = compile_src(
+            r#"
+class Svc {}
+impl Svc {
+    fn maybe() -> Option<int> {
+        return Option::Some(7);
+    }
+}
+fn main() {
+    let s = new Svc();
+    let o = s.maybe();
+    let _ = match o {
+        Option::Some(_) => 0,
+        Option::None => -1,
+    };
+}
+"#,
+        );
+        let pair_to_heap = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::PairToHeap));
+        assert!(
+            pair_to_heap.is_some(),
+            "instance method Option bind must PairToHeap; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            pair_to_heap.unwrap().operand_u32(),
+            1,
+            "Option PairToHeap operand must be 1 (is_option=true)",
+        );
+    }
+
+    #[test]
+    fn method_result_direct_match_skips_pair_to_heap() {
+        let (bc, _) = compile_src(
+            r#"
+class Svc {}
+enum Node { Obj { v: int } }
+impl Svc {
+    fn decode() -> Result<Node, string> {
+        return Node::Obj { v: 42 };
+    }
+}
+fn main() {
+    let s = new Svc();
+    let _ = match s.decode() {
+        Result::Ok(_) => 0,
+        Result::Err(_) => -1,
+    };
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PairToHeap)),
+            "direct match on pair-return method must stay in pair_value_context; opcodes={:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn nested_option_string_none_stays_boxed() {
         let (bc, _) = compile_src(
             r#"
