@@ -1019,22 +1019,6 @@ fn main() {
 
 ---
 
-### `coil-regex/examples/regex_demo.hy`
-
-**Demonstrates:** Userland [coil-regex](https://github.com/ardax-corp/coil-regex) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
-
-```coil
-use regex::{compile, find_all, is_match, replace_all, split};
-```
-
-| | |
-|---|---|
-| **Run** | `make -C coil-regex/native && cargo run -- coil-regex/examples/regex_demo.hy` |
-| **Output** | `true,2,a->1 b->2,a|b|c` |
-| **Needs** | `coil-regex/native/libregex.so` (libpcre2) |
-
----
-
 ### `examples/aliases.hy`
 
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
@@ -2115,7 +2099,6 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `static_singleton.hy` | Statics | `121` |
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
-| `coil-regex/examples/regex_demo.hy` | Regex (userland) | `true,2,a->1 b->2,a|b|c` |
 | `gc_root_weak.hy` | GC | `pinned\npinned` |
 | `gc_collect.hy` | GC | `none` |
 | `finalizer.hy` | GC | `closed` |

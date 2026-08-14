@@ -27,7 +27,7 @@ You can build and run all non-FFI examples without libffi.
 
 ### Regular expressions ([coil-regex](https://github.com/ardax-corp/coil-regex))
 
-Regex is a **userland** package (not a virtual module). Clone beside coil-lang or add via spool; see [regex reference](../references/regex.md). Native build needs **libpcre2** (`libpcre2-dev` on Debian/Ubuntu).
+Regex is a **userland** package (not a virtual module). Clone [coil-regex](https://github.com/ardax-corp/coil-regex) separately or add via spool; see [regex reference](../references/regex.md). Tests and examples live in that repo (`coil test` after `make -C native`).
 
 ### Optional Cargo features (`crypto` / `time`)
 

@@ -25,7 +25,7 @@ use regex::{compile, find_all, Regex};
 
 ## Sibling checkout
 
-In this repo, `coil-regex/` lives beside coil-lang. Point your `coil.toml` at it:
+Clone [coil-regex](https://github.com/ardax-corp/coil-regex) beside your project and point `coil.toml` at it:
 
 ```toml
 [module]

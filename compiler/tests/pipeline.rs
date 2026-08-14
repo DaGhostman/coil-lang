@@ -7363,14 +7363,6 @@ fn example_io_tls_prints_tls_ok() {
     assert_eq!(run_example("examples/io_tls.hy"), "tls-ok");
 }
 
-#[test]
-fn example_coil_regex_demo_prints_expected() {
-    assert_eq!(
-        run_example("coil-regex/examples/regex_demo.hy"),
-        "true,2,a->1 b->2,a|b|c"
-    );
-}
-
 /// Feature-off `use` of optional virtual modules is a compile error (E0900 /
 /// "Module not found"), not a hang. Stays ungated so `--no-default-features`
 /// still exercises it.
