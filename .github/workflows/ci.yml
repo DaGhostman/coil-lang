@@ -78,7 +78,7 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install libffi
+          brew install libffi pcre2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
