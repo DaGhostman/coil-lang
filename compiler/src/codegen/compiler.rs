@@ -4593,23 +4593,38 @@ impl Compiler {
         )
     }
 
-    /// True when a free `fn` body calls `recv.method(...)` (needs `impl` emit first).
-    fn function_body_calls_instance_method(body: &Output<'_>) -> bool {
-        fn walk(node: &Output<'_>) -> bool {
+    /// True when a free `fn` body calls a method declared in a user `impl`
+    /// block in the same file (must emit after those `impl`s). Builtin
+    /// methods such as `Vec::push` do not count.
+    fn function_body_calls_user_impl_method(
+        body: &Output<'_>,
+        user_impl_methods: &std::collections::HashSet<String>,
+    ) -> bool {
+        if user_impl_methods.is_empty() {
+            return false;
+        }
+        fn walk(node: &Output<'_>, user_impl_methods: &std::collections::HashSet<String>) -> bool {
             if let Expression::Call { name, args } = node.1.as_ref() {
-                if matches!(name.1.as_ref(), Expression::Access(..)) {
-                    return true;
+                if let Expression::Access(recv, method) = name.1.as_ref() {
+                    if user_impl_methods.contains(*method)
+                        && matches!(
+                            recv.1.as_ref(),
+                            Expression::Identifier(_) | Expression::Variable(_, _)
+                        )
+                    {
+                        return true;
+                    }
                 }
-                if walk(name) {
+                if walk(name, user_impl_methods) {
                     return true;
                 }
                 if let Some(args) = args {
-                    return args.iter().any(walk);
+                    return args.iter().any(|a| walk(a, user_impl_methods));
                 }
             }
             match node.1.as_ref() {
                 Expression::Block(children) | Expression::Fragment(children) => {
-                    children.iter().any(walk)
+                    children.iter().any(|c| walk(c, user_impl_methods))
                 }
                 Expression::Expr(inner)
                 | Expression::Group(inner)
@@ -4617,15 +4632,37 @@ impl Compiler {
                 | Expression::ExprStatement(inner)
                 | Expression::Return(inner)
                 | Expression::Raise(inner)
-                | Expression::Yield(inner) => walk(inner),
+                | Expression::Yield(inner) => walk(inner, user_impl_methods),
                 Expression::Match { scrutinee, arms } => {
-                    walk(scrutinee) || arms.iter().any(|arm| walk(&arm.body))
+                    walk(scrutinee, user_impl_methods)
+                        || arms.iter().any(|arm| walk(&arm.body, user_impl_methods))
                 }
-                Expression::Access(recv, _) => walk(recv),
+                Expression::Access(recv, _) => walk(recv, user_impl_methods),
                 _ => false,
             }
         }
-        walk(body)
+        walk(body, user_impl_methods)
+    }
+
+    fn collect_user_impl_method_names(children: &[Output<'_>]) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+        let mut names = HashSet::new();
+        for child in children {
+            let methods = match child.1.as_ref() {
+                Expression::Implementation { methods, .. } => methods.as_slice(),
+                _ => continue,
+            };
+            for method in methods {
+                let inner = match method.1.as_ref() {
+                    Expression::Method(_, inner) => inner,
+                    _ => method,
+                };
+                if let Expression::Function { name, .. } = inner.1.as_ref() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        names
     }
 
     /// True when `body` is just the sole pattern binding (e.g. `Ok(x) => x`).
@@ -9567,15 +9604,15 @@ impl Compiler {
             }
             Expression::Program(children) => {
                 // Emit phases (COI-109): helpers before `impl`, but free fns
-                // that call instance methods must follow their `impl` blocks.
+                // that call user `impl` methods must follow their `impl` blocks.
+                let user_impl_methods = Self::collect_user_impl_method_names(children);
                 let phase = |c: &Output| -> u8 {
                     match c.1.as_ref() {
                         Expression::Function { name, body, .. } if *name == "main" => 3,
                         Expression::Function { body, .. } => {
-                            if body
-                                .as_ref()
-                                .is_some_and(Self::function_body_calls_instance_method)
-                            {
+                            if body.as_ref().is_some_and(|b| {
+                                Self::function_body_calls_user_impl_method(b, &user_impl_methods)
+                            }) {
                                 25
                             } else {
                                 1
