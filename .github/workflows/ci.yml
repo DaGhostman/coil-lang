@@ -196,6 +196,12 @@ jobs:
         with:
           shared-key: ci-windows-gnu-default
 
+      - name: Build coil-regex native lib
+        shell: msys2 {0}
+        run: |
+          export PATH="$MINGW_PREFIX/bin:/usr/bin:$PATH"
+          make -C coil-regex/native
+
       - name: Build all CLI binaries
         shell: msys2 {0}
         run: |
