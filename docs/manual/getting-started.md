@@ -25,28 +25,20 @@ Examples that call C code (`examples/strlen.hy`, `examples/ffi_sum.hy`) require 
 
 You can build and run all non-FFI examples without libffi.
 
-### libpcre2 (optional, for `regex` examples)
+### Regular expressions ([coil-regex](https://github.com/ardax-corp/coil-regex))
 
-The virtual `regex` module links **libpcre2** via the `pcre2` / `pcre2-sys` crates (`examples/regex_demo.hy`).
+Regex is a **userland** package (not a virtual module). Clone beside coil-lang or add via spool; see [regex reference](../references/regex.md). Native build needs **libpcre2** (`libpcre2-dev` on Debian/Ubuntu).
 
-| Platform | Package |
-|----------|---------|
-| Arch Linux | `pcre2` |
-| Debian / Ubuntu | `libpcre2-dev` |
-| Fedora | `pcre2-devel` |
+### Optional Cargo features (`crypto` / `time`)
 
-If the system library is missing, `pcre2-sys` may build PCRE2 from source (needs a C toolchain).
-
-### Optional Cargo features (`crypto` / `time` / `regex`)
-
-The default build enables the virtual `crypto`, `time`, and `regex` modules (and their crate dependencies). Embedders can strip them:
+The default build enables virtual `crypto` and `time` (and `tls`). Embedders can strip them:
 
 ```toml
 machine = { path = "...", default-features = false, features = ["time"] }
-# or: features = ["crypto"] / ["regex"]
+# or: features = ["crypto"]
 ```
 
-The `compiler` and root `coil` crates mirror the same feature names. With a feature disabled, the corresponding virtual module imports (e.g. `use crypto::{sha256};`, `use time::{timestamp};`, `use regex::{compile};`) will not resolve.
+The `compiler` and root `coil` crates mirror the same feature names. With a feature disabled, the corresponding virtual module imports (e.g. `use crypto::{sha256};`, `use time::{timestamp};`) will not resolve. Use [coil-regex](https://github.com/ardax-corp/coil-regex) for `use regex::{…}`.
 
 ## Build the project
 

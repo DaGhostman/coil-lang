@@ -1019,27 +1019,19 @@ fn main() {
 
 ---
 
-### `examples/regex_demo.hy`
+### `coil-regex/examples/regex_demo.hy`
 
-**Demonstrates:** Virtual `regex` (PCRE2) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
+**Demonstrates:** Userland [coil-regex](https://github.com/ardax-corp/coil-regex) — `compile` with flags (`i`), `is_match`, `find_all`, `replace_all` (`$1`), and `split`.
 
 ```coil
 use regex::{compile, find_all, is_match, replace_all, split};
-
-fn main() {
-    let re = match compile("(\\w+)=(\\d+)", "i") {
-        Result::Ok(v) => v,
-        Result::Err(_) => panic "compile",
-    };
-    // …
-}
 ```
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/regex_demo.hy` |
+| **Run** | `make -C coil-regex/native && cargo run -- coil-regex/examples/regex_demo.hy` |
 | **Output** | `true,2,a->1 b->2,a|b|c` |
-| **Needs** | system **libpcre2** (or `pcre2-sys` source build) |
+| **Needs** | `coil-regex/native/libregex.so` (libpcre2) |
 
 ---
 
@@ -2123,7 +2115,7 @@ See [`examples/projects/README.md`](../../examples/projects/README.md).
 | `static_singleton.hy` | Statics | `121` |
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
-| `regex_demo.hy` | Regex | `true,2,a->1 b->2,a|b|c` |
+| `coil-regex/examples/regex_demo.hy` | Regex (userland) | `true,2,a->1 b->2,a|b|c` |
 | `gc_root_weak.hy` | GC | `pinned\npinned` |
 | `gc_collect.hy` | GC | `none` |
 | `finalizer.hy` | GC | `closed` |
