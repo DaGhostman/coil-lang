@@ -1538,6 +1538,9 @@ impl Checker {
         if let Err(msgs) = self.pre_register_enums(ast) {
             self.messages.extend(msgs);
         }
+        self.pre_register_free_functions(ast);
+        self.pre_process_top_level_uses(ast);
+        self.pre_pass_ffi_invoke_param_flow(ast);
 
         // Top frame for natives/globals; left on stack after check_program.
         self.push_scope();
@@ -5721,6 +5724,8 @@ impl Checker {
         if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
             return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
         }
+
+        self.maybe_record_ffi_param_invoke_flow_for_call(&ident, &flat_args);
 
         let result = self.apply_function(
             Some(&ident),
@@ -10678,6 +10683,9 @@ impl Checker {
         param_names: &[String],
         arg_exprs: &[Output],
     ) {
+        if arg_exprs.len() != param_names.len() {
+            return;
+        }
         for (param, arg) in param_names.iter().zip(arg_exprs.iter()) {
             let Some((ret, variadic, nfixed)) = self.ffi_invoke_fn_id_metadata(arg) else {
                 continue;
@@ -10686,6 +10694,111 @@ impl Checker {
             self.ffi_fn_param_invoke_ret
                 .insert(key, (ret, variadic, nfixed));
         }
+    }
+
+    fn maybe_record_ffi_param_invoke_flow_for_call(
+        &mut self,
+        fn_name: &str,
+        arg_exprs: &[Output],
+    ) {
+        let Some(param_names) = self.fn_param_names.get(fn_name).cloned() else {
+            return;
+        };
+        self.record_ffi_param_invoke_flow(fn_name, &param_names, arg_exprs);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_ffi_param_invoke_ret(
+        &self,
+        key: &str,
+    ) -> Option<&(Ty, bool, usize)> {
+        self.ffi_fn_param_invoke_ret.get(key)
+    }
+
+    fn ffi_invoke_fn_id_metadata_prescan(
+        &self,
+        expr: &Output,
+        local_class_scopes: &[HashMap<String, String>],
+    ) -> Option<(Ty, bool, usize)> {
+        match expr.1.as_ref() {
+            Expression::Identifier(name) => {
+                if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                    let variadic = self.ffi_fn_variadic.get(*name).copied().unwrap_or(false);
+                    let nfixed = self.ffi_fn_nfixed.get(*name).copied().unwrap_or(0);
+                    return Some((ty.clone(), variadic, nfixed));
+                }
+                None
+            }
+            Expression::Access(receiver, field) => {
+                let class = match receiver.1.as_ref() {
+                    Expression::Identifier("self") => self.impl_owner.clone()?,
+                    Expression::Identifier(name) => local_class_scopes
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.get(*name).cloned())?,
+                    _ => return None,
+                };
+                let key = Self::qualified_class_field_key(&class, field);
+                let ret = self.ffi_fn_ret_by_field.get(&key)?.clone();
+                let variadic = self
+                    .ffi_fn_variadic_by_field
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(false);
+                let nfixed = self.ffi_fn_nfixed_by_field.get(&key).copied().unwrap_or(0);
+                Some((ret, variadic, nfixed))
+            }
+            _ => None,
+        }
+    }
+
+    fn record_ffi_param_invoke_flow_prescan(
+        &mut self,
+        fn_name: &str,
+        param_names: &[String],
+        arg_exprs: &[Output],
+        local_class_scopes: &[HashMap<String, String>],
+    ) {
+        if arg_exprs.len() != param_names.len() {
+            return;
+        }
+        for (param, arg) in param_names.iter().zip(arg_exprs.iter()) {
+            let Some((ret, variadic, nfixed)) =
+                self.ffi_invoke_fn_id_metadata_prescan(arg, local_class_scopes)
+            else {
+                continue;
+            };
+            let key = Self::ffi_param_invoke_key(fn_name, param);
+            self.ffi_fn_param_invoke_ret
+                .insert(key, (ret, variadic, nfixed));
+        }
+    }
+
+    fn maybe_pre_record_field_declare(
+        &mut self,
+        target: &Output,
+        value: &Output,
+        local_class_scopes: &[HashMap<String, String>],
+    ) {
+        let Expression::Access(receiver, field) = target.1.as_ref() else {
+            return;
+        };
+        let Some(dargs) = Self::declare_args_from_expr(value) else {
+            return;
+        };
+        let class = match receiver.1.as_ref() {
+            Expression::Identifier("self") => self.impl_owner.clone(),
+            Expression::Identifier(name) => local_class_scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(*name).cloned()),
+            _ => None,
+        };
+        let Some(class) = class else {
+            return;
+        };
+        let key = Self::qualified_class_field_key(&class, field);
+        self.record_ffi_declare_metadata(key, dargs, true);
     }
 
     fn infer_ffi_invoke(&mut self, args: &[Output], range: Range<usize>) -> Ty {
@@ -12501,9 +12614,7 @@ impl Checker {
                 tys.push(self.infer_call_arg(arg));
                 exprs.push(arg.clone());
             }
-            if let Some(param_names) = self.fn_param_names.get(fn_name).cloned() {
-                self.record_ffi_param_invoke_flow(fn_name, &param_names, &exprs);
-            }
+            self.maybe_record_ffi_param_invoke_flow_for_call(fn_name, &exprs);
             return (tys, exprs);
         }
 
@@ -12809,6 +12920,9 @@ impl Checker {
         if exprs.len() != tys.len() {
             exprs.clear();
         }
+        if has_named || has_rest {
+            self.maybe_record_ffi_param_invoke_flow_for_call(fn_name, &exprs);
+        }
         (tys, exprs)
     }
 
@@ -12855,6 +12969,331 @@ impl Checker {
     // ============================================================
     //  Enums and pattern matching
     // ============================================================
+
+    /// Pre-pass: register top-level `fn` parameter names before main inference
+    /// so call-site `declare` metadata can flow into callee `invoke` params.
+    fn pre_register_free_functions(&mut self, ast: &Output) {
+        let children = match ast.1.as_ref() {
+            Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
+            _ => return,
+        };
+        for child in children {
+            if let Expression::Function {
+                name,
+                type_params,
+                args,
+                where_constraints,
+                ..
+            } = child.1.as_ref()
+            {
+                if self.fn_param_names.contains_key(*name) {
+                    continue;
+                }
+                let pushed = self.push_type_params_for_type_parsing(type_params);
+                let prev_constraints_len = self.active_constraints.len();
+                for wc in where_constraints {
+                    let wc_args: Vec<Ty> =
+                        wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+                    self.active_constraints.push(Constraint {
+                        class: wc.class.to_string(),
+                        args: wc_args,
+                    });
+                }
+                self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
+                let arg_tys = self.parse_arg_list(args);
+                self.current_tuple_pack = None;
+                self.fn_param_names.insert(
+                    name.to_string(),
+                    arg_tys.iter().map(|(n, _)| n.clone()).collect(),
+                );
+                self.active_constraints.truncate(prev_constraints_len);
+                self.pop_type_params_for_type_parsing(pushed);
+            }
+        }
+    }
+
+    /// Pre-pass: apply top-level `use` imports so FFI type tags resolve during
+    /// the later `declare` metadata scan.
+    fn pre_process_top_level_uses(&mut self, ast: &Output) {
+        let children = match ast.1.as_ref() {
+            Expression::Program(c) | Expression::Fragment(c) | Expression::Block(c) => c.as_slice(),
+            _ => return,
+        };
+        for child in children {
+            if let Expression::Use { path, name, alias } = child.1.as_ref() {
+                if name != "*" {
+                    let _ = self.apply_virtual_use(path, name, alias.as_deref());
+                }
+            }
+        }
+    }
+
+    /// Pre-pass: record `declare` metadata and param call-site flow before main
+    /// inference so helpers defined before their callers still refine `invoke`.
+    fn pre_pass_ffi_invoke_param_flow(&mut self, ast: &Output) {
+        let mut local_class_scopes = Vec::new();
+        self.pre_pass_ffi_invoke_param_flow_walk(ast, &mut local_class_scopes);
+    }
+
+    fn pre_pass_ffi_invoke_param_flow_walk(
+        &mut self,
+        node: &Output,
+        local_class_scopes: &mut Vec<HashMap<String, String>>,
+    ) {
+        match node.1.as_ref() {
+            Expression::Statement(inner)
+            | Expression::ExprStatement(inner)
+            | Expression::Expr(inner)
+            | Expression::Group(inner) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(inner, local_class_scopes);
+            }
+            Expression::Program(children)
+            | Expression::Fragment(children)
+            | Expression::Block(children) => {
+                self.pre_pass_ffi_invoke_fragment(children, local_class_scopes);
+            }
+            Expression::Implementation { owner, methods, .. } => {
+                let prev_owner = self.impl_owner.clone();
+                self.impl_owner = Some(owner.to_string());
+                for method in methods {
+                    self.pre_pass_ffi_invoke_param_flow_walk(method, local_class_scopes);
+                }
+                self.impl_owner = prev_owner;
+            }
+            Expression::Function { args, body, .. } => {
+                let mut scope = HashMap::new();
+                if let Expression::Fragment(children) = args.1.as_ref() {
+                    for child in children {
+                        if let Expression::Argument {
+                            ty: Some(ty),
+                            name,
+                            is_rest: false,
+                            ..
+                        } = child.1.as_ref()
+                        {
+                            if let Expression::Identifier(class) = ty.1.as_ref() {
+                                scope.insert(name.to_string(), class.to_string());
+                            }
+                        }
+                    }
+                }
+                local_class_scopes.push(scope);
+                if let Some(body) = body {
+                    self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+                }
+                local_class_scopes.pop();
+            }
+            Expression::Call { name, args } => {
+                if let Expression::Identifier(fn_name) = name.1.as_ref() {
+                    let arg_exprs: Vec<Output> = args
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|arg| match arg.1.as_ref() {
+                            Expression::NamedArg(_, value) => value.clone(),
+                            _ => arg.clone(),
+                        })
+                        .collect();
+                    if let Some(param_names) = self.fn_param_names.get(*fn_name).cloned() {
+                        self.record_ffi_param_invoke_flow_prescan(
+                            fn_name,
+                            &param_names,
+                            &arg_exprs,
+                            local_class_scopes,
+                        );
+                    }
+                }
+                self.pre_pass_ffi_invoke_param_flow_walk(name, local_class_scopes);
+                if let Some(args) = args {
+                    for arg in args {
+                        self.pre_pass_ffi_invoke_param_flow_walk(arg, local_class_scopes);
+                    }
+                }
+            }
+            Expression::Assignment(target, value) => {
+                self.maybe_pre_record_field_declare(target, value, local_class_scopes);
+                self.pre_pass_ffi_invoke_param_flow_walk(target, local_class_scopes);
+                self.pre_pass_ffi_invoke_param_flow_walk(value, local_class_scopes);
+            }
+            Expression::Class { fields, .. } => {
+                for field in fields {
+                    self.pre_pass_ffi_invoke_param_flow_walk(field, local_class_scopes);
+                }
+            }
+            Expression::Lambda { args, body, .. } => {
+                self.pre_pass_ffi_invoke_param_flow_walk(args, local_class_scopes);
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+            }
+            Expression::TestCase { name, body } => {
+                self.pre_pass_ffi_invoke_param_flow_walk(name, local_class_scopes);
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+            }
+            Expression::If(branches) => {
+                for branch in branches {
+                    self.pre_pass_ffi_invoke_param_flow_walk(branch, local_class_scopes);
+                }
+            }
+            Expression::Branch(cond, body) => {
+                if let Some(cond) = cond {
+                    self.pre_pass_ffi_invoke_param_flow_walk(cond, local_class_scopes);
+                }
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+            }
+            Expression::Loop {
+                iterable,
+                body,
+                identifier,
+            } => {
+                self.pre_pass_ffi_invoke_param_flow_walk(iterable, local_class_scopes);
+                if let Some(identifier) = identifier {
+                    self.pre_pass_ffi_invoke_param_flow_walk(identifier, local_class_scopes);
+                }
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    self.pre_pass_ffi_invoke_param_flow_walk(init, local_class_scopes);
+                }
+                self.pre_pass_ffi_invoke_param_flow_walk(cond, local_class_scopes);
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+                if let Some(step) = step {
+                    self.pre_pass_ffi_invoke_param_flow_walk(step, local_class_scopes);
+                }
+            }
+            Expression::Match { scrutinee, arms } => {
+                self.pre_pass_ffi_invoke_param_flow_walk(scrutinee, local_class_scopes);
+                for arm in arms {
+                    self.pre_pass_ffi_invoke_param_flow_walk(&arm.body, local_class_scopes);
+                }
+            }
+            Expression::Method(_, body) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(body, local_class_scopes);
+            }
+            Expression::Access(receiver, _)
+            | Expression::OptionalAccess(receiver, _) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(receiver, local_class_scopes);
+            }
+            Expression::Instantiate(class, args) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(class, local_class_scopes);
+                if let Some(args) = args {
+                    for arg in args {
+                        self.pre_pass_ffi_invoke_param_flow_walk(arg, local_class_scopes);
+                    }
+                }
+            }
+            Expression::Return(expr)
+            | Expression::ImplicitReturn(expr)
+            | Expression::Raise(expr)
+            | Expression::Try(expr)
+            | Expression::Readonly(expr)
+            | Expression::Spread(expr) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(expr, local_class_scopes);
+            }
+            Expression::Tuple(items)
+            | Expression::List(items)
+            | Expression::Declare(items)
+            | Expression::Invoke(items) => {
+                for item in items {
+                    self.pre_pass_ffi_invoke_param_flow_walk(item, local_class_scopes);
+                }
+            }
+            Expression::Array(items) => {
+                for item in items {
+                    self.pre_pass_ffi_invoke_param_flow_walk(item, local_class_scopes);
+                }
+            }
+            Expression::Index(target, index) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(target, local_class_scopes);
+                if let Some(index) = index {
+                    self.pre_pass_ffi_invoke_param_flow_walk(index, local_class_scopes);
+                }
+            }
+            Expression::StaticDecl { ty, init, .. } => {
+                if let Some(ty) = ty {
+                    self.pre_pass_ffi_invoke_param_flow_walk(ty, local_class_scopes);
+                }
+                self.pre_pass_ffi_invoke_param_flow_walk(init, local_class_scopes);
+            }
+            Expression::Dload(path) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(path, local_class_scopes);
+            }
+            Expression::Done(handle) => {
+                self.pre_pass_ffi_invoke_param_flow_walk(handle, local_class_scopes);
+            }
+            _ => {}
+        }
+    }
+
+    fn pre_pass_ffi_invoke_fragment(
+        &mut self,
+        children: &[Output],
+        local_class_scopes: &mut Vec<HashMap<String, String>>,
+    ) {
+        let mut i = 0;
+        while i < children.len() {
+            let child = &children[i];
+            let stmt = Self::pre_pass_unwrap_stmt(child);
+            match stmt.1.as_ref() {
+                Expression::Class { .. }
+                | Expression::Function { .. }
+                | Expression::Implementation { .. }
+                | Expression::EnumDecl { .. } => {
+                    self.pre_pass_ffi_invoke_param_flow_walk(stmt, local_class_scopes);
+                    i += 1;
+                }
+                Expression::Variable(var_name, _) => {
+                    self.pre_pass_ffi_invoke_param_flow_walk(stmt, local_class_scopes);
+                    if i + 1 < children.len() {
+                        let next = Self::pre_pass_unwrap_stmt(&children[i + 1]);
+                        if !is_declaration_like(next) {
+                            let unwrapped = unwrap_expr_wrappers(next);
+                            let unwrapped = match unwrapped.1.as_ref() {
+                                Expression::Try(inner) => unwrap_expr_wrappers(inner),
+                                _ => unwrapped,
+                            };
+                            if let Some(dargs) = Self::declare_args_from_expr(unwrapped) {
+                                self.record_ffi_declare_metadata(var_name.to_string(), dargs, false);
+                            }
+                            if let Expression::Instantiate(class, _) = unwrapped.1.as_ref() {
+                                if let Expression::Identifier(class_name) = class.1.as_ref() {
+                                    if let Some(scope) = local_class_scopes.last_mut() {
+                                        scope.insert(var_name.to_string(), class_name.to_string());
+                                    }
+                                }
+                            }
+                            self.pre_pass_ffi_invoke_param_flow_walk(next, local_class_scopes);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                _ => {
+                    self.pre_pass_ffi_invoke_param_flow_walk(stmt, local_class_scopes);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn pre_pass_unwrap_stmt<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
+        let mut current = node;
+        for _ in 0..8 {
+            current = match current.1.as_ref() {
+                Expression::Statement(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Expr(inner)
+                | Expression::Group(inner) => inner,
+                _ => break,
+            };
+        }
+        current
+    }
 
     /// Pre-pass: register enum shapes before main inference (forward refs).
     fn pre_register_enums(&mut self, ast: &Output) -> Result<(), Vec<Message>> {

@@ -4386,6 +4386,98 @@ fn main() -> Result<(), Error> {
         );
     }
 
+    /// Call-site `declare` metadata flows into a callee's bare `invoke` param.
+    #[test]
+    fn invoke_refines_return_type_from_param_call_site_flow() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+class Api {
+    id: int,
+}
+
+impl Api {
+    fn load(int lib) -> Result<(), Error> {
+        self.id = declare(lib, "f", (), Float)?;
+    }
+}
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let api = new Api(0);
+    api.load(lib)?;
+    let _ = helper(api.id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Pre-pass records param flow even when the helper is defined before callers.
+    #[test]
+    fn pre_pass_records_param_invoke_flow_before_main_infer() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (), Float)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let mut c = Checker::new();
+        let trimmed = normalize_adjacent_decls(src.trim());
+        let owned = format_check_src(trimmed.as_str());
+        let ast = Pratt::default().parse(owned.as_str()).unwrap();
+        crate::typechecking::id::pre_walk(&ast, &mut c.ids);
+        c.pre_register_enums(&ast).unwrap();
+        c.pre_register_free_functions(&ast);
+        c.pre_process_top_level_uses(&ast);
+        c.pre_pass_ffi_invoke_param_flow(&ast);
+        assert!(c.test_ffi_param_invoke_ret("helper::id").is_some());
+    }
+
+    #[test]
+    fn invoke_refines_return_type_from_param_call_site_flow_forward_ref() {
+        let src = r#"
+use ffi::{declare, dload, invoke, Error};
+use ffi::types::Float;
+
+fn helper(int id) -> Result<float, Error> {
+    let f: float = invoke(0, id, ())?;
+    return f;
+}
+
+fn main() -> Result<(), Error> {
+    let lib = dload("noop")?;
+    let fn_id = declare(lib, "f", (), Float)?;
+    let _ = helper(fn_id)?;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
     /// Variadic `declare` metadata stored on a class field must refine arity
     /// (extra args ok) — same path codegen uses for `is_ffi_declare_variadic_for_fn_id`.
     #[test]
