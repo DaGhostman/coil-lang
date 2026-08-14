@@ -5780,6 +5780,90 @@ fn main() {
     assert_eq!(output, "xx");
 }
 
+/// COI-115: inherent `impl` after `impl IntoIterator` must still compile + run.
+#[test]
+fn trait_impl_calls_inherent_method_declared_later() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class ItemBox { v: int }
+class ItemBoxIter { i: int }
+impl IntoIterator<ItemBox> {
+    type Item = int;
+    type IntoIter = ItemBoxIter;
+    fn into_iter(ItemBox m) -> ItemBoxIter {
+        return m.iter();
+    }
+}
+impl ItemBox {
+    fn iter() -> ItemBoxIter {
+        return new ItemBoxIter(self.v);
+    }
+}
+impl Iterator<ItemBoxIter> {
+    type Item = int;
+    fn next(ItemBoxIter it) -> Option<int> {
+        if it.i == 0 {
+            it.i = 1;
+            return Option::Some(1);
+        }
+        return Option::None;
+    }
+}
+fn main() {
+    let b = new ItemBox(0);
+    for x in b {
+        write(stdout(), to_bytes(format("%i", x)));
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// COI-115: static inherent helper declared after the trait instance.
+#[test]
+fn trait_impl_calls_static_inherent_method_declared_later() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+class ItemBox { v: int }
+class ItemBoxIter { i: int }
+impl IntoIterator<ItemBox> {
+    type Item = int;
+    type IntoIter = ItemBoxIter;
+    fn into_iter(ItemBox m) -> ItemBoxIter {
+        return ItemBox::make_iter(m);
+    }
+}
+impl ItemBox {
+    static fn make_iter(ItemBox m) -> ItemBoxIter {
+        return new ItemBoxIter(m.v);
+    }
+}
+impl Iterator<ItemBoxIter> {
+    type Item = int;
+    fn next(ItemBoxIter it) -> Option<int> {
+        if it.i == 0 {
+            it.i = 1;
+            return Option::Some(7);
+        }
+        return Option::None;
+    }
+}
+fn main() {
+    let b = new ItemBox(0);
+    for x in b {
+        write(stdout(), to_bytes(format("%i", x)));
+    }
+}
+"#,
+    );
+    assert_eq!(output, "7");
+}
+
 #[test]
 fn example_thread_join_prints_42() {
     let output = run_example("examples/thread_join.hy");

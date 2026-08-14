@@ -4250,6 +4250,131 @@ fn main() {
         );
     }
 
+    /// Stubbing must not invent methods — missing inherent stays an error.
+    #[test]
+    fn trait_impl_missing_inherent_method_still_errors() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter();
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                let t = m.message();
+                t.contains("Cannot find method `iter`") || t.contains("Unknown method")
+            }),
+            "expected missing-method diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Forward stubs must carry real arity — extra args still reject.
+    #[test]
+    fn trait_impl_inherent_method_arity_mismatch_still_errors() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return m.iter(1);
+    }
+}
+
+impl Box {
+    fn iter() -> BoxIter {
+        return new BoxIter(self.v);
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+}
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                let t = m.message();
+                t.contains("too many arguments") || t.contains("Unknown method")
+            }),
+            "expected arity diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Static inherent methods declared after a trait instance must resolve.
+    #[test]
+    fn trait_impl_can_call_static_inherent_method_declared_later() {
+        let src = r#"
+class Box { v: int }
+class BoxIter { i: int }
+
+impl IntoIterator<Box> {
+    type Item = int;
+    type IntoIter = BoxIter;
+    fn into_iter(Box m) -> BoxIter {
+        return Box::make_iter(m);
+    }
+}
+
+impl Box {
+    static fn make_iter(Box m) -> BoxIter {
+        return new BoxIter(m.v);
+    }
+}
+
+impl Iterator<BoxIter> {
+    type Item = int;
+    fn next(BoxIter it) -> Option<int> {
+        return Option::None;
+    }
+}
+
+fn main() {
+    let b = new Box(1);
+    let it = b.into_iter();
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            c.is_static_method("Box", "make_iter"),
+            "stub must record static method"
+        );
+    }
+
     #[test]
     fn yield_outside_async_is_diagnostic() {
         let (c, _) = check("fn main() { yield 1; }");
