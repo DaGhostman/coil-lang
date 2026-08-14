@@ -6,7 +6,7 @@ use io::sync::{read_to_end, write_all};
 use string::{format, to_bytes};
 
 fn main() {
-    let path = "/tmp/coil_io_nested_host.bin";
+    let path = "coil_io_nested_host.bin";
     let z: byte = 0;
     let a: byte = 97;
     let b: byte = 98;

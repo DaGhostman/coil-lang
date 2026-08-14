@@ -191,7 +191,7 @@ fn format_operands(
             format!("op={} a={a} b={b}", bin_op_name(bop))
         }
         Instruction::BinReturn => format!("op={}", bin_op_name(byte.bin_return_op())),
-        Instruction::CmpJmpf => {
+        Instruction::CmpJmpf | Instruction::CmpJmpt => {
             let (bop, t_or_idx) = byte.cmp_jmpf_parts();
             if byte.cmp_jmpf_is_pool() {
                 format!("op={} pool_idx={t_or_idx}", bin_op_name(bop))
@@ -203,15 +203,15 @@ fn format_operands(
                 )
             }
         }
-        Instruction::BinSlotImmJmpf => {
+        Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
             let (bop, slot, pool_idx) = byte.bin_slot_imm_jmpf_parts();
             format!("op={} slot={slot} pool_idx={pool_idx}", bin_op_name(bop))
         }
-        Instruction::BinSlotSlotJmpf => {
+        Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
             let (bop, a, pool_idx) = byte.bin_slot_slot_jmpf_parts();
             format!("op={} a={a} pool_idx={pool_idx}", bin_op_name(bop))
         }
-        Instruction::BinSlotSlotConstJmpf => {
+        Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
             let (bop, a, pool_idx) = byte.bin_slot_slot_const_jmpf_parts();
             format!("bin={} a={a} pool_idx={pool_idx}", bin_op_name(bop))
         }
@@ -224,7 +224,7 @@ fn format_operands(
             format!("op={} a={a} b={b} dest={dest}", bin_op_name(bop))
         }
         Instruction::Seek => format!("slot={}", byte.operand_u32()),
-        Instruction::LogNotJmpf => {
+        Instruction::LogNotJmpf | Instruction::LogNotJmpt => {
             let t = byte.operand_u32() as usize;
             if (byte.operand_u32() & (1 << 16)) != 0 {
                 format!("pool_idx={}", t & 0xFFFF)

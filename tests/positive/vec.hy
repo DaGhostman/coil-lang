@@ -94,6 +94,19 @@ test("from copies independently") {
     assert(v.len() == 3)?;
 }
 
+// Same Index / StoreIndex OOB contract as fixed arrays (arrays.md).
+test("vec variable oob index and store") {
+    let v = Vec::from([1, 2]);
+    let hi = 5;
+    let neg = 0 - 1;
+    assert(v[hi] == -1)?;
+    assert(v[neg] == -1)?;
+    v[hi] = 42;
+    assert(v[0] == 1)?;
+    assert(v[1] == 2)?;
+    assert(v.len() == 2)?;
+}
+
 test("fixed local escapes to callee") {
     let a = [4, 5, 6];
     a[1] = 50;

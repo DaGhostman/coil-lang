@@ -15,7 +15,13 @@ fn coil_debug_bin() -> PathBuf {
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for base in ["../target/debug/coil-debug", "../../target/debug/coil-debug"] {
+    for base in [
+        format!("../target/debug/coil-debug{}", std::env::consts::EXE_SUFFIX),
+        format!(
+            "../../target/debug/coil-debug{}",
+            std::env::consts::EXE_SUFFIX
+        ),
+    ] {
         let local = manifest.join(base);
         if local.is_file() {
             return local.canonicalize().unwrap_or(local);

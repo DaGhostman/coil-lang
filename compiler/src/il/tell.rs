@@ -211,7 +211,7 @@ fn jump_target(byte: &Byte, pool: &[u64]) -> Option<usize> {
         Instruction::JMP | Instruction::JMPF | Instruction::JMPT => {
             Some(byte.operand_u32() as usize)
         }
-        Instruction::CmpJmpf => {
+        Instruction::CmpJmpf | Instruction::CmpJmpt => {
             let (_, t) = byte.cmp_jmpf_parts();
             if byte.cmp_jmpf_is_pool() {
                 Some(*pool.get(t)? as usize)
@@ -219,7 +219,7 @@ fn jump_target(byte: &Byte, pool: &[u64]) -> Option<usize> {
                 Some(t)
             }
         }
-        Instruction::LogNotJmpf => {
+        Instruction::LogNotJmpf | Instruction::LogNotJmpt => {
             let t = byte.log_not_jmpf_target();
             if byte.log_not_jmpf_is_pool() {
                 Some(*pool.get(t)? as usize)
@@ -227,15 +227,15 @@ fn jump_target(byte: &Byte, pool: &[u64]) -> Option<usize> {
                 Some(t)
             }
         }
-        Instruction::BinSlotImmJmpf => {
+        Instruction::BinSlotImmJmpf | Instruction::BinSlotImmJmpt => {
             let (_, _, pool_idx) = byte.bin_slot_imm_jmpf_parts();
             Some((*pool.get(pool_idx)? >> 32) as usize)
         }
-        Instruction::BinSlotSlotJmpf => {
+        Instruction::BinSlotSlotJmpf | Instruction::BinSlotSlotJmpt => {
             let (_, _, pool_idx) = byte.bin_slot_slot_jmpf_parts();
             Some((*pool.get(pool_idx)? >> 32) as usize)
         }
-        Instruction::BinSlotSlotConstJmpf => {
+        Instruction::BinSlotSlotConstJmpf | Instruction::BinSlotSlotConstJmpt => {
             let (_, _, pool_idx) = byte.bin_slot_slot_const_jmpf_parts();
             let packed = *pool.get(pool_idx)?;
             Some((packed >> 32) as usize)

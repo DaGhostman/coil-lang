@@ -148,7 +148,9 @@ Indexing uses the same `arr[i]` syntax as tuples (also works on `Vec`).
   let _ = arr[i];        // OK
   ```
 
-**`Vec<T>`:** no compile-time out-of-bounds check on variable indices.
+**`Vec<T>`:** no compile-time out-of-bounds check on variable indices. At
+runtime an out-of-range read yields `-1` and an out-of-range write is a no-op
+(same as `[T; N]` with a variable index). See [Arrays and Vec](../../references/arrays.md#out-of-range-index).
 
 ### Growing collections with `Vec` and `len`
 
