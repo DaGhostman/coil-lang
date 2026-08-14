@@ -33,3 +33,47 @@ pub const REGEX_STUB_WIRING: &[(&str, usize, fn(&mut Heap, &[Value]) -> Value)] 
     (REGEX_REPLACE, 3, host_regex_removed),
     (REGEX_REPLACE_ALL, 3, host_regex_removed),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_wiring_names_and_arities_match_former_regex_module() {
+        assert_eq!(REGEX_STUB_WIRING.len(), 9);
+        let names: Vec<&str> = REGEX_STUB_WIRING.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            names,
+            [
+                "regex_compile",
+                "regex_is_match",
+                "regex_find",
+                "regex_find_all",
+                "regex_captures",
+                "regex_captures_all",
+                "regex_split",
+                "regex_replace",
+                "regex_replace_all",
+            ]
+        );
+        let by_name: std::collections::BTreeMap<&str, usize> =
+            REGEX_STUB_WIRING.iter().map(|&(n, a, _)| (n, a)).collect();
+        assert_eq!(by_name["regex_compile"], 2);
+        assert_eq!(by_name["regex_is_match"], 2);
+        assert_eq!(by_name["regex_find"], 2);
+        assert_eq!(by_name["regex_find_all"], 2);
+        assert_eq!(by_name["regex_captures"], 2);
+        assert_eq!(by_name["regex_captures_all"], 2);
+        assert_eq!(by_name["regex_split"], 2);
+        assert_eq!(by_name["regex_replace"], 3);
+        assert_eq!(by_name["regex_replace_all"], 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "regex HostInvoke removed")]
+    fn stub_host_fn_panics_instead_of_running_pcre() {
+        let mut heap = Heap::default();
+        let (_, _, host) = REGEX_STUB_WIRING[0];
+        let _ = host(&mut heap, &[Value::from(0i64), Value::from(0i64)]);
+    }
+}

@@ -697,6 +697,51 @@ fn push_thread_natives(
 mod tests {
     use super::*;
 
+    /// Regex slots stay reserved (even without an in-tree PCRE2 module) so
+    /// `ord` / `thread_*` / packed-LA HostInvoke ids do not shift under stale bytecode.
+    #[test]
+    fn regex_stub_slots_are_contiguous_immediately_before_ord() {
+        let mut registrations = Vec::new();
+        let natives = build_standard_host_natives(|name, id| {
+            registrations.push((name.to_string(), id));
+        });
+
+        let expected: Vec<&str> = crate::regex_stubs::REGEX_STUB_WIRING
+            .iter()
+            .map(|(n, _, _)| *n)
+            .collect();
+        let start = registrations
+            .iter()
+            .position(|(name, _)| name == expected[0])
+            .expect("regex_compile registration");
+        let end = start + expected.len();
+        assert_eq!(
+            registrations[start..end]
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (offset, _) in expected.iter().enumerate() {
+            assert_eq!(registrations[start + offset].1, start + offset);
+        }
+        assert_eq!(registrations[end].0, "ord");
+        assert_eq!(natives[start].name(), "regex_compile");
+        assert_eq!(natives[end - 1].name(), "regex_replace_all");
+    }
+
+    #[test]
+    #[should_panic(expected = "regex HostInvoke removed")]
+    fn invoking_registered_regex_stub_panics() {
+        let natives = build_standard_host_natives(|_, _| {});
+        let stub = natives
+            .iter()
+            .find(|n| n.name() == "regex_compile")
+            .expect("regex_compile stub");
+        let mut heap = crate::Heap::default();
+        let _ = stub.invoke(&mut heap, &[Value::from(0i64), Value::from(0i64)]);
+    }
+
     #[test]
     fn math_libm_natives_are_float_typed_and_appended_after_gc() {
         let mut registrations = Vec::new();
