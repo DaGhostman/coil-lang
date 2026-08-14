@@ -7336,6 +7336,155 @@ fn main() {
     }
 
     #[test]
+    fn imported_enum_payload_match_via_use_in_test_body() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("json::value");
+        let ast = parser
+            .parse("enum JsonValue { Null, Str(string), }")
+            .expect("parse value module");
+        let _ = c.check_program(&ast);
+        assert!(
+            c.take_messages().is_empty(),
+            "value module: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        c.set_current_module("");
+        let ast = parser
+            .parse(
+                r#"
+use json::value::{JsonValue};
+test("match imported payload") {
+    let v = JsonValue::Str("hi");
+    match v {
+        JsonValue::Str(s) => assert(s == "hi")?,
+        _ => assert(false)?,
+    };
+}
+"#,
+            )
+            .expect("parse importer test");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn imported_enum_match_via_use_in_fn_body() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("pkg");
+        let ast = parser
+            .parse("enum Status { Ok, Err, }")
+            .expect("parse pkg");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+
+        c.set_current_module("");
+        let ast = parser
+            .parse(
+                r#"
+use pkg::{Status};
+fn tag_of(Status s) -> int {
+    return match s {
+        Status::Ok => 0,
+        Status::Err => 1,
+    };
+}
+fn main() {
+    let n = tag_of(Status::Ok);
+}
+"#,
+            )
+            .expect("parse importer");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn module_enum_fqn_retained_across_check_program() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("pkg");
+        let ast = parser
+            .parse("enum Status { Ok, Err, }")
+            .expect("parse pkg");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert_eq!(c.tag_for("pkg::Status", "Ok"), Some(0));
+        assert_eq!(c.tag_for("pkg::Status", "Err"), Some(1));
+
+        c.set_current_module("");
+        let ast = parser
+            .parse("enum Local { A, B, }")
+            .expect("parse root enum");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert_eq!(
+            c.tag_for("pkg::Status", "Ok"),
+            Some(0),
+            "module FQN tags must survive the next check_program"
+        );
+        assert_eq!(c.tag_for("Local", "A"), Some(0));
+
+        let ast = parser.parse("fn main() {}").expect("parse next file");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+        assert_eq!(
+            c.tag_for("pkg::Status", "Ok"),
+            Some(0),
+            "module FQN tags must survive a third check_program"
+        );
+        assert!(
+            c.tag_for("Local", "A").is_none(),
+            "bare entry-module enum tags must be cleared between programs"
+        );
+    }
+
+    #[test]
+    fn unimported_module_enum_construct_is_unknown() {
+        let mut c = Checker::new();
+        let parser = Pratt::default();
+
+        c.set_current_module("pkg");
+        let ast = parser
+            .parse("enum Status { Ok, Err, }")
+            .expect("parse pkg");
+        let _ = c.check_program(&ast);
+        assert!(c.take_messages().is_empty());
+
+        c.set_current_module("");
+        let ast = parser
+            .parse(
+                r#"test("no import") {
+    let v = Status::Ok;
+}"#,
+            )
+            .expect("parse test without use");
+        let _ = c.check_program(&ast);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::UnknownEnum)),
+            "expected UnknownEnum without import, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn two_modules_can_export_same_class_short_name() {
         let mut c = Checker::new();
         let parser = Pratt::default();
