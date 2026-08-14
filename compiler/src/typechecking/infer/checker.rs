@@ -9981,7 +9981,12 @@ impl Checker {
                     .nominal_head_from_instance_arg(expr)
                     .or_else(|| self.nominal_head_from_ty(ty));
                 head.as_deref().is_some_and(|name| {
-                    self.generics.nominal_type_module(name) == Some(self.current_module.as_str())
+                    let mod_of = |n: &str| self.generics.nominal_type_module(n);
+                    mod_of(name) == Some(self.current_module.as_str())
+                        // COI-110 registers enums/classes under `module::Name`;
+                        // synth `Show`/`String` still pass the short head.
+                        || mod_of(&self.qualify_module_name(name))
+                            == Some(self.current_module.as_str())
                 })
             })
     }
@@ -10226,6 +10231,11 @@ impl Checker {
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
             _ => {
                 if let Some(key) = self.resolve_class_key(name) {
+                    return Ty::Con(key);
+                }
+                // COI-110: enums live under `module::Name`; annotations must use
+                // that key so they unify with `Enum::Variant` constructors.
+                if let Some(key) = self.resolve_enum_key(name) {
                     return Ty::Con(key);
                 }
                 // Prefer concrete type constructors over bare-class existentials
@@ -15959,38 +15969,40 @@ impl Checker {
     // ============================================================
     // ============================================================
 
-    /// Variant tag by enum and variant name (source-declaration order).
-    /// Map surface enum paths (`ffi::types`) to the internal registry key.
-    fn registry_enum_name<'a>(&self, enum_name: &'a str) -> &'a str {
+    /// Map surface enum paths (`ffi::types`, short `E`) to the registry key
+    /// (`module::E` after COI-110).
+    fn registry_enum_key(&self, enum_name: &str) -> String {
         if common::is_builtin_ffi_enum(enum_name) {
-            common::BUILTIN_FFI_TYPE_ENUM
+            common::BUILTIN_FFI_TYPE_ENUM.to_string()
         } else {
-            enum_name
+            self.resolve_enum_key(enum_name)
+                .unwrap_or_else(|| enum_name.to_string())
         }
     }
 
     pub fn tag_for(&self, enum_name: &str, variant_name: &str) -> Option<u32> {
-        let key = self.registry_enum_name(enum_name);
+        let key = self.registry_enum_key(enum_name);
         self.enum_tags
-            .get(key)
+            .get(&key)
             .and_then(|t| t.get(variant_name).copied())
     }
 
     /// Payload arity for `(enum_name, variant_name)`.
     pub fn arity_for(&self, enum_name: &str, variant_name: &str) -> Option<usize> {
-        let key = self.registry_enum_name(enum_name);
+        let key = self.registry_enum_key(enum_name);
         self.tag_for(enum_name, variant_name).and_then(|t| {
             self.enum_arities
-                .get(key)
+                .get(&key)
                 .and_then(|a| a.get(t as usize).copied())
         })
     }
 
     /// Variants in source-declaration order: `(name, tag, payload_types)`.
     pub fn enum_variants(&self, enum_name: &str) -> Option<Vec<(String, u32, Vec<Ty>)>> {
-        let names = self.enums.get(enum_name)?.clone();
-        let tags = self.enum_tags.get(enum_name)?.clone();
-        let payloads = self.enum_payloads.get(enum_name)?.clone();
+        let key = self.registry_enum_key(enum_name);
+        let names = self.enums.get(&key)?.clone();
+        let tags = self.enum_tags.get(&key)?.clone();
+        let payloads = self.enum_payloads.get(&key)?.clone();
         let mut out = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
             let tag = tags.get(name).copied().unwrap_or(i as u32);
@@ -16019,14 +16031,14 @@ impl Checker {
     /// — see `EnumVariantPayloadTy::field_pairs`. For Record
     /// variants, the field names are the declared names.
     pub fn payload_tys_for(&self, enum_name: &str, variant_name: &str) -> Vec<(String, Ty)> {
-        let key = self.registry_enum_name(enum_name);
+        let key = self.registry_enum_key(enum_name);
         let tag = match self.tag_for(enum_name, variant_name) {
             Some(t) => t,
             None => return Vec::new(),
         };
         match self
             .enum_payloads
-            .get(key)
+            .get(&key)
             .and_then(|p| p.get(tag as usize))
         {
             Some(payload) => payload.field_pairs(),
@@ -16049,8 +16061,9 @@ impl Checker {
         field: &str,
         specific_tag: Option<u32>,
     ) -> Option<(String, u16)> {
-        let payloads = self.enum_payloads.get(enum_name)?;
-        let names = self.enums.get(enum_name)?;
+        let key = self.registry_enum_key(enum_name);
+        let payloads = self.enum_payloads.get(&key)?;
+        let names = self.enums.get(&key)?;
         if let Some(tag) = specific_tag {
             let i = tag as usize;
             let payload = payloads.get(i)?;
@@ -16342,6 +16355,20 @@ impl Checker {
                 && self.enum_tags.contains_key(n)
             {
                 return Some(n.clone());
+            }
+        }
+        // Codegen may look up short names after `current_module` moved on;
+        // accept a unique `…::Name` registry hit.
+        if !name.contains("::") {
+            let suffix = format!("::{name}");
+            let mut hits: Vec<String> = self
+                .enum_tags
+                .keys()
+                .filter(|k| *k == name || k.ends_with(&suffix))
+                .cloned()
+                .collect();
+            if hits.len() == 1 {
+                return hits.pop();
             }
         }
         None
