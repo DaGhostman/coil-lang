@@ -4593,6 +4593,41 @@ impl Compiler {
         )
     }
 
+    /// True when a free `fn` body calls `recv.method(...)` (needs `impl` emit first).
+    fn function_body_calls_instance_method(body: &Output<'_>) -> bool {
+        fn walk(node: &Output<'_>) -> bool {
+            if let Expression::Call { name, args } = node.1.as_ref() {
+                if matches!(name.1.as_ref(), Expression::Access(..)) {
+                    return true;
+                }
+                if walk(name) {
+                    return true;
+                }
+                if let Some(args) = args {
+                    return args.iter().any(walk);
+                }
+            }
+            match node.1.as_ref() {
+                Expression::Block(children) | Expression::Fragment(children) => {
+                    children.iter().any(walk)
+                }
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner)
+                | Expression::Return(inner)
+                | Expression::Raise(inner)
+                | Expression::Yield(inner) => walk(inner),
+                Expression::Match { scrutinee, arms } => {
+                    walk(scrutinee) || arms.iter().any(|arm| walk(&arm.body))
+                }
+                Expression::Access(recv, _) => walk(recv),
+                _ => false,
+            }
+        }
+        walk(body)
+    }
+
     /// True when `body` is just the sole pattern binding (e.g. `Ok(x) => x`).
     fn match_arm_body_is_identity_binding<'a>(
         pattern: &parser::ast::Pattern<'a>,
@@ -9531,16 +9566,27 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(value));
             }
             Expression::Program(children) => {
+                // Emit phases (COI-109): helpers before `impl`, but free fns
+                // that call instance methods must follow their `impl` blocks.
                 let phase = |c: &Output| -> u8 {
                     match c.1.as_ref() {
-                        Expression::Function { name, .. } if *name == "main" => 3,
-                        Expression::Function { .. } => 1,
+                        Expression::Function { name, body, .. } if *name == "main" => 3,
+                        Expression::Function { body, .. } => {
+                            if body
+                                .as_ref()
+                                .is_some_and(Self::function_body_calls_instance_method)
+                            {
+                                25
+                            } else {
+                                1
+                            }
+                        }
                         Expression::Implementation { .. } => 2,
                         Expression::TestCase { .. } => 3,
                         _ => 0,
                     }
                 };
-                for p in 0..=3u8 {
+                for p in [0u8, 1, 2, 25, 3] {
                     for child in children.iter().filter(|c| phase(c) == p) {
                         bytecode.append(&mut self.do_compile(child));
                     }
