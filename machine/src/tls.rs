@@ -1309,7 +1309,7 @@ mod tests {
     #[test]
     fn enable_rejects_file_stream() {
         let mut heap = Heap::default();
-        let s = stream_open(&mut heap, "/tmp/coil_tls_file_kind.bin", "w").expect("open");
+        let s = stream_open(&mut heap, "coil_tls_file_kind.bin", "w").expect("open");
         let opts = make_opts(&mut heap, false);
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
@@ -1470,7 +1470,7 @@ mod tests {
     fn server_enable_rejects_file_stream() {
         let (cert_pem, key_pem) = test_server_pem();
         let mut heap = Heap::default();
-        let s = stream_open(&mut heap, "/tmp/coil_tls_server_enable_file.bin", "w").expect("open");
+        let s = stream_open(&mut heap, "coil_tls_server_enable_file.bin", "w").expect("open");
         let opts = make_server_enable_opts(&mut heap, &cert_pem, &key_pem);
         let err = tls_server_enable(&mut heap, s, opts).unwrap_err();
         assert_eq!(err, IoErrorTag::InvalidInput);
@@ -1940,7 +1940,7 @@ mod tests {
             &mut heap,
             true,
             None,
-            Some("/tmp/coil_tls_missing_ca_does_not_exist.pem"),
+            Some("coil_tls_missing_ca_does_not_exist.pem"),
             0,
         );
         let err = tls_client_enable(&mut heap, s, "127.0.0.1", opts).unwrap_err();

@@ -1620,7 +1620,7 @@ mod tests {
     #[test]
     fn stream_timeouts_round_trip_setters() {
         let mut heap = Heap::default();
-        let path = "/tmp/coil_io_timeout_setters.bin";
+        let path = "coil_io_timeout_setters.bin";
         let _ = std::fs::remove_file(path);
         let s = stream_open(&mut heap, path, "w").expect("open");
         stream_set_read_timeout(&mut heap, s, 100).expect("read to");
@@ -1664,7 +1664,7 @@ mod tests {
     #[test]
     fn stream_timeouts_on_closed_are_already_closed() {
         let mut heap = Heap::default();
-        let path = "/tmp/coil_io_timeout_closed.bin";
+        let path = "coil_io_timeout_closed.bin";
         let _ = std::fs::remove_file(path);
         let s = stream_open(&mut heap, path, "w").expect("open");
         stream_close(&mut heap, s).unwrap();

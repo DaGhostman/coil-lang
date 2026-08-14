@@ -29,7 +29,7 @@ fn describe(string path) {
 }
 
 fn main() {
-    let path = "/tmp/coil_io_eof_test.bin";
+    let path = "coil_io_eof_test.bin";
     write_all(stdout(), to_bytes(format("%s", match describe(path) {
         Result::Ok(s) => s,
         Result::Err(_) => "err",
