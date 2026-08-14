@@ -955,6 +955,51 @@ use string::{format, to_bytes};
         );
     }
 
+    /// COI-109: free helpers defined after an inherent `impl` must still be
+    /// emitted before methods so CALL targets exist at runtime.
+    #[test]
+    fn inherent_method_calling_later_helper_emits_helper_before_method() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+                class Foo { v: int, }
+                impl Foo {
+                    fn bump(Foo f) -> int { return helper(f.v); }
+                }
+                fn helper(int n) -> int { return n + 1; }
+                fn main() {
+                    let f = new Foo(1);
+                    let x = f.bump();
+                }
+                "#,
+            )
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        let _bc = compiler.compile("", &mut ast);
+        assert!(
+            compiler.messages.is_empty(),
+            "unexpected: {:?}",
+            compiler
+                .messages
+                .iter()
+                .map(|m| m.message())
+                .collect::<Vec<_>>()
+        );
+        let helper = *compiler
+            .functions
+            .get("helper")
+            .expect("later helper must be registered");
+        let method = *compiler
+            .functions
+            .get("Foo::bump")
+            .or_else(|| compiler.functions.get("Foo__bump"))
+            .expect("inherent method must be registered");
+        assert!(
+            helper < method,
+            "helper @{helper} must precede method @{method} in emit order"
+        );
+    }
+
     #[test]
     fn emit_call_indirect_pushes_target_then_opcode() {
         use common::Instruction;
