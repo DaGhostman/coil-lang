@@ -1,0 +1,7 @@
+{
+  "name": "coil-lang",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "./.cursor/install.sh"
+}
