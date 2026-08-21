@@ -19,3 +19,12 @@ fi
 # Warm the workspace build; also produces ./target/debug/coil used by the
 # `coil test` language harness and showcase project tests.
 cargo build
+
+# Build the FFI example shared lib so examples/ffi_*.hy run out of the box.
+# `cargo test` builds this on demand; install mirrors that for direct demos.
+# Rebuild only when missing or the C source is newer (idempotent).
+if command -v cc >/dev/null 2>&1; then
+    if [ examples/sum.c -nt examples/libsum.so ] || [ ! -f examples/libsum.so ]; then
+        cc -shared -fPIC -O2 -o examples/libsum.so examples/sum.c
+    fi
+fi
