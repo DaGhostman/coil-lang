@@ -61,16 +61,22 @@ runs one multiplexed wait over all outstanding handles.
 
 ## Waiting on readiness
 
-TLS handshake waits and top-level `await_*` call
+Top-level `await_*` and sync adapters call
 [`IoReactor::wait_fd`](../../machine/src/io_reactor.rs) (via
 [`reactor_wait_fd`](../../machine/src/io.rs)). Cooperative awaits use
 [`register_wait`](../../machine/src/io_reactor.rs) + yield.
 Userland sync adapters (`write_all`, …) reach the park path through top-level
 `await_readable` / `await_writable`.
 
-When a CPU reactor is bound (`HostStateGuard`), blocking waits use
+When a CPU reactor is bound (`HostStateGuard`), those blocking waits use
 [`wait_fd_helping`](../../machine/src/io_reactor.rs): short poll slices interleaved with
 [`Reactor::help_once`](../../machine/src/reactor.rs).
+
+**TLS handshake is different:** `tls_*_enable` waits via
+[`reactor_wait_fd_no_help`](../../machine/src/io.rs) so a mid-handshake park
+cannot nest-steal the peer `thread::spawn` job onto the same stack (that
+deadlocked both sides under `COIL_MAX_WORKER_THREADS=1` — COI-116). The pool
+worker still runs the peer while the waiter polls.
 
 ## Env / knobs
 
