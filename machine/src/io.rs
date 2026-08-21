@@ -202,6 +202,15 @@ pub fn reactor_wait_fd(
     crate::thread::host_io_wait(handle, interest, timeout)
 }
 
+/// Wait for handle readiness without CPU help-steal (TLS handshake; see COI-116).
+pub fn reactor_wait_fd_no_help(
+    handle: WaitHandle,
+    interest: Interest,
+    timeout: Option<Duration>,
+) -> Result<(), IoErrorTag> {
+    crate::thread::host_io_wait_no_help(handle, interest, timeout)
+}
+
 fn poll_ready(
     handle: WaitHandle,
     for_read: bool,
