@@ -51,6 +51,8 @@ pub struct OptimizeOptions {
     pub loop_unroll: bool,
     /// Cap on trips fully unrolled (clamped to 8). Loops with more trips stay rolled.
     pub loop_unroll_factor: usize,
+    /// Sink or drop loop stores of an invariant value that is not read in the loop.
+    pub invariant_store_elim: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -78,6 +80,7 @@ impl Default for OptimizeOptions {
             seek_back_edge: false,
             loop_unroll: true,
             loop_unroll_factor: 8,
+            invariant_store_elim: true,
         }
     }
 }
@@ -130,6 +133,9 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
     }
     if opts.loop_unroll {
         loop_unroll::unroll_loops(ops, opts.loop_unroll_factor);
+    }
+    if opts.invariant_store_elim {
+        invariant_store_elim::eliminate_invariant_stores(ops, entry_sp);
     }
     // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
     if opts.slot_promote {
@@ -228,6 +234,7 @@ pub(crate) fn emitting_range_to_raw(
 mod cfg;
 mod convoy;
 mod dce;
+mod invariant_store_elim;
 mod loop_unroll;
 mod slot_promote;
 
