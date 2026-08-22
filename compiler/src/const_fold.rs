@@ -83,6 +83,11 @@ pub fn eval_expr<'a>(
         Expression::Neq(lhs, rhs) => {
             eval_eq(lhs, rhs, env).map(|b| ConstValue::Bool(!matches!(b, ConstValue::Bool(true))))
         }
+        Expression::BitAnd(lhs, rhs) => eval_int_bit(lhs, rhs, env, |a, b| a & b),
+        Expression::BitOr(lhs, rhs) => eval_int_bit(lhs, rhs, env, |a, b| a | b),
+        Expression::Xor(lhs, rhs) => eval_int_bit(lhs, rhs, env, |a, b| a ^ b),
+        Expression::Shl(lhs, rhs) => eval_int_shift(lhs, rhs, env, true),
+        Expression::Shr(lhs, rhs) => eval_int_shift(lhs, rhs, env, false),
         Expression::Call { name, args } => eval_len_call(name, args.as_deref(), env),
         Expression::TypeOf(_) => None,
         _ => None,
@@ -148,6 +153,47 @@ fn eval_binop<'a>(
         (ConstValue::Float(x), ConstValue::Float(y)) => Some(ConstValue::Float(float_op(x, y))),
         _ => None,
     }
+}
+
+fn eval_int_bit<'a>(
+    lhs: &Output<'a>,
+    rhs: &Output<'a>,
+    env: &HashMap<String, ConstValue>,
+    op: fn(i64, i64) -> i64,
+) -> Option<ConstValue> {
+    let ConstValue::Int(a) = eval_expr(lhs, env)? else {
+        return None;
+    };
+    let ConstValue::Int(b) = eval_expr(rhs, env)? else {
+        return None;
+    };
+    Some(ConstValue::Int(op(a, b)))
+}
+
+/// Fold `<<` / `>>` only when the shift is in `0..32` (VM `i32` shift).
+fn eval_int_shift<'a>(
+    lhs: &Output<'a>,
+    rhs: &Output<'a>,
+    env: &HashMap<String, ConstValue>,
+    left: bool,
+) -> Option<ConstValue> {
+    let ConstValue::Int(a) = eval_expr(lhs, env)? else {
+        return None;
+    };
+    let ConstValue::Int(b) = eval_expr(rhs, env)? else {
+        return None;
+    };
+    if !(0..32).contains(&b) {
+        return None;
+    }
+    let a32 = a as i32;
+    let n = b as u32;
+    let r = if left {
+        a32.wrapping_shl(n)
+    } else {
+        a32.wrapping_shr(n)
+    };
+    Some(ConstValue::Int(r as i64))
 }
 
 fn eval_cmp<'a>(
@@ -255,6 +301,129 @@ pub fn strength_div_dividend_nonneg(
     env: &HashMap<String, ConstValue>,
 ) -> bool {
     matches!(eval_expr(expr, env), Some(ConstValue::Int(k)) if k >= 0)
+}
+
+/// Result of [`strength_reduce_bitops`]. Does not return [`crate::il::IlOp`]:
+/// const-fold stays AST-level; codegen emits CONST / the inner expr.
+#[derive(Debug, Clone, Copy)]
+pub enum StrengthBitop<'a> {
+    /// Drop the bitop; the remaining operand is the result.
+    Identity(&'a Output<'a>),
+    /// Fold to an integer constant (operand is a trivial identifier / literal).
+    Const(i64),
+}
+
+fn int_imm(expr: &Output<'_>, env: &HashMap<String, ConstValue>) -> Option<i64> {
+    match eval_expr(expr, env)? {
+        ConstValue::Int(k) => Some(k),
+        _ => None,
+    }
+}
+
+fn is_trivial_operand(expr: &Output<'_>) -> bool {
+    match expr.1.as_ref() {
+        Expression::Integer(_) | Expression::Identifier(_) | Expression::Bool(_) => true,
+        Expression::Group(inner) | Expression::Expr(inner) | Expression::Positive(inner) => {
+            is_trivial_operand(inner)
+        }
+        _ => false,
+    }
+}
+
+fn same_ident<'a>(a: &Output<'a>, b: &Output<'a>) -> bool {
+    match (a.1.as_ref(), b.1.as_ref()) {
+        (Expression::Identifier(x), Expression::Identifier(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// i32 all-ones (`-1` or `0xFFFF_FFFF` as a positive i64 literal).
+fn is_i32_all_ones(k: i64) -> bool {
+    k == -1 || k == 0xFFFF_FFFF
+}
+
+/// Common bitwise identities / annihilators. Side-effecting operands are refused
+/// so `f() & 0` still evaluates `f()`.
+pub fn strength_reduce_bitops<'a>(
+    expr: &'a (SimpleSpan, Box<Expression<'a>>),
+    env: &HashMap<String, ConstValue>,
+) -> Option<StrengthBitop<'a>> {
+    match expr.1.as_ref() {
+        Expression::BitAnd(lhs, rhs) => bitand_reduce(lhs, rhs, env),
+        Expression::BitOr(lhs, rhs) => bitor_reduce(lhs, rhs, env),
+        Expression::Xor(lhs, rhs) => xor_reduce(lhs, rhs, env),
+        Expression::Shl(lhs, rhs) | Expression::Shr(lhs, rhs) => {
+            if int_imm(rhs, env) == Some(0) {
+                Some(StrengthBitop::Identity(lhs))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn bitand_reduce<'a>(
+    lhs: &'a Output<'a>,
+    rhs: &'a Output<'a>,
+    env: &HashMap<String, ConstValue>,
+) -> Option<StrengthBitop<'a>> {
+    if same_ident(lhs, rhs) {
+        return Some(StrengthBitop::Identity(lhs));
+    }
+    let (x, k) = match (int_imm(lhs, env), int_imm(rhs, env)) {
+        (Some(k), None) if is_trivial_operand(rhs) => (rhs, k),
+        (None, Some(k)) if is_trivial_operand(lhs) => (lhs, k),
+        _ => return None,
+    };
+    if k == 0 {
+        return Some(StrengthBitop::Const(0));
+    }
+    if is_i32_all_ones(k) {
+        return Some(StrengthBitop::Identity(x));
+    }
+    None
+}
+
+fn bitor_reduce<'a>(
+    lhs: &'a Output<'a>,
+    rhs: &'a Output<'a>,
+    env: &HashMap<String, ConstValue>,
+) -> Option<StrengthBitop<'a>> {
+    if same_ident(lhs, rhs) {
+        return Some(StrengthBitop::Identity(lhs));
+    }
+    let (x, k) = match (int_imm(lhs, env), int_imm(rhs, env)) {
+        (Some(k), None) if is_trivial_operand(rhs) => (rhs, k),
+        (None, Some(k)) if is_trivial_operand(lhs) => (lhs, k),
+        _ => return None,
+    };
+    if k == 0 {
+        return Some(StrengthBitop::Identity(x));
+    }
+    if is_i32_all_ones(k) {
+        return Some(StrengthBitop::Const(-1));
+    }
+    None
+}
+
+fn xor_reduce<'a>(
+    lhs: &'a Output<'a>,
+    rhs: &'a Output<'a>,
+    env: &HashMap<String, ConstValue>,
+) -> Option<StrengthBitop<'a>> {
+    if same_ident(lhs, rhs) {
+        return Some(StrengthBitop::Const(0));
+    }
+    let (x, k) = match (int_imm(lhs, env), int_imm(rhs, env)) {
+        (Some(k), None) if is_trivial_operand(rhs) => (rhs, k),
+        (None, Some(k)) if is_trivial_operand(lhs) => (lhs, k),
+        _ => return None,
+    };
+    if k == 0 {
+        return Some(StrengthBitop::Identity(x));
+    }
+    None
 }
 
 /// If `expr` is `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x % 1` (when defined), return inner.
@@ -668,6 +837,112 @@ mod tests {
         assert!(strength_div_dividend_nonneg(&id_expr("x"), &env_pos));
         env_pos.insert("x".into(), ConstValue::Int(-1));
         assert!(!strength_div_dividend_nonneg(&id_expr("x"), &env_pos));
+    }
+
+    #[test]
+    fn strength_reduce_bitops_identities_and_zeros() {
+        let env = HashMap::new();
+        let or0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitOr(id_expr("x"), int_expr(0))),
+        );
+        let xor0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Xor(id_expr("x"), int_expr(0))),
+        );
+        let and_ones = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitAnd(id_expr("x"), int_expr(-1))),
+        );
+        let and_ff = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitAnd(id_expr("x"), int_expr(0xFF))),
+        );
+        let and0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitAnd(id_expr("x"), int_expr(0))),
+        );
+        let xor_x = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Xor(id_expr("x"), id_expr("x"))),
+        );
+        let or_x = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitOr(id_expr("x"), id_expr("x"))),
+        );
+        let shl0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Shl(id_expr("x"), int_expr(0))),
+        );
+        let shr0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Shr(id_expr("x"), int_expr(0))),
+        );
+        let or_ones = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitOr(id_expr("x"), int_expr(-1))),
+        );
+        let call_and0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitAnd(
+                (
+                    SimpleSpan::from(0..1),
+                    Box::new(Expression::Call {
+                        name: id_expr("f"),
+                        args: None,
+                    }),
+                ),
+                int_expr(0),
+            )),
+        );
+        assert!(matches!(
+            strength_reduce_bitops(&or0, &env),
+            Some(StrengthBitop::Identity(e)) if matches!(e.1.as_ref(), Expression::Identifier("x"))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&xor0, &env),
+            Some(StrengthBitop::Identity(_))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&and_ones, &env),
+            Some(StrengthBitop::Identity(_))
+        ));
+        assert!(strength_reduce_bitops(&and_ff, &env).is_none());
+        assert!(strength_reduce_bitops(&call_and0, &env).is_none());
+        assert!(matches!(
+            strength_reduce_bitops(&and0, &env),
+            Some(StrengthBitop::Const(0))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&xor_x, &env),
+            Some(StrengthBitop::Const(0))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&or_x, &env),
+            Some(StrengthBitop::Identity(_))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&shl0, &env),
+            Some(StrengthBitop::Identity(_))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&shr0, &env),
+            Some(StrengthBitop::Identity(_))
+        ));
+        assert!(matches!(
+            strength_reduce_bitops(&or_ones, &env),
+            Some(StrengthBitop::Const(-1))
+        ));
+    }
+
+    #[test]
+    fn eval_bitand_const() {
+        let env = HashMap::new();
+        let and = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::BitAnd(int_expr(0xFF), int_expr(3))),
+        );
+        assert_eq!(eval_expr(&and, &env), Some(ConstValue::Int(3)));
     }
 
     #[test]
