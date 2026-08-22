@@ -13,6 +13,7 @@ mod codebuf;
 mod emit_buf;
 mod func;
 mod gvn;
+mod gvn_ssa;
 mod licm;
 mod lower;
 mod module;

@@ -53,6 +53,8 @@ pub struct OptimizeOptions {
     pub loop_unroll_factor: usize,
     /// Sink or drop loop stores of an invariant value that is not read in the loop.
     pub invariant_store_elim: bool,
+    /// SSA-style global CSE of pure binops whose result already lives in a slot.
+    pub ssa_gvn: bool,
 }
 
 impl Default for OptimizeOptions {
@@ -81,6 +83,7 @@ impl Default for OptimizeOptions {
             loop_unroll: true,
             loop_unroll_factor: 8,
             invariant_store_elim: true,
+            ssa_gvn: true,
         }
     }
 }
@@ -136,6 +139,9 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
     }
     if opts.invariant_store_elim {
         invariant_store_elim::eliminate_invariant_stores(ops, entry_sp);
+    }
+    if opts.ssa_gvn {
+        super::gvn_ssa::ssa_gvn(ops);
     }
     // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
     if opts.slot_promote {
