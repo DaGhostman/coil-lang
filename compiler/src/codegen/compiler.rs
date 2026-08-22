@@ -1189,6 +1189,20 @@ impl Compiler {
             return false;
         }
         let ops = self.bytecode.code_slice_ops(start, end);
+        let recursive = self.current_function_qualified.as_deref() == Some(fqn)
+            || self.current_function_table_key.as_deref() == Some(fqn)
+            || self.current_function_qualified.as_deref() == Some(lookup.as_str())
+            || self.current_function_table_key.as_deref() == Some(lookup.as_str());
+        let cost = super::inline_cost::estimate_inline_cost(&ops);
+        let site = super::inline_cost::CallInfo {
+            recursive,
+            hot: false,
+            force_inline: false,
+            no_inline: false,
+        };
+        if !super::inline_cost::should_inline_function(cost, &site, &self.inline_cost) {
+            return false;
+        }
         if !Self::is_tiny_inline_il(&ops) {
             return false;
         }
