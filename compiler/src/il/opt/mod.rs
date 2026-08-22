@@ -47,6 +47,10 @@ pub struct OptimizeOptions {
     /// Off: innermost mandelbrot has no such self-stores; outer-loop Seek
     /// splits FloatChainStore fuse windows.
     pub seek_back_edge: bool,
+    /// Full-unroll counted natural loops with a known trip count ≤ 8.
+    pub loop_unroll: bool,
+    /// Cap on trips fully unrolled (clamped to 8). Loops with more trips stay rolled.
+    pub loop_unroll_factor: usize,
 }
 
 impl Default for OptimizeOptions {
@@ -72,6 +76,8 @@ impl Default for OptimizeOptions {
             invert_guard_branch: true,
             slot_promote_tell: true,
             seek_back_edge: false,
+            loop_unroll: true,
+            loop_unroll_factor: 8,
         }
     }
 }
@@ -121,6 +127,9 @@ pub fn optimize_at(ops: &mut Vec<IlOp>, opts: &OptimizeOptions, entry_sp: i32, p
     }
     if opts.loop_bounds {
         super::bounds::loop_bounds(ops);
+    }
+    if opts.loop_unroll {
+        loop_unroll::unroll_loops(ops, opts.loop_unroll_factor);
     }
     // After LICM so hoisted `LOAD temp; STORE local` copies become aliases.
     if opts.slot_promote {
@@ -219,6 +228,7 @@ pub(crate) fn emitting_range_to_raw(
 mod cfg;
 mod convoy;
 mod dce;
+mod loop_unroll;
 mod slot_promote;
 
 use cfg::{eliminate_dead_blocks, invert_branch_over_jump, jump_thread};

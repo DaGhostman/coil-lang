@@ -1208,6 +1208,8 @@ mod tests {
                 invert_guard_branch: false,
                 slot_promote_tell: false,
                 seek_back_edge: false,
+                loop_unroll: false,
+                loop_unroll_factor: 8,
             },
             &mut pool,
         );
