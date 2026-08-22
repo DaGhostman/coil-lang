@@ -329,6 +329,30 @@ impl Compiler {
             bytecode.push_const(shift as i32);
             bytecode.push(Byte::new(Instruction::SHL));
             true
+        } else if allow_mul_shl
+            && let Some((inner, shift)) =
+                crate::const_fold::strength_div_to_shr(ast, self.const_env())
+        {
+            // Signed `/ 2^n` is toward-zero; VM `SHR` is arithmetic `i32 >>`.
+            // Equivalent only for non-negative dividends (including `byte`).
+            use crate::typechecking::subst::apply_ty_prune;
+            use crate::typechecking::ty::{BYTE, INT};
+            let inner_ty = self.codegen_expr_ty(inner).map(|ty| {
+                apply_ty_prune(self.checker.subst(), &ty)
+            });
+            let is_byte = matches!(inner_ty, Some(Ty::Con(ref n)) if n == BYTE);
+            let is_int = matches!(inner_ty, Some(Ty::Con(ref n)) if n == INT);
+            let safe = is_byte
+                || (is_int
+                    && crate::const_fold::strength_div_dividend_nonneg(inner, self.const_env()));
+            if !safe {
+                return false;
+            }
+            let mut inner_bc = self.do_compile(inner);
+            bytecode.append(&mut inner_bc);
+            bytecode.push_const(shift as i32);
+            bytecode.push(Byte::new(Instruction::SHR));
+            true
         } else if let Some((base, kind)) = crate::const_fold::strength_pow_int(ast, self.const_env()) {
             use crate::typechecking::subst::apply_ty_prune;
             use crate::typechecking::ty::{BYTE, INT};
@@ -11832,30 +11856,36 @@ impl Compiler {
                 ) {
                     // Intentional empty body: the emit/try_emit call in the
                     // condition already wrote bytecode as a side effect.
-                } else if let Some(hint) = self_id
-                    .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| {
-                        self.checker
-                            .bound_operator_call_for_span(span.start, span.end)
-                    })
-                    .cloned()
-                    && self.emit_bound_operator_call(
-                        &mut bytecode,
-                        lhs,
-                        rhs,
-                        hint.dict_index,
-                        hint.method_slot,
-                    )
-                {
-                    // Intentional empty body: the emit/try_emit call in the
-                    // condition already wrote bytecode as a side effect.
                 } else {
-                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                    bytecode.push(Byte::new(if is_float {
-                        Instruction::DIVF
+                    let bound_div = self_id
+                        .and_then(|id| self.checker.bound_operator_call_at(id))
+                        .or_else(|| {
+                            self.checker
+                                .bound_operator_call_for_span(span.start, span.end)
+                        })
+                        .cloned();
+                    if self.try_emit_folded_expr(ast, &mut bytecode, bound_div.is_none()) {
+                        // Const-fold, `/ 1`, or `byte / 2^n` → SHR.
+                    } else if let Some(hint) = bound_div
+                        && self.emit_bound_operator_call(
+                            &mut bytecode,
+                            lhs,
+                            rhs,
+                            hint.dict_index,
+                            hint.method_slot,
+                        )
+                    {
+                        // Intentional empty body: the emit/try_emit call in the
+                        // condition already wrote bytecode as a side effect.
                     } else {
-                        Instruction::DIV
-                    }));
+                        let is_float =
+                            likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                        bytecode.push(Byte::new(if is_float {
+                            Instruction::DIVF
+                        } else {
+                            Instruction::DIV
+                        }));
+                    }
                 }
             }
             Expression::And(lhs, rhs) => {
