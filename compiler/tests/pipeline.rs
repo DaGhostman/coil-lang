@@ -4133,6 +4133,27 @@ fn main() {
     assert_eq!(output, "6");
 }
 
+/// IL unroll of counted `while` must still run the induction step each trip.
+#[test]
+fn const_while_unroll_prints_sum() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let s = 0;
+    let i = 0;
+    while i < 4 {
+        s = s + i;
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", s)));
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
 /// Same induction check with `i <= 2` (3 trips: 0+1+2).
 #[test]
 fn const_for_unroll_leq_advances_induction() {

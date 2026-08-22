@@ -1637,7 +1637,7 @@ fn main() {
         let (bc, _pool) = compile_src(
             "fn main() { \
  let i = 0; \
- while (i < 3) { \
+ while (i < 10) { \
  i = i + 1; \
  } \
  }",
@@ -1841,7 +1841,7 @@ fn main() {
         let (bc, pool) = compile_src(
             "fn main() { \
  let i = 0; \
- while (i < 3) { \
+ while (i < 10) { \
  i = i + 1; \
  } \
  }",
@@ -2005,7 +2005,7 @@ i = i + 1; \
     #[test]
     fn while_header_stays_fused_jmpf_not_jmpt() {
         use common::Instruction;
-        let (bc, _) = compile_src("fn main() { let i = 0; while (i < 3) { i = i + 1; } }");
+        let (bc, _) = compile_src("fn main() { let i = 0; while (i < 10) { i = i + 1; } }");
         let jmpt = bc
             .iter()
             .filter(|b| {
@@ -2197,7 +2197,7 @@ fn main() { for x in counter() { if x == 1 { break; } } }",
         let (bc, _pool) = compile_src(
             "fn main() { \
  let i = 0; \
- while (i < 3) { \
+ while (i < 10) { \
  i = i + 1; \
  } \
  }",
@@ -3948,6 +3948,28 @@ write(stdout(), to_bytes(format(\"%i\", s))); \
                 Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
             )),
             "unrolled for (i < 3) must not emit a loop exit jump; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Counted `while i < 3` is unrolled by the IL pass (codegen does not peel while).
+    #[test]
+    fn const_while_loop_unrolled_without_back_edge() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let s = 0; \
+let i = 0; \
+while i < 3 { s = s + i; i = i + 1; } \
+return s; \
+}",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+            )),
+            "unrolled while i < 3 must not emit a loop exit jump; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

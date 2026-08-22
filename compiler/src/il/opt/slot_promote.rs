@@ -2173,6 +2173,8 @@ mod tell {
                 invert_guard_branch: false,
                 slot_promote_tell: true,
                 seek_back_edge: on,
+                loop_unroll: false,
+                loop_unroll_factor: 8,
             }
         }
 
