@@ -3659,6 +3659,31 @@ fn main() { let x = 0; while x < 3 { x = x + 1; } return add(x, 4); }",
     }
 
     #[test]
+    fn zero_inline_budget_emits_call_for_tiny_add() {
+        use common::Instruction;
+        let src = r#"
+fn add(int a, int b) -> int { return a + b; }
+fn run() -> int { return add(1, 2); }
+"#;
+        let (bc_inlined, _) = compile_src(src);
+        let mut ast = Pratt::default().parse(src).expect("parse");
+        let mut compiler = Compiler::default();
+        compiler.inline_cost.max_inline_cost = 0;
+        let bc_call = compiler.compile("", &mut ast);
+        let count_calls = |bc: &[Byte]| {
+            bc.iter()
+                .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+                .count()
+        };
+        assert!(
+            count_calls(&bc_call) > count_calls(&bc_inlined),
+            "budget 0 should keep CALL; inlined={:?} call={:?}",
+            bc_inlined.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+            bc_call.iter().map(|b| b.bytecode()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn is_tiny_inline_il_rejects_jump_span() {
         use crate::il::{IlJumpKind, IlOp, Label};
         use common::{Byte, DebugLoc, Instruction};
