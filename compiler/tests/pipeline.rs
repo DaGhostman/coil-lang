@@ -4170,6 +4170,22 @@ fn main() {
     assert_eq!(output, "-2");
 }
 
+/// Bit identities: `x | 0` and `x ^ x` keep value / yield zero (COI-123).
+#[test]
+fn bitop_identities_print() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let x = 7;
+    write(stdout(), to_bytes(format("%i %i", x | 0, x ^ x)));
+}
+"#,
+    );
+    assert_eq!(output, "7 0");
+}
+
 /// Invariant `t = 42` in a counted `while` must still be visible after the loop
 /// (COI-120 sinks the store rather than dropping a live slot).
 #[test]

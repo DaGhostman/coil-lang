@@ -873,6 +873,78 @@ use string::{format, to_bytes};
         );
     }
 
+    fn bytecode_has_bitand(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::BITAND)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::BITAND as u8)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::BITAND as u8)
+        })
+    }
+
+    fn bytecode_has_bitor(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::BITOR)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::BITOR as u8)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::BITOR as u8)
+        })
+    }
+
+    #[test]
+    fn bitand_zero_emits_const_not_bitand() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn z(int x) -> int { return x & 0; }");
+        assert!(
+            !bytecode_has_bitand(&bc),
+            "x & 0 should not emit BITAND; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CONST)
+                || matches!(b.bytecode(), Instruction::ConstReturnImm)),
+            "expected CONST 0 for x & 0; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bitor_zero_skips_bitor() {
+        let (bc, _pool) = compile_src("fn id(int x) -> int { return x | 0; }");
+        assert!(
+            !bytecode_has_bitor(&bc),
+            "x | 0 should skip BITOR; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn xor_same_ident_emits_zero() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn z(int x) -> int { return x ^ x; }");
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::XOR)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::XOR as u8)),
+            "x ^ x should not emit XOR; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shl_zero_skips_shl() {
+        let (bc, _pool) = compile_src("fn id(int x) -> int { return x << 0; }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "x << 0 should skip SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     /// Type aliases to `int` expand at check time, so `I * 8` still SHLs.
     #[test]
     fn aliased_int_mul_by_power_of_two_emits_shl() {

@@ -305,6 +305,20 @@ impl Compiler {
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
             true
+        } else if let Some(bit) =
+            crate::const_fold::strength_reduce_bitops(ast, self.const_env())
+        {
+            match bit {
+                crate::const_fold::StrengthBitop::Identity(inner) => {
+                    let mut inner_bc = self.do_compile(inner);
+                    bytecode.append(&mut inner_bc);
+                    true
+                }
+                crate::const_fold::StrengthBitop::Const(k) => {
+                    self.emit_const_value(&crate::const_fold::ConstValue::Int(k), bytecode);
+                    true
+                }
+            }
         } else if allow_mul_shl
             && let Some((inner, shift)) = crate::const_fold::strength_mul_to_shl(ast, self.const_env())
         {
@@ -11918,19 +11932,34 @@ impl Compiler {
                 }
             }
             Expression::Shl(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHL));
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHL));
+                }
             }
             Expression::Shr(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHR));
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHR));
+                }
             }
             Expression::Xor(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::XOR));
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::XOR));
+                }
             }
             Expression::BitAnd(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITAND));
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITAND));
+                }
             }
             Expression::BitOr(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITOR));
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITOR));
+                }
             }
             Expression::Or(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::OR));
