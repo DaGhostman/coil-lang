@@ -4154,6 +4154,49 @@ fn main() {
     assert_eq!(output, "6");
 }
 
+/// Invariant `t = 42` in a counted `while` must still be visible after the loop
+/// (COI-120 sinks the store rather than dropping a live slot).
+#[test]
+fn loop_invariant_store_live_after_prints() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let t = 0;
+    let i = 0;
+    while i < 10 {
+        t = 42;
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", t)));
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Loop-variant stores must keep the last iteration's value.
+#[test]
+fn loop_variant_store_live_after_prints() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let t = 0;
+    let i = 0;
+    while i < 10 {
+        t = i;
+        i = i + 1;
+    }
+    write(stdout(), to_bytes(format("%i", t)));
+}
+"#,
+    );
+    assert_eq!(output, "9");
+}
+
 /// Same induction check with `i <= 2` (3 trips: 0+1+2).
 #[test]
 fn const_for_unroll_leq_advances_induction() {
