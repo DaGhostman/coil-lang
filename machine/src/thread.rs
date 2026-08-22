@@ -436,6 +436,29 @@ pub(crate) fn host_io_wait(
     }
 }
 
+/// Block on IO readiness without CPU help-steal.
+///
+/// TLS handshakes use this path (COI-116): `wait_fd_helping` can nest the peer
+/// `thread::spawn` job under the client's wait on a 1-worker reactor, so both
+/// sides park on the same OS stack and time out. Pool workers still run the peer.
+pub(crate) fn host_io_wait_no_help(
+    handle: crate::io_handle::WaitHandle,
+    interest: crate::io_reactor::Interest,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), crate::io::IoErrorTag> {
+    use crate::io_reactor::IoReactor;
+
+    let io = HOST_STATE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|s| s.io_reactor.clone())
+    });
+    match io {
+        Some(io) => io.wait_fd(handle, interest, timeout),
+        None => IoReactor::new().wait_fd(handle, interest, timeout),
+    }
+}
+
 /// Poll async waiters once on the bound IO reactor.
 pub(crate) fn host_io_drive() -> usize {
     HOST_STATE.with(|c| {

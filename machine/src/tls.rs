@@ -316,7 +316,8 @@ fn wait_handle_deadline(
     } else {
         crate::io_reactor::Interest::Writable
     };
-    crate::io::reactor_wait_fd(handle, interest, timeout)
+    // No help-steal: nesting the peer spawn under this wait deadlocks (COI-116).
+    crate::io::reactor_wait_fd_no_help(handle, interest, timeout)
 }
 
 /// Run handshake while keeping the socket non-blocking; honor optional deadline.
@@ -1612,6 +1613,50 @@ mod tests {
         server.join().expect("server");
     }
 
+    /// COI-116: same round-trip with HostState bound so waits go through the
+    /// reactor path (must use no-help TLS parks, not nested help-steal).
+    #[test]
+    fn server_client_enable_with_host_state_bound() {
+        use crate::reactor::Reactor;
+        use crate::thread::HostStateGuard;
+        use std::sync::Arc;
+
+        let (cert_pem, key_pem) = test_server_pem();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reactor = Reactor::new(1);
+        let server_reactor = Arc::clone(&reactor);
+        let server = thread::spawn(move || {
+            let mut vm = crate::Machine::<64>::default();
+            vm.set_reactor(Arc::clone(&server_reactor));
+            let _guard = HostStateGuard::enter(&mut vm);
+            let mut heap = Heap::default();
+            ready_tx.send(()).ok();
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            let s = crate::io::alloc_stream(&mut heap, NativeHandle::Tcp(sock), StreamKind::Tcp)
+                .expect("stream");
+            let opts = make_server_enable_opts_full(&mut heap, &cert_pem, &key_pem, 5000, "");
+            let s = tls_server_enable(&mut heap, s, opts).expect("server enable");
+            stream_close(&mut heap, s).ok();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
+        let mut vm = crate::Machine::<64>::default();
+        vm.set_reactor(Arc::clone(&reactor));
+        let _guard = HostStateGuard::enter(&mut vm);
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "localhost", port as i64).expect("tcp");
+        let opts = make_opts_full(&mut heap, false, None, None, 5000);
+        let s = tls_client_enable(&mut heap, s, "localhost", opts).expect("client enable");
+        stream_close(&mut heap, s).ok();
+        server.join().expect("server");
+        reactor.shutdown();
+    }
+
     #[test]
     fn server_enable_requires_cert_and_key() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2298,5 +2343,81 @@ mod tests {
                 "unexpected server err {e:?}"
             );
         }
+    }
+
+    /// COI-116: TLS handshake parks must not `help_once` CPU jobs (nested peer deadlock).
+    #[test]
+    fn handshake_wait_does_not_help_steal_cpu_jobs() {
+        use crate::reactor::{Job, Reactor};
+        use crate::thread::{HostStateGuard, JoinState, ThreadProgram};
+        use crate::ffi::Natives;
+        use common::{Byte, Instruction, ProgramDebug};
+        use std::sync::Arc;
+
+        fn const_job(reactor: &Arc<Reactor>, imm: i32) -> Arc<JoinState> {
+            let state = Arc::new(JoinState::new());
+            let code = vec![
+                Byte::new(Instruction::CONST).with_value_u32(imm as u32),
+                Byte::new(Instruction::RETURN),
+            ];
+            let program = Arc::new(ThreadProgram {
+                code: Arc::new(code),
+                constants: Arc::new(Vec::new()),
+                strings: Arc::new(Vec::new()),
+                static_slot_count: 0,
+                debug: ProgramDebug::default(),
+                operand_stack_slots: crate::DEFAULT_OPERAND_STACK_SLOTS as u32,
+            });
+            reactor.submit(Job {
+                entry: 0,
+                args: Vec::new(),
+                state: Arc::clone(&state),
+                program,
+                natives: Natives::new(),
+                shared_print: None,
+                live_threads: crate::thread::new_live_thread_registry(),
+                reactor: Arc::clone(reactor),
+                io_reactor: crate::io_reactor::IoReactor::new(),
+            });
+            state
+        }
+
+        let reactor = Reactor::new(1);
+        let warmup = const_job(&reactor, 0);
+        let _ = reactor.wait_join(&warmup);
+        reactor.shutdown();
+
+        let pending = const_job(&reactor, 99);
+        assert!(
+            pending.try_take_result().is_none(),
+            "job must sit in injector after shutdown"
+        );
+
+        let mut vm = crate::Machine::<64>::default();
+        vm.set_reactor(Arc::clone(&reactor));
+        let _guard = HostStateGuard::enter(&mut vm);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = thread::spawn(move || {
+            let _ = listener.accept();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut heap = Heap::default();
+        let s = tcp_connect(&mut heap, "127.0.0.1", port as i64).expect("tcp");
+        let opts = make_opts_full(&mut heap, false, None, None, 100);
+        let _ = tls_client_enable(&mut heap, s, "127.0.0.1", opts);
+        stream_close(&mut heap, s).ok();
+        let _ = peer.join();
+
+        assert!(
+            pending.try_take_result().is_none(),
+            "TLS handshake wait must not help-steal CPU jobs (COI-116)"
+        );
+        reactor.help_once();
+        assert_eq!(
+            pending.try_take_result().expect("helped job"),
+            Ok(crate::thread::PortableValue::Immediate(99))
+        );
     }
 }
