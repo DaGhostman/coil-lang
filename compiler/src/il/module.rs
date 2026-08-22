@@ -142,7 +142,7 @@ impl IlModule {
 
         for body in &mut self.funcs {
             opt::optimize_at(&mut body.ops, &per, body.meta.entry_sp as i32, pool);
-            super::gvn::cfg_gvn(&mut body.ops);
+            super::gvn::cfg_gvn_with(&mut body.ops, per.ssa_gvn);
             if run_seek_back_edge {
                 opt::seek_normalize_back_edges(&mut body.ops, body.meta.entry_sp);
             }
@@ -397,6 +397,7 @@ mod tests {
                 loop_unroll: false,
                 loop_unroll_factor: 8,
                 invariant_store_elim: false,
+                ssa_gvn: false,
             },
             &mut Vec::new(),
         );
@@ -455,6 +456,7 @@ mod tests {
             loop_unroll: false,
             loop_unroll_factor: 8,
             invariant_store_elim: false,
+            ssa_gvn: false,
         }
     }
 

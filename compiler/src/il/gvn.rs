@@ -204,6 +204,22 @@ fn build_blocks(ops: &[IlOp]) -> Vec<Block> {
     blocks
 }
 
+/// Block ranges and predecessor lists for SSA-GVN (COI-121).
+pub(crate) fn gvn_cfg(ops: &[IlOp]) -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
+    let blocks = build_blocks(ops);
+    let n = blocks.len();
+    let mut preds = vec![Vec::new(); n];
+    for (i, b) in blocks.iter().enumerate() {
+        for &s in &b.succs {
+            if s < n {
+                preds[s].push(i);
+            }
+        }
+    }
+    let ranges = blocks.into_iter().map(|b| (b.start, b.end)).collect();
+    (ranges, preds)
+}
+
 fn preds_of(blocks: &[Block]) -> Vec<Vec<usize>> {
     let mut preds = vec![Vec::new(); blocks.len()];
     for (i, b) in blocks.iter().enumerate() {
@@ -626,16 +642,25 @@ fn is_return_like(op: &IlOp) -> bool {
 
 /// Run CFG-local GVN on a single function body in place.
 pub fn cfg_gvn(ops: &mut Vec<IlOp>) {
+    cfg_gvn_with(ops, true);
+}
+
+/// Like [`cfg_gvn`], with SSA global numbering optional (COI-121).
+pub fn cfg_gvn_with(ops: &mut Vec<IlOp>, ssa: bool) {
     if ops.len() < 2 {
         return;
     }
     let blocks = build_blocks(ops);
     gvn_within_blocks(ops, &blocks);
-    // Recompute blocks after possible Dup rewrites (indices unchanged).
     let blocks = build_blocks(ops);
     gvn_at_joins(ops, &blocks);
+    if ssa {
+        super::gvn_ssa::ssa_gvn(ops);
+    }
     expand_dup_after_load(ops);
 }
+
+pub use super::gvn_ssa::{build_ssa, eliminate_redundant, number_values, ssa_gvn};
 
 /// `Load s; Dup` → `Load s; Load s`, undoing Dup-CSE that would otherwise hide
 /// a binop's operands from fuse-select (`BinSlotSlot*`, packed `LOAD`).
@@ -652,6 +677,10 @@ fn expand_dup_after_load(ops: &mut [IlOp]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gvn.tests.rs"]
+mod ssa_tests;
 
 #[cfg(test)]
 mod tests {
