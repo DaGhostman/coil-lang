@@ -82,6 +82,32 @@
         })
     }
 
+    fn bytecode_has_shr_by(bc: &[Byte], shift: i64) -> bool {
+        use common::Instruction;
+        let has_load_const_shr = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHR)
+                && (w[1].operand_u32() & Byte::POOL_FLAG) == 0
+                && w[1].operand_u32() as i32 == shift as i32
+        });
+        let has_fused_shr = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHR as u8
+                && b.bin_slot_imm_parts().2 == shift
+        });
+        has_load_const_shr || has_fused_shr
+    }
+
+    fn bytecode_has_any_shr(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::SHR)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::SHR as u8)
+        })
+    }
+
     #[test]
     fn method_call_target_relocated_after_static_init_splice() {
         use common::Instruction;
@@ -809,6 +835,40 @@ use string::{format, to_bytes};
         assert!(
             bytecode_has_shl_by(&bc, 3),
             "expected SHL (shift 3) for byte*8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Unsigned `byte / 8` is `>> 3`. Signed `int / 8` must stay `DIV`.
+    #[test]
+    fn byte_div_by_power_of_two_emits_shr() {
+        let (bc, _pool) = compile_src("fn scale(byte x) -> byte { return x / 8; }");
+        assert!(
+            bytecode_has_shr_by(&bc, 3),
+            "expected SHR (shift 3) for byte/8; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn int_div_by_power_of_two_keeps_div() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { return x / 8; }");
+        assert!(
+            !bytecode_has_any_shr(&bc),
+            "signed int / 8 must not become SHR; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let has_div = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::DIV)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::DIV as u8)
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::DIV as u8)
+        });
+        assert!(
+            has_div,
+            "expected DIV for signed int/8; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

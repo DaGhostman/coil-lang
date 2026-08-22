@@ -226,6 +226,37 @@ pub fn strength_mul_to_shl<'a>(
     None
 }
 
+/// Integer strength-reduction hint: `x / k` when k is a positive power of
+/// two → shift right by `trailing_zeros(k)`.
+pub fn strength_div_int(k: i64) -> Option<u32> {
+    strength_mul_int(k).filter(|&shift| shift > 0)
+}
+
+/// If `expr` is `x / 2^n` (n ≥ 1), return `(x, n)` so codegen can emit `SHR`
+/// when the dividend is provably non-negative. Divisor-on-the-left (`k / x`)
+/// is not a shift.
+pub fn strength_div_to_shr<'a>(
+    expr: &'a (SimpleSpan, Box<Expression<'a>>),
+    env: &HashMap<String, ConstValue>,
+) -> Option<(&'a Output<'a>, u32)> {
+    let Expression::Div(lhs, rhs) = expr.1.as_ref() else {
+        return None;
+    };
+    let ConstValue::Int(k) = eval_expr(rhs, env)? else {
+        return None;
+    };
+    let shift = strength_div_int(k)?;
+    Some((lhs, shift))
+}
+
+/// `true` when `expr` folds to an integer ≥ 0 (safe for signed `>>` ≡ `/ 2^n`).
+pub fn strength_div_dividend_nonneg(
+    expr: &Output<'_>,
+    env: &HashMap<String, ConstValue>,
+) -> bool {
+    matches!(eval_expr(expr, env), Some(ConstValue::Int(k)) if k >= 0)
+}
+
 /// If `expr` is `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x % 1` (when defined), return inner.
 pub fn strength_reduced_inner<'a>(
     expr: &'a (SimpleSpan, Box<Expression<'a>>),
@@ -587,6 +618,56 @@ mod tests {
         );
         assert_eq!(strength_mul_to_shl(&mul0, &env), None);
         assert_eq!(strength_mul_to_shl(&mul_neg, &env), None);
+    }
+
+    #[test]
+    fn strength_div_int_only_positive_powers_of_two() {
+        assert_eq!(strength_div_int(2), Some(1));
+        assert_eq!(strength_div_int(4), Some(2));
+        assert_eq!(strength_div_int(3), None);
+        assert_eq!(strength_div_int(0), None);
+        assert_eq!(strength_div_int(-2), None);
+        assert_eq!(strength_div_int(1), None);
+    }
+
+    #[test]
+    fn strength_div_to_shr_rewrites_power_of_two_divisor() {
+        let env = HashMap::new();
+        let div2 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(id_expr("x"), int_expr(2))),
+        );
+        let div4 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(id_expr("x"), int_expr(4))),
+        );
+        let div3 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(id_expr("x"), int_expr(3))),
+        );
+        let div0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(id_expr("x"), int_expr(0))),
+        );
+        let div_neg = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(id_expr("x"), int_expr(-2))),
+        );
+        let (inner, shift) = strength_div_to_shr(&div2, &env).expect("x/2");
+        assert!(matches!(inner.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(shift, 1);
+        let (inner, shift) = strength_div_to_shr(&div4, &env).expect("x/4");
+        assert!(matches!(inner.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(shift, 2);
+        assert_eq!(strength_div_to_shr(&div3, &env), None);
+        assert_eq!(strength_div_to_shr(&div0, &env), None);
+        assert_eq!(strength_div_to_shr(&div_neg, &env), None);
+        assert!(!strength_div_dividend_nonneg(&id_expr("x"), &env));
+        let mut env_pos = HashMap::new();
+        env_pos.insert("x".into(), ConstValue::Int(8));
+        assert!(strength_div_dividend_nonneg(&id_expr("x"), &env_pos));
+        env_pos.insert("x".into(), ConstValue::Int(-1));
+        assert!(!strength_div_dividend_nonneg(&id_expr("x"), &env_pos));
     }
 
     #[test]

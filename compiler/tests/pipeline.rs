@@ -4154,6 +4154,22 @@ fn main() {
     assert_eq!(output, "6");
 }
 
+/// Signed `/` is toward zero; arithmetic `>>` would differ for negatives.
+#[test]
+fn signed_div_toward_zero_prints() {
+    let output = run_example_src(
+        r#"
+use io::{stdout, write};
+use string::{format, to_bytes};
+fn main() {
+    let x = 0 - 5;
+    write(stdout(), to_bytes(format("%i", x / 2)));
+}
+"#,
+    );
+    assert_eq!(output, "-2");
+}
+
 /// Invariant `t = 42` in a counted `while` must still be visible after the loop
 /// (COI-120 sinks the store rather than dropping a live slot).
 #[test]
